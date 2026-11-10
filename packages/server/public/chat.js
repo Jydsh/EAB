@@ -738,6 +738,7 @@ function showSessionMenu(sessionId, anchor) {
   const session = sessionById(sessionId)
   if (!menu || !session) return
   hideFileMenu()
+  hideLocalMenu()
   menu.innerHTML = `<div class="session-menu-title">${esc(session.title)}</div>
     <button type="button" data-act="rename">重命名</button>
     <button type="button" data-act="delete" class="is-danger">删除</button>`
@@ -749,6 +750,57 @@ function showSessionMenu(sessionId, anchor) {
   const top = below + box.height + 8 > window.innerHeight ? Math.max(8, anchor.top - box.height - 4) : below
   menu.style.left = `${left}px`
   menu.style.top = `${top}px`
+}
+
+function openConfirmCard({ eyebrow = '危险操作', title, targetLabel = '目标', target, message, confirmText = '删除', cancelText = '取消' }) {
+  return new Promise((resolve) => {
+    const previousFocus = document.activeElement
+    const overlay = document.createElement('div')
+    overlay.className = 'modal-overlay confirm-overlay'
+    overlay.innerHTML = `<div class="modal confirm-card" role="dialog" aria-modal="true" aria-labelledby="confirm-card-title" aria-describedby="confirm-card-message">
+      <div class="confirm-card-head">
+        <span class="confirm-card-icon" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 2.6 14.2 13.4H1.8L8 2.6Z" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round"/><path d="M8 6.2v3.5" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/><circle cx="8" cy="11.4" r=".65" fill="currentColor"/></svg></span>
+        <div class="confirm-card-titles">
+          <span class="confirm-card-eyebrow">${esc(eyebrow)}</span>
+          <h3 id="confirm-card-title">${esc(title)}</h3>
+        </div>
+        <button class="modal-x" type="button" aria-label="关闭">×</button>
+      </div>
+      <div class="confirm-card-body">
+        <div class="confirm-card-target"><span>${esc(targetLabel)}</span><strong>${esc(target || '未命名')}</strong></div>
+        <p class="confirm-card-message" id="confirm-card-message">${esc(message)}</p>
+      </div>
+      <div class="confirm-card-actions">
+        <button class="btn ghost" type="button" data-confirm-cancel>${esc(cancelText)}</button>
+        <button class="btn danger" type="button" data-confirm-ok>${esc(confirmText)}</button>
+      </div>
+    </div>`
+    document.body.appendChild(overlay)
+    let settled = false
+    const finish = (value) => {
+      if (settled) return
+      settled = true
+      document.removeEventListener('keydown', onKey)
+      overlay.remove()
+      if (previousFocus instanceof HTMLElement && previousFocus.isConnected && !previousFocus.closest('[hidden]')) {
+        previousFocus.focus({ preventScroll: true })
+      } else {
+        $('#input')?.focus()
+      }
+      resolve(value)
+    }
+    const onKey = (event) => {
+      if (event.key === 'Escape') finish(false)
+    }
+    document.addEventListener('keydown', onKey)
+    overlay.addEventListener('click', (event) => {
+      if (event.target === overlay) finish(false)
+    })
+    overlay.querySelector('.modal-x').addEventListener('click', () => finish(false))
+    overlay.querySelector('[data-confirm-cancel]').addEventListener('click', () => finish(false))
+    overlay.querySelector('[data-confirm-ok]').addEventListener('click', () => finish(true))
+    overlay.querySelector('[data-confirm-cancel]').focus()
+  })
 }
 
 async function renameSession(sessionId, currentTitle) {
@@ -772,7 +824,15 @@ async function renameSession(sessionId, currentTitle) {
 async function deleteSession(sessionId) {
   if (!sessionId) return
   const session = sessionById(sessionId)
-  if (!window.confirm(`删除会话「${session?.title || '未命名'}」？聊天记录会软删除，可在数据库审计中追溯。`)) return
+  const confirmed = await openConfirmCard({
+    eyebrow: '会话管理',
+    title: '删除这个会话？',
+    targetLabel: '要删除的会话',
+    target: `「${session?.title || '未命名'}」`,
+    message: '删除后聊天记录会软删除，可在数据库审计中追溯。',
+    confirmText: '删除会话',
+  })
+  if (!confirmed) return
   try {
     await api(`/api/chat/sessions/${encodeURIComponent(sessionId)}${qs()}`, { method: 'DELETE' })
     if (state.sessionId === sessionId) {
@@ -1082,34 +1142,134 @@ function renderLocalSpaces() {
   renderLocalTree()
 }
 
+function localEntryIcon(entry) {
+  if (entry.type === 'dir') {
+    return `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" aria-hidden="true"><path d="M1.7 4.3h4.1l1.2 1.4h7.3v7.6H1.7V4.3Z"/><path d="M1.7 4.3V3.1h4.4l1.2 1.2"/></svg>`
+  }
+  return `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" aria-hidden="true"><path d="M3.4 1.9h5l3.2 3.2v9H3.4v-12Z"/><path d="M8.4 1.9v3.2h3.2"/></svg>`
+}
+
+function localEntryByPath(relPath) {
+  return state.localEntries.find((entry) => entry.relPath === relPath)
+}
+
 function renderLocalTree() {
   const box = $('#local-tree')
   if (!box) return
-  if (!currentLocalSpace()) return
+  const space = currentLocalSpace()
+  if (!space) return
   if (state.localEntries.length === 0) {
     box.innerHTML = '<div class="muted" style="font-size:12px;padding:4px">这个目录是空的，或没有可显示的文件。</div>'
     return
   }
+  const activePath =
+    state.filePreview?.kind === 'local' && state.filePreview.spaceId === space.id
+      ? state.filePreview.relPath
+      : ''
+  const writable = space.mode === 'read_write'
   box.innerHTML = state.localEntries
     .map(
-      (entry) => `<div class="side-file local-entry" data-local-entry="${esc(entry.relPath)}" data-local-type="${entry.type}">
-        <span class="local-entry-icon">${entry.type === 'dir' ? '▸' : '·'}</span>
+      (entry) => `<div class="side-file local-entry${activePath === entry.relPath ? ' is-active' : ''}" data-local-entry="${esc(entry.relPath)}" data-local-type="${entry.type}">
+        <span class="local-entry-icon${entry.type === 'dir' ? ' is-dir' : ''}" aria-hidden="true">${localEntryIcon(entry)}</span>
         <button class="side-file-name" type="button" data-local-open="${esc(entry.relPath)}" title="${esc(entry.relPath)}">${esc(entry.name)}</button>
         ${entry.type === 'file' ? `<span class="side-file-size">${fmtSize(entry.size)}</span>` : ''}
+        <button class="side-file-more" type="button" data-local-more="${esc(entry.relPath)}" title="文件操作" aria-label="文件操作" aria-haspopup="menu">⋯</button>
       </div>`,
     )
     .join('') + (state.localTruncated ? '<div class="muted local-truncated">目录较多，只显示前 200 项。</div>' : '')
   for (const button of box.querySelectorAll('[data-local-open]')) {
     button.addEventListener('click', () => {
-      const entry = state.localEntries.find((item) => item.relPath === button.dataset.localOpen)
+      const entry = localEntryByPath(button.dataset.localOpen)
       if (!entry) return
-      if (entry.type === 'dir') {
-        state.localPath = entry.relPath
-        loadLocalEntries(entry.relPath)
-      } else {
-        openLocalFile(entry.relPath)
-      }
+      openLocalEntry(entry)
     })
+  }
+  for (const button of box.querySelectorAll('[data-local-more]')) {
+    button.addEventListener('click', (event) => {
+      event.stopPropagation()
+      showLocalMenu(button.dataset.localMore, button.getBoundingClientRect())
+    })
+  }
+  for (const row of box.querySelectorAll('[data-local-entry]')) {
+    row.addEventListener('contextmenu', (event) => {
+      event.preventDefault()
+      showLocalMenu(
+        row.dataset.localEntry,
+        { left: event.clientX, top: event.clientY, right: event.clientX, bottom: event.clientY },
+        true,
+      )
+    })
+  }
+}
+
+function openLocalEntry(entry) {
+  if (!entry) return
+  if (entry.type === 'dir') {
+    state.localPath = entry.relPath
+    loadLocalEntries(entry.relPath)
+  } else {
+    openLocalFile(entry.relPath)
+  }
+}
+
+function hideLocalMenu() {
+  const menu = $('#local-menu')
+  if (!menu) return
+  menu.hidden = true
+  menu.dataset.localPath = ''
+}
+
+function showLocalMenu(relPath, anchor, atPoint = false) {
+  const menu = $('#local-menu')
+  const entry = localEntryByPath(relPath)
+  if (!menu || !entry) return
+  hideSessionMenu()
+  hideFileMenu()
+  const writable = currentLocalSpace()?.mode === 'read_write'
+  menu.innerHTML = `<div class="session-menu-title">${esc(entry.name)}</div>
+    ${
+      entry.type === 'dir'
+        ? '<button type="button" data-local-act="open">打开目录</button>'
+        : `<button type="button" data-local-act="open">打开</button>
+           ${writable ? '<button type="button" data-local-act="edit">编辑</button>' : ''}
+           ${writable ? '<button type="button" data-local-act="rename">重命名</button>' : ''}
+           <button type="button" data-local-act="download">下载</button>
+           ${writable ? '<button type="button" data-local-act="delete" class="is-danger">删除</button>' : ''}`
+    }`
+  menu.dataset.localPath = relPath
+  menu.hidden = false
+  const box = menu.getBoundingClientRect()
+  const left = atPoint
+    ? Math.min(anchor.left, window.innerWidth - box.width - 8)
+    : Math.min(Math.max(8, anchor.right - box.width), window.innerWidth - box.width - 8)
+  const top = atPoint
+    ? Math.min(anchor.top, window.innerHeight - box.height - 8)
+    : anchor.bottom + 4 + box.height + 8 > window.innerHeight
+      ? Math.max(8, anchor.top - box.height - 4)
+      : anchor.bottom + 4
+  menu.style.left = `${Math.max(8, left)}px`
+  menu.style.top = `${Math.max(8, top)}px`
+}
+
+function downloadLocalEntry(entry) {
+  const space = currentLocalSpace()
+  if (!space || !entry) return
+  const link = document.createElement('a')
+  link.href = localFileUrl(space, entry.relPath)
+  link.download = entry.name
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+}
+
+async function editLocalEntry(entry) {
+  if (!entry) return
+  await openLocalFile(entry.relPath)
+  if (state.filePreview?.relPath !== entry.relPath) return
+  if (!$('#file-pane-edit').hidden) {
+    beginWorkspaceEdit()
+  } else {
+    banner('这个文件类型不支持在线编辑，请下载后编辑。', 'bad')
   }
 }
 
@@ -1154,6 +1314,7 @@ async function openLocalFile(relPath) {
     size: 0,
     mode: space.mode,
   }
+  renderLocalTree()
   workspacePreviewText = ''
   workspacePreviewTextLoaded = false
   const pane = $('#file-pane')
@@ -1283,14 +1444,18 @@ function openLocalNewFile() {
   input.focus()
 }
 
-function renameLocalFile() {
-  const file = state.filePreview
+function renameLocalFile(target) {
+  const preview = state.filePreview
+  const file = target
+    ? { kind: 'local', relPath: target.relPath, name: target.name, size: target.size || 0 }
+    : preview
   const space = currentLocalSpace()
   if (!file || file.kind !== 'local' || !space) return
   if (space.mode !== 'read_write') {
     banner('当前本地空间是只读的，不能重命名文件', 'bad')
     return
   }
+  const wasOpen = preview?.kind === 'local' && preview.relPath === file.relPath
   const dir = file.relPath.split('/').slice(0, -1).join('/')
   const overlay = document.createElement('div')
   overlay.className = 'modal-overlay'
@@ -1337,7 +1502,7 @@ function renameLocalFile() {
       })
       close()
       await loadLocalEntries(state.localPath)
-      await openLocalFile(to)
+      if (wasOpen) await openLocalFile(to)
       banner('文件已重命名', 'ok')
     } catch (err) {
       saveButton.disabled = false
@@ -1714,6 +1879,7 @@ function showFileMenu(fileId, anchor, atPoint = false) {
   const file = fileById(fileId)
   if (!menu || !file) return
   hideSessionMenu()
+  hideLocalMenu()
   const owner = file.ownerUserId === state.me?.person?.id
   menu.innerHTML = `<div class="session-menu-title">${esc(file.name)}</div>
     ${
@@ -2051,14 +2217,18 @@ async function saveWorkspaceEdit() {
   }
 }
 
-async function deleteLocalPreview() {
-  const file = state.filePreview
+async function deleteLocalPreview(target) {
+  const preview = state.filePreview
+  const file = target
+    ? { kind: 'local', relPath: target.relPath, name: target.name, size: target.size || 0 }
+    : preview
   const space = currentLocalSpace()
   if (!file || file.kind !== 'local' || !space) return
   if (space.mode !== 'read_write') {
     banner('当前本地空间是只读的，不能删除文件', 'bad')
     return
   }
+  const wasOpen = preview?.kind === 'local' && preview.relPath === file.relPath
   const overlay = document.createElement('div')
   overlay.className = 'modal-overlay'
   overlay.innerHTML = `<div class="modal">
@@ -2085,7 +2255,7 @@ async function deleteLocalPreview() {
         { method: 'DELETE' },
       )
       close()
-      if (state.filePreview?.kind === 'local' && state.filePreview.relPath === file.relPath) closeWorkspaceFile()
+      if (wasOpen && state.filePreview?.kind === 'local' && state.filePreview.relPath === file.relPath) closeWorkspaceFile()
       await loadLocalEntries(state.localPath)
       banner('本地文件已删除', 'ok')
     } catch (err) {
@@ -4623,14 +4793,36 @@ async function boot() {
       link.remove()
     }
   })
+  $('#local-menu').addEventListener('click', async (event) => {
+    const action = event.target.closest('[data-local-act]')
+    if (!action) return
+    const relPath = $('#local-menu').dataset.localPath
+    const entry = localEntryByPath(relPath)
+    hideLocalMenu()
+    if (!entry) return
+    const act = action.dataset.localAct
+    if (act === 'open') {
+      openLocalEntry(entry)
+    } else if (act === 'edit') {
+      await editLocalEntry(entry)
+    } else if (act === 'rename') {
+      renameLocalFile(entry)
+    } else if (act === 'download') {
+      downloadLocalEntry(entry)
+    } else if (act === 'delete') {
+      deleteLocalPreview(entry)
+    }
+  })
   document.addEventListener('click', (event) => {
     if (!event.target.closest('#session-menu') && !event.target.closest('.side-session-more')) hideSessionMenu()
     if (!event.target.closest('#file-menu') && !event.target.closest('.side-file-more')) hideFileMenu()
+    if (!event.target.closest('#local-menu') && !event.target.closest('[data-local-more]')) hideLocalMenu()
   })
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape') {
       hideSessionMenu()
       hideFileMenu()
+      hideLocalMenu()
       hideSpaceMenu()
       hideQuota()
     }
@@ -4638,6 +4830,7 @@ async function boot() {
   window.addEventListener('resize', () => {
     hideSessionMenu()
     hideFileMenu()
+    hideLocalMenu()
     hideSpaceMenu()
     hideQuota()
   })

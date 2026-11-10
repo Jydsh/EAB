@@ -93,6 +93,8 @@ eab server
 ### 常用命令
 
 ```text
+eab -v, --version              显示当前版本
+eab -h, --help                 显示命令帮助
 eab server                     前台启动（员工 8787 / 控制台 8788）
 eab server --background        后台启动并做健康检查
 eab server --host=0.0.0.0      本次启动监听所有网卡

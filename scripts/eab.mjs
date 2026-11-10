@@ -430,8 +430,15 @@ function init() {
   if (existsSync(backups)) console.log(`备份目录：${backups}（${readdirSync(backups).length} 个）`)
 }
 
+function version() {
+  const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'))
+  console.log(`EAB CLI v${pkg.version}`)
+}
+
 function help() {
   console.log(`EAB CLI
+  eab -v, --version    显示当前版本
+  eab -h, --help       显示帮助
   eab server [--background] [--host=0.0.0.0] [--chat-port=8787] [--admin-port=8788]
   eab stop
   eab update [--apply]
@@ -452,7 +459,8 @@ function help() {
 const [command, sub, ...rest] = process.argv.slice(2)
 const { flags } = argsOf(process.argv, 3)
 try {
-  if (!command || command === 'help' || command === '--help') help()
+  if (!command || command === 'help' || command === '--help' || command === '-h') help()
+  else if (command === 'version' || command === '-v' || command === '--version') version()
   else if (command === 'init') init()
   else if (command === 'doctor') await doctor()
   else if (command === 'backup') await backup()

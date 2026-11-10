@@ -1980,7 +1980,9 @@
 .local-empty p { margin: 0 0 6px; }
 .local-tree { max-height: 240px; }
 .local-entry { gap: 5px; }
-.local-entry-icon { flex: 0 0 auto; width: 12px; color: #98a2b3; font-size: 10.5px; }
+.local-entry-icon { flex: 0 0 auto; width: 16px; height: 16px; display: inline-flex; align-items: center; justify-content: center; color: #98a2b3; }
+.local-entry-icon svg { width: 13px; height: 13px; display: block; }
+.local-entry-icon.is-dir { color: #0f766e; }
 .local-truncated { padding: 4px 8px; font-size: 10.5px; }
 .local-bind-modal { width: min(620px, calc(100vw - 32px)); }
 .local-bind-body { padding: 2px 20px 0; }
@@ -2150,6 +2152,7 @@
 @media (hover: none) { .side-file-more { opacity: 1; } }
 .side-file-more:hover { background: #e6ebf1; color: #344054; }
 #file-menu { min-width: 146px; }
+#local-menu { min-width: 146px; }
 
 #ws-quota-popover .ws-quota-head { display:flex; align-items:baseline; justify-content:space-between; gap:8px; }
 .ws-quota-label { font-size:11px; font-weight:600; color:#667085; letter-spacing:.2px; }
@@ -2177,6 +2180,121 @@
 
 .btn.danger { background:#b42318; border-color:#b42318; color:#fff; }
 .btn.danger:hover:not(:disabled) { background:#912018; border-color:#912018; color:#fff; }
+
+.confirm-overlay {
+  z-index: 65;
+  background: rgba(16, 24, 40, .46);
+  backdrop-filter: blur(2px);
+}
+
+.confirm-card {
+  width: min(420px, 92vw);
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid #e7eeeb;
+  border-radius: 16px;
+  box-shadow: 0 24px 70px rgba(16, 24, 40, .28);
+}
+
+.confirm-card::before {
+  content: "";
+  display: block;
+  height: 3px;
+  background: linear-gradient(90deg, #d92d20, #f04438);
+}
+
+.confirm-card-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 18px 20px 0;
+}
+
+.confirm-card-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  background: #fef3f2;
+  color: #b42318;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+}
+
+.confirm-card-titles {
+  min-width: 0;
+  flex: 1;
+}
+
+.confirm-card-eyebrow {
+  display: block;
+  color: #b42318;
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: .08em;
+}
+
+.confirm-card h3 {
+  margin: 2px 0 0;
+  color: #101828;
+  font-size: 16px;
+  line-height: 1.4;
+}
+
+.confirm-card .modal-x {
+  margin-left: auto;
+}
+
+.confirm-card-body {
+  padding: 14px 20px 0;
+}
+
+.confirm-card-target {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 11px;
+  border: 1px solid #e7eeeb;
+  border-radius: 9px;
+  background: #f8fbfa;
+  color: #344054;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.confirm-card-target span {
+  flex: 0 0 auto;
+  color: #7b8d90;
+  font-size: 10.5px;
+}
+
+.confirm-card-target strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.confirm-card-message {
+  margin: 11px 0 0;
+  color: #667085;
+  font-size: 11.5px;
+  line-height: 1.65;
+}
+
+.confirm-card-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+  padding: 14px 20px 18px;
+  border-top: 1px solid #f0f4f3;
+}
+
+.confirm-card-actions .btn {
+  min-width: 92px;
+}
 
 /* ---------------- 思考过程 + 工具调用 ---------------- */
 
