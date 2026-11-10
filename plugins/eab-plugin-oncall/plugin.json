@@ -1,0 +1,13 @@
+{
+  "id": "eab-plugin-oncall",
+  "name": "值班表",
+  "version": "0.1.0",
+  "description": "演示插件：从组织成员里按部门挑人，生成一张每周值班表（纯前端，数据走 EAB 的 HTTP API）",
+  "author": "EAB 内置示例",
+  "license": "MIT",
+  "homepage": "",
+  "keywords": ["值班", "组织架构", "示例"],
+  "compatibility": { "eab": ">=2026.11.0" },
+  "scopes": ["org:member:read"],
+  "pages": [{ "id": "oncall", "title": "值班表", "file": "page.html" }]
+}

@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>EAB 管理控制台</title>
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+    <!-- 顶栏：品牌 + 当前公司 + 服务状态 + 退出。控制台不登录组织成员，这里没有"我是谁"。 -->
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo">EAB</span>
+        <div class="brand-text">
+          <h1>企业智能体基座</h1>
+          <p class="sub">管理控制台</p>
+        </div>
+      </div>
+      <div class="topbar-company" id="company-picker" aria-label="当前管理公司"></div>
+      <div class="who">
+        <span id="health-dot" class="dot" title="服务状态"></span>
+        <span id="health-text" class="health-text">连接中</span>
+        <span class="who-divider"></span>
+        <div class="account" id="account">
+          <button class="account-btn" id="account-toggle" type="button" aria-haspopup="true" aria-expanded="false">
+            <span class="account-avatar" aria-hidden="true">管</span>
+            <span class="account-name">
+              <strong>超级管理员</strong>
+              <small>服务器侧</small>
+            </span>
+            <span class="account-caret" aria-hidden="true">▾</span>
+          </button>
+          <div class="account-pop" id="account-pop" hidden>
+            <div class="account-head">
+              <span class="account-avatar lg" aria-hidden="true">管</span>
+              <div class="account-head-text">
+                <strong>超级管理员</strong>
+                <small id="account-user">admin</small>
+              </div>
+            </div>
+            <div class="account-meta" id="account-meta">加载中…</div>
+            <div class="account-menu">
+              <button type="button" data-account-action="password" id="account-password">
+                <span>修改密码</span>
+                <small>更新控制台登录口令</small>
+              </button>
+              <button type="button" class="danger" data-account-action="logout">
+                <span>退出登录</span>
+                <small>结束当前控制台会话</small>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <!-- 一级导航：只按业务域分组；点一下切到该域，页面列表在左侧常驻 -->
+    <nav class="topnav primary-nav" id="topnav" aria-label="业务域导航">
+      <button class="nav-primary" type="button" data-domain="overview">概览</button>
+      <button class="nav-primary" type="button" data-domain="org">组织与权限</button>
+      <button class="nav-primary" type="button" data-domain="knowledge">知识与模型</button>
+      <button class="nav-primary" type="button" data-domain="platform">连接与平台</button>
+      <button class="nav-primary" type="button" data-domain="plugins">插件管理</button>
+      <button class="nav-primary" type="button" data-domain="ops">运营与审计</button>
+      <div class="nav-tail" id="nav-tail"></div>
+    </nav>
+
+    <div class="workspace">
+      <!-- 二级导航：当前业务域下的页面列表，常驻左侧，不再靠悬停发现 -->
+      <aside class="nav-rail" id="nav-rail" aria-label="二级导航"></aside>
+
+      <main class="page">
+        <div class="page-head">
+          <div class="page-heading">
+            <div class="page-kicker" id="page-kicker">EAB CONFIG</div>
+            <h1 id="page-title">概览</h1>
+            <p class="page-sub" id="page-sub">服务状态与配置入口</p>
+          </div>
+          <div class="page-head-right">
+            <div class="page-actions" id="page-actions"></div>
+          </div>
+        </div>
+
+        <!-- 页内 rail：组织树 / 知识库列表 / 角色列表这类"本页选择器"，不是全站导航 -->
+        <div class="page-body" id="page-body">
+          <aside class="page-rail" id="page-rail" aria-label="页内选择器"></aside>
+          <div id="view" class="view"></div>
+        </div>
+      </main>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,1406 @@
+/**
+ * 工具注册表（TOOL-01 ~ TOOL-06）。
+ *
+ * 注册的工具都有：id、中文名、说明、所需 scope、是否高危（需审批）、参数 JSON Schema。
+ * 调用统一走 `POST /api/tools/:id/invoke`，先鉴权、再审批、再执行、再审计。
+ * 不在本地执行任意脚本；工具白名单是代码常量，插件想加工具必须走插件清单。
+ */
+import type { FastifyInstance, FastifyRequest } from 'fastify'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { basename, dirname, join } from 'node:path'
+import { EC, EabError, SC, ulid, type Scope } from '@eab/domain'
+import { appendAudit } from '@eab/storage'
+import { assertScoped, buildScopeFilter, predicateToSql } from '@eab/authz'
+import type { Db } from '@eab/storage'
+import { safeJoin, toSlug } from '@eab/workspace'
+import type { ServerDeps } from '../deps.js'
+import { ok, requireScope } from '../http.js'
+import { resolveActor } from '../session.js'
+import { hashPassword } from '../password.js'
+import { retrieveExternalKb } from '../kb-external.js'
+import {
+  deleteLocalFile,
+  findLocalSpaceRow,
+  listLocalEntries,
+  mkdirLocal,
+  moveLocalEntry,
+  readLocalText,
+  writeLocalText,
+  type ActiveSpace,
+} from '../local-space.js'
+import { executePluginTool, pluginToolCatalogFor, pluginToolSpecsFor, resolvePluginToolForActor } from '../plugin-tools.js'
+import {
+  resolveUserWorkspaceQuota,
+  workspaceCapacity,
+  workspaceUsedBytes,
+} from '../workspace-quota.js'
+import { sendDingTalkFileToUser } from '../dingtalk-outbound.js'
+import { sendDingTalkFileToConversation, uploadFileToUserDrive } from '../dingtalk-drive.js'
+import {
+  createRobotUserFileSend,
+  markRobotUserFileSendFailed,
+  markRobotUserFileSendSent,
+} from '../dingtalk-file-echo.js'
+import { deleteUserWorkspaceFile, readUserWorkspaceFile, renameUserWorkspaceFile } from './workspace.js'
+import { createSchedule, deleteSchedule, listSchedules } from '../schedule.js'
+
+export interface ToolDef {
+  id: string
+  name: string
+  description: string
+  scope: Scope
+  dangerous: boolean
+  input: Record<string, { type: string; description: string; required?: boolean }>
+}
+
+export interface ToolExecutionContext {
+  /** 当前对话的会话 id；定时任务创建时用它绑定结果回到哪个会话 */
+  sessionId?: string
+  /** 当前入口：web / dingtalk 等，决定定时任务默认回推通道 */
+  channel?: 'web' | 'dingtalk'
+}
+
+export interface ChatToolSpec {
+  type: 'function'
+  function: {
+    name: string
+    description: string
+    parameters: {
+      type: 'object'
+      properties: Record<string, { type: string; description: string }>
+      required: string[]
+      additionalProperties: false
+    }
+  }
+}
+
+type Actor = ReturnType<typeof resolveActor>
+
+export const TOOLS: readonly ToolDef[] = [
+  {
+    id: 'tool.search',
+    name: '搜索工具目录',
+    description:
+      '搜索当前员工可用的工具目录。当前对话只加载了常用工具；当需要文件发送/重命名/删除、容量查询、定时任务管理、计算或插件能力等未直接列出的能力时，先调用本工具。query 用用户原话或中文/英文能力词（例如“发送文件到钉钉”“查看我的定时任务”“计算 (1200+300)/4”“plugin”）；返回匹配工具的名称、用途和参数，下一轮会自动加载这些工具，之后即可直接调用。不要因为工具列表里暂时没有就直接说做不到。',
+    scope: SC.AGENT_TOOL_INVOKE,
+    dangerous: false,
+    input: {
+      query: { type: 'string', description: '用户要完成的能力或场景关键词，支持中英文与工具 id 片段', required: true },
+      limit: { type: 'number', description: '最多返回几个工具，默认 8，范围 1-12' },
+    },
+  },
+  {
+    id: 'time.now',
+    name: '当前时间',
+    description: '返回服务器当前时间（ISO 与本地时区），用于换算日程',
+    scope: SC.AGENT_TOOL_INVOKE,
+    dangerous: false,
+    input: {},
+  },
+  {
+    id: 'schedule.create',
+    name: '创建定时任务',
+    description:
+      '创建属于当前员工自己的定时提醒。它是挂在当前会话上的持久提醒，到点后会在原会话里自动跑一轮并把结果回复给用户。用户说“30 秒后提醒我 / 明天早上 8 点提醒我开会 / 每天 9 点把日报发我 / 每周一 10 点汇总上周数据 / 每 10 分钟检查一次”时调用。prompt 写到点要执行的完整任务。时间选择器优先级：after_seconds（多少秒后一次）> every_seconds（每多少秒，最少 300）> at（指定时间）> daily/weekly（日历规则）。不要自己计算绝对时间。',
+    scope: SC.SCHEDULE_WRITE,
+    dangerous: false,
+    input: {
+      title: { type: 'string', description: '任务标题，最多 40 字；不填则用 prompt 前 20 字' },
+      prompt: {
+        type: 'string',
+        description: '到点要执行的任务，写成完整一句话，例如“汇总上周安全防护记录并给出三点结论”',
+        required: true,
+      },
+      mode: { type: 'string', description: 'once | daily | weekly | interval；给了 after_seconds/every_seconds 时可省略' },
+      at: { type: 'string', description: 'once 用，例如 2026-11-10 09:00 或 2026-11-10T09:00:00+08:00' },
+      time: { type: 'string', description: 'daily/weekly 用，HH:MM，例如 08:30' },
+      days: { type: 'string', description: 'weekly 用，0=周日…6=周六，可写 1,3,5' },
+      intervalMinutes: { type: 'string', description: 'interval 用，最小 5 分钟，例如 30' },
+      afterSeconds: { type: 'string', description: '多少秒后触发一次（once），最少 30，例如 60' },
+      everySeconds: { type: 'string', description: '每隔多少秒重复（interval），最少 300，例如 600' },
+      timezone: { type: 'string', description: '时区，默认 Asia/Shanghai；一般不用填' },
+      channel: { type: 'string', description: '结果回推通道：dingtalk（默认，回到当前员工钉钉）或 web（只落网页会话）' },
+    },
+  },
+  {
+    id: 'schedule.list',
+    name: '查看我的定时任务',
+    description: '列出当前员工自己创建的定时任务，返回标题、规则、下次执行时间、最近结果和失败原因。用户问“我有哪些定时任务/那个提醒还在吗”时调用。',
+    scope: SC.SCHEDULE_READ,
+    dangerous: false,
+    input: {
+      status: { type: 'string', description: '可选过滤：active | paused | done | error | cancelled | running' },
+    },
+  },
+  {
+    id: 'schedule.delete',
+    name: '删除定时任务',
+    description: '删除当前员工自己的一个定时任务，删除后不会再有后续触发。用户说“取消明天那个提醒/删掉那个任务/不要再发了”时调用；先用 schedule.list 找到 id。',
+    scope: SC.SCHEDULE_WRITE,
+    dangerous: false,
+    input: {
+      id: { type: 'string', description: 'schedule.list 返回的任务 id', required: true },
+    },
+  },
+  {
+    id: 'math.eval',
+    name: '四则运算',
+    description: '计算 + - * / 与括号，不支持函数与变量',
+    scope: SC.AGENT_TOOL_INVOKE,
+    dangerous: false,
+    input: { expression: { type: 'string', description: '例如 (1200+300)/4', required: true } },
+  },
+  {
+    id: 'org.directory',
+    name: '组织通讯录（对话式）',
+    description:
+      '不要求用户先输入姓名。按对话意图查组织：intent=leader 查“我的组长/我的上级/我所在部门”；intent=me 查“我是谁/我在哪个部门”；intent=departments 查“公司有哪些部门/组织架构”；intent=members 查某个部门有谁（需要查看成员权限）；intent=search 按姓名/岗位关键字查人（需要查看成员权限）。返回部门、岗位、组长，不返回手机号。',
+    scope: SC.CHAT_USE,
+    dangerous: false,
+    input: {
+      intent: {
+        type: 'string',
+        description: 'leader | me | departments | members | search，按用户问题选择',
+        required: true,
+      },
+      query: { type: 'string', description: 'intent=members 时填部门名；intent=search 时填姓名/岗位关键字' },
+    },
+  },
+  {
+    id: 'org.search',
+    name: '通讯录搜索',
+    description: '按姓名/工号/岗位搜索本公司在职成员，返回部门与岗位，不返回手机号',
+    scope: SC.ORG_MEMBER_READ,
+    dangerous: false,
+    input: { query: { type: 'string', description: '姓名或工号关键字', required: true } },
+  },
+  {
+    id: 'kb.search',
+    name: '知识库检索',
+    description: '在当前用户可见的知识库里检索片段（与对话同一条可见性规则）',
+    scope: SC.KB_READ,
+    dangerous: false,
+    input: { query: { type: 'string', description: '要检索的问题或关键词', required: true } },
+  },
+  {
+    id: 'workspace.list',
+    name: '列出我的文件',
+    description: '列出个人工作区里未删除的文件',
+    scope: SC.WORKSPACE_READ,
+    dangerous: false,
+    input: {},
+  },
+  {
+    id: 'workspace.capacity',
+    name: '个人云空间容量',
+    description:
+      '查询个人云空间的已用、总容量、剩余空间和容量预警等级。用户问“我还有多少空间/云空间快满了吗/还能不能放大文件”时调用；返回 remainingBytes、percent 和 warning.message，回答时优先给出剩余空间和预警原话。',
+    scope: SC.WORKSPACE_READ,
+    dangerous: false,
+    input: {},
+  },
+  {
+    id: 'workspace.write',
+    name: '写入工作区文件',
+    description: '把一段文本写成个人工作区里的文件（同名覆盖）',
+    scope: SC.WORKSPACE_WRITE,
+    dangerous: false,
+    input: {
+      path: { type: 'string', description: '相对路径，例如 notes/todo.md', required: true },
+      text: { type: 'string', description: '文本内容', required: true },
+    },
+  },
+  {
+    id: 'workspace.read',
+    name: '读取工作区文件',
+    description: '读取云空间里一个文本文件的正文（最大 5 MB）',
+    scope: SC.WORKSPACE_READ,
+    dangerous: false,
+    input: {
+      path: { type: 'string', description: '相对路径，例如 notes/todo.md', required: true },
+    },
+  },
+  {
+    id: 'workspace.send_dingtalk',
+    name: '发送云空间文件到钉钉',
+    description:
+      '把个人云空间里的文件作为钉钉文件消息发给当前用户。用户说“把文件发给我/发到钉钉/把这个文件发我”时调用；先用 workspace.list 找到文件名或相对路径，再传 path，或直接传 workspace.list 返回的 fileId。钉钉单聊里会用用户方向的原生文件消息发送（右侧气泡、带预览/未查收/下载/编辑），机器人识别回声后不重复保存；网页会话退回机器人文件消息。只支持当前员工的个人云空间文件，单个文件不超过 20 MB。',
+    scope: SC.WORKSPACE_READ,
+    dangerous: false,
+    input: {
+      fileId: { type: 'string', description: 'workspace.list 返回的文件 id；和 path 二选一' },
+      path: { type: 'string', description: '文件相对路径或文件名，例如 suale.txt；和 fileId 二选一' },
+    },
+  },
+  {
+    id: 'workspace.rename',
+    name: '重命名云空间文件',
+    description:
+      '修改个人云空间里一个文件的名字。用户说“重命名/改名/把文件名改成…”时调用；先用 workspace.list 找到文件，再传 fileId 或 path，并提供 newName。只改文件名，不移动文件。',
+    scope: SC.WORKSPACE_WRITE,
+    dangerous: false,
+    input: {
+      fileId: { type: 'string', description: 'workspace.list 返回的文件 id；和 path 二选一' },
+      path: { type: 'string', description: '文件相对路径或文件名，例如 suale.txt；和 fileId 二选一' },
+      newName: { type: 'string', description: '新文件名或新相对路径，例如 安全防护记录表.docx', required: true },
+    },
+  },
+  {
+    id: 'workspace.delete',
+    name: '删除云空间文件',
+    description:
+      '删除个人云空间里的一个文件。用户明确说“删掉/删除/清理某个文件”时调用；先用 workspace.list 找到 fileId 或 path。只能删自己的文件；删除是软删，文件会移到回收目录，列表里不再显示，但保留可审计。不要用它删除目录或非个人云空间文件。',
+    scope: SC.WORKSPACE_WRITE,
+    dangerous: false,
+    input: {
+      fileId: { type: 'string', description: 'workspace.list 返回的文件 id；和 path 二选一' },
+      path: { type: 'string', description: '文件相对路径或文件名，例如 安全防护记录表.docx；和 fileId 二选一' },
+    },
+  },
+  {
+    id: 'local.list',
+    name: '列出本地目录',
+    description: '列出当前本地空间某个目录下的文件和子目录（默认忽略 node_modules、.git 等重目录）',
+    scope: SC.LOCAL_SPACE_READ,
+    dangerous: false,
+    input: {
+      path: { type: 'string', description: '相对空间根目录的路径；留空表示根目录' },
+      all: { type: 'boolean', description: '是否包含 node_modules、.git 等重目录，默认 false' },
+    },
+  },
+  {
+    id: 'local.read',
+    name: '读取本地文件',
+    description: '读取当前本地空间里的文本/代码/Markdown 文件正文（最大 5 MB）',
+    scope: SC.LOCAL_SPACE_READ,
+    dangerous: false,
+    input: {
+      path: { type: 'string', description: '相对空间根目录的文件路径', required: true },
+    },
+  },
+  {
+    id: 'local.write',
+    name: '编辑本地文件',
+    description:
+      '在当前本地空间创建或覆盖文本文件，用来编辑本地文本/代码/Markdown。用户说“改一下/编辑/修改/保存这段内容”时调用；先 local.read 读原文，再传完整新内容覆盖。不会删除文件，也不会执行命令。',
+    scope: SC.LOCAL_SPACE_WRITE,
+    dangerous: false,
+    input: {
+      path: { type: 'string', description: '相对空间根目录的文件路径，例如 src/app.ts', required: true },
+      text: { type: 'string', description: '完整文本内容', required: true },
+    },
+  },
+  {
+    id: 'local.delete',
+    name: '删除本地文件',
+    description:
+      '从当前本地空间永久删除一个文件。只有用户明确说“删除/删掉/清理某个本地文件”时调用；先用 local.list 确认相对路径。只能删文件，不能删目录；删除不可恢复；只读空间不能删。',
+    scope: SC.LOCAL_SPACE_WRITE,
+    dangerous: false,
+    input: {
+      path: { type: 'string', description: '要删除的文件相对路径，例如 logs/old.log', required: true },
+    },
+  },
+  {
+    id: 'local.move',
+    name: '移动本地文件',
+    description: '在当前本地空间内移动或重命名文件/目录；不删除文件',
+    scope: SC.LOCAL_SPACE_WRITE,
+    dangerous: false,
+    input: {
+      from: { type: 'string', description: '源相对路径', required: true },
+      to: { type: 'string', description: '目标相对路径', required: true },
+      overwrite: { type: 'boolean', description: '目标存在时是否覆盖，默认 false' },
+    },
+  },
+  {
+    id: 'local.mkdir',
+    name: '新建本地目录',
+    description: '在当前本地空间里创建一个目录',
+    scope: SC.LOCAL_SPACE_WRITE,
+    dangerous: false,
+    input: {
+      path: { type: 'string', description: '相对空间根目录的目录路径', required: true },
+    },
+  },
+  {
+    id: 'admin.password.reset',
+    name: '重置成员密码',
+    description: '给指定成员重置密码并吊销其全部会话。高危：需要审批。',
+    scope: SC.ORG_MEMBER_MANAGE,
+    dangerous: true,
+    input: {
+      userId: { type: 'string', description: '成员 id', required: true },
+      password: { type: 'string', description: '新密码（至少 8 位）', required: true },
+    },
+  },
+]
+
+function requireEnabled(actor: ReturnType<typeof resolveActor>): void {
+  if (actor.subject.status !== 'active') throw new EabError(EC.FORBIDDEN, '账号已被停用')
+}
+
+function audit(deps: ServerDeps, req: FastifyRequest, action: string, detail: Record<string, unknown>): void {
+  const actor = resolveActor(deps.db, deps.config, req)
+  appendAudit(deps.db, {
+    companyId: actor.subject.companyId,
+    actorUserId: actor.subject.userId,
+    action,
+    resourceType: 'tool',
+    resourceId: String(detail.toolId ?? ''),
+    resourceScope: null,
+    result: 'success',
+    detail,
+    traceId: String(req.id),
+    ip: req.ip,
+    channel: 'web',
+  })
+}
+
+/** 只允许数字、括号、四则运算；用递归下降，不用 eval */
+function evaluate(expression: string): number {
+  const tokens = expression.replace(/\s+/g, '')
+  if (!/^[0-9+\-*/().%]+$/.test(tokens)) throw new EabError(EC.VALIDATION, '表达式只允许数字与 + - * / ( ) %')
+  let index = 0
+  function number(): number {
+    const start = index
+    while (index < tokens.length && /[0-9.]/.test(tokens[index])) index++
+    if (start === index) throw new EabError(EC.VALIDATION, '表达式格式错误')
+    return Number(tokens.slice(start, index))
+  }
+  function factor(): number {
+    if (tokens[index] === '+') {
+      index++
+      return factor()
+    }
+    if (tokens[index] === '-') {
+      index++
+      return -factor()
+    }
+    if (tokens[index] === '(') {
+      index++
+      const value = addsub()
+      if (tokens[index] !== ')') throw new EabError(EC.VALIDATION, '括号不匹配')
+      index++
+      return value
+    }
+    return number()
+  }
+  function muldiv(): number {
+    let value = factor()
+    while (tokens[index] === '*' || tokens[index] === '/' || tokens[index] === '%') {
+      const op = tokens[index++]
+      const right = factor()
+      if ((op === '/' || op === '%') && right === 0) throw new EabError(EC.VALIDATION, '不能除以 0')
+      value = op === '*' ? value * right : op === '/' ? value / right : value % right
+    }
+    return value
+  }
+  function addsub(): number {
+    let value = muldiv()
+    while (tokens[index] === '+' || tokens[index] === '-') {
+      const op = tokens[index++]
+      const right = muldiv()
+      value = op === '+' ? value + right : value - right
+    }
+    return value
+  }
+  const result = addsub()
+  if (index !== tokens.length) throw new EabError(EC.VALIDATION, '表达式有未解析的字符')
+  if (!Number.isFinite(result)) throw new EabError(EC.VALIDATION, '结果超出范围')
+  return result
+}
+
+/** 组织通讯录工具：只读，不返回手机号；按 subject 的 dataScope 裁剪可见成员。 */
+function visibleUserIds(db: Db, actor: Actor): string[] | null {
+  if (!actor.subject.scopes.has(SC.ORG_MEMBER_READ)) return null
+  const filter = buildScopeFilter(actor.subject, SC.ORG_MEMBER_READ, 'user')
+  assertScoped(filter, actor.subject)
+  const compiled = predicateToSql(filter.predicate, {
+    allowedFields: ['company_id', 'dept_path', 'id'],
+  })
+  const rows = db
+    .prepare(`SELECT id FROM users WHERE ${compiled.sql}`)
+    .all(...(compiled.params as string[])) as unknown as Array<{ id: string }>
+  return rows.map((row) => row.id)
+}
+
+function leaderOfDept(db: Db, companyId: string, deptId: string): { deptName: string; name: string; title: string | null; level: 'own' | 'ancestor' } | null {
+  const dept = db
+    .prepare('SELECT id, name, path FROM departments WHERE id = ? AND company_id = ? AND deleted_at IS NULL')
+    .get(deptId, companyId) as { id: string; name: string; path: string } | undefined
+  if (!dept) return null
+  const segments = dept.path.split('/').filter(Boolean)
+  // 自身 → 逐级上级部门；取第一个配了负责人的部门
+  for (let index = segments.length - 1; index >= 0; index -= 1) {
+    const candidate = db
+      .prepare(
+        `SELECT d.name AS dept_name, u.name, u.title
+           FROM departments d JOIN users u ON u.id = d.manager_user_id
+          WHERE d.id = ? AND d.company_id = ? AND d.deleted_at IS NULL
+            AND u.deleted_at IS NULL AND u.status = 'active'`,
+      )
+      .get(segments[index], companyId) as { dept_name: string; name: string; title: string | null } | undefined
+    if (candidate) {
+      return {
+        deptName: candidate.dept_name,
+        name: candidate.name,
+        title: candidate.title,
+        level: index === segments.length - 1 ? 'own' : 'ancestor',
+      }
+    }
+  }
+  return null
+}
+
+function companyDisplayName(db: Db, companyId: string): string {
+  const row = db.prepare('SELECT name FROM companies WHERE id = ?').get(companyId) as
+    | { name?: string }
+    | undefined
+  return row?.name?.trim() || '公司'
+}
+
+function orgDirectory(db: Db, actor: Actor, args: Record<string, unknown>): unknown {
+  const intent = String(args.intent ?? '').trim()
+  if (intent === 'me' || intent === 'leader') {
+    const leader = leaderOfDept(db, actor.subject.companyId, actor.person.deptId)
+    return {
+      intent,
+      me: {
+        name: actor.person.name,
+        title: actor.person.title,
+        deptName: actor.person.deptName,
+      },
+      leader,
+      note:
+        leader === null
+          ? '这个部门在组织数据里没有登记负责人，无法确认组长；可以请管理员在「组织与权限」里配置部门负责人。'
+          : leader.level === 'ancestor'
+            ? `你所在部门没有单独登记负责人，已取上级部门「${leader.deptName}」的负责人。`
+            : '',
+    }
+  }
+
+  if (intent === 'departments') {
+    const companyName = companyDisplayName(db, actor.subject.companyId)
+    const rows = db
+      .prepare(
+        `SELECT d.name, d.parent_id, d.depth, d.path, m.name AS leader_name,
+                (SELECT COUNT(*) FROM users u
+                  WHERE u.dept_id = d.id AND u.company_id = d.company_id
+                    AND u.deleted_at IS NULL AND u.status = 'active') AS member_count
+           FROM departments d LEFT JOIN users m ON m.id = d.manager_user_id
+          WHERE d.company_id = ? AND d.deleted_at IS NULL
+          ORDER BY d.path LIMIT 100`,
+      )
+      .all(actor.subject.companyId) as unknown as Array<{
+      name: string
+      parent_id: string | null
+      depth: number
+      path: string
+      leader_name: string | null
+      member_count: number
+    }>
+    return {
+      intent,
+      company: companyName,
+      totalDepartments: rows.length,
+      departments: rows.map((row) => ({
+        // 根部门是公司容器；公司改名后，通讯录工具展示的顶层名称也必须跟着改。
+        name: row.parent_id === null ? companyName : row.name,
+        depth: row.depth,
+        leader: row.leader_name,
+        memberCount: Number(row.member_count),
+      })),
+    }
+  }
+
+  if (intent === 'members' || intent === 'search') {
+    const query = String(args.query ?? '').trim()
+    const visible = visibleUserIds(db, actor)
+    if (visible === null) {
+      return {
+        intent,
+        denied: true,
+        reason: '当前角色没有查看成员名单的权限（org:member:read），只能查看自己的部门、组长和部门列表。',
+      }
+    }
+    const placeholders = visible.length > 0 ? visible.map(() => '?').join(',') : 'NULL'
+    if (intent === 'members') {
+      if (!query) throw new EabError(EC.VALIDATION, '查部门成员时 query 填部门名')
+      const dept = db
+        .prepare(
+          `SELECT id, name FROM departments
+            WHERE company_id = ? AND deleted_at IS NULL AND name LIKE ? LIMIT 1`,
+        )
+        .get(actor.subject.companyId, `%${query}%`) as { id: string; name: string } | undefined
+      if (!dept) return { intent, query, found: false, message: `没有找到名称包含「${query}」的部门。` }
+      const people = db
+        .prepare(
+          `SELECT u.name, u.title, d.name AS dept_name, m.name AS leader_name
+             FROM users u JOIN departments d ON d.id = u.dept_id
+             LEFT JOIN users m ON m.id = d.manager_user_id
+            WHERE u.company_id = ? AND u.dept_id = ? AND u.deleted_at IS NULL AND u.status = 'active'
+              AND u.id IN (${placeholders})
+            ORDER BY u.name LIMIT 50`,
+        )
+        .all(actor.subject.companyId, dept.id, ...visible) as unknown as Array<{
+        name: string
+        title: string | null
+        dept_name: string
+        leader_name: string | null
+      }>
+      return {
+        intent,
+        department: dept.name,
+        visible: people.length,
+        people: people.map((row) => ({
+          name: row.name,
+          title: row.title,
+          deptName: row.dept_name,
+          leader: row.leader_name,
+        })),
+      }
+    }
+    if (!query) throw new EabError(EC.VALIDATION, '查人时 query 不能为空')
+    const people = db
+      .prepare(
+        `SELECT u.name, u.title, u.employee_no, d.name AS dept_name, m.name AS leader_name
+           FROM users u JOIN departments d ON d.id = u.dept_id
+           LEFT JOIN users m ON m.id = d.manager_user_id
+          WHERE u.company_id = ? AND u.deleted_at IS NULL AND u.status = 'active'
+            AND u.id IN (${placeholders})
+            AND (u.name LIKE ? OR u.employee_no LIKE ? OR u.title LIKE ?)
+          ORDER BY u.name LIMIT 20`,
+      )
+      .all(actor.subject.companyId, ...visible, `%${query}%`, `%${query}%`, `%${query}%`) as unknown as Array<{
+      name: string
+      title: string | null
+      employee_no: string | null
+      dept_name: string
+      leader_name: string | null
+    }>
+    return {
+      intent,
+      query,
+      people: people.map((row) => ({
+        name: row.name,
+        title: row.title,
+        employeeNo: row.employee_no,
+        deptName: row.dept_name,
+        leader: row.leader_name,
+      })),
+    }
+  }
+
+  throw new EabError(EC.VALIDATION, `不支持的 intent: ${intent}`, {
+    hint: '可用 leader / me / departments / members / search',
+  })
+}
+
+function orgSearch(db: Db, companyId: string, query: string) {
+  return db
+    .prepare(
+      `SELECT u.name, u.title, u.employee_no, d.name AS dept_name
+         FROM users u JOIN departments d ON d.id = u.dept_id
+        WHERE u.company_id = ? AND u.deleted_at IS NULL AND u.status = 'active'
+          AND (u.name LIKE ? OR u.employee_no LIKE ? OR u.title LIKE ?)
+        ORDER BY u.name LIMIT 20`,
+    )
+    .all(companyId, `%${query}%`, `%${query}%`, `%${query}%`)
+}
+
+/** OpenAI function 名只允许字母数字下划线；工具 id 里的点换成下划线。 */
+export function toolFunctionName(id: string): string {
+  return id.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64)
+}
+
+export function resolveToolByFunctionName(name: string): ToolDef | undefined {
+  return TOOLS.find((tool) => toolFunctionName(tool.id) === name)
+}
+
+/**
+ * Agent 默认常驻的核心工具：高频、低参数、几乎每轮都可能用到。
+ * 其余工具（文件发送/改名/删除、容量、定时任务列表、计算、插件等）通过 tool_search 按需加载。
+ * 这样工具数量继续增长时，首轮请求不会线性膨胀。
+ */
+export const AGENT_CORE_TOOL_IDS: readonly string[] = [
+  'tool.search',
+  'time.now',
+  'org.directory',
+  'kb.search',
+  'schedule.create',
+  'workspace.list',
+  'workspace.read',
+  'local.list',
+  'local.read',
+]
+
+export interface ToolSearchHit {
+  toolId: string
+  functionName: string
+  name: string
+  description: string
+  source: 'builtin' | 'plugin'
+  parameters: Array<{ name: string; type: string; description: string; required: boolean }>
+  score: number
+}
+
+export interface ToolSearchResult {
+  query: string
+  total: number
+  tools: ToolSearchHit[]
+  hint: string
+}
+
+/** 把中文查询拆成短词，避免用户说“把文件发到钉钉”时整句匹配不到。 */
+function toolSearchTerms(query: string): string[] {
+  const lower = query.toLowerCase().trim()
+  const terms = new Set<string>()
+  if (lower) terms.add(lower)
+  for (const token of lower.split(/[^a-z0-9_\u4e00-\u9fff]+/i)) {
+    if (token) terms.add(token)
+  }
+  const han = lower.replace(/[^\u4e00-\u9fff]+/g, '')
+  for (let i = 0; i < han.length - 1; i += 1) {
+    const bigram = han.slice(i, i + 2)
+    if (bigram.length === 2) terms.add(bigram)
+  }
+  const stopwords = new Set(['的', '了', '吗', '呢', '把', '给', '我', '你', '他', '她', '它', '请', '帮', '一个', '一下', '怎么', '如何', '什么', '哪些'])
+  return [...terms].filter((term) => term.length >= 2 && !stopwords.has(term))
+}
+
+/** 工具描述之外的可检索同义词：中文口语、英文和常见叫法。 */
+const TOOL_SEARCH_ALIASES: Record<string, string> = {
+  'time.now': '时间 现在 几点 日期 今天 星期 time date now clock',
+  'schedule.create': '提醒 定时 日程 每天 每周 几点 定时任务 remind schedule timer',
+  'schedule.list': '查看定时任务 我的任务 提醒列表 任务状态 schedule list',
+  'schedule.delete': '取消定时任务 删除提醒 停止任务 cancel schedule delete',
+  'math.eval': '计算 算一下 四则运算 加减乘除 数学 math calculate calculator',
+  'org.directory': '通讯录 组织架构 部门 组长 上级 同事 成员 查找人 org directory',
+  'org.search': '找人 搜索成员 姓名 工号 岗位 search member',
+  'kb.search': '知识库 文档 资料 检索 搜索 制度 流程 kb rag search',
+  'workspace.list': '文件 列表 我的文件 云空间 workspace file list',
+  'workspace.capacity': '容量 空间 剩余 配额 满了吗 capacity quota space',
+  'workspace.write': '写文件 保存 新建文件 文本 write file save',
+  'workspace.read': '读文件 查看文件 打开文件 内容 read file',
+  'workspace.send_dingtalk': '发送文件 发文件 发给我 钉钉 send file dingtalk attachment',
+  'workspace.rename': '重命名 改名 文件名 rename file',
+  'workspace.delete': '删除文件 删掉 清理文件 delete file remove',
+  'local.list': '本地 文件 目录 列表 local file list',
+  'local.read': '本地 读文件 查看 local read file',
+  'local.write': '本地 写文件 保存 编辑 修改 local write edit save file',
+  'local.delete': '本地 删除 删掉 清理 local delete remove file',
+  'local.move': '本地 移动 改名 移动文件 local move rename',
+  'local.mkdir': '本地 新建目录 创建文件夹 local mkdir folder',
+  'admin.password.reset': '重置密码 改密码 成员密码 password reset',
+}
+
+/**
+ * 在当前员工可见、当前空间可用的工具里做轻量检索。
+ * 只返回名称、用途和参数提示，不返回完整 JSON Schema；完整 Schema 由 Agent 循环按命中结果加载。
+ */
+export function searchToolCatalog(
+  db: Db,
+  actor: Actor,
+  space: ActiveSpace = { kind: 'cloud' },
+  query: string,
+  limit = 8,
+): ToolSearchResult {
+  const clean = query.trim()
+  if (!clean) throw new EabError(EC.VALIDATION, 'query 不能为空')
+  const capped = Math.min(12, Math.max(1, Number.isFinite(limit) ? Math.floor(limit) : 8))
+  const specs = toolSpecsForActor(db, actor, space)
+  const builtinByFunction = new Map(TOOLS.map((tool) => [toolFunctionName(tool.id), tool]))
+  const terms = toolSearchTerms(clean)
+  const hits: ToolSearchHit[] = []
+
+  for (const spec of specs) {
+    if (spec.function.name === 'tool_search') continue
+    const def = builtinByFunction.get(spec.function.name)
+    const name = def?.name ?? spec.function.name
+    const description = def?.description ?? spec.function.description
+    const id = def?.id ?? spec.function.name
+    const alias = TOOL_SEARCH_ALIASES[id] ?? ''
+    const haystack = `${spec.function.name} ${id} ${name} ${description} ${alias}`.toLowerCase()
+    let score = 0
+    if (haystack.includes(clean.toLowerCase())) score += 50
+    for (const term of terms) {
+      if (spec.function.name.toLowerCase() === term) score += 120
+      else if (spec.function.name.toLowerCase().includes(term)) score += 22
+      if (name.toLowerCase() === term) score += 100
+      else if (name.toLowerCase().includes(term)) score += 30
+      if (id.toLowerCase().includes(term)) score += 14
+      if (alias.includes(term)) score += 12
+      if (description.toLowerCase().includes(term)) score += 9
+    }
+    if (score <= 0) continue
+    const required = spec.function.parameters.required ?? []
+    hits.push({
+      toolId: id,
+      functionName: spec.function.name,
+      name,
+      description: description.length > 220 ? `${description.slice(0, 220)}…` : description,
+      source: def ? 'builtin' : 'plugin',
+      parameters: Object.entries(spec.function.parameters.properties ?? {}).map(([key, value]) => ({
+        name: key,
+        type: value.type,
+        description: value.description,
+        required: required.includes(key),
+      })),
+      score,
+    })
+  }
+
+  hits.sort((a, b) => b.score - a.score || a.name.localeCompare(b.name, 'zh-CN'))
+  return {
+    query: clean,
+    total: hits.length,
+    tools: hits.slice(0, capped),
+    hint: hits.length
+      ? '这些工具已按匹配度排序，并会在本次工具结果之后自动加载完整参数；直接继续调用即可，不需要让用户再次确认，也不要向用户解释工具加载机制。'
+      : '没有匹配到可用工具；换一个中文/英文能力词再试，或直接说明做不到。',
+  }
+}
+
+/** Agent 首轮只提交核心工具 + tool_search，其余按需加载。 */
+export function toolSpecsForAgent(db: Db, actor: Actor, space: ActiveSpace = { kind: 'cloud' }): ChatToolSpec[] {
+  const coreNames = new Set(AGENT_CORE_TOOL_IDS.map(toolFunctionName))
+  return toolSpecsForActor(db, actor, space).filter((spec) => coreNames.has(spec.function.name))
+}
+
+/** 当前空间只暴露对应的一套文件工具，避免模型把云空间和本地目录混用。 */
+function toolAllowedInSpace(toolId: string, space: ActiveSpace): boolean {
+  if (toolId.startsWith('local.')) return space.kind === 'local'
+  if (toolId.startsWith('workspace.')) return space.kind === 'cloud'
+  return true
+}
+
+function localSpaceForTool(deps: ServerDeps, actor: Actor, space: ActiveSpace) {
+  if (space.kind !== 'local' || !space.spaceId) {
+    throw new EabError(EC.VALIDATION, '当前对话没有选择本地空间')
+  }
+  const row = findLocalSpaceRow(deps.db, actor.subject.companyId, actor.person.id, space.spaceId)
+  if (!row) throw new EabError(EC.NOT_FOUND, '本地空间不存在或已删除')
+  return row
+}
+
+/** 取当前对话对应的钉钉机器人单聊 openConversationId；网页会话或旧会话可能为空。 */
+function openConversationIdForTool(
+  deps: ServerDeps,
+  companyId: string,
+  context: ToolExecutionContext,
+): string {
+  const sessionId = String(context.sessionId ?? '').trim()
+  if (!sessionId) return ''
+  const row = deps.db
+    .prepare(
+      `SELECT open_conversation_id FROM chat_sessions
+        WHERE id = ? AND company_id = ? AND deleted_at IS NULL
+        LIMIT 1`,
+    )
+    .get(sessionId, companyId) as { open_conversation_id: string | null } | undefined
+  return String(row?.open_conversation_id ?? '').trim()
+}
+
+function auditLocalTool(
+  deps: ServerDeps,
+  actor: Actor,
+  action: string,
+  spaceId: string,
+  detail: Record<string, unknown>,
+): void {
+  appendAudit(deps.db, {
+    companyId: actor.subject.companyId,
+    actorUserId: actor.subject.userId,
+    action,
+    resourceType: 'local_space',
+    resourceId: spaceId,
+    resourceScope: `local:${spaceId}`,
+    result: 'success',
+    detail,
+    traceId: null,
+    ip: null,
+    channel: 'agent',
+  })
+}
+
+/** 给对话模型用的工具声明：内置工具 + 当前员工已安装且启用插件的工具。 */
+export function toolSpecsForActor(db: Db, actor: Actor, space: ActiveSpace = { kind: 'cloud' }): ChatToolSpec[] {
+  const builtin: ChatToolSpec[] = TOOLS.filter(
+    (tool) =>
+      !tool.dangerous &&
+      actor.subject.scopes.has(tool.scope) &&
+      toolAllowedInSpace(tool.id, space),
+  ).map((tool): ChatToolSpec => ({
+    type: 'function' as const,
+    function: {
+      name: toolFunctionName(tool.id),
+      description: tool.description,
+      parameters: {
+        type: 'object',
+        properties: Object.fromEntries(
+          Object.entries(tool.input).map(([key, value]) => [key, { type: value.type, description: value.description }]),
+        ),
+        required: Object.entries(tool.input)
+          .filter(([, value]) => value.required)
+          .map(([key]) => key),
+        additionalProperties: false,
+      },
+    },
+  }))
+  const builtinNames = new Set(builtin.map((tool) => tool.function.name))
+  const pluginSpecs = pluginToolSpecsFor(db, actor)
+    .map((spec) => spec as unknown as ChatToolSpec)
+    // 插件工具不能覆盖 EAB 内置工具的同名 function
+    .filter((spec) => !builtinNames.has(spec.function.name))
+  return [...builtin, ...pluginSpecs]
+}
+
+/** 执行一个工具。鉴权在本函数内再做一次，调用方仍需自己处理高危审批。 */
+export async function executeTool(
+  deps: ServerDeps,
+  actor: Actor,
+  toolId: string,
+  args: Record<string, unknown>,
+  space: ActiveSpace = { kind: 'cloud' },
+  context: ToolExecutionContext = {},
+): Promise<unknown> {
+  const tool = TOOLS.find((item) => item.id === toolId)
+  if (!tool) throw new EabError(EC.NOT_FOUND, `工具不存在: ${toolId}`)
+  requireScope(actor.subject, tool.scope)
+  if (!toolAllowedInSpace(tool.id, space)) {
+    throw new EabError(EC.FORBIDDEN, `工具 ${tool.id} 不属于当前文件空间`)
+  }
+
+  let result: unknown
+  const now = new Date()
+  switch (tool.id) {
+    case 'tool.search':
+      result = searchToolCatalog(deps.db, actor, space, String(args.query ?? ''), args.limit === undefined ? 8 : Number(args.limit))
+      break
+    case 'time.now':
+      result = { iso: now.toISOString(), local: now.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }) }
+      break
+    case 'schedule.create':
+      result = createSchedule(
+        deps.db,
+        actor,
+        {
+          title: args.title === undefined ? undefined : String(args.title),
+          prompt: String(args.prompt ?? ''),
+          mode: String(args.mode ?? ''),
+          at: args.at === undefined ? undefined : String(args.at),
+          time: args.time === undefined ? undefined : String(args.time),
+          days: args.days === undefined ? undefined : String(args.days),
+          intervalMinutes: args.intervalMinutes === undefined ? undefined : String(args.intervalMinutes),
+          afterSeconds: args.afterSeconds === undefined ? undefined : String(args.afterSeconds),
+          everySeconds: args.everySeconds === undefined ? undefined : String(args.everySeconds),
+          timezone: args.timezone === undefined ? undefined : String(args.timezone),
+          channel: args.channel === undefined ? undefined : String(args.channel),
+        },
+        { sessionId: context.sessionId, channel: context.channel === 'dingtalk' ? 'dingtalk' : 'web' },
+      )
+      break
+    case 'schedule.list':
+      result = {
+        schedules: listSchedules(deps.db, actor, args.status === undefined ? undefined : String(args.status)),
+      }
+      break
+    case 'schedule.delete': {
+      const id = String(args.id ?? '').trim()
+      if (!id) throw new EabError(EC.VALIDATION, 'id 不能为空')
+      result = deleteSchedule(deps.db, actor, id)
+      break
+    }
+    case 'math.eval': {
+      const expression = String(args.expression ?? '')
+      result = { expression, value: evaluate(expression) }
+      break
+    }
+    case 'org.directory':
+      result = orgDirectory(deps.db, actor, args)
+      break
+    case 'org.search': {
+      const query = String(args.query ?? '').trim()
+      if (!query) throw new EabError(EC.VALIDATION, 'query 不能为空')
+      result = { people: orgSearch(deps.db, actor.subject.companyId, query) }
+      break
+    }
+    case 'kb.search': {
+      const query = String(args.query ?? '').trim()
+      if (!query) throw new EabError(EC.VALIDATION, 'query 不能为空')
+      const { retrieveKb } = await import('./chat.js')
+      const local = await retrieveKb(deps.db, deps.config.dbPath, actor, query)
+      const external = await retrieveExternalKb(deps.db, deps.config.dbPath, actor, query, 4)
+      const hits = [...local, ...external].slice(0, 6)
+      result = {
+        hits: hits.map((hit) => ({
+          collection: hit.collectionName,
+          title: hit.docTitle,
+          text: hit.text,
+          source: 'source' in hit ? hit.source : 'local',
+        })),
+        externalCount: external.length,
+      }
+      break
+    }
+    case 'workspace.list': {
+      const rows = deps.db
+        .prepare('SELECT id, name, rel_path, size, updated_at FROM workspace_files WHERE company_id = ? AND owner_user_id = ? AND deleted_at IS NULL ORDER BY updated_at DESC')
+        .all(actor.subject.companyId, actor.subject.userId)
+      result = { files: rows }
+      break
+    }
+    case 'workspace.capacity': {
+      const policy = resolveUserWorkspaceQuota(deps.db, actor.subject.companyId, actor.subject.userId)
+      const used = workspaceUsedBytes(deps.db, actor.subject.companyId, 'user', actor.subject.userId)
+      const capacity = workspaceCapacity(policy.limitBytes, used)
+      result = {
+        scope: '个人云空间',
+        usedBytes: capacity.usedBytes,
+        limitBytes: capacity.limitBytes,
+        remainingBytes: capacity.remainingBytes,
+        percent: Number(capacity.percent.toFixed(1)),
+        level: capacity.level,
+        warning: { level: capacity.level, message: capacity.message },
+        fileLimitBytes: policy.fileLimitBytes,
+        quotaSource: policy.source,
+        roleCodes: policy.roleCodes,
+      }
+      break
+    }
+    case 'workspace.read': {
+      const path = String(args.path ?? '')
+      const root = join(dirname(deps.config.dbPath), 'workspaces', toSlug(actor.subject.companyId, 'c'), `user-${toSlug(actor.subject.userId, 'x')}`)
+      const target = safeJoin(root, path)
+      let content: Buffer
+      try {
+        content = readFileSync(target)
+      } catch {
+        throw new EabError(EC.NOT_FOUND, `云空间文件不存在: ${path}`)
+      }
+      if (content.byteLength > 5 * 1024 * 1024) {
+        throw new EabError(EC.VALIDATION, '文件超过 5 MB，请下载后查看')
+      }
+      result = { path, size: content.byteLength, text: content.toString('utf8'), truncated: false }
+      break
+    }
+    case 'workspace.send_dingtalk': {
+      const fileIdArg = String(args.fileId ?? '').trim()
+      const pathArg = String(args.path ?? '').trim()
+      let targetId = fileIdArg
+      if (!targetId) {
+        if (!pathArg) throw new EabError(EC.VALIDATION, 'fileId 和 path 至少提供一个')
+        const row = deps.db
+          .prepare(
+            `SELECT id FROM workspace_files
+              WHERE company_id = ? AND owner_user_id = ? AND deleted_at IS NULL
+                AND (rel_path = ? OR name = ?)
+              ORDER BY updated_at DESC LIMIT 1`,
+          )
+          .get(actor.subject.companyId, actor.subject.userId, pathArg, pathArg) as { id: string } | undefined
+        if (!row) {
+          throw new EabError(EC.NOT_FOUND, `云空间里没有找到文件: ${pathArg}`, {
+            hint: '先调用 workspace.list 查看文件名和相对路径，再用 path 或 fileId 发送。',
+          })
+        }
+        targetId = row.id
+      }
+      const file = readUserWorkspaceFile(deps, actor, targetId)
+      if (space.kind === 'cloud') {
+        // 钉钉会话里优先用「用户方向」发文件：convFile/conversations/files/send 会以
+        // 操作人 unionId 发出，文件落在机器人私聊右侧，客户端原生带预览/未查收/下载/编辑。
+        // 机器人随后会收到同一条 file 入站消息，用 robot_user_file_sends 一次性标记拦截，
+        // 跳过个人云空间保存，只回复「你要的文件已发送」。
+        const openConversationId = openConversationIdForTool(deps, actor.subject.companyId, context)
+        if (context.channel === 'dingtalk' && openConversationId) {
+          const uploaded = await uploadFileToUserDrive(deps, {
+            companyId: actor.subject.companyId,
+            userId: actor.subject.userId,
+            fileName: file.name,
+            mime: file.mime,
+            buffer: file.buffer,
+          })
+          const markerId = createRobotUserFileSend(deps.db, {
+            companyId: actor.subject.companyId,
+            userId: actor.subject.userId,
+            conversationId: openConversationId,
+            fileName: uploaded.fileName,
+            sizeBytes: uploaded.size,
+          })
+          try {
+            const sent = await sendDingTalkFileToConversation(deps, {
+              companyId: actor.subject.companyId,
+              userId: actor.subject.userId,
+              openConversationId,
+              spaceId: uploaded.spaceId,
+              dentryId: uploaded.dentryId,
+            })
+            markRobotUserFileSendSent(deps.db, markerId, {
+              fileId: sent.fileId,
+              spaceId: sent.spaceId,
+              fileName: sent.name || uploaded.fileName,
+            })
+            result = {
+              sent: true,
+              delivery: 'file-user-identity',
+              to: '钉钉机器人私聊（用户方向）',
+              fileName: sent.name || uploaded.fileName,
+              size: uploaded.size,
+              relPath: file.relPath,
+              fileId: sent.fileId,
+            }
+          } catch (error) {
+            markRobotUserFileSendFailed(deps.db, markerId)
+            throw error
+          }
+          break
+        }
+        // 网页会话拿不到 openConversationId 时退回机器人 sampleFile，保证仍有文件送达。
+        const sent = await sendDingTalkFileToUser(deps, {
+          companyId: actor.subject.companyId,
+          userId: actor.subject.userId,
+          fileName: file.name,
+          mime: file.mime,
+          buffer: file.buffer,
+        })
+        result = {
+          sent: true,
+          delivery: 'file',
+          to: '钉钉机器人私聊',
+          fileName: file.name,
+          size: file.size,
+          relPath: file.relPath,
+          fileType: sent.fileType,
+          mediaType: sent.mediaType,
+        }
+        break
+      }
+      const sent = await sendDingTalkFileToUser(deps, {
+        companyId: actor.subject.companyId,
+        userId: actor.subject.userId,
+        fileName: file.name,
+        mime: file.mime,
+        buffer: file.buffer,
+      })
+      result = {
+        sent: true,
+        delivery: 'file',
+        to: '钉钉',
+        fileName: file.name,
+        size: file.size,
+        relPath: file.relPath,
+        fileType: sent.fileType,
+        mediaType: sent.mediaType,
+      }
+      break
+    }
+    case 'workspace.rename': {
+      const fileIdArg = String(args.fileId ?? '').trim()
+      const pathArg = String(args.path ?? '').trim()
+      let targetId = fileIdArg
+      if (!targetId) {
+        if (!pathArg) throw new EabError(EC.VALIDATION, 'fileId 和 path 至少提供一个')
+        const row = deps.db
+          .prepare(
+            `SELECT id FROM workspace_files
+              WHERE company_id = ? AND owner_user_id = ? AND deleted_at IS NULL
+                AND (rel_path = ? OR name = ?)
+              ORDER BY updated_at DESC LIMIT 1`,
+          )
+          .get(actor.subject.companyId, actor.subject.userId, pathArg, pathArg) as { id: string } | undefined
+        if (!row) {
+          throw new EabError(EC.NOT_FOUND, `云空间里没有找到文件: ${pathArg}`, {
+            hint: '先调用 workspace.list 查看文件名和相对路径，再用 path 或 fileId 重命名。',
+          })
+        }
+        targetId = row.id
+      }
+      const newName = String(args.newName ?? args.name ?? '').trim()
+      if (!newName) throw new EabError(EC.VALIDATION, 'newName 不能为空')
+      const renamed = renameUserWorkspaceFile(deps, actor, targetId, newName)
+      result = {
+        renamed: true,
+        fileId: renamed.file.id,
+        from: renamed.from,
+        to: renamed.to,
+        name: renamed.file.name,
+      }
+      break
+    }
+    case 'workspace.delete': {
+      const fileIdArg = String(args.fileId ?? '').trim()
+      const pathArg = String(args.path ?? '').trim()
+      let targetId = fileIdArg
+      if (!targetId) {
+        if (!pathArg) throw new EabError(EC.VALIDATION, 'fileId 和 path 至少提供一个')
+        const row = deps.db
+          .prepare(
+            `SELECT id FROM workspace_files
+              WHERE company_id = ? AND owner_user_id = ? AND deleted_at IS NULL
+                AND (rel_path = ? OR name = ?)
+              ORDER BY updated_at DESC LIMIT 1`,
+          )
+          .get(actor.subject.companyId, actor.subject.userId, pathArg, pathArg) as { id: string } | undefined
+        if (!row) {
+          throw new EabError(EC.NOT_FOUND, `云空间里没有找到文件: ${pathArg}`, {
+            hint: '先调用 workspace.list 查看文件名和相对路径，再用 path 或 fileId 删除。',
+          })
+        }
+        targetId = row.id
+      }
+      const deleted = deleteUserWorkspaceFile(deps, actor, targetId)
+      result = {
+        deleted: true,
+        fileId: deleted.file.id,
+        fileName: deleted.file.name,
+        relPath: deleted.file.relPath,
+        size: deleted.file.size,
+        recycled: true,
+      }
+      break
+    }
+    case 'workspace.write': {
+      const path = String(args.path ?? '')
+      const text = String(args.text ?? '')
+      if (!path) throw new EabError(EC.VALIDATION, 'path 不能为空')
+      const root = join(dirname(deps.config.dbPath), 'workspaces', toSlug(actor.subject.companyId, 'c'), `user-${toSlug(actor.subject.userId, 'x')}`)
+      const target = safeJoin(root, path)
+      if (!target) throw new EabError(EC.VALIDATION, '非法路径')
+      mkdirSync(dirname(target), { recursive: true })
+      writeFileSync(target, text, 'utf8')
+      const row = deps.db
+        .prepare(
+          `SELECT id FROM workspace_files WHERE company_id = ? AND scope_type = 'user' AND scope_id = ? AND rel_path = ? AND deleted_at IS NULL`,
+        )
+        .get(actor.subject.companyId, actor.subject.userId, path) as { id: string } | undefined
+      const size = Buffer.byteLength(text, 'utf8')
+      if (row) {
+        deps.db
+          .prepare('UPDATE workspace_files SET size = ?, storage_path = ?, updated_at = ? WHERE id = ?')
+          .run(size, target, Date.now(), row.id)
+      } else {
+        deps.db
+          .prepare(
+            `INSERT INTO workspace_files (id, company_id, scope_type, scope_id, owner_user_id, rel_path, name, size, mime, storage_path, created_at, updated_at)
+             VALUES (?, ?, 'user', ?, ?, ?, ?, ?, 'text/plain', ?, ?, ?)`,
+          )
+          .run(ulid(), actor.subject.companyId, actor.subject.userId, actor.subject.userId, path, basename(path), size, target, Date.now(), Date.now())
+      }
+      result = { path, size }
+      break
+    }
+    case 'local.list': {
+      const row = localSpaceForTool(deps, actor, space)
+      const listed = listLocalEntries(row, String(args.path ?? ''), {
+        showAll: args.all === true,
+      })
+      auditLocalTool(deps, actor, 'local_file.list', row.id, {
+        path: String(args.path ?? ''),
+        count: listed.entries.length,
+      })
+      result = { space: row.name, path: String(args.path ?? ''), ...listed }
+      break
+    }
+    case 'local.read': {
+      const row = localSpaceForTool(deps, actor, space)
+      const read = readLocalText(row, String(args.path ?? ''))
+      if (read.binary) {
+        throw new EabError(EC.VALIDATION, '这是二进制文件，不能按文本读取；请下载后查看')
+      }
+      auditLocalTool(deps, actor, 'local_file.read', row.id, {
+        path: read.relPath,
+        bytes: read.size,
+        truncated: read.truncated,
+      })
+      result = {
+        space: row.name,
+        path: read.relPath,
+        size: read.size,
+        text: read.text,
+        truncated: read.truncated,
+        encoding: read.encoding,
+      }
+      break
+    }
+    case 'local.write': {
+      const row = localSpaceForTool(deps, actor, space)
+      const written = writeLocalText(row, String(args.path ?? ''), String(args.text ?? ''))
+      auditLocalTool(deps, actor, 'local_file.write', row.id, {
+        path: written.relPath,
+        bytes: written.size,
+      })
+      result = { space: row.name, ...written }
+      break
+    }
+    case 'local.delete': {
+      const row = localSpaceForTool(deps, actor, space)
+      const deleted = deleteLocalFile(row, String(args.path ?? ''))
+      auditLocalTool(deps, actor, 'local_file.delete', row.id, {
+        path: deleted.relPath,
+        bytes: deleted.size,
+      })
+      result = { space: row.name, deleted: true, ...deleted }
+      break
+    }
+    case 'local.move': {
+      const row = localSpaceForTool(deps, actor, space)
+      const moved = moveLocalEntry(
+        row,
+        String(args.from ?? ''),
+        String(args.to ?? ''),
+        args.overwrite === true,
+      )
+      auditLocalTool(deps, actor, 'local_file.move', row.id, moved)
+      result = { space: row.name, ...moved }
+      break
+    }
+    case 'local.mkdir': {
+      const row = localSpaceForTool(deps, actor, space)
+      const created = mkdirLocal(row, String(args.path ?? ''))
+      auditLocalTool(deps, actor, 'local_file.mkdir', row.id, created)
+      result = { space: row.name, ...created }
+      break
+    }
+    case 'admin.password.reset': {
+      const userId = String(args.userId ?? '')
+      const password = String(args.password ?? '')
+      if (password.length < 8) throw new EabError(EC.VALIDATION, '密码至少 8 位')
+      const user = deps.db
+        .prepare('SELECT id, name FROM users WHERE id = ? AND company_id = ? AND deleted_at IS NULL')
+        .get(userId, actor.subject.companyId) as { id: string; name: string } | undefined
+      if (!user) throw new EabError(EC.NOT_FOUND, '成员不存在')
+      const now = Date.now()
+      deps.db
+        .prepare('UPDATE users SET password_hash = ?, password_set_at = ?, updated_at = ? WHERE id = ?')
+        .run(hashPassword(password), now, now, user.id)
+      result = { userId: user.id, name: user.name, reset: true }
+      break
+    }
+    default:
+      throw new EabError(EC.NOT_FOUND, `未实现的工具: ${tool.id}`)
+  }
+  return result
+}
+
+export function registerToolRoutes(app: FastifyInstance, deps: ServerDeps): void {
+  app.get('/api/tools', async (req) => {
+    const actor = resolveActor(deps.db, deps.config, req)
+    requireEnabled(actor)
+    requireScope(actor.subject, SC.AGENT_TOOL_LIST)
+    return ok({
+      tools: [
+        ...TOOLS.map((tool) => ({
+          id: tool.id,
+          name: tool.name,
+          description: tool.description,
+          dangerous: tool.dangerous,
+          available: actor.subject.scopes.has(tool.scope),
+          input: tool.input,
+          source: 'builtin' as const,
+        })),
+        ...pluginToolCatalogFor(deps.db, actor).map((tool) => ({
+          id: tool.id,
+          name: tool.name,
+          description: tool.description,
+          dangerous: false,
+          available: tool.available,
+          input: tool.input,
+          source: 'plugin' as const,
+          pluginId: tool.pluginId,
+        })),
+      ],
+    })
+  })
+
+  app.post<{
+    Params: { id: string }
+    Body: { args?: Record<string, unknown>; approvalId?: string; sessionId?: string }
+  }>(
+    '/api/tools/:id/invoke',
+    async (req) => {
+      const actor = resolveActor(deps.db, deps.config, req)
+      requireEnabled(actor)
+      const args = (req.body?.args ?? {}) as Record<string, unknown>
+
+      // 插件工具：id 形如 plugin:<pluginId>:<toolName>，权限与内置工具一致
+      if (req.params.id.startsWith('plugin:')) {
+        requireScope(actor.subject, SC.AGENT_TOOL_INVOKE)
+        const rest = req.params.id.slice('plugin:'.length)
+        const colon = rest.indexOf(':')
+        const pluginId = colon >= 0 ? rest.slice(0, colon) : ''
+        const functionName = colon >= 0 ? rest.slice(colon + 1) : ''
+        const pluginTool = pluginId ? resolvePluginToolForActor(deps.db, actor, functionName) : null
+        if (!pluginTool || pluginTool.pluginId !== pluginId) {
+          throw new EabError(EC.NOT_FOUND, `插件工具不存在或当前不可用: ${req.params.id}`)
+        }
+        const sessionId = typeof req.body?.sessionId === 'string' ? req.body.sessionId : ''
+        const result = await executePluginTool(pluginTool, args, {
+          agent: { session: { id: sessionId } },
+          session: { id: sessionId },
+        })
+        audit(deps, req, `tool.invoke.plugin:${pluginId}:${pluginTool.name}`, {
+          toolId: `plugin:${pluginId}:${pluginTool.name}`,
+          args,
+        })
+        return ok({ toolId: `plugin:${pluginId}:${pluginTool.name}`, result })
+      }
+
+      const tool = TOOLS.find((item) => item.id === req.params.id)
+      if (!tool) throw new EabError(EC.NOT_FOUND, `工具不存在: ${req.params.id}`)
+      requireScope(actor.subject, tool.scope)
+
+      if (tool.dangerous) {
+        const approvalId = req.body?.approvalId
+        const approval = approvalId
+          ? (deps.db
+              .prepare('SELECT * FROM approvals WHERE id = ? AND company_id = ? AND requester_user_id = ? AND action = ?')
+              .get(approvalId, actor.subject.companyId, actor.subject.userId, `tool:${tool.id}`) as
+              | { id: string; status: string; expires_at: number | null }
+              | undefined)
+          : undefined
+        if (!approval || approval.status !== 'approved' || (approval.expires_at && approval.expires_at < Date.now())) {
+          const existing = deps.db
+            .prepare(
+              `SELECT id FROM approvals WHERE company_id = ? AND requester_user_id = ? AND action = ? AND status = 'pending'
+                 AND resource_id = ? AND created_at > ? ORDER BY created_at DESC LIMIT 1`,
+            )
+            .get(actor.subject.companyId, actor.subject.userId, `tool:${tool.id}`, String(args.userId ?? ''), Date.now() - 60_000) as
+            | { id: string }
+            | undefined
+          const id = existing?.id ?? ulid()
+          if (!existing) {
+            deps.db
+              .prepare(
+                `INSERT INTO approvals (id, company_id, requester_user_id, action, resource_type, resource_id, payload_json, status, created_at, expires_at)
+                 VALUES (?, ?, ?, ?, 'user', ?, ?, 'pending', ?, ?)`,
+              )
+              .run(
+                id,
+                actor.subject.companyId,
+                actor.subject.userId,
+                `tool:${tool.id}`,
+                String(args.userId ?? ''),
+                JSON.stringify({ tool: tool.id, args: { userId: args.userId } }),
+                Date.now(),
+                Date.now() + 30 * 60 * 1000,
+              )
+          }
+          throw new EabError(EC.APPROVAL_REQUIRED, `「${tool.name}」需要审批，已生成待办`, {
+            details: { approvalId: id, toolId: tool.id },
+            hint: '让拥有审批权限的管理员在控制台「审批」页通过后，再带 approvalId 调用一次',
+          })
+        }
+      }
+
+      const result = await executeTool(deps, actor, tool.id, args)
+      audit(deps, req, `tool.invoke.${tool.id}`, { toolId: tool.id, args: tool.id === 'admin.password.reset' ? { userId: args.userId } : args })
+      return ok({ toolId: tool.id, result })
+    },
+  )
+}
+
+export function listToolDefinitions(): readonly ToolDef[] {
+  return TOOLS
+}

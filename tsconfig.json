@@ -1,0 +1,19 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "paths": {
+      "@eab/domain": ["./packages/domain/src/index.ts"],
+      "@eab/authz": ["./packages/authz/src/index.ts"],
+      "@eab/workspace": ["./packages/workspace/src/index.ts"],
+      "@eab/storage": ["./packages/storage/src/index.ts"],
+      "@eab/channel": ["./packages/channel/src/index.ts"],
+      "@eab/server": ["./packages/server/src/index.ts"]
+    }
+  },
+  "include": [
+    "packages/**/src/**/*.ts",
+    "packages/**/test/**/*.ts",
+    "demo/**/*.ts",
+    "vitest.config.ts"
+  ]
+}

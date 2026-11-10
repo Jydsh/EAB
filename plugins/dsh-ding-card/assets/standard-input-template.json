@@ -1,0 +1,67 @@
+{
+  "componentMap": {
+    "package": "@ali/dxComponent",
+    "version": "1.0.0",
+    "exportName": "Input",
+    "main": "./src/index.tsx",
+    "destructuring": false,
+    "subName": "",
+    "componentName": "Input"
+  },
+  "inputNode": {
+    "componentName": "Input",
+    "id": "node_oclv29olgx5",
+    "props": {
+      "placeholder": {
+        "type": "dynamicString",
+        "content": "请输入内容",
+        "i18n": false
+      },
+      "currentValue": {
+        "i18n": false,
+        "type": "dynamicString",
+        "content": "${final_input}"
+      },
+      "message": {
+        "type": "dynamicString",
+        "content": "请输入内容",
+        "i18n": false
+      },
+      "title": {
+        "i18n": false,
+        "type": "dynamicString",
+        "content": "卡片交互"
+      },
+      "id": "input",
+      "params": [],
+      "visible": {
+        "type": "dynamicVisible",
+        "value": true,
+        "valueType": "fixed",
+        "condition": {
+          "op": "and",
+          "conditions": []
+        }
+      },
+      "status": {
+        "type": "dynamicSelect",
+        "valueType": "variable",
+        "value": "normal",
+        "variable": "input_status",
+        "variableType": "global"
+      },
+      "actionType": "setLocalState",
+      "localVarAction": {
+        "variable": "local_input",
+        "variableType": "global",
+        "varType": "string",
+        "type": "variableValue"
+      }
+    },
+    "title": "文本输入",
+    "hidden": false,
+    "isLocked": false,
+    "condition": true,
+    "conditionGroup": ""
+  }
+}

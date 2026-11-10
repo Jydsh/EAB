@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>EAB 工作台</title>
+    <link rel="stylesheet" href="/app.css" />
+    <link rel="stylesheet" href="/chat.css" />
+  </head>
+  <body class="chat-body">
+    <!-- 左侧：账号与可用模型。桌面网页对话产品的常规布局，右侧只放对话。 -->
+    <aside class="chat-side" id="chat-side">
+      <div class="side-brand">
+        <span class="logo">EAB</span>
+        <span class="side-brand-text">企业AI智能体基座</span>
+      </div>
+
+      <div class="side-user" id="side-user" hidden>
+        <div class="side-user-row">
+          <span class="avatar lg" id="user-avatar">·</span>
+          <div class="side-user-meta">
+            <strong id="user-name">—</strong>
+            <span class="muted" id="user-title">—</span>
+          </div>
+        </div>
+        <div class="side-user-org muted" id="user-org">—</div>
+        <div class="side-user-roles" id="user-roles"></div>
+      </div>
+
+      <div class="side-section" id="side-sessions" hidden>
+        <div class="side-section-title side-section-title-row">
+          <span>对话</span>
+          <button class="side-mini-btn" id="new-session" type="button">新建</button>
+        </div>
+        <div class="side-sessions" id="session-list"></div>
+      </div>
+
+      <div class="side-section" id="side-files" hidden>
+        <div class="side-section-title side-section-title-row">
+          <span>云空间</span>
+          <span class="side-title-tools">
+            <span class="side-info-wrap">
+              <button class="side-info-badge" id="ws-info" type="button" aria-label="查看云空间使用情况" aria-expanded="false">i</button>
+              <div class="side-popover" id="ws-quota-popover" hidden></div>
+            </span>
+            <button class="side-mini-btn" id="ws-upload" type="button">上传</button>
+          </span>
+        </div>
+        <input id="ws-input" type="file" multiple hidden />
+        <div class="side-sessions" id="ws-list"></div>
+      </div>
+
+      <div class="side-section" id="side-local" hidden>
+        <div class="side-section-title side-section-title-row">
+          <span>本地空间</span>
+          <div class="side-title-tools">
+            <button class="side-mini-btn" id="local-new-file" type="button" hidden>新建</button>
+            <button class="side-mini-btn" id="local-config" type="button">管理</button>
+          </div>
+        </div>
+        <div class="local-space-summary" id="local-space-summary"></div>
+        <div class="side-sessions local-tree" id="local-tree"></div>
+      </div>
+
+      <div class="side-section" id="side-models-section" hidden>
+        <div class="side-section-title">可用模型</div>
+        <div class="side-models" id="side-models"></div>
+      </div>
+
+      <div class="side-bottom">
+        <button class="side-settings-btn" id="open-settings" type="button">
+          <span class="side-settings-icon">⚙</span>
+          <span>设置</span>
+        </button>
+        <div class="side-foot muted" id="side-foot">EAB 企业智能体基座 · 预览版</div>
+      </div>
+    </aside>
+
+    <div class="chat-stage" id="chat-stage">
+      <header class="chat-head">
+        <div class="chat-mode-switch" id="mode-switch" role="tablist" aria-label="页面切换">
+          <button class="chat-mode-btn is-active" type="button" data-mode="chat" role="tab" aria-selected="true">对话</button>
+          <button class="chat-mode-btn" type="button" data-mode="workspace" role="tab" aria-selected="false">工作台</button>
+        </div>
+        <div class="chat-head-title" id="chat-title">新对话</div>
+        <div class="chat-head-right">
+          <span class="chat-demo-pill" id="demo-pill" hidden>演示回声</span>
+          <button class="btn ghost sm" id="login-btn" type="button" hidden>登录</button>
+        </div>
+      </header>
+
+      <main class="chat-main">
+        <section class="chat-thread" id="thread">
+          <div class="chat-empty" id="chat-empty">
+            <div class="chat-empty-logo">EAB</div>
+            <h2 id="empty-title">你好</h2>
+            <p class="muted" id="empty-sub">问点什么开始。你的身份、能用的模型都由组织与权限决定。</p>
+            <div class="chat-suggest" id="suggest"></div>
+          </div>
+        </section>
+
+        <section class="file-pane" id="file-pane" hidden>
+          <div class="file-pane-head">
+            <div class="file-pane-head-main">
+              <span class="file-pane-kicker" id="file-pane-kicker">云空间</span>
+              <h2 id="file-pane-name">未选择文件</h2>
+              <div class="file-pane-meta muted" id="file-pane-meta"></div>
+            </div>
+            <div class="file-pane-actions">
+              <button class="btn ghost sm" id="file-pane-download" type="button">下载</button>
+              <button class="btn ghost sm" id="file-pane-send-dingtalk" type="button">发送到钉钉</button>
+              <button class="btn ghost sm" id="file-pane-rename" type="button" hidden>重命名</button>
+              <button class="btn ghost sm" id="file-pane-edit" type="button" hidden>编辑</button>
+              <button class="btn danger sm" id="file-pane-delete" type="button" hidden>删除</button>
+              <button class="icon-btn file-pane-x" id="file-pane-close" type="button" title="关闭文件" aria-label="关闭文件">×</button>
+            </div>
+          </div>
+          <div class="file-pane-body" id="file-pane-body"></div>
+          <div class="file-pane-editor" id="file-pane-editor" hidden>
+            <textarea id="file-pane-text" spellcheck="false" aria-label="编辑文件内容"></textarea>
+            <div class="file-pane-editor-actions">
+              <span class="hint" id="file-pane-editor-hint"></span>
+              <button class="btn ghost" id="file-pane-cancel" type="button">取消</button>
+              <button class="btn primary" id="file-pane-save" type="button">保存</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="workspace-pane" id="workspace-pane" hidden>
+          <div class="workspace-head">
+            <div>
+              <span class="workspace-eyebrow">PERSONAL PLUGIN WORKSPACE</span>
+              <h2>我的工作台</h2>
+              <p class="muted">只显示你自己安装的插件。启停、卸载、查看详情和打开插件页面都只影响你本人，不会碰公司和别人的安装。</p>
+            </div>
+          </div>
+          <div class="workspace-shell">
+            <aside class="ws-plugin-rail" id="my-plugin-rail" aria-label="个人插件列表">
+              <div class="plugin-empty muted">正在读取插件…</div>
+            </aside>
+            <main class="ws-plugin-main" id="my-plugin-detail" aria-live="polite">
+              <div class="plugin-empty muted">正在读取插件…</div>
+            </main>
+          </div>
+        </section>
+
+        <footer class="composer">
+          <button class="scroll-bottom" id="scroll-bottom" type="button" title="回到最新消息" aria-label="回到最新消息" hidden>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+          <div class="attach-strip" id="attach-strip" hidden></div>
+          <div class="queue-bar" id="queue-bar" hidden>
+            <span class="queue-dot" aria-hidden="true"></span>
+            <span id="queue-text">正在回复，你的新消息会按顺序排队</span>
+            <button class="queue-stop" id="queue-stop" type="button">停止当前回复</button>
+          </div>
+          <div class="composer-box" id="composer-box">
+            <textarea
+              id="input"
+              rows="1"
+              placeholder="输入消息，Enter 发送，Shift + Enter 换行"
+            ></textarea>
+            <div class="composer-bar">
+              <div class="composer-left">
+                <button class="icon-btn" id="pick-image" type="button" title="上传图片" aria-label="上传图片">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5.5A1.5 1.5 0 0 1 5.5 4h13A1.5 1.5 0 0 1 20 5.5v13A1.5 1.5 0 0 1 18.5 20h-13A1.5 1.5 0 0 1 4 18.5v-13Zm1.6 11.9 4.1-4.4 3.1 3.3 2.4-2.6 5 5.3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><circle cx="9" cy="9" r="1.6" fill="currentColor"/></svg>
+                </button>
+                <button class="icon-btn" id="pick-file" type="button" title="上传文件" aria-label="上传文件">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-5-5Z" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M14 3v5h5" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>
+                </button>
+                <button class="space-chip" id="space-chip" type="button" aria-haspopup="listbox" aria-expanded="false">
+                  <span class="space-dot"></span>
+                  <span id="space-chip-label">云空间</span>
+                  <span class="caret">▾</span>
+                </button>
+                <div class="space-menu" id="space-menu" hidden></div>
+                <button class="model-chip" id="model-chip" type="button" aria-haspopup="listbox">
+                  <span class="dot"></span>
+                  <span id="model-chip-label">自动</span>
+                  <span class="caret">▾</span>
+                </button>
+                <div class="model-menu" id="model-menu" hidden></div>
+              </div>
+              <button class="send-btn" id="send" type="button" title="发送" aria-label="发送">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 11.5 20 4l-7.4 16-2.1-6.3-6.5-2.2Z" fill="none" stroke="currentColor" stroke-width="1.7"/></svg>
+              </button>
+            </div>
+          </div>
+          <div class="composer-foot muted" id="composer-foot">回答由所选模型生成；支持 Ctrl+V 粘贴截图/图片，附件随消息提交，不会公网分享</div>
+        </footer>
+      </main>
+
+      <section class="settings-stage" id="settings-stage" hidden>
+        <header class="settings-head">
+          <button class="settings-back" id="settings-back" type="button">← 返回对话</button>
+          <div class="settings-head-title">设置</div>
+          <span class="settings-head-spacer"></span>
+        </header>
+        <div class="settings-main">
+          <div class="settings-profile" id="settings-profile"></div>
+
+          <div class="settings-group">
+            <div class="settings-group-title">个人设置</div>
+            <button class="settings-row" id="settings-memories" type="button">
+              <span class="settings-row-icon">◎</span>
+              <span class="settings-row-text">
+                <strong>我的记忆</strong>
+                <em>管理长期偏好与已确认的记忆</em>
+              </span>
+              <span class="settings-row-arrow">›</span>
+            </button>
+            <button class="settings-row" id="settings-caps" type="button">
+              <span class="settings-row-icon">◇</span>
+              <span class="settings-row-text">
+                <strong>我的权限</strong>
+                <em>查看角色与当前生效的权限点</em>
+              </span>
+              <span class="settings-row-arrow">›</span>
+            </button>
+          </div>
+
+          <div class="settings-group">
+            <div class="settings-group-title">账号</div>
+            <button class="settings-row" id="settings-password" type="button">
+              <span class="settings-row-icon">✎</span>
+              <span class="settings-row-text">
+                <strong>修改密码</strong>
+                <em>更新登录密码，其他设备会退出登录</em>
+              </span>
+              <span class="settings-row-arrow">›</span>
+            </button>
+            <button class="settings-row danger" id="settings-logout" type="button">
+              <span class="settings-row-icon">↪</span>
+              <span class="settings-row-text">
+                <strong>退出登录</strong>
+                <em>结束当前浏览器会话，回到登录页</em>
+              </span>
+              <span class="settings-row-arrow">›</span>
+            </button>
+          </div>
+
+          <div class="settings-note muted">设置只影响你的个人使用，不会改动公司权限配置。</div>
+        </div>
+      </section>
+    </div>
+
+    <input type="file" id="file-image" accept="image/*" multiple hidden />
+    <input type="file" id="file-any" multiple hidden />
+    <div class="session-menu" id="session-menu" hidden></div>
+    <div class="session-menu" id="file-menu" hidden></div>
+
+    <!-- 未登录：只显示登录，不展示任何组织/成员信息 -->
+    <div class="login-gate" id="login-gate" hidden>
+      <div class="login-card login-shell" id="login-card">
+        <div class="login-brand"><span class="logo">EAB</span><strong id="login-brand-name">企业智能体基座</strong></div>
+
+        <div class="login-mode-tabs" id="login-mode-tabs" hidden>
+          <button class="login-mode-tab is-active" id="login-mode-qr" type="button" data-login-mode="qr">扫码登录</button>
+          <button class="login-mode-tab" id="login-mode-password" type="button" data-login-mode="password">账号密码</button>
+        </div>
+
+        <section class="login-pane login-pane-qr" id="login-pane-qr">
+          <div class="login-pane-head">
+            <h2>用企业身份扫码登录</h2>
+            <p class="muted" id="login-qr-sub">打开手机钉钉扫一扫，确认后这台电脑会自动登录。</p>
+          </div>
+
+          <div class="login-sso-tabs" id="login-sso-tabs" hidden>
+            <button class="login-sso-tab is-active" id="login-tab-dingtalk" type="button" data-sso="dingtalk">
+              <span class="login-method-icon">钉</span>钉钉扫码
+            </button>
+            <button class="login-sso-tab" id="login-tab-feishu" type="button" data-sso="feishu">
+              <span class="login-method-icon">飞</span>飞书登录
+            </button>
+          </div>
+
+          <div class="login-sso-body">
+            <div class="login-error" id="login-sso-error" hidden></div>
+            <a class="login-error-link" id="login-sso-error-link" href="#" target="_blank" rel="noreferrer" hidden>去钉钉开放平台开通权限 →</a>
+            <div class="login-sso-panel" id="login-sso-dingtalk" hidden>
+              <div class="login-qr" id="login-qr">
+                <div class="login-qr-stage">
+                  <div class="login-qr-frame" id="login-qr-frame"></div>
+                  <button class="login-qr-expired" id="login-qr-expired" type="button" hidden aria-label="二维码已过期，点我刷新">
+                    <span class="login-qr-expired-icon">↻</span>
+                    <strong>二维码已过期</strong>
+                    <span>点我刷新二维码</span>
+                  </button>
+                </div>
+                <div class="login-qr-actions" hidden>
+                  <button class="btn ghost sm" id="login-qr-refresh" type="button">刷新二维码</button>
+                  <a class="link-btn" id="login-qr-open" href="#" target="_blank" rel="noreferrer">改用授权页登录</a>
+                </div>
+                <div class="login-sso-appid" id="login-sso-appid" hidden></div>
+              </div>
+            </div>
+            <div class="login-sso-panel login-sso-placeholder" id="login-sso-feishu" hidden>
+              <span class="login-method-icon">飞</span>
+              <strong>飞书扫码登录</strong>
+              <p>这家公司已绑定飞书。飞书扫码登录链路还在接入中，先切到「账号密码」登录。</p>
+            </div>
+            <div class="login-sso-empty" id="login-sso-empty" hidden>
+              <strong>还没配置企业扫码登录</strong>
+              <p>由公司管理员在控制台「渠道」里绑定钉钉或飞书后，这里会自动出现扫码入口。</p>
+              <p class="muted">现在可以直接用账号密码登录。</p>
+            </div>
+          </div>
+
+          <div class="login-qr-foot" id="login-qr-foot">二维码由钉钉官方组件渲染，手机不需要访问本机地址；扫码只用于身份登录。</div>
+        </section>
+
+        <section class="login-pane login-pane-password" id="login-pane-password" hidden>
+          <div class="login-pane-head">
+            <h2>账号密码登录</h2>
+            <p class="muted" id="login-sub" hidden>用工号、邮箱或手机号登录。账号只能由本人登录，密码校验在服务端完成。</p>
+          </div>
+          <form class="login-form" id="login-form">
+            <label>工号、邮箱或手机号<input id="login-account" autocomplete="username" placeholder="例如 U_ZW 或 13800138000" required /></label>
+            <label>密码<input id="login-password" type="password" autocomplete="current-password" placeholder="至少 8 位" required /></label>
+            <button class="login-submit" id="login-submit" type="submit">登录</button>
+            <div class="login-error" id="login-error" hidden></div>
+          </form>
+          <div class="login-foot muted">浏览器会话 7 天有效；账号停用后立即失效。</div>
+        </section>
+      </div>
+    </div>
+
+    <!-- 登录页打开时不要让背后的对话空状态透出来，哪怕静态资源还没加载完 -->
+    <script>
+      if (new URLSearchParams(location.search).get('login') === '1') {
+        const side = document.getElementById('chat-side')
+        const stage = document.getElementById('chat-stage')
+        const gate = document.getElementById('login-gate')
+        if (side) side.hidden = true
+        if (stage) stage.hidden = true
+        if (gate) gate.hidden = false
+      }
+    </script>
+    <script src="/chat.js"></script>
+  </body>
+</html>

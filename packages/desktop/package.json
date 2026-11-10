@@ -1,0 +1,55 @@
+{
+  "name": "@eab/desktop",
+  "version": "2026.11.10",
+  "private": true,
+  "description": "EAB 企业智能体基座桌面端（自带本地服务）",
+  "author": "EAB",
+  "main": "main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win nsis"
+  },
+  "dependencies": {
+    "electron-updater": "^6.6.2"
+  },
+  "devDependencies": {
+    "electron": "^35.0.0",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "com.eab.desktop",
+    "productName": "EAB",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "main.cjs",
+      "build/**",
+      "package.json"
+    ],
+    "asar": true,
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "EAB-Setup-${version}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "EAB"
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "Jydsh",
+      "repo": "EAB"
+    }
+  }
+}

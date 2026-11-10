@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>EAB 管理控制台 · 管理员登录</title>
+    <link rel="stylesheet" href="/app.css" />
+    <style>
+      .gate-body {
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: #f4f6f7;
+        padding: 24px;
+      }
+      .gate-card {
+        width: 100%;
+        max-width: 420px;
+        background: #fff;
+        border: 1px solid #e3e8e8;
+        border-radius: 14px;
+        padding: 28px 28px 24px;
+        box-shadow: 0 12px 32px rgba(20, 40, 40, 0.06);
+      }
+      .gate-brand {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin-bottom: 18px;
+      }
+      .gate-brand .logo {
+        width: 44px;
+        height: 44px;
+        border-radius: 10px;
+        background: #0f3f39;
+        color: #fff;
+        display: grid;
+        place-items: center;
+        font-weight: 700;
+        letter-spacing: 0.5px;
+      }
+      .gate-brand h1 {
+        font-size: 17px;
+        margin: 0;
+      }
+      .gate-brand p {
+        margin: 2px 0 0;
+        font-size: 12px;
+        color: #6b7b7b;
+      }
+      .gate-lede {
+        margin: 10px 0 2px;
+        font-size: 12.5px;
+        line-height: 1.6;
+        color: #6b7b7b;
+      }
+      .gate-card label {
+        display: block;
+        font-size: 12px;
+        color: #556;
+        margin: 14px 0 6px;
+      }
+      .gate-card input {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 10px 12px;
+        border: 1px solid #cfd8d8;
+        border-radius: 8px;
+        font: inherit;
+      }
+      .gate-card button {
+        width: 100%;
+        margin-top: 16px;
+        padding: 10px 12px;
+        border: 0;
+        border-radius: 8px;
+        background: #0f3f39;
+        color: #fff;
+        font: inherit;
+        cursor: pointer;
+      }
+      .gate-card button:disabled {
+        opacity: 0.6;
+        cursor: progress;
+      }
+      .gate-err {
+        margin-top: 12px;
+        font-size: 12px;
+        color: #b42318;
+      }
+      .gate-label-row {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        margin: 14px 0 6px;
+      }
+      .gate-label-row label {
+        margin: 0;
+      }
+      .gate-card .gate-help {
+        flex: none;
+        width: 16px;
+        min-width: 16px;
+        height: 16px;
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+        border: 1px solid #cfd8d8;
+        border-radius: 50%;
+        background: #fff;
+        color: #8a9a9a;
+        font-size: 11px;
+        line-height: 1;
+        cursor: pointer;
+      }
+      .gate-card .gate-help:hover,
+      .gate-card .gate-help[aria-expanded="true"] {
+        border-color: #0f3f39;
+        color: #0f3f39;
+      }
+      .gate-card .gate-help:focus-visible {
+        outline: 2px solid #0f3f3933;
+        outline-offset: 1px;
+      }
+      .gate-hint {
+        margin-top: 8px;
+        padding: 8px 10px;
+        border: 1px solid #eef2f2;
+        border-radius: 7px;
+        background: #f8fafa;
+        font-size: 11.5px;
+        line-height: 1.6;
+        color: #6b7b7b;
+      }
+      @media (max-width: 480px) {
+        .gate-card {
+          padding: 22px 18px;
+        }
+      }
+    </style>
+  </head>
+  <body class="gate-body">
+    <section class="gate-card">
+      <div class="gate-brand">
+        <span class="logo">EAB</span>
+        <div>
+          <h1>企业智能体基座</h1>
+          <p>管理控制台 · 服务器侧</p>
+        </div>
+      </div>
+
+      <p class="gate-lede">仅限运维账号登录；员工对话请走 8787 端口。</p>
+
+      <label for="user">管理员账号</label>
+      <input id="user" type="text" autocomplete="username" placeholder="默认 admin" value="admin" />
+      <div class="gate-label-row">
+        <label for="pass">管理员密码</label>
+        <button class="gate-help" id="gate-help" type="button" aria-label="密码在哪里" aria-expanded="false" aria-controls="gate-hint">?</button>
+      </div>
+      <input id="pass" type="password" autocomplete="current-password" placeholder="部署时设置的密码" />
+      <div class="gate-hint" id="gate-hint" hidden>
+        密码在服务器 <code>.eab-dev/admin-credentials.txt</code>，启动日志也会打印；默认仅允许本机登录。
+      </div>
+      <button id="enter" type="button">进入控制台</button>
+      <div class="gate-err" id="gate-err" hidden></div>
+    </section>
+
+    <script>
+      (function () {
+        var user = document.getElementById('user')
+        var pass = document.getElementById('pass')
+        var enter = document.getElementById('enter')
+        var err = document.getElementById('gate-err')
+
+        function fail(message) {
+          err.hidden = false
+          err.textContent = message
+          enter.disabled = false
+        }
+
+        async function submit() {
+          var username = user.value.trim()
+          var password = pass.value
+          if (!username) {
+            fail('先输入管理员账号')
+            user.focus()
+            return
+          }
+          if (!password) {
+            fail('先输入管理员密码')
+            pass.focus()
+            return
+          }
+          enter.disabled = true
+          err.hidden = true
+          try {
+            var res = await fetch('/api/console/login', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', accept: 'application/json' },
+              body: JSON.stringify({ username: username, password: password }),
+            })
+            var body = await res.json().catch(function () { return null })
+            if (!res.ok || !body || body.ok !== true) {
+              fail((body && (body.message || body.error)) || '账号或密码不正确（HTTP ' + res.status + '）')
+              return
+            }
+            location.replace('/admin' + location.search)
+          } catch (e) {
+            fail('请求失败：' + (e && e.message ? e.message : e))
+          }
+        }
+
+        enter.addEventListener('click', submit)
+        pass.addEventListener('keydown', function (event) {
+          if (event.key === 'Enter') submit()
+        })
+
+        var help = document.getElementById('gate-help')
+        var hint = document.getElementById('gate-hint')
+        function toggleHint(open) {
+          hint.hidden = !open
+          help.setAttribute('aria-expanded', open ? 'true' : 'false')
+        }
+        help.addEventListener('click', function (event) {
+          event.stopPropagation()
+          toggleHint(hint.hidden)
+        })
+        hint.addEventListener('click', function (event) {
+          event.stopPropagation()
+        })
+        document.addEventListener('click', function () {
+          toggleHint(false)
+        })
+        document.addEventListener('keydown', function (event) {
+          if (event.key === 'Escape') toggleHint(false)
+        })
+        user.focus()
+      })()
+    </script>
+  </body>
+</html>

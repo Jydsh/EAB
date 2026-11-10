@@ -1,0 +1,39 @@
+{
+  "name": "eab",
+  "version": "2026.11.10",
+  "private": true,
+  "type": "module",
+  "description": "EAB 企业智能体基座（Enterprise Agent Base）",
+  "license": "SEE LICENSE IN LICENSE",
+  "packageManager": "pnpm@12.16.1",
+  "bin": {
+    "eab": "./scripts/eab.mjs"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "verify": "pnpm typecheck && pnpm test",
+    "smoke": "node scripts/smoke-http.mjs && node scripts/smoke-platform.mjs",
+    "dev": "pnpm --filter @eab/server dev",
+    "eab": "node scripts/eab.mjs",
+    "server": "node scripts/eab.mjs server",
+    "desktop:build": "node scripts/build-desktop.mjs",
+    "desktop:dist": "node scripts/build-desktop.mjs && pnpm --filter @eab/desktop dist",
+    "demo:kb": "tsx demo/kb-visibility.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/qrcode": "^1.5.6",
+    "esbuild": "^0.28.2",
+    "tsx": "^4.23.15",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4"
+  }
+}

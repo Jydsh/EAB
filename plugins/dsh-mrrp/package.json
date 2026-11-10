@@ -1,0 +1,63 @@
+{
+  "name": "dsh-mrrp",
+  "version": "2026.11.07",
+  "description": "MRRP 控制台：DSH 模型路由与管理插件。管理模型分类、路由模型配置、角色/部门与用户，让不同角色/部门的请求路由到指定分类下的模型。",
+  "keywords": [
+    "deepseek-harness",
+    "dsh-plugin",
+    "mrrp",
+    "model-routing",
+    "model-router"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": "./dist/index.js",
+    "./client": "./lib/client.js",
+    "./lib/client.js": "./lib/client.js",
+    "./package.json": "./package.json",
+    "./dist/*.js": "./dist/*.js",
+    "./dist/*": "./dist/*.js"
+  },
+  "files": [
+    "dist",
+    "lib/client.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "pack": "npm pack",
+    "test": "node --test"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-locale"
+      ],
+      "platform": "web"
+    },
+    "compatibility": {
+      "dsh": "0.2.1-rc.2",
+      "profiles": [
+        "web",
+        "desktop"
+      ]
+    }
+  },
+  "engines": {
+    "node": ">=22.19"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2"
+  }
+}

@@ -1,0 +1,10 @@
+packages:
+  - packages/*
+
+# pnpm 12 起这些设置从 package.json 的 "pnpm" 字段迁到这里。
+# esbuild（vitest 的依赖）需要 postinstall 下载平台二进制，必须放行，
+# 否则 vitest 起不来，而报错信息只说 "Ignored build scripts"。
+allowBuilds:
+  esbuild: true
+  electron: true
+  electron-winstaller: true

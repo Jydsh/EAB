@@ -1,0 +1,16 @@
+node_modules/
+dist/
+coverage/
+*.log
+.eab-dev/
+.EAB_HOME/
+plans/
+*.db
+*.db-wal
+*.db-shm
+packages/desktop/build/
+packages/desktop/release/
+console-*.png
+chat-*.png
+.DS_Store
+Thumbs.db

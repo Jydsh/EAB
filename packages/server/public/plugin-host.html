@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>DSH 插件</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.55 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif; color: #1f2937; background: #f6f8f7; }
+  .ph-top { min-width: 0; display: flex; align-items: center; gap: 12px; padding: 14px 20px; background: #fff; border-bottom: 1px solid #e4e7ec; position: sticky; top: 0; z-index: 5; }
+  .ph-mark { width: 34px; height: 34px; border-radius: 10px; background: #e6f4f2; color: #0f766e; display: grid; place-items: center; font-weight: 700; }
+  .ph-name { font-weight: 700; font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ph-sub { color: #6b7280; font-size: 12px; margin-top: 2px; }
+  .ph-badge { white-space: nowrap; display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px; border-radius: 999px; background: #f0fdfa; color: #0f766e; border: 1px solid #ccfbf1; font-size: 12px; }
+  .ph-badge.warn { background: #fffbeb; color: #b45309; border-color: #fde68a; }
+  .ph-right { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+  .ph-btn { white-space: nowrap; appearance: none; border: 1px solid #d1d5db; background: #fff; color: #374151; border-radius: 8px; padding: 5px 11px; font-size: 12px; cursor: pointer; }
+  .ph-btn:hover { border-color: #0f766e; color: #0f766e; }
+  .ph-body { display: grid; grid-template-columns: 210px minmax(0, 1fr); min-height: calc(100vh - 63px); }
+  .ph-rail { background: #fff; border-right: 1px solid #e4e7ec; padding: 14px 10px; }
+  .ph-rail-title { font-size: 11px; letter-spacing: .08em; color: #94a3b8; padding: 4px 10px 8px; text-transform: uppercase; }
+  .ph-nav { display: flex; flex-direction: column; gap: 2px; margin-bottom: 14px; }
+  .ph-nav button { appearance: none; border: 0; background: transparent; text-align: left; padding: 8px 10px; border-radius: 8px; color: #374151; cursor: pointer; font-size: 13px; display: flex; align-items: center; gap: 8px; }
+  .ph-nav button:hover { background: #f3f7f6; }
+  .ph-nav button.on { background: #e6f4f2; color: #0f766e; font-weight: 600; }
+  .ph-dot { width: 7px; height: 7px; border-radius: 50%; background: #cbd5e1; flex: none; }
+  .ph-nav button.on .ph-dot { background: #0f766e; }
+  .ph-main { padding: 18px 20px 40px; min-width: 0; }
+  .ph-panel { background: #fff; border: 1px solid #e4e7ec; border-radius: 12px; padding: 18px; min-height: 360px; }
+  .ph-log { margin-top: 12px; border: 1px solid #e4e7ec; border-radius: 10px; background: #fff; padding: 10px 12px; max-height: 190px; overflow: auto; font: 12px/1.5 ui-monospace, Consolas, monospace; color: #475569; white-space: pre-wrap; }
+  .ph-empty { color: #6b7280; padding: 40px 10px; text-align: center; }
+  .ph-error { color: #b91c1c; background: #fef2f2; border: 1px solid #fecaca; border-radius: 10px; padding: 10px 12px; margin-bottom: 12px; font-size: 12px; }
+  .ph-hidden { display: none; }
+</style>
+</head>
+<body>
+<div class="ph-top">
+  <div class="ph-mark" id="ph-mark">D</div>
+  <div>
+    <div class="ph-name" id="ph-name">DSH 插件</div>
+    <div class="ph-sub" id="ph-sub">正在加载插件…</div>
+  </div>
+  <span class="ph-badge" id="ph-format">DSH 插件</span>
+  <span class="ph-badge" id="ph-host">host 状态检测中</span>
+  <div class="ph-right">
+    <button class="ph-btn" id="ph-reload" type="button">重新加载</button>
+    <button class="ph-btn" id="ph-log-toggle" type="button">宿主日志</button>
+  </div>
+</div>
+<div class="ph-body">
+  <aside class="ph-rail">
+    <div class="ph-rail-title">插件页面</div>
+    <nav class="ph-nav" id="ph-nav"></nav>
+    <div class="ph-rail-title ph-hidden" id="ph-settings-title">设置</div>
+    <nav class="ph-nav" id="ph-settings-nav"></nav>
+  </aside>
+  <main class="ph-main">
+    <div class="ph-error ph-hidden" id="ph-error"></div>
+    <section class="ph-panel" id="ph-panel">
+      <div class="ph-empty">正在准备 DSH 运行时…</div>
+    </section>
+    <pre class="ph-log ph-hidden" id="ph-log"></pre>
+  </main>
+</div>
+<script src="/vendor/react.production.min.js"></script>
+<script src="/vendor/react-dom.production.min.js"></script>
+<script src="/dsh-runtime.js"></script>
+<script>
+(function () {
+  var query = new URLSearchParams(location.search);
+  var pluginId = query.get('id') || '';
+  var entry = query.get('entry') || '';
+  var company = query.get('company') || '';
+  var version = query.get('version') || '';
+  var title = query.get('title') || pluginId;
+  /** 个人工作台打开时 scope=user：走不带控制台会话的员工接口 */
+  var scope = query.get('scope') === 'user' ? 'user' : 'console';
+  var asUser = query.get('as') || '';
+  var apiBase = scope === 'user' ? '/api/my/plugins/' : '/api/console/plugins/';
+
+  function withAs(url) {
+    if (!asUser) return url;
+    return url + (url.indexOf('?') >= 0 ? '&' : '?') + 'as=' + encodeURIComponent(asUser);
+  }
+
+  var host = window.__DSH_HOST__;
+  var React = window.React;
+  var ReactDOM = window.ReactDOM;
+  var nameEl = document.getElementById('ph-name');
+  var subEl = document.getElementById('ph-sub');
+  var errorEl = document.getElementById('ph-error');
+  var logEl = document.getElementById('ph-log');
+  var navEl = document.getElementById('ph-nav');
+  var settingsNavEl = document.getElementById('ph-settings-nav');
+  var settingsTitleEl = document.getElementById('ph-settings-title');
+  var panelEl = document.getElementById('ph-panel');
+  var hostBadge = document.getElementById('ph-host');
+
+  nameEl.textContent = title;
+  subEl.textContent = pluginId + (version ? ' · v' + version : '') + ' · DSH 协议' + (scope === 'user' ? ' · 个人安装' : '');
+  if (scope === 'user') {
+    document.title = title + ' · 个人插件';
+    document.getElementById('ph-log-toggle').hidden = true;
+  }
+
+  function showError(message) {
+    errorEl.textContent = message;
+    errorEl.classList.remove('ph-hidden');
+  }
+
+  function rpcHeaders() {
+    if (scope === 'user') return { 'content-type': 'application/json' };
+    return { 'content-type': 'application/json', 'x-eab-console': '1' };
+  }
+
+  function postRpc(channel, call) {
+    return fetch(withAs(apiBase + encodeURIComponent(pluginId) + '/rpc'), {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: rpcHeaders(),
+      body: JSON.stringify({ channel: channel, call: call }),
+    }).then(function (response) {
+      return response.json().then(function (payload) {
+        if (!payload || payload.ok !== true) {
+          throw new Error((payload && (payload.message || payload.error)) || 'RPC 请求失败');
+        }
+        return payload.data;
+      });
+    });
+  }
+
+  function loadHostStatus() {
+    fetch(withAs(apiBase + encodeURIComponent(pluginId) + '/host'), {
+      headers: rpcHeaders(),
+      credentials: 'same-origin',
+    })
+      .then(function (response) { return response.json(); })
+      .then(function (payload) {
+        var status = payload && payload.ok ? payload.data.status : null;
+        if (!status) return;
+        if (status.error) {
+          hostBadge.textContent = 'host 未就绪';
+          hostBadge.classList.add('warn');
+          logEl.textContent = '错误：' + status.error;
+        } else {
+          hostBadge.textContent = 'host 已运行 · ' + (status.routes || []).length + ' 条通道';
+          hostBadge.classList.remove('warn');
+          logEl.textContent = scope === 'user' ? '个人插件不在此处展示宿主日志。' : '（暂无日志）';
+        }
+      })
+      .catch(function () {
+        hostBadge.textContent = 'host 状态未知';
+      });
+  }
+
+  document.getElementById('ph-log-toggle').addEventListener('click', function () {
+    logEl.classList.toggle('ph-hidden');
+  });
+
+  document.getElementById('ph-reload').addEventListener('click', function () {
+    location.reload();
+  });
+
+  if (!host || !React || !ReactDOM) {
+    showError('DSH 运行时没有装载成功：缺少 React UMD 或 dsh-runtime.js。');
+    return;
+  }
+
+  host.configure({ id: pluginId, company: company, rpc: postRpc });
+  loadHostStatus();
+
+  var shell = host.createShell({
+    React: React,
+    ReactDOM: ReactDOM,
+    mount: panelEl,
+    nav: navEl,
+    settingsNav: settingsNavEl,
+    settingsTitle: settingsTitleEl,
+    labels: { settings: '设置' },
+    onError: showError,
+  });
+
+  if (!entry || entry.indexOf('..') >= 0 || entry.charAt(0) === '/' || /^[A-Za-z]:/.test(entry)) {
+    showError('插件没有声明合法的 client 入口（exports["./client"]）。');
+    return;
+  }
+
+  var script = document.createElement('script');
+  script.src = withAs('/plugins/assets/' + encodeURIComponent(pluginId) + '/' + entry.split('/').map(encodeURIComponent).join('/'));
+  script.onerror = function () {
+    showError('client bundle 加载失败：' + script.src + '（确认插件已安装并在本司启用）');
+  };
+  script.onload = function () {
+    try {
+      host.boot();
+      subEl.textContent = pluginId + (version ? ' · v' + version : '') + ' · ' + shell.panelCount() + ' 个页面' + (scope === 'user' ? ' · 个人安装' : '');
+    } catch (error) {
+      showError('插件 client 启动失败：' + (error && error.message ? error.message : error));
+    }
+  };
+  document.body.appendChild(script);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+{
+  "name": "@eab/channel",
+  "version": "2026.11.07",
+  "private": true,
+  "type": "module",
+  "description": "渠道接入：组织架构同步（provider 抽象 + 映射纯函数 + 落库幂等）",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@eab/domain": "workspace:*",
+    "@eab/storage": "workspace:*"
+  }
+}

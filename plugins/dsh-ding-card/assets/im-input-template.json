@@ -1,0 +1,502 @@
+{
+  "componentMap": {
+    "package": "@ali/dxComponent",
+    "version": "1.0.0",
+    "exportName": "Input",
+    "main": "./src/index.tsx",
+    "destructuring": false,
+    "subName": "",
+    "componentName": "Input"
+  },
+  "inputNode": {
+    "componentName": "Input",
+    "id": "node_oclw9159002",
+    "props": {
+      "placeholder": {
+        "i18n": false,
+        "type": "dynamicString",
+        "content": "请输入内容"
+      },
+      "currentValue": {
+        "i18n": false,
+        "type": "dynamicString",
+        "content": "${input}"
+      },
+      "message": {
+        "type": "dynamicString",
+        "content": "请输入内容",
+        "i18n": false
+      },
+      "title": {
+        "i18n": false,
+        "type": "dynamicString",
+        "content": "文本输入"
+      },
+      "id": "input",
+      "params": [],
+      "visible": {
+        "type": "dynamicVisible",
+        "value": true,
+        "valueType": "fixed",
+        "condition": {
+          "op": "and",
+          "conditions": []
+        }
+      },
+      "status": {
+        "type": "dynamicSelect",
+        "valueType": "variable",
+        "value": "normal",
+        "variable": "submitBtnStatus",
+        "variableType": "global"
+      },
+      "actionType": "setLocalState",
+      "localVarAction": {
+        "variable": "localInput",
+        "variableType": "global",
+        "varType": "string",
+        "type": "variableValue"
+      }
+    },
+    "title": "文本输入",
+    "hidden": false,
+    "isLocked": false,
+    "condition": true,
+    "conditionGroup": ""
+  },
+  "submitNode": {
+    "componentName": "SingleButton",
+    "id": "node_oclw9159003",
+    "props": {
+      "text": {
+        "i18n": false,
+        "type": "dynamicString",
+        "content": "${submitBtnText}"
+      },
+      "status": {
+        "type": "dynamicSelect",
+        "valueType": "variable",
+        "value": "normal",
+        "variable": "submitBtnStatus",
+        "variableType": "global"
+      },
+      "color": {
+        "type": "dynamicSelect",
+        "valueType": "fixed",
+        "value": "blue",
+        "variable": "",
+        "variableType": "global"
+      },
+      "icon": {
+        "type": "dynamicLink",
+        "value": "",
+        "valueType": "fixed",
+        "variable": "",
+        "variableType": "global"
+      },
+      "darkModeIcon": {
+        "type": "dynamicLink",
+        "value": "",
+        "valueType": "fixed",
+        "variable": "",
+        "variableType": "global"
+      },
+      "iconType": "image",
+      "iconFont": {
+        "type": "dynamicIcon",
+        "valueType": "fixed",
+        "value": {
+          "type": "icon",
+          "icon": "icon_XDS_goodlike_line",
+          "iconType": "ddIcon"
+        },
+        "variable": "",
+        "variableType": "global"
+      },
+      "actionType": "request",
+      "statPoint": {
+        "type": "dynamicString",
+        "content": "",
+        "i18n": false
+      },
+      "statPointParams": [],
+      "urlType": "all",
+      "url": {
+        "type": "dynamicLink",
+        "value": "",
+        "valueType": "fixed",
+        "variable": "",
+        "variableType": "global"
+      },
+      "androidUrl": {
+        "type": "dynamicLink",
+        "value": "",
+        "valueType": "fixed",
+        "variable": "",
+        "variableType": "global"
+      },
+      "pcUrl": {
+        "type": "dynamicLink",
+        "value": "",
+        "valueType": "fixed",
+        "variable": "",
+        "variableType": "global"
+      },
+      "iosUrl": {
+        "type": "dynamicLink",
+        "value": "",
+        "valueType": "fixed",
+        "variable": "",
+        "variableType": "global"
+      },
+      "isDtmd": false,
+      "actionId": {
+        "type": "dynamicString",
+        "content": "",
+        "i18n": false
+      },
+      "params": [
+        {
+          "type": "variable",
+          "variable": "localInput",
+          "value": "",
+          "name": "input",
+          "variableType": "global",
+          "id": "1"
+        },
+        {
+          "type": "variable",
+          "variable": "localSelect",
+          "value": "",
+          "name": "select",
+          "id": "6354",
+          "variableType": "global"
+        },
+        {
+          "type": "variable",
+          "variable": "localMultiSelect",
+          "value": "",
+          "name": "multiSelect",
+          "id": "7144",
+          "variableType": "global"
+        },
+        {
+          "type": "variable",
+          "variable": "localCheckbox",
+          "value": "",
+          "name": "checkbox",
+          "id": "1549",
+          "variableType": "global"
+        },
+        {
+          "type": "variable",
+          "variable": "localSingleCheckbox",
+          "value": "",
+          "name": "singleCheckbox",
+          "id": "6105",
+          "variableType": "global"
+        },
+        {
+          "type": "variable",
+          "variable": "localMultiCheckbox",
+          "value": "",
+          "name": "multiCheckbox",
+          "id": "9965",
+          "variableType": "global"
+        },
+        {
+          "type": "variable",
+          "variable": "localDate",
+          "value": "",
+          "name": "date",
+          "id": "4543",
+          "variableType": "global"
+        },
+        {
+          "type": "variable",
+          "variable": "localDatetime",
+          "value": "",
+          "name": "datetime",
+          "id": "8629",
+          "variableType": "global"
+        },
+        {
+          "type": "variable",
+          "variable": "singleCheckboxItems",
+          "value": "",
+          "name": "singleCheckboxItems",
+          "id": "8217",
+          "variableType": "global"
+        },
+        {
+          "type": "variable",
+          "variable": "multiCheckboxItems",
+          "value": "",
+          "name": "multiCheckboxItems",
+          "id": "8387",
+          "variableType": "global"
+        }
+      ],
+      "successToast": {
+        "i18n": false,
+        "type": "dynamicString",
+        "content": "提交成功"
+      },
+      "failureToast": {
+        "i18n": false,
+        "type": "dynamicString",
+        "content": "${errMsg}"
+      },
+      "successCondition": {
+        "op": "and",
+        "conditions": [
+          {
+            "value": "disabled",
+            "op": "equal",
+            "variable": "submitBtnStatus",
+            "variableType": "global",
+            "type": "variable",
+            "valueType": "fixed",
+            "valueVariableType": "global"
+          }
+        ]
+      },
+      "copyValue": {
+        "type": "dynamicString",
+        "content": "",
+        "i18n": false
+      },
+      "copyVariable": {
+        "type": "variableValue",
+        "variableType": "global",
+        "variable": ""
+      },
+      "customHandler": "",
+      "confirmTitle": {
+        "type": "dynamicString",
+        "content": "标题",
+        "i18n": false
+      },
+      "confirmMessage": {
+        "type": "dynamicString",
+        "content": "内容",
+        "i18n": false
+      },
+      "confirmOkText": {
+        "type": "dynamicString",
+        "content": "确认",
+        "i18n": false
+      },
+      "confirmOkAction": "request",
+      "confirmOkReqActionActionId": {
+        "type": "dynamicString",
+        "content": "",
+        "i18n": false
+      },
+      "confirmOkReqActionParams": [
+        {
+          "type": "fixed",
+          "variable": "",
+          "value": "",
+          "name": "",
+          "variableType": "global",
+          "id": "1"
+        }
+      ],
+      "confirmOkReqActionToast": {
+        "type": "dynamicString",
+        "content": "",
+        "i18n": false
+      },
+      "confirmCancelText": {
+        "type": "dynamicString",
+        "content": "取消",
+        "i18n": false
+      },
+      "confirmCancelAction": "none",
+      "confirmCancelReqActionActionId": {
+        "type": "dynamicString",
+        "content": "",
+        "i18n": false
+      },
+      "confirmCancelReqActionParams": [
+        {
+          "type": "fixed",
+          "variable": "",
+          "value": "",
+          "name": "",
+          "variableType": "global",
+          "id": "1"
+        }
+      ],
+      "confirmCancelReqActionToast": {
+        "type": "dynamicString",
+        "content": "",
+        "i18n": false
+      },
+      "actionSheetTitle": {
+        "type": "dynamicString",
+        "content": "标题",
+        "i18n": false
+      },
+      "actionSheetMessage": {
+        "type": "dynamicString",
+        "content": "面板描述",
+        "i18n": false
+      },
+      "actionSheetItems": [],
+      "toastContent": {
+        "type": "dynamicString",
+        "content": "",
+        "i18n": false
+      },
+      "toastType": 1,
+      "localVarAction": {
+        "type": "variableValue",
+        "variableType": "global",
+        "variable": ""
+      },
+      "booleanLocalValue": {
+        "type": "dynamicBoolean",
+        "valueType": "fixed",
+        "value": false,
+        "variable": "",
+        "variableType": "global"
+      },
+      "numberLocalValue": {
+        "type": "dynamicNumber",
+        "valueType": "fixed",
+        "value": 0,
+        "variable": "",
+        "variableType": "global"
+      },
+      "stringLocalValue": {
+        "type": "dynamicString",
+        "content": "",
+        "i18n": false
+      },
+      "openModalTitle": {
+        "type": "dynamicString",
+        "content": "标题",
+        "i18n": false
+      },
+      "openModalHeight": 500,
+      "openModalWidth": 400,
+      "events": [],
+      "selectActionType": "setLocalState",
+      "selectDataKey": {
+        "type": "variableValue",
+        "variableType": "global",
+        "variable": ""
+      },
+      "selectOptions": {
+        "type": "dynamicSelectOptions",
+        "valueType": "fixed",
+        "value": [],
+        "variable": "",
+        "variableType": "global"
+      },
+      "selectParams": [],
+      "selectIndex": {
+        "type": "variableValue",
+        "variableType": "global",
+        "variable": ""
+      },
+      "fixWidth": false,
+      "fixedWidth": 0,
+      "autoWidth": false,
+      "dataSources": [],
+      "updateTargetValue": {
+        "type": "variableValue",
+        "variableType": "global",
+        "variable": ""
+      },
+      "updateTargetVariable": {
+        "type": "variableValue",
+        "variableType": "global",
+        "variable": ""
+      },
+      "apiName": {
+        "type": "dynamicString",
+        "content": "",
+        "i18n": false
+      },
+      "apiParams": [
+        {
+          "type": "variable",
+          "variable": "",
+          "value": "",
+          "name": "",
+          "variableType": "global",
+          "id": "1"
+        }
+      ],
+      "apiRetLocalVar": {
+        "type": "variableValue",
+        "variableType": "global",
+        "variable": ""
+      },
+      "jsapiName": {
+        "type": "dynamicString",
+        "content": "",
+        "i18n": false
+      },
+      "jsapiParams": [
+        {
+          "type": "fixed",
+          "variable": "",
+          "value": "",
+          "name": "",
+          "variableType": "global",
+          "id": "1"
+        }
+      ],
+      "jsapiRetLocalVar": {
+        "type": "variableValue",
+        "variableType": "global",
+        "variable": ""
+      },
+      "callAPIName": {
+        "type": "dynamicString",
+        "content": "",
+        "i18n": false
+      },
+      "callAPIParams": [
+        {
+          "type": "fixed",
+          "variable": "",
+          "value": "",
+          "name": "",
+          "variableType": "global",
+          "id": "1"
+        }
+      ],
+      "isCallAPIParamsVariable": false,
+      "callAPIVariableParams": {
+        "type": "variableValue",
+        "variableType": "global",
+        "variable": ""
+      },
+      "visible": {
+        "type": "dynamicVisible",
+        "value": true,
+        "valueType": "fixed",
+        "condition": {
+          "op": "and",
+          "conditions": []
+        }
+      },
+      "marginLeft": 12,
+      "marginRight": 12,
+      "marginTop": 8,
+      "marginBottom": 8,
+      "disabledWhileForward": false,
+      "innerOffset": 0
+    },
+    "title": "单个按钮",
+    "hidden": false,
+    "isLocked": false,
+    "condition": true,
+    "conditionGroup": ""
+  }
+}

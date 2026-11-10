@@ -1,0 +1,12 @@
+{
+  "id": "eab-plugin-ghtest",
+  "name": "GitHub 安装验证",
+  "version": "0.2.0",
+  "description": "用于验证 GitHub tarball 安装链路的临时插件",
+  "author": "EAB 测试",
+  "license": "MIT",
+  "keywords": ["测试", "github"],
+  "compatibility": { "eab": ">=2026.11.0" },
+  "scopes": ["org:member:read"],
+  "pages": [{ "id": "ghtest", "title": "GitHub 安装验证", "file": "page.html" }]
+}

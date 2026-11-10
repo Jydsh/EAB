@@ -1,0 +1,295 @@
+[
+  {
+    "version": "v1.0",
+    "createSurface": {
+      "surfaceId": "eab-demo-surface",
+      "catalogId": "https://dingtalk.com/card/a2ui/catalogs/public/catalog.json"
+    }
+  },
+  {
+    "version": "v1.0",
+    "updateDataModel": {
+      "surfaceId": "eab-demo-surface",
+      "path": "/",
+      "value": {
+        "answer": { "text": "" },
+        "thinking": { "text": "正在分析你的问题…", "preview": "" },
+        "tools": { "text": "", "preview": "" },
+        "thinkingDone": false,
+        "ui": {
+          "showThinking": true,
+          "showThinkingPreview": false,
+          "showTools": false,
+          "showToolsPreview": false
+        }
+      }
+    }
+  },
+  {
+    "version": "v1.0",
+    "updateComponents": {
+      "surfaceId": "eab-demo-surface",
+      "components": [
+        {
+          "id": "root",
+          "component": "Card",
+          "child": "rootColumn",
+          "backgroundColor": "#FFFFFFFF",
+          "padding": 16,
+          "cornerRadius": 12
+        },
+        {
+          "id": "rootColumn",
+          "component": "Column",
+          "children": ["thinkingBlock", "toolBlock", "answer"],
+          "gap": 10
+        },
+        {
+          "id": "thinkingBlock",
+          "component": "Column",
+          "children": ["thinkingPanel", "thinkingPreview"],
+          "gap": 4,
+          "visible": { "path": "/ui/showThinking" }
+        },
+        {
+          "id": "thinkingPanel",
+          "component": "CollapsiblePanel",
+          "title": "✦ 正在思考…",
+          "variant": "reasoning",
+          "defaultExpanded": false,
+          "visible": { "path": "/ui/showThinking" },
+          "children": ["thinkingText"],
+          "fallbackMarkdown": "思考过程",
+          "textEffect": "shimmer"
+        },
+        {
+          "id": "thinkingText",
+          "component": "Markdown",
+          "content": { "path": "/thinking/text" }
+        },
+        {
+          "id": "thinkingPreview",
+          "component": "Text",
+          "text": { "path": "/thinking/preview" },
+          "maxLine": 1,
+          "visible": { "path": "/ui/showThinkingPreview" }
+        },
+        {
+          "id": "toolBlock",
+          "component": "Column",
+          "children": ["toolPanel", "toolsPreview"],
+          "gap": 4,
+          "visible": { "path": "/ui/showTools" }
+        },
+        {
+          "id": "toolPanel",
+          "component": "CollapsiblePanel",
+          "title": "🛠️ 工具调用中…",
+          "defaultExpanded": false,
+          "visible": { "path": "/ui/showTools" },
+          "children": ["toolText"],
+          "fallbackMarkdown": "工具调用记录"
+        },
+        {
+          "id": "toolText",
+          "component": "Markdown",
+          "content": { "path": "/tools/text" }
+        },
+        {
+          "id": "toolsPreview",
+          "component": "Text",
+          "text": { "path": "/tools/preview" },
+          "maxLine": 1,
+          "visible": { "path": "/ui/showToolsPreview" }
+        },
+        {
+          "id": "answer",
+          "component": "Markdown",
+          "content": { "path": "/answer/text" }
+        }
+      ]
+    }
+  },
+  {
+    "version": "v1.0",
+    "updateDataModel": {
+      "surfaceId": "eab-demo-surface",
+      "path": "/thinking/text",
+      "value": "先确认用户身份，再查部门。"
+    }
+  },
+  {
+    "version": "v1.0",
+    "updateDataModel": {
+      "surfaceId": "eab-demo-surface",
+      "path": "/thinking/preview",
+      "value": "先确认用户身份，再查部门。"
+    }
+  },
+  {
+    "version": "v1.0",
+    "updateDataModel": {
+      "surfaceId": "eab-demo-surface",
+      "path": "/ui/showThinkingPreview",
+      "value": true
+    }
+  },
+  {
+    "version": "v1.0",
+    "updateDataModel": {
+      "surfaceId": "eab-demo-surface",
+      "path": "/tools/text",
+      "value": "1. **org.directory** · 执行中\n   参数：{\"query\":\"部门\"}"
+    }
+  },
+  {
+    "version": "v1.0",
+    "updateDataModel": {
+      "surfaceId": "eab-demo-surface",
+      "path": "/tools/preview",
+      "value": "org.directory · 执行中"
+    }
+  },
+  {
+    "version": "v1.0",
+    "updateDataModel": {
+      "surfaceId": "eab-demo-surface",
+      "path": "/thinking/preview",
+      "value": ""
+    }
+  },
+  {
+    "version": "v1.0",
+    "updateDataModel": {
+      "surfaceId": "eab-demo-surface",
+      "path": "/ui/showThinkingPreview",
+      "value": false
+    }
+  },
+  {
+    "version": "v1.0",
+    "updateDataModel": {
+      "surfaceId": "eab-demo-surface",
+      "path": "/ui/showThinking",
+      "value": false
+    }
+  },
+  {
+    "version": "v1.0",
+    "updateDataModel": {
+      "surfaceId": "eab-demo-surface",
+      "path": "/ui/showTools",
+      "value": true
+    }
+  },
+  {
+    "version": "v1.0",
+    "updateDataModel": {
+      "surfaceId": "eab-demo-surface",
+      "path": "/ui/showToolsPreview",
+      "value": true
+    }
+  },
+  {
+    "version": "v1.0",
+    "updateComponents": {
+      "surfaceId": "eab-demo-surface",
+      "components": [
+        {
+          "id": "thinkingPanel",
+          "component": "CollapsiblePanel",
+          "title": "✦ 已深度思考",
+          "variant": "reasoning",
+          "defaultExpanded": false,
+          "visible": { "path": "/ui/showThinking" },
+          "children": ["thinkingText"],
+          "fallbackMarkdown": "思考过程"
+        },
+        {
+          "id": "toolPanel",
+          "component": "CollapsiblePanel",
+          "title": "🛠️ 工具调用中…",
+          "defaultExpanded": false,
+          "visible": { "path": "/ui/showTools" },
+          "children": ["toolText"],
+          "fallbackMarkdown": "工具调用记录"
+        }
+      ]
+    }
+  },
+  {
+    "version": "v1.0",
+    "updateDataModel": {
+      "surfaceId": "eab-demo-surface",
+      "path": "/answer/text",
+      "value": "**最终回答**：当前部门共有 15 人。"
+    }
+  },
+  {
+    "version": "v1.0",
+    "updateDataModel": {
+      "surfaceId": "eab-demo-surface",
+      "path": "/tools/text",
+      "value": "1. **org.directory** · 完成 · 320ms\n   参数：{\"query\":\"部门\"}\n   结果：找到 3 个部门"
+    }
+  },
+  {
+    "version": "v1.0",
+    "updateDataModel": {
+      "surfaceId": "eab-demo-surface",
+      "path": "/tools/preview",
+      "value": ""
+    }
+  },
+  {
+    "version": "v1.0",
+    "updateDataModel": {
+      "surfaceId": "eab-demo-surface",
+      "path": "/ui/showToolsPreview",
+      "value": false
+    }
+  },
+  {
+    "version": "v1.0",
+    "updateDataModel": {
+      "surfaceId": "eab-demo-surface",
+      "path": "/ui/showThinking",
+      "value": true
+    }
+  },
+  {
+    "version": "v1.0",
+    "updateDataModel": {
+      "surfaceId": "eab-demo-surface",
+      "path": "/ui/showTools",
+      "value": true
+    }
+  },
+  {
+    "version": "v1.0",
+    "updateComponents": {
+      "surfaceId": "eab-demo-surface",
+      "components": [
+        {
+          "id": "thinkingPanel",
+          "component": "CollapsiblePanel",
+          "title": "✦ 已深度思考",
+          "variant": "reasoning",
+          "defaultExpanded": false,
+          "visible": { "path": "/ui/showThinking" },
+          "children": ["thinkingText"],
+          "fallbackMarkdown": "思考过程"
+        },
+        {
+          "id": "toolPanel",
+          "component": "CollapsiblePanel",
+          "title": "🛠️ 工具调用记录",
+          "defaultExpanded": false,
+          "visible": { "path": "/ui/showTools" },
+          "children": ["toolText"],
+          "fallbackMarkdown": "工具调用记录"
+        }
+      ]
+    }
+  }
+]
