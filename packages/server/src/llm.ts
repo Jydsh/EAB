@@ -196,6 +196,31 @@ async function readError(res: Response): Promise<string> {
   return text.slice(0, 300)
 }
 
+/**
+ * 上游瞬时限流/网关错误才值得重试；超时、鉴权失败、模型名错误重试只会放大等待。
+ * 只重试响应尚未开始读取的请求，流式调用也不会因为重试而把半截内容拼两次。
+ */
+const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504])
+const RETRY_MAX_ATTEMPTS = 3
+
+function retryDelay(attempt: number, res: Response): number {
+  const retryAfter = Number(res.headers.get('retry-after') ?? '')
+  if (Number.isFinite(retryAfter) && retryAfter > 0) return Math.min(retryAfter * 1000, 2_000)
+  return attempt === 1 ? 500 : 1_000
+}
+
+async function fetchModelWithRetry(url: string, init: RequestInit): Promise<Response> {
+  for (let attempt = 1; attempt <= RETRY_MAX_ATTEMPTS; attempt += 1) {
+    const res = await fetch(url, init)
+    if (!RETRYABLE_STATUS.has(res.status) || attempt === RETRY_MAX_ATTEMPTS) return res
+    if (init.signal?.aborted) return res
+    await res.body?.cancel().catch(() => {})
+    await new Promise((resolve) => setTimeout(resolve, retryDelay(attempt, res)))
+  }
+  throw new EabError(EC.UPSTREAM, '模型请求重试次数已用完')
+}
+
+
 async function callOpenAi(
   base: string,
   key: string,
@@ -204,7 +229,7 @@ async function callOpenAi(
   maxTokens: number,
   tools: ToolSpec[] = [],
 ): Promise<CallResult> {
-  const res = await fetch(`${trimBase(base)}/chat/completions`, {
+  const res = await fetchModelWithRetry(`${trimBase(base)}/chat/completions`, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
@@ -265,7 +290,7 @@ async function callAzure(
 ): Promise<CallResult> {
   if (!base) throw new EabError(EC.VALIDATION, 'Azure OpenAI 需要填写资源 Endpoint')
   if (!key) throw new EabError(EC.VALIDATION, 'Azure OpenAI 没有可用密钥')
-  const res = await fetch(
+  const res = await fetchModelWithRetry(
     `${trimBase(base)}/openai/deployments/${encodeURIComponent(deployment)}/chat/completions?api-version=2024-06-01`,
     {
       method: 'POST',
@@ -300,7 +325,7 @@ async function callAnthropic(
   if (!key) throw new EabError(EC.VALIDATION, 'Anthropic 没有可用密钥')
   const system = messages.filter((item) => item.role === 'system').map((item) => contentAsText(item.content)).join('\n')
   const rest = messages.filter((item) => item.role !== 'system')
-  const res = await fetch(`${trimBase(base)}/messages`, {
+  const res = await fetchModelWithRetry(`${trimBase(base)}/messages`, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
@@ -344,7 +369,7 @@ async function callGemini(
       role: item.role === 'assistant' ? 'model' : 'user',
       parts: geminiParts(item.content),
     }))
-  const res = await fetch(
+  const res = await fetchModelWithRetry(
     `${trimBase(base)}/models/${encodeURIComponent(modelKey)}:generateContent?key=${encodeURIComponent(key)}`,
     {
       method: 'POST',
@@ -388,7 +413,7 @@ async function callOpenAiStream(
 ): Promise<CallResult> {
   const timeout = AbortSignal.timeout(120_000)
   const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout
-  const res = await fetch(`${trimBase(base)}/chat/completions`, {
+  const res = await fetchModelWithRetry(`${trimBase(base)}/chat/completions`, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',

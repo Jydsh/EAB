@@ -407,6 +407,26 @@
   gap: 4px;
 }
 
+.msg .who-ai {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  max-width: 72px;
+}
+
+.msg .who-ai .who-name {
+  max-width: 72px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  line-height: 1.2;
+  color: var(--muted);
+  text-align: center;
+}
+
 .msg .who-me .who-name {
   max-width: 72px;
   overflow: hidden;
@@ -448,6 +468,14 @@
 .msg .who-badge.me {
   background: var(--brand);
   color: var(--brand-ink);
+}
+
+/* 有头像时图片铺满方块；首字仍留在下层，图片加载失败后回退显示。 */
+.msg .who-badge.has-photo {
+  color: transparent;
+}
+.msg .who-badge .avatar-img {
+  z-index: 1;
 }
 
 .msg .bubble {

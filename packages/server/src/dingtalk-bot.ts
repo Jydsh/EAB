@@ -574,6 +574,15 @@ export async function notifyDingTalkUser(
   }
 }
 
+/** 绑定成功后的第一声招呼：只讲“我是谁、能做什么、去哪里继续”，不报连接状态。 */
+export function buildDingTalkWelcome(companyName: string): string {
+  return [
+    `你好，我是「${companyName}」的 EAB 企业智能助手。`,
+    '制度、部门、负责人可以直接问我；文档、表格、定时任务也可以交给我处理。',
+    '这里和 EAB 网页工作台共用同一段对话，随时可以接着聊。',
+  ].join('\n')
+}
+
 /** 绑定成功后给扫码人发一条 EAB 品牌欢迎语（失败不影响绑定结果）。 */
 export async function sendDingTalkWelcome(
   deps: ServerDeps,
@@ -581,12 +590,7 @@ export async function sendDingTalkWelcome(
   companyName: string,
 ): Promise<void> {
   if (!userId) return
-  const text = [
-    `EAB 企业智能体已连接「${companyName}」。`,
-    '我是这家公司的 EAB 企业智能助手：可以直接在钉钉私聊里问制度、查部门、找组长，也可以到 EAB 网页工作台继续同一段对话。',
-    '钉钉与网页共用同一份聊天历史；网页删除会话后，两边都不再保留这段内容。',
-  ].join('\n')
-  await notifyDingTalkUser(deps, userId, text)
+  await notifyDingTalkUser(deps, userId, buildDingTalkWelcome(companyName))
 }
 
 function resolveDingTalkUser(db: Db, companyId: string, externalId: string): string | null {
@@ -751,7 +755,7 @@ export async function handleDingTalkMessage(
   try {
     prepareDshImCompat(deps.db, {
       dbPath: deps.config.dbPath,
-      dataDir: deps.config.dataDir,
+      dshHomeDir: deps.config.dshHomeDir,
       companyId: deps.companyId,
     })
     syncDshImSession(deps.db, externalId, sessionId)

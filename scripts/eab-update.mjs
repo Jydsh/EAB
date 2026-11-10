@@ -27,7 +27,6 @@ const CODE_PATHS = [
   'packages/workspace',
   'packages/channel',
   'packages/server',
-  'packages/desktop',
   'scripts',
   'package.json',
   'pnpm-lock.yaml',

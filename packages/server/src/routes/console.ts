@@ -13,6 +13,7 @@ import { appendAudit } from '@eab/storage'
 import type { ServerDeps } from '../deps.js'
 import { ok } from '../http.js'
 import { resolveActor } from '../session.js'
+import { effectiveNetwork } from '../network-settings.js'
 import { resolveSecret, secretConfigured, storeSecret } from '../secrets.js'
 import {
   defaultWorkspaceQuota,
@@ -34,6 +35,8 @@ import {
   type ModelProfileSuggestion,
 } from '../model-registry.js'
 import { collectionVectorStats, latestKbIndexJob, startKbIndexJob } from '../kb-vector.js'
+import { callModel } from '../llm.js'
+import { createModelStressState, modelStressSnapshot, runModelStress, type ModelStressState } from '../model-stress.js'
 import {
   clearSessionCookie,
   createSession,
@@ -170,11 +173,17 @@ function requireConsole(req: FastifyRequest, deps: ServerDeps): void {
 }
 
 export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): void {
+  /** 控制台手压测任务：只在进程内保留最近结果，不落库；重启后需要重跑。 */
+  const stressJobs = new Map<
+    string,
+    { companyId: string; modelId: string; modelName: string; state: ModelStressState }
+  >()
+
   app.post<{ Body: { username?: string; password?: string; token?: string } }>(
     '/api/console/login',
     async (req, reply) => {
-      // 控制台只给服务器本机/跳板机用；要远程必须显式打开 EAB_CONSOLE_ALLOW_REMOTE=1
-      if (!deps.config.allowRemoteConsole && !isLoopback(req.ip)) {
+      // 控制台只给服务器本机/跳板机用；要远程必须显式打开。这个开关可以在系统页热切换。
+      if (!effectiveNetwork(deps.config).allowRemoteConsole && !isLoopback(req.ip)) {
         throw new EabError(EC.FORBIDDEN, '控制台只允许在服务器本机登录', {
           hint: '如需从其他机器访问，请在部署侧设置 EAB_CONSOLE_ALLOW_REMOTE=1 并配合内网/隧道',
         })
@@ -311,7 +320,7 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
         status: row.status,
         counts: { users: Number(row.users), depts: Number(row.depts), collections: Number(row.collections) },
       })),
-      defaultCompanyId: rows[0]?.id ?? deps.companyId,
+      defaultCompanyId: rows[0]?.id ?? null,
     })
   })
 
@@ -2517,6 +2526,111 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
     if (!row) throw new EabError(EC.NOT_FOUND, '模型不存在')
     deps.db.prepare('UPDATE models SET deleted_at = ?, updated_at = ? WHERE id = ?').run(Date.now(), Date.now(), id)
     return ok({ deleted: true })
+  })
+
+  app.post<{
+    Params: { id: string }
+    Body: { concurrency?: number; requests?: number; prompt?: string; maxTokens?: number }
+  }>('/api/console/models/:id/stress-test', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const modelId = String(req.params.id)
+    const model = deps.db
+      .prepare(
+        `SELECT m.id, m.name, m.model_key, m.endpoint_kind, m.enabled,
+                p.kind AS provider_kind, p.name AS provider_name, p.status AS provider_status
+           FROM models m
+           JOIN model_providers p ON p.id = m.provider_id
+          WHERE m.id = ? AND m.company_id = ? AND m.deleted_at IS NULL AND p.deleted_at IS NULL`,
+      )
+      .get(modelId, companyId) as
+      | {
+          id: string
+          name: string
+          model_key: string
+          endpoint_kind: string | null
+          enabled: number
+          provider_kind: string
+          provider_name: string
+          provider_status: string
+        }
+      | undefined
+    if (!model) throw new EabError(EC.NOT_FOUND, '模型不存在')
+    if (model.enabled !== 1) throw new EabError(EC.VALIDATION, '这个模型已停用，先启用再做压测')
+    if (model.provider_status !== 'active') throw new EabError(EC.VALIDATION, '供应商已停用，先启用再做压测')
+    if ((model.endpoint_kind ?? 'chat') !== 'chat') {
+      throw new EabError(EC.VALIDATION, '压测目前只支持对话模型；向量、重排、语音和视频模型不适用')
+    }
+    if (model.provider_kind === 'demo') {
+      throw new EabError(EC.VALIDATION, '演示回声模型没有真实上游，不能做压力测试')
+    }
+
+    const clampInt = (value: unknown, min: number, max: number, fallback: number): number => {
+      const number = Number(value)
+      if (!Number.isFinite(number)) return fallback
+      return Math.min(max, Math.max(min, Math.trunc(number)))
+    }
+    const total = clampInt(req.body?.requests, 1, 100, 10)
+    const concurrency = Math.min(total, clampInt(req.body?.concurrency, 1, 20, 3))
+    const prompt = String(req.body?.prompt ?? '').trim() || '请只回复 OK。'
+    if (prompt.length > 2000) throw new EabError(EC.VALIDATION, '测试提示词最多 2000 字')
+    const maxTokens = clampInt(req.body?.maxTokens, 16, 512, 128)
+
+    const jobId = `stress_${randomUUID()}`
+    const state = createModelStressState(total, concurrency)
+    stressJobs.set(jobId, { companyId, modelId, modelName: model.name, state })
+    for (const [key, job] of stressJobs) {
+      if (stressJobs.size <= 32) break
+      if (!job.state.running && job.companyId === companyId) stressJobs.delete(key)
+    }
+
+    void runModelStress(state, async () => {
+      const result = await callModel(deps.db, deps.config.dbPath, companyId, modelId, [
+        { role: 'user' as const, content: prompt },
+      ], maxTokens)
+      if (!result) throw new EabError(EC.UPSTREAM, '模型没有返回真实结果')
+      if (!result.text.trim()) throw new EabError(EC.UPSTREAM, '模型返回了空正文')
+      return result
+    }).catch((error) => {
+      state.running = false
+      state.finishedAt = Date.now()
+      state.errors.push({
+        index: state.completed,
+        code: error instanceof EabError ? error.code : 'EAB_STRESS_FAILED',
+        message: error instanceof Error ? error.message : String(error),
+        durationMs: 0,
+      })
+    })
+
+    return ok({
+      jobId,
+      status: 'running',
+      model: {
+        id: model.id,
+        name: model.name,
+        modelKey: model.model_key,
+        providerName: model.provider_name,
+        providerKind: model.provider_kind,
+      },
+      total,
+      concurrency,
+      prompt,
+      maxTokens,
+      startedAt: state.startedAt,
+    })
+  })
+
+  app.get<{ Params: { jobId: string } }>('/api/console/model-stress-tests/:jobId', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const job = stressJobs.get(String(req.params.jobId))
+    if (!job || job.companyId !== companyId) throw new EabError(EC.NOT_FOUND, '压测任务不存在或已过期')
+    return ok({
+      jobId: req.params.jobId,
+      modelId: job.modelId,
+      modelName: job.modelName,
+      ...modelStressSnapshot(job.state),
+    })
   })
 
   /* ---------------- 模型用途路由：把"要干什么"绑定到"哪个模型" ---------------- */

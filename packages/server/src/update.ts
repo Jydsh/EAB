@@ -4,7 +4,6 @@
  * 设计边界：
  * - 只读 GitHub API，不执行远程脚本；
  * - 确认更新后，交给 scripts/eab-update.mjs 下载源码包、备份、替换、重启；
- * - 桌面端走自己的安装包更新，不在这里替换 Electron 文件。
  */
 import { spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'

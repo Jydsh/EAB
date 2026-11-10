@@ -25,6 +25,9 @@ export const DSH_IM_COMPAT_VERSION = '5.10.0-eab.1'
 
 export interface DshImOptions {
   readonly dbPath: string
+  /** 已解析的插件运行数据目录；配置后会直接使用，不再拼接 dsh-home */
+  readonly dshHomeDir?: string
+  /** 兼容旧调用：没给 dshHomeDir 时在它下面拼 dsh-home */
   readonly dataDir?: string
   readonly companyId: string
 }
@@ -32,8 +35,9 @@ export interface DshImOptions {
 let currentOptions: DshImOptions | null = null
 let currentRoot: string | null = null
 
-/** dsh-im 兼容根目录（与 EAB 数据目录同盘，切数据盘会一起搬走） */
+/** dsh-im 兼容根目录：优先用控制台配置的独立路径，没配则跟随数据目录。 */
 export function dshCompatRoot(options: DshImOptions): string {
+  if (options.dshHomeDir) return options.dshHomeDir
   return join(options.dataDir || dirname(options.dbPath), 'dsh-home')
 }
 

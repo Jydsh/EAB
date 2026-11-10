@@ -21,14 +21,11 @@
     "dev": "pnpm --filter @eab/server dev",
     "eab": "node scripts/eab.mjs",
     "server": "node scripts/eab.mjs server",
-    "desktop:build": "node scripts/build-desktop.mjs",
-    "desktop:dist": "node scripts/build-desktop.mjs && pnpm --filter @eab/desktop dist",
     "demo:kb": "tsx demo/kb-visibility.ts"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
     "@types/qrcode": "^1.5.6",
-    "esbuild": "^0.28.2",
     "tsx": "^4.23.15",
     "typescript": "^5.7.2",
     "vitest": "^2.1.8"

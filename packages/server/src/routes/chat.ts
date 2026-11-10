@@ -22,7 +22,14 @@ import { executeTool, resolveToolByFunctionName, toolSpecsForActor, toolSpecsFor
 import { executePluginTool, pluginPromptTexts, resolvePluginToolForActor } from '../plugin-tools.js'
 import { subscribeChatEvents } from '../chat-events.js'
 import { assertChatQuota } from '../quota.js'
+import { createChatCapacity } from '../chat-capacity.js'
 import { findLocalSpaceRow, type ActiveSpace } from '../local-space.js'
+import {
+  acquireAgentSessionLock,
+  recordAgentStep,
+  startAgentRun,
+  type AgentRunStatus,
+} from '../agent-runtime.js'
 
 /** CHAT-05：会话级串行锁（同一会话同一时刻只有一个 turn 在跑） */
 interface TurnLock {
@@ -518,8 +525,10 @@ export function buildSystemPrompt(opts: {
   pluginPrompts?: readonly string[]
   /** 当前文件空间说明；用于告诉模型该用哪套文件工具，且不要输出绝对路径 */
   spaceLabel?: string
+  /** 当前文件空间类型；与 spaceLabel 一起锁定本轮可用工具，避免跨空间引用 */
+  spaceKind?: 'cloud' | 'local' | 'none'
 }): string {
-  const { actor, chatTools, memories, hits, hasAttachments, pluginPrompts = [], spaceLabel } = opts
+  const { actor, chatTools, memories, hits, hasAttachments, pluginPrompts = [], spaceLabel, spaceKind } = opts
   const nowLabel = new Intl.DateTimeFormat('zh-CN', {
     timeZone: 'Asia/Shanghai',
     year: 'numeric',
@@ -530,18 +539,43 @@ export function buildSystemPrompt(opts: {
     minute: '2-digit',
     hour12: false,
   }).format(new Date())
+  const spaceRule =
+    spaceKind === 'local'
+      ? [
+          `当前文件空间：${spaceLabel || '本地空间'}。本轮只允许使用本地空间工具（local_ 开头），云空间工具（workspace_ 开头）本轮不可用。`,
+          `不要把云空间、历史对话或其他会话里出现的文件当成当前本地空间的文件；也不要用「云空间」来称呼当前空间，当前空间名称以上一句为准。`,
+          '不要尝试通过 tool_search 或插件寻找访问云空间的工具；用户要云空间文件时，只提示他在输入区切换空间。',
+          '所有文件路径都相对于当前本地空间根目录；不要输出、猜测或编造本地绝对路径。',
+        ].join('\n')
+      : spaceKind === 'cloud'
+        ? [
+            `当前文件空间：${spaceLabel || '云空间'}。云空间是默认空间，用户没有单独选择也可以使用；本轮只允许使用云空间工具（workspace_ 开头），本地空间工具（local_ 开头）本轮不可用。`,
+            '不要把历史对话或其他会话里出现的本地文件当成云空间文件；回答里提到当前空间时统一说「云空间」。',
+            '用户要操作本地磁盘文件时，先请他在输入区选择本地空间，不要假装已经读取了本地文件。',
+            '不要尝试通过 tool_search 或插件寻找访问本地磁盘的工具；用户要本地文件时，只提示他在输入区选择本地空间。',
+            '所有文件路径都相对于云空间根目录；不要输出、猜测或编造本地绝对路径。',
+          ].join('\n')
+        : spaceKind === 'none'
+          ? '当前未选择文件空间：本轮没有任何文件读写工具，云空间和本地空间都不能操作；用户要读写文件时，请先让他选择云空间（可直接使用）或本地空间（必须选择）。'
+          : spaceLabel
+            ? `当前文件空间：${spaceLabel}。本轮只使用与该空间对应的文件工具，不要混用另一个空间的文件或工具；所有文件路径都相对于该空间根目录，不要输出、猜测或编造本地绝对路径。`
+            : ''
   return [
     `你是「${actor.person.companyName}」的企业智能助手 EAB（Enterprise Agent Base），当前用户是 ${actor.person.name}（${actor.person.deptName}）。`,
     `当前时间：${nowLabel}（Asia/Shanghai）。用户说“今天/现在/本周”时以此为准；需要精确到秒、换算日程或时区时再调用 time_now，不要靠心算日期和星期。`,
     '回答要简洁、可执行。涉及公司制度、流程、资料时，只能依据下面提供的知识库片段；片段不足以回答就直说“现有资料里没有”，不要编造。',
-    spaceLabel
-      ? `当前文件空间：${spaceLabel}。所有文件路径都相对于该空间根目录；不要输出、猜测或编造本地绝对路径。`
-      : '',
+    spaceRule,
     chatTools.length > 0
       ? `你可以调用工具获取实时信息或本企业数据（当前已加载：${chatTools.map((tool) => tool.function.name).join('、')}）。需要精确时间、通讯录或知识库检索时优先调用这些工具，拿到结果再回答；计算等未直接列出的能力先按下面的工具搜索规则加载。不要编造工具结果。`
       : '',
     chatTools.some((tool) => tool.function.name === 'tool_search')
-      ? '当前工具列表只是常用工具，不是全部。需要文件发送/重命名/删除、云空间容量、定时任务列表、计算、插件等未直接列出的能力时，先调用 tool_search，query 写用户原话或中文/英文能力词；工具结果返回后，命中的工具会自动加载为可调用工具，直接继续调用即可，不要向用户解释工具加载机制，也不要因为当前列表里没有就直接说做不到。'
+      ? spaceKind === 'local'
+        ? '当前工具列表只是常用工具，不是全部。需要文件发送/重命名/删除、定时任务列表、计算、插件等未直接列出的能力时，先调用 tool_search；但当前在本地空间，query 只能写本地文件/目录相关能力，不要搜云空间工具、云空间容量或“发送到云空间”。工具结果返回后，命中的工具会自动加载为可调用工具，直接继续调用即可。'
+        : spaceKind === 'cloud'
+          ? '当前工具列表只是常用工具，不是全部。需要文件发送/重命名/删除、容量、定时任务列表、计算、插件等未直接列出的能力时，先调用 tool_search；当前在云空间，query 只能写云空间文件/容量相关能力，不要搜本地磁盘工具。工具结果返回后，命中的工具会自动加载为可调用工具，直接继续调用即可。'
+          : spaceKind === 'none'
+            ? '当前工具列表只是常用工具，不是全部；但本轮未选择文件空间，tool_search 不会返回文件读写工具。用户要文件操作时，直接请他在输入区选择云空间（可直接使用）或本地空间（必须选择）。'
+            : '当前工具列表只是常用工具，不是全部。需要文件发送/重命名/删除、容量、定时任务列表、计算、插件等未直接列出的能力时，先调用 tool_search，query 写用户原话或中文/英文能力词；工具结果返回后，命中的工具会自动加载为可调用工具，直接继续调用即可，不要向用户解释工具加载机制，也不要因为当前列表里没有就直接说做不到。'
       : '',
     chatTools.some((tool) => tool.function.name === 'org_directory')
       ? '遇到“我的组长是谁 / 我在哪个部门 / 公司有哪些部门 / 某部门有谁 / 找某个人”这类组织问题时，直接调用 org_directory 工具，从当前对话推断 intent，不要先让用户输入姓名。工具返回 denied 或没有负责人时，如实说明权限或数据缺失，不要猜。'
@@ -755,6 +789,7 @@ export type AgentEvent =
   | { type: 'tool_result'; id: string; status: 'done' | 'error'; summary: string; durationMs: number }
 
 export interface AgentTurnResult {
+  runId: string
   text: string
   reasoning: string
   toolCalls: AgentToolTrace[]
@@ -775,6 +810,159 @@ function parseToolArgs(raw: string): Record<string, unknown> {
   } catch {
     return {}
   }
+}
+
+interface SubAgentTask {
+  title?: string
+  prompt: string
+  modelId?: string
+  retries?: number
+}
+
+interface SubAgentResult {
+  runId: string
+  title: string
+  modelId: string
+  status: 'succeeded' | 'failed' | 'cancelled'
+  durationMs: number
+  attempts: number
+  text?: string
+  error?: string
+  toolCount: number
+}
+
+/** agent.spawn 的 tasks 参数；模型有时会直接给数组，这里两种都接受。 */
+function parseSubAgentTasks(raw: unknown): SubAgentTask[] {
+  let value: unknown = raw
+  if (typeof raw === 'string') {
+    try {
+      value = JSON.parse(raw)
+    } catch {
+      throw new EabError(EC.VALIDATION, 'tasks 不是合法 JSON 数组')
+    }
+  }
+  if (!Array.isArray(value)) throw new EabError(EC.VALIDATION, 'tasks 必须是 JSON 数组')
+  return value.map((item, index) => {
+    if (!item || typeof item !== 'object') throw new EabError(EC.VALIDATION, `第 ${index + 1} 个子任务不是对象`)
+    const record = item as Record<string, unknown>
+    const prompt = String(record.prompt ?? '').trim()
+    if (!prompt) throw new EabError(EC.VALIDATION, `第 ${index + 1} 个子任务缺少 prompt`)
+    return {
+      prompt,
+      title: record.title === undefined ? undefined : String(record.title).slice(0, 80),
+      modelId: record.modelId === undefined ? undefined : String(record.modelId),
+      retries: record.retries === undefined ? undefined : Number(record.retries),
+    }
+  })
+}
+
+/** 并行跑多个子 Agent；每个子任务独立 runId、独立 session，失败/重试互不影响。 */
+async function spawnSubAgents(opts: {
+  deps: ServerDeps
+  actor: RequestActor
+  parentRunId: string
+  parentModelId: string
+  depth: number
+  space: ActiveSpace
+  signal?: AbortSignal
+  tasks: SubAgentTask[]
+}): Promise<{ ok: true; agents: SubAgentResult[] }> {
+  const maxDepth = Math.max(1, opts.deps.config.agentMaxDepth ?? 2)
+  if (opts.depth + 1 > maxDepth) {
+    throw new EabError(EC.VALIDATION, `子 Agent 嵌套超过上限（最多 ${maxDepth} 层）`)
+  }
+  const maxParallel = Math.max(1, Math.min(8, opts.deps.config.agentMaxParallel ?? 4))
+  const tasks = opts.tasks.slice(0, maxParallel)
+  const catalog = loadModelCatalog(opts.deps.db, opts.actor.subject.companyId, opts.deps.config.devAuth)
+  const allowedModels = new Set(
+    visibleModelsFor(catalog, [...opts.actor.subject.roles]).map((model) => model.id),
+  )
+  // 父回合已经通过的模型允许子 Agent 继续使用；只对显式覆盖的模型再做可见性校验。
+  allowedModels.add(opts.parentModelId)
+  const maxRetries = Math.max(0, Math.min(3, opts.deps.config.agentMaxRetries ?? 1))
+
+  const agents = await Promise.all(
+    tasks.map(async (task, index): Promise<SubAgentResult> => {
+      const title = task.title ?? `子任务 ${index + 1}`
+      const modelId = task.modelId || opts.parentModelId
+      if (!allowedModels.has(modelId)) {
+        return {
+          runId: '',
+          title,
+          modelId,
+          status: 'failed',
+          durationMs: 0,
+          attempts: 0,
+          error: `模型不可用或未对当前员工开放: ${modelId}`,
+          toolCount: 0,
+        }
+      }
+      const retries = Number.isFinite(task.retries ?? NaN)
+        ? Math.max(0, Math.min(maxRetries, Math.floor(task.retries ?? 0)))
+        : maxRetries
+      let lastError = ''
+      let lastRunId = ''
+      for (let attempt = 0; attempt <= retries; attempt += 1) {
+        const runId = randomUUID()
+        lastRunId = runId
+        const startedAt = Date.now()
+        try {
+          const result = await runAgentTurn({
+            deps: opts.deps,
+            actor: opts.actor,
+            modelId,
+            runId,
+            parentRunId: opts.parentRunId,
+            agentId: `sub-${index + 1}`,
+            agentTitle: title,
+            depth: opts.depth + 1,
+            sessionId: `agent:${runId}`,
+            sessionLockKey: `agent:${runId}`,
+            budget: 4096,
+            messages: [{ role: 'user', content: task.prompt }],
+            emit: () => {},
+            space: opts.space,
+            signal: opts.signal,
+          })
+          return {
+            runId,
+            title,
+            modelId,
+            status: 'succeeded',
+            durationMs: Date.now() - startedAt,
+            attempts: attempt + 1,
+            text: result?.text ? result.text.slice(0, 2400) : '',
+            toolCount: result?.toolCalls.length ?? 0,
+          }
+        } catch (error) {
+          lastError = error instanceof EabError ? error.message : (error as Error)?.message ?? '子 Agent 执行失败'
+          if (opts.signal?.aborted) {
+            return {
+              runId,
+              title,
+              modelId,
+              status: 'cancelled',
+              durationMs: Date.now() - startedAt,
+              attempts: attempt + 1,
+              error: lastError,
+              toolCount: 0,
+            }
+          }
+        }
+      }
+      return {
+        runId: lastRunId,
+        title,
+        modelId,
+        status: 'failed',
+        durationMs: 0,
+        attempts: retries + 1,
+        error: lastError,
+        toolCount: 0,
+      }
+    }),
+  )
+  return { ok: true, agents }
 }
 
 /** 从 tool_search 的返回里取出 function 名，供下一轮动态加载完整 Schema。 */
@@ -807,30 +995,87 @@ export async function runAgentTurn(opts: {
   space?: ActiveSpace
   /** 用户停止生成时用它中止在途模型调用 */
   signal?: AbortSignal
+  /** 外部指定 runId（子 Agent 用）；不传则本次自动生成 */
+  runId?: string
+  /** 父 runId；子 Agent 必须指向派生它的父 run */
+  parentRunId?: string
+  /** 运行树里的 Agent 标识与展示标题 */
+  agentId?: string
+  agentTitle?: string
+  /** 0=根对话，1=第一层子 Agent；限制递归派生 */
+  depth?: number
+  /** 子 Agent 独立会话锁；不传表示调用方已经持有父会话锁 */
+  sessionLockKey?: string
+  /** token 预算，仅作为运行树展示与上限提示 */
+  budget?: number
 }): Promise<AgentTurnResult | null> {
   const { deps, actor, modelId, emit } = opts
-  const space = opts.space ?? { kind: 'cloud' }
-  // 全量工具只用于“可加载目录”和权限校验；真正发给模型的是核心工具 + tool_search。
-  const allTools = toolSpecsForActor(deps.db, actor, space)
-  let tools = toolSpecsForAgent(deps.db, actor, space)
-  const allowedToolNames = new Set(allTools.map((tool) => tool.function.name))
-  const activeToolNames = new Set(tools.map((tool) => tool.function.name))
-  const modelProfile = findModelById(deps.db, actor.subject.companyId, modelId)
-  const maxOutputTokens = opts.maxTokens ?? modelProfile?.maxOutputTokens ?? 4096
-  let messages: LlmMessage[] = [...opts.messages]
-  if (modelProfile?.maxContext && modelProfile.contextCompression !== false) {
-    const compressed = compressMessagesForContext(messages, {
-      maxContext: modelProfile.maxContext,
-      maxOutputTokens,
-      toolTokens: estimateTokens(JSON.stringify(tools)),
-    })
-    messages = compressed.messages
-  }
-  const traces: AgentToolTrace[] = []
-  let text = ''
-  let reasoning = ''
+  const runId = opts.runId ?? randomUUID()
+  const depth = opts.depth ?? 0
+  let sessionRelease: (() => void) | null = null
+  let runStatus: AgentRunStatus = 'succeeded'
+  let runError: string | null = null
   let promptTokens = 0
   let completionTokens = 0
+  const run = startAgentRun(
+    deps.db,
+    {
+      id: runId,
+      companyId: actor.subject.companyId,
+      userId: actor.person.id,
+      parentRunId: opts.parentRunId ?? null,
+      agentId: opts.agentId ?? (depth === 0 ? 'eab-main' : 'sub-agent'),
+      title: opts.agentTitle ?? null,
+      modelId,
+      sessionId: opts.sessionId ?? null,
+      budget: opts.budget ?? null,
+    },
+    opts.signal,
+  )
+  try {
+    if (opts.sessionLockKey) {
+      try {
+        sessionRelease = await acquireAgentSessionLock(opts.sessionLockKey, opts.signal)
+      } catch (error) {
+        runStatus = opts.signal?.aborted ? 'cancelled' : 'failed'
+        runError = error instanceof Error ? error.message : '会话锁获取失败'
+        throw error
+      }
+    }
+    return await runAgentTurnBody()
+  } catch (error) {
+    runStatus = opts.signal?.aborted || run.signal.aborted ? 'cancelled' : 'failed'
+    runError = error instanceof Error ? error.message : 'Agent 执行失败'
+    throw error
+  } finally {
+    sessionRelease?.()
+    run.finish(runStatus, runError, promptTokens + completionTokens)
+  }
+
+  async function runAgentTurnBody(): Promise<AgentTurnResult | null> {
+    const space = opts.space ?? { kind: 'cloud' }
+    // 一次用户消息内的稳定回合 id：同一回合模型重复发出相同工具调用时只执行一次。
+    const turnId = randomUUID()
+    // 全量工具只用于“可加载目录”和权限校验；真正发给模型的是核心工具 + tool_search。
+    const allTools = toolSpecsForActor(deps.db, actor, space)
+    let tools = toolSpecsForAgent(deps.db, actor, space)
+    const allowedToolNames = new Set(allTools.map((tool) => tool.function.name))
+    const activeToolNames = new Set(tools.map((tool) => tool.function.name))
+    const modelProfile = findModelById(deps.db, actor.subject.companyId, modelId)
+    const maxOutputTokens = opts.maxTokens ?? modelProfile?.maxOutputTokens ?? 4096
+    let messages: LlmMessage[] = [...opts.messages]
+    if (modelProfile?.maxContext && modelProfile.contextCompression !== false) {
+      const compressed = compressMessagesForContext(messages, {
+        maxContext: modelProfile.maxContext,
+        maxOutputTokens,
+        toolTokens: estimateTokens(JSON.stringify(tools)),
+      })
+      messages = compressed.messages
+    }
+    const traces: AgentToolTrace[] = []
+    let stepSeq = 0
+    let text = ''
+  let reasoning = ''
   let rounds = 0
   let sawModel = false
 
@@ -911,16 +1156,43 @@ export async function runAgentTurn(opts: {
           throw new EabError(EC.VALIDATION, `工具尚未加载: ${functionName}。请先调用 tool_search 搜索能力，再调用返回的工具。`)
         }
         if (!def && !pluginTool) throw new EabError(EC.NOT_FOUND, `模型调用了未注册的工具: ${functionName}`)
-        if (def) {
+        if (functionName === 'agent_spawn') {
+          payload = await spawnSubAgents({
+            deps,
+            actor,
+            parentRunId: runId,
+            parentModelId: modelId,
+            depth,
+            space,
+            signal: opts.signal,
+            tasks: parseSubAgentTasks(args.tasks),
+          })
+          if (opts.signal?.aborted) {
+            const abortError = new Error('子 Agent 已随父任务取消')
+            abortError.name = 'AbortError'
+            throw abortError
+          }
+        } else if (def) {
           payload = await executeTool(deps, actor, def.id, args, space, {
             sessionId: opts.sessionId,
             channel: space.kind === 'cloud' && space.channel?.startsWith('dingtalk') ? 'dingtalk' : 'web',
+            signal: opts.signal,
+            turnId,
           })
         } else if (pluginTool) {
-          payload = await executePluginTool(pluginTool, args, {
-            agent: { session: { id: opts.sessionId ?? '' } },
-            session: { id: opts.sessionId ?? '' },
-          })
+          payload = await executePluginTool(
+            pluginTool,
+            args,
+            {
+              agent: { session: { id: opts.sessionId ?? '' } },
+              session: { id: opts.sessionId ?? '' },
+            },
+            {
+              maxConcurrent: deps.config.pluginToolMaxConcurrent ?? 4,
+              timeoutMs: deps.config.pluginToolTimeoutMs ?? 60_000,
+              signal: opts.signal,
+            },
+          )
           if (payload === undefined || payload === null) payload = { ok: true }
         }
         if (functionName === 'tool_search') {
@@ -938,6 +1210,18 @@ export async function runAgentTurn(opts: {
         payload = { error: trace.summary }
       }
       trace.durationMs = Date.now() - started
+      recordAgentStep(deps.db, {
+        runId,
+        seq: stepSeq,
+        kind: 'tool',
+        toolId,
+        name: toolName,
+        status: trace.status === 'done' ? 'done' : 'error',
+        args,
+        resultSummary: trace.summary,
+        durationMs: trace.durationMs,
+      })
+      stepSeq += 1
       emit({
         type: 'tool_result',
         id: traceId,
@@ -956,10 +1240,22 @@ export async function runAgentTurn(opts: {
   }
 
   if (!sawModel) return null
-  return { text, reasoning, toolCalls: traces, rounds, promptTokens, completionTokens }
+  return { runId, text, reasoning, toolCalls: traces, rounds, promptTokens, completionTokens }
+  }
 }
 
 export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void {
+  const capacity =
+    deps.chatCapacity ??
+    createChatCapacity({
+      maxConcurrent: deps.config.chatMaxConcurrent ?? 8,
+      queueLimit: deps.config.chatQueueLimit ?? 100,
+      queueTimeoutMs: deps.config.chatQueueTimeoutMs ?? 240_000,
+      maxInFlightPerUser: deps.config.chatUserMaxInFlight ?? 2,
+      messagesPerMinute: deps.config.chatUserMessagesPerMinute ?? 20,
+      modelMaxConcurrent: deps.config.chatModelMaxConcurrent ?? 4,
+      companyMaxConcurrent: deps.config.chatCompanyMaxConcurrent ?? deps.config.chatMaxConcurrent ?? 8,
+    })
   app.get('/api/chat/models', async (req) => {
     const { subject, person } = resolveActor(deps.db, deps.config, req, deps.companyId)
     const roles = [...subject.roles]
@@ -1372,7 +1668,14 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
       })
     }
 
-    const sessionId = ensureSession(deps.db, actor, req.body?.sessionId, text || attachments[0]?.name || '新对话')
+    const capacitySlot = await capacity.acquire(actor.person.id, {
+      companyId: actor.subject.companyId,
+      modelId: model.id,
+    })
+    let sessionId = ''
+    let turnToken: string | null = null
+    try {
+    sessionId = ensureSession(deps.db, actor, req.body?.sessionId, text || attachments[0]?.name || '新对话')
     deps.db
       .prepare('UPDATE chat_sessions SET space_kind = ?, space_id = ?, updated_at = ?, last_message_at = ? WHERE id = ?')
       .run(
@@ -1382,7 +1685,7 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
         Date.now(),
         sessionId,
       )
-    const turnToken = await acquireTurn(sessionId)
+    turnToken = await acquireTurn(sessionId)
     const abortController = new AbortController()
     const hits = await retrieveKb(deps.db, deps.config.dbPath, actor, text)
     const memories = deps.db
@@ -1408,6 +1711,7 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
       hasAttachments: attachments.length > 0,
       pluginPrompts,
       spaceLabel,
+      spaceKind: space.kind,
     })
 
     const messages: LlmMessage[] = [
@@ -1505,7 +1809,7 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
         },
       })
     } catch (error) {
-      releaseTurn(sessionId, turnToken)
+      if (turnToken) releaseTurn(sessionId, turnToken)
       // 用户主动停止（SSE 断开）不是失败：不写失败审计、不再往断开的连接写事件。
       if (abortController.signal.aborted) {
         if (streaming) {
@@ -1600,7 +1904,7 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
         JSON.stringify(meta),
         Date.now(),
       )
-    releaseTurn(sessionId, turnToken)
+    if (turnToken) releaseTurn(sessionId, turnToken)
     deps.db
       .prepare('UPDATE chat_sessions SET updated_at = ?, last_message_at = ? WHERE id = ?')
       .run(Date.now(), Date.now(), sessionId)
@@ -1665,5 +1969,11 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
         createdAt: new Date().toISOString(),
       },
     })
+    } finally {
+      // 无论成功、模型失败还是客户端中断，都要把全局名额和会话锁还回去；
+      // 否则一次异常就会永久占住一个并发槽，直到进程重启。
+      if (turnToken) releaseTurn(sessionId, turnToken)
+      capacitySlot.release()
+    }
   })
 }

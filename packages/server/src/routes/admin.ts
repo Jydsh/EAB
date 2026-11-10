@@ -5,10 +5,12 @@
  * 这些接口与页面一一对应，不靠脚本造数据。
  */
 import type { FastifyInstance, FastifyRequest } from 'fastify'
-import { mkdirSync, existsSync, statSync, readdirSync } from 'node:fs'
-import { join, resolve as resolvePath } from 'node:path'
+import { mkdirSync, existsSync, statSync, readdirSync, unlinkSync } from 'node:fs'
+import { spawn } from 'node:child_process'
+import { basename, dirname, join, resolve as resolvePath } from 'node:path'
 import QRCode from 'qrcode'
 import { EC, EabError, isKnownScope, normalizeMobile, ulid } from '@eab/domain'
+import { BUILTIN_ROLES } from '@eab/authz'
 import { appendAudit, verifyAuditChain } from '@eab/storage'
 import {
   applyOrgSync,
@@ -25,6 +27,7 @@ import { isConsoleRequest } from '../console-auth.js'
 import { hashPassword } from '../password.js'
 import { revokeAllSessions } from '../employee-session.js'
 import { storeSecret } from '../secrets.js'
+import { companyAssistantView, resolveAssistantDataDir, saveCompanyAssistant } from '../company-assistant.js'
 import { refreshDingTalkStream, sendDingTalkWelcome } from '../dingtalk-bot.js'
 
 function requireConsole(req: FastifyRequest, deps: ServerDeps): void {
@@ -59,6 +62,23 @@ function audit(
   })
 }
 
+/** 备份目录：优先用控制台配置的独立路径，没配则跟随数据库同级 backups。 */
+function backupDir(deps: ServerDeps): string {
+  return deps.config.backupsDir ?? resolvePath(deps.config.dbPath, '..', 'backups')
+}
+
+/** 备份操作只接受备份目录下的文件名，避免把任意路径带进删除或打开动作。 */
+function resolveBackupFile(deps: ServerDeps, rawName: unknown): { dir: string; file: string; size: number } {
+  const name = String(rawName ?? '')
+  if (!name || name !== basename(name) || !name.endsWith('.db')) {
+    throw new EabError(EC.VALIDATION, '备份文件名不合法')
+  }
+  const dir = backupDir(deps)
+  const file = join(dir, name)
+  if (!existsSync(file) || !statSync(file).isFile()) throw new EabError(EC.NOT_FOUND, '备份不存在')
+  return { dir, file, size: statSync(file).size }
+}
+
 function text(value: unknown, field: string, max = 200): string {
   const out = String(value ?? '').trim()
   if (!out) throw new EabError(EC.VALIDATION, `${field} 不能为空`)
@@ -72,6 +92,22 @@ function optionalText(value: unknown, max = 200): string | null {
   if (!out) return null
   if (out.length > max) throw new EabError(EC.VALIDATION, `字段最多 ${max} 字`)
   return out
+}
+
+/**
+ * 员工端登录时账号会同时匹配工号、邮箱和手机号（见 auth.ts 的登录查询）。
+ * 新建管理员前按同一口径查占用，避免只查工号时仍然撞掉已有登录身份。
+ */
+function findAccountOwner(deps: ServerDeps, account: string): { id: string; name: string } | undefined {
+  const mobileAccount = normalizeMobile(account)
+  return deps.db
+    .prepare(
+      `SELECT id, name FROM users
+        WHERE lower(employee_no) = lower(?) OR lower(email) = lower(?)
+           OR (mobile IS NOT NULL AND mobile <> '' AND (mobile = ? OR mobile = ?))
+        ORDER BY created_at LIMIT 1`,
+    )
+    .get(account, account, mobileAccount, account) as { id: string; name: string } | undefined
 }
 
 interface DeptRow {
@@ -910,17 +946,35 @@ export function registerAdminRoutes(app: FastifyInstance, deps: ServerDeps): voi
     }
   }>('/api/console/companies', async (req) => {
     requireConsole(req, deps)
-    throw new EabError(EC.CONFLICT, '当前是单公司本地部署，只允许一家公司', {
-      hint: '需要接入企业组织请走「钉钉扫码绑定组织」；本实例不会新建第二家公司。',
-    })
+    /**
+     * 单公司实例只允许一家公司，但“空库”是首次部署的正常状态：
+     * GitHub 发布后在服务器上第一次打开 /admin，库里还没有任何公司，
+     * 此时必须允许创建这一家，否则控制台永远进不去。
+     */
+    const existing = deps.db
+      .prepare('SELECT id, name FROM companies WHERE deleted_at IS NULL ORDER BY created_at ASC LIMIT 1')
+      .get() as { id: string; name: string } | undefined
+    if (existing) {
+      throw new EabError(EC.CONFLICT, '当前是单公司本地部署，只允许一家公司', {
+        hint: `本实例已经有公司「${existing.name}」；需要换组织请先删除它，或走「钉钉扫码绑定组织」。`,
+      })
+    }
+
     const name = text(req.body?.name, '公司名称', 80)
-    const slug = text(req.body?.slug, 'slug', 40).toLowerCase()
-    if (!/^[a-z][a-z0-9-]{1,39}$/.test(slug)) throw new EabError(EC.VALIDATION, 'slug 只能是小写字母开头、字母数字和短横线')
-    const exists = deps.db.prepare('SELECT id FROM companies WHERE slug = ?').get(slug)
-    if (exists) throw new EabError(EC.VALIDATION, `slug ${slug} 已存在`)
+    const requestedSlug = optionalText(req.body?.slug, 40)
+    let slug = (requestedSlug ?? `eab-${ulid().slice(-8)}`).toLowerCase()
+    if (!/^[a-z][a-z0-9-]{1,39}$/.test(slug)) {
+      throw new EabError(EC.VALIDATION, 'slug 只能是小写字母开头、字母数字和短横线')
+    }
+    for (let attempt = 0; deps.db.prepare('SELECT id FROM companies WHERE slug = ?').get(slug); attempt += 1) {
+      if (requestedSlug) throw new EabError(EC.VALIDATION, `slug ${slug} 已存在`)
+      if (attempt >= 5) throw new EabError(EC.CONFLICT, '自动生成的公司标识连续冲突，请手动填写 slug')
+      slug = `eab-${ulid().slice(-8)}`.toLowerCase()
+    }
 
     const now = Date.now()
-    const companyId = `c_${ulid()}`
+    /** 单公司：公司 ID 固定用配置值（默认 c1），这样控制台、员工端和后续绑定都指向同一家。 */
+    const companyId = deps.companyId
     const rootDeptId = `d_${ulid()}`
     deps.db.exec('BEGIN')
     try {
@@ -934,34 +988,37 @@ export function registerAdminRoutes(app: FastifyInstance, deps: ServerDeps): voi
         )
         .run(rootDeptId, companyId, '公司总部', `/${companyId}/`, now)
 
-      // 新公司复制一套内置角色（权限点一致，角色 id 独立）
-      const template = deps.db
-        .prepare(
-          `SELECT r.id, r.code, r.name, r.data_scope, r.builtin FROM roles r
-            WHERE r.deleted_at IS NULL
-            GROUP BY r.code
-            ORDER BY r.builtin DESC LIMIT 20`,
-        )
-        .all() as unknown as Array<{ id: string; code: string; name: string; data_scope: string; builtin: number }>
+      /**
+       * 空库里没有可复制的旧角色，必须直接从代码里的 BUILTIN_ROLES 建一套；
+       * 否则新公司没有任何角色，后续成员授权和权限判断都会是空的。
+       */
       const insertRole = deps.db.prepare(
         'INSERT INTO roles (id, company_id, code, name, data_scope, builtin, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
       )
       const insertScope = deps.db.prepare('INSERT OR IGNORE INTO role_scopes (role_id, scope) VALUES (?, ?)')
       const roleByCode = new Map<string, string>()
-      for (const role of template) {
+      for (const role of BUILTIN_ROLES) {
         const roleId = `r_${ulid()}`
-        insertRole.run(roleId, companyId, role.code, role.name, role.data_scope, role.builtin, now)
-        const scopes = deps.db.prepare('SELECT scope FROM role_scopes WHERE role_id = ?').all(role.id) as unknown as Array<{ scope: string }>
-        for (const scope of scopes) insertScope.run(roleId, scope.scope)
+        insertRole.run(roleId, companyId, role.code, role.name, role.dataScope, 1, now)
+        for (const scope of new Set(role.scopes)) insertScope.run(roleId, scope)
         roleByCode.set(role.code, roleId)
       }
 
       let adminUserId: string | null = null
-      if (req.body?.adminName) {
-        const adminName = text(req.body.adminName, '管理员姓名', 40)
-        const adminAccount = optionalText(req.body.adminAccount, 40) ?? simAccount(slug)
-        const adminPassword = String(req.body.adminPassword ?? '')
+      const adminName = optionalText(req.body?.adminName, 40)
+      if (adminName) {
+        const requestedAdminAccount = optionalText(req.body?.adminAccount, 40)
+        const adminAccount = requestedAdminAccount ?? simAccount(slug)
+        const adminPassword = String(req.body?.adminPassword ?? '')
         if (adminPassword.length < 8) throw new EabError(EC.VALIDATION, '管理员初始密码至少 8 位')
+        const accountOwner = findAccountOwner(deps, adminAccount)
+        if (accountOwner) {
+          throw new EabError(
+            EC.VALIDATION,
+            `管理员账号 ${adminAccount} 已被${accountOwner.name ? `成员「${accountOwner.name}」` : '已有成员'}占用，请换一个`,
+            { hint: '账号会同时匹配工号、邮箱和手机号；请换一个没有被任何成员使用的账号。' },
+          )
+        }
         adminUserId = `u_${ulid()}`
         deps.db
           .prepare(
@@ -982,15 +1039,41 @@ export function registerAdminRoutes(app: FastifyInstance, deps: ServerDeps): voi
             now,
           )
         const roleId = roleByCode.get('company_admin')
-        if (adminUserId && roleId) deps.db.prepare('INSERT INTO user_roles VALUES (?, ?, ?, ?)').run(adminUserId as string, roleId as string, 'console-operator', now)
+        if (roleId) {
+          deps.db
+            .prepare('INSERT INTO user_roles (user_id, role_id, granted_by, granted_at) VALUES (?, ?, ?, ?)')
+            .run(adminUserId, roleId, 'console-operator', now)
+        }
       }
+
       deps.db.exec('COMMIT')
-      audit(deps, req, companyId, 'platform.company.create', 'company', companyId, { name, slug, adminUserId })
+      audit(deps, req, companyId, 'platform.company.create', 'company', companyId, {
+        name,
+        slug,
+        adminUserId,
+        firstCompany: true,
+      })
       return ok({ id: companyId, name, slug, rootDeptId, adminUserId })
     } catch (error) {
       deps.db.exec('ROLLBACK')
       throw error
     }
+  })
+
+  /**
+   * 首次建公司时管理员账号的可用性预检。
+   * 只读接口；真正创建时 POST /api/console/companies 会按同一口径再查一遍。
+   */
+  app.post<{ Body: { account?: string } }>('/api/console/companies/check-admin-account', async (req) => {
+    requireConsole(req, deps)
+    const account = optionalText(req.body?.account, 40)
+    if (!account) throw new EabError(EC.VALIDATION, '请填写管理员账号')
+    const owner = findAccountOwner(deps, account)
+    return ok({
+      account,
+      available: !owner,
+      ownerName: owner?.name ?? null,
+    })
   })
 
   /* ---------------- 钉钉一键开通：建公司 + 绑定 + 同步 ---------------- */
@@ -1464,6 +1547,29 @@ export function registerAdminRoutes(app: FastifyInstance, deps: ServerDeps): voi
     return ok({ id: company.id, name: company.name, deleted, next: '空库后可在控制台用「钉钉扫码绑定组织」重新接入一家公司' })
   })
 
+  /**
+   * 网页工作台 AI 消息旁的助手身份：名字 + 头像。
+   * 只 merge settings_json.assistant，不覆盖其它公司配置；头像文件落数据目录。
+   */
+  app.put<{ Body: { name?: unknown; avatarDataUrl?: unknown; removeAvatar?: unknown } }>(
+    '/api/console/company/assistant',
+    { bodyLimit: 4 * 1024 * 1024 },
+    async (req) => {
+      requireConsole(req, deps)
+      const saved = saveCompanyAssistant(
+        deps.db,
+        resolveAssistantDataDir(deps.config.dataDir, deps.config.dbPath),
+        deps.companyId,
+        req.body ?? {},
+      )
+      audit(deps, req, deps.companyId, 'platform.company.assistant.update', 'company', deps.companyId, {
+        name: saved.name,
+        hasAvatar: Boolean(saved.avatar),
+      })
+      return ok({ assistant: companyAssistantView(deps.db, deps.companyId) })
+    },
+  )
+
   app.patch<{ Params: { id: string }; Body: { name?: string; status?: string; settings?: Record<string, unknown> } }>(
     '/api/console/companies/:id',
     async (req) => {
@@ -1590,6 +1696,7 @@ export function registerAdminRoutes(app: FastifyInstance, deps: ServerDeps): voi
         lastSyncedAt: row.last_synced_at ? new Date(Number(row.last_synced_at)).toISOString() : null,
         updatedAt: new Date(Number(row.updated_at)).toISOString(),
       })),
+      assistant: companyAssistantView(deps.db, companyId),
     })
   })
 
@@ -1785,7 +1892,7 @@ export function registerAdminRoutes(app: FastifyInstance, deps: ServerDeps): voi
   app.post('/api/console/backups', async (req) => {
     requireConsole(req, deps)
     const companyId = companyOf(req, deps)
-    const dir = resolvePath(deps.config.dbPath, '..', 'backups')
+    const dir = backupDir(deps)
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
     const stamp = new Date().toISOString().replace(/[:.]/g, '-')
     const file = join(dir, `eab-${stamp}.db`)
@@ -1797,7 +1904,7 @@ export function registerAdminRoutes(app: FastifyInstance, deps: ServerDeps): voi
 
   app.get('/api/console/backups', async (req) => {
     requireConsole(req, deps)
-    const dir = resolvePath(deps.config.dbPath, '..', 'backups')
+    const dir = backupDir(deps)
     if (!existsSync(dir)) return ok({ items: [] })
     const items = readdirSync(dir)
       .filter((name) => name.endsWith('.db'))
@@ -1807,6 +1914,40 @@ export function registerAdminRoutes(app: FastifyInstance, deps: ServerDeps): voi
       })
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
     return ok({ items })
+  })
+
+  app.post<{ Params: { name: string } }>('/api/console/backups/:name/reveal', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const { dir, file } = resolveBackupFile(deps, req.params.name)
+    let opened = false
+    try {
+      const command = process.platform === 'win32' ? 'explorer.exe' : process.platform === 'darwin' ? 'open' : 'xdg-open'
+      const args = process.platform === 'win32' ? [`/select,"${file}"`] : process.platform === 'darwin' ? ['-R', file] : [dirname(file)]
+      const child = spawn(command, args, {
+        detached: true,
+        stdio: 'ignore',
+        windowsVerbatimArguments: process.platform === 'win32',
+      })
+      child.on('error', () => {
+        /* 打不开资源管理器时由前端提示手动路径 */
+      })
+      child.unref()
+      opened = true
+    } catch {
+      opened = false
+    }
+    audit(deps, req, companyId, 'ops.backup.reveal', 'database', file, { dir, opened })
+    return ok({ file, opened })
+  })
+
+  app.delete<{ Params: { name: string } }>('/api/console/backups/:name', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const { file, size } = resolveBackupFile(deps, req.params.name)
+    unlinkSync(file)
+    audit(deps, req, companyId, 'ops.backup.delete', 'database', file, { size })
+    return ok({ deleted: true, file })
   })
 }
 

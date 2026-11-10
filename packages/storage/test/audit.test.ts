@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { appendAudit, canonicalJson, migrate, openDatabase, verifyAuditChain } from '@eab/storage'
+import { appendAudit, canonicalJson, migrate, openDatabase, pruneAuditLogs, verifyAuditChain } from '@eab/storage'
 
 function freshDb() {
   const db = openDatabase({ path: ':memory:' })
@@ -70,6 +70,57 @@ describe('审计流', () => {
     const verified = verifyAuditChain(db)
     expect(verified.ok).toBe(false)
     expect(verified.reasons.join('|')).toContain('hash 不匹配')
+    db.close()
+  })
+
+  it('按保留天数剪掉最老一段后链仍可校验，新记录继续接', () => {
+    const db = freshDb()
+    const now = Date.now()
+    const day = 86_400_000
+    appendAudit(db, { companyId: 'c1', action: 'old.a', result: 'success' }, now - 20 * day)
+    appendAudit(db, { companyId: 'c1', action: 'old.b', result: 'success' }, now - 15 * day)
+    appendAudit(db, { companyId: 'c1', action: 'keep.a', result: 'success' }, now - 2 * day)
+    appendAudit(db, { companyId: 'c1', action: 'keep.b', result: 'success' }, now - day)
+
+    const pruned = pruneAuditLogs(db, 10, now)
+    expect(pruned.deleted).toBe(2)
+    expect(pruned.remaining).toBe(2)
+    expect(pruned.anchorSeq).toBe(2)
+
+    const verified = verifyAuditChain(db)
+    expect(verified.ok).toBe(true)
+    expect(verified.checked).toBe(2)
+    expect(verified.pruned).toBe(2)
+    expect(verified.startSeq).toBe(3)
+
+    const next = appendAudit(db, { companyId: 'c1', action: 'new', result: 'success' }, now)
+    expect(next.seq).toBe(5)
+    expect(verifyAuditChain(db).ok).toBe(true)
+
+    // 清理结束后 append-only 触发器必须恢复，不能把审计表变成可删表。
+    expect(() => db.prepare('DELETE FROM audit_logs').run()).toThrow()
+    db.close()
+  })
+
+  it('全部剪掉后从锚点继续编号，不会退回 seq=1', () => {
+    const db = freshDb()
+    const now = Date.now()
+    const day = 86_400_000
+    appendAudit(db, { companyId: 'c1', action: 'old.a', result: 'success' }, now - 20 * day)
+    appendAudit(db, { companyId: 'c1', action: 'old.b', result: 'success' }, now - 15 * day)
+
+    const pruned = pruneAuditLogs(db, 10, now)
+    expect(pruned.deleted).toBe(2)
+    expect(pruned.remaining).toBe(0)
+    expect(verifyAuditChain(db)).toMatchObject({ ok: true, checked: 0, pruned: 2 })
+
+    const next = appendAudit(db, { companyId: 'c1', action: 'new', result: 'success' }, now)
+    expect(next.seq).toBe(3)
+    const rows = db.prepare('SELECT prev_hash FROM audit_logs ORDER BY seq').all() as unknown as Array<{
+      prev_hash: string
+    }>
+    expect(rows[0]?.prev_hash).toBe(pruned.anchorHash)
+    expect(verifyAuditChain(db).ok).toBe(true)
     db.close()
   })
 })

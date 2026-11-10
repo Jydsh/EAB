@@ -7,16 +7,23 @@
  */
 import type { FastifyInstance, FastifyRequest } from 'fastify'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { basename, dirname, join } from 'node:path'
+import { basename, dirname } from 'node:path'
 import { EC, EabError, SC, ulid, type Scope } from '@eab/domain'
 import { appendAudit } from '@eab/storage'
 import { assertScoped, buildScopeFilter, predicateToSql } from '@eab/authz'
 import type { Db } from '@eab/storage'
-import { safeJoin, toSlug } from '@eab/workspace'
+import { safeJoin } from '@eab/workspace'
 import type { ServerDeps } from '../deps.js'
 import { ok, requireScope } from '../http.js'
-import { resolveActor } from '../session.js'
+import { resolveActor, type RequestActor } from '../session.js'
 import { hashPassword } from '../password.js'
+import { KeyedMutex, KeyedSemaphore, LockAbortedError, LockTimeoutError, SemaphoreQueueFullError, SemaphoreTimeoutError } from '../concurrency.js'
+import {
+  beginToolOperation,
+  completeToolOperation,
+  failToolOperation,
+  resolveToolOperationKey,
+} from '../tool-idempotency.js'
 import { retrieveExternalKb } from '../kb-external.js'
 import {
   deleteLocalFile,
@@ -41,7 +48,7 @@ import {
   markRobotUserFileSendFailed,
   markRobotUserFileSendSent,
 } from '../dingtalk-file-echo.js'
-import { deleteUserWorkspaceFile, readUserWorkspaceFile, renameUserWorkspaceFile } from './workspace.js'
+import { deleteUserWorkspaceFile, readUserWorkspaceFile, renameUserWorkspaceFile, userScopeDir } from './workspace.js'
 import { createSchedule, deleteSchedule, listSchedules } from '../schedule.js'
 
 export interface ToolDef {
@@ -51,6 +58,17 @@ export interface ToolDef {
   scope: Scope
   dangerous: boolean
   input: Record<string, { type: string; description: string; required?: boolean }>
+  /** 并发属性：read 只读；write 按资源键互斥；exclusive 全局/公司级互斥。默认 read */
+  concurrency?: 'read' | 'write' | 'exclusive'
+  /** 互斥资源键；返回 null 表示该次调用不需要加锁 */
+  lockKey?: (
+    deps: ServerDeps,
+    actor: RequestActor,
+    args: Record<string, unknown>,
+    space: ActiveSpace,
+  ) => string | null
+  /** 是否对外部副作用做幂等去重；只对发送、删除、改名、建任务这类不可重复动作开启。 */
+  idempotent?: boolean
 }
 
 export interface ToolExecutionContext {
@@ -58,6 +76,12 @@ export interface ToolExecutionContext {
   sessionId?: string
   /** 当前入口：web / dingtalk 等，决定定时任务默认回推通道 */
   channel?: 'web' | 'dingtalk'
+  /** 用户停止生成时用它中断等待中的资源锁 */
+  signal?: AbortSignal
+  /** 一次用户消息内的 Agent 回合 id；同一回合重复调用按参数去重 */
+  turnId?: string
+  /** 调用方显式提供的幂等键，优先于 turnId */
+  idempotencyKey?: string
 }
 
 export interface ChatToolSpec {
@@ -75,6 +99,133 @@ export interface ChatToolSpec {
 }
 
 type Actor = ReturnType<typeof resolveActor>
+
+/**
+ * 工具级资源锁。只在当前 EAB 进程内有效，用于挡住“同一文件/同一任务被两个 Agent
+ * 同时读改写”。跨进程部署需要换成数据库/Redis 锁（见 P0-4）。
+ */
+export const toolResourceLocks = new KeyedMutex()
+
+/** 工具级并发名额；不同工具互不占名额，同一工具超过上限时排队。 */
+export const toolSemaphore = new KeyedSemaphore()
+
+interface ToolMetric {
+  runs: number
+  failures: number
+  totalDurationMs: number
+  maxDurationMs: number
+  lockWaitMs: number
+}
+
+const toolMetrics = new Map<string, ToolMetric>()
+
+/** 记录一次工具执行的耗时和锁等待，供 /metrics 与控制台并发面板读取。 */
+export function recordToolRun(toolId: string, durationMs: number, status: 'ok' | 'failed' | 'replay', lockWaitMs: number): void {
+  const item = toolMetrics.get(toolId) ?? { runs: 0, failures: 0, totalDurationMs: 0, maxDurationMs: 0, lockWaitMs: 0 }
+  item.runs += 1
+  if (status === 'failed') item.failures += 1
+  item.totalDurationMs += Math.max(0, durationMs)
+  item.maxDurationMs = Math.max(item.maxDurationMs, durationMs)
+  item.lockWaitMs += Math.max(0, lockWaitMs)
+  toolMetrics.set(toolId, item)
+}
+
+export function toolConcurrencyStats(): {
+  active: number
+  queued: number
+  keys: ReadonlyArray<{ key: string; active: number; queued: number }>
+  runs: number
+  failures: number
+  avgDurationMs: number
+  maxDurationMs: number
+  lockWaitMs: number
+  byTool: ReadonlyArray<{ toolId: string; runs: number; failures: number; avgDurationMs: number; maxDurationMs: number; lockWaitMs: number }>
+} {
+  const semaphore = toolSemaphore.stats()
+  const byTool = [...toolMetrics.entries()]
+    .map(([toolId, item]) => ({
+      toolId,
+      runs: item.runs,
+      failures: item.failures,
+      avgDurationMs: item.runs ? Math.round(item.totalDurationMs / item.runs) : 0,
+      maxDurationMs: item.maxDurationMs,
+      lockWaitMs: item.lockWaitMs,
+    }))
+    .sort((a, b) => b.runs - a.runs)
+  const runs = byTool.reduce((sum, item) => sum + item.runs, 0)
+  const failures = byTool.reduce((sum, item) => sum + item.failures, 0)
+  const totalDurationMs = [...toolMetrics.values()].reduce((sum, item) => sum + item.totalDurationMs, 0)
+  return {
+    ...semaphore,
+    runs,
+    failures,
+    avgDurationMs: runs ? Math.round(totalDurationMs / runs) : 0,
+    maxDurationMs: [...toolMetrics.values()].reduce((max, item) => Math.max(max, item.maxDurationMs), 0),
+    lockWaitMs: [...toolMetrics.values()].reduce((sum, item) => sum + item.lockWaitMs, 0),
+    byTool,
+  }
+}
+
+function toolConcurrencyLimit(tool: ToolDef, deps: ServerDeps): number {
+  const max = Math.max(1, deps.config.toolMaxConcurrent ?? 8)
+  if (tool.concurrency === 'exclusive') return 1
+  // 写工具通常还要拿资源锁，名额比读工具少，避免大量写一起排队抢锁。
+  if (tool.concurrency === 'write') return Math.max(1, Math.min(4, max))
+  return max
+}
+
+function workspaceFileLockKey(
+  deps: ServerDeps,
+  actor: RequestActor,
+  args: Record<string, unknown>,
+): string {
+  const companyId = actor.subject.companyId
+  const userId = actor.subject.userId
+  let path = String(args.path ?? '').trim()
+  const fileId = String(args.fileId ?? '').trim()
+  if (!path && fileId) {
+    const row = deps.db
+      .prepare('SELECT rel_path FROM workspace_files WHERE id = ? AND company_id = ? AND owner_user_id = ? AND deleted_at IS NULL')
+      .get(fileId, companyId, userId) as { rel_path: string } | undefined
+    path = row?.rel_path ?? `id:${fileId}`
+  }
+  if (path && fileId) {
+    // 同时给了 fileId 和 path 时以真实元数据路径为准，避免两种写法锁不到一起。
+    const row = deps.db
+      .prepare('SELECT rel_path FROM workspace_files WHERE id = ? AND company_id = ? AND owner_user_id = ? AND deleted_at IS NULL')
+      .get(fileId, companyId, userId) as { rel_path: string } | undefined
+    if (row?.rel_path) path = row.rel_path
+  }
+  if (path && !fileId) {
+    const row = deps.db
+      .prepare(
+        `SELECT rel_path FROM workspace_files
+          WHERE company_id = ? AND owner_user_id = ? AND deleted_at IS NULL
+            AND (rel_path = ? OR name = ?)
+          ORDER BY updated_at DESC LIMIT 1`,
+      )
+      .get(companyId, userId, path, path) as { rel_path: string } | undefined
+    if (row?.rel_path) path = row.rel_path
+  }
+  return `workspace:file:${companyId}:${userId}:${path || 'unknown'}`
+}
+
+function localMutationLockKey(space: ActiveSpace): string {
+  const spaceId = space.kind === 'local' ? space.spaceId : 'none'
+  return `local:space:${spaceId}:mutate`
+}
+
+function scheduleCreateLockKey(actor: RequestActor): string {
+  return `schedule:create:${actor.subject.companyId}:${actor.subject.userId}`
+}
+
+function scheduleDeleteLockKey(actor: RequestActor, args: Record<string, unknown>): string {
+  return `schedule:delete:${actor.subject.companyId}:${actor.subject.userId}:${String(args.id ?? 'unknown')}`
+}
+
+export function adminPasswordLockKey(actor: RequestActor, args: Record<string, unknown>): string {
+  return `admin:password:${actor.subject.companyId}:${String(args.userId ?? 'unknown')}`
+}
 
 export const TOOLS: readonly ToolDef[] = [
   {
@@ -98,12 +249,31 @@ export const TOOLS: readonly ToolDef[] = [
     input: {},
   },
   {
+    id: 'agent.spawn',
+    name: '并行子 Agent',
+    description:
+      '把一个复杂任务拆成多个互不依赖的子任务，并行交给多个子 Agent 执行。适合“同时查三份资料”“分别分析几个文件”“多模型各给一版方案”这类可以并行的任务。每个子 Agent 有独立运行记录和会话锁；一个子任务失败不会取消其他子任务。tasks 必须是 JSON 数组字符串，每项形如 {"title":"资料A","prompt":"完整子任务指令","modelId":"可选模型 id","retries":1}。不要让子任务互相依赖，不要用子 Agent 代替普通的一次工具调用。',
+    scope: SC.AGENT_TOOL_INVOKE,
+    dangerous: false,
+    concurrency: 'read',
+    input: {
+      tasks: {
+        type: 'string',
+        description: 'JSON 数组字符串；每项必须包含 prompt，可选 title、modelId、retries',
+        required: true,
+      },
+    },
+  },
+  {
     id: 'schedule.create',
     name: '创建定时任务',
     description:
       '创建属于当前员工自己的定时提醒。它是挂在当前会话上的持久提醒，到点后会在原会话里自动跑一轮并把结果回复给用户。用户说“30 秒后提醒我 / 明天早上 8 点提醒我开会 / 每天 9 点把日报发我 / 每周一 10 点汇总上周数据 / 每 10 分钟检查一次”时调用。prompt 写到点要执行的完整任务。时间选择器优先级：after_seconds（多少秒后一次）> every_seconds（每多少秒，最少 300）> at（指定时间）> daily/weekly（日历规则）。不要自己计算绝对时间。',
     scope: SC.SCHEDULE_WRITE,
     dangerous: false,
+    concurrency: 'write',
+    lockKey: (_deps, actor) => scheduleCreateLockKey(actor),
+    idempotent: true,
     input: {
       title: { type: 'string', description: '任务标题，最多 40 字；不填则用 prompt 前 20 字' },
       prompt: {
@@ -138,6 +308,9 @@ export const TOOLS: readonly ToolDef[] = [
     description: '删除当前员工自己的一个定时任务，删除后不会再有后续触发。用户说“取消明天那个提醒/删掉那个任务/不要再发了”时调用；先用 schedule.list 找到 id。',
     scope: SC.SCHEDULE_WRITE,
     dangerous: false,
+    concurrency: 'write',
+    lockKey: (_deps, actor, args) => scheduleDeleteLockKey(actor, args),
+    idempotent: true,
     input: {
       id: { type: 'string', description: 'schedule.list 返回的任务 id', required: true },
     },
@@ -205,6 +378,8 @@ export const TOOLS: readonly ToolDef[] = [
     description: '把一段文本写成个人工作区里的文件（同名覆盖）',
     scope: SC.WORKSPACE_WRITE,
     dangerous: false,
+    concurrency: 'write',
+    lockKey: (deps, actor, args) => workspaceFileLockKey(deps, actor, args),
     input: {
       path: { type: 'string', description: '相对路径，例如 notes/todo.md', required: true },
       text: { type: 'string', description: '文本内容', required: true },
@@ -227,6 +402,9 @@ export const TOOLS: readonly ToolDef[] = [
       '把个人云空间里的文件作为钉钉文件消息发给当前用户。用户说“把文件发给我/发到钉钉/把这个文件发我”时调用；先用 workspace.list 找到文件名或相对路径，再传 path，或直接传 workspace.list 返回的 fileId。钉钉单聊里会用用户方向的原生文件消息发送（右侧气泡、带预览/未查收/下载/编辑），机器人识别回声后不重复保存；网页会话退回机器人文件消息。只支持当前员工的个人云空间文件，单个文件不超过 20 MB。',
     scope: SC.WORKSPACE_READ,
     dangerous: false,
+    concurrency: 'write',
+    lockKey: (deps, actor, args) => workspaceFileLockKey(deps, actor, args),
+    idempotent: true,
     input: {
       fileId: { type: 'string', description: 'workspace.list 返回的文件 id；和 path 二选一' },
       path: { type: 'string', description: '文件相对路径或文件名，例如 suale.txt；和 fileId 二选一' },
@@ -239,6 +417,9 @@ export const TOOLS: readonly ToolDef[] = [
       '修改个人云空间里一个文件的名字。用户说“重命名/改名/把文件名改成…”时调用；先用 workspace.list 找到文件，再传 fileId 或 path，并提供 newName。只改文件名，不移动文件。',
     scope: SC.WORKSPACE_WRITE,
     dangerous: false,
+    concurrency: 'write',
+    lockKey: (deps, actor, args) => workspaceFileLockKey(deps, actor, args),
+    idempotent: true,
     input: {
       fileId: { type: 'string', description: 'workspace.list 返回的文件 id；和 path 二选一' },
       path: { type: 'string', description: '文件相对路径或文件名，例如 suale.txt；和 fileId 二选一' },
@@ -252,6 +433,9 @@ export const TOOLS: readonly ToolDef[] = [
       '删除个人云空间里的一个文件。用户明确说“删掉/删除/清理某个文件”时调用；先用 workspace.list 找到 fileId 或 path。只能删自己的文件；删除是软删，文件会移到回收目录，列表里不再显示，但保留可审计。不要用它删除目录或非个人云空间文件。',
     scope: SC.WORKSPACE_WRITE,
     dangerous: false,
+    concurrency: 'write',
+    lockKey: (deps, actor, args) => workspaceFileLockKey(deps, actor, args),
+    idempotent: true,
     input: {
       fileId: { type: 'string', description: 'workspace.list 返回的文件 id；和 path 二选一' },
       path: { type: 'string', description: '文件相对路径或文件名，例如 安全防护记录表.docx；和 fileId 二选一' },
@@ -285,6 +469,8 @@ export const TOOLS: readonly ToolDef[] = [
       '在当前本地空间创建或覆盖文本文件，用来编辑本地文本/代码/Markdown。用户说“改一下/编辑/修改/保存这段内容”时调用；先 local.read 读原文，再传完整新内容覆盖。不会删除文件，也不会执行命令。',
     scope: SC.LOCAL_SPACE_WRITE,
     dangerous: false,
+    concurrency: 'write',
+    lockKey: (_deps, _actor, _args, space) => localMutationLockKey(space),
     input: {
       path: { type: 'string', description: '相对空间根目录的文件路径，例如 src/app.ts', required: true },
       text: { type: 'string', description: '完整文本内容', required: true },
@@ -297,6 +483,8 @@ export const TOOLS: readonly ToolDef[] = [
       '从当前本地空间永久删除一个文件。只有用户明确说“删除/删掉/清理某个本地文件”时调用；先用 local.list 确认相对路径。只能删文件，不能删目录；删除不可恢复；只读空间不能删。',
     scope: SC.LOCAL_SPACE_WRITE,
     dangerous: false,
+    concurrency: 'write',
+    lockKey: (_deps, _actor, _args, space) => localMutationLockKey(space),
     input: {
       path: { type: 'string', description: '要删除的文件相对路径，例如 logs/old.log', required: true },
     },
@@ -307,6 +495,8 @@ export const TOOLS: readonly ToolDef[] = [
     description: '在当前本地空间内移动或重命名文件/目录；不删除文件',
     scope: SC.LOCAL_SPACE_WRITE,
     dangerous: false,
+    concurrency: 'write',
+    lockKey: (_deps, _actor, _args, space) => localMutationLockKey(space),
     input: {
       from: { type: 'string', description: '源相对路径', required: true },
       to: { type: 'string', description: '目标相对路径', required: true },
@@ -319,6 +509,8 @@ export const TOOLS: readonly ToolDef[] = [
     description: '在当前本地空间里创建一个目录',
     scope: SC.LOCAL_SPACE_WRITE,
     dangerous: false,
+    concurrency: 'write',
+    lockKey: (_deps, _actor, _args, space) => localMutationLockKey(space),
     input: {
       path: { type: 'string', description: '相对空间根目录的目录路径', required: true },
     },
@@ -329,6 +521,9 @@ export const TOOLS: readonly ToolDef[] = [
     description: '给指定成员重置密码并吊销其全部会话。高危：需要审批。',
     scope: SC.ORG_MEMBER_MANAGE,
     dangerous: true,
+    concurrency: 'exclusive',
+    lockKey: (_deps, actor, args) => adminPasswordLockKey(actor, args),
+    idempotent: true,
     input: {
       userId: { type: 'string', description: '成员 id', required: true },
       password: { type: 'string', description: '新密码（至少 8 位）', required: true },
@@ -627,6 +822,7 @@ export function resolveToolByFunctionName(name: string): ToolDef | undefined {
 export const AGENT_CORE_TOOL_IDS: readonly string[] = [
   'tool.search',
   'time.now',
+  'agent.spawn',
   'org.directory',
   'kb.search',
   'schedule.create',
@@ -873,9 +1069,110 @@ export async function executeTool(
     throw new EabError(EC.FORBIDDEN, `工具 ${tool.id} 不属于当前文件空间`)
   }
 
-  let result: unknown
-  const now = new Date()
-  switch (tool.id) {
+  const startedAt = Date.now()
+  let toolRelease: (() => void) | null = null
+  try {
+    toolRelease = await toolSemaphore.acquire(tool.id, {
+      limit: toolConcurrencyLimit(tool, deps),
+      queueLimit: deps.config.toolQueueLimit ?? 200,
+      timeoutMs: deps.config.toolTimeoutMs ?? 30_000,
+      signal: context.signal,
+    })
+  } catch (error) {
+    recordToolRun(tool.id, Date.now() - startedAt, 'failed', 0)
+    if (error instanceof SemaphoreTimeoutError) {
+      throw new EabError(EC.RATE_LIMITED, '工具并发已满，等待超时，请稍后重试', {
+        details: { toolId: tool.id, timeoutMs: error.timeoutMs },
+      })
+    }
+    if (error instanceof SemaphoreQueueFullError) {
+      throw new EabError(EC.RATE_LIMITED, '工具排队已满，请稍后重试', {
+        details: { toolId: tool.id, queueLimit: error.queueLimit },
+      })
+    }
+    if (error instanceof LockAbortedError) {
+      throw new EabError(EC.CONFLICT, '操作已取消')
+    }
+    throw error
+  }
+
+  const lockStartedAt = Date.now()
+  const lockKey = tool.concurrency && tool.concurrency !== 'read'
+    ? tool.lockKey?.(deps, actor, args, space) ?? null
+    : null
+  let release: (() => void) | null = null
+  if (lockKey) {
+    try {
+      release = await toolResourceLocks.acquire(lockKey, {
+        timeoutMs: 30_000,
+        signal: context.signal,
+      })
+    } catch (error) {
+      toolRelease?.()
+      recordToolRun(tool.id, Date.now() - startedAt, 'failed', Date.now() - lockStartedAt)
+      if (error instanceof LockTimeoutError) {
+        throw new EabError(EC.CONFLICT, '资源正被其他 Agent 占用，等待超时，请稍后重试', {
+          details: { resource: lockKey },
+        })
+      }
+      if (error instanceof LockAbortedError) {
+        throw new EabError(EC.CONFLICT, '操作已取消')
+      }
+      throw error
+    }
+  }
+  const lockWaitMs = lockKey ? Date.now() - lockStartedAt : 0
+
+  const operationKey = tool.idempotent
+    ? resolveToolOperationKey({
+        toolId: tool.id,
+        args,
+        turnId: context.turnId,
+        idempotencyKey: context.idempotencyKey,
+      })
+    : null
+  let operationId: string | null = null
+  if (operationKey) {
+    let start: ReturnType<typeof beginToolOperation>
+    try {
+      start = beginToolOperation({
+        db: deps.db,
+        companyId: actor.subject.companyId,
+        userId: actor.subject.userId,
+        toolId: tool.id,
+        key: operationKey,
+      })
+    } catch (error) {
+      // 幂等表写入失败时不能把资源锁/工具名额留在手里。
+      release?.()
+      toolRelease?.()
+      recordToolRun(tool.id, Date.now() - startedAt, 'failed', lockWaitMs)
+      throw error
+    }
+    if (start.kind === 'replay') {
+      release?.()
+      toolRelease?.()
+      recordToolRun(tool.id, Date.now() - startedAt, 'replay', lockWaitMs)
+      return start.result
+    }
+    if (start.kind === 'busy') {
+      release?.()
+      toolRelease?.()
+      recordToolRun(tool.id, Date.now() - startedAt, 'failed', lockWaitMs)
+      throw new EabError(EC.CONFLICT, '同一操作正在执行，请稍后重试', {
+        details: { toolId: tool.id, retryAfterMs: start.retryAfterMs },
+      })
+    }
+    operationId = start.id
+  }
+
+  let toolStatus: 'ok' | 'failed' = 'ok'
+  try {
+    let result: unknown
+    const now = new Date()
+    switch (tool.id) {
+    case 'agent.spawn':
+      throw new EabError(EC.VALIDATION, 'agent.spawn 只能由对话 Agent 调度器执行')
     case 'tool.search':
       result = searchToolCatalog(deps.db, actor, space, String(args.query ?? ''), args.limit === undefined ? 8 : Number(args.limit))
       break
@@ -972,7 +1269,7 @@ export async function executeTool(
     }
     case 'workspace.read': {
       const path = String(args.path ?? '')
-      const root = join(dirname(deps.config.dbPath), 'workspaces', toSlug(actor.subject.companyId, 'c'), `user-${toSlug(actor.subject.userId, 'x')}`)
+      const root = userScopeDir(deps, actor.subject.companyId, actor.subject.userId)
       const target = safeJoin(root, path)
       let content: Buffer
       try {
@@ -1165,7 +1462,7 @@ export async function executeTool(
       const path = String(args.path ?? '')
       const text = String(args.text ?? '')
       if (!path) throw new EabError(EC.VALIDATION, 'path 不能为空')
-      const root = join(dirname(deps.config.dbPath), 'workspaces', toSlug(actor.subject.companyId, 'c'), `user-${toSlug(actor.subject.userId, 'x')}`)
+      const root = userScopeDir(deps, actor.subject.companyId, actor.subject.userId)
       const target = safeJoin(root, path)
       if (!target) throw new EabError(EC.VALIDATION, '非法路径')
       mkdirSync(dirname(target), { recursive: true })
@@ -1281,7 +1578,17 @@ export async function executeTool(
     default:
       throw new EabError(EC.NOT_FOUND, `未实现的工具: ${tool.id}`)
   }
-  return result
+    if (operationId) completeToolOperation(deps.db, operationId, result)
+    return result
+  } catch (error) {
+    toolStatus = 'failed'
+    if (operationId) failToolOperation(deps.db, operationId, error)
+    throw error
+  } finally {
+    release?.()
+    toolRelease?.()
+    recordToolRun(tool.id, Date.now() - startedAt, toolStatus, lockWaitMs)
+  }
 }
 
 export function registerToolRoutes(app: FastifyInstance, deps: ServerDeps): void {
@@ -1316,7 +1623,7 @@ export function registerToolRoutes(app: FastifyInstance, deps: ServerDeps): void
 
   app.post<{
     Params: { id: string }
-    Body: { args?: Record<string, unknown>; approvalId?: string; sessionId?: string }
+    Body: { args?: Record<string, unknown>; approvalId?: string; sessionId?: string; idempotencyKey?: string }
   }>(
     '/api/tools/:id/invoke',
     async (req) => {
@@ -1336,10 +1643,18 @@ export function registerToolRoutes(app: FastifyInstance, deps: ServerDeps): void
           throw new EabError(EC.NOT_FOUND, `插件工具不存在或当前不可用: ${req.params.id}`)
         }
         const sessionId = typeof req.body?.sessionId === 'string' ? req.body.sessionId : ''
-        const result = await executePluginTool(pluginTool, args, {
-          agent: { session: { id: sessionId } },
-          session: { id: sessionId },
-        })
+        const result = await executePluginTool(
+          pluginTool,
+          args,
+          {
+            agent: { session: { id: sessionId } },
+            session: { id: sessionId },
+          },
+          {
+            maxConcurrent: deps.config.pluginToolMaxConcurrent ?? 4,
+            timeoutMs: deps.config.pluginToolTimeoutMs ?? 60_000,
+          },
+        )
         audit(deps, req, `tool.invoke.plugin:${pluginId}:${pluginTool.name}`, {
           toolId: `plugin:${pluginId}:${pluginTool.name}`,
           args,
@@ -1361,31 +1676,58 @@ export function registerToolRoutes(app: FastifyInstance, deps: ServerDeps): void
               | undefined)
           : undefined
         if (!approval || approval.status !== 'approved' || (approval.expires_at && approval.expires_at < Date.now())) {
+          const now = Date.now()
+          const resourceId = String(args.userId ?? '')
+          // 先把已经过期的 pending 标成 expired，避免它继续占着唯一索引。
+          deps.db
+            .prepare(
+              `UPDATE approvals
+                  SET status = 'expired', decided_by = 'system:expired', decided_at = ?
+                WHERE company_id = ? AND requester_user_id = ? AND action = ? AND resource_id = ?
+                  AND status = 'pending' AND expires_at IS NOT NULL AND expires_at <= ?`,
+            )
+            .run(now, actor.subject.companyId, actor.subject.userId, `tool:${tool.id}`, resourceId, now)
           const existing = deps.db
             .prepare(
               `SELECT id FROM approvals WHERE company_id = ? AND requester_user_id = ? AND action = ? AND status = 'pending'
-                 AND resource_id = ? AND created_at > ? ORDER BY created_at DESC LIMIT 1`,
+                 AND resource_id = ? AND (expires_at IS NULL OR expires_at > ?) ORDER BY created_at DESC LIMIT 1`,
             )
-            .get(actor.subject.companyId, actor.subject.userId, `tool:${tool.id}`, String(args.userId ?? ''), Date.now() - 60_000) as
+            .get(actor.subject.companyId, actor.subject.userId, `tool:${tool.id}`, resourceId, now) as
             | { id: string }
             | undefined
-          const id = existing?.id ?? ulid()
-          if (!existing) {
-            deps.db
-              .prepare(
-                `INSERT INTO approvals (id, company_id, requester_user_id, action, resource_type, resource_id, payload_json, status, created_at, expires_at)
-                 VALUES (?, ?, ?, ?, 'user', ?, ?, 'pending', ?, ?)`,
-              )
-              .run(
-                id,
-                actor.subject.companyId,
-                actor.subject.userId,
-                `tool:${tool.id}`,
-                String(args.userId ?? ''),
-                JSON.stringify({ tool: tool.id, args: { userId: args.userId } }),
-                Date.now(),
-                Date.now() + 30 * 60 * 1000,
-              )
+          let id = existing?.id
+          if (!id) {
+            const candidate = ulid()
+            try {
+              deps.db
+                .prepare(
+                  `INSERT INTO approvals (id, company_id, requester_user_id, action, resource_type, resource_id, payload_json, status, created_at, expires_at)
+                   VALUES (?, ?, ?, ?, 'user', ?, ?, 'pending', ?, ?)`,
+                )
+                .run(
+                  candidate,
+                  actor.subject.companyId,
+                  actor.subject.userId,
+                  `tool:${tool.id}`,
+                  resourceId,
+                  JSON.stringify({ tool: tool.id, args: { userId: args.userId } }),
+                  now,
+                  now + 30 * 60 * 1000,
+                )
+              id = candidate
+            } catch (error) {
+              // 唯一索引冲突说明另一个并发请求刚插入了同一条待办，读回它的 id。
+              const raced = deps.db
+                .prepare(
+                  `SELECT id FROM approvals WHERE company_id = ? AND requester_user_id = ? AND action = ? AND status = 'pending'
+                     AND resource_id = ? ORDER BY created_at DESC LIMIT 1`,
+                )
+                .get(actor.subject.companyId, actor.subject.userId, `tool:${tool.id}`, resourceId) as
+                | { id: string }
+                | undefined
+              if (!raced) throw error
+              id = raced.id
+            }
           }
           throw new EabError(EC.APPROVAL_REQUIRED, `「${tool.name}」需要审批，已生成待办`, {
             details: { approvalId: id, toolId: tool.id },
@@ -1394,7 +1736,9 @@ export function registerToolRoutes(app: FastifyInstance, deps: ServerDeps): void
         }
       }
 
-      const result = await executeTool(deps, actor, tool.id, args)
+      const result = await executeTool(deps, actor, tool.id, args, { kind: 'cloud' }, {
+        idempotencyKey: typeof req.body?.idempotencyKey === 'string' ? req.body.idempotencyKey : undefined,
+      })
       audit(deps, req, `tool.invoke.${tool.id}`, { toolId: tool.id, args: tool.id === 'admin.password.reset' ? { userId: args.userId } : args })
       return ok({ toolId: tool.id, result })
     },

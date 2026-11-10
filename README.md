@@ -10,22 +10,9 @@ EAB 是一套面向**单公司本地部署**的企业智能体基座：一个进
 
 ---
 
-## 一、两种安装方式
+## 一、安装方式（Web / Node）
 
-### 方式 A：桌面版（Windows 安装包，自带本地服务）
-
-适合不想装 Node.js、希望双击即用的场景。安装包内置 EAB 服务，启动后自动拉起本机服务并打开员工工作台。
-
-1. 打开 [Releases](https://github.com/Jydsh/EAB/releases)，下载与版本对应的 `EAB-Setup-2026.11.10.exe`。
-2. 双击安装，选择安装目录，完成安装。
-3. 从开始菜单或桌面打开 **EAB**。
-4. 首次启动会自动生成控制台账号，文件在 `%APPDATA%\EAB\data\admin-credentials.txt`。
-5. 桌面端菜单「EAB → 管理控制台」进入 `http://127.0.0.1:8788/admin` 完成企业配置。
-
-桌面端数据目录：`%APPDATA%\EAB\data`（数据库、密钥、凭据、备份都在这里，升级安装包不会删除）。
-桌面端也可以连接远程 EAB 服务：在控制台把监听地址改为 `0.0.0.0`，或直接用浏览器访问远程服务器地址。
-
-### 方式 B：Web / Node + pnpm（服务器或本机运行）
+> **桌面版已停止发布。** 旧版 Windows 安装包中的本地服务不再维护，Release 也不再提供 `EAB-Setup-*.exe`。已经安装桌面版的用户，请先卸载桌面版，再按下面的 Web / Node 方式重新部署；数据备份、迁移和清理步骤见 [`docs/UNINSTALL-REDEPLOY.md`](docs/UNINSTALL-REDEPLOY.md)。
 
 适合部署在 Windows / macOS / Linux 服务器上，用浏览器访问。
 
@@ -42,8 +29,7 @@ pnpm install
 node scripts/eab.mjs server
 ```
 
-> 如果 `pnpm install` 卡在 Electron 下载（`connect ETIMEDOUT`），先设置镜像再装：
-> `$env:ELECTRON_MIRROR='https://npmmirror.com/mirrors/electron/'; $env:ELECTRON_BUILDER_BINARIES_MIRROR='https://npmmirror.com/mirrors/electron-builder-binaries/'; pnpm install`（PowerShell）。只跑 Web/Node 服务不需要桌面端，也可以先 `pnpm install --filter @eab/server...` 跳过 Electron。
+> 如果 `pnpm install` 卡住，先确认网络和镜像配置；服务端运行不需要 Electron，也不再有桌面端依赖。
 
 首次启动会在终端打印员工端、控制台、健康检查地址；控制台账号写入：
 
@@ -168,7 +154,7 @@ EAB_HOST=0.0.0.0 EAB_PORT=8787 EAB_ADMIN_PORT=8788 EAB_CONSOLE_ALLOW_REMOTE=1 ea
 
 ## 四、数据目录与环境变量
 
-默认数据目录是项目根下的 `.eab-dev`；桌面端是 `%APPDATA%\EAB\data`。
+默认数据目录是项目根下的 `.eab-dev`。如果你是从旧桌面版迁移，数据默认在 `%APPDATA%\EAB\data`，迁移方法见 [`docs/UNINSTALL-REDEPLOY.md`](docs/UNINSTALL-REDEPLOY.md)。
 
 | 环境变量 | 作用 |
 |---|---|
@@ -178,10 +164,10 @@ EAB_HOST=0.0.0.0 EAB_PORT=8787 EAB_ADMIN_PORT=8788 EAB_CONSOLE_ALLOW_REMOTE=1 ea
 | `EAB_PORT` | 员工对话端口 |
 | `EAB_ADMIN_PORT` | 管理控制台端口 |
 | `EAB_CONSOLE_ALLOW_REMOTE` | `1` 允许局域网登录控制台 |
-| `EAB_VERSION` | 桌面端注入版本号；Web 端默认读 `package.json` |
-| `EAB_PUBLIC_DIR` | 静态页面目录（桌面端内部使用） |
-| `EAB_MIGRATIONS_DIR` | 迁移 SQL 目录（桌面端内部使用） |
-| `EAB_PLUGINS_DIR` | 插件目录（桌面端内部使用） |
+| `EAB_VERSION` | 覆盖健康检查显示的版本号；默认读 `package.json` |
+| `EAB_PUBLIC_DIR` | 可选：覆盖静态页面目录 |
+| `EAB_MIGRATIONS_DIR` | 可选：覆盖迁移 SQL 目录 |
+| `EAB_PLUGINS_DIR` | 可选：覆盖插件目录 |
 | `EAB_UPDATE_REPO` | 更新检查仓库，默认 `Jydsh/EAB` |
 | `EAB_GITHUB_TOKEN` | 访问私有 Release 或提高 GitHub API 限额时使用 |
 
@@ -194,7 +180,7 @@ EAB_HOST=0.0.0.0 EAB_PORT=8787 EAB_ADMIN_PORT=8788 EAB_CONSOLE_ALLOW_REMOTE=1 ea
 EAB 的版本来自 GitHub Release：
 
 - Release tag：`v2026.11.10`
-- Release 资产：源码 zip（`EAB-2026.11.10.zip`）+ Windows 安装包（`EAB-Setup-2026.11.10.exe`）
+- Release 资产：源码 zip（`EAB-2026.11.10.zip`）。桌面安装包、`latest.yml`、`.blockmap` 已停止发布。
 
 ### 两种更新方式
 
@@ -218,8 +204,6 @@ eab update --apply    # 确认更新
 
 启动时也会异步检查一次新版本，只在终端打印提示，不阻塞服务。
 
-桌面版另走 Electron 安装包更新：菜单「EAB → 检查桌面更新」，从同一个 GitHub Release 下载新的安装包并重启安装。
-
 ---
 
 ## 六、目录结构
@@ -233,11 +217,9 @@ EAB/
 │   ├── workspace/    工作区/空间
 │   ├── channel/      钉钉、飞书、企业微信渠道
 │   ├── server/       Fastify 服务、控制台/员工端页面、Agent
-│   └── desktop/      Electron 桌面壳（自带本地服务）
 ├── scripts/
 │   ├── eab.mjs       CLI：server / stop / update / install-cli
-│   ├── eab-update.mjs 源码更新器（下载/备份/替换/回滚/重启）
-│   └── build-desktop.mjs 桌面端内嵌服务构建
+│   └── eab-update.mjs 源码更新器（下载/备份/替换/回滚/重启）
 ├── plugins/          插件（hello / oncall / dsh-*）
 ├── docs/             补充文档
 └── .eab-dev/         运行数据（不入库）
@@ -252,19 +234,15 @@ pnpm install
 pnpm typecheck
 pnpm test
 pnpm dev                  # 等价于 eab server
-pnpm desktop:build        # 构建桌面端内嵌 server.mjs + 静态页面
-pnpm desktop:dist         # 构建 Windows NSIS 安装包，产物在 packages/desktop/release
 ```
 
 发布新版本：
 
-1. 改根 `package.json` 与 `packages/desktop/package.json` 的 `version`（同步）；
-2. 更新 `README.md` 版本与安装包名；
+1. 改根 `package.json` 的 `version`；
+2. 更新 `README.md` 版本与源码包名；
 3. 提交并打 tag：`git tag v2026.11.10 && git push origin v2026.11.10`；
-4. GitHub Actions 会构建 Windows 安装包并创建/更新 Release，上传源码 zip 和安装包；
+4. GitHub Actions 只构建源码 zip 并创建/更新 Release，不再生成桌面安装包；
 5. 控制台/CLI 的版本检查读取该 Release。
-
-详细构建与发布说明见 [`docs/DESKTOP.md`](docs/DESKTOP.md)。
 
 ---
 
@@ -287,6 +265,10 @@ pnpm desktop:dist         # 构建 Windows NSIS 安装包，产物在 packages/d
 
 **Q：更新后数据还在吗？**  
 在。更新器只替换代码，不碰 `.eab-dev` / `EAB_HOME`。
+
+**Q：以前装过桌面版，现在怎么办？**
+
+先退出桌面版并备份 `%APPDATA%\EAB\data`，再卸载桌面版，按本文的 Web / Node 方式部署；完整步骤见 [`docs/UNINSTALL-REDEPLOY.md`](docs/UNINSTALL-REDEPLOY.md)。
 
 **Q：为什么只有一家公司？**  
 这是产品边界：一个实例服务一家公司。多公司请部署多个实例/多个数据目录。

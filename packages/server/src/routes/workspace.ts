@@ -1,7 +1,8 @@
 /**
  * 工作区（WS-01 ~ WS-07）。
  *
- * 文件真身落在磁盘：`<db 同级>/workspaces/<companyId>/<scopeType>-<scopeId>/<相对路径>`
+ * 文件真身落在配置的云空间根目录：`<workspacesDir>/<companyId>/<scopeType>-<scopeId>/<相对路径>`
+ * 未单独配置时 workspacesDir 跟随总存储位置，再退回 `<db 同级>/workspaces`。
  * 元数据落 `workspace_files`；共享落 `workspace_shares`；配额落 `storage_quotas`。
  *
  * 所有用户提供的路径先过 `normalizeRelativePath` / `safeJoin`，再落盘。
@@ -60,12 +61,21 @@ interface FileRow {
   updated_at: number
 }
 
+export function workspaceRootOf(deps: ServerDeps): string {
+  return deps.config.workspacesDir ?? join(dirname(deps.config.dbPath), 'workspaces')
+}
+
 function rootOf(deps: ServerDeps): string {
-  return join(dirname(deps.config.dbPath), 'workspaces')
+  return workspaceRootOf(deps)
 }
 
 function scopeDir(deps: ServerDeps, companyId: string, scopeType: string, scopeId: string): string {
   return join(rootOf(deps), toSlug(companyId, 'c'), `${toSlug(scopeType, 's')}-${toSlug(scopeId, 'x')}`)
+}
+
+/** 个人云空间目录；网页上传、agent 的 workspace.read/write 共用同一套解析。 */
+export function userScopeDir(deps: ServerDeps, companyId: string, userId: string): string {
+  return scopeDir(deps, companyId, 'user', userId)
 }
 
 function publicFile(row: FileRow) {
@@ -192,8 +202,12 @@ function addUsage(deps: ServerDeps, companyId: string, scopeType: string, scopeI
 }
 
 function diskPathOf(deps: ServerDeps, row: FileRow): string {
+  const current = safeJoin(scopeDir(deps, row.company_id, row.scope_type, row.scope_id), row.rel_path)
+  // 旧记录里可能存着切换存储位置前的绝对路径；以当前配置解析出的路径为准，
+  // 只有当前位置没有文件时才回退到旧路径，避免迁移后仍读旧盘。
+  if (existsSync(current)) return current
   if (row.storage_path && existsSync(row.storage_path)) return row.storage_path
-  return safeJoin(scopeDir(deps, row.company_id, row.scope_type, row.scope_id), row.rel_path)
+  return current
 }
 
 function deptIdsOf(actor: ReturnType<typeof resolveActor>): string[] {
@@ -678,8 +692,8 @@ function isShared(deps: ServerDeps, row: FileRow, actor: ReturnType<typeof resol
 }
 
 /** 启动时清理 tmp 下超过 1 天的临时文件；tmp 与工作区完全分开（WS-07） */
-export function cleanupTemp(dbPath: string): void {
-  const tmp = join(dirname(dbPath), 'tmp')
+export function cleanupTemp(tmpDir: string): void {
+  const tmp = tmpDir
   if (!existsSync(tmp)) {
     mkdirSync(tmp, { recursive: true })
     return

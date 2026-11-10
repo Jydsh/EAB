@@ -22,7 +22,7 @@ function audit(deps: ServerDeps, req: FastifyRequest, action: string, detail: Re
     actorUserId: 'console-operator',
     action,
     resourceType: 'version_update',
-    resourceId: 'desktop-or-source',
+    resourceId: 'source',
     result: 'success',
     ip: req.ip,
     channel: 'console',

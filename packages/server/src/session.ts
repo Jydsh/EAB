@@ -122,7 +122,9 @@ export function consoleActor(db: Db, companyId?: string): RequestActor {
       | { id: string; name: string }
       | undefined)
   if (!company) {
-    throw new EabError(EC.NOT_FOUND, '库里还没有任何公司', { hint: '先执行 pnpm dev 造演示数据' })
+    throw new EabError(EC.NOT_FOUND, '库里还没有任何公司', {
+      hint: '首次部署请在 /admin 点击「创建第一家公司」完成初始化',
+    })
   }
 
   const root = db

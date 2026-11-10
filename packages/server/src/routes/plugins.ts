@@ -143,8 +143,8 @@ function ensureConsole(req: FastifyRequest, deps: ServerDeps): void {
   }
 }
 
-function dshOptions(deps: ServerDeps): { dbPath: string; dataDir?: string; companyId: string } {
-  return { dbPath: deps.config.dbPath, dataDir: deps.config.dataDir, companyId: deps.companyId }
+function dshOptions(deps: ServerDeps): { dbPath: string; dshHomeDir?: string; companyId: string } {
+  return { dbPath: deps.config.dbPath, dshHomeDir: deps.config.dshHomeDir, companyId: deps.companyId }
 }
 
 export function registerPluginRoutes(app: FastifyInstance, deps: ServerDeps): void {

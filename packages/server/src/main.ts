@@ -8,29 +8,70 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { networkInterfaces } from 'node:os'
 import { randomBytes } from 'node:crypto'
+import type { FastifyInstance } from 'fastify'
 import { migrate, openDatabase } from '@eab/storage'
 import { buildApp } from './app.js'
 import { refreshDingTalkStream, stopDingTalkStream } from './dingtalk-bot.js'
 import { cleanupTemp } from './routes/workspace.js'
 import { loadConfig } from './config.js'
 import { COMPANY_ID, COMPANY_NAME, ensureDemoData, ensureDemoPasswords, ensureModelCatalog } from './dev-seed.js'
-import { readConsoleSettings, resolveStorage, writeConsoleSettings, SETTINGS_PATH } from './settings.js'
+import {
+  applyPendingStorageMigrations,
+  readConsoleSettings,
+  resolveStorage,
+  writeConsoleSettings,
+  SETTINGS_PATH,
+} from './settings.js'
 import { startRetention } from './retention.js'
 import { startScheduleWorker } from './schedule.js'
 import { reloadPluginHosts } from './plugin-host.js'
+import { setPluginRoot } from './plugins.js'
 import { checkForUpdate } from './update.js'
+import { acquireProcessLock, type ProcessLock } from './process-lock.js'
+import { applyNetworkToConfig, type NetworkTarget } from './network-settings.js'
+
+// 搬迁必须在开库之前完成：旧的库、云空间、插件目录先复制并校验，成功后才切换指针。
+try {
+  const migrated = applyPendingStorageMigrations()
+  if (migrated.moved.length > 0) console.log(`存储位置已迁移：${migrated.moved.join('、')}`)
+} catch (error) {
+  console.error(`[eab] 存储位置迁移失败：${error instanceof Error ? error.message : String(error)}`)
+  console.error('[eab] 旧目录仍保留；修正 pendingMigrations 或目标目录后重启。')
+  process.exit(1)
+}
 
 let config = loadConfig()
-const storage = resolveStorage(config.dbPath, process.env.EAB_DB)
+const storage = resolveStorage(config.dbPath, process.env.EAB_DB, process.env.EAB_PLUGINS_DIR)
 config = {
   ...config,
   dbPath: storage.dbPath,
   dataDir: storage.dataDir,
   dataDirEnvLocked: storage.envLocked,
+  dbDir: storage.dbDir,
+  workspacesDir: storage.workspacesDir,
+  tmpDir: storage.tmpDir,
+  backupsDir: storage.backupsDir,
+  pluginsDir: storage.pluginsDir,
+  dshHomeDir: storage.dshHomeDir,
+  pluginsEnvLocked: storage.pluginsEnvLocked,
 }
+setPluginRoot(storage.pluginsDir)
 mkdirSync(dirname(config.dbPath), { recursive: true })
+const lockDir = config.dataDir ?? dirname(config.dbPath)
+let processLock: ProcessLock
+try {
+  processLock = acquireProcessLock(lockDir, config.dbPath)
+} catch (error) {
+  console.error(`[eab] ${error instanceof Error ? error.message : String(error)}`)
+  process.exit(1)
+}
+// 正常退出、异常退出和 Ctrl+C 都要回收锁；release 自身是幂等的。
+process.on('exit', () => processLock.release())
 if (storage.migratedFrom) {
   console.log(`数据目录已迁移：${storage.migratedFrom} → ${storage.dataDir}（配置见 ${SETTINGS_PATH}）`)
+}
+if (storage.pluginsSeededFrom) {
+  console.log(`插件目录已初始化：${storage.pluginsSeededFrom} → ${storage.pluginsDir}`)
 }
 
 const db = openDatabase({ path: config.dbPath })
@@ -40,7 +81,8 @@ if (migration.applied.length > 0) {
 }
 
 /**
- * 日志保留：同步记录 / 渠道事件 / 登录失败 / 插件事件按天清理。
+ * 日志保留：同步记录 / 渠道事件 / 登录失败 / 插件事件按天清理；
+ * 审计日志按独立保留天数只删最老的一段，并保留哈希链锚点。
  * 策略存在控制台设置文件里，改完立即生效，不用重启。
  */
 startRetention(
@@ -48,8 +90,11 @@ startRetention(
   () => readConsoleSettings().logRetentionDays,
   (result) => {
     writeConsoleSettings({ lastCleanupAt: new Date().toISOString(), lastCleanupStats: result.deleted })
-    console.log(`[eab] 日志清理完成：删除 ${result.total} 条（保留 ${result.days} 天）`)
+    console.log(
+      `[eab] 保留清理完成：删除 ${result.total} 条（日志 ${result.days} 天 / 审计 ${result.audit.days} 天）`,
+    )
   },
+  () => readConsoleSettings().auditRetentionDays,
 )
 
 /**
@@ -68,7 +113,7 @@ if (!configuredCompany) {
     config = { ...config, companyId: correction }
   }
 }
-cleanupTemp(config.dbPath)
+cleanupTemp(config.tmpDir ?? join(config.dataDir ?? dirname(config.dbPath), 'tmp'))
 
 if (config.devAuth) {
   const seeded = ensureDemoData(db)
@@ -80,7 +125,7 @@ if (config.devAuth) {
   }
   const demoAccounts = ensureDemoPasswords(db)
   if (demoAccounts.length > 0) {
-    const accountPath = join(dirname(config.dbPath), 'demo-accounts.txt')
+    const accountPath = join(config.dbDir ?? dirname(config.dbPath), 'demo-accounts.txt')
     writeFileSync(
       accountPath,
       `# EAB 员工工作台演示账号（仅在 EAB_DEV_AUTH=1 时生成）\n` +
@@ -104,7 +149,7 @@ if (config.devAuth) {
  */
 let adminPassword = config.adminPassword
 let adminPasswordSource: 'env' | 'auto' = adminPassword ? 'env' : 'auto'
-const credentialsPath = join(dirname(config.dbPath), 'admin-credentials.txt')
+const credentialsPath = join(config.dbDir ?? dirname(config.dbPath), 'admin-credentials.txt')
 if (!adminPassword && existsSync(credentialsPath)) {
   // 自动生成的密码要跨重启保持不变，否则每次重启运维都得重新找密码
   const text = readFileSync(credentialsPath, 'utf8')
@@ -126,6 +171,7 @@ if (!adminPassword) {
 /** 解析后的口令要进入 config：身份解析（session.ts）靠它识别控制台操作员 */
 config = { ...config, consoleToken: config.consoleToken, adminPassword, adminPasswordSource }
 
+const apps: { chat?: FastifyInstance; console?: FastifyInstance } = {}
 const deps = {
   db,
   config,
@@ -136,24 +182,26 @@ const deps = {
   shutdown: () => {
     void shutdown()
   },
+  /** 网络设置保存后在本进程内重建两个监听，不重启服务 */
+  applyNetwork: (next: NetworkTarget) => rebindNetwork(next, apps),
 }
 
 /** 两个入口分端口：员工对话 / 管理控制台。共用同一个库与同一套身份/审计。 */
-const chatApp = buildApp(deps, 'chat')
-const consoleApp = buildApp(deps, 'console')
+apps.chat = buildApp(deps, 'chat')
+apps.console = buildApp(deps, 'console')
 
 /** 用户自建定时任务：到点执行并回推钉钉；停止函数在 shutdown 里调用 */
 const stopScheduleWorker = startScheduleWorker(deps)
 
 await Promise.all([
-  chatApp.listen({ host: config.host, port: config.port }),
-  consoleApp.listen({ host: config.host, port: config.adminPort }),
+  apps.chat.listen({ host: config.host, port: config.port }),
+  apps.console.listen({ host: config.host, port: config.adminPort }),
 ])
 
 /** DSH 插件 host：已安装且启用的插件在这里跑 apply()，把它们的 RPC 通道挂起来 */
 await reloadPluginHosts(db, {
   dbPath: config.dbPath,
-  dataDir: config.dataDir,
+  dshHomeDir: config.dshHomeDir,
   companyId: config.companyId,
 }).catch((error) => {
   console.warn('[eab] DSH 插件宿主启动失败：', (error as Error).message)
@@ -209,9 +257,106 @@ void refreshDingTalkStream(deps).catch((error) => {
 async function shutdown(): Promise<void> {
   stopScheduleWorker()
   stopDingTalkStream()
-  await Promise.allSettled([chatApp.close(), consoleApp.close()])
+  await closeApps(apps)
+  processLock.release()
   db.close()
   process.exit(0)
+}
+
+/** 关掉监听时同时断掉空闲/长连接，否则员工页的 SSE 会让 close 一直等。 */
+function closeServer(app?: FastifyInstance): Promise<void> {
+  return new Promise((resolve) => {
+    const server = app?.server
+    if (!server || !server.listening) {
+      resolve()
+      return
+    }
+    let timer: NodeJS.Timeout | undefined
+    const done = () => {
+      if (timer) clearTimeout(timer)
+      resolve()
+    }
+    server.close(done)
+    timer = setTimeout(() => server.closeAllConnections?.(), 50)
+  })
+}
+
+async function closeApps(target: { chat?: FastifyInstance; console?: FastifyInstance }): Promise<void> {
+  await Promise.all([closeServer(target.chat), closeServer(target.console)])
+}
+
+function listenServer(app: FastifyInstance | undefined, host: string, port: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const server = app?.server
+    if (!server) {
+      reject(new Error('监听未初始化'))
+      return
+    }
+    const onError = (error: Error) => {
+      server.off('error', onError)
+      reject(error)
+    }
+    server.once('error', onError)
+    server.listen({ host, port }, () => {
+      server.off('error', onError)
+      resolve()
+    })
+  })
+}
+
+let networkApplyQueue: Promise<{ rebound: boolean; error?: string }> = Promise.resolve({ rebound: false })
+
+/** 控制台保存监听地址/端口后，在本进程内重建两个监听；失败回滚设置并恢复旧监听。 */
+function rebindNetwork(
+  next: NetworkTarget,
+  target: { chat?: FastifyInstance; console?: FastifyInstance },
+): Promise<{ rebound: boolean; error?: string }> {
+  const run = async (): Promise<{ rebound: boolean; error?: string }> => {
+    const previous = {
+      host: config.host,
+      chatPort: config.port,
+      adminPort: config.adminPort,
+      allowRemoteConsole: config.allowRemoteConsole,
+    }
+    if (next.host === previous.host && next.chatPort === previous.chatPort && next.adminPort === previous.adminPort) {
+      applyNetworkToConfig(config, next)
+      return { rebound: false }
+    }
+
+    await closeApps(target)
+    try {
+      await Promise.all([
+        listenServer(target.chat, next.host, next.chatPort),
+        listenServer(target.console, next.host, next.adminPort),
+      ])
+      applyNetworkToConfig(config, next)
+      console.log(`[eab] 监听已切换：${next.host}:${next.chatPort} / ${next.adminPort}`)
+      return { rebound: true }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      console.error(`[eab] 监听切换失败，恢复旧监听：${message}`)
+      await closeApps(target)
+      try {
+        await Promise.all([
+          listenServer(target.chat, previous.host, previous.chatPort),
+          listenServer(target.console, previous.host, previous.adminPort),
+        ])
+      } catch (rollbackError) {
+        console.error(
+          `[eab] 旧监听恢复失败：${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+        )
+      }
+      writeConsoleSettings({
+        host: previous.host,
+        chatPort: previous.chatPort,
+        adminPort: previous.adminPort,
+        allowRemoteConsole: previous.allowRemoteConsole,
+      })
+      return { rebound: false, error: message }
+    }
+  }
+  networkApplyQueue = networkApplyQueue.then(run, run)
+  return networkApplyQueue
 }
 
 process.on('SIGINT', () => void shutdown())

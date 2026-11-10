@@ -157,7 +157,16 @@ export interface PluginEventRecord {
   readonly at: number
 }
 
-const PLUGIN_ROOT = process.env.EAB_PLUGINS_DIR || fileURLToPath(new URL('../../../plugins', import.meta.url))
+let pluginRootPath = process.env.EAB_PLUGINS_DIR || fileURLToPath(new URL('../../../plugins', import.meta.url))
+
+/** 启动时由 main.ts 按「独立配置 > 总存储位置 > 内置默认」解析后注入。 */
+export function setPluginRoot(path: string): void {
+  pluginRootPath = path
+}
+
+function trashDir(): string {
+  return join(pluginRootPath, '.trash')
+}
 const KNOWN_SCOPES = new Set<string>(Object.values(SC))
 const ID_PATTERN = /^[a-z][a-z0-9-]{1,40}$/
 
@@ -671,7 +680,7 @@ function NEW_SCOPE_OK(scope: string): boolean {
 
  /** 读取磁盘上所有插件目录，按公司过滤“装了哪些”，再叠加上这家企业的启停状态 */
  export function loadPlugins(db: Db, companyId: string): PluginRecord[] {
-   if (!existsSync(PLUGIN_ROOT)) return []
+   if (!existsSync(pluginRootPath)) return []
 
    const states = db
      .prepare('SELECT plugin_id, enabled FROM plugin_states WHERE company_id = ?')
@@ -748,16 +757,16 @@ function NEW_SCOPE_OK(scope: string): boolean {
      ]),
    )
 
-   const dirs = readdirSync(PLUGIN_ROOT)
+   const dirs = readdirSync(pluginRootPath)
      .filter((name) => !name.startsWith('.') && !name.startsWith('_'))
      .filter((name) => {
-       const full = join(PLUGIN_ROOT, name)
+       const full = join(pluginRootPath, name)
        return statSync(full).isDirectory()
      })
 
    return dirs
      .flatMap((dirName) => {
-       const { record } = parseManifest(join(PLUGIN_ROOT, dirName), dirName)
+       const { record } = parseManifest(join(pluginRootPath, dirName), dirName)
        const owned = companyOwned.get(record.id)
        const owners = activeOwners.get(record.id) ?? new Set<string>()
        // 当前公司没装、别家公司装了 → 不进入当前公司的列表；磁盘上没人认领的才作为“已发现”展示
@@ -819,7 +828,7 @@ export function loadPluginsForUser(db: Db, companyId: string, userId: string): P
   const personalOnly = rows
     .filter((row) => row.removed_at === null && !visible.has(row.plugin_id))
     .flatMap((row) => {
-      const dir = join(PLUGIN_ROOT, row.plugin_id)
+      const dir = join(pluginRootPath, row.plugin_id)
       if (!existsSync(dir) || !statSync(dir).isDirectory()) return []
       const { record } = parseManifest(dir, row.plugin_id)
       const personal = userMap.get(row.plugin_id)
@@ -957,7 +966,6 @@ export function uninstallUserPlugin(
 
 /* ---------------- 生命周期：安装 / 更新 / 卸载 / 事件 ---------------- */
 
-const TRASH_DIR = join(PLUGIN_ROOT, '.trash')
 const COPY_SKIP = new Set(['node_modules', '.git', '.tmp', '.trash', '.staging'])
 const MAX_FILES = 300
 const MAX_BYTES = 20 * 1024 * 1024
@@ -1254,9 +1262,9 @@ function commitPluginPackage(
   options: InstallPluginOptions,
 ): InstallPluginResult {
   const dirName = prepared.id
-  mkdirSync(PLUGIN_ROOT, { recursive: true })
-  const staging = join(PLUGIN_ROOT, `.staging-${dirName}-${Date.now()}-${randomSuffix()}`)
-  const dest = join(PLUGIN_ROOT, dirName)
+  mkdirSync(pluginRootPath, { recursive: true })
+  const staging = join(pluginRootPath, `.staging-${dirName}-${Date.now()}-${randomSuffix()}`)
+  const dest = join(pluginRootPath, dirName)
   let trashPath: string | null = null
   const installSource = options.source ?? 'local-dir'
   const sourceRef = options.sourceRef ?? source
@@ -1295,8 +1303,8 @@ function commitPluginPackage(
         if (!options.overwrite) {
           throw new EabError(EC.VALIDATION, `插件 ${dirName} 目录已存在（未被任何安装认领）；替换请显式确认覆盖`)
         }
-        mkdirSync(TRASH_DIR, { recursive: true })
-        trashPath = join(TRASH_DIR, `${dirName}-${Date.now()}`)
+        mkdirSync(trashDir(), { recursive: true })
+        trashPath = join(trashDir(), `${dirName}-${Date.now()}`)
         renameSync(dest, trashPath)
         renameSync(staging, dest)
         replaced = true
@@ -1314,8 +1322,8 @@ function commitPluginPackage(
             details: { owners },
           })
         }
-        mkdirSync(TRASH_DIR, { recursive: true })
-        trashPath = join(TRASH_DIR, `${dirName}-${Date.now()}`)
+        mkdirSync(trashDir(), { recursive: true })
+        trashPath = join(trashDir(), `${dirName}-${Date.now()}`)
         renameSync(dest, trashPath)
         renameSync(staging, dest)
         replaced = true
@@ -1859,7 +1867,7 @@ export function uninstallPluginPackage(db: Db, pluginId: string, actorId: string
     throw new EabError(EC.NOT_FOUND, `当前公司没有安装插件 ${pluginId}`)
   }
 
-  const dir = join(PLUGIN_ROOT, pluginId)
+  const dir = join(pluginRootPath, pluginId)
   if (!existsSync(dir)) throw new EabError(EC.NOT_FOUND, `插件不在磁盘上：${pluginId}`)
   const { record } = parseManifest(dir, pluginId)
   const now = Date.now()
@@ -1877,8 +1885,8 @@ export function uninstallPluginPackage(db: Db, pluginId: string, actorId: string
   const shared = ownersAfter > 0
   let trashPath: string | null = null
   if (!shared) {
-    mkdirSync(TRASH_DIR, { recursive: true })
-    trashPath = join(TRASH_DIR, `${pluginId}-${Date.now()}`)
+    mkdirSync(trashDir(), { recursive: true })
+    trashPath = join(trashDir(), `${pluginId}-${Date.now()}`)
     renameSync(dir, trashPath)
     const existing = installRecordOf(db, pluginId)
     db.prepare(
@@ -1958,7 +1966,7 @@ export function listPluginEvents(db: Db, limit = 20, companyId?: string): Plugin
 
 /** 插件源：`plugins/catalog.json` 是部署侧维护的本地"货架"，控制台只读展示、按 sourcePath 安装 */
 export function readPluginCatalog(): PluginCatalog {
-  const path = join(PLUGIN_ROOT, 'catalog.json')
+  const path = join(pluginRootPath, 'catalog.json')
   if (!existsSync(path)) return { path, entries: [], error: null }
   try {
     const raw = JSON.parse(readFileSync(path, 'utf8')) as unknown
@@ -1990,16 +1998,16 @@ export function readPluginCatalog(): PluginCatalog {
 }
 
 export function pluginRoot(): string {
-  return PLUGIN_ROOT
+  return pluginRootPath
 }
 
 /** 磁盘上的插件目录清单（跳过 .trash / .staging / 下划线目录） */
 export function listPluginDirectories(): Array<{ id: string; dir: string }> {
-  if (!existsSync(PLUGIN_ROOT)) return []
-  return readdirSync(PLUGIN_ROOT)
+  if (!existsSync(pluginRootPath)) return []
+  return readdirSync(pluginRootPath)
     .filter((name) => !name.startsWith('.') && !name.startsWith('_'))
     .flatMap((name) => {
-      const dir = join(PLUGIN_ROOT, name)
+      const dir = join(pluginRootPath, name)
       try {
         return statSync(dir).isDirectory() ? [{ id: name, dir }] : []
       } catch {
@@ -2011,13 +2019,13 @@ export function listPluginDirectories(): Array<{ id: string; dir: string }> {
 /** 按目录名读取单个插件清单（DSH host 运行时启动时用） */
 export function readPluginDirectory(id: string): PluginRecord | null {
   if (!ID_PATTERN.test(id)) return null
-  const dir = join(PLUGIN_ROOT, id)
+  const dir = join(pluginRootPath, id)
   if (!existsSync(dir)) return null
   const { record } = parseManifest(dir, id)
   return { ...record, enabled: record.valid }
 }
 
 export function relativeToRoot(path: string): string {
-  return relative(PLUGIN_ROOT, path)
+  return relative(pluginRootPath, path)
 }
 

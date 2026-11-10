@@ -10,7 +10,8 @@
  * 插件工具统一要求 `agent:tool:invoke` 权限，不能借插件绕过 EAB 的工具权限。
  */
 import type { Db } from '@eab/storage'
-import { SC } from '@eab/domain'
+import { EC, EabError, SC } from '@eab/domain'
+import { KeyedSemaphore, LockAbortedError, SemaphoreQueueFullError, SemaphoreTimeoutError } from './concurrency.js'
 
 export interface PluginToolActor {
   readonly subject: {
@@ -36,6 +37,17 @@ interface PromptEntry {
 
 const toolsByPlugin = new Map<string, Map<string, PluginToolRegistration>>()
 const promptsByPlugin = new Map<string, Map<string, PromptEntry>>()
+
+/** 插件工具并发上限；按插件隔离，避免一个插件递归/死循环拖垮整个服务。 */
+export const pluginToolSemaphore = new KeyedSemaphore()
+
+export interface PluginToolExecOptions {
+  /** 同一插件同时执行上限；默认 4 */
+  readonly maxConcurrent?: number
+  /** 执行超时毫秒；默认 60 秒 */
+  readonly timeoutMs?: number
+  readonly signal?: AbortSignal
+}
 
 function safeToolName(raw: unknown): string {
   return String(raw ?? '')
@@ -231,12 +243,50 @@ export function resolvePluginToolForActor(
   return null
 }
 
-export function executePluginTool(
+export async function executePluginTool(
   tool: PluginToolRegistration,
   args: Record<string, unknown>,
   exec: Record<string, unknown>,
+  options: PluginToolExecOptions = {},
 ): Promise<unknown> {
-  return Promise.resolve(tool.execute(args, exec))
+  const maxConcurrent = Math.max(1, options.maxConcurrent ?? 4)
+  const timeoutMs = Math.max(1, options.timeoutMs ?? 60_000)
+  let release: (() => void) | null = null
+  try {
+    release = await pluginToolSemaphore.acquire(tool.pluginId, {
+      limit: maxConcurrent,
+      queueLimit: 50,
+      timeoutMs: 30_000,
+      signal: options.signal,
+    })
+  } catch (error) {
+    if (error instanceof SemaphoreTimeoutError || error instanceof SemaphoreQueueFullError) {
+      throw new EabError(EC.RATE_LIMITED, '插件工具并发已满，请稍后重试', {
+        details: { pluginId: tool.pluginId, tool: tool.name },
+      })
+    }
+    if (error instanceof LockAbortedError) throw new EabError(EC.CONFLICT, '操作已取消')
+    throw error
+  }
+
+  let timer: ReturnType<typeof setTimeout> | null = null
+  try {
+    return await Promise.race([
+      Promise.resolve(tool.execute(args, exec)),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          reject(
+            new EabError(EC.UPSTREAM, `插件工具「${tool.name}」执行超时（${Math.round(timeoutMs / 1000)} 秒）`, {
+              details: { pluginId: tool.pluginId, tool: tool.name, timeoutMs },
+            }),
+          )
+        }, timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+    release?.()
+  }
 }
 
 /** 插件给系统提示的贡献；执行时会实时调用 text()，拿到插件当前配置 */

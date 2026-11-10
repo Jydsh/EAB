@@ -148,6 +148,90 @@ function esc(value) {
   })
 }
 
+/** 把长说明收成小角标；完整文案挂在 data-tip，由统一浮层按需展示。 */
+function hintBadge(label, tip, ariaLabel, extraClass = '') {
+  const cls = extraClass ? `hint-badge ${extraClass}` : 'hint-badge'
+  return `<span class="${cls}" data-tip="${esc(tip)}" tabindex="0" aria-label="${esc(ariaLabel || label)}">${esc(label)}</span>`
+}
+
+/** 独立一行的角标：用于表单说明、弹窗提示等原本占一整段的文案。 */
+function hintNote(label, tip, ariaLabel) {
+  return `<div class="hint-note">${hintBadge(label, tip, ariaLabel)}</div>`
+}
+
+/** 模型表格的统一图标操作；图标本身不带文字，名称挂在浮层与 aria-label。 */
+function modelActionIcon(name) {
+  const paths = {
+    test: '<path d="M9 7V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v3"/><path d="M7 7h10v3a5 5 0 0 1-10 0V7Z"/><path d="M12 15v5"/>',
+    discover: '<circle cx="10.5" cy="10.5" r="4.5"/><path d="m14 14 4 4"/><path d="M10.5 8.5v4M8.5 10.5h4"/>',
+    edit: '<path d="M4 20h4l10-10-4-4L4 16v4Z"/><path d="m13 5 4 4"/>',
+    toggle: '<path d="M12 3v9"/><path d="M6.5 6.5a8 8 0 1 0 11 0"/>',
+    delete: '<path d="M4 7h16"/><path d="M9 7V5h6v2"/><path d="M6 7l1 13h10l1-13"/><path d="M10 11v5M14 11v5"/>',
+    stress: '<path d="M4 17a8 8 0 0 1 16 0"/><path d="m12 17 4-5"/><circle cx="12" cy="17" r="1.2"/>',
+  }
+  return `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">${paths[name] || ''}</svg>`
+}
+
+/** 控制台角标浮层：只绑定一次，后续页面重绘不需要重新挂监听。 */
+function bindHintTips() {
+  if (document.body.dataset.hintTipBound === '1') return
+  document.body.dataset.hintTipBound = '1'
+  const tip = document.createElement('div')
+  tip.className = 'hint-tip'
+  tip.id = 'admin-hint-tip'
+  tip.setAttribute('role', 'tooltip')
+  document.body.appendChild(tip)
+  let current = null
+  const hide = () => {
+    if (current) current.removeAttribute('aria-describedby')
+    current = null
+    tip.classList.remove('is-visible')
+  }
+  const show = (target) => {
+    const text = target?.dataset?.tip
+    if (!text) return
+    if (current && current !== target) current.removeAttribute('aria-describedby')
+    current = target
+    target.setAttribute('aria-describedby', tip.id)
+    tip.textContent = text
+    tip.style.left = '0px'
+    tip.style.top = '0px'
+    tip.classList.add('is-visible')
+    const rect = target.getBoundingClientRect()
+    const tipWidth = tip.offsetWidth
+    const tipHeight = tip.offsetHeight
+    let left = rect.left + rect.width / 2 - tipWidth / 2
+    left = Math.max(8, Math.min(left, window.innerWidth - tipWidth - 8))
+    let top = rect.bottom + 8
+    if (top + tipHeight > window.innerHeight - 8) top = rect.top - tipHeight - 8
+    tip.style.left = `${Math.round(left)}px`
+    tip.style.top = `${Math.max(8, Math.round(top))}px`
+  }
+  const targetOf = (event) => event.target?.closest?.('[data-tip]')
+  document.addEventListener('pointerover', (event) => {
+    const target = targetOf(event)
+    if (target) show(target)
+  })
+  document.addEventListener('pointerout', (event) => {
+    const target = targetOf(event)
+    if (target && !target.contains(event.relatedTarget)) hide()
+  })
+  document.addEventListener('focusin', (event) => {
+    const target = targetOf(event)
+    if (target) show(target)
+  })
+  document.addEventListener('focusout', (event) => {
+    const target = targetOf(event)
+    if (target && !target.contains(event.relatedTarget)) hide()
+  })
+  window.addEventListener('scroll', hide, true)
+  window.addEventListener('resize', hide)
+  // 页面重绘或弹窗关闭时，原角标可能已被移除；此时收起浮层，避免留下幽灵提示。
+  new MutationObserver(() => {
+    if (current && !current.isConnected) hide()
+  }).observe(document.body, { childList: true, subtree: true })
+}
+
 function qs(path) {
   if (!state.company) return ''
   const sep = String(path ?? '').includes('?') ? '&' : '?'
@@ -252,15 +336,16 @@ function renderCompanyPicker() {
    * 只显示这家公司本身，像一个身份牌，而不是一个可选多家公司的下拉。
    */
   if (state.companies.length <= 1) {
+    const empty = state.companies.length === 0
     const only = state.companies[0] ?? current
     picker.innerHTML = `
       <span class="company-picker-kicker">当前公司</span>
-      <div class="company-single" aria-label="当前公司">
+      <div class="company-single${empty ? ' is-empty' : ''}" aria-label="当前公司">
         <span class="company-single-name">
-          <strong>${esc(only?.name ?? '未接入公司')}</strong>
-          <code>${esc(only?.id ?? '')}</code>
+          <strong>${esc(empty ? '未接入公司' : only?.name ?? '未接入公司')}</strong>
+          ${empty ? '' : `<code>${esc(only?.id ?? '')}</code>`}
         </span>
-        <span class="company-single-tag">唯一组织</span>
+        <span class="company-single-tag${empty ? ' is-waiting' : ''}">${empty ? '待创建' : '唯一组织'}</span>
       </div>`
     picker.onclick = null
     return
@@ -292,7 +377,7 @@ function renderCompanyPicker() {
       <div class="company-picker-menu" id="company-picker-menu" role="listbox" aria-label="切换管理公司" hidden>
         <div class="company-picker-menu-head">切换管理范围</div>
         ${options || '<div class="company-picker-empty">没有可选公司</div>'}
-        <div class="company-picker-note">切换后，当前页的权限、模型、知识库与设置都会按新公司重新加载。</div>
+        ${hintBadge('切换说明', '切换后，当前页的权限、模型、知识库与设置都会按新公司重新加载。')}
       </div>
     </div>
     <span class="company-picker-hint">此页所有配置按这家公司隔离</span>`
@@ -559,9 +644,6 @@ async function loadKb() {
     renderKbSide(data)
     view.innerHTML = `<div id="kb-docs"><section class="panel"><div class="empty">从左侧选择一个知识库，或新建一个</div></section></div>`
 
-    setPageActions('<button class="btn primary" type="button" id="kb-new">新建知识库</button>')
-    $('#kb-new')?.addEventListener('click', () => openKbModal(null))
-
     const keep =
       state.selectedCollection && data.collections.some((c) => c.id === state.selectedCollection)
         ? state.selectedCollection
@@ -596,7 +678,10 @@ function renderKbSide(data) {
 
   setSide(`
     <div class="side-head">知识库 <span class="muted">${data.collections.length}</span></div>
-    <div class="side-list">${items || '<div class="side-note">还没有知识库，点右上角新建</div>'}</div>`)
+    <button class="btn primary side-add" type="button" id="kb-new">新建知识库</button>
+    <div class="side-list">${items || '<div class="side-note">还没有知识库，点上方新建</div>'}</div>`)
+
+  $('#kb-new')?.addEventListener('click', () => openKbModal(null))
 
   for (const item of document.querySelectorAll('.side-item[data-collection]')) {
     const select = () => {
@@ -710,7 +795,7 @@ function kbSourceFieldsHtml(kind, config, secretConfigured) {
     return `<label class="field"><span>Dify API 地址</span><input id="kb-src-base" value="${esc(config.baseUrl || 'https://api.dify.ai/v1')}" placeholder="https://api.dify.ai/v1" /></label>
       <label class="field"><span>datasetId</span><input id="kb-src-dataset" value="${esc(config.datasetId || '')}" placeholder="Dify 知识库 ID" /></label>
       <label class="field"><span>API Key</span><input id="kb-src-secret" type="password" placeholder="${secretConfigured ? '已保存，留空不修改' : 'dataset 检索权限的 API Key'}" autocomplete="new-password" /></label>
-      <div class="hint">Dify 走在线检索；文档由 Dify 管理，EAB 内只读展示。</div>`
+      ${hintNote('来源说明', 'Dify 走在线检索；文档由 Dify 管理，EAB 内只读展示。')}`
   }
   if (kind === 'obsidian') {
     return `<label class="field"><span>Vault 目录（服务器本地路径）</span><input id="kb-src-vault" value="${esc(config.vaultPath || '')}" placeholder="例如 D:\\Notes\\MyVault" /></label>
@@ -719,7 +804,7 @@ function kbSourceFieldsHtml(kind, config, secretConfigured) {
         <option value="internal"${config.classification !== 'public' && config.classification !== 'confidential' ? ' selected' : ''}>内部</option>
         <option value="confidential"${config.classification === 'confidential' ? ' selected' : ''}>机密</option>
       </select></label>
-      <div class="hint">保存后点“同步 Vault”把 Markdown 导入 EAB；导入后的文档可以点击编辑、删除，检索走本地切片。</div>`
+      ${hintNote('同步说明', '保存后点“同步 Vault”把 Markdown 导入 EAB；导入后的文档可以点击编辑、删除，检索走本地切片。')}`
   }
   if (kind === 'generic') {
     return `<label class="field"><span>检索接口地址</span><input id="kb-src-endpoint" value="${esc(config.endpoint || '')}" placeholder="https://example.com/api/search" /></label>
@@ -735,9 +820,9 @@ function kbSourceFieldsHtml(kind, config, secretConfigured) {
         <label class="field"><span>标题字段</span><input id="kb-src-title-field" value="${esc(config.titleField || 'title')}" /></label>
         <label class="field"><span>正文字段</span><input id="kb-src-text-field" value="${esc(config.textField || 'text')}" /></label>
       </div>
-      <div class="hint">适配 Confluence / Notion 代理、RAGFlow、火山知识库等自定义 REST 接口；返回数组元素至少包含正文字段。</div>`
+      ${hintNote('接口说明', '适配 Confluence / Notion 代理、RAGFlow、火山知识库等自定义 REST 接口；返回数组元素至少包含正文字段。')}`
   }
-  return '<div class="hint">本地知识库：文档在 EAB 内新增、编辑、删除，走本地切片检索。</div>'
+  return hintNote('本地知识库', '文档在 EAB 内新增、编辑、删除，走本地切片检索。')
 }
 
 function bindKbSourceFields(overlay, collection) {
@@ -977,7 +1062,8 @@ async function openKbDocEdit(docId) {
           <option value="confidential"${doc.classification === 'confidential' ? ' selected' : ''}>机密</option>
         </select>
       </label>
-      <div class="hint">保存后会重新切片；当前 ${doc.chunkCount} 个切片，来源：${esc(doc.sourceKind || 'local')}</div>
+      ${hintNote('保存说明', '保存后会重新切片。')}
+      <div class="hint">当前 ${doc.chunkCount} 个切片 · 来源：${esc(doc.sourceKind || 'local')}</div>
     </div>
     <div class="modal-state" id="doc-state"></div>
     <div class="modal-actions">
@@ -1064,13 +1150,13 @@ async function loadDocs(collectionId) {
       sourceKind === 'local'
         ? ''
         : `<span class="pill source-pill">${esc(sourceLabel)}</span>`
-    const sourceNote = external
-      ? `<div class="kb-source-note">文档由 ${esc(sourceLabel)} 上游管理，EAB 内只读；检索通过 kb.search 在线调用。${
-          data.docs.length === 0 ? ' 当前没有返回文档，请检查 API Key 是否有 dataset:read 权限。' : ''
-        }</div>`
+    const docsHint = external
+      ? `上游知识库返回的文档，EAB 内只读。文档由 ${sourceLabel} 上游管理；检索通过 kb.search 在线调用。${
+          data.docs.length === 0 ? '当前没有返回文档，请检查 API Key 是否有 dataset:read 权限。' : ''
+        }`
       : sourceKind === 'obsidian'
-        ? '<div class="kb-source-note">Obsidian 文档已导入为本地切片，可直接点击编辑；上游新增文件请点“同步 Vault”。</div>'
-        : ''
+        ? 'Obsidian 文档已导入为本地切片，可直接点击编辑；上游新增文件请点“同步 Vault”。'
+        : '点击任意一行可编辑内容、密级与索引状态。'
 
     host.innerHTML = `
       <section class="panel kb-summary-panel">
@@ -1098,7 +1184,6 @@ async function loadDocs(collectionId) {
           </div>
         </div>
         <div class="modal-state" id="kb-source-state"></div>
-        ${sourceNote}
         ${
           external
             ? ''
@@ -1123,7 +1208,7 @@ async function loadDocs(collectionId) {
 
       <section class="panel kb-doc-panel">
         <div class="panel-head">
-          <div><h2>文档</h2><span class="hint">${external ? '上游知识库返回的文档，EAB 内只读' : '点击任意一行可编辑内容、密级与索引状态'}</span></div>
+          <div><h2>文档</h2>${hintBadge(external ? '来源说明' : '文档说明', docsHint)}</div>
           <span class="pill">${data.docs.length} 篇</span>
         </div>
         <table class="data">
@@ -1249,7 +1334,7 @@ async function loadDepartments() {
               <button class="btn sm primary" type="button" id="dept-new">＋ 新建部门</button>
             </div>
           </div>
-          <p class="dept-tip">点部门查看详情；右键可编辑或删除。人数口径为含下级部门的成员数，与成员管理页选「含下级」一致。</p>
+          <div class="hint-note" style="margin:0 18px 12px">${hintBadge('人数口径', '点部门查看详情；右键可编辑或删除。人数口径为含下级部门的成员数，与成员管理页选「含下级」一致。')}</div>
           <div class="tree dept-tree" id="tree"></div>
         </section>
         <section class="dept-detail" id="dept-detail"></section>
@@ -1298,7 +1383,7 @@ function renderDeptDetail(node) {
         <div><strong>${direct}</strong><span>直属成员</span></div>
         <div><strong>${total}</strong><span>含下级成员</span></div>
         <div><strong>${children.length}</strong><span>下级部门</span></div>
-        <div><strong>${esc(node.managerName || '—')}</strong><span>负责人</span></div>
+        <div><strong>${esc(node.managerName || '未设置')}</strong><span>负责人 <button class="link-btn accent dept-manager-link" type="button" data-dept-detail-manager>${node.managerName ? '更换' : '去设置'}</button></span></div>
       </div>
       <div class="dept-detail-path mono">${esc(node.path)}</div>
       <div class="dept-detail-section">
@@ -1322,6 +1407,7 @@ function renderDeptDetail(node) {
       </div>
     </section>`
   host.querySelector('[data-dept-detail-edit]')?.addEventListener('click', () => openDeptEdit(node))
+  host.querySelector('[data-dept-detail-manager]')?.addEventListener('click', () => openDeptEdit(node, { focusManager: true }))
   host.querySelector('[data-dept-detail-delete]')?.addEventListener('click', () => deleteDept(node))
   host.querySelector('[data-dept-view-members]')?.addEventListener('click', () => {
     state.deptFilter = node.path
@@ -1579,7 +1665,7 @@ async function toggleMemberStatus(member, host) {
     if (!ok) return
   }
   try {
-    await apiPatch(`/api/console/members/${encodeURIComponent(member.id)}`, { status: next })
+    await apiSend('PATCH', `/api/console/members/${encodeURIComponent(member.id)}`, { status: next })
     loadMembers(host)
   } catch (err) {
     alert(err.message || '操作失败')
@@ -1629,7 +1715,7 @@ async function openMemberQuota(member, host) {  let data
         formatStorageBytes(effective.fileLimitBytes),
       )}<span class="desc"> · ${esc(sourceLabel)}${esc(roleText)}</span></div></div>
     </div>
-    <div class="modal-section-title">单独配置个人工作区 <span>优先于角色配置；留空 = 跟随角色 / 默认</span></div>
+    <div class="modal-section-title">单独配置个人工作区 ${hintBadge('填写说明', '个人容量优先于角色配置；留空表示跟随角色 / 默认。保存后立即生效。容量和单文件上限要一起填；两项都留空等于恢复跟随角色 / 默认。')}</div>
     <div class="form-grid">
       <label><span>个人容量（MB）</span><input id="mq-limit" type="number" min="1" step="0.1" value="${esc(
         limitValue,
@@ -1638,7 +1724,6 @@ async function openMemberQuota(member, host) {  let data
         fileValue,
       )}" placeholder="默认 ${defaultFileMb} MB" /></label>
     </div>
-    <p class="hint">保存后立即生效。容量和单文件上限要一起填；两项都留空表示恢复跟随角色 / 默认。</p>
     <div class="modal-state" id="mq-state"></div>
     <div class="modal-actions">
       <button class="btn ghost" type="button" id="mq-reset">恢复默认</button>
@@ -1727,7 +1812,7 @@ async function openMemberRoles(member) {
   const overlay = modelModal(`
     <div class="modal-head"><h3>配置成员权限 · ${esc(member.name)}</h3><button class="modal-x" type="button">×</button></div>
     <div class="member-sum"><strong>${esc(member.deptName)}</strong><span>${esc(member.title || '未设置职务')}</span></div>
-    <div class="modal-section-title">授予角色 <span>一个成员可以同时拥有多个角色</span></div>
+    <div class="modal-section-title">授予角色 ${hintBadge('角色说明', '一个成员可以同时拥有多个角色；保存后立即生效。')}</div>
     <div class="scope-groups">
       <div class="scope-group">
         ${roleData.roles
@@ -1852,7 +1937,7 @@ function orgSelectedDept() {
   return deptNodes(root).find((node) => node.path === state.deptFilter) ?? root
 }
 
-async function openDeptEdit(node) {
+async function openDeptEdit(node, { focusManager = false } = {}) {
   if (!node) return
   let members = []
   try {
@@ -1877,21 +1962,37 @@ async function openDeptEdit(node) {
             )}${esc(candidate.name)}</option>`,
         )
         .join('')
-  const managerOptions = [
-    '<option value="">不设负责人</option>',
-    ...members.map(
-      (member) =>
-        `<option value="${esc(member.id)}"${member.id === node.managerUserId ? ' selected' : ''}>${esc(member.name)}${member.title ? ` · ${esc(member.title)}` : ''}</option>`,
-    ),
-  ].join('')
+  const managerCandidates = [
+    { id: '', name: '不设负责人', title: '' },
+    ...members.map((member) => ({ id: String(member.id), name: member.name, title: member.title || '' })),
+  ]
+  if (node.managerUserId && !managerCandidates.some((candidate) => candidate.id === String(node.managerUserId))) {
+    managerCandidates.push({ id: String(node.managerUserId), name: node.managerName || '当前负责人', title: '' })
+  }
+  const selectedManager =
+    managerCandidates.find((candidate) => candidate.id === String(node.managerUserId || '')) ?? managerCandidates[0]
   const overlay = modelModal(`
     <div class="modal-head"><h3>编辑部门</h3><button class="modal-x" type="button">×</button></div>
     <div class="form-grid">
       <label class="field"><span>部门名称</span><input id="de-name" value="${esc(node.name)}" /></label>
       <label class="field"><span>上级部门</span><select id="de-parent"${isRoot ? ' disabled' : ''}>${parentOptions}</select></label>
-      <label class="field"><span>部门负责人</span><select id="de-manager">${managerOptions}</select></label>
+      <label class="field dept-manager-field"><span>部门负责人 ${hintBadge('负责人说明', '负责人从上一次同步（或手工建）的成员里选；移动部门会同时更新下级部门与成员路径。')}</span>
+        <div class="search-select" data-manager-select>
+          <input id="de-manager-search" class="search-select-input" type="text" role="combobox" aria-expanded="false" aria-controls="de-manager-list" aria-autocomplete="list" autocomplete="off" placeholder="搜索姓名或岗位" value="${esc(selectedManager.name)}" />
+          <input type="hidden" id="de-manager" value="${esc(selectedManager.id)}" />
+          <span class="search-select-caret" aria-hidden="true"></span>
+          <div class="search-select-list" id="de-manager-list" role="listbox" hidden>
+            ${managerCandidates
+              .map(
+                (candidate, index) =>
+                  `<button type="button" class="search-select-option${candidate.id === selectedManager.id ? ' is-selected' : ''}" id="de-manager-opt-${index}" role="option" data-value="${esc(candidate.id)}" aria-selected="${candidate.id === selectedManager.id}"><span>${esc(candidate.name)}</span>${candidate.title ? `<small>${esc(candidate.title)}</small>` : ''}</button>`,
+              )
+              .join('')}
+            <div class="search-select-empty" hidden>没有匹配的成员</div>
+          </div>
+        </div>
+      </label>
     </div>
-    <p class="field-note">负责人从上一次同步（或手工建）的成员里选；移动部门会同时更新下级部门与成员路径。</p>
     <div class="modal-state" id="de-state"></div>
     <div class="modal-actions">
       <button class="btn primary" type="button" id="de-save">保存</button>
@@ -1900,6 +2001,117 @@ async function openDeptEdit(node) {
   const close = () => overlay.remove()
   overlay.querySelector('.modal-x').addEventListener('click', close)
   overlay.querySelector('#de-cancel').addEventListener('click', close)
+
+  const managerSelect = overlay.querySelector('[data-manager-select]')
+  const managerSearch = overlay.querySelector('#de-manager-search')
+  const managerList = overlay.querySelector('#de-manager-list')
+  const managerValue = overlay.querySelector('#de-manager')
+  const managerOptions = [...managerList.querySelectorAll('.search-select-option')]
+  const managerEmpty = managerList.querySelector('.search-select-empty')
+  let managerActive = -1
+  const managerLabel = () =>
+    managerOptions.find((option) => option.dataset.value === managerValue.value)?.querySelector('span')?.textContent ||
+    '不设负责人'
+  const paintManagerActive = () => {
+    managerOptions.forEach((option, index) => option.classList.toggle('is-active', index === managerActive))
+    if (managerActive >= 0) managerOptions[managerActive]?.scrollIntoView({ block: 'nearest' })
+  }
+  const filterManagerOptions = () => {
+    const query = managerSearch.value.trim().toLowerCase()
+    let visible = 0
+    managerOptions.forEach((option) => {
+      const matched = !query || option.textContent.toLowerCase().includes(query)
+      option.hidden = !matched
+      if (matched) visible += 1
+    })
+    managerEmpty.hidden = visible > 0
+    managerActive =
+      managerOptions.findIndex((option) => !option.hidden && option.classList.contains('is-selected'))
+    if (managerActive < 0) managerActive = managerOptions.findIndex((option) => !option.hidden)
+    paintManagerActive()
+  }
+  const openManager = (showAll = false) => {
+    managerList.hidden = false
+    managerSearch.setAttribute('aria-expanded', 'true')
+    if (showAll) {
+      managerOptions.forEach((option) => {
+        option.hidden = false
+      })
+      managerEmpty.hidden = true
+      managerActive = managerOptions.findIndex((option) => option.classList.contains('is-selected'))
+      if (managerActive < 0) managerActive = 0
+      paintManagerActive()
+      return
+    }
+    filterManagerOptions()
+  }
+  const closeManager = (restore = true) => {
+    managerList.hidden = true
+    managerSearch.setAttribute('aria-expanded', 'false')
+    if (restore) managerSearch.value = managerLabel()
+    managerActive = -1
+    paintManagerActive()
+  }
+  const chooseManager = (option) => {
+    managerValue.value = option.dataset.value
+    managerOptions.forEach((candidate) => {
+      const selected = candidate === option
+      candidate.classList.toggle('is-selected', selected)
+      candidate.setAttribute('aria-selected', selected ? 'true' : 'false')
+    })
+    managerSearch.value = option.querySelector('span')?.textContent || ''
+    closeManager(false)
+    managerSearch.focus()
+  }
+  const moveManagerActive = (step) => {
+    if (managerList.hidden) openManager(true)
+    const visibleOptions = managerOptions.filter((option) => !option.hidden)
+    if (!visibleOptions.length) return
+    const currentVisible = visibleOptions.findIndex((option) => option === managerOptions[managerActive])
+    const nextVisible = currentVisible < 0 ? 0 : (currentVisible + step + visibleOptions.length) % visibleOptions.length
+    managerActive = managerOptions.indexOf(visibleOptions[nextVisible])
+    paintManagerActive()
+  }
+  managerSearch.addEventListener('focus', () => {
+    openManager(true)
+    managerSearch.select()
+  })
+  managerSearch.addEventListener('click', () => {
+    openManager(true)
+    managerSearch.select()
+  })
+  managerSearch.addEventListener('input', () => openManager())
+  managerList.addEventListener('pointerdown', (event) => event.preventDefault())
+  managerOptions.forEach((option) => option.addEventListener('click', () => chooseManager(option)))
+  managerSearch.addEventListener('keydown', (event) => {
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault()
+      moveManagerActive(event.key === 'ArrowDown' ? 1 : -1)
+      return
+    }
+    if (event.key === 'Enter' && !managerList.hidden) {
+      event.preventDefault()
+      const option = managerOptions[managerActive]
+      if (option && !option.hidden) chooseManager(option)
+      return
+    }
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      closeManager()
+    }
+  })
+  managerSearch.addEventListener('blur', () => {
+    setTimeout(() => {
+      if (!managerSelect.contains(document.activeElement)) closeManager()
+    }, 0)
+  })
+  overlay.addEventListener('pointerdown', (event) => {
+    if (!managerSelect.contains(event.target)) closeManager()
+  })
+  if (focusManager) {
+    managerSearch.focus()
+    openManager(true)
+  }
   overlay.querySelector('#de-save').addEventListener('click', async () => {
     const name = overlay.querySelector('#de-name').value.trim()
     const parentId = overlay.querySelector('#de-parent').value
@@ -1914,7 +2126,7 @@ async function openDeptEdit(node) {
     stateEl.className = 'modal-state'
     stateEl.textContent = '保存中…'
     try {
-      await apiPatch(`/api/console/departments/${encodeURIComponent(node.id)}`, {
+      await apiSend('PATCH', `/api/console/departments/${encodeURIComponent(node.id)}`, {
         name,
         ...(parentId ? { parentId } : {}),
         // 服务端把 undefined 当"清空负责人"，所以这里永远显式传值
@@ -1982,7 +2194,7 @@ async function openMemberCreate(deptPath) {
       <label class="field"><span>手机号</span><input id="m-mobile" placeholder="选填" /></label>
       <label class="field"><span>初始密码</span><input id="m-password" type="password" placeholder="至少 8 位；留空则暂不能登录" /></label>
     </div>
-    <div class="modal-section-title">角色 <span>可以多选</span></div>
+    <div class="modal-section-title">角色 ${hintBadge('角色说明', '创建成员时可以同时勾选多个角色；也可以先不选，之后再配置。')}</div>
     <div class="scope-groups"><div class="scope-group">${rolesHtml}</div></div>
     <div class="modal-state" id="m-state"></div>
     <div class="modal-actions">
@@ -2047,7 +2259,7 @@ async function openOverrideModal(member) {
     .join('')
   const overlay = modelModal(`
     <div class="modal-head"><h3>临时授权 / 例外 · ${esc(member.name)}</h3><button class="modal-x" type="button">×</button></div>
-    <div class="hint">拒绝优先于角色授权；允许可以补上角色没有的单个权限点。到期自动失效，变更写审计。</div>
+    ${hintNote('授权规则', '拒绝优先于角色授权；允许可以补上角色没有的单个权限点。到期自动失效，变更写审计。')}
     <div class="modal-section-title">已有例外 <span>${(current.overrides || []).length} 条</span></div>
     <div class="mini-list">${existing || '<span class="hint">还没有临时授权</span>'}</div>
     <div class="modal-section-title">新增一条</div>
@@ -2175,7 +2387,7 @@ async function openBulkGrant(members) {
   const rolesHtml = await roleCheckboxes([])
   const overlay = modelModal(`
     <div class="modal-head"><h3>批量授权</h3><button class="modal-x" type="button">×</button></div>
-    <div class="hint" style="margin-bottom:8px">给当前列表里的人一次性追加角色（不覆盖已有角色）。</div>
+    ${hintNote('批量说明', '给当前列表里的人一次性追加角色，不覆盖已有角色。')}
     <div class="modal-section-title">成员 <span>${members.length} 人</span></div>
     <label class="scope-check"><input type="checkbox" id="bg-all" /> 全选</label>
     <div class="scope-groups"><div class="scope-group" style="max-height:220px;overflow:auto">
@@ -2289,7 +2501,7 @@ async function loadOverview() {
     <div class="overview-grid">
       <section class="panel overview-tasks">
         <div class="panel-head">
-          <div><h2>配置进度</h2><span class="hint">先处理未完成的项，已完成的会保持安静</span></div>
+          <div><h2>配置进度</h2>${hintBadge('进度说明', '先处理未完成的项，已完成的会保持安静。')}</div>
           <span class="pill ${tasks.filter((task) => task.done).length === tasks.length ? 'ok' : 'warn'}">${
             tasks.filter((task) => task.done).length
           } / ${tasks.length} 已完成</span>
@@ -2310,7 +2522,7 @@ async function loadOverview() {
       <aside class="overview-side">
         <section class="panel">
           <div class="panel-head">
-            <div><h2>快捷入口</h2><span class="hint">直接进入最常改的四块配置</span></div>
+            <div><h2>快捷入口</h2>${hintBadge('入口说明', '直接进入最常改的四块配置：组织与成员、模型、知识库、渠道。')}</div>
           </div>
           <div class="quick-grid">
             ${quickLinks
@@ -2326,7 +2538,7 @@ async function loadOverview() {
         </section>
 
         <section class="panel">
-          <div class="panel-head"><div><h2>运行信息</h2><span class="hint">服务与当前管理范围</span></div></div>
+          <div class="panel-head"><div><h2>运行信息</h2>${hintBadge('范围说明', '展示当前服务版本与这个控制台的管理范围；数据范围固定为全公司。')}</div></div>
           <div class="kv-grid">
             <div><span>公司</span><strong>${esc(me?.company?.name ?? '—')}</strong></div>
             <div><span>公司 ID</span><strong class="mono">${esc(me?.company?.id ?? '—')}</strong></div>
@@ -2396,7 +2608,7 @@ function openRoleCreateModal() {
         <option value="dept" selected>本部门及下级</option>
         <option value="company">全公司</option>
       </select></label>
-      <p class="field-note">创建后立即进入权限编辑，勾选这个角色能做什么；成员授权在组织架构页完成。</p>
+      ${hintNote('创建说明', '创建后立即进入权限编辑，勾选这个角色能做什么；成员授权在组织架构页完成。')}
     </div>
     <div class="modal-state" id="nr-state"></div>
     <div class="modal-actions">
@@ -2541,7 +2753,7 @@ async function openRoleMemberPicker(role, allMembers, boundIds) {
     <div class="modal-head">
       <div>
         <h3>添加成员 · ${esc(role.name)}</h3>
-        <p class="member-picker-sub">按部门组织架构多选；部门行可全选该部门及下级成员</p>
+        ${hintBadge('多选说明', '按部门组织架构多选；部门行可全选该部门及下级成员。')}
       </div>
       <button class="modal-x" type="button">×</button>
     </div>
@@ -2659,7 +2871,7 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
     <section class="panel" data-role-pane="permissions"${activeRoleTab === 'permissions' ? '' : ' hidden'}>
       <div class="panel-head">
         <h2>${esc(companyMeta()?.name || '')} · ${esc(ROLE_LABEL[role.code] || role.name)} <span class="mono muted">${esc(role.code)}</span></h2>
-        <span class="hint">${role.builtin ? '内置角色（改权限点会立即影响该角色下所有人）' : '自定义角色'}</span>
+        ${hintBadge('角色说明', role.builtin ? '内置角色：改权限点会立即影响该角色下所有人。' : '自定义角色：只影响被授予该角色的成员。')}
       </div>
       <div class="form-grid">
         <label>角色名<input id="role-name" value="${esc(role.name)}" /></label>
@@ -2675,12 +2887,12 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
               .join('')}
           </select>
         </label>
-        <label><span class="field-label">个人工作区容量（MB）<span class="field-badge" title="存储配额作用于该角色的所有成员；成员单独配置优先。容量和单文件上限要一起填，两项都留空表示跟随默认。" aria-label="存储配额说明">?</span></span><input id="role-quota-limit" type="number" min="1" step="0.1" value="${esc(
+        <label><span class="field-label">个人工作区容量（MB）${hintBadge('?', '存储配额作用于该角色的所有成员；成员单独配置优先。容量和单文件上限要一起填，两项都留空表示跟随默认。', '存储配额说明', 'icon-only')}</span><input id="role-quota-limit" type="number" min="1" step="0.1" value="${esc(
           role.quota ? String(Number(role.quota.limitBytes) / (1024 * 1024)) : '',
         )}" placeholder="默认 ${esc(
           String(Math.round(Number(meta.quotaDefaults?.limitBytes) / (1024 * 1024))),
         )} MB" /></label>
-        <label><span class="field-label">单文件上限（MB）<span class="field-badge" title="存储配额作用于该角色的所有成员；成员单独配置优先。容量和单文件上限要一起填，两项都留空表示跟随默认。" aria-label="存储配额说明">?</span></span><input id="role-quota-file" type="number" min="1" step="0.1" value="${esc(
+        <label><span class="field-label">单文件上限（MB）${hintBadge('?', '存储配额作用于该角色的所有成员；成员单独配置优先。容量和单文件上限要一起填，两项都留空表示跟随默认。', '存储配额说明', 'icon-only')}</span><input id="role-quota-file" type="number" min="1" step="0.1" value="${esc(
           role.quota ? String(Number(role.quota.fileLimitBytes) / (1024 * 1024)) : '',
         )}" placeholder="默认 ${esc(
           String(Math.round(Number(meta.quotaDefaults?.fileLimitBytes) / (1024 * 1024))),
@@ -2716,7 +2928,7 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
       <div class="panel-head">
         <div>
           <h2>角色成员</h2>
-          <span class="hint">这里只显示已绑定成员；点「添加成员」从部门组织架构中多选</span>
+          ${hintBadge('成员说明', '这里只显示已绑定成员；点「添加成员」从部门组织架构中多选。角色成员与成员角色共用同一份授权数据：这里添加/移除后，成员管理页立即同步；在成员管理页改角色，这里也会同步。')}
         </div>
         <div class="panel-actions">
           <button class="btn sm primary" type="button" id="role-member-add">＋ 添加成员</button>
@@ -2725,7 +2937,6 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
       </div>
       <div class="role-member-toolbar">
         <span class="role-member-count">已绑定 <strong id="role-member-count">${boundMembers.length}</strong> 人</span>
-        <span class="hint">成员管理页的「配置权限」会同步显示这个角色</span>
       </div>
       <div class="role-member-list" id="role-member-list">
         ${
@@ -2750,7 +2961,6 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
           '<div class="empty role-member-empty">该角色还没有成员，点右上角「添加成员」从部门组织架构中选择。</div>'
         }
       </div>
-      <p class="role-member-note">角色成员与成员角色共用同一份授权数据：这里添加/移除后，成员管理页立即同步；在成员管理页改角色，这里也会同步。</p>
     </section>`
 
   const setRoleTab = (tab) => {
@@ -2852,8 +3062,6 @@ async function loadRoles() {
     state.roles = data.roles
     renderNavRail()
     const selected = data.roles.find((role) => role.code === state.selectedRole)
-    // 进入具体角色后，角色详情自己带「← 角色管理」页签头，隐藏外层页头（标题与顶部操作按钮）
-    document.querySelector('.page-head')?.classList.toggle('is-hidden', Boolean(selected))
     if (!selected) {
       view.innerHTML = `
         <div class="permission-flow">
@@ -2864,7 +3072,7 @@ async function loadRoles() {
           <div class="flow-step"><span>3</span><strong>成员</strong><p>把角色授予人，可多角色叠加</p></div>
         </div>
         <section class="panel">
-          <div class="panel-head"><div><h2>角色清单</h2><span class="hint">点左侧角色编辑；成员直接在角色页勾选，和成员管理双向同步</span></div>
+          <div class="panel-head"><div><h2>角色清单</h2>${hintBadge('角色说明', '点左侧角色编辑；成员直接在角色页勾选，和成员管理双向同步。')}</div>
           <button class="btn" type="button" id="role-goto-org">去成员管理</button></div>
           <table class="data">
             <thead><tr><th>角色</th><th>数据范围</th><th>权限点</th><th>成员</th><th>存储配额</th></tr></thead>
@@ -3201,8 +3409,7 @@ function modelModal(html) {
 }
 
 function fieldInfo(text) {
-  const safe = esc(text)
-  return `<span class="field-info" tabindex="0" title="${safe}" aria-label="${safe}">i</span>`
+  return hintBadge('i', text, text, 'icon-only')
 }
 
 async function openProviderModal(provider) {
@@ -3215,7 +3422,7 @@ async function openProviderModal(provider) {
     }>${esc(item.label)}</option>`
   const overlay = modelModal(`
     <div class="modal-head"><h3>${provider ? '编辑供应商' : '添加供应商'}</h3><button class="modal-x" type="button">×</button></div>
-    <p class="field-note models-provider-note">任意 OpenAI 兼容、Anthropic、Gemini、Azure 或本地推理服务都能接入；保存后会尝试读取 <span class="mono">/models</span>，读不到也能手动添加模型。</p>
+    ${hintNote('接入说明', '任意 OpenAI 兼容、Anthropic、Gemini、Azure 或本地推理服务都能接入；保存后会尝试读取 /models，读不到也能手动添加模型。密钥只写入服务器 .eab-dev/secrets.json 或环境变量，不写数据库、不在页面回显；本地 Ollama / vLLM / LM Studio 一般不需要密钥。')}
     <div class="field-stack">
       <label class="field"><span>供应商类型</span><select id="p-kind">
         <optgroup label="云端厂商">${cloudKinds.map(option).join('')}</optgroup>
@@ -3225,7 +3432,6 @@ async function openProviderModal(provider) {
       <label class="field"><span>Base URL</span><input id="p-base" class="mono" value="${esc(provider?.baseUrl ?? '')}" placeholder="选择类型后自动填入，本地模型不要填公网地址" /></label>
       <label class="field"><span>API Key ${provider ? '（留空则不修改）' : ''}</span><input id="p-key" type="password" autocomplete="off" placeholder="直接粘贴密钥，保存到服务器本地密钥文件，不回显" /></label>
       <label class="field"><span>密钥引用名（可选）</span><input id="p-env" class="mono" value="${esc(provider?.apiKeyEnv ?? '')}" placeholder="例如 DEEPSEEK_API_KEY；留空自动生成" /></label>
-      <p class="field-note">密钥只写入服务器 <code>.eab-dev/secrets.json</code> 或环境变量，不写数据库、不在页面回显。本地 Ollama / vLLM / LM Studio 一般不需要密钥。</p>
     </div>
     <div class="modal-state" id="p-state"></div>
     <div class="modal-actions">
@@ -3322,9 +3528,10 @@ function openModelImportModal(provider, data) {
 
   const overlay = modelModal(`
     <div class="modal-head"><h3>发现 ${data.models.length} 个模型</h3><button class="modal-x" type="button">×</button></div>
-    <p class="field-note">来源：<span class="mono">${esc(data.baseUrl)}/models</span> · 勾选后加入「${esc(
+    <div class="hint">来源：<span class="mono">${esc(data.baseUrl)}/models</span> · 勾选后加入「${esc(
       provider.name,
-    )}」。<strong>类型是按模型名推断的，不是协议探测</strong>，可逐条改；点保存后才会写入模型列表。</p>
+    )}」</div>
+    ${hintNote('导入说明', '类型是按模型名推断的，不是协议探测，可逐条修改；点保存后才会写入模型列表。')}
     <div class="model-import-toolbar">
       <span class="muted" id="imp-count"></span>
       <button class="link-btn" type="button" id="imp-all">全选</button>
@@ -3462,7 +3669,7 @@ async function openModelModal(model, providers, roles) {
           ${fieldInfo('类型决定默认能力，端点类型决定服务端用哪个协议调用；切换类型会自动带出推荐端点。')}
         </div>
         <div class="form-cols">
-          <label class="field"><span>模型类型 <span class="field-info" id="m-type-hint" tabindex="0" aria-label="模型类型说明">i</span></span><select id="m-type">
+          <label class="field"><span>模型类型 <span class="hint-badge icon-only" id="m-type-hint" tabindex="0" data-tip="模型类型说明" aria-label="模型类型说明">i</span></span><select id="m-type">
             <option value="chat">对话模型</option>
             <option value="decision">决策 / 推理模型</option>
             <option value="vision">多模态 / 视觉模型</option>
@@ -3616,7 +3823,7 @@ async function openModelModal(model, providers, roles) {
       ? '<strong>图片识别已开启</strong><span>员工工作台可以直接上传或粘贴图片，服务端会按图片内容送入模型。</span>'
       : '<strong>未开启图片识别</strong><span>带图片的消息不会发给这个模型；需要图片能力时请勾选「图片识别 / 多模态」。</span>'
     const hintText = typeHints[type.value] || typeHints.custom
-    typeHint.title = hintText
+    typeHint.dataset.tip = hintText
     typeHint.setAttribute('aria-label', hintText)
   }
   for (const input of overlay.querySelectorAll('.models-cap-grid input')) {
@@ -3778,6 +3985,219 @@ function openModelCapabilityPopover(trigger, model, onSave) {
   }
 }
 
+function formatStressDuration(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return '—'
+  return ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(2)} s`
+}
+
+function openModelStressModal(model, trigger) {
+  const canRun =
+    model.enabled &&
+    model.providerStatus === 'active' &&
+    (model.endpointKind ?? 'chat') === 'chat' &&
+    model.providerKind !== 'demo'
+  let timer = null
+  let jobId = ''
+  let running = false
+  const overlay = modelModal(`
+    <div class="modal-head">
+      <div class="models-modal-title">
+        <h3>模型压测 ${fieldInfo('直接调用真实模型，不经过在线对话闸门；用来判断这个模型端点自己的并发能力。')}</h3>
+        <p>只发测试请求，不写会话和消息；结果只保留在当前服务进程里。</p>
+      </div>
+      <button class="modal-x" type="button">×</button>
+    </div>
+    <div class="models-modal-body stress-modal-body">
+      <div class="stress-model-card">
+        <div class="stress-model-main">
+          <span class="models-provider-pill">${esc(model.providerName)}</span>
+          <strong>${esc(model.name)}</strong>
+          <span class="mono">${esc(model.modelKey)}</span>
+        </div>
+        <span class="pill ${canRun ? 'ok' : 'warn'}">${canRun ? '可压测' : '当前不可压测'}</span>
+      </div>
+      ${
+        canRun
+          ? ''
+          : `<p class="stress-blocked">这个模型需要先启用、供应商处于启用状态，且类型为对话模型；演示回声没有真实上游。</p>`
+      }
+      <div class="stress-form-grid">
+        <label class="field"><span>并发数 ${fieldInfo('同时发出的请求数；越高越能压出模型吞吐上限，也越占用算力。')}</span><input id="st-concurrency" type="number" min="1" max="20" value="3" ${canRun ? '' : 'disabled'} /></label>
+        <label class="field"><span>总请求数 ${fieldInfo('本次一共发多少条请求；单次压测上限 100 条。')}</span><input id="st-requests" type="number" min="1" max="100" value="10" ${canRun ? '' : 'disabled'} /></label>
+      </div>
+      <div class="stress-presets" aria-label="压测档位">
+        <button class="stress-preset" type="button" data-stress-preset="2,6">轻量 2 × 6</button>
+        <button class="stress-preset is-active" type="button" data-stress-preset="3,10">标准 3 × 10</button>
+        <button class="stress-preset" type="button" data-stress-preset="8,24">高压 8 × 24</button>
+      </div>
+      <label class="field"><span>测试提示词 ${fieldInfo('每条请求都发同一句短提示词，避免提示词长度影响延迟对比。')}</span><input id="st-prompt" value="请只回复 OK。" maxlength="2000" ${canRun ? '' : 'disabled'} /></label>
+      ${hintNote('压测说明', '压测会消耗真实 token 和模型算力，建议在低峰执行；关闭弹窗不会终止已经开始的压测。')}
+      <div class="stress-run" id="st-run">
+        <div class="stress-run-head">
+          <strong id="st-status" aria-live="polite">尚未开始</strong>
+          <span id="st-progress-text">0 / 0</span>
+        </div>
+        <div class="stress-progress-track" id="st-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="压测进度"><div class="stress-progress-fill" id="st-progress-fill"></div></div>
+        <div class="stress-metrics">
+          <div class="stress-metric"><span>成功 / 失败</span><strong id="st-success">—</strong><small>按已完成请求统计</small></div>
+          <div class="stress-metric"><span>成功率</span><strong id="st-rate">—</strong><small>成功数 ÷ 已请求数</small></div>
+          <div class="stress-metric"><span>p50</span><strong id="st-p50">—</strong><small>一半请求快于此</small></div>
+          <div class="stress-metric"><span>p95</span><strong id="st-p95">—</strong><small>95% 请求快于此</small></div>
+          <div class="stress-metric"><span>吞吐</span><strong id="st-rps">—</strong><small>条 / 秒</small></div>
+          <div class="stress-metric"><span>总耗时</span><strong id="st-total">—</strong><small>从开始到结束</small></div>
+        </div>
+        <div class="stress-error-list" id="st-errors"></div>
+      </div>
+      <div class="modal-state" id="st-state" aria-live="polite"></div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn primary" type="button" id="st-run-btn"${canRun ? '' : ' disabled'}>开始压测</button>
+      <button class="btn ghost" type="button" id="st-close">关闭</button>
+    </div>`)
+  const close = () => {
+    if (timer) clearTimeout(timer)
+    document.removeEventListener('keydown', onKey)
+    overlay.remove()
+    trigger?.focus?.()
+  }
+  const setBusy = (busy) => {
+    running = busy
+    for (const input of overlay.querySelectorAll('#st-concurrency, #st-requests, #st-prompt')) {
+      input.disabled = busy || !canRun
+    }
+    for (const preset of overlay.querySelectorAll('[data-stress-preset]')) preset.disabled = busy || !canRun
+    const runButton = overlay.querySelector('#st-run-btn')
+    if (runButton) {
+      runButton.disabled = busy || !canRun
+      runButton.textContent = busy ? '压测中…' : jobId ? '重新压测' : '开始压测'
+    }
+  }
+  const syncPresetActive = () => {
+    const concurrency = Number(overlay.querySelector('#st-concurrency')?.value)
+    const requests = Number(overlay.querySelector('#st-requests')?.value)
+    for (const preset of overlay.querySelectorAll('[data-stress-preset]')) {
+      preset.classList.toggle('is-active', preset.dataset.stressPreset === `${concurrency},${requests}`)
+    }
+  }
+  const fill = (concurrency, requests) => {
+    const concurrencyInput = overlay.querySelector('#st-concurrency')
+    const requestsInput = overlay.querySelector('#st-requests')
+    if (concurrencyInput) concurrencyInput.value = String(concurrency)
+    if (requestsInput) requestsInput.value = String(requests)
+    syncPresetActive()
+  }
+  for (const input of overlay.querySelectorAll('#st-concurrency, #st-requests')) {
+    input.addEventListener('input', syncPresetActive)
+  }
+  for (const preset of overlay.querySelectorAll('[data-stress-preset]')) {
+    preset.addEventListener('click', () => {
+      if (running) return
+      const [concurrency, requests] = preset.dataset.stressPreset.split(',').map(Number)
+      fill(concurrency, requests)
+    })
+  }
+  const render = (data) => {
+    const completed = Number(data.completed || 0)
+    const total = Number(data.total || 0)
+    const percent = total ? Math.min(100, Math.max(0, (completed / total) * 100)) : 0
+    const status = overlay.querySelector('#st-status')
+    const statusText = data.running
+      ? '压测中'
+      : data.failed === 0
+        ? '检测通过'
+        : data.success === 0
+          ? '连接失败'
+          : '部分失败'
+    status.textContent = statusText
+    status.className = data.running ? 'is-running' : data.failed === 0 ? 'is-ok' : 'is-bad'
+    overlay.querySelector('#st-progress-text').textContent = `${completed} / ${total}`
+    overlay.querySelector('#st-progress-fill').style.width = `${percent}%`
+    overlay.querySelector('#st-progress').setAttribute('aria-valuenow', String(Math.round(percent)))
+    overlay.querySelector('#st-success').textContent = `${data.success} / ${data.failed}`
+    overlay.querySelector('#st-rate').textContent = `${(Number(data.successRate || 0) * 100).toFixed(1)}%`
+    overlay.querySelector('#st-p50').textContent = formatStressDuration(Number(data.latencyMs?.p50 || 0))
+    overlay.querySelector('#st-p95').textContent = formatStressDuration(Number(data.latencyMs?.p95 || 0))
+    overlay.querySelector('#st-rps').textContent = Number(data.throughputRps || 0).toFixed(2)
+    overlay.querySelector('#st-total').textContent = formatStressDuration(Number(data.elapsedMs || 0))
+    const errors = Array.isArray(data.errors) ? data.errors : []
+    const errorList = overlay.querySelector('#st-errors')
+    if (errors.length) {
+      errorList.innerHTML = errors
+        .map(
+          (item) =>
+            `<div class="stress-error-item"><span>第 ${Number(item.index) + 1} 次</span><strong>${esc(item.code || 'ERROR')}</strong><p>${esc(item.message || '调用失败')}</p><small>${formatStressDuration(Number(item.durationMs || 0))}</small></div>`,
+        )
+        .join('')
+    } else if (!data.running && data.failed === 0) {
+      errorList.innerHTML = '<p class="stress-success-note">全部请求成功，端点响应正常。</p>'
+    } else {
+      errorList.innerHTML = ''
+    }
+    const runBox = overlay.querySelector('#st-run')
+    runBox.classList.toggle('is-running', Boolean(data.running))
+    runBox.classList.toggle('is-ok', !data.running && data.failed === 0)
+    runBox.classList.toggle('is-bad', !data.running && data.failed > 0)
+  }
+  const poll = async () => {
+    if (!jobId) return
+    try {
+      const data = await api(`/api/console/model-stress-tests/${encodeURIComponent(jobId)}`)
+      render(data)
+      if (data.running) {
+        timer = setTimeout(poll, 900)
+      } else {
+        timer = null
+        setBusy(false)
+        overlay.querySelector('#st-state').textContent = ''
+      }
+    } catch (err) {
+      timer = null
+      setBusy(false)
+      overlay.querySelector('#st-state').textContent = err.message || '读取压测进度失败'
+    }
+  }
+  const start = async () => {
+    if (!canRun || running) return
+    const concurrency = Math.min(20, Math.max(1, Math.trunc(Number(overlay.querySelector('#st-concurrency').value) || 3)))
+    const requests = Math.min(100, Math.max(1, Math.trunc(Number(overlay.querySelector('#st-requests').value) || 10)))
+    const prompt = overlay.querySelector('#st-prompt').value.trim() || '请只回复 OK。'
+    setBusy(true)
+    jobId = ''
+    overlay.querySelector('#st-state').textContent = ''
+    overlay.querySelector('#st-status').textContent = '准备请求…'
+    overlay.querySelector('#st-status').className = 'is-running'
+    overlay.querySelector('#st-progress-text').textContent = `0 / ${requests}`
+    overlay.querySelector('#st-progress-fill').style.width = '0%'
+    overlay.querySelector('#st-progress').setAttribute('aria-valuenow', '0')
+    try {
+      const data = await apiPost(`/api/console/models/${encodeURIComponent(model.id)}/stress-test`, {
+        concurrency,
+        requests,
+        prompt,
+      })
+      jobId = data.jobId
+      overlay.querySelector('#st-status').textContent = `正在跑 ${data.concurrency} 并发 × ${data.total} 次…`
+      timer = setTimeout(poll, 600)
+    } catch (err) {
+      setBusy(false)
+      overlay.querySelector('#st-state').textContent = err.message || '压测启动失败'
+      overlay.querySelector('#st-status').textContent = '未开始'
+      overlay.querySelector('#st-status').className = ''
+    }
+  }
+  overlay.querySelector('#st-run-btn')?.addEventListener('click', start)
+  overlay.querySelector('#st-close')?.addEventListener('click', close)
+  overlay.querySelector('.modal-x')?.addEventListener('click', close)
+  const onKey = (event) => {
+    if (event.key === 'Escape') close()
+  }
+  document.addEventListener('keydown', onKey)
+  overlay.addEventListener('click', (event) => {
+    if (event.target === overlay) close()
+  })
+  setTimeout(() => overlay.querySelector(canRun ? '#st-run-btn' : '#st-close')?.focus(), 0)
+}
+
 async function loadModels() {
   const view = $('#view')
   renderLoading(view)
@@ -3826,17 +4246,15 @@ async function loadModels() {
               provider.status === 'active' ? '启用' : '停用'
             }</span></td>
             <td class="model-actions">
-              <button class="link-btn" type="button" data-test="${esc(provider.id)}">测试连接</button>
+              <button class="btn sm model-action-btn" type="button" data-test="${esc(provider.id)}" data-tip="测试连接：用当前凭证请求一次供应商端点。" aria-label="测试连接">${modelActionIcon('test')}</button>
               ${
                 provider.kind === 'demo' && !provider.baseUrl
                   ? ''
-                  : `<button class="link-btn" type="button" data-discover-provider="${esc(provider.id)}">检测模型</button>`
+                  : `<button class="btn sm model-action-btn" type="button" data-discover-provider="${esc(provider.id)}" data-tip="检测模型：读取 /models 清单并导入。" aria-label="检测模型">${modelActionIcon('discover')}</button>`
               }
-              <button class="link-btn" type="button" data-edit-provider="${esc(provider.id)}">编辑</button>
-              <button class="link-btn" type="button" data-toggle-provider="${esc(provider.id)}">${
-                provider.status === 'active' ? '停用' : '启用'
-              }</button>
-              <button class="link-btn danger" type="button" data-del-provider="${esc(provider.id)}">删除</button>
+              <button class="btn sm model-action-btn" type="button" data-edit-provider="${esc(provider.id)}" data-tip="编辑供应商。" aria-label="编辑供应商">${modelActionIcon('edit')}</button>
+              <button class="btn sm model-action-btn" type="button" data-toggle-provider="${esc(provider.id)}" data-tip="${provider.status === 'active' ? '停用供应商。' : '启用供应商。'}" aria-label="${provider.status === 'active' ? '停用供应商' : '启用供应商'}">${modelActionIcon('toggle')}</button>
+              <button class="btn sm model-action-btn is-danger" type="button" data-del-provider="${esc(provider.id)}" data-tip="删除供应商及其下模型。" aria-label="删除供应商">${modelActionIcon('delete')}</button>
             </td>
           </tr>`,
         )
@@ -3890,7 +4308,7 @@ async function loadModels() {
         <div class="models-panel-head">
           <div>
             <h2>供应商与端点</h2>
-            <p class="models-panel-sub">接入端点后会自动读取模型清单；读不到也可以手动添加模型。密钥只保存在服务端，不会回到浏览器。</p>
+            ${hintBadge('端点说明', '接入端点后会自动读取模型清单；读不到也可以手动添加模型。密钥只保存在服务端，不会回到浏览器。')}
           </div>
           <div class="models-panel-actions">
             <span class="models-panel-note">${providers.length} 个端点 · ${providers.filter((item) => item.status === 'active').length} 个启用</span>
@@ -3911,7 +4329,7 @@ async function loadModels() {
         <div class="models-panel-head">
           <div>
             <h2>用途路由 <span class="models-panel-count">${boundRouteCount}/${routeItems.length}</span></h2>
-            <p class="models-panel-sub">把「这次要做什么」绑定到具体模型；留空则按能力和优先级自动挑。变更立即生效，未配置的用途会降级但不阻断现有对话。</p>
+            ${hintBadge('路由说明', '把「这次要做什么」绑定到具体模型；留空则按能力和优先级自动挑。变更立即生效，未配置的用途会降级但不阻断现有对话。')}
           </div>
           <span class="models-panel-note">${routeItems.length ? '绑定后立即生效' : '迁移后可用'}</span>
         </div>
@@ -3923,7 +4341,7 @@ async function loadModels() {
         <div class="models-panel-head">
           <div>
             <h2>模型目录 <span class="models-panel-count" id="model-count">${models.length}</span></h2>
-            <p class="models-panel-sub">按能力管理模型：点击「能力」可直接勾选，保存后立即生效。</p>
+            ${hintBadge('能力说明', '按能力管理模型：点击「能力」可直接勾选，保存后立即生效。')}
           </div>
           <div class="models-tools">
             <label class="models-search"><span aria-hidden="true">⌕</span><input id="model-search" type="search" value="${esc(state.modelsSearch)}" placeholder="搜索模型、标识或供应商" autocomplete="off" /></label>
@@ -3943,8 +4361,7 @@ async function loadModels() {
       <div class="models-overview">
         <div class="models-overview-copy">
           <span class="models-eyebrow">MODEL ROUTER</span>
-          <strong>模型与路由，按任务分开管理</strong>
-          <p>先确认模型目录，再按任务绑定用途路由，最后核对供应商端点；密钥只保留在服务端。</p>
+          <strong>模型与路由，按任务分开管理 ${hintBadge('使用顺序', '先确认模型目录，再按任务绑定用途路由，最后核对供应商端点；密钥只保留在服务端。')}</strong>
         </div>
         <div class="models-summary">
           <div class="models-summary-card"><span>供应商</span><strong id="stat-providers">${providers.length}</strong><small>个端点</small></div>
@@ -4036,9 +4453,14 @@ async function loadModels() {
         <td class="models-roles-cell">${roleChips}</td>
         <td><span class="pill ${model.enabled ? 'ok' : 'warn'}">${model.enabled ? '启用' : '停用'}</span></td>
         <td class="model-actions">
-          <button class="btn sm model-action-btn" type="button" data-edit-model="${esc(model.id)}">编辑</button>
-          <button class="btn sm model-action-btn" type="button" data-toggle-model="${esc(model.id)}">${model.enabled ? '停用' : '启用'}</button>
-          <button class="btn sm model-action-btn is-danger" type="button" data-del-model="${esc(model.id)}">删除</button>
+          ${
+            (model.endpointKind ?? 'chat') === 'chat'
+              ? `<button class="btn sm model-action-btn" type="button" data-stress-model="${esc(model.id)}" data-tip="压测：直接调用真实模型，检查端点并发能力。" aria-label="压测">${modelActionIcon('stress')}</button>`
+              : ''
+          }
+          <button class="btn sm model-action-btn" type="button" data-edit-model="${esc(model.id)}" data-tip="编辑模型。" aria-label="编辑模型">${modelActionIcon('edit')}</button>
+          <button class="btn sm model-action-btn" type="button" data-toggle-model="${esc(model.id)}" data-tip="${model.enabled ? '停用模型。' : '启用模型。'}" aria-label="${model.enabled ? '停用模型' : '启用模型'}">${modelActionIcon('toggle')}</button>
+          <button class="btn sm model-action-btn is-danger" type="button" data-del-model="${esc(model.id)}" data-tip="删除模型。" aria-label="删除模型">${modelActionIcon('delete')}</button>
         </td>
       </tr>`
     }
@@ -4162,6 +4584,12 @@ async function loadModels() {
         })
         return
       }
+      const stressButton = event.target.closest('[data-stress-model]')
+      if (stressButton) {
+        const model = modelById.get(stressButton.dataset.stressModel)
+        if (model) openModelStressModal(model, stressButton)
+        return
+      }
       const editButton = event.target.closest('[data-edit-model]')
       if (editButton) {
         openModelModal(modelById.get(editButton.dataset.editModel), providers, modelData.roles)
@@ -4274,27 +4702,35 @@ async function loadMatrix() {
       <div class="panel">
         <div class="panel-head">
           <h2>知识库可见性核对</h2>
-          <span class="hint">按同一套 ACL 把每个成员重算一遍，用来核对配置结果</span>
+          ${hintBadge('核对说明', '按同一套 ACL 把每个成员重算一遍，用来核对配置结果。')}
         </div>
         <div class="matrix-wrap"><table class="data matrix"><thead>${head}</thead><tbody>${body}</tbody></table></div>
-        <div class="legend"><span class="cell-yes">✓</span> 可见 <span class="cell-no">—</span> 不可见 · 同行「缺 kb:read」表示该身份连检索权限都没有，一个库也进不来</div>
+        <div class="legend"><span class="cell-yes">✓</span> 可见 <span class="cell-no">—</span> 不可见 ${hintBadge('图例说明', '同行「缺 kb:read」表示该身份连检索权限都没有，一个库也进不来。')}</div>
       </div>`
 
     const me = state.me
     setSide(`
-      <div class="side-head">本页用途</div>
-      <div class="side-note">把成员、角色与知识库可见范围放在一张表里核对，不再挨个点开猜。</div>
-      <div class="side-head">配置顺序</div>
-      <div class="side-note">先在「角色权限」给角色配权限点，再到「知识库」设可见范围，最后回这里核对结果。</div>
+      <div class="side-head">本页用途 ${hintBadge('用途说明', '把成员、角色与知识库可见范围放在一张表里核对，不再挨个点开猜。')}</div>
+      <div class="side-head">配置顺序 ${hintBadge('配置顺序', '先在「角色权限」给角色配权限点，再到「知识库」设可见范围，最后回这里核对结果。')}</div>
       <div class="side-head">图例</div>
       <div class="legend-box">
         <div><span class="cell-yes">✓</span> 该成员可读</div>
         <div><span class="cell-no">—</span> 不可读</div>
         <div><span class="pill danger">缺 kb:read</span> 没有知识库读取权限</div>
       </div>
-      <div class="side-foot muted">${esc(me && me.company ? me.company.name : '—')} · 仅服务器侧核对使用</div>`)
+      <div class="side-foot">${esc(me && me.company ? me.company.name : '—')} ${hintBadge('核对范围', '仅服务器侧核对使用，成员看不到这张矩阵。')}</div>`)
   } catch (err) {
-    setSide(`<div class="side-head">权限矩阵</div><div class="side-note">当前管理范围看不到矩阵</div>`)
+    setSide('', true)
+    if (err.status === 404) {
+      view.innerHTML = `
+        <section class="panel">
+          <div class="panel-head">
+            <div><h2>权限矩阵当前未开放 ${hintBadge('未开放原因', '该页调用开发态核对接口；当前部署没有开启开发身份（devAuth）。')}</h2></div>
+          </div>
+          <div class="muted" style="padding:0 2px">日常授权请以「角色权限」和「知识库 · 可见范围」为准。</div>
+        </section>`
+      return
+    }
     renderDenied(view, err)
   }
 }
@@ -4309,6 +4745,27 @@ async function loadSys() {
     const health = await api('/api/health')
     const settings = await api('/api/console/settings').catch(() => null)
     const update = await api('/api/console/update').catch(() => null)
+    const concurrency = await api('/api/console/concurrency').catch(() => null)
+    const agentRuns = await api('/api/console/agent-runs?limit=50').catch(() => null)
+    const cap = concurrency?.chat ?? null
+    const toolStats = concurrency?.tools ?? null
+    const pluginStats = concurrency?.plugins ?? null
+    const toolRows = (() => {
+      const rows = new Map()
+      for (const row of toolStats?.keys ?? []) {
+        rows.set(row.key, { toolId: row.key, active: row.active, queued: row.queued, runs: 0, failures: 0, avgDurationMs: 0 })
+      }
+      for (const metric of toolStats?.byTool ?? []) {
+        const row = rows.get(metric.toolId) ?? { toolId: metric.toolId, active: 0, queued: 0 }
+        rows.set(metric.toolId, {
+          ...row,
+          runs: metric.runs,
+          failures: metric.failures,
+          avgDurationMs: metric.avgDurationMs,
+        })
+      }
+      return [...rows.values()].sort((a, b) => b.active + b.queued - (a.active + a.queued))
+    })()
     const network = settings?.network ?? {
       host: health.host ?? '127.0.0.1',
       chatPort: health.chatPort ?? 8787,
@@ -4319,7 +4776,10 @@ async function loadSys() {
     }
     const locked = network.envLocked ?? {}
     const retentionDays = settings?.retentionDays ?? 90
+    const auditRetentionDays = settings?.auditRetentionDays ?? 180
     const logs = settings?.logs ?? {}
+    const storageRows = settings?.storage?.rows ?? []
+    const storagePending = settings?.storage?.pendingMigrations ?? []
     const cleanupText = settings?.lastCleanupAt
       ? new Date(settings.lastCleanupAt).toLocaleString('zh-CN')
       : '还没有清理记录'
@@ -4327,18 +4787,16 @@ async function loadSys() {
       ${sectionNavHtml(
         [
           { key: 'runtime', label: '运行与准入', meta: '服务状态 · 安全边界' },
+          { key: 'concurrency', label: '并发与队列', meta: '对话 · 模型 · 工具 · 插件' },
+          { key: 'agents', label: 'Agent 运行树', meta: '父任务 · 子 Agent · 工具轨迹' },
           { key: 'company', label: '公司设置', meta: '名称 · 启停 · 删除' },
           { key: 'data', label: '数据与运维', meta: '目录 · 日志 · 备份' },
         ],
         state.systemSection || 'runtime',
       )}
       <div class="section-panels">
-      <div class="banner warn" data-section-panel="runtime" style="margin:0 0 16px">
-        <strong>只给部署方看的运行视图</strong>
-        <span>组织里的成员不会进入这个控制台。企业配置在这里完成；监听地址与端口可在「网络与访问入口」保存，环境变量优先。</span>
-      </div>
       <section class="panel" data-section-panel="runtime">
-        <div class="panel-head"><div><h2>运行状态</h2><span class="hint">本机服务与版本</span></div></div>
+        <div class="panel-head"><div><h2>运行状态</h2>${hintBadge('运行说明', '本机服务与版本；网络设置保存后即时生效，监听地址与端口会自动切换，不用重启服务。')}${hintBadge('部署说明', '这是只给部署方看的运行视图；组织成员不会进入控制台。监听地址与端口可在「网络与访问入口」保存，环境变量优先。')}</div></div>
         <div class="kv-grid">
           <div><span>服务</span><strong>正常运行</strong></div>
           <div><span>版本</span><strong class="mono">v${esc(health.version)}</strong></div>
@@ -4348,18 +4806,106 @@ async function loadSys() {
           <div><span>开发身份切换</span><strong>${health.devAuth ? '<span class="pill warn">开启</span>' : '<span class="pill ok">关闭</span>'}</strong></div>
         </div>
       </section>
-      <section class="panel" data-section-panel="runtime">
+      <section class="panel" data-section-panel="concurrency">
         <div class="panel-head">
-          <div><h2>网络与访问入口</h2><span class="hint">员工对话和管理控制台分端口；改完重启后生效</span></div>
-          <span class="pill ${network.allowRemoteConsole ? 'warn' : 'ok'}">${network.allowRemoteConsole ? '允许局域网登录控制台' : '控制台仅本机登录'}</span>
+          <div><h2>并发与队列</h2>${hintBadge('并发说明', '对话 / 模型 / 工具 / 插件四级闸门；数字是当前进程的实时值。')}</div>
+          <div class="panel-actions">
+            <span class="pill ${(cap?.queued ?? 0) + (toolStats?.queued ?? 0) + (pluginStats?.queued ?? 0) > 0 ? 'warn' : 'ok'}">
+              ${(cap?.queued ?? 0) + (toolStats?.queued ?? 0) + (pluginStats?.queued ?? 0) > 0 ? '有请求排队' : '当前无排队'}
+            </span>
+            <button class="btn sm ghost" type="button" id="concurrency-refresh">刷新</button>
+          </div>
         </div>
         <div class="kv-grid kv-2">
-          <div><span>当前监听地址</span><strong class="mono">${esc(network.host)}</strong></div>
+          <div><span>对话在生成</span><strong>${cap?.active ?? 0} / ${cap?.limits?.maxConcurrent ?? 8}<span class="desc" style="display:block;font-weight:400">公司上限 ${cap?.limits?.companyMaxConcurrent ?? 8} · 模型上限 ${cap?.limits?.modelMaxConcurrent ?? 4}</span></strong></div>
+          <div><span>对话排队</span><strong>${cap?.queued ?? 0}<span class="desc" style="display:block;font-weight:400">队列上限 ${cap?.limits?.queueLimit ?? 100}</span></strong></div>
+          <div><span>工具在执行 / 排队</span><strong>${toolStats?.active ?? 0} / ${toolStats?.queued ?? 0}<span class="desc" style="display:block;font-weight:400">单工具上限 ${toolStats?.limits?.maxConcurrent ?? 8}</span></strong></div>
+          <div><span>插件工具在执行 / 排队</span><strong>${pluginStats?.active ?? 0} / ${pluginStats?.queued ?? 0}<span class="desc" style="display:block;font-weight:400">单插件上限 ${pluginStats?.limits?.maxConcurrent ?? 4}</span></strong></div>
+          <div><span>工具执行次数</span><strong>${fmtNum(toolStats?.runs ?? 0)}<span class="desc" style="display:block;font-weight:400">失败 ${fmtNum(toolStats?.failures ?? 0)}</span></strong></div>
+          <div><span>SQLITE_BUSY</span><strong>${fmtNum(concurrency?.sqlite?.busyTotal ?? 0)}<span class="desc" style="display:block;font-weight:400">写事务抢锁次数</span></strong></div>
+        </div>
+        <div class="table-scroll" style="margin-top:14px">
+          <table class="data">
+            <thead><tr><th>模型</th><th>正在生成</th><th>排队</th></tr></thead>
+            <tbody>
+              ${(cap?.models ?? []).length
+                ? (cap?.models ?? []).map((row) => `<tr><td class="mono">${esc(row.modelId)}</td><td>${row.active}</td><td>${row.queued}</td></tr>`).join('')
+                : '<tr><td colspan="3" class="muted">当前没有正在生成的模型</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+        <div class="table-scroll" style="margin-top:12px">
+          <table class="data">
+            <thead><tr><th>工具</th><th>正在执行</th><th>排队</th><th>累计次数</th><th>失败</th><th>平均耗时</th></tr></thead>
+            <tbody>
+              ${toolRows.length
+                ? toolRows.map((row) => `<tr><td class="mono">${esc(row.toolId)}</td><td>${row.active}</td><td>${row.queued}</td><td>${fmtNum(row.runs)}</td><td>${fmtNum(row.failures)}</td><td>${row.avgDurationMs} ms</td></tr>`).join('')
+                : '<tr><td colspan="6" class="muted">还没有工具执行记录</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+      </section>
+      <section class="panel" data-section-panel="agents">
+        <div class="panel-head">
+          <div><h2>Agent 运行树</h2>${hintBadge('运行树说明', '父任务和 agent.spawn 派生的子 Agent；点开「步骤」看每个子 Agent 的工具轨迹。')}</div>
+          <div class="panel-actions">
+            <span class="pill ${(agentRuns?.active ?? 0) > 0 ? 'warn' : 'ok'}">${(agentRuns?.active ?? 0) > 0 ? `运行中 ${agentRuns.active}` : '无运行中任务'}</span>
+            <button class="btn sm ghost" type="button" id="agents-refresh">刷新</button>
+          </div>
+        </div>
+        <div class="table-scroll">
+          <table class="data">
+            <thead><tr><th>任务 / Agent</th><th>模型</th><th>状态</th><th>耗时</th><th>步骤</th><th>工具轨迹</th></tr></thead>
+            <tbody>
+              ${(agentRuns?.runs ?? []).length
+                ? (agentRuns.runs).map((row) => {
+                  const duration = Math.max(0, Math.round(((row.endedAt ?? Date.now()) - row.startedAt) / 1000))
+                  const statusClass = row.status === 'succeeded' ? 'ok' : row.status === 'failed' ? 'warn' : row.status === 'cancelled' ? 'warn' : 'warn'
+                  const statusText = row.status === 'succeeded' ? '成功' : row.status === 'failed' ? '失败' : row.status === 'cancelled' ? '已取消' : '运行中'
+                  const steps = row.steps ?? []
+                  return `<tr>
+                    <td><span style="padding-left:${row.depth * 16}px">${row.depth ? '↳ ' : ''}${esc(row.title ?? row.agentId)}</span><div class="desc">${esc(row.id.slice(0, 8))} · ${esc(row.agentId)}</div></td>
+                    <td class="mono">${esc(row.modelId ?? '—')}</td>
+                    <td><span class="pill ${statusClass}">${statusText}</span></td>
+                    <td>${duration} 秒</td>
+                    <td>${steps.length}</td>
+                    <td>${steps.length ? `<details><summary>${steps.length} 步</summary><div style="margin-top:6px">${steps.map((step) => `<div style="margin-bottom:6px">${step.seq + 1}. ${esc(step.name ?? step.toolId ?? step.kind)} · ${esc(step.status)} · ${step.durationMs} ms${step.resultSummary ? `<div class="desc">${esc(step.resultSummary)}</div>` : ''}</div>`).join('')}</div></details>` : '<span class="muted">暂无步骤</span>'}</td>
+                  </tr>`
+                }).join('')
+                : '<tr><td colspan="6" class="muted">还没有 Agent 运行记录；发起一次对话后这里会出现根任务和子 Agent</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+        ${hintNote('隔离说明', '子 Agent 使用独立 runId 和独立会话锁；父任务取消会级联取消子任务。共享云空间文件仍由 P0-1 的资源锁串行化。')}
+      </section>
+      <section class="panel" data-section-panel="runtime">
+        <div class="panel-head">
+          <div><h2>网络与访问入口</h2>${hintBadge('端口说明', '局域网开关切换即生效；监听地址与端口保存后自动重建监听，不用重启服务。本机访问填 127.0.0.1；局域网访问填 0.0.0.0，并确认服务器防火墙已放行两个端口。环境变量 EAB_HOST / EAB_PORT / EAB_ADMIN_PORT 优先于这里。')}</div>
+          <span class="pill ${network.allowRemoteConsole ? 'warn' : 'ok'}" id="net-access-pill">${network.allowRemoteConsole ? '允许局域网登录控制台' : '控制台仅本机登录'}</span>
+        </div>
+        <div class="kv-grid kv-2">
+          <div><span>当前监听地址</span><strong class="mono">${esc(network.host)}:${esc(String(network.chatPort))}</strong></div>
           <div><span>员工对话</span><strong class="mono">http://${esc(network.host)}:${esc(String(network.chatPort))}/chat</strong></div>
           <div><span>管理控制台</span><strong class="mono">http://${esc(network.host)}:${esc(String(network.adminPort))}/admin</strong></div>
           <div><span>本机局域网 IP</span><strong class="mono">${esc((network.localAddresses || []).join(' / ') || '未检测到')}</strong></div>
         </div>
-        <div class="form-grid" style="align-items:end;margin-top:14px">
+        <div class="net-access">
+          <div class="net-access-copy">
+            <span class="net-access-kicker">控制台访问范围</span>
+            <strong id="net-access-title">${network.allowRemoteConsole ? '局域网内可登录控制台' : '仅服务器本机能登录控制台'}</strong>
+            <span class="net-access-state" id="net-access-state">${locked.allowRemoteConsole ? '由 EAB_CONSOLE_ALLOW_REMOTE 固定，需改环境变量' : '切换后立即生效'}</span>
+          </div>
+          <label class="net-switch${locked.allowRemoteConsole ? ' is-locked' : ''}">
+            <input id="net-remote" type="checkbox"${network.allowRemoteConsole ? ' checked' : ''} ${locked.allowRemoteConsole ? 'disabled' : ''} />
+            <span class="net-switch-track"><span class="net-switch-thumb"></span></span>
+            <span class="net-switch-text">允许局域网登录</span>
+          </label>
+        </div>
+        <div class="net-listen-head">
+          <strong>监听地址与端口</strong>
+          <span>保存后自动切换监听，不用重启</span>
+        </div>
+        <div class="form-grid net-form">
           <label class="field"><span>监听地址</span>
             <input id="net-host" value="${esc(network.host)}" placeholder="127.0.0.1 或 0.0.0.0" ${locked.host ? 'disabled' : ''} />
           </label>
@@ -4369,16 +4915,15 @@ async function loadSys() {
           <label class="field"><span>管理控制台端口</span>
             <input id="net-admin-port" type="number" min="1" max="65535" value="${esc(String(network.adminPort))}" ${locked.adminPort ? 'disabled' : ''} />
           </label>
-          <div class="panel-actions" style="align-self:end">
-            <label class="check"><input id="net-remote" type="checkbox"${network.allowRemoteConsole ? ' checked' : ''} ${locked.allowRemoteConsole ? 'disabled' : ''} /><span>允许局域网登录控制台</span></label>
-            <button class="btn sm primary" type="button" id="net-save">保存网络设置</button>
+          <div class="panel-actions net-actions">
+            <button class="btn sm primary" type="button" id="net-save" ${locked.host && locked.chatPort && locked.adminPort ? 'disabled' : ''}>保存并切换</button>
           </div>
         </div>
-        <div class="inline-note" id="net-state" style="margin-top:10px">本机访问填 127.0.0.1；局域网访问填 0.0.0.0，并确认服务器防火墙已放行两个端口。环境变量 EAB_HOST / EAB_PORT / EAB_ADMIN_PORT 优先于这里。</div>
+        <div class="inline-note" id="net-state" style="margin-top:10px"></div>
       </section>
       <section class="panel" data-section-panel="data">
         <div class="panel-head">
-          <div><h2>版本更新</h2><span class="hint">从 GitHub Release 检测新版本；确认后由更新器替换代码并重启</span></div>
+          <div><h2>版本更新</h2>${hintBadge('更新说明', '从 GitHub Release 检测新版本；确认后由更新器替换代码并重启。命令行方式：eab update（检测） / eab update --apply（确认更新）。更新会先备份当前代码；数据目录 .eab-dev 不会被替换。')}</div>
           <span class="pill ${update?.hasUpdate ? 'warn' : 'ok'}">${update?.hasUpdate ? '发现新版本' : update?.latest ? '已是最新' : '尚未检查'}</span>
         </div>
         <div class="kv-grid kv-2">
@@ -4393,10 +4938,10 @@ async function loadSys() {
           <button class="btn sm primary" type="button" id="update-apply" ${update?.hasUpdate && update?.sourceUrl ? '' : 'disabled'}>一键更新</button>
           <button class="btn sm ghost" type="button" id="update-copy">复制命令</button>
         </div>
-        <div class="inline-note" id="update-state" style="margin-top:10px">命令行方式：eab update（检测） / eab update --apply（确认更新）。更新会先备份当前代码；数据目录 .eab-dev 不会被替换。</div>
+        <div class="inline-note" id="update-state" style="margin-top:10px"></div>
       </section>
       <section class="panel" data-section-panel="company">
-        <div class="panel-head"><div><h2>公司信息</h2><span class="hint">单公司实例：只此一家，ID 固定</span></div></div>
+        <div class="panel-head"><div><h2>公司信息</h2>${hintBadge('公司范围', '单公司实例：只此一家，ID 固定；改名会同步根部门与成员部门显示。')}</div></div>
         <div class="form-grid" style="align-items:end">
           <label class="field"><span>公司名称</span><input id="company-name-input" value="${esc(state.companies[0]?.name ?? '')}" maxlength="80" /></label>
           <div class="panel-actions" style="align-self:end">
@@ -4407,7 +4952,7 @@ async function loadSys() {
         </div>
       </section>
       <section class="panel" data-section-panel="runtime">
-        <div class="panel-head"><div><h2>准入与安全</h2><span class="hint">控制台不是员工入口，只有服务器本机或部署方账号能进</span></div></div>
+        <div class="panel-head"><div><h2>准入与安全</h2>${hintBadge('准入说明', '控制台不是员工入口，只有服务器本机或部署方账号能进；远程访问需部署侧显式开启。')}</div></div>
         <div class="kv-grid">
           <div><span>登录账号</span><strong class="mono">admin</strong></div>
           <div><span>登录方式</span><strong>超级管理员账号 + 密码</strong></div>
@@ -4419,28 +4964,35 @@ async function loadSys() {
       </section>
       <section class="panel" data-section-panel="data">
         <div class="panel-head">
-          <div><h2>数据目录</h2><span class="hint">数据库、密钥、凭据与备份的落盘位置；可以放到其它盘</span></div>
-          <span class="pill ${settings?.envLocked ? 'warn' : 'ok'}">${settings?.envLocked ? '由 EAB_DB 固定' : '可在控制台调整'}</span>
+          <div><h2>存储位置</h2>${hintBadge('路径规则', '每个分类都可以单独指定绝对路径；没单独配置时跟随总存储位置。保存后重启，启动时先把旧目录复制到新目录并校验，成功后才切换，旧目录保留。目标目录已有数据时不会自动覆盖。')}</div>
+          <span class="pill ${storagePending.length > 0 ? 'warn' : 'ok'}">${storagePending.length > 0 ? '待重启迁移' : '可在控制台调整'}</span>
         </div>
-        <div class="kv-grid kv-2">
-          <div><span>当前数据目录</span><strong class="mono">${esc(settings?.dataDir || '（读取中）')}</strong></div>
-          <div><span>数据库文件</span><strong class="mono">${esc(settings?.dbPath || '—')}</strong><span class="desc">${settings?.dbSizeBytes ? `${(settings.dbSizeBytes / 1024 / 1024).toFixed(2)} MB` : ''}</span></div>
+        <div class="storage-rows" id="storage-rows">
+          ${storageRows.map((row) => `
+            <div class="storage-row" data-storage-key="${esc(row.key)}">
+              <div class="storage-meta">
+                <span class="storage-label">${esc(row.label)}</span>
+                <span class="pill ${row.source === '独立配置' ? 'accent' : ''}">${row.locked ? '由环境变量固定' : esc(row.source)}</span>
+              </div>
+              <div class="storage-current">
+                <span class="desc">当前</span>
+                <strong class="mono">${esc(row.path || '—')}</strong>
+                ${row.key === 'database' ? '<span class="desc">eab.db、密钥与管理凭据所在目录</span>' : ''}
+                ${row.key === 'dataDir' && settings?.dbPath ? `<span class="desc">数据库 ${esc(settings.dbPath)}</span>` : ''}
+              </div>
+              <div class="storage-edit">
+                <input id="storage-input-${esc(row.key)}" placeholder="新绝对路径，例如 E:\\EABData\\${esc(row.key === 'dataDir' ? '' : row.key)}" ${row.locked ? 'disabled' : ''} />
+                <button class="btn sm primary" type="button" data-storage-save ${row.locked ? 'disabled' : ''}>保存</button>
+                <button class="btn sm ghost" type="button" data-storage-reset ${row.locked ? 'disabled' : ''}>${row.key === 'dataDir' ? '恢复部署默认' : '跟随总位置'}</button>
+              </div>
+            </div>`).join('')}
         </div>
-        <div class="form-grid" style="align-items:end;margin-top:14px">
-          <label class="field"><span>迁移到（绝对路径）</span>
-            <input id="data-dir-input" placeholder="例如 D:\\EABData" ${settings?.envLocked ? 'disabled' : ''} />
-          </label>
-          <div class="panel-actions" style="align-self:end">
-            <button class="btn sm primary" type="button" id="data-dir-save" ${settings?.envLocked ? 'disabled' : ''}>保存（重启生效）</button>
-            <button class="btn sm ghost" type="button" id="data-dir-reset" ${settings?.envLocked ? 'disabled' : ''}>回到部署目录</button>
-          </div>
-        </div>
-        <div class="inline-note" id="data-dir-state" style="margin-top:10px">保存后需要重启服务；启动时会把现有数据库、secrets.json、管理员凭据一起搬到新目录，不会新建空库。运行期间不移动文件。</div>
+        <div class="inline-note" id="storage-state" style="margin-top:10px">${storagePending.length > 0 ? `待迁移：${storagePending.map((job) => `${esc(job.from)} → ${esc(job.to)}`).join('；')}` : '所有分类当前都按上面的路径生效'}</div>
       </section>
       <section class="panel" data-section-panel="data">
         <div class="panel-head">
-          <div><h2>日志保留</h2><span class="hint">同步记录、渠道事件、登录失败、插件事件按天自动清理</span></div>
-          <span class="pill">${retentionDays > 0 ? `${retentionDays} 天` : '永久保留'}</span>
+          <div><h2>日志与审计保留</h2>${hintBadge('清理说明', '同步记录、渠道事件、登录失败、插件事件按日志保留天数清理；审计按独立天数，只从最老一端连续删除，被删段最后一行会留作链锚点，所以清理本身不会造成断链。后台每 6 小时检查一次。')}</div>
+          <span class="pill">日志 ${retentionDays > 0 ? `${retentionDays} 天` : '永久'} · 审计 ${auditRetentionDays > 0 ? `${auditRetentionDays} 天` : '永久'}</span>
         </div>
         <div class="kv-grid">
           <div><span>同步记录</span><strong>${fmtNum(logs.syncRuns ?? 0)} 条<span class="desc">差异 ${fmtNum(logs.syncDiffs ?? 0)} 条</span></strong></div>
@@ -4448,21 +5000,24 @@ async function loadSys() {
           <div><span>登录失败计数</span><strong>${fmtNum(logs.loginAttempts ?? 0)} 条</strong></div>
           <div><span>插件 / 扫码事件</span><strong>${fmtNum((logs.pluginEvents ?? 0) + (logs.onboardAttempts ?? 0))} 条</strong></div>
           <div><span>上次清理</span><strong>${esc(cleanupText)}</strong></div>
-          <div><span>审计日志</span><strong>${fmtNum(logs.auditLogs ?? 0)} 条<span class="desc">append-only，不参与自动清理</span></strong></div>
+          <div><span>审计日志</span><strong>${fmtNum(logs.auditLogs ?? 0)} 条 ${hintBadge('审计保留', auditRetentionDays > 0 ? `超过 ${auditRetentionDays} 天自动清理；只删最老一段，保留链锚点，不会因清理断链。` : '审计日志永久保留，不自动清理。')}</strong></div>
         </div>
         <div class="form-grid" style="align-items:end;margin-top:14px">
-          <label class="field"><span>保留天数（0 = 永久保留）</span>
+          <label class="field"><span>日志保留天数（0 = 永久保留）</span>
             <input id="retention-input" type="number" min="0" max="3650" value="${retentionDays}" />
+          </label>
+          <label class="field"><span>审计保留天数（0 = 永久保留）</span>
+            <input id="audit-retention-input" type="number" min="0" max="3650" value="${auditRetentionDays}" />
           </label>
           <div class="panel-actions" style="align-self:end">
             <button class="btn sm primary" type="button" id="retention-save">保存策略</button>
             <button class="btn sm ghost" type="button" id="retention-run">立即清理一次</button>
           </div>
         </div>
-        <div class="inline-note" id="retention-state" style="margin-top:10px">后台每 6 小时检查一次，超过保留期的记录会被删除；审计日志是哈希链，删一条就会断链，所以不自动清理。</div>
+        <div class="inline-note" id="retention-state" style="margin-top:10px"></div>
       </section>
       <section class="panel" data-section-panel="runtime">
-        <div class="panel-head"><div><h2>配置边界</h2><span class="hint">哪些东西在这里配，哪些不在这里配</span></div></div>
+        <div class="panel-head"><div><h2>配置边界</h2>${hintBadge('边界说明', '哪些东西在这里配，哪些不在这里配；进程托管、日志级别、环境变量与防火墙属于部署侧。')}</div></div>
         <div class="mini-list">
           <div class="mini-row"><span>在这里配置</span><div><span class="chip accent">组织与成员</span><span class="chip accent">角色权限</span><span class="chip accent">知识库</span><span class="chip accent">模型供应商</span><span class="chip accent">渠道凭证</span><span class="chip accent">插件</span></div></div>
           <div class="mini-row"><span>不在这里配置</span><div><span class="chip">进程托管</span><span class="chip">日志级别</span><span class="chip">环境变量 EAB_DB</span><span class="chip">防火墙</span></div></div>
@@ -4472,7 +5027,7 @@ async function loadSys() {
     view.querySelector('.section-panels')?.insertAdjacentHTML(
       'beforeend',
       `<section class="panel" data-section-panel="data">
-        <div class="panel-head"><div><h2>平台与运维</h2><span class="hint">数据库备份；渠道绑定已统一到「连接与平台 → 渠道 → 企业一键绑定」</span></div>
+        <div class="panel-head"><div><h2>平台与运维</h2>${hintBadge('运维说明', '数据库备份；渠道绑定已统一到「连接与平台 → 渠道 → 企业一键绑定」。')}</div>
           <div class="panel-actions">
             <button class="btn sm ghost" type="button" id="backup-now">立即备份</button>
           </div>
@@ -4483,6 +5038,14 @@ async function loadSys() {
     mountSectionNav(view, state.systemSection, 'runtime', (key) => {
       state.systemSection = key
     })
+    const concurrencyRefresh = $('#concurrency-refresh')
+    if (concurrencyRefresh) {
+      concurrencyRefresh.addEventListener('click', () => PAGES.system.render())
+    }
+    const agentsRefresh = $('#agents-refresh')
+    if (agentsRefresh) {
+      agentsRefresh.addEventListener('click', () => PAGES.system.render())
+    }
     const companyOnboard = $('#company-onboard')
     if (companyOnboard) companyOnboard.remove()
 
@@ -4568,10 +5131,46 @@ async function loadSys() {
               .slice(0, 6)
               .map(
                 (item) =>
-                  `<div class="mini-row"><span class="mono">${esc(item.name)}</span><div>${(item.size / 1024 / 1024).toFixed(2)} MB · ${esc(new Date(item.createdAt).toLocaleString())}</div></div>`,
+                  `<div class="mini-row backup-row">
+                    <span class="mono backup-name">${esc(item.name)}</span>
+                    <div class="backup-meta">
+                      <span class="backup-stamp">${(item.size / 1024 / 1024).toFixed(2)} MB · ${esc(new Date(item.createdAt).toLocaleString())}</span>
+                      <div class="backup-actions">
+                        <button class="btn sm ghost" type="button" data-reveal-backup="${esc(item.name)}" title="在服务器所在电脑上打开该备份所在目录">打开文件位置</button>
+                        <button class="btn sm ghost danger" type="button" data-del-backup="${esc(item.name)}">删除</button>
+                      </div>
+                    </div>
+                  </div>`,
               )
               .join('')
           : '<div class="mini-row"><span>备份</span><div class="muted">还没有备份。点「立即备份」生成一个 SQLite 快照。</div></div>'
+        for (const button of box.querySelectorAll('[data-reveal-backup]')) {
+          button.addEventListener('click', async () => {
+            button.disabled = true
+            try {
+              const result = await apiPost(`/api/console/backups/${encodeURIComponent(button.dataset.revealBackup)}/reveal`, {})
+              if (!result.opened) alert(`无法自动打开资源管理器；备份在服务器上的路径：\n${result.file}`)
+            } catch (err) {
+              alert(err.message)
+            } finally {
+              button.disabled = false
+            }
+          })
+        }
+        for (const button of box.querySelectorAll('[data-del-backup]')) {
+          button.addEventListener('click', async () => {
+            const name = button.dataset.delBackup
+            if (!confirm(`删除备份 ${name}？删除后无法恢复。`)) return
+            button.disabled = true
+            try {
+              await apiSend('DELETE', `/api/console/backups/${encodeURIComponent(name)}`)
+              refreshBackups()
+            } catch (err) {
+              alert(err.message)
+              button.disabled = false
+            }
+          })
+        }
       } catch (err) {
         box.innerHTML = `<div class="mini-row"><span>备份</span><div class="muted">读取失败：${esc(err.message)}</div></div>`
       }
@@ -4586,13 +5185,23 @@ async function loadSys() {
       }
       retentionSave.addEventListener('click', async () => {
         const days = Number($('#retention-input')?.value)
-        if (!Number.isInteger(days) || days < 0 || (days > 0 && days < 7) || days > 3650) {
-          return setNote('保留天数只能填 0（永久）或 7–3650', true)
+        const auditDays = Number($('#audit-retention-input')?.value)
+        for (const [label, value] of [
+          ['日志保留天数', days],
+          ['审计保留天数', auditDays],
+        ]) {
+          if (!Number.isInteger(value) || value < 0 || (value > 0 && value < 7) || value > 3650) {
+            return setNote(`${label}只能填 0（永久）或 7–3650`, true)
+          }
         }
         retentionSave.disabled = true
         try {
-          await apiSend('PUT', '/api/console/settings/retention', { days })
-          setNote(days > 0 ? `已保存：超过 ${days} 天的日志会被自动清理（后台每 6 小时检查一次）` : '已保存：日志永久保留，不再自动清理')
+          await apiSend('PUT', '/api/console/settings/retention', { days, auditDays })
+          const policy = [
+            days > 0 ? `日志超过 ${days} 天` : '日志永久保留',
+            auditDays > 0 ? `审计超过 ${auditDays} 天` : '审计永久保留',
+          ]
+          setNote(`已保存：${policy.join('；')}（后台每 6 小时检查一次）`)
         } catch (err) {
           setNote(err.message, true)
         } finally {
@@ -4609,7 +5218,7 @@ async function loadSys() {
         try {
           const result = await apiPost('/api/console/settings/retention/run', {})
           if (result.skipped) {
-            if (note) note.textContent = '当前策略是永久保留（0 天），没有需要清理的记录'
+            if (note) note.textContent = '当前日志与审计都设为永久保留（0 天），没有需要清理的记录'
           } else {
             const labels = {
               syncDiffs: '同步差异',
@@ -4618,6 +5227,7 @@ async function loadSys() {
               loginAttempts: '登录失败',
               pluginEvents: '插件事件',
               onboardAttempts: '扫码尝试',
+              auditLogs: '审计记录',
             }
             const detail = Object.entries(result.deleted ?? {})
               .filter(([, n]) => Number(n) > 0)
@@ -4627,6 +5237,8 @@ async function loadSys() {
           }
           const input = $('#retention-input')
           if (input && result.days > 0) input.value = result.days
+          const auditInput = $('#audit-retention-input')
+          if (auditInput && result.audit?.days > 0) auditInput.value = result.audit.days
         } catch (err) {
           if (note) {
             note.textContent = err.message
@@ -4681,37 +5293,151 @@ async function loadSys() {
         }
       })
     }
+    const storageRowsEl = $('#storage-rows')
+    if (storageRowsEl) {
+      storageRowsEl.addEventListener('click', async (event) => {
+        const btn = event.target.closest('[data-storage-save], [data-storage-reset]')
+        if (!btn) return
+        const row = btn.closest('.storage-row')
+        const key = row?.dataset.storageKey
+        if (!key) return
+        const input = row.querySelector('input')
+        const reset = btn.hasAttribute('data-storage-reset')
+        const path = reset ? null : String(input?.value ?? '').trim()
+        if (!reset && !path) {
+          const note = $('#storage-state')
+          if (note) {
+            note.textContent = '先填写新的绝对路径，例如 E:\\EABData\\workspaces'
+            note.classList.add('bad-text')
+          }
+          return
+        }
+        const note = $('#storage-state')
+        const buttons = row.querySelectorAll('button, input')
+        buttons.forEach((item) => { item.disabled = true })
+        try {
+          const result = await apiSend('PUT', '/api/console/settings/storage', { key, path, reset })
+          if (note) {
+            note.textContent = result.changed ? result.hint : '路径没有变化'
+            note.classList.toggle('bad-text', false)
+          }
+          if (input) input.value = ''
+        } catch (err) {
+          if (note) {
+            note.textContent = err.message
+            note.classList.add('bad-text')
+          }
+        } finally {
+          buttons.forEach((item) => { item.disabled = false })
+        }
+      })
+    }
     const netSave = $('#net-save')
     if (netSave) {
       const note = $('#net-state')
+      const setNetNote = (text, bad = false) => {
+        if (!note) return
+        note.textContent = text
+        note.classList.toggle('bad-text', bad)
+      }
+      const setAccessUi = (allowed) => {
+        const pill = $('#net-access-pill')
+        const title = $('#net-access-title')
+        const accessState = $('#net-access-state')
+        if (pill) {
+          pill.textContent = allowed ? '允许局域网登录控制台' : '控制台仅本机登录'
+          pill.classList.toggle('warn', allowed)
+          pill.classList.toggle('ok', !allowed)
+        }
+        if (title) title.textContent = allowed ? '局域网内可登录控制台' : '仅服务器本机能登录控制台'
+        if (accessState) accessState.textContent = '切换后立即生效'
+      }
+      const netRemote = $('#net-remote')
+      if (netRemote && !netRemote.disabled) {
+        let previous = netRemote.checked
+        netRemote.addEventListener('change', async () => {
+          const target = netRemote.checked
+          netRemote.disabled = true
+          setNetNote(target ? '正在打开局域网登录…' : '正在关闭局域网登录…')
+          try {
+            const result = await apiSend('PUT', '/api/console/settings/network', {
+              allowRemoteConsole: target,
+            })
+            const allowed = Boolean(result.network?.allowRemoteConsole ?? target)
+            setAccessUi(allowed)
+            setNetNote(result.hint || '已立即生效')
+            previous = allowed
+          } catch (err) {
+            netRemote.checked = previous
+            setAccessUi(previous)
+            setNetNote(err.message, true)
+          } finally {
+            netRemote.disabled = false
+          }
+        })
+      }
+      const targetAdminUrl = (network) => {
+        const url = new URL(location.href)
+        const host = String(network?.host ?? '')
+        if (host && host !== '0.0.0.0' && host !== '::') url.hostname = host
+        if (network?.adminPort) url.port = String(network.adminPort)
+        return url
+      }
       netSave.addEventListener('click', async () => {
         const host = String($('#net-host')?.value ?? '').trim()
         const chatPort = Number($('#net-chat-port')?.value)
         const adminPort = Number($('#net-admin-port')?.value)
         if (!host) {
-          if (note) note.textContent = '监听地址不能为空'
+          setNetNote('监听地址不能为空', true)
           return
         }
         if (!Number.isInteger(chatPort) || !Number.isInteger(adminPort) || chatPort === adminPort) {
-          if (note) note.textContent = '两个端口都必须是 1–65535 的整数，且不能相同'
+          setNetNote('两个端口都必须是 1–65535 的整数，且不能相同', true)
           return
         }
         netSave.disabled = true
+        setNetNote('正在保存并切换监听…')
         try {
           const result = await apiSend('PUT', '/api/console/settings/network', {
             host,
             chatPort,
             adminPort,
-            allowRemoteConsole: Boolean($('#net-remote')?.checked),
           })
-          if (note) {
-            note.textContent = result.restartRequired
-              ? '已保存；重启服务后生效。局域网访问请同时放行防火墙端口。'
-              : '网络设置没有变化'
+          if (result.switching && result.network) {
+            const target = targetAdminUrl(result.network)
+            setNetNote('监听正在切换，正在确认新地址…')
+            let reachable = false
+            for (let i = 0; i < 8; i += 1) {
+              await new Promise((resolve) => setTimeout(resolve, 500))
+              try {
+                await fetch(`${target.origin}/api/health?t=${Date.now()}`, {
+                  mode: 'no-cors',
+                  cache: 'no-store',
+                })
+                reachable = true
+                break
+              } catch {
+                // 新端口还没起来时继续等，最多 4 秒。
+              }
+            }
+            if (!reachable) {
+              setNetNote('监听切换失败，已保留原监听；请查看服务日志', true)
+              netSave.disabled = false
+              return
+            }
+            if (target.origin !== location.origin) {
+              location.assign(target.toString())
+              return
+            }
+            setNetNote('监听已切换，无需重启')
+            netSave.disabled = false
+            return
           }
+          setAccessUi(Boolean(result.network?.allowRemoteConsole ?? netRemote?.checked))
+          setNetNote(result.hint || '网络设置没有变化')
+          netSave.disabled = false
         } catch (err) {
-          if (note) note.textContent = err.message
-        } finally {
+          setNetNote(err.message, true)
           netSave.disabled = false
         }
       })
@@ -4808,10 +5534,7 @@ async function loadSys() {
 function openDingTalkOnboard(onDone) {
   const overlay = modelModal(`
     <div class="modal-head"><h3>钉钉扫码绑定</h3><button class="modal-x" type="button">×</button></div>
-    <div class="banner" style="margin:0 0 14px">
-      <strong>把本实例的唯一公司绑定到你的钉钉企业</strong>
-      <span>用手机钉钉扫码，钉钉官方会创建/连接机器人并补齐机器人权限；扫完 EAB 自动把部门与成员同步到当前唯一公司，并让「EAB · 公司名」机器人开始接收私聊。通讯录权限如果钉钉没自动给，会在这里给出一次性批量开通入口。</span>
-    </div>
+    ${hintNote('扫码说明', '用手机钉钉扫码，钉钉官方会创建/连接机器人并补齐机器人权限；扫完 EAB 自动把部门与成员同步到当前唯一公司，并让「EAB · 公司名」机器人开始接收私聊。通讯录权限如果钉钉没自动给，会在这里给出一次性批量开通入口。')}
     <div class="onboard-qr">
       <div class="onboard-qr-visual">
         <div class="onboard-qr-frame"><img id="od-qr" alt="钉钉扫码开通二维码" /></div>
@@ -4837,9 +5560,7 @@ function openDingTalkOnboard(onDone) {
         <label class="field"><span>公司名称（可空）</span><input id="od-name" placeholder="默认用钉钉企业名" /></label>
         <label class="field"><span>slug（可空）</span><input id="od-slug" class="mono" placeholder="默认自动生成" /></label>
       </div>
-      <div class="hint" style="padding-top:10px">
-        手工方式要求应用已开通部门、成员、部门成员读权限，且发布过新版本。扫码方式会由钉钉自动补齐权限。
-      </div>
+      ${hintNote('权限说明', '手工方式要求应用已开通部门、成员、部门成员读权限，且发布过新版本。扫码方式会由钉钉自动补齐权限。')}
       <div class="modal-actions" style="justify-content:flex-start">
         <button class="btn" type="button" id="od-save">手工开通并同步</button>
       </div>
@@ -5012,31 +5733,217 @@ function openDingTalkOnboard(onDone) {
   })
 }
 
+/**
+ * 空库首次部署：控制台还进不去任何业务页，先把“创建唯一公司”做成主内容，
+ * 避免用户卡在空白的组织树 / 系统页上。
+ */
+function renderFirstCompany() {
+  const view = $('#view')
+  if (!view) return
+  const title = $('#page-title')
+  const sub = $('#page-sub')
+  const kicker = $('#page-kicker')
+  if (title) title.textContent = '首次部署'
+  if (sub) sub.textContent = '空库启动：先创建唯一公司，再接入组织与模型'
+  if (kicker) kicker.textContent = 'FIRST SETUP'
+  setSide('', true)
+
+  view.innerHTML = `
+    <section class="panel first-run-panel">
+      <div class="panel-head">
+        <div>
+          <h2>开始使用 EAB</h2>
+          ${hintBadge('空库说明', '这是空库部署；创建第一家公司后，组织、模型与渠道配置才有归属。')}
+        </div>
+        <div class="head-actions"><span class="pill">单公司实例</span></div>
+      </div>
+      <div class="first-run-body">
+        <div class="first-run-mark" aria-hidden="true">EAB</div>
+        <div class="first-run-copy">
+          <span class="first-run-kicker">STEP 01</span>
+          <h3>先创建一家公司</h3>
+          <p>服务器刚部署时数据库里没有任何公司。创建后，这家公司就是本实例唯一的管理范围；公司总部根部门、内置角色与权限骨架会自动建好。</p>
+          <div class="first-run-actions">
+            <button class="btn primary" type="button" id="first-company-create">创建第一家公司</button>
+            ${hintBadge('接入说明', '创建后可在「连接与平台 → 渠道」用钉钉扫码接入真实组织。')}
+          </div>
+        </div>
+      </div>
+      <div class="first-run-steps">
+        <div class="first-run-step"><span>01</span><strong>创建公司</strong><p>定义本实例唯一组织，生成公司总部与角色骨架。</p></div>
+        <div class="first-run-step"><span>02</span><strong>接入组织</strong><p>在渠道页扫码绑定钉钉，同步部门和成员。</p></div>
+        <div class="first-run-step"><span>03</span><strong>配置模型</strong><p>接入本地或云端模型，再开始对话与压测。</p></div>
+      </div>
+    </section>`
+
+  view.querySelector('#first-company-create')?.addEventListener('click', openCompanyCreate)
+}
+
 function openCompanyCreate() {
   const overlay = modelModal(`
-    <div class="modal-head"><h3>新建公司</h3><button class="modal-x" type="button">×</button></div>
-    <div class="banner" style="margin:0 0 12px"><strong>一个平台可以托多家公司</strong><span>新公司会得到独立的部门根、角色副本和数据范围；成员/知识库/模型都按公司隔离。</span></div>
-    <div class="form-grid">
-      <label class="field"><span>公司名称</span><input id="c-name" placeholder="例如 丙科技" /></label>
-      <label class="field"><span>slug（唯一标识）</span><input id="c-slug" class="mono" placeholder="例如 bing-tech" /></label>
-      <label class="field"><span>管理员姓名</span><input id="c-admin" placeholder="选填；填了就同时建公司管理员" /></label>
-      <label class="field"><span>管理员账号</span><input id="c-account" class="mono" placeholder="留空自动生成" /></label>
-      <label class="field"><span>管理员初始密码</span><input id="c-password" type="password" placeholder="留空则不建管理员" /></label>
+    <div class="modal-head company-create-head">
+      <div class="company-create-title">
+        <span class="company-create-eyebrow">STEP 01 · 初始化</span>
+        <h3>创建第一家公司</h3>
+      </div>
+      <span class="company-create-scope">单公司实例</span>
+      <button class="modal-x" type="button">×</button>
     </div>
-    <label class="check" style="margin:12px 0 0;white-space:normal;width:100%">
-      <input id="c-bind-dt" type="checkbox" checked />
-      <span style="white-space:normal">创建后立即去绑定钉钉并同步通讯录（推荐，复用钉钉已有部门树与成员）</span>
-    </label>
+    <div class="company-create-lead">
+      <span class="company-create-lead-dot"></span>
+      ${hintBadge('范围说明', '这一家公司就是本实例唯一的管理范围，创建后自动生成组织骨架。公司 ID 使用服务器配置值，不会出现第二家公司。需要换组织请先在「系统 → 公司信息」删除。')}
+    </div>
+    <section class="company-create-section">
+      <div class="company-create-section-head">
+        <span class="company-create-step">01</span>
+        <div class="company-create-section-title">
+          <h4>公司信息 ${hintBadge('显示说明', '员工端与顶栏都会显示这家公司。')}</h4>
+        </div>
+        <span class="company-create-required">必填</span>
+      </div>
+      <div class="form-grid company-create-grid">
+        <label class="field"><span>公司名称 ${fieldInfo('创建后可在「系统 → 公司信息」改名，根部门和顶栏会一起同步。')}</span><input id="c-name" placeholder="例如 居易科技" maxlength="80" /></label>
+        <label class="field"><span>公司标识（slug） ${fieldInfo('留空自动生成；用于内部标识和自动管理员账号前缀，创建后不建议修改。')}</span><input id="c-slug" class="mono" placeholder="留空自动生成" maxlength="40" /></label>
+      </div>
+    </section>
+    <section class="company-create-section">
+      <div class="company-create-section-head">
+        <span class="company-create-step">02</span>
+        <div class="company-create-section-title">
+          <h4>初始管理员 ${hintBadge('添加说明', '可以稍后在「组织与权限」里再添加；不建管理员也能先完成公司初始化。')}</h4>
+        </div>
+        <span class="company-create-optional">可选</span>
+      </div>
+      <div class="form-grid company-create-grid">
+        <label class="field"><span>管理员姓名 ${fieldInfo('填了姓名才会创建管理员账号；留空则只建公司。')}</span><input id="c-admin" placeholder="选填；填了就同时建公司管理员" maxlength="40" /></label>
+        <label class="field"><span>管理员账号 ${fieldInfo('留空自动生成。手填后会实时检测工号、邮箱、手机号是否已被占用。')}</span><input id="c-account" class="mono" placeholder="留空自动生成" maxlength="40" aria-describedby="c-account-status" /><small class="field-hint" id="c-account-status" aria-live="polite"></small></label>
+        <label class="field"><span>管理员初始密码 ${fieldInfo('填了管理员姓名则至少 8 位；仅用于首次创建管理员，之后可在成员详情里重置。')}</span><input id="c-password" type="password" autocomplete="new-password" placeholder="填了管理员姓名则至少 8 位" /></label>
+      </div>
+    </section>
+    <div class="company-create-extra">
+      <label class="check company-create-check">
+        <input id="c-bind-dt" type="checkbox" />
+        <span>创建后去渠道页绑定钉钉并同步通讯录</span>
+      </label>
+      <span class="company-create-extra-note">可选</span>
+      ${fieldInfo('勾选后创建完成会跳到渠道页并打开钉钉绑定；不会自动创建成员，只发起绑定流程。')}
+    </div>
+    <div class="company-create-autogen">
+      <span>创建后自动生成</span>
+      <b>公司总部</b>
+      <b>8 个内置角色</b>
+      ${fieldInfo('公司总部根部门和内置角色权限会一次建好；钉钉同步会在此基础上追加部门与成员。')}
+    </div>
     <div class="modal-state" id="c-state"></div>
     <div class="modal-actions">
       <button class="btn primary" type="button" id="c-save">创建公司</button>
       <button class="btn ghost" type="button" id="c-cancel">取消</button>
     </div>`)
-  const close = () => overlay.remove()
+  overlay.querySelector('.modal')?.classList.add('company-create-modal')
+  const stateEl = overlay.querySelector('#c-state')
+  const save = overlay.querySelector('#c-save')
+  const accountInput = overlay.querySelector('#c-account')
+  const adminInput = overlay.querySelector('#c-admin')
+  const accountStatus = overlay.querySelector('#c-account-status')
+  const ACCOUNT_HINT = ''
+  let accountCheckTimer = null
+  let accountCheckSeq = 0
+  let verifiedAccount = ''
+
+  function setAccountStatus(text, tone = '') {
+    if (!accountStatus) return
+    accountStatus.className = `field-hint${tone ? ` ${tone}` : ''}`
+    accountStatus.textContent = text
+  }
+
+  function resetAccountStatus() {
+    verifiedAccount = ''
+    setAccountStatus(ACCOUNT_HINT)
+    accountInput?.setAttribute('aria-invalid', 'false')
+    if (save) save.disabled = false
+  }
+
+  async function checkAdminAccount() {
+    const seq = ++accountCheckSeq
+    if (!accountInput || !adminInput) return true
+    const account = accountInput.value.trim()
+    const adminName = adminInput.value.trim()
+    if (!adminName || !account) {
+      resetAccountStatus()
+      return true
+    }
+    setAccountStatus('正在检测账号是否已被占用…', 'is-checking')
+    try {
+      const result = await apiPost('/api/console/companies/check-admin-account', { account })
+      if (seq !== accountCheckSeq) return false
+      if (!result.available) {
+        verifiedAccount = ''
+        accountInput.setAttribute('aria-invalid', 'true')
+        setAccountStatus(
+          `账号已被${result.ownerName ? `成员「${result.ownerName}」` : '已有成员'}占用，请换一个`,
+          'is-bad',
+        )
+        save.disabled = true
+        return false
+      }
+      verifiedAccount = account
+      accountInput.setAttribute('aria-invalid', 'false')
+      setAccountStatus('账号可用', 'is-ok')
+      save.disabled = false
+      return true
+    } catch {
+      if (seq !== accountCheckSeq) return false
+      verifiedAccount = ''
+      accountInput.setAttribute('aria-invalid', 'false')
+      setAccountStatus('暂时无法检测账号；提交时服务器会再校验', 'is-checking')
+      save.disabled = false
+      return true
+    }
+  }
+
+  function scheduleAccountCheck() {
+    verifiedAccount = ''
+    if (save) save.disabled = false
+    if (accountCheckTimer) clearTimeout(accountCheckTimer)
+    accountCheckTimer = setTimeout(() => {
+      accountCheckTimer = null
+      void checkAdminAccount()
+    }, 400)
+  }
+
+  function checkAccountNow() {
+    if (accountCheckTimer) {
+      clearTimeout(accountCheckTimer)
+      accountCheckTimer = null
+    }
+    void checkAdminAccount()
+  }
+
+  function close() {
+    if (accountCheckTimer) {
+      clearTimeout(accountCheckTimer)
+      accountCheckTimer = null
+    }
+    accountCheckSeq += 1
+    document.removeEventListener('keydown', onKey)
+    overlay.remove()
+  }
+  const onKey = (event) => {
+    if (event.key === 'Escape') close()
+  }
+  document.addEventListener('keydown', onKey)
   overlay.querySelector('.modal-x').addEventListener('click', close)
   overlay.querySelector('#c-cancel').addEventListener('click', close)
+  overlay.addEventListener('click', (event) => {
+    if (event.target === overlay) close()
+  })
+  accountInput?.addEventListener('input', scheduleAccountCheck)
+  adminInput?.addEventListener('input', scheduleAccountCheck)
+  accountInput?.addEventListener('blur', checkAccountNow)
+  adminInput?.addEventListener('blur', checkAccountNow)
+  overlay.querySelector('#c-name')?.focus()
+
   overlay.querySelector('#c-save').addEventListener('click', async () => {
-    const stateEl = overlay.querySelector('#c-state')
     const body = {
       name: overlay.querySelector('#c-name').value.trim(),
       slug: overlay.querySelector('#c-slug').value.trim(),
@@ -5044,24 +5951,53 @@ function openCompanyCreate() {
       adminAccount: overlay.querySelector('#c-account').value.trim(),
       adminPassword: overlay.querySelector('#c-password').value,
     }
-    if (!body.name || !body.slug) {
+    if (!body.name) {
       stateEl.className = 'modal-state bad'
-      stateEl.textContent = '公司名称和 slug 都要填'
+      stateEl.textContent = '公司名称不能为空'
+      overlay.querySelector('#c-name')?.focus()
       return
     }
+    if (body.adminName && body.adminPassword.length < 8) {
+      stateEl.className = 'modal-state bad'
+      stateEl.textContent = '填了管理员姓名时，初始密码至少 8 位'
+      overlay.querySelector('#c-password')?.focus()
+      return
+    }
+    if (accountCheckTimer) {
+      clearTimeout(accountCheckTimer)
+      accountCheckTimer = null
+    }
+    if (body.adminName && body.adminAccount && verifiedAccount !== body.adminAccount) {
+      const available = await checkAdminAccount()
+      if (!available) {
+        stateEl.className = 'modal-state bad'
+        stateEl.textContent = '管理员账号已被占用，请换一个'
+        accountInput?.focus()
+        return
+      }
+    }
+    save.disabled = true
+    stateEl.className = 'modal-state'
+    stateEl.textContent = '正在创建公司…'
     try {
       const result = await apiPost('/api/console/companies', body)
       const bindDingtalk = Boolean(overlay.querySelector('#c-bind-dt')?.checked)
       close()
-      const query = new URLSearchParams({ company: result.id })
+      const query = new URLSearchParams({ company: result.id, goto: 'overview' })
       if (bindDingtalk) {
         query.set('goto', 'channels')
         query.set('open', 'dingtalk')
       }
       location.href = `/admin?${query.toString()}`
     } catch (err) {
+      save.disabled = false
       stateEl.className = 'modal-state bad'
       stateEl.textContent = err.message || '创建失败'
+      if (err.code === 'EAB_VALIDATION' && /账号/.test(err.message || '')) {
+        setAccountStatus(err.message, 'is-bad')
+        accountInput?.setAttribute('aria-invalid', 'true')
+        accountInput?.focus()
+      }
     }
   })
 }
@@ -5088,10 +6024,10 @@ async function loadTools() {
       .map(
         (tool) => `<tr>
           <td><strong>${esc(tool.name)}</strong><div class="desc mono">${esc(tool.id)}</div></td>
-          <td>${esc(tool.description)}</td>
+          <td class="tool-desc"><div class="tool-desc-text" title="${esc(tool.description)}">${esc(tool.description)}</div></td>
           <td>${tool.source === 'plugin' ? '<span class="pill">插件</span>' : '<span class="pill ok">内置</span>'} ${tool.dangerous ? '<span class="pill warn">需审批</span>' : ''}</td>
           <td>${tool.available ? '<span class="pill ok">当前可用</span>' : '<span class="pill">无权限</span>'}</td>
-          <td><button class="link-btn accent" type="button" data-tool-test="${esc(tool.id)}"${tool.available ? '' : ' disabled'}>试运行</button></td>
+          <td class="tool-actions"><button class="link-btn accent" type="button" data-tool-test="${esc(tool.id)}"${tool.available ? '' : ' disabled'}>试运行</button></td>
         </tr>`,
       )
       .join('')
@@ -5099,7 +6035,7 @@ async function loadTools() {
     const pluginCount = data.tools.length - builtinCount
     view.innerHTML = `
       <section class="panel">
-        <div class="panel-head"><div><h2>工具注册表</h2><span class="hint">${builtinCount} 个内置工具 + ${pluginCount} 个插件工具；插件工具随插件安装/停用动态出现</span></div></div>
+        <div class="panel-head"><div><h2>工具注册表</h2><span class="hint">${builtinCount} 个内置工具 + ${pluginCount} 个插件工具</span>${hintBadge('工具说明', '插件工具随插件安装 / 停用动态出现；没有权限的工具会在当前身份列标记为不可用。')}</div></div>
         <table class="data">
           <thead><tr><th>工具</th><th>说明</th><th>来源 / 风险</th><th>当前身份</th><th>操作</th></tr></thead>
           <tbody>${rows}</tbody>
@@ -5149,13 +6085,12 @@ async function loadUsage(days = 30) {
   const view = $('#view')
   renderLoading(view)
   setSide(`
-    <div class="side-head">统计窗口</div>
+    <div class="side-head usage-side-head"><span class="side-title">统计窗口</span>${hintBadge('数据来源', '数据来自 usage_daily：每轮对话按用户按天累加请求、prompt、completion token。')}</div>
     <div class="side-list">
       ${[7, 30, 90]
         .map((item) => `<button class="side-item${days === item ? ' is-active' : ''}" type="button" data-usage-days="${item}">最近 ${item} 天</button>`)
         .join('')}
-    </div>
-    <div class="side-foot muted">数据来自 usage_daily：每轮对话按用户按天累加请求、prompt、completion token。</div>`)
+    </div>`)
   for (const button of document.querySelectorAll('[data-usage-days]')) {
     button.addEventListener('click', () => loadUsage(Number(button.dataset.usageDays)))
   }
@@ -5174,7 +6109,7 @@ async function loadUsage(days = 30) {
       .join('')
     view.innerHTML = `
       <section class="panel">
-        <div class="panel-head"><div><h2>最近 ${days} 天</h2><span class="hint">按人和按天聚合</span></div></div>
+        <div class="panel-head"><div><h2>最近 ${days} 天</h2>${hintBadge('统计口径', '按人和按天聚合；只统计当前管理范围内的对话请求。')}</div></div>
         <div class="kv-grid">
           <div><span>对话请求</span><strong>${data.totals.requests}</strong></div>
           <div><span>Prompt tokens</span><strong>${data.totals.promptTokens}</strong></div>
@@ -5241,6 +6176,179 @@ const CHANNEL_STATUS_LABEL = {
   error: '异常',
 }
 
+const ASSISTANT_AVATAR_MAX_BYTES = 1024 * 1024
+
+function assistantAvatarPreview(name, url) {
+  const label = String(name || 'AI').trim() || 'AI'
+  const initial = esc(label.length <= 2 ? label : label.slice(0, 1))
+  return `${url ? `<img class="assistant-avatar-img" src="${esc(url)}" alt="">` : ''}<span class="assistant-avatar-letter">${initial}</span>`
+}
+
+function assistantAvatarBytes(dataUrl) {
+  const comma = dataUrl.indexOf(',')
+  if (comma < 0) return Number.POSITIVE_INFINITY
+  return Math.floor(((dataUrl.length - comma - 1) * 3) / 4)
+}
+
+function loadAssistantImage(url) {
+  return new Promise((resolve, reject) => {
+    const image = new Image()
+    image.onload = () => resolve(image)
+    image.onerror = () => reject(new Error('无法读取这张图片，请换一张 PNG / JPEG / WebP'))
+    image.src = url
+  })
+}
+
+/**
+ * 头像统一裁成 1:1、512px 再上传：
+ * 后台弹窗里看到的预览和员工工作台里的最终效果保持一致，也避免把几 MB 原图塞进请求体。
+ */
+async function prepareAssistantAvatar(file) {
+  if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type)) {
+    throw new Error('头像只支持 PNG / JPEG / WebP 图片')
+  }
+  if (file.size > 8 * 1024 * 1024) {
+    throw new Error('原图超过 8 MB，请先压缩后再上传')
+  }
+  const objectUrl = URL.createObjectURL(file)
+  try {
+    const image = await loadAssistantImage(objectUrl)
+    const side = Math.min(image.naturalWidth, image.naturalHeight)
+    if (!side) throw new Error('图片尺寸无效')
+    const canvas = document.createElement('canvas')
+    canvas.width = 512
+    canvas.height = 512
+    const context = canvas.getContext('2d')
+    if (!context) throw new Error('浏览器不支持图片处理')
+    context.drawImage(
+      image,
+      Math.max(0, (image.naturalWidth - side) / 2),
+      Math.max(0, (image.naturalHeight - side) / 2),
+      side,
+      side,
+      0,
+      0,
+      512,
+      512,
+    )
+    let dataUrl = canvas.toDataURL('image/webp', 0.9)
+    if (!dataUrl.startsWith('data:image/webp')) dataUrl = canvas.toDataURL('image/png')
+    if (assistantAvatarBytes(dataUrl) > ASSISTANT_AVATAR_MAX_BYTES) {
+      context.fillStyle = '#fff'
+      context.fillRect(0, 0, 512, 512)
+      context.drawImage(
+        image,
+        Math.max(0, (image.naturalWidth - side) / 2),
+        Math.max(0, (image.naturalHeight - side) / 2),
+        side,
+        side,
+        0,
+        0,
+        512,
+        512,
+      )
+      dataUrl = canvas.toDataURL('image/jpeg', 0.86)
+    }
+    if (assistantAvatarBytes(dataUrl) > ASSISTANT_AVATAR_MAX_BYTES) {
+      throw new Error('压缩后仍超过 1 MB，请换一张更简单的图片')
+    }
+    return dataUrl
+  } finally {
+    URL.revokeObjectURL(objectUrl)
+  }
+}
+
+function bindAssistantEditor(initial) {
+  const nameInput = $('#assistant-name')
+  const preview = $('#assistant-avatar-preview')
+  const fileInput = $('#assistant-avatar-file')
+  const removeButton = $('#assistant-avatar-remove')
+  const saveButton = $('#assistant-save')
+  const stateEl = $('#assistant-save-state')
+  if (!nameInput || !preview || !fileInput || !removeButton || !saveButton || !stateEl) return
+
+  let avatarUrl = initial.avatarUrl || ''
+  let pendingDataUrl = ''
+  let pendingRemove = false
+
+  const setState = (text, tone = '') => {
+    stateEl.className = `pill ${tone}`.trim()
+    stateEl.textContent = text
+  }
+
+  const refresh = () => {
+    preview.innerHTML = assistantAvatarPreview(nameInput.value, avatarUrl)
+    preview.classList.toggle('has-photo', Boolean(avatarUrl))
+    const image = preview.querySelector('.assistant-avatar-img')
+    if (image) {
+      image.addEventListener('error', () => {
+        avatarUrl = ''
+        refresh()
+      })
+    }
+  }
+
+  nameInput.addEventListener('input', () => {
+    refresh()
+    setState('待保存', 'warn')
+  })
+
+  fileInput.addEventListener('change', async () => {
+    const file = fileInput.files?.[0]
+    if (!file) return
+    setState('处理图片中…', 'warn')
+    try {
+      pendingDataUrl = await prepareAssistantAvatar(file)
+      pendingRemove = false
+      avatarUrl = pendingDataUrl
+      refresh()
+      setState('新头像待保存', 'warn')
+    } catch (error) {
+      setState(error.message || '图片处理失败', 'danger')
+    } finally {
+      fileInput.value = ''
+    }
+  })
+
+  removeButton.addEventListener('click', () => {
+    pendingDataUrl = ''
+    pendingRemove = true
+    avatarUrl = ''
+    refresh()
+    setState('头像待恢复默认', 'warn')
+  })
+
+  saveButton.addEventListener('click', async () => {
+    const name = nameInput.value.trim()
+    if (!name) {
+      setState('助手名称不能为空', 'danger')
+      nameInput.focus()
+      return
+    }
+    saveButton.disabled = true
+    setState('保存中…', 'warn')
+    try {
+      const payload = { name }
+      if (pendingDataUrl) payload.avatarDataUrl = pendingDataUrl
+      else if (pendingRemove) payload.removeAvatar = true
+      const result = await apiSend('PUT', '/api/console/company/assistant', payload)
+      const saved = result.assistant || {}
+      nameInput.value = saved.name || name
+      avatarUrl = saved.avatarUrl || ''
+      pendingDataUrl = ''
+      pendingRemove = false
+      refresh()
+      setState('已保存', 'ok')
+    } catch (error) {
+      setState(error.message || '保存失败', 'danger')
+    } finally {
+      saveButton.disabled = false
+    }
+  })
+
+  refresh()
+}
+
 async function loadCompanyProfile() {
   const view = $('#view')
   renderLoading(view)
@@ -5264,12 +6372,20 @@ async function loadCompanyProfile() {
         </tr>`,
       )
       .join('')
+    const assistant = data.assistant || { name: 'AI', avatarUrl: '' }
 
     view.innerHTML = `
       <section class="panel">
         <div class="panel-head">
-          <div><h2>${esc(company.name)}</h2><span class="hint mono">${esc(company.slug)} · ${esc(company.id)}</span></div>
-          <span class="pill ${active ? 'ok' : 'danger'}">${active ? '在营' : '已停用'}</span>
+          <div><h2>${esc(company.name)}</h2><span class="hint mono">${esc(company.slug)} · ${esc(company.id)}</span>${hintBadge(
+            active ? '状态说明' : '停用说明',
+            active ? '成员可以正常登录对话；停用后成员登录会被拒绝，控制台仍可管理。' : '成员登录会被拒绝；重新启用后立即恢复。',
+          )}</div>
+          <div class="company-head-actions">
+            <span class="pill ${active ? 'ok' : 'danger'}">${active ? '在营' : '已停用'}</span>
+            <button class="btn sm primary" type="button" id="company-rename">重命名</button>
+            <button class="btn sm ghost" type="button" id="company-refresh">刷新</button>
+          </div>
         </div>
         <div class="kv-grid kv-2">
           <div><span>公司名称</span><strong>${esc(company.name)}</strong></div>
@@ -5277,14 +6393,41 @@ async function loadCompanyProfile() {
           <div><span>创建时间</span><strong>${esc(fmtDateTime(company.createdAt))}</strong></div>
           <div><span>组织根节点</span><strong>${esc(company.rootDeptName || '—')}</strong></div>
         </div>
-        <div class="banner ${active ? '' : 'danger'}">
-          <strong>${active ? '公司在营' : '公司已停用'}</strong>
-          <span>${active ? '成员可以正常登录对话；停用后成员登录会被拒绝，控制台仍可管理。' : '成员登录会被拒绝；重新启用后立即恢复。'}</span>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div><h2>助手身份</h2>${hintBadge(
+            '展示位置',
+            '显示在员工工作台 AI 消息左侧：头像在上，名字在下方。不配置时使用默认「AI」。',
+          )}</div>
+          <span class="pill" id="assistant-save-state">未修改</span>
+        </div>
+        <div class="assistant-editor">
+          <div class="assistant-avatar" id="assistant-avatar-preview">
+            ${assistantAvatarPreview(assistant.name, assistant.avatarUrl)}
+          </div>
+          <div class="assistant-fields">
+            <label class="field">
+              <span>助手名称 <em>最多 40 个字</em></span>
+              <input id="assistant-name" maxlength="40" value="${esc(assistant.name)}" autocomplete="off" />
+            </label>
+            <div class="assistant-actions">
+              <div class="assistant-media-actions">
+                <label class="btn sm ghost assistant-upload">上传图片
+                  <input id="assistant-avatar-file" type="file" accept="image/png,image/jpeg,image/webp" hidden />
+                </label>
+                <button class="btn sm ghost" type="button" id="assistant-avatar-remove">恢复默认头像</button>
+                ${hintBadge('头像要求', '建议正方形 1:1，选择后会自动裁切并压到 512px；单张不超过 1 MB。头像只保存在本机数据目录。')}
+              </div>
+              <button class="btn sm primary assistant-save" type="button" id="assistant-save">保存</button>
+            </div>
+          </div>
         </div>
       </section>
 
       <section class="panel">
-        <div class="panel-head"><div><h2>规模</h2><span class="hint">来自当前库，实时统计</span></div></div>
+        <div class="panel-head"><div><h2>规模</h2>${hintBadge('统计说明', '来自当前库，实时统计；成员包含在职与停用，部门包含根节点以下全部层级。')}</div></div>
         <div class="stats">
           <div class="stat"><div class="stat-label">成员</div><div class="stat-value">${fmtNum(counts.members)}<span class="stat-unit">在职 ${fmtNum(counts.activeMembers)}</span></div></div>
           <div class="stat"><div class="stat-label">部门</div><div class="stat-value">${fmtNum(counts.departments)}</div></div>
@@ -5294,7 +6437,7 @@ async function loadCompanyProfile() {
       </section>
 
       <section class="panel">
-        <div class="panel-head"><div><h2>渠道绑定</h2><span class="hint">一个渠道一行；绑定与解绑在「渠道」页操作</span></div>
+        <div class="panel-head"><div><h2>渠道绑定</h2>${hintBadge('渠道说明', '一个渠道一行；绑定与解绑统一在「连接与平台 → 渠道 → 企业一键绑定」操作。')}</div>
           <button class="btn sm ghost" type="button" id="company-goto-channel">去渠道页</button></div>
         <table class="data">
           <thead><tr><th>渠道</th><th>状态</th><th>组织 / 租户</th><th>启用</th><th>最近同步</th></tr></thead>
@@ -5320,15 +6463,14 @@ async function loadCompanyProfile() {
         </div>
       </section>`
 
-    setPageActions(`
-      <button class="btn sm primary" type="button" id="company-rename">重命名</button>
-      <button class="btn sm ghost" type="button" id="company-refresh">刷新</button>`)
+    setPageActions('')
 
     $('#company-refresh')?.addEventListener('click', () => loadCompanyProfile())
     $('#company-goto-channel')?.addEventListener('click', () => navigate('channels'))
     $('#company-rename')?.addEventListener('click', () => openCompanyRename(company))
     $('#company-toggle')?.addEventListener('click', () => toggleCompanyStatus(company))
     $('#company-delete')?.addEventListener('click', () => deleteCompany(company))
+    bindAssistantEditor(assistant)
   } catch (err) {
     renderDenied(view, err)
   }
@@ -5339,7 +6481,7 @@ function openCompanyRename(company) {
     <div class="modal-head"><h3>重命名公司</h3><button class="modal-x" type="button">×</button></div>
     <div class="field-stack">
       <label class="field"><span>公司名称</span><input id="co-name" value="${esc(company.name)}" maxlength="80" /></label>
-      <p class="field-note">改名会同步组织树根节点与成员部门显示，不需要重新同步通讯录。</p>
+      ${hintNote('改名说明', '改名会同步组织树根节点与成员部门显示，不需要重新同步通讯录。')}
     </div>
     <div class="modal-state" id="co-state"></div>
     <div class="modal-actions">
@@ -5360,7 +6502,7 @@ function openCompanyRename(company) {
     stateEl.className = 'modal-state'
     stateEl.textContent = '保存中…'
     try {
-      await apiPatch(`/api/console/companies/${encodeURIComponent(company.id)}`, { name })
+      await apiSend('PATCH', `/api/console/companies/${encodeURIComponent(company.id)}`, { name })
       close()
       await loadCompanies()
       loadCompanyProfile()
@@ -5383,7 +6525,7 @@ async function toggleCompanyStatus(company) {
     if (!ok) return
   }
   try {
-    await apiPatch(`/api/console/companies/${encodeURIComponent(company.id)}`, { status: next })
+    await apiSend('PATCH', `/api/console/companies/${encodeURIComponent(company.id)}`, { status: next })
     loadCompanyProfile()
   } catch (err) {
     alert(err.message || '操作失败')
@@ -5480,7 +6622,7 @@ async function loadQuota(month = state.quotaMonth || '') {
     const header = `
       <section class="panel">
         <div class="panel-head">
-          <div><h2>${esc(data.month)} · 额度与用量</h2><span class="hint">${esc(data.company.name)} · 成员 → 部门 → 公司逐级判定</span></div>
+          <div><h2>${esc(data.month)} · 额度与用量</h2><span class="hint">${esc(data.company.name)}</span>${hintBadge('判定顺序', '额度按成员 → 部门 → 公司逐级判定；成员额度优先，部门额度覆盖整棵子树。')}</div>
           <div class="panel-actions">
             <label class="field-inline"><span>月份</span><input type="month" id="quota-month" value="${esc(data.month)}" /></label>
           </div>
@@ -5501,7 +6643,7 @@ async function loadQuota(month = state.quotaMonth || '') {
       const cell = quotaUsageCell(usage, data.company.quota)
       table = `
         <section class="panel">
-          <div class="panel-head"><div><h2>公司月度额度</h2><span class="hint">所有成员共享同一个上限</span></div>
+          <div class="panel-head"><div><h2>公司月度额度</h2>${hintBadge('额度规则', '所有成员共享同一个上限；达到上限后本月新的对话请求会被拦截。')}</div>
             <button class="btn sm ghost" type="button" data-quota-edit="company" data-scope-id="${esc(data.company.id)}" data-scope-name="${esc(data.company.name)}">设置额度</button></div>
           <div class="table-wrap"><table class="data quota-table">
             <thead><tr><th>范围</th><th class="num">请求</th><th class="num">token</th><th>上限</th><th>使用率</th></tr></thead>
@@ -5534,7 +6676,7 @@ async function loadQuota(month = state.quotaMonth || '') {
         .join('')
       table = `
         <section class="panel">
-          <div class="panel-head"><div><h2>部门额度</h2><span class="hint">部门额度覆盖整棵子树，下级的用量也算在这里</span></div></div>
+          <div class="panel-head"><div><h2>部门额度</h2>${hintBadge('额度规则', '部门额度覆盖整棵子树，下级的用量也算在这里。')}</div></div>
           <div class="table-wrap"><table class="data quota-table wide">
             <thead><tr><th>部门</th><th class="num">成员</th><th class="num">请求</th><th class="num">token</th><th>上限</th><th>使用率</th><th>操作</th></tr></thead>
             <tbody>${rows || '<tr><td colspan="7" class="empty">还没有部门</td></tr>'}</tbody>
@@ -5561,7 +6703,7 @@ async function loadQuota(month = state.quotaMonth || '') {
         .join('')
       table = `
         <section class="panel">
-          <div class="panel-head"><div><h2>成员额度</h2><span class="hint">成员额度优先级最高：个人用完即拦，不影响同部门其他人</span></div></div>
+          <div class="panel-head"><div><h2>成员额度</h2>${hintBadge('额度规则', '成员额度优先级最高：个人用完即拦，不影响同部门其他人。')}</div></div>
           <div class="table-wrap"><table class="data quota-table wide">
             <thead><tr><th>成员</th><th>部门</th><th>状态</th><th class="num">请求</th><th class="num">token</th><th>上限</th><th>使用率</th><th>操作</th></tr></thead>
             <tbody>${rows || '<tr><td colspan="8" class="empty">还没有成员</td></tr>'}</tbody>
@@ -5624,7 +6766,7 @@ function openQuotaEdit(row) {
         <option value="hard"${quota?.mode !== 'soft' ? ' selected' : ''}>硬限制：用尽即拒绝对话</option>
         <option value="soft"${quota?.mode === 'soft' ? ' selected' : ''}>软限制：只记录不拦截</option>
       </select></label>
-      <p class="field-note">${label === '部门' ? '部门额度覆盖整棵子树；' : ''}至少填一个上限。判定顺序为成员 → 部门 → 公司。</p>
+      ${hintNote('判定说明', `${label === '部门' ? '部门额度覆盖整棵子树；' : ''}至少填一个上限。判定顺序为成员 → 部门 → 公司。`)}
     </div>
     <div class="modal-state" id="q-state"></div>
     <div class="modal-actions">
@@ -5673,7 +6815,7 @@ async function loadAudit(action = '', page = 0) {
   const view = $('#view')
   renderLoading(view)
   setSide(`
-    <div class="side-head">审计</div>
+    <div class="side-head audit-side-head"><span class="side-title">审计</span>${hintBadge('审计说明', '审计表 append-only + 哈希链；导出行为本身也会写一条审计。')}</div>
     <div class="side-list">
       <button class="side-item ${action ? '' : 'is-active'}" type="button" id="audit-all">全部操作</button>
       <button class="side-item ${action === 'org.member' ? 'is-active' : ''}" type="button" data-audit-action="org.member">成员变更</button>
@@ -5681,8 +6823,7 @@ async function loadAudit(action = '', page = 0) {
       <button class="side-item ${action === 'chat' ? 'is-active' : ''}" type="button" data-audit-action="chat">对话</button>
       <button class="side-item ${action === 'auth' ? 'is-active' : ''}" type="button" data-audit-action="auth">登录</button>
       <button class="side-item ${action === 'plugin' ? 'is-active' : ''}" type="button" data-audit-action="plugin">插件</button>
-    </div>
-    <div class="side-foot muted">审计表 append-only + 哈希链；导出行为本身也会写一条审计。</div>`)
+    </div>`)
   $('#audit-all')?.addEventListener('click', () => loadAudit(''))
   for (const button of document.querySelectorAll('[data-audit-action]')) {
     button.addEventListener('click', () => loadAudit(button.dataset.auditAction))
@@ -5720,14 +6861,14 @@ async function loadAudit(action = '', page = 0) {
           </table>
         </div>
         ${pagerHtml(data.total, page, AUDIT_PAGE_SIZE)}
-        <div class="hint" style="padding:12px 2px 0">共 ${data.total} 条，每页 ${AUDIT_PAGE_SIZE} 条；导出包含最近 10 万条。</div>
+        <div class="hint" style="padding:12px 2px 0">共 ${data.total} 条，每页 ${AUDIT_PAGE_SIZE} 条 ${hintBadge('导出说明', '导出包含最近 10 万条；更早的记录不会写入导出文件。')}</div>
       </section>`
     bindPager(view, (next) => loadAudit(action, next))
     $('#audit-verify')?.addEventListener('click', async () => {
       const box = $('#audit-verify-result')
       try {
         const result = await api('/api/console/audit/verify')
-        box.innerHTML = `<div class="banner ${result.ok ? '' : 'danger'}"><strong>${result.ok ? '哈希链完整' : '哈希链断裂'}</strong><span>检查 ${result.checked ?? '—'} 条${result.brokenAt ? ` · 首个异常 #${result.brokenAt}` : ''}</span></div>`
+        box.innerHTML = `<div class="banner ${result.ok ? '' : 'danger'}"><strong>${result.ok ? '哈希链完整' : '哈希链断裂'}</strong><span>检查 ${result.checked ?? '—'} 条${result.pruned ? ` · 已清理到 #${result.pruned}` : ''}${result.brokenAt ? ` · 首个异常 #${result.brokenAt}` : ''}</span></div>`
       } catch (err) {
         box.innerHTML = `<div class="banner danger"><strong>校验失败</strong><span>${esc(err.message)}</span></div>`
       }
@@ -5762,7 +6903,7 @@ async function loadApprovals() {
       .join('')
     view.innerHTML = `
       <section class="panel">
-        <div class="panel-head"><div><h2>审批</h2><span class="hint">高危动作需要先申请，再由控制台决定</span></div></div>
+        <div class="panel-head"><div><h2>审批</h2>${hintBadge('审批说明', '高危动作需要先申请，再由控制台决定；通过或拒绝都会写审计。')}</div></div>
         <table class="data">
           <thead><tr><th>申请人</th><th>动作</th><th>状态</th><th>提交时间</th><th>操作</th></tr></thead>
           <tbody>${rows || '<tr><td colspan="5" class="empty">没有审批记录。插件高危能力、跨部门导出等动作会在这里生成待办。</td></tr>'}</tbody>
@@ -5878,13 +7019,14 @@ function channelConfigCard(item, options = {}) {
     : ''
   return `<div class="channel-config${bound ? ' is-bound' : ''}${secondary ? ' is-secondary' : ''}">
     <div class="channel-config-head">
-      <div><strong>${esc(item.label)}</strong><span class="channel-sub">${
+      <div><strong>${esc(item.label)}</strong>${hintBadge(
+        '接入说明',
         bound
-          ? '已完成企业绑定，机器人可以直接收发消息'
+          ? '已完成企业绑定，机器人可以直接收发消息。'
           : hasCredentials
-            ? '应用凭证已保存，可拉取真实通讯录并接收事件回调'
-            : '还没有填写应用凭证，无法拉取通讯录'
-      }</span></div>
+            ? '应用凭证已保存，可拉取真实通讯录并接收事件回调。'
+            : '还没有填写应用凭证，无法拉取通讯录。',
+      )}</div>
       <span class="pill ${bound || configured ? 'ok' : 'warn'}">${topState}</span>
     </div>
     <div class="channel-flags">${badges}</div>
@@ -5921,7 +7063,7 @@ function bindingCard(item, channel) {
             : ' · 演示租户，可解除后重新绑定'
           : ''
       }</div>`
-    : esc(item.hint)
+    : hintBadge('绑定方式', item.hint || '未绑定；完成企业授权后同步组织与成员。')
   let actions = ''
   if (item.bound && demoBinding) {
     actions =
@@ -5981,8 +7123,8 @@ function renderSync(channels, data, bindings) {
   const paneBinding = `
     <section class="panel channel-pane" id="ch-binding" data-pane="binding">
       <div class="panel-head">
-        <div><h2>企业一键绑定</h2><span class="hint">钉钉扫码一次完成绑定与首次同步；飞书 / 企微后续接入</span></div>
-        <span class="pill">一个租户只归一家公司</span>
+        <div><h2>企业一键绑定</h2>${hintBadge('绑定说明', '钉钉扫码一次完成绑定与首次同步；飞书 / 企微后续接入。钉钉扫码绑定后会自动拉取部门树与成员；重复绑定同一企业会原地更新并重跑同步。')}</div>
+        ${hintBadge('租户规则', '一个租户只归一家公司；绑定关系与同步结果都会写审计。')}
       </div>
       ${
         bindingList.length
@@ -5991,13 +7133,13 @@ function renderSync(channels, data, bindings) {
               .join('')}</div>`
           : '<div class="inline-note">没有读到绑定状态。点右上角「刷新状态」重试，或检查控制台会话。</div>'
       }
-      <div class="inline-note" id="binding-state" style="margin-top:10px">钉钉扫码绑定后会自动拉取部门树与成员；重复绑定同一企业会原地更新并重跑同步。</div>
+      <div class="inline-note" id="binding-state" style="margin-top:10px"></div>
     </section>`
 
   const paneConfig = `
     <section class="panel channel-pane" id="ch-config" data-pane="config" hidden>
       <div class="panel-head">
-        <div><h2>渠道接入</h2><span class="hint">已绑定的企业优先显示；未绑定渠道收在下方，避免抢占视线</span></div>
+        <div><h2>渠道接入</h2>${hintBadge('展示说明', '已绑定的企业优先显示；未绑定渠道收在下方，避免抢占视线。')}</div>
       </div>
       <div class="channel-tier-head">
         <div>
@@ -6019,7 +7161,7 @@ function renderSync(channels, data, bindings) {
         secondaryChannels.length
           ? `<details class="channel-secondary">
               <summary>
-                <div><strong>其他渠道</strong><span>未绑定 · 配置凭证后可接入，不占用主视线</span></div>
+                <div><strong>其他渠道</strong>${hintBadge('收纳说明', '未绑定渠道收在下方；配置凭证后可接入，不占用主视线。')}</div>
                 <span class="channel-more-count">${secondaryChannels.length} 个待接入 <span class="channel-more-chevron" aria-hidden="true">⌄</span></span>
               </summary>
               <div class="channel-config-grid channel-config-grid-secondary">${secondaryChannels
@@ -6034,7 +7176,7 @@ function renderSync(channels, data, bindings) {
   const paneSync = `
     <section class="panel channel-pane" id="ch-sync" data-pane="sync" hidden>
       <div class="panel-head">
-        <div><h2>通讯录同步</h2><span class="hint">从渠道 API 真实拉取部门与成员，按差异写回组织架构</span></div>
+        <div><h2>通讯录同步</h2>${hintBadge('同步说明', '从渠道 API 真实拉取部门与成员，按差异写回组织架构；不会删除外部系统里已有的数据。')}</div>
         <span class="pill">真实 API</span>
       </div>
       <div class="sync-actions">
@@ -6054,7 +7196,7 @@ function renderSync(channels, data, bindings) {
 
   const paneHistory = `
     <section class="panel channel-pane" id="ch-history" data-pane="history" hidden>
-      <div class="panel-head"><div><h2>同步记录</h2><span class="hint">点一行查看差异；表格内滚动，翻页只换数据</span></div>
+      <div class="panel-head"><div><h2>同步记录</h2>${hintBadge('记录说明', '点一行查看差异；表格内滚动，翻页只换数据。')}</div>
         <span class="pill" id="sync-history-count">共 ${syncTotal} 条</span></div>
       <div class="table-scroll">
         <table class="data">
@@ -6069,11 +7211,10 @@ function renderSync(channels, data, bindings) {
   const paneIdentity = `
     <section class="panel channel-pane" id="ch-identities" data-pane="identities" hidden>
       <div class="panel-head">
-        <div><h2>外部账号绑定</h2><span class="hint">飞书 open_id / 钉钉 staffId / 企微 UserId 绑定到 EAB 成员；未绑定不触发检索</span></div>
+        <div><h2>外部账号绑定</h2>${hintBadge('身份说明', '飞书 open_id / 钉钉 staffId / 企微 UserId 绑定到 EAB 成员；未绑定不触发检索。钉钉私聊与网页共用同一份会话；解除绑定后两边都不再保留。')}</div>
         <button class="btn sm primary" type="button" id="ident-new">＋ 新增绑定</button>
       </div>
       <div id="ident-list"><span class="hint">加载中…</span></div>
-      <div class="inline-note" style="margin-top:10px">钉钉私聊与网页共用同一份会话；解除绑定后两边都不再保留。</div>
     </section>`
 
   const pendingBindings = bindingList.filter((item) => !item.bound).length
@@ -6144,8 +7285,6 @@ function renderSync(channels, data, bindings) {
   bindHistoryRows()
   bindPager(view.querySelector('#sync-history-pager'), (next) => paintHistory(next))
 
-  setPageActions('<button class="btn" type="button" id="channel-refresh">刷新状态</button>')
-  $('#channel-refresh')?.addEventListener('click', () => loadSync())
   view.querySelector('#ident-new')?.addEventListener('click', () => openIdentityModal())
   loadIdentities(view)
 
@@ -6316,7 +7455,7 @@ async function openIdentityModal() {
       <label class="field"><span>对应成员</span><select id="ident-user">${members
         .map((member) => `<option value="${esc(member.id)}">${esc(member.name)} · ${esc(member.deptName)}</option>`)
         .join('')}</select></label>
-      <div class="hint">一个外部账号只能绑定一个成员；重复绑定会报错，避免身份串号。</div>
+      ${hintNote('绑定规则', '一个外部账号只能绑定一个成员；重复绑定会报错，避免身份串号。')}
     </div>
     <div class="modal-state" id="ident-state"></div>
     <div class="modal-actions"><button class="btn primary" type="button" id="ident-save">保存绑定</button><button class="btn ghost" type="button" id="ident-cancel">取消</button></div>`)
@@ -6372,12 +7511,12 @@ async function openChannelModal(item) {
       <label class="switch"><input type="checkbox" id="ch-enabled"${item.enabled ? ' checked' : ''} /><span>启用该渠道</span></label>
       ${
         item.callbackToken
-          ? `<p class="field-note">回调地址：<code>${esc(location.origin + item.callbackPath)}?token=${esc(
+          ? `<div class="hint">回调地址：<code>${esc(location.origin + item.callbackPath)}?token=${esc(
               item.callbackToken,
-            )}</code></p>`
-          : '<p class="field-note">保存后生成回调地址与回调 token。</p>'
+            )}</code></div>`
+          : hintNote('回调说明', '保存后生成回调地址与回调 token。')
       }
-      <p class="field-note">应用凭证用于后续通讯录同步与事件回调；Webhook 用于群通知和立即验证连通性。密钥保存到服务器本地，不写数据库。</p>
+      ${hintNote('凭证说明', '应用凭证用于后续通讯录同步与事件回调；Webhook 用于群通知和立即验证连通性。密钥保存到服务器本地，不写数据库。')}
     </div>
     <div class="modal-state" id="ch-state"></div>
     <div class="modal-actions">
@@ -6511,7 +7650,7 @@ function openDingTalkBind(channel, bindings, organization = null) {
           </label>`
         : ''
     }
-    <div class="inline-note" style="margin:10px 20px 0">绑定成功后会立即拉取一次通讯录，并把结果写进当前公司的组织架构；已存在的数据只做差异更新，不会重复创建。</div>
+    <div class="hint-note" style="margin:10px 20px 0">${hintBadge('同步说明', '绑定成功后会立即拉取一次通讯录，并把结果写进当前公司的组织架构；已存在的数据只做差异更新，不会重复创建。')}</div>
     <div class="modal-state" id="dt-state"></div>
     <div class="modal-actions">
       <button class="btn primary" type="button" id="dt-submit">${demoChannel ? '替换演示租户并同步' : '绑定并同步'}</button>
@@ -7295,7 +8434,7 @@ function pluginVersionsBody(data, plugin) {
       <div><span>来源</span><strong class="mono">${esc(registry)}</strong></div>
       <div><span>安装范围</span><strong>${plugin.personal ? '个人' : '当前公司'}</strong></div>
     </div>
-    <div class="plugin-note">更新只改版本 / 来源 / 指纹，保留首次安装时间；旧目录移到 <span class="mono">plugins/.trash</span>。同版本也可重装（覆盖更新）。</div>`
+    ${hintNote('更新说明', '更新只改版本 / 来源 / 指纹，保留首次安装时间；旧目录移到 plugins/.trash。同版本也可重装（覆盖更新）。')}`
 }
 
 function pluginSettingsBody(data, plugin, host) {
@@ -7397,8 +8536,10 @@ function pluginWelcomeHtml(data) {
     <div class="plugin-welcome-mark">P</div>
     <span class="install-eyebrow">PLUGIN WORKSPACE</span>
     <h2>${hasPlugins ? '从左侧选择一个插件' : '当前公司还没有安装插件'}</h2>
-    <p>${hasPlugins ? '点击左侧插件，右侧会展开它的概览、页面、版本、设置和生命周期记录。' : '可以安装本地目录、npm 国内镜像、GitHub 仓库里的 EAB 插件，或直接装 D 盘里的 DSH 插件。'}</p>
-    <div class="plugin-welcome-stats">
+    <div class="hint-note" style="justify-content:center">${hintBadge(
+      hasPlugins ? '工作区说明' : '安装来源',
+      hasPlugins ? '点击左侧插件，右侧会展开它的概览、页面、版本、设置和生命周期记录。' : '可以安装本地目录、npm 国内镜像、GitHub 仓库里的 EAB 插件，或直接装 D 盘里的 DSH 插件。',
+    )}</div>    <div class="plugin-welcome-stats">
       <div><strong>${data.stats.installed}</strong><span>已安装</span></div>
       <div><strong>${data.stats.enabled}</strong><span>启用</span></div>
       <div><strong>${hosts}</strong><span>host 运行</span></div>
@@ -7426,7 +8567,7 @@ function pluginCatalogHtml(data) {
     : '<div class="empty plugin-empty-inline">插件源里没有当前公司可安装或可更新的条目。</div>'
   return `<section class="panel plugin-catalog">
     <div class="panel-head"><h2>插件源</h2><span class="hint">${entries.length} 个可装 / 可更新 · <span class="mono">${esc(data.catalog.path)}</span></span></div>
-    <div class="legend" style="margin-top:0">${data.catalog.error ? esc(data.catalog.error) : '本地目录、npm 国内镜像、GitHub 三种来源安装后走同一条校验与登记链路；DSH 插件按 package.json 的 files 白名单复制。'}</div>
+    <div class="legend" style="margin-top:0">${data.catalog.error ? esc(data.catalog.error) : hintBadge('来源说明', '本地目录、npm 国内镜像、GitHub 三种来源安装后走同一条校验与登记链路；DSH 插件按 package.json 的 files 白名单复制。')}</div>
     <div class="plugin-catalog-grid">${cards}</div>
   </section>`
 }
@@ -7441,9 +8582,11 @@ function pluginRailHtml(data) {
   const catalog = available.map(pluginCatalogRailItem).join('')
   const hosts = (data.hosts || []).filter((host) => !host.error).length
   return `<div class="plugin-scope-block">
-      <span class="plugin-scope-eyebrow">当前公司</span>
+      <div class="plugin-scope-kicker">
+        <span class="plugin-scope-eyebrow">当前公司</span>
+        ${hintBadge('归属说明', '安装 / 启停 / 卸载只记在本司名下。')}
+      </div>
       <strong>${esc(companyName)}</strong>
-      <small>安装 / 启停 / 卸载只记在本司名下</small>
     </div>
     <div class="plugin-rail-metrics">
       <div><strong>${data.stats.installed}</strong><span>已装</span></div>
@@ -7678,13 +8821,7 @@ function renderNavRail() {
     return
   }
   rail.classList.remove('org-rail-mode')
-  const companyName = state.me?.company?.name ?? ''
   rail.innerHTML = `
-    <div class="nav-rail-head">
-      <span class="nav-rail-kicker">${esc(domain.kicker)}</span>
-      <span class="nav-rail-title">${esc(domain.label)}</span>
-      <span class="nav-rail-count">${domain.pages.length} 个页面${companyName ? ` · ${esc(companyName)}` : ''}</span>
-    </div>
     ${domain.pages
       .map((page) => {
         const meta = PAGES[page]
@@ -7701,9 +8838,14 @@ function renderNavRail() {
 function setPageActions(html) {
   const slot = document.querySelector('#page-actions')
   if (slot) slot.innerHTML = html ?? ''
+  slot?.closest('.page-head')?.classList.toggle('has-actions', Boolean(String(html ?? '').trim()))
 }
 
 function navigate(page) {
+  if (!state.companies.length) {
+    renderFirstCompany()
+    return
+  }
   if (!PAGES[page]) return
   state.page = page
   state.domain = PAGE_DOMAIN[page] ?? 'overview'
@@ -7719,15 +8861,14 @@ function navigate(page) {
     button.classList.toggle('is-active', button.dataset.domain === state.domain)
   }
   // 插件域：左侧栏承载插件概览与列表，内容区不再保留页内 rail，右侧视图铺满
-  document.querySelector('.workspace')?.classList.toggle('is-plugin-domain', state.domain === 'plugins')
-  // 插件页顶部已有「插件管理」一级导航和左侧概览，组织页的页头也已收进树右键菜单
-  document.querySelector('.page-head')?.classList.toggle(
-    'is-hidden',
-    state.domain === 'plugins' ||
-      state.page === 'org' ||
-      state.page === 'departments' ||
-      (state.page === 'roles' && Boolean(state.selectedRole)),
-  )
+  const workspace = document.querySelector('.workspace')
+  workspace?.classList.toggle('is-plugin-domain', state.domain === 'plugins')
+  // 概览域只有一页，左侧二级导航没有可切换项；收起侧栏，让概览卡片铺满内容区
+  workspace?.classList.toggle('no-side', state.domain === 'overview')
+  // 所有页面统一不显示大标题/副标题；page-head 只作为页面操作的右侧工具条保留。
+  const pageHead = document.querySelector('.page-head')
+  pageHead?.classList.remove('is-hidden')
+  pageHead?.classList.add('is-headingless')
   renderNavRail()
   state.deptFilter = null
   meta.render()
@@ -7778,14 +8919,14 @@ function openPasswordModal() {
     <div class="modal-head"><h3>修改控制台密码</h3><button class="modal-x" type="button">×</button></div>
     ${
       envManaged
-        ? `<p class="field-note">当前密码由环境变量 <code>EAB_ADMIN_PASSWORD</code> 管理，控制台内不能修改。请改部署环境变量后重启服务。</p>
+        ? `${hintNote('环境变量管理', '当前密码由环境变量 EAB_ADMIN_PASSWORD 管理，控制台内不能修改。请改部署环境变量后重启服务。')}
            <div class="modal-actions"><button class="btn ghost" type="button" id="pw-close">关闭</button></div>`
         : `<div class="field-stack">
              <label class="field"><span>当前密码</span><input id="pw-current" type="password" autocomplete="current-password" /></label>
              <label class="field"><span>新密码（8–72 位）</span><input id="pw-new" type="password" autocomplete="new-password" /></label>
              <label class="field"><span>再输一遍新密码</span><input id="pw-confirm" type="password" autocomplete="new-password" /></label>
            </div>
-           <p class="field-note">改完后其它设备上的控制台会话立即失效，当前会话保留；新密码会写入 <code>.eab-dev/admin-credentials.txt</code>。</p>
+           ${hintNote('生效说明', '改完后其它设备上的控制台会话立即失效，当前会话保留；新密码会写入 .eab-dev/admin-credentials.txt。')}
            <div class="modal-state" id="pw-state"></div>
            <div class="modal-actions">
              <button class="btn primary" type="button" id="pw-save">更新密码</button>
@@ -7887,7 +9028,13 @@ async function boot() {
     return
   }
 
+  /**
+   * 空库部署：先渲染“创建第一家公司”，不要继续 loadMe ——
+   * 此时 resolveActor 找不到公司，会直接抛错，页面就卡成空白/拒绝页。
+   */
+  const needsFirstCompany = state.companies.length === 0
   setupAccount()
+  if (needsFirstCompany) renderFirstCompany()
 
   // 顶部：只切业务域。点同一个域时回到该域上次停留的页面。
   $('#topnav').addEventListener('click', (event) => {
@@ -7955,7 +9102,9 @@ async function boot() {
     }
   })
 
+  if (needsFirstCompany) return
   await refresh()
 }
 
+bindHintTips()
 boot()

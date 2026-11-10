@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url'
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify'
 import { EC, EabError, toEabError } from '@eab/domain'
 import type { ServerDeps } from './deps.js'
+import { createChatCapacity } from './chat-capacity.js'
 import { readVersion } from './http.js'
 import { hasConsoleSession } from './console-auth.js'
 import { registerAdminRoutes } from './routes/admin.js'
@@ -84,6 +85,45 @@ function installSurfaceGuard(app: FastifyInstance, surface: AppSurface): void {
   })
 }
 
+/**
+ * 大请求体在 Fastify 解析前就按 Content-Length 记账，避免几十个 60MB 附件
+ * 同时被读进内存。预算按“声明大小之和”粗算；base64/JSON 的实际开销更高，
+ * 所以这里故意留了余量。
+ */
+function installBodyBudgetGuard(app: FastifyInstance, deps: ServerDeps): void {
+  const budgetBytes = (deps.config.maxInflightBodyMb ?? 256) * 1024 * 1024
+  let inflightBytes = 0
+  const reservations = new WeakMap<FastifyRequest, () => void>()
+
+  app.addHook('onRequest', async (req, reply) => {
+    const header = req.headers['content-length']
+    if (header === undefined) return
+    const bytes = Number(Array.isArray(header) ? header[0] : header)
+    if (!Number.isFinite(bytes) || bytes <= 0) return
+    if (bytes > budgetBytes || inflightBytes + bytes > budgetBytes) {
+      throw new EabError(EC.RATE_LIMITED, '当前同时上传或提交的数据太多，请稍后重试', {
+        hint: `同时在内存中的请求体预算约 ${Math.round(budgetBytes / 1024 / 1024)}MB`,
+        details: { inflightBytes, requestBytes: bytes, budgetBytes },
+      })
+    }
+
+    inflightBytes += bytes
+    let released = false
+    const release = () => {
+      if (released) return
+      released = true
+      inflightBytes = Math.max(0, inflightBytes - bytes)
+    }
+    reservations.set(req, release)
+    // 客户端中途断开时 onResponse 不一定触发，这里兜底。
+    reply.raw.once('close', release)
+  })
+
+  app.addHook('onResponse', async (req) => {
+    reservations.get(req)?.()
+  })
+}
+
 function servePublic(name: string, reply: FastifyReply): FastifyReply {
   const publicDir = process.env.EAB_PUBLIC_DIR || fileURLToPath(new URL('../public', import.meta.url))
   const body = readFileSync(join(publicDir, name))
@@ -111,6 +151,22 @@ export function buildApp(deps: ServerDeps, surface: AppSurface = 'all'): Fastify
   })
 
   installSurfaceGuard(app, surface)
+  installBodyBudgetGuard(app, deps)
+
+  const runtimeDeps: ServerDeps = deps.chatCapacity
+    ? deps
+    : {
+        ...deps,
+        chatCapacity: createChatCapacity({
+          maxConcurrent: deps.config.chatMaxConcurrent ?? 8,
+          queueLimit: deps.config.chatQueueLimit ?? 100,
+          queueTimeoutMs: deps.config.chatQueueTimeoutMs ?? 240_000,
+          maxInFlightPerUser: deps.config.chatUserMaxInFlight ?? 2,
+          messagesPerMinute: deps.config.chatUserMessagesPerMinute ?? 20,
+          modelMaxConcurrent: deps.config.chatModelMaxConcurrent ?? 4,
+          companyMaxConcurrent: deps.config.chatCompanyMaxConcurrent ?? deps.config.chatMaxConcurrent ?? 8,
+        }),
+      }
 
   app.addHook('onSend', async (_req: FastifyRequest, reply: FastifyReply) => {
     reply.header('x-eab-version', readVersion())
@@ -173,13 +229,13 @@ export function buildApp(deps: ServerDeps, surface: AppSurface = 'all'): Fastify
   app.get('/favicon.ico', async (_req, reply) => reply.code(204).send())
 
   // ---- API ----
-  registerSystemRoutes(app, deps)
+  registerSystemRoutes(app, runtimeDeps)
   registerAuthRoutes(app, deps)
   registerOrgRoutes(app, deps)
   registerChannelRoutes(app, deps)
   registerOrgSyncRoutes(app, deps)
   registerKbRoutes(app, deps)
-  registerChatRoutes(app, deps)
+  registerChatRoutes(app, runtimeDeps)
   registerMemoryRoutes(app, deps)
   registerPluginRoutes(app, deps)
   registerConsoleRoutes(app, deps)

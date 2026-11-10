@@ -37,10 +37,24 @@ export interface ServerConfig {
   readonly adminPassword: string
   /** 密码来源：环境变量（改了要重启）还是自动生成并落盘（可在账号中心直接改） */
   readonly adminPasswordSource?: 'env' | 'auto'
-  /** 业务数据目录（库、密钥、凭据、备份所在目录）；启动时由 settings 解析后填入 */
+  /** 总存储位置（所有未独立配置的分类都以它为根）；启动时由 settings 解析后填入 */
   readonly dataDir?: string
-  /** 数据目录是否由 EAB_DB 环境变量锁定（锁定时控制台不能改） */
+  /** 数据目录是否由 EAB_DB 环境变量锁定（锁定时控制台不能改数据库位置） */
   readonly dataDirEnvLocked?: boolean
+  /** 数据库目录（eab.db、secrets.json、管理员凭据所在目录） */
+  readonly dbDir?: string
+  /** 个人 / 部门 / 公司云空间根目录 */
+  readonly workspacesDir?: string
+  /** 临时文件目录 */
+  readonly tmpDir?: string
+  /** 数据库备份目录 */
+  readonly backupsDir?: string
+  /** 插件安装目录 */
+  readonly pluginsDir?: string
+  /** 插件运行数据目录（DSH_HOME 隔离树） */
+  readonly dshHomeDir?: string
+  /** 插件目录是否由 EAB_PLUGINS_DIR 环境变量锁定 */
+  readonly pluginsEnvLocked?: boolean
   /** 是否允许非本机地址登录控制台。默认否——控制台只在服务器本机/内网跳板用。 */
   readonly allowRemoteConsole: boolean
   /** 网络项由环境变量固定时，控制台不能改；未固定的项可在控制台保存。 */
@@ -51,6 +65,38 @@ export interface ServerConfig {
     readonly allowRemoteConsole: boolean
   }
   readonly logLevel: string
+  /** 网页对话全局同时生成上限；超出排队 */
+  readonly chatMaxConcurrent?: number
+  /** 全局排队上限；满了直接 429 */
+  readonly chatQueueLimit?: number
+  /** 排队最长等待毫秒数；超时 429 */
+  readonly chatQueueTimeoutMs?: number
+  /** 同一个人同时最多几条在途消息 */
+  readonly chatUserMaxInFlight?: number
+  /** 同一个人每分钟最多发起几条消息 */
+  readonly chatUserMessagesPerMinute?: number
+  /** 同一个模型同时生成上限；默认 4 */
+  readonly chatModelMaxConcurrent?: number
+  /** 同一个公司同时生成上限；默认等于全局上限 */
+  readonly chatCompanyMaxConcurrent?: number
+  /** 同一内置工具同时执行上限；默认 8 */
+  readonly toolMaxConcurrent?: number
+  /** 工具级排队上限；默认 200 */
+  readonly toolQueueLimit?: number
+  /** 工具级等待名额超时毫秒；默认 30 秒 */
+  readonly toolTimeoutMs?: number
+  /** 同一插件工具同时执行上限；默认 4 */
+  readonly pluginToolMaxConcurrent?: number
+  /** 插件工具执行超时毫秒；默认 60 秒 */
+  readonly pluginToolTimeoutMs?: number
+  /** 一次 agent.spawn 最多并行几个子 Agent；默认 4 */
+  readonly agentMaxParallel?: number
+  /** 子 Agent 最大嵌套深度（根为 0）；默认 2 */
+  readonly agentMaxDepth?: number
+  /** 单个子 Agent 最多重试几次；默认 1 */
+  readonly agentMaxRetries?: number
+  /** 所有请求体同时在内存中的粗略预算（MB）；超过时新的大请求直接 429 */
+  readonly maxInflightBodyMb?: number
 }
 
 function readInt(raw: string | undefined, fallback: number, name: string): number {
@@ -113,5 +159,21 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
       allowRemoteConsole: env.EAB_CONSOLE_ALLOW_REMOTE !== undefined,
     },
     logLevel: env.EAB_LOG_LEVEL ?? 'info',
+    chatMaxConcurrent: readInt(env.EAB_CHAT_MAX_CONCURRENT, 8, 'EAB_CHAT_MAX_CONCURRENT'),
+    chatQueueLimit: readInt(env.EAB_CHAT_QUEUE_LIMIT, 100, 'EAB_CHAT_QUEUE_LIMIT'),
+    chatQueueTimeoutMs: readInt(env.EAB_CHAT_QUEUE_TIMEOUT_MS, 240_000, 'EAB_CHAT_QUEUE_TIMEOUT_MS'),
+    chatUserMaxInFlight: readInt(env.EAB_CHAT_USER_MAX_IN_FLIGHT, 2, 'EAB_CHAT_USER_MAX_IN_FLIGHT'),
+    chatUserMessagesPerMinute: readInt(env.EAB_CHAT_USER_MESSAGES_PER_MINUTE, 20, 'EAB_CHAT_USER_MESSAGES_PER_MINUTE'),
+    chatModelMaxConcurrent: readInt(env.EAB_CHAT_MODEL_MAX_CONCURRENT, 4, 'EAB_CHAT_MODEL_MAX_CONCURRENT'),
+    chatCompanyMaxConcurrent: readInt(env.EAB_CHAT_COMPANY_MAX_CONCURRENT, 8, 'EAB_CHAT_COMPANY_MAX_CONCURRENT'),
+    toolMaxConcurrent: readInt(env.EAB_TOOL_MAX_CONCURRENT, 8, 'EAB_TOOL_MAX_CONCURRENT'),
+    toolQueueLimit: readInt(env.EAB_TOOL_QUEUE_LIMIT, 200, 'EAB_TOOL_QUEUE_LIMIT'),
+    toolTimeoutMs: readInt(env.EAB_TOOL_TIMEOUT_MS, 30_000, 'EAB_TOOL_TIMEOUT_MS'),
+    pluginToolMaxConcurrent: readInt(env.EAB_PLUGIN_TOOL_MAX_CONCURRENT, 4, 'EAB_PLUGIN_TOOL_MAX_CONCURRENT'),
+    pluginToolTimeoutMs: readInt(env.EAB_PLUGIN_TOOL_TIMEOUT_MS, 60_000, 'EAB_PLUGIN_TOOL_TIMEOUT_MS'),
+    agentMaxParallel: readInt(env.EAB_AGENT_MAX_PARALLEL, 4, 'EAB_AGENT_MAX_PARALLEL'),
+    agentMaxDepth: readInt(env.EAB_AGENT_MAX_DEPTH, 2, 'EAB_AGENT_MAX_DEPTH'),
+    agentMaxRetries: readInt(env.EAB_AGENT_MAX_RETRIES, 1, 'EAB_AGENT_MAX_RETRIES'),
+    maxInflightBodyMb: readInt(env.EAB_MAX_INFLIGHT_BODY_MB, 256, 'EAB_MAX_INFLIGHT_BODY_MB'),
   }
 }

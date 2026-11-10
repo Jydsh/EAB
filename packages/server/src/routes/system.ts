@@ -1,8 +1,17 @@
 import type { FastifyInstance } from 'fastify'
 import { EC, EabError, resolveVisibleCollections, SC, scopeAllows } from '@eab/domain'
-import { loadKbCollectionAcls } from '@eab/storage'
+import { loadKbCollectionAcls, sqliteBusyStats } from '@eab/storage'
 import type { ServerDeps } from '../deps.js'
 import { ensureDingTalkUserAvatar } from '../dingtalk-avatar.js'
+import {
+  companyAssistantView,
+  readCompanyAssistantAvatar,
+  resolveAssistantDataDir,
+} from '../company-assistant.js'
+import { isConsoleRequest, hasConsoleSession } from '../console-auth.js'
+import { pluginToolSemaphore } from '../plugin-tools.js'
+import { toolConcurrencyStats } from './tools.js'
+import { activeAgentRunCount, cancelAgentRunTree, listAgentRuns } from '../agent-runtime.js'
 import { capabilityList, ok, readVersion } from '../http.js'
 import { actorFor, listPersonas, resolveActor, roleCodesOf } from '../session.js'
 
@@ -52,6 +61,59 @@ export function registerSystemRoutes(app: FastifyInstance, deps: ServerDeps): vo
     const audits = Number((deps.db.prepare('SELECT COUNT(*) AS n FROM audit_logs').get() as { n: number }).n)
     const uptime = Math.round(process.uptime())
     const memory = process.memoryUsage()
+    const capacity = deps.chatCapacity?.stats()
+    const toolStats = toolConcurrencyStats()
+    const pluginStats = pluginToolSemaphore.stats()
+    const sqliteBusy = sqliteBusyStats().count
+    const capacityLines = capacity
+      ? [
+          '# HELP eab_chat_turns_active 当前正在生成的对话 turn 数',
+          '# TYPE eab_chat_turns_active gauge',
+          `eab_chat_turns_active ${capacity.active}`,
+          '# HELP eab_chat_turns_queued 排队等待对话 turn 的数量',
+          '# TYPE eab_chat_turns_queued gauge',
+          `eab_chat_turns_queued ${capacity.queued}`,
+          ...capacity.models.flatMap((model) => [
+            `eab_chat_model_turns_active{model="${model.modelId.replace(/["\\]/g, '_')}"} ${model.active}`,
+            `eab_chat_model_turns_queued{model="${model.modelId.replace(/["\\]/g, '_')}"} ${model.queued}`,
+          ]),
+        ]
+      : []
+    const toolLines = [
+      '# HELP eab_tool_active 当前正在执行的内置工具数',
+      '# TYPE eab_tool_active gauge',
+      `eab_tool_active ${toolStats.active}`,
+      '# HELP eab_tool_queued 排队等待工具名额的数量',
+      '# TYPE eab_tool_queued gauge',
+      `eab_tool_queued ${toolStats.queued}`,
+      '# HELP eab_tool_runs_total 工具执行次数',
+      '# TYPE eab_tool_runs_total counter',
+      `eab_tool_runs_total ${toolStats.runs}`,
+      '# HELP eab_tool_failures_total 工具执行失败次数',
+      '# TYPE eab_tool_failures_total counter',
+      `eab_tool_failures_total ${toolStats.failures}`,
+      '# HELP eab_tool_duration_ms_avg 工具平均执行耗时（毫秒）',
+      '# TYPE eab_tool_duration_ms_avg gauge',
+      `eab_tool_duration_ms_avg ${toolStats.avgDurationMs}`,
+      '# HELP eab_tool_duration_ms_max 工具最大执行耗时（毫秒）',
+      '# TYPE eab_tool_duration_ms_max gauge',
+      `eab_tool_duration_ms_max ${toolStats.maxDurationMs}`,
+      '# HELP eab_tool_lock_wait_ms_total 工具等待资源锁累计耗时（毫秒）',
+      '# TYPE eab_tool_lock_wait_ms_total counter',
+      `eab_tool_lock_wait_ms_total ${toolStats.lockWaitMs}`,
+      '# HELP eab_plugin_tool_active 当前正在执行的插件工具数',
+      '# TYPE eab_plugin_tool_active gauge',
+      `eab_plugin_tool_active ${pluginStats.active}`,
+      '# HELP eab_plugin_tool_queued 排队等待插件工具名额的数量',
+      '# TYPE eab_plugin_tool_queued gauge',
+      `eab_plugin_tool_queued ${pluginStats.queued}`,
+      '# HELP eab_agent_runs_active 当前进程内仍在运行的多 Agent 节点数',
+      '# TYPE eab_agent_runs_active gauge',
+      `eab_agent_runs_active ${activeAgentRunCount()}`,
+      '# HELP eab_sqlite_busy_total 事务遇到 SQLITE_BUSY 的次数',
+      '# TYPE eab_sqlite_busy_total counter',
+      `eab_sqlite_busy_total ${sqliteBusy}`,
+    ]
     const text = [
       '# HELP eab_uptime_seconds 进程运行秒数',
       '# TYPE eab_uptime_seconds gauge',
@@ -68,10 +130,90 @@ export function registerSystemRoutes(app: FastifyInstance, deps: ServerDeps): vo
       '# HELP eab_process_resident_memory_bytes 常驻内存',
       '# TYPE eab_process_resident_memory_bytes gauge',
       `eab_process_resident_memory_bytes ${memory.rss}`,
+      '# HELP eab_process_heap_used_bytes V8 已用堆内存',
+      '# TYPE eab_process_heap_used_bytes gauge',
+      `eab_process_heap_used_bytes ${memory.heapUsed}`,
+      '# HELP eab_process_external_bytes V8 外部内存（Buffer 等）',
+      '# TYPE eab_process_external_bytes gauge',
+      `eab_process_external_bytes ${memory.external}`,
+      '# HELP eab_process_active_resources 进程活跃资源数（定时器/句柄/请求）',
+      '# TYPE eab_process_active_resources gauge',
+      `eab_process_active_resources ${process.getActiveResourcesInfo().length}`,
+      ...capacityLines,
+      ...toolLines,
       '',
     ].join('\n')
     reply.type('text/plain; version=0.0.4; charset=utf-8')
     return reply.send(text)
+  })
+
+  app.get('/api/console/concurrency', async (req) => {
+    if (!isConsoleRequest(req, deps.config)) {
+      throw new EabError(EC.FORBIDDEN, '需要控制台登录后再查看并发状态')
+    }
+    const chat = deps.chatCapacity?.stats()
+    const tools = toolConcurrencyStats()
+    const plugins = pluginToolSemaphore.stats()
+    return ok({
+      updatedAt: new Date().toISOString(),
+      chat: {
+        active: chat?.active ?? 0,
+        queued: chat?.queued ?? 0,
+        users: chat?.users ?? 0,
+        models: chat?.models ?? [],
+        companies: chat?.companies ?? [],
+        limits: {
+          maxConcurrent: deps.config.chatMaxConcurrent ?? 8,
+          queueLimit: deps.config.chatQueueLimit ?? 100,
+          queueTimeoutMs: deps.config.chatQueueTimeoutMs ?? 240_000,
+          userMaxInFlight: deps.config.chatUserMaxInFlight ?? 2,
+          userMessagesPerMinute: deps.config.chatUserMessagesPerMinute ?? 20,
+          modelMaxConcurrent: deps.config.chatModelMaxConcurrent ?? 4,
+          companyMaxConcurrent: deps.config.chatCompanyMaxConcurrent ?? deps.config.chatMaxConcurrent ?? 8,
+        },
+      },
+      tools: {
+        ...tools,
+        limits: {
+          maxConcurrent: deps.config.toolMaxConcurrent ?? 8,
+          queueLimit: deps.config.toolQueueLimit ?? 200,
+          timeoutMs: deps.config.toolTimeoutMs ?? 30_000,
+        },
+      },
+      plugins: {
+        ...plugins,
+        limits: {
+          maxConcurrent: deps.config.pluginToolMaxConcurrent ?? 4,
+          timeoutMs: deps.config.pluginToolTimeoutMs ?? 60_000,
+        },
+      },
+      sqlite: { busyTotal: sqliteBusyStats().count },
+    })
+  })
+
+  app.get('/api/console/agent-runs', async (req) => {
+    if (!isConsoleRequest(req, deps.config)) {
+      throw new EabError(EC.FORBIDDEN, '需要控制台登录后再查看 Agent 运行树')
+    }
+    const query = req.query as { limit?: string; sessionId?: string } | undefined
+    const parsedLimit = Number(query?.limit ?? 50)
+    return ok({
+      active: activeAgentRunCount(),
+      runs: listAgentRuns(deps.db, deps.companyId, {
+        limit: Number.isFinite(parsedLimit) ? Math.floor(parsedLimit) : 50,
+        sessionId: typeof query?.sessionId === 'string' && query.sessionId ? query.sessionId : undefined,
+      }),
+    })
+  })
+
+  app.post('/api/console/agent-runs/:id/cancel', async (req) => {
+    if (!isConsoleRequest(req, deps.config)) {
+      throw new EabError(EC.FORBIDDEN, '需要控制台登录后再取消 Agent 任务')
+    }
+    const id = (req.params as { id?: string } | undefined)?.id ?? ''
+    if (!id) throw new EabError(EC.VALIDATION, '缺少运行 id')
+    const cancelled = cancelAgentRunTree(deps.db, id, '控制台取消了任务')
+    return ok({ cancelled, count: cancelled.length })
   })
 
   app.get('/api/me', async (req) => {
@@ -91,12 +233,37 @@ export function registerSystemRoutes(app: FastifyInstance, deps: ServerDeps): vo
     return ok({
       person,
       company: { id: person.companyId, name: person.companyName },
+      assistant: companyAssistantView(deps.db, person.companyId),
       roles: [...subject.roles],
       dataScope: subject.dataScope,
       channelType: subject.channelType,
       capabilities: capabilityList(subject),
       passwordConfigured: passwordRow?.password_set_at != null,
     })
+  })
+
+  /**
+   * 公司助手头像：只按当前登录人的公司取，避免把任意文件路径带进接口。
+   * URL 带 updatedAt 版本号，换图后前端缓存自动失效。
+   */
+  app.get('/api/company/assistant-avatar', async (req, reply) => {
+    // 控制台「公司资料」也用同一个地址做预览；图片请求带不了自定义头，所以控制台只认会话 Cookie。
+    const companyId = hasConsoleSession(req)
+      ? deps.companyId
+      : resolveActor(deps.db, deps.config, req, deps.companyId).person.companyId
+    const avatar = readCompanyAssistantAvatar(
+      deps.db,
+      resolveAssistantDataDir(deps.config.dataDir, deps.config.dbPath),
+      companyId,
+    )
+    if (!avatar) return reply.code(404).send()
+    const etag = `"${avatar.updatedAt}"`
+    if (req.headers['if-none-match'] === etag) return reply.code(304).send()
+    reply
+      .header('cache-control', 'private, max-age=31536000, immutable')
+      .header('etag', etag)
+      .type(avatar.mime)
+    return reply.send(avatar.bytes)
   })
 
   /**

@@ -44,11 +44,48 @@ export function openDatabase(options: OpenDatabaseOptions): Db {
 }
 
 /** 事务包装：出错回滚。注意 SQLite 的 DDL 也在事务内，所以迁移可以整体回滚 */
+const BUSY_RETRY_ATTEMPTS = 3
+const BUSY_SLEEP_ARRAY = new Int32Array(new SharedArrayBuffer(4))
+let sqliteBusyCount = 0
+
+/** SQLITE_BUSY 计数；跨进程单写锁之外的写冲突，用来判断是否需要进入 P2。 */
+export function sqliteBusyStats(): { count: number } {
+  return { count: sqliteBusyCount }
+}
+
+function isSqliteBusy(error: unknown): boolean {
+  const record = error as { code?: string; errcode?: number; message?: string } | null
+  if (!record) return false
+  return record.code === 'SQLITE_BUSY' || record.errcode === 5 || /SQLITE_BUSY|database is locked/i.test(record.message ?? '')
+}
+
+function sleepSync(ms: number): void {
+  Atomics.wait(BUSY_SLEEP_ARRAY, 0, 0, ms)
+}
+
+function execWithBusyRetry(db: Db, sql: string): void {
+  let lastError: unknown
+  for (let attempt = 0; attempt < BUSY_RETRY_ATTEMPTS; attempt += 1) {
+    try {
+      db.exec(sql)
+      return
+    } catch (error) {
+      lastError = error
+      if (isSqliteBusy(error)) sqliteBusyCount += 1
+      if (!isSqliteBusy(error) || attempt === BUSY_RETRY_ATTEMPTS - 1) throw error
+      // BEGIN/COMMIT 抢写锁失败时短暂退避；不回滚、不重跑事务体。
+      sleepSync(100 * (attempt + 1))
+    }
+  }
+  throw lastError
+}
+
 export function withTransaction<T>(db: Db, fn: () => T): T {
-  db.exec('BEGIN')
+  // IMMEDIATE 在事务开始时就拿写锁，避免「先读后写」升级锁时出现两个事务互相等待。
+  execWithBusyRetry(db, 'BEGIN IMMEDIATE')
   try {
     const result = fn()
-    db.exec('COMMIT')
+    execWithBusyRetry(db, 'COMMIT')
     return result
   } catch (error) {
     try {

@@ -6,5 +6,3 @@ packages:
 # 否则 vitest 起不来，而报错信息只说 "Ignored build scripts"。
 allowBuilds:
   esbuild: true
-  electron: true
-  electron-winstaller: true

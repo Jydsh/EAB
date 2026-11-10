@@ -226,6 +226,7 @@ async function api(path, options) {
 
 const state = {
   me: null,
+  assistant: null,
   models: [],
   autoModelId: null,
   canChat: true,
@@ -964,7 +965,7 @@ function renderSpaceChip() {
     state.spaceKind === 'local' && local
       ? `当前本地空间：${local.rootPath}（${local.mode === 'read_only' ? '只读' : '读写'}）`
       : state.spaceKind === 'cloud'
-        ? '当前文件空间：云空间（EAB 服务端）'
+        ? '当前文件空间：云空间（EAB 服务端 · 默认可用）'
         : '当前不使用文件空间'
 }
 
@@ -987,10 +988,11 @@ function setSpace(kind, spaceId, options = {}) {
 }
 
 function applySessionSpace(session) {
-  const kind = session?.space_kind === 'local' ? 'local' : 'cloud'
+  const savedKind = session?.space_kind
+  const kind = savedKind === 'local' ? 'local' : savedKind === 'none' ? 'none' : 'cloud'
   const spaceId = kind === 'local' ? String(session?.space_id || '') : ''
   const local = kind === 'local' ? state.localSpaces.find((item) => item.id === spaceId) : null
-  state.spaceKind = local ? 'local' : 'cloud'
+  state.spaceKind = kind === 'local' && !local ? 'cloud' : kind
   if (local) state.localSpaceId = spaceId
   state.localPath = ''
   state.spaceLabel = spaceLabelFor(state.spaceKind, local)
@@ -1012,7 +1014,7 @@ function renderSpaceMenu() {
   const local = state.spaceKind === 'local' ? currentLocalSpace() : null
   const items = [
     `<button type="button" data-space-kind="cloud" class="${state.spaceKind === 'cloud' ? 'is-active' : ''}">
-      <span class="space-menu-name">云空间</span><span class="space-menu-desc">EAB 服务端 · 换设备可用</span>
+      <span class="space-menu-name">云空间</span><span class="space-menu-desc">EAB 服务端 · 默认可用 · 换设备可用</span>
     </button>`,
     ...state.localSpaces.map(
       (space) => `<button type="button" data-space-id="${esc(space.id)}" class="${state.spaceKind === 'local' && state.localSpaceId === space.id ? 'is-active' : ''}">
@@ -2376,6 +2378,7 @@ function safeAvatarUrl(value) {
   if (!raw) return ''
   // 同源头像代理；只接受固定路径（可带用户/头像版本参数），不接受任意相对地址。
   if (raw === '/api/me/avatar' || raw.startsWith('/api/me/avatar?')) return raw
+  if (raw === '/api/company/assistant-avatar' || raw.startsWith('/api/company/assistant-avatar?')) return raw
   try {
     const url = new URL(raw)
     return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : ''
@@ -2388,16 +2391,16 @@ function safeAvatarUrl(value) {
  * 头像统一渲染：有地址就用钉钉头像，没有/加载失败就露姓名首字。
  * 首字始终在 span 里，img 盖在上面；onerror 只摘掉图片和 has-photo，不留下破图。
  */
-function avatarInner(name, url) {
-  const initial = esc(String(name || '我').trim().slice(0, 1) || '我')
+function avatarInner(name, url, fallback, eager = false) {
+  const initial = esc(String(fallback || String(name || '我').trim().slice(0, 1) || '我'))
   const safeUrl = safeAvatarUrl(url)
   if (!safeUrl) return initial
-  return `<img class="avatar-img" src="${esc(safeUrl)}" alt="" loading="lazy" onerror="this.parentElement.classList.remove('has-photo');this.remove()">${initial}`
+  return `<img class="avatar-img" src="${esc(safeUrl)}" alt="" loading="${eager ? 'eager' : 'lazy'}" onerror="this.parentElement.classList.remove('has-photo');this.remove()">${initial}`
 }
 
-function avatarMarkup(name, url, className) {
+function avatarMarkup(name, url, className, fallback, eager = false) {
   const hasPhoto = Boolean(safeAvatarUrl(url))
-  return `<span class="${className}${hasPhoto ? ' has-photo' : ''}">${avatarInner(name, url)}</span>`
+  return `<span class="${className}${hasPhoto ? ' has-photo' : ''}">${avatarInner(name, url, fallback, eager)}</span>`
 }
 
 /**
@@ -2409,6 +2412,27 @@ function meAvatarUrl(me = state.me) {
   const person = me?.person
   if (!person?.avatar) return ''
   return `/api/me/avatar?v=${encodeURIComponent(`${person.id}:${person.avatar}`)}`
+}
+
+/** 后台「公司资料 → 助手身份」配置；没配置时回退到现在的「AI」。 */
+function assistantIdentity() {
+  const assistant = state.assistant || {}
+  const name = String(assistant.name || '').trim() || 'AI'
+  return { name, avatarUrl: assistant.avatarUrl || '' }
+}
+
+/**
+ * AI 消息左侧统一身份区：头像在上、名字在下，和「我」的 who-me 排版对应。
+ * 短名字（AI / 小易）无头像时直接露全名，长名字只露首字。
+ */
+function aiWhoMarkup() {
+  const { name, avatarUrl } = assistantIdentity()
+  const fallback = name.length <= 2 ? name : name.slice(0, 1)
+  // 没配头像且名字很短时，徽标本身就露全名，不再重复一行名字；保持旧版「AI」的观感。
+  const showName = Boolean(avatarUrl) || name.length > 2
+  return `<div class="who-ai">${avatarMarkup(name, avatarUrl, 'who-badge ai', fallback, true)}${
+    showName ? `<span class="who-name" title="${esc(name)}">${esc(name)}</span>` : ''
+  }</div>`
 }
 
 function renderSideUser(me) {
@@ -3635,7 +3659,7 @@ function appendMessage(role, text, meta, attachments, rich, options = {}) {
     role === 'me'
       ? `<div class="bubble">${esc(text)}${files}</div>
         <div class="who-me"><span class="who-name">${esc(meName)}</span>${channel}${avatarMarkup(meName, meAvatarUrl(), 'who-badge me')}</div>`
-      : `<div class="who-badge">AI</div><div class="bubble ai-turn">${historyAiBubble(text, meta, rich || {})}</div>`
+      : `${aiWhoMarkup()}<div class="bubble ai-turn">${historyAiBubble(text, meta, rich || {})}</div>`
   const thread = $('#thread')
   if (options.prepend) {
     const firstMessage = thread.querySelector('.msg')
@@ -3654,7 +3678,7 @@ function createAiTurn() {
   setEmptyVisible(false)
   const node = document.createElement('div')
   node.className = 'msg ai'
-  node.innerHTML = `<div class="who-badge">AI</div><div class="bubble ai-turn">
+  node.innerHTML = `${aiWhoMarkup()}<div class="bubble ai-turn">
     <div class="think-panel" hidden>
       <button class="think-head" type="button" aria-expanded="true">
         <span class="think-icon">✦</span><span class="think-title">正在思考…</span><span class="think-chevron">⌄</span>
@@ -3813,7 +3837,7 @@ function appendTyping() {
   setEmptyVisible(false)
   const node = document.createElement('div')
   node.className = 'msg ai'
-  node.innerHTML = `<div class="who-badge">AI</div><div class="bubble"><span class="typing"><i></i><i></i><i></i></span></div>`
+  node.innerHTML = `${aiWhoMarkup()}<div class="bubble"><span class="typing"><i></i><i></i><i></i></span></div>`
   $('#thread').appendChild(node)
   node.scrollIntoView({ block: 'end', behavior: 'smooth' })
   return node
@@ -4608,6 +4632,7 @@ async function boot() {
   try {
     me = await api(`/api/me${qs()}`)
     state.me = me
+    state.assistant = me.assistant || { name: 'AI', avatarUrl: '' }
   } catch (err) {
     // as 指向不存在/失效的人 → 回到登录页，而不是显示别人的信息
     showLogin()

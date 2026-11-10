@@ -123,9 +123,98 @@ export async function dingTalkAccessToken(appId: string, appSecret: string): Pro
   }
 }
 
+/** 钉钉卡片的正文区在手机上约为 330px；超过这个宽度的表格会被裁掉。 */
+const MAX_MARKDOWN_TABLE_WIDTH = 330
+
+function tableTextWidth(value: string): number {
+  let units = 0
+  // 粗略按“中文 2 个字符宽、英文/数字 1 个字符宽”估算，宁可提前转列表，也不要让手机端裁列。
+  for (const char of value.replace(/<[^>]*>/g, '')) {
+    units += /[\u3000-\u9fff\uff00-\uffef]/.test(char) ? 2 : 1
+  }
+  return units
+}
+
+function markdownTableWidth(header: string[], rows: string[][]): number {
+  const columns = Math.max(header.length, ...rows.map((row) => row.length))
+  let units = 0
+  for (let column = 0; column < columns; column += 1) {
+    const cells = [header[column] ?? '', ...rows.map((row) => row[column] ?? '')]
+    units += Math.max(...cells.map(tableTextWidth))
+  }
+  return units * 8.5 + columns * 24
+}
+
+/** 只把“手机宽度放不下”的表格拆成竖排列表；短表格继续保留 Markdown 表格。 */
+export function flattenMarkdownTables(value: string): string {
+  const lines = String(value ?? '').replace(/\r\n?/g, '\n').split('\n')
+  const output: string[] = []
+  let inFence = false
+  let index = 0
+
+  const cellsOf = (line: string): string[] =>
+    line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((cell) => cell.trim())
+
+  const isSeparator = (cells: string[]): boolean =>
+    cells.length >= 2 && cells.every((cell) => /^:?-{2,}:?$/.test(cell.replace(/\s+/g, '')))
+
+  while (index < lines.length) {
+    const line = lines[index] ?? ''
+    if (/^\s*```/.test(line)) {
+      inFence = !inFence
+      output.push(line)
+      index += 1
+      continue
+    }
+    if (inFence) {
+      output.push(line)
+      index += 1
+      continue
+    }
+
+    const header = cellsOf(line)
+    const separator = lines[index + 1] ? cellsOf(lines[index + 1] ?? '') : []
+    if (header.length >= 2 && line.includes('|') && isSeparator(separator)) {
+      const rows: string[][] = []
+      let rowIndex = index + 2
+      while (rowIndex < lines.length && (lines[rowIndex] ?? '').includes('|')) {
+        const row = cellsOf(lines[rowIndex] ?? '')
+        if (row.length < 2 || isSeparator(row)) break
+        rows.push(row)
+        rowIndex += 1
+      }
+
+      if (markdownTableWidth(header, rows) <= MAX_MARKDOWN_TABLE_WIDTH) {
+        output.push(...lines.slice(index, rowIndex))
+        index = rowIndex
+        continue
+      }
+
+      output.push(`**${header[0] || '列表'}**`)
+      for (const row of rows) {
+        const tail = row
+          .slice(1)
+          .map((cell, cellIndex) => {
+            const label = header[cellIndex + 1]
+            return label ? `${label}：${cell}` : cell
+          })
+          .filter(Boolean)
+        output.push(`- ${row[0] || ''}${tail.length > 0 ? ` · ${tail.join(' · ')}` : ''}`)
+      }
+      index = rowIndex
+      continue
+    }
+
+    output.push(line)
+    index += 1
+  }
+
+  return output.join('\n')
+}
+
 /** 每行之间补 <br>，让钉钉卡片按聊天文本的换行习惯渲染。 */
 export function normalizeCardMarkdown(value: string): string {
-  const text = String(value ?? '').replace(/\r\n?/g, '\n')
+  const text = flattenMarkdownTables(String(value ?? ''))
   const lines = text.split('\n')
   let inCodeBlock = false
   return lines
@@ -188,12 +277,6 @@ function previewLine(text: string, maxLength = 120): string {
   return normalized.length > maxLength ? `…${normalized.slice(-maxLength)}` : normalized
 }
 
-function toolStatus(tool: DingTalkToolRecord): string {
-  if (tool.status === 'running') return '执行中'
-  if (tool.status === 'error') return '失败'
-  return '完成'
-}
-
 function formatDuration(ms: number | undefined): string {
   if (!ms || ms < 0) return ''
   return ms < 1000 ? ` · ${Math.max(1, Math.round(ms))}ms` : ` · ${(ms / 1000).toFixed(1)}s`
@@ -211,17 +294,36 @@ function richToolsMarkdown(details: DingTalkToolRecord[], tools: string[]): stri
   }
   return details
     .map((tool, index) => {
-      const args = tool.args && Object.keys(tool.args).length ? `\n   参数：${compactValue(tool.args)}` : ''
-      const summary = tool.summary ? `\n   ${tool.status === 'error' ? '错误' : '结果'}：${compactValue(tool.summary)}` : ''
-      return `${index + 1}. **${tool.name}** · ${toolStatus(tool)}${formatDuration(tool.durationMs)}${args}${summary}`
+      // 只有执行中的工具才展开参数和中间结果；结束后只保留工具名和耗时，
+      // 避免折叠区里堆满参数，把真正的回答正文挤下去。
+      if (tool.status === 'running') {
+        const args = tool.args && Object.keys(tool.args).length ? `\n   参数：${compactValue(tool.args)}` : ''
+        const summary = tool.summary ? `\n   结果：${compactValue(tool.summary)}` : ''
+        return `${index + 1}. **${tool.name}** · 执行中${args}${summary}`
+      }
+      const failed = tool.status === 'error' ? ' · 失败' : ''
+      return `${index + 1}. **${tool.name}**${failed}${formatDuration(tool.durationMs)}`
     })
     .join('\n\n')
 }
 
-function richToolsPreview(details: DingTalkToolRecord[]): string {
+function richToolsPreview(details: DingTalkToolRecord[], tools: string[]): string {
   const running = details.find((tool) => tool.status === 'running')
-  if (!running) return ''
-  return `${running.name} · 执行中`
+  if (running) return `${running.name} · 执行中`
+  // 工具详情还没到时，至少把最近一个工具名显示出来，避免工具面板只有标题。
+  const latest = details.at(-1)
+  if (latest) return `${latest.name}${latest.status === 'error' ? ' · 失败' : ''}${formatDuration(latest.durationMs)}`
+  const last = tools.at(-1)
+  return last ? `${last} · 执行中` : ''
+}
+
+/** 工具一出现就说明思考阶段已经结束，标题不能继续停在“正在思考”。 */
+function richHasTools(state: DingTalkRichCardState): boolean {
+  return (state.tools ?? []).length > 0 || (state.toolDetails ?? []).length > 0
+}
+
+function richThinkingDone(state: DingTalkRichCardState): boolean {
+  return Boolean(state.thinkingDone) || richHasTools(state)
 }
 
 /**
@@ -244,18 +346,20 @@ export function dingTalkConversationSummary(text: string): string {
 
 export function renderDingTalkProgressCard(progress: DingTalkCardProgress): string {
   // 旧模板卡只能显示一段 msgContent，不能做真正的折叠。
-  // 思考阶段只显示思考行；真正发生工具调用后切换成工具行，避免两个状态同时出现。
+  // 思考结束或工具出现后，思考标题固定为“已深度思考”，不再被工具行覆盖。
   const blocks: string[] = []
   const usedTools = progress.tools ?? []
   const detailNames = (progress.toolDetails ?? []).map((tool) => tool.name).filter(Boolean)
   const toolNames = usedTools.length > 0 ? usedTools : detailNames
-  if (progress.tool) blocks.push(`**🛠️ 工具调用中…**\n_${progress.tool}_`)
-  else if (toolNames.length > 0) blocks.push(`**🛠️ 工具调用中…**\n_${toolNames[toolNames.length - 1]}_`)
-  else blocks.push(progress.thinkingDone ? '**✦ 已深度思考**' : '**✦ 正在思考…**')
-  if (!progress.thinkingDone) {
+  const toolActive = Boolean(progress.tool) || toolNames.length > 0
+  const thinkingDone = Boolean(progress.thinkingDone) || toolActive
+  blocks.push(thinkingDone ? '**✦ 已深度思考**' : '**✦ 正在思考…**')
+  if (!thinkingDone) {
     const preview = previewLine(progress.reasoning, 90)
     if (preview) blocks.push(`> ${preview}`)
   }
+  if (progress.tool) blocks.push(`**🛠️ 工具调用中…**\n_${progress.tool}_`)
+  else if (toolNames.length > 0) blocks.push(`**🛠️ 工具调用中…**\n_${toolNames[toolNames.length - 1]}_`)
   if (progress.toolDetails?.length) blocks.push(richToolsMarkdown(progress.toolDetails, toolNames))
   if (progress.answer.trim()) blocks.push(progress.answer.trim())
   return blocks.join('\n\n')
@@ -602,7 +706,15 @@ function richStructureChanged(current: DingTalkRichCardState, previous: DingTalk
 }
 
 interface DingTalkRichCardData {
-  answer: { text: string }
+  answer: {
+    blocks: Array<{
+      text: string
+      table: {
+        meta: Array<{ colKey: string; colName: string; type: 'text' }>
+        data: Array<Record<string, string>>
+      }
+    }>
+  }
   thinking: { text: string; preview: string }
   tools: { text: string; preview: string }
   attachments: Array<{
@@ -624,7 +736,194 @@ interface DingTalkRichCardData {
     showAttachment0: boolean
     showAttachment1: boolean
     showAttachment2: boolean
+    [key: `showAnswerUnit${number}`]: boolean
+    [key: `showAnswerText${number}`]: boolean
+    [key: `showAnswerTable${number}`]: boolean
   }
+}
+
+interface DingTalkAnswerTable {
+  meta: Array<{ colKey: string; colName: string; type: 'text' }>
+  data: Array<Record<string, string>>
+}
+
+interface DingTalkAnswerBlock {
+  text: string
+  table: DingTalkAnswerTable
+}
+
+/** A2UI 组件树里预留的正文块数；绝大多数回答只有“正文 + 表格 + 收尾”三块。 */
+const MAX_ANSWER_BLOCKS = 6
+
+function plainTableCell(value: string): string {
+  return String(value ?? '')
+    .replace(/`([^`]*)`/g, '$1')
+    .replace(/\*\*([^*]*)\*\*/g, '$1')
+    .replace(/<br\s*\/?>/gi, ' ')
+    .trim()
+}
+
+function emptyAnswerTable(): DingTalkAnswerTable {
+  return { meta: [], data: [] }
+}
+
+function emptyAnswerBlocks(): DingTalkAnswerBlock[] {
+  return Array.from({ length: MAX_ANSWER_BLOCKS }, () => ({ text: '', table: emptyAnswerTable() }))
+}
+
+/**
+ * 手机卡片正文区约 320px，5 列一定放不下。文件清单这类表把
+ * “文件名 + 路径”合成一列、丢掉纯序号列，压到 3 列才能完整显示。
+ */
+function compactAnswerTable(table: DingTalkAnswerTable): DingTalkAnswerTable {
+  const normal = (value: string): string => value.replace(/\s+/g, '').toLowerCase()
+  const labels = table.meta.map((column) => column.colName)
+  const indexColumn = labels.findIndex((label) => /^(#|序号|no\.?)$/i.test(label.trim()))
+  const nameColumn = labels.findIndex((label) => /文件名|文件名称|名称|filename|name/i.test(label))
+  const pathColumn = labels.findIndex((label) => /路径|目录|path/i.test(label))
+  if (indexColumn < 0 && nameColumn < 0 && table.meta.length <= 3) {
+    return table
+  }
+
+  const mergedFile = nameColumn >= 0
+  const outputLabels: string[] = []
+  const outputKeys: Array<number | 'file'> = []
+  if (mergedFile) {
+    outputLabels.push('文件')
+    outputKeys.push('file')
+  }
+  labels.forEach((label, index) => {
+    if (index === indexColumn || index === nameColumn || index === pathColumn) return
+    // 文件清单里 3 列是上限：优先保留大小、更新时间，其余列不再挤进来。
+    if (mergedFile && outputLabels.length >= 3) return
+    if (!mergedFile && outputLabels.length >= 3) return
+    outputLabels.push(label)
+    outputKeys.push(index)
+  })
+
+  if (outputLabels.length === 0) return table
+  const meta = outputLabels.map((colName, index) => ({
+    colKey: `c${index}`,
+    colName,
+    type: 'text' as const,
+  }))
+  const data = table.data.map((row) => {
+    const next: Record<string, string> = {}
+    outputKeys.forEach((key, index) => {
+      if (key === 'file') {
+        const name = normal(String(row[`c${nameColumn}`] ?? '')) ? String(row[`c${nameColumn}`] ?? '') : ''
+        const path = pathColumn >= 0 ? String(row[`c${pathColumn}`] ?? '') : ''
+        next[`c${index}`] = path && path !== name ? `${name}（${path}）` : name || path
+      } else {
+        next[`c${index}`] = String(row[`c${key}`] ?? '')
+      }
+    })
+    return next
+  })
+  return { meta, data }
+}
+
+/**
+ * 把回答拆成“普通 Markdown 段 + 原生 A2UI Table 段”。
+ * 钉钉 A2UI 的 Markdown 组件没有横向滚动，宽表格会被裁；原生 Table 才有 scrollAreaWidth，
+ * 所以这里保留真表格，交给 Table 组件内部横滚，而不是把表格改写成竖排列表。
+ */
+function parseAnswerBlocks(value: string): DingTalkAnswerBlock[] {
+  const lines = String(value ?? '').replace(/\r\n?/g, '\n').split('\n')
+  const blocks: Array<{ kind: 'text' | 'table'; text: string; table: DingTalkAnswerTable }> = []
+  let textLines: string[] = []
+  let inFence = false
+  let index = 0
+
+  const cellsOf = (line: string): string[] =>
+    line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((cell) => cell.trim())
+
+  const isSeparator = (cells: string[]): boolean =>
+    cells.length >= 2 && cells.every((cell) => /^:?-{2,}:?$/.test(cell.replace(/\s+/g, '')))
+
+  const flushText = (): void => {
+    const text = textLines.join('\n').replace(/\n{3,}/g, '\n\n').trim()
+    textLines = []
+    if (text) blocks.push({ kind: 'text', text, table: emptyAnswerTable() })
+  }
+
+  while (index < lines.length) {
+    const line = lines[index] ?? ''
+    if (/^\s*```/.test(line)) {
+      inFence = !inFence
+      textLines.push(line)
+      index += 1
+      continue
+    }
+    if (inFence) {
+      textLines.push(line)
+      index += 1
+      continue
+    }
+
+    const header = cellsOf(line)
+    const separator = lines[index + 1] ? cellsOf(lines[index + 1] ?? '') : []
+    if (header.length >= 2 && line.includes('|') && isSeparator(separator)) {
+      const rows: string[][] = []
+      let rowIndex = index + 2
+      while (rowIndex < lines.length && (lines[rowIndex] ?? '').includes('|')) {
+        const row = cellsOf(lines[rowIndex] ?? '')
+        if (row.length < 2 || isSeparator(row)) break
+        rows.push(row)
+        rowIndex += 1
+      }
+
+      flushText()
+      const columns = Math.max(header.length, ...rows.map((row) => row.length))
+      const labels = Array.from({ length: columns }, (_, column) =>
+        plainTableCell(header[column] ?? '') || `列${column + 1}`,
+      )
+      const meta = labels.map((colName, column) => ({
+        colKey: `c${column}`,
+        colName,
+        type: 'text' as const,
+      }))
+      const data = rows.map((row) =>
+        Object.fromEntries(
+          labels.map((_, column) => [`c${column}`, plainTableCell(row[column] ?? '')]),
+        ),
+      )
+      const table = compactAnswerTable({ meta, data })
+      blocks.push({ kind: 'table', text: '', table })
+      index = rowIndex
+      continue
+    }
+
+    textLines.push(line)
+    index += 1
+  }
+  flushText()
+
+  // 超出预留块数的部分不能再丢：把后续表格/文字并回最后一块文本，至少保持可读。
+  if (blocks.length > MAX_ANSWER_BLOCKS) {
+    const extra = blocks.slice(MAX_ANSWER_BLOCKS)
+    const tail = extra
+      .map((block) => {
+        if (block.kind === 'text') return block.text
+        return block.table.data
+          .map((row) => Object.values(row).join(' · '))
+          .join('\n')
+      })
+      .filter(Boolean)
+      .join('\n\n')
+    const last = blocks[MAX_ANSWER_BLOCKS - 1]
+    if (last) {
+      last.text = [last.text, tail].filter(Boolean).join('\n\n')
+      last.table = emptyAnswerTable()
+    }
+    blocks.length = MAX_ANSWER_BLOCKS
+  }
+
+  const padded = emptyAnswerBlocks()
+  blocks.forEach((block, blockIndex) => {
+    padded[blockIndex] = { text: block.text, table: block.table }
+  })
+  return padded
 }
 
 function richCardData(
@@ -632,11 +931,12 @@ function richCardData(
   active: boolean,
 ): DingTalkRichCardData {
   const reasoning = state.reasoning.trim()
-  const tools = state.tools
+  const tools = state.tools ?? []
   const details = state.toolDetails ?? []
-  const hasTools = tools.length > 0 || details.length > 0
-  const thinkingDone = Boolean(state.thinkingDone)
+  const hasTools = richHasTools(state)
+  const thinkingDone = richThinkingDone(state)
   const answer = state.answer.trim()
+  const answerBlocks = parseAnswerBlocks(answer)
   const attachments = (state.attachments ?? []).slice(0, 3).map((attachment) => ({
     fileName: String(attachment.fileName ?? ''),
     url: String(attachment.url ?? ''),
@@ -645,32 +945,40 @@ function richCardData(
     mimeType: String(attachment.mimeType ?? ''),
     description: String(attachment.description ?? '钉盘在线预览'),
   }))
+  const answerUi: Record<string, boolean> = {}
+  answerBlocks.forEach((block, blockIndex) => {
+    const hasText = Boolean(block.text.trim())
+    const hasTable = block.table.meta.length > 0
+    answerUi[`showAnswerText${blockIndex}`] = hasText
+    answerUi[`showAnswerTable${blockIndex}`] = hasTable
+    answerUi[`showAnswerUnit${blockIndex}`] = hasText || hasTable
+  })
   return {
-    // 正文只放原始文本；圆环由组件树里的 answerSpinner 承担，避免 Markdown
-    // 把图片当成块级元素排到下一行。
-    answer: { text: answer },
+    // 正文拆成文本段和原生表格段；表格由 Table 组件自己横滚，不改成竖排列表。
+    answer: { blocks: answerBlocks },
     thinking: {
-      text: reasoning || (active ? '正在分析你的问题…' : ''),
+      text: flattenMarkdownTables(reasoning || (active && !hasTools ? '正在分析你的问题…' : '')),
       preview: active && !thinkingDone ? previewLine(reasoning) : '',
     },
     tools: {
-      text: richToolsMarkdown(details, tools),
-      preview: active && hasTools ? richToolsPreview(details) : '',
+      text: flattenMarkdownTables(richToolsMarkdown(details, tools)),
+      preview: active && hasTools ? richToolsPreview(details, tools) : '',
     },
     attachments,
     thinkingDone,
     ui: {
-      // 思考阶段只显示思考面板；真正发生工具调用后才出现工具面板。
-      // 结束时两个面板都按实际内容显示，但仍是收起状态。
-      showThinking: active ? !hasTools : Boolean(reasoning),
+      // 思考面板不因工具出现而隐藏：工具阶段仍保留“已深度思考”，
+      // 工具面板在它下面单独占一行标题 + 一行当前工具信息。
+      showThinking: Boolean(reasoning) || hasTools,
       showThinkingPreview: active && !thinkingDone && Boolean(previewLine(reasoning)),
       showTools: hasTools,
-      showToolsPreview: active && hasTools && Boolean(richToolsPreview(details)),
+      showToolsPreview: active && hasTools && Boolean(richToolsPreview(details, tools)),
       showAnswerSpinner: active && Boolean(answer),
       showAttachments: attachments.length > 0,
       showAttachment0: attachments.length > 0,
       showAttachment1: attachments.length > 1,
       showAttachment2: attachments.length > 2,
+      ...answerUi,
     },
   }
 }
@@ -687,7 +995,8 @@ function richCardComponents(active: boolean, thinkingDone = false): Array<Record
       id: 'root',
       component: 'Card',
       child: 'rootColumn',
-      backgroundColor: '#FFFFFFFF',
+      // 交给钉钉按当前主题解析底色，避免写死白底在桌面端变成一块灰边白卡。
+      backgroundColorToken: 'common_bg_color',
       padding: 16,
       cornerRadius: 12,
     },
@@ -764,14 +1073,41 @@ function richCardComponents(active: boolean, thinkingDone = false): Array<Record
       component: 'Row',
       align: 'end',
       gap: 0,
-      children: active ? ['answer', 'answerSpinner'] : ['answer'],
+      children: active ? ['answerBlocks', 'answerSpinner'] : ['answerBlocks'],
     },
     {
-      id: 'answer',
-      component: 'Markdown',
-      content: { path: '/answer/text' },
+      id: 'answerBlocks',
+      component: 'Column',
+      gap: 8,
       weight: 1,
+      children: Array.from({ length: MAX_ANSWER_BLOCKS }, (_, index) => `answerUnit${index}`),
     },
+    ...Array.from({ length: MAX_ANSWER_BLOCKS }, (_, index) => [
+      {
+        id: `answerUnit${index}`,
+        component: 'Column',
+        gap: 6,
+        visible: { path: `/ui/showAnswerUnit${index}` },
+        children: [`answerText${index}`, `answerTable${index}`],
+      },
+      {
+        id: `answerText${index}`,
+        component: 'Markdown',
+        content: { path: `/answer/blocks/${index}/text` },
+        visible: { path: `/ui/showAnswerText${index}` },
+      },
+      {
+        // 原生 Table 才有 scrollAreaWidth；宽表格在这里横向滚动，不再被裁列。
+        id: `answerTable${index}`,
+        component: 'Table',
+        data: { path: `/answer/blocks/${index}/table` },
+        scrollAreaWidth: 320,
+        cellPadding: 6,
+        maxLine: 3,
+        zebra: true,
+        visible: { path: `/ui/showAnswerTable${index}` },
+      },
+    ]).flat(),
     ...(active
       ? [
           {
@@ -818,9 +1154,13 @@ export function buildDingTalkA2UIArtifactAnnotations(surfaceId: string): Array<{
   componentId: string
   type: 'artifact'
 }> {
-  // 钉钉用标为 artifact 的组件生成会话列表里的文本；未标注时只写默认品牌文案。
-  // answer 的 content 绑定 /answer/text，卡片收口后列表预览即为机器人回复正文。
-  return [{ surfaceId, componentId: 'answer', type: 'artifact' }]
+  // 钉钉用标为 artifact 的组件生成会话列表里的文本；正文现在拆成多个段，
+  // 每个 Markdown 段都标上，避免“只有表格没有正文”时摘要为空。
+  return Array.from({ length: MAX_ANSWER_BLOCKS }, (_, index) => ({
+    surfaceId,
+    componentId: `answerText${index}`,
+    type: 'artifact' as const,
+  }))
 }
 
 export function buildDingTalkA2UICreateMessages(
@@ -844,7 +1184,7 @@ export function buildDingTalkA2UICreateMessages(
     a2uiMessage({
       updateComponents: {
         surfaceId,
-        components: richCardComponents(true, Boolean(state.thinkingDone)),
+        components: richCardComponents(true, richThinkingDone(state)),
       },
     }),
   ]
@@ -864,22 +1204,18 @@ export function buildDingTalkA2UIUpdateMessages(
     messages.push(a2uiMessage({ updateDataModel: { surfaceId, path, value } }))
   }
 
-  pushData('/answer/text', data.answer.text, previousData?.answer.text)
+  if (!previousData || JSON.stringify(data.answer) !== JSON.stringify(previousData.answer)) {
+    messages.push(a2uiMessage({ updateDataModel: { surfaceId, path: '/answer', value: data.answer } }))
+  }
   pushData('/thinking/text', data.thinking.text, previousData?.thinking.text)
   pushData('/thinking/preview', data.thinking.preview, previousData?.thinking.preview)
   pushData('/tools/text', data.tools.text, previousData?.tools.text)
   pushData('/tools/preview', data.tools.preview, previousData?.tools.preview)
-  pushData('/ui/showThinking', data.ui.showThinking, previousData?.ui.showThinking)
-  pushData('/ui/showThinkingPreview', data.ui.showThinkingPreview, previousData?.ui.showThinkingPreview)
-  pushData('/ui/showTools', data.ui.showTools, previousData?.ui.showTools)
-  pushData('/ui/showToolsPreview', data.ui.showToolsPreview, previousData?.ui.showToolsPreview)
-  pushData('/ui/showAnswerSpinner', data.ui.showAnswerSpinner, previousData?.ui.showAnswerSpinner)
+  if (!previousData || JSON.stringify(data.ui) !== JSON.stringify(previousData.ui)) {
+    messages.push(a2uiMessage({ updateDataModel: { surfaceId, path: '/ui', value: data.ui } }))
+  }
   if (!previousData || JSON.stringify(data.attachments) !== JSON.stringify(previousData.attachments)) {
     pushData('/attachments', data.attachments, previousData?.attachments)
-    pushData('/ui/showAttachments', data.ui.showAttachments, previousData?.ui.showAttachments)
-    pushData('/ui/showAttachment0', data.ui.showAttachment0, previousData?.ui.showAttachment0)
-    pushData('/ui/showAttachment1', data.ui.showAttachment1, previousData?.ui.showAttachment1)
-    pushData('/ui/showAttachment2', data.ui.showAttachment2, previousData?.ui.showAttachment2)
   }
 
   // 思考结束 / 工具出现或结束时才重发面板组件；纯流式阶段只更新变化的数据，
