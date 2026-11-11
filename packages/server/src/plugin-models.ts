@@ -24,6 +24,8 @@ interface RegisteredAdapter {
   revision: number
   configurable: Map<string, Record<string, unknown>>
   discovery: ((...args: unknown[]) => unknown) | null
+  /** 上次从插件重读目录的时间，避免页面轮询把 listModels 打满。 */
+  lastSyncedAt: number
 }
 
 interface PluginModelTarget {
@@ -82,7 +84,12 @@ const pendingDiscovery = new Map<string, Map<string, (...args: unknown[]) => unk
 
 type PluginActiveResolver = (companyId: string, pluginId: string) => boolean
 type ModelVisibleResolver = (companyId: string, modelId: string) => boolean
-type PluginModelsChangedListener = (companyId: string) => void
+export interface PluginModelCatalogChange {
+  readonly added: string[]
+  readonly removed: string[]
+  readonly updated: string[]
+}
+type PluginModelsChangedListener = (companyId: string, change?: PluginModelCatalogChange) => void
 
 /**
  * 宿主可以在查询时判断插件是否仍对公司有效。插件卸载/停用后，host 的异步 dispose
@@ -200,34 +207,77 @@ function toDefinition(
   }
 }
 
-async function refreshAdapter(companyId: string, registration: RegisteredAdapter): Promise<void> {
+const emptyCatalogChange = (): PluginModelCatalogChange => ({ added: [], removed: [], updated: [] })
+
+/**
+ * 从插件重读 adapter 的模型目录并做差量同步。
+ *
+ * 关键点：先读取成功再替换。某个 route 的 listModels 抛错或返回非数组时保留它
+ * 上一次的模型，避免插件临时探测失败把整条通道的模型误删；只有成功返回的空数组
+ * 才代表“插件确实不再提供这些模型”，此时才删除。
+ */
+async function refreshAdapter(
+  companyId: string,
+  registration: RegisteredAdapter,
+): Promise<PluginModelCatalogChange> {
   const revision = (registration.revision ?? 0) + 1
   registration.revision = revision
+  registration.lastSyncedAt = Date.now()
+  const routes = [...registration.routes]
+  const fetched = new Map<string, unknown[]>()
+  const failed = new Set<string>()
+  await Promise.all(
+    routes.map(async (route) => {
+      let rows: unknown = []
+      try {
+        rows = registration.adapter.listModels ? await registration.adapter.listModels(route) : []
+      } catch {
+        failed.add(route)
+        return
+      }
+      if (!Array.isArray(rows)) {
+        failed.add(route)
+        return
+      }
+      fetched.set(route, rows)
+    }),
+  )
+  if (registration.revision !== revision) return emptyCatalogChange()
+
   const models = companyModels(companyId)
   const targets = companyTargets(companyId)
+  const before = new Map<string, string>()
   for (const [id, target] of targets) {
-    if (target.adapter === registration.adapter) {
+    if (target.adapter !== registration.adapter) continue
+    const definition = models.get(id)
+    if (definition) before.set(id, JSON.stringify(definition))
+  }
+
+  // route 被 replace 掉时，旧 route 的模型必须一起消失。
+  for (const [id, target] of [...targets]) {
+    if (target.adapter === registration.adapter && !routes.includes(target.provider)) {
       targets.delete(id)
       models.delete(id)
     }
   }
-  for (const provider of registration.routes) {
-    let rows: unknown = []
-    try {
-      rows = registration.adapter.listModels ? await registration.adapter.listModels(provider) : []
-    } catch {
-      rows = []
+
+  for (const route of routes) {
+    if (failed.has(route)) continue
+    const channelId = pluginChannelId(registration.pluginId, route)
+    // 同一 route 只有成功读到目录时才整体替换，未变化的内容不会触发探测。
+    for (const [id, target] of [...targets]) {
+      if (target.adapter === registration.adapter && target.provider === route) {
+        targets.delete(id)
+        models.delete(id)
+      }
     }
-    if (registration.revision !== revision) return
-    if (!Array.isArray(rows)) continue
-    const channelId = pluginChannelId(registration.pluginId, provider)
-    for (const raw of rows) {
+    for (const raw of fetched.get(route) ?? []) {
       const info = asRecord(raw)
       try {
-        const definition = toDefinition(provider, info, registration.pluginId, channelId)
+        const definition = toDefinition(route, info, registration.pluginId, channelId)
         models.set(definition.id, definition)
         targets.set(definition.id, {
-          provider,
+          provider: route,
           modelId: String(info.id),
           pluginId: registration.pluginId,
           channelId,
@@ -239,8 +289,24 @@ async function refreshAdapter(companyId: string, registration: RegisteredAdapter
       }
     }
   }
-  // 注册/刷新完成后通知宿主补做真实回复探测；模型在探测通过前不会出现在目录里。
-  modelsChangedListener?.(companyId)
+
+  const added: string[] = []
+  const removed: string[] = []
+  const updated: string[] = []
+  for (const [id, signature] of before) {
+    if (!targets.has(id) || targets.get(id)?.adapter !== registration.adapter) removed.push(id)
+    else if (JSON.stringify(models.get(id)) !== signature) updated.push(id)
+  }
+  for (const [id, target] of targets) {
+    if (target.adapter === registration.adapter && !before.has(id)) added.push(id)
+  }
+
+  const change: PluginModelCatalogChange = { added, removed, updated }
+  if (added.length || removed.length || updated.length) {
+    // 新增/变更的模型要重新探测；移除的模型由宿主清掉健康状态，避免模型回来时沿用旧结果。
+    modelsChangedListener?.(companyId, change)
+  }
+  return change
 }
 
 /**
@@ -262,6 +328,7 @@ export function registerPluginAdapter(
     revision: 0,
     configurable: new Map(),
     discovery: null,
+    lastSyncedAt: 0,
   }
   if (existing) {
     registration.pluginId = String(pluginId || registration.pluginId)
@@ -291,11 +358,16 @@ export function registerPluginAdapter(
     if (index >= 0) list.splice(index, 1)
     const models = companyModels(companyId)
     const targets = companyTargets(companyId)
+    const removed: string[] = []
     for (const [id, target] of targets) {
       if (target.adapter === registration.adapter) {
         targets.delete(id)
         models.delete(id)
+        removed.push(id)
       }
+    }
+    if (removed.length) {
+      modelsChangedListener?.(companyId, { added: [], removed, updated: [] })
     }
   }
   return { replace, dispose }
@@ -443,6 +515,75 @@ export async function refreshPluginChannel(companyId: string, channelId: string)
   return listPluginModels(companyId).filter((model) => model.channelId === String(channelId)).length
 }
 
+export interface PluginModelSyncResult {
+  readonly added: number
+  readonly removed: number
+  readonly updated: number
+}
+
+const catalogSyncsInFlight = new Map<string, Promise<PluginModelSyncResult>>()
+
+/**
+ * 让 EAB 目录跟随插件当前的模型目录。
+ *
+ * 插件会在自己的免费额度扫描里把不再免费的模型从 `listModels()` 摘掉；EAB 不能只在
+ * 注册时读一次，否则插件里已经消失的模型仍会留在对话和控制台里。这里只重读
+ * adapter 的目录，不额外打上游，失败时保留旧模型，成功返回的空目录才会清理。
+ */
+export function syncPluginModels(
+  companyId: string,
+  options: { minIntervalMs?: number } = {},
+): Promise<PluginModelSyncResult> {
+  const existing = catalogSyncsInFlight.get(companyId)
+  if (existing) return existing
+  const minIntervalMs = Math.max(0, Number(options.minIntervalMs ?? 0))
+  const task = (async (): Promise<PluginModelSyncResult> => {
+    const result = { added: 0, removed: 0, updated: 0 }
+    for (const registration of [...companyAdapters(companyId)]) {
+      if (!pluginIsActive(companyId, registration.pluginId)) continue
+      if (registration.routes.size === 0) continue
+      if (minIntervalMs > 0 && Date.now() - registration.lastSyncedAt < minIntervalMs) continue
+      const change = await refreshAdapter(companyId, registration)
+      result.added += change.added.length
+      result.removed += change.removed.length
+      result.updated += change.updated.length
+    }
+    return result
+  })()
+  catalogSyncsInFlight.set(companyId, task)
+  const cleanup = (): void => {
+    if (catalogSyncsInFlight.get(companyId) === task) catalogSyncsInFlight.delete(companyId)
+  }
+  void task.then(cleanup, cleanup)
+  return task
+}
+
+const DEFAULT_CATALOG_SYNC_INTERVAL_MS = 15_000
+
+/**
+ * 周期性把插件目录同步到 EAB。只读插件的 `listModels()`，不触发真实回复探测；
+ * 新增或变更的模型由 modelsChangedListener 统一补探测。
+ */
+export function startPluginModelCatalogSync(
+  companyId: string,
+  options: { intervalMs?: number } = {},
+): () => void {
+  const raw = Number(options.intervalMs ?? DEFAULT_CATALOG_SYNC_INTERVAL_MS)
+  const intervalMs = Number.isFinite(raw) && raw >= 5_000 ? Math.trunc(raw) : DEFAULT_CATALOG_SYNC_INTERVAL_MS
+  let stopped = false
+  const run = (): void => {
+    if (stopped) return
+    void syncPluginModels(companyId, { minIntervalMs: intervalMs }).catch(() => undefined)
+  }
+  run()
+  const timer = setInterval(run, intervalMs)
+  timer.unref?.()
+  return () => {
+    stopped = true
+    clearInterval(timer)
+  }
+}
+
 export function findPluginModel(companyId: string, id: string): PluginModelDefinition | null {
   const model = companyModels(companyId).get(String(id))
   if (!model || !pluginIsActive(companyId, model.pluginId)) return null
@@ -456,11 +597,18 @@ export function findPluginModel(companyId: string, id: string): PluginModelDefin
 export function removePluginModelsForPlugin(companyId: string, pluginId: string): void {
   const models = companyModels(companyId)
   const targets = companyTargets(companyId)
+  const removed: string[] = []
   for (const [id, model] of models) {
-    if (model.pluginId === String(pluginId)) models.delete(id)
+    if (model.pluginId === String(pluginId)) {
+      models.delete(id)
+      removed.push(id)
+    }
   }
   for (const [id, target] of targets) {
     if (target.pluginId === String(pluginId)) targets.delete(id)
+  }
+  if (removed.length) {
+    modelsChangedListener?.(companyId, { added: [], removed, updated: [] })
   }
 }
 

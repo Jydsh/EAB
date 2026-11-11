@@ -2884,6 +2884,7 @@ table.data tr.clickable { cursor: pointer; }
 .channel-config-head strong { display: block; font-size: 14px; }
 .channel-sub { display: block; margin-top: 3px; color: var(--muted); font-size: 11px; }
 .channel-flags { display: flex; flex-wrap: wrap; gap: 5px; margin: 12px 0; }
+.channel-stream-note { margin: -2px 0 12px; padding: 9px 11px; border: 1px solid #f0d9a8; border-radius: 8px; background: #fffaf0; color: #8a5a12; font-size: 11.5px; line-height: 1.6; }
 .channel-fields { margin: 0; display: grid; gap: 6px; }
 .channel-fields > div { display: flex; justify-content: space-between; gap: 10px; font-size: 11.5px; }
 .channel-fields dt { color: #98a2b3; flex: none; }
@@ -5666,6 +5667,77 @@ table.data tr.clickable { cursor: pointer; }
 }
 .models-filter span { color: #98a2b3; font-size: 9.5px; }
 .models-filter.is-active span { color: #0f766e; }
+.models-plugin-sources {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 0 18px 10px;
+}
+.models-plugin-sources-label {
+  color: #98a2b3;
+  font-size: 10px;
+  letter-spacing: 0.02em;
+}
+.models-plugin-source {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  padding: 3px 8px;
+  border: 1px solid #e3ece9;
+  border-radius: 999px;
+  background: #fbfdfc;
+  color: #475467;
+  font-size: 10.5px;
+  line-height: 1.4;
+}
+.models-plugin-source i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #12a07f;
+  flex: none;
+}
+.models-plugin-source strong {
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #1d2939;
+  font-weight: 600;
+}
+.models-plugin-source code {
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #98a2b3;
+  font-size: 9.5px;
+}
+.models-plugin-source b {
+  color: #0f766e;
+  font-weight: 600;
+}
+.models-plugin-source small { color: #667085; }
+.models-plugin-source.is-off {
+  border-color: #f0dfc0;
+  background: #fffbf2;
+}
+.models-plugin-source.is-off i { background: #d97706; }
+.models-plugin-source.is-off b { color: #b45309; }
+.models-plugin-goto {
+  border: 0;
+  background: transparent;
+  padding: 0 0 0 2px;
+  color: #0f766e;
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.models-plugin-goto:hover { color: #115e59; }
 .models-catalog-scroll { min-height: 360px; }
 .models-table { min-width: 880px; width: 100%; table-layout: fixed; }
 .models-table th:nth-child(1) { width: 16%; }

@@ -1294,35 +1294,94 @@ export async function handleDingTalkMessage(
 
 // ---------- Stream 长连接（本地无公网地址时使用） ----------
 
+interface StreamClientLike {
+  connected?: boolean
+  registered?: boolean
+  reconnecting?: boolean
+  disconnect: () => void
+}
+
 interface StreamState {
-  client: { disconnect: () => void; connected?: boolean } | null
+  client: StreamClientLike | null
   appId: string | null
   startedAt: number | null
+  lastConnectedAt: number | null
+  lastAttemptAt: number | null
+  error: string | null
 }
 
-const streamState: StreamState = { client: null, appId: null, startedAt: null }
-
-export function dingTalkStreamStatus(): { running: boolean; appId: string | null; startedAt: number | null } {
-  return { running: Boolean(streamState.client), appId: streamState.appId, startedAt: streamState.startedAt }
+const streamState: StreamState = {
+  client: null,
+  appId: null,
+  startedAt: null,
+  lastConnectedAt: null,
+  lastAttemptAt: null,
+  error: null,
 }
+
+export interface DingTalkStreamStatus {
+  readonly running: boolean
+  readonly appId: string | null
+  readonly startedAt: number | null
+  readonly connected: boolean
+  readonly registered: boolean
+  readonly lastConnectedAt: number | null
+  readonly lastAttemptAt: number | null
+  readonly error: string | null
+}
+
+export function dingTalkStreamStatus(): DingTalkStreamStatus {
+  return {
+    // running 只代表宿主持有客户端；真正能收消息看 connected + registered。
+    running: Boolean(streamState.client),
+    appId: streamState.appId,
+    startedAt: streamState.startedAt,
+    connected: streamState.client?.connected === true,
+    registered: streamState.client?.registered === true,
+    lastConnectedAt: streamState.lastConnectedAt,
+    lastAttemptAt: streamState.lastAttemptAt,
+    error: streamState.error,
+  }
+}
+
+let refreshPromise: Promise<void> | null = null
 
 /**
  * 启动/重建钉钉 Stream。绑定换机器人后调用它即可切换凭证，不必重启整个服务。
  * 只有 robot_mode=STREAM（钉钉扫码默认给这个模式）才需要主动连网关。
  */
-export async function refreshDingTalkStream(deps: ServerDeps): Promise<void> {
+export function refreshDingTalkStream(deps: ServerDeps): Promise<void> {
+  // 启动、绑定回写、30 秒巡检可能同时触发；串行化，避免并发建出多条长连接。
+  if (refreshPromise) return refreshPromise
+  refreshPromise = doRefreshDingTalkStream(deps).finally(() => {
+    refreshPromise = null
+  })
+  return refreshPromise
+}
+
+async function doRefreshDingTalkStream(deps: ServerDeps): Promise<void> {
   const cfg = dingTalkConfig(deps.db, deps.companyId)
   const mode = String(cfg?.robot_mode ?? '').toUpperCase()
+  streamState.lastAttemptAt = Date.now()
   if (!cfg?.app_id || !cfg.secret_ref || cfg.status !== 'bound' || mode !== 'STREAM') {
     stopDingTalkStream()
+    streamState.error = '钉钉渠道未满足 Stream 启动条件（需已绑定且 robot_mode=STREAM）'
     return
   }
   const secret = resolveSecret(deps.config.dbPath, cfg.secret_ref)
   if (!secret) {
+    // 密钥文件被覆盖/迁移丢失时，之前这里直接 return，界面仍显示“已绑定”，
+    // 手机端会表现为机器人完全不回复。必须把原因挂到状态里让控制台可见。
     stopDingTalkStream()
+    streamState.error = `钉钉渠道密钥缺失：${cfg.secret_ref} 未配置，请重新保存 AppSecret`
+    console.warn(`[eab] 钉钉 Stream 未启动：${streamState.error}`)
     return
   }
-  if (streamState.client && streamState.appId === cfg.app_id) return
+  if (streamState.client && streamState.appId === cfg.app_id) {
+    if (streamState.client.connected || streamState.client.registered) return
+    // 客户端还在建连/等待自动重连时不要拆掉它；否则每轮巡检都会打断退避。
+    if (streamState.client.reconnecting) return
+  }
 
   stopDingTalkStream()
   const { DWClient, TOPIC_ROBOT } = await import('dingtalk-stream')
@@ -1351,11 +1410,40 @@ export async function refreshDingTalkStream(deps: ServerDeps): Promise<void> {
   streamState.client = client
   streamState.appId = cfg.app_id
   streamState.startedAt = Date.now()
+  streamState.error = null
   try {
     await client.connect()
-    console.log(`[eab] 钉钉 Stream 已连接：EAB · ${cfg.tenant_name ?? deps.companyId}`)
+    if (client.connected) {
+      streamState.lastConnectedAt = Date.now()
+      streamState.error = null
+      console.log(`[eab] 钉钉 Stream 已连接：EAB · ${cfg.tenant_name ?? deps.companyId}`)
+    } else {
+      // 库的 connect() 内部会吞掉网关错误并返回，不能只看它有没有抛异常。
+      streamState.error = '钉钉 Stream 连接未建立（网关鉴权或网络失败），正在自动重连'
+      console.warn(`[eab] ${streamState.error}`)
+    }
   } catch (error) {
-    console.warn('[eab] 钉钉 Stream 连接失败：', (error as Error).message)
+    streamState.error = `钉钉 Stream 连接失败：${(error as Error).message}`
+    console.warn(`[eab] ${streamState.error}`)
+  }
+}
+
+/**
+ * 定期巡检 Stream：只有 connected 但未 registered 仍收不到消息；
+ * 连续失败或客户端卡死时重建，避免“服务在跑、机器人却静默”的状态长期存在。
+ */
+export function startDingTalkStreamMonitor(deps: ServerDeps, intervalMs = 30_000): () => void {
+  let stopped = false
+  const timer = setInterval(() => {
+    if (stopped) return
+    void refreshDingTalkStream(deps).catch((error) => {
+      console.warn('[eab] 钉钉 Stream 巡检失败：', (error as Error).message)
+    })
+  }, Math.max(5_000, intervalMs))
+  timer.unref?.()
+  return () => {
+    stopped = true
+    clearInterval(timer)
   }
 }
 

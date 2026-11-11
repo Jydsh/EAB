@@ -3,6 +3,7 @@ import { EC, EabError } from '@eab/domain'
 import { listPluginModels, registerPluginAdapter } from '../src/plugin-models.js'
 import {
   filterHealthyModels,
+  forgetModelHealth,
   isModelHealthy,
   markModelHealthy,
   markModelUnhealthy,
@@ -56,6 +57,17 @@ describe('模型健康状态', () => {
     const abort = new Error('stopped')
     abort.name = 'AbortError'
     expect(shouldMarkModelFailure(abort)).toBe(false)
+  })
+
+  it('插件移除模型时清掉健康结论，模型回来仍要重新探测', async () => {
+    const company = 'health-forget-test'
+    const model = [{ id: 'plugin:route:model' }]
+    markModelHealthy(company, model[0].id)
+    expect(filterHealthyModels(company, model)).toHaveLength(1)
+
+    forgetModelHealth(company, [model[0].id])
+    expect(isModelHealthy(company, model[0].id)).toBe(false)
+    expect(filterHealthyModels(company, model)).toEqual([])
   })
 
   it('探测真实插件 adapter：成功标记可用，失败标记不可用', async () => {

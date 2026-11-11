@@ -26,7 +26,7 @@ import { resolveActor } from '../session.js'
 import { isConsoleRequest } from '../console-auth.js'
 import { hashPassword } from '../password.js'
 import { revokeAllSessions } from '../employee-session.js'
-import { storeSecret } from '../secrets.js'
+import { resolveSecret, storeSecret } from '../secrets.js'
 import { companyAssistantView, resolveAssistantDataDir, saveCompanyAssistant } from '../company-assistant.js'
 import { refreshDingTalkStream } from '../dingtalk-bot.js'
 
@@ -1302,7 +1302,12 @@ export function registerAdminRoutes(app: FastifyInstance, deps: ServerDeps): voi
           hint: '请重新生成二维码再扫一次；若仍失败，改用「手工填写 AppKey/AppSecret/CorpId」开通。',
         })
       }
-      const secretRef = row.client_secret_ref ?? storeSecret(deps.config.dbPath, null, appSecret, 'EAB_DINGTALK_APP_SECRET')
+      // 旧 attempt 的 ref 可能还在，但密钥文件已被覆盖/清理；不能只看 ref 名，
+      // 必须确认现在仍能解析到值，否则会把新扫到的 secret 丢掉、继续指向空引用。
+      const canReuseRef = Boolean(row.client_secret_ref && resolveSecret(deps.config.dbPath, row.client_secret_ref))
+      const secretRef = canReuseRef
+        ? row.client_secret_ref!
+        : storeSecret(deps.config.dbPath, null, appSecret, 'EAB_DINGTALK_APP_SECRET')
       deps.db
         .prepare(
           `UPDATE dingtalk_onboard_attempts

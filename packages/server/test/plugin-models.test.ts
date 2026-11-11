@@ -9,6 +9,8 @@ import {
   registerPluginConfigurableProviders,
   registerPluginModelDiscovery,
   setPluginModelActiveResolver,
+  setPluginModelsChangedListener,
+  syncPluginModels,
 } from '../src/plugin-models.js'
 
 const COMPANY = 'c_plugin_models_test'
@@ -132,6 +134,116 @@ describe('插件 LLM adapter 注册表', () => {
     } finally {
       registration.dispose()
       setPluginModelActiveResolver(null)
+    }
+  })
+
+  it('插件目录移除模型后，周期同步会把模型从 EAB 目录删掉', async () => {
+    const company = 'c_plugin_catalog_remove_test'
+    let rows = [
+      { provider: 'demo-route', id: 'demo/model', name: '演示模型' },
+      { provider: 'demo-route', id: 'demo/other', name: '另一个模型' },
+    ]
+    const adapter = {
+      listModels: async (provider: string) => rows.map((row) => ({ ...row, provider })),
+      prepareCall: async (provider: string, model: string) => ({
+        model: { provider, id: model, name: '演示模型' },
+        stream: () => stream(),
+      }),
+      stream: () => stream(),
+    }
+    const registration = registerPluginAdapter(company, 'dsh-catalog', ['demo-route'], adapter)
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      expect(listPluginModels(company)).toHaveLength(2)
+
+      rows = [{ provider: 'demo-route', id: 'demo/model', name: '演示模型' }]
+      const result = await syncPluginModels(company)
+      expect(result.removed).toBe(1)
+      expect(listPluginModels(company).map((model) => model.id)).toEqual(['plugin:demo-route:demo%2Fmodel'])
+    } finally {
+      registration.dispose()
+    }
+  })
+
+  it('插件读取目录失败时保留上一次模型，不把整条通道误删', async () => {
+    const company = 'c_plugin_catalog_failure_test'
+    let broken = false
+    const adapter = {
+      listModels: async (provider: string) => {
+        if (broken) throw new Error('临时读取失败')
+        return [{ provider, id: 'demo/model', name: '演示模型' }]
+      },
+      prepareCall: async (provider: string, model: string) => ({
+        model: { provider, id: model, name: '演示模型' },
+        stream: () => stream(),
+      }),
+      stream: () => stream(),
+    }
+    const registration = registerPluginAdapter(company, 'dsh-catalog-failure', ['demo-route'], adapter)
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      expect(listPluginModels(company)).toHaveLength(1)
+
+      broken = true
+      const result = await syncPluginModels(company)
+      expect(result).toEqual({ added: 0, removed: 0, updated: 0 })
+      expect(listPluginModels(company)).toHaveLength(1)
+    } finally {
+      registration.dispose()
+    }
+  })
+
+  it('插件只返回动态附加字段时不算模型变化，避免每轮同步清空健康状态', async () => {
+    const company = 'c_plugin_catalog_stable_test'
+    let tick = 0
+    const adapter = {
+      listModels: async (provider: string) => [
+        { provider, id: 'demo/model', name: '演示模型', checkedAt: ++tick, latencyMs: tick * 3 },
+      ],
+      prepareCall: async (provider: string, model: string) => ({
+        model: { provider, id: model, name: '演示模型' },
+        stream: () => stream(),
+      }),
+      stream: () => stream(),
+    }
+    const registration = registerPluginAdapter(company, 'dsh-catalog-stable', ['demo-route'], adapter)
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      const first = await syncPluginModels(company)
+      const second = await syncPluginModels(company)
+      expect(first).toEqual({ added: 0, removed: 0, updated: 0 })
+      expect(second).toEqual({ added: 0, removed: 0, updated: 0 })
+    } finally {
+      registration.dispose()
+    }
+  })
+
+  it('插件模型定义变化时通过 updated 差量通知宿主重新探测', async () => {
+    const company = 'c_plugin_catalog_update_test'
+    const changes: string[][] = []
+    let name = '旧名称'
+    const adapter = {
+      listModels: async (provider: string) => [{ provider, id: 'demo/model', name }],
+      prepareCall: async (provider: string, model: string) => ({
+        model: { provider, id: model, name: '演示模型' },
+        stream: () => stream(),
+      }),
+      stream: () => stream(),
+    }
+    setPluginModelsChangedListener((_companyId, change) => {
+      if (change?.updated.length) changes.push(change.updated)
+    })
+    const registration = registerPluginAdapter(company, 'dsh-catalog-update', ['demo-route'], adapter)
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      name = '新名称'
+      const result = await syncPluginModels(company)
+      expect(result.updated).toBe(1)
+      expect(listPluginModels(company)[0]?.name).toBe('新名称')
+      expect(changes.at(-1)).toEqual(['plugin:demo-route:demo%2Fmodel'])
+    } finally {
+      registration.dispose()
+      setPluginModelsChangedListener(null)
     }
   })
 })

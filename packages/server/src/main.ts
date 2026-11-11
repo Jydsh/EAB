@@ -11,7 +11,7 @@ import { randomBytes } from 'node:crypto'
 import type { FastifyInstance } from 'fastify'
 import { migrate, openDatabase } from '@eab/storage'
 import { buildApp } from './app.js'
-import { refreshDingTalkStream, stopDingTalkStream } from './dingtalk-bot.js'
+import { refreshDingTalkStream, startDingTalkStreamMonitor, stopDingTalkStream } from './dingtalk-bot.js'
 import { cleanupTemp } from './routes/workspace.js'
 import { loadConfig } from './config.js'
 import { COMPANY_ID, COMPANY_NAME, ensureDemoData, ensureDemoPasswords, ensureModelCatalog } from './dev-seed.js'
@@ -24,9 +24,9 @@ import {
 } from './settings.js'
 import { startRetention } from './retention.js'
 import { startScheduleWorker } from './schedule.js'
-import { startModelHealthMonitor, isModelHealthy, probeUnverifiedPluginModels } from './model-health.js'
+import { startModelHealthMonitor, isModelHealthy, probeUnverifiedPluginModels, forgetModelHealth } from './model-health.js'
 import { reloadPluginHosts } from './plugin-host.js'
-import { setPluginModelVisibilityResolver, setPluginModelsChangedListener } from './plugin-models.js'
+import { setPluginModelVisibilityResolver, setPluginModelsChangedListener, startPluginModelCatalogSync } from './plugin-models.js'
 import { setPluginRoot } from './plugins.js'
 import { checkForUpdate } from './update.js'
 import { acquireProcessLock, type ProcessLock } from './process-lock.js'
@@ -203,7 +203,13 @@ await Promise.all([
 /** 插件模型只有在真实回复探测通过后才进入模型目录。 */
 setPluginModelVisibilityResolver((companyId, modelId) => isModelHealthy(companyId, modelId))
 const pluginProbeTimers = new Map<string, ReturnType<typeof setTimeout>>()
-setPluginModelsChangedListener((companyId) => {
+setPluginModelsChangedListener((companyId, change) => {
+  // 插件移除的模型要清掉旧健康结论；否则同一个模型 ID 重新出现时会绕过真实探测。
+  const removed = change?.removed ?? []
+  const reset = [...(change?.added ?? []), ...(change?.updated ?? [])]
+  if (removed.length) forgetModelHealth(companyId, removed)
+  if (reset.length) forgetModelHealth(companyId, reset)
+  if (reset.length === 0) return
   // adapter 注册发生在插件 apply() 期间，等初始化落定再探测，避免 prepareCall 撞上半初始化状态。
   const previous = pluginProbeTimers.get(companyId)
   if (previous) clearTimeout(previous)
@@ -226,6 +232,9 @@ await reloadPluginHosts(db, {
 
 /** 插件模型定时健康探测：失败模型从对话候选过滤，恢复后自动回来。 */
 const stopModelHealthMonitor = startModelHealthMonitor(config.companyId)
+
+/** 插件模型目录定时重读：插件把不再免费的模型摘掉后，EAB 目录跟随清理。 */
+const stopPluginModelCatalogSync = startPluginModelCatalogSync(config.companyId)
 
 /** 0.0.0.0 时给运维一个可直接复制的局域网地址；只做展示，不参与监听。 */
 function localIpv4(): string | null {
@@ -273,10 +282,14 @@ console.log('')
 void refreshDingTalkStream(deps).catch((error) => {
   console.warn('[eab] 钉钉 Stream 启动失败：', (error as Error).message)
 })
+/** 每 30 秒巡检一次：密钥缺失、网关断开、客户端卡死都要在控制台可见并自动重建。 */
+const stopDingTalkStreamMonitor = startDingTalkStreamMonitor(deps)
 
 async function shutdown(): Promise<void> {
   stopScheduleWorker()
   stopModelHealthMonitor()
+  stopPluginModelCatalogSync()
+  stopDingTalkStreamMonitor()
   stopDingTalkStream()
   await closeApps(apps)
   processLock.release()

@@ -4603,6 +4603,7 @@ async function loadModels() {
     const pluginProviderCount = providers.length - writableProviders.length
     const models = modelData.models
     const roles = modelData.roles || []
+    const pluginStates = modelData.pluginStates || []
     const enabledModels = models.filter((model) => model.enabled)
     const visionModels = models.filter((model) => {
       const caps = modelCapabilitySummary(model.tags)
@@ -4741,6 +4742,34 @@ async function loadModels() {
         <div class="models-route-list">${routeRows || '<div class="empty">还没有可路由的用途</div>'}</div>
       </section>`
 
+    const pluginSourceChips = pluginStates
+      .map((plugin) => {
+        const off = !plugin.enabled || !plugin.valid
+        const stateLabel = !plugin.valid ? '清单异常' : off ? '已停用' : '启用'
+        const idLabel = plugin.name === plugin.id ? '' : `<code>${esc(plugin.id)}</code>`
+        return `<span class="models-plugin-source${off ? ' is-off' : ''}">
+          <i aria-hidden="true"></i>
+          <strong>${esc(plugin.name)}</strong>
+          ${idLabel}
+          <b>${stateLabel}</b>
+          <small>${
+            off
+              ? '相关模型已自动清理'
+              : plugin.modelCount
+                ? `${plugin.modelCount} 个模型已通过探测`
+                : '尚未有模型通过探测'
+          }</small>
+          ${off ? '<button class="models-plugin-goto" type="button" data-plugin-goto="plugins">去启用</button>' : ''}
+        </span>`
+      })
+      .join('')
+    const pluginSourcesHtml = pluginStates.length
+      ? `<div class="models-plugin-sources" aria-label="插件模型来源状态">
+          <span class="models-plugin-sources-label">插件模型来源</span>
+          ${pluginSourceChips}
+        </div>`
+      : ''
+
     const catalogPanel = `
       <section class="panel models-panel models-catalog-panel" data-section-panel="catalog">
         <div class="models-panel-head">
@@ -4754,6 +4783,7 @@ async function loadModels() {
           </div>
         </div>
         <div class="models-filter-bar" id="model-filter"></div>
+        ${pluginSourcesHtml}
         <div class="models-table-scroll models-catalog-scroll">
           <table class="data models-table">
             <thead><tr><th>模型</th><th>供应商</th><th>类型</th><th>上下文 / 输出</th><th>能力 / 擅长场景</th><th>可见角色</th><th>状态</th><th>操作</th></tr></thead>
@@ -4985,6 +5015,11 @@ async function loadModels() {
       renderModelRows()
     })
     view.onclick = async (event) => {
+      const pluginGoto = event.target.closest('[data-plugin-goto]')
+      if (pluginGoto) {
+        navigate('plugins')
+        return
+      }
       const filterButton = event.target.closest('[data-model-filter]')
       if (filterButton) {
         state.modelsFilter = filterButton.dataset.modelFilter
@@ -7513,7 +7548,32 @@ function channelConfigCard(item, options = {}) {
   const hasCredentials = Boolean(item.appId && item.appSecretConfigured)
   const hasWebhook = Boolean(item.webhookUrl)
   const configured = hasCredentials || hasWebhook
-  const topState = bound ? '已绑定' : hasCredentials ? '凭证已配置' : hasWebhook ? '仅配置了 Webhook' : '待配置'
+  const missingSecret = bound && Boolean(item.appId) && !item.appSecretConfigured
+  const topState = missingSecret
+    ? '凭证缺失'
+    : bound
+      ? '已绑定'
+      : hasCredentials
+        ? '凭证已配置'
+        : hasWebhook
+          ? '仅配置了 Webhook'
+          : '待配置'
+  const stream = item.stream
+  const streamOk = Boolean(stream?.running && stream.connected && stream.registered)
+  const streamBadge = stream
+    ? streamOk
+      ? '<span class="pill ok">Stream 已连接</span>'
+      : '<span class="pill warn">Stream 未连接</span>'
+    : ''
+  const streamNote =
+    stream && !streamOk
+      ? `<div class="channel-stream-note">${esc(
+          stream.error ||
+            (stream.running
+              ? '钉钉 Stream 正在建立连接；若持续未连接，请检查网络或重新保存 AppSecret。'
+              : '钉钉 Stream 未运行；手机消息暂时不会进入 EAB。'),
+        )}</div>`
+      : ''
   const badges = [
     item.appId
       ? `<span class="pill ok">应用凭证</span>`
@@ -7524,6 +7584,7 @@ function channelConfigCard(item, options = {}) {
     item.webhookUrl
       ? `<span class="pill ok">Webhook</span>`
       : `<span class="pill">Webhook 未配置</span>`,
+    streamBadge,
   ].join('')
   const callback = item.callbackToken
     ? `<div class="callback-row"><span>回调地址</span><code>${esc(item.callbackPath)}?token=${esc(
@@ -7534,15 +7595,18 @@ function channelConfigCard(item, options = {}) {
     <div class="channel-config-head">
       <div><strong>${esc(item.label)}</strong>${hintBadge(
         '接入说明',
-        bound
-          ? '已完成企业绑定，机器人可以直接收发消息。'
-          : hasCredentials
-            ? '应用凭证已保存，可拉取真实通讯录并接收事件回调。'
-            : '还没有填写应用凭证，无法拉取通讯录。',
+        missingSecret
+          ? '应用凭证还在，但密钥已经丢失；机器人无法连钉钉网关，请重新保存 AppSecret。'
+          : bound
+            ? '已完成企业绑定，机器人可以直接收发消息。'
+            : hasCredentials
+              ? '应用凭证已保存，可拉取真实通讯录并接收事件回调。'
+              : '还没有填写应用凭证，无法拉取通讯录。',
       )}</div>
-      <span class="pill ${bound || configured ? 'ok' : 'warn'}">${topState}</span>
+      <span class="pill ${missingSecret ? 'warn' : bound || configured ? 'ok' : 'warn'}">${topState}</span>
     </div>
     <div class="channel-flags">${badges}</div>
+    ${streamNote}
     <dl class="channel-fields">
       <div><dt>App ID</dt><dd>${esc(item.appId || '—')}</dd></div>
       <div><dt>Agent ID</dt><dd>${esc(item.agentId || '—')}</dd></div>

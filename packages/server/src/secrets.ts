@@ -7,7 +7,7 @@
  * 3. 文件写入用 0600 权限，目录不存在先建；
  * 4. 控制台接口只返回"是否已配置"，不回显值。
  */
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 
@@ -15,6 +15,10 @@ type SecretFile = Record<string, string>
 
 function secretsPath(dbPath: string): string {
   return join(dirname(dbPath), 'secrets.json')
+}
+
+function backupPath(file: string): string {
+  return `${file}.bak`
 }
 
 function readFile(file: string): SecretFile {
@@ -32,12 +36,32 @@ function readFile(file: string): SecretFile {
   }
 }
 
-/** 解析密钥：环境变量优先，其次本地 secrets.json。 */
+/** 覆盖前留一份上一版；密钥文件被误覆盖时还能从 .bak 找回。 */
+function writeSecretFile(file: string, value: SecretFile): void {
+  if (existsSync(file)) {
+    try {
+      copyFileSync(file, backupPath(file))
+    } catch {
+      /* 备份失败不阻断本次写入 */
+    }
+  }
+  writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
+  try {
+    chmodSync(file, 0o600)
+  } catch {
+    /* Windows 上 chmod 只是尽力而为 */
+  }
+}
+
+/** 解析密钥：环境变量优先，其次本地 secrets.json，最后回退上一版备份。 */
 export function resolveSecret(dbPath: string, ref: string | null | undefined): string {
   if (!ref) return ''
   const fromEnv = process.env[ref]
   if (fromEnv) return fromEnv
-  return readFile(secretsPath(dbPath))[ref] ?? ''
+  const file = secretsPath(dbPath)
+  const current = readFile(file)[ref]
+  if (current) return current
+  return readFile(backupPath(file))[ref] ?? ''
 }
 
 /** 写入密钥并返回引用名；ref 为空时自动生成。 */
@@ -47,12 +71,7 @@ export function storeSecret(dbPath: string, ref: string | null | undefined, valu
   mkdirSync(dirname(file), { recursive: true })
   const current = readFile(file)
   current[name] = value
-  writeFileSync(file, `${JSON.stringify(current, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
-  try {
-    chmodSync(file, 0o600)
-  } catch {
-    /* Windows 上 chmod 只是尽力而为 */
-  }
+  writeSecretFile(file, current)
   return name
 }
 
@@ -69,5 +88,18 @@ export function deleteSecret(dbPath: string, ref: string | null | undefined): vo
   const current = readFile(file)
   if (!(name in current)) return
   delete current[name]
-  writeFileSync(file, `${JSON.stringify(current, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
+  writeSecretFile(file, current)
+  // 显式删除后不能让 resolveSecret 又从上一版备份里把它复活。
+  const backup = backupPath(file)
+  if (existsSync(backup)) {
+    const previous = readFile(backup)
+    if (name in previous) {
+      delete previous[name]
+      try {
+        writeFileSync(backup, `${JSON.stringify(previous, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
+      } catch {
+        /* 备份清理失败不影响主文件 */
+      }
+    }
+  }
 }

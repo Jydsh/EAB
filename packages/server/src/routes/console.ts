@@ -2214,7 +2214,9 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
       .prepare('SELECT code, name FROM roles WHERE company_id = ? AND deleted_at IS NULL ORDER BY code')
       .all(companyId) as unknown as Array<{ code: string; name: string }>
 
-    const channels = new Map(listPluginChannels(companyId).map((channel) => [channel.id, channel]))
+    const pluginChannels = listPluginChannels(companyId)
+    const channels = new Map(pluginChannels.map((channel) => [channel.id, channel]))
+    const channelPluginIds = new Set(pluginChannels.map((channel) => channel.pluginId))
     const pluginRoleOverrides = loadPluginModelRoleMap(deps.db, companyId)
     const pluginModels = applyPluginModelRoles(
       filterHealthyModels(companyId, listPluginModels(companyId)),
@@ -2249,9 +2251,26 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
       }
     })
 
+    // 插件来源状态：仍活跃的模型通道 + 已停用/清单不完整的 DSH 插件。
+    // 停用后模型会被宿主清掉，但这里仍要把“插件已停用”告诉控制台，而不是让模型静默消失。
+    const pluginStates = loadPlugins(deps.db, companyId)
+      .filter((plugin) => plugin.format === 'dsh' && plugin.companyInstall && plugin.companyInstall.removedAt === null)
+      .filter((plugin) => channelPluginIds.has(plugin.id) || !plugin.enabled || !plugin.valid)
+      .map((plugin) => ({
+        id: plugin.id,
+        name: plugin.name,
+        version: plugin.version,
+        enabled: plugin.enabled && plugin.valid,
+        valid: plugin.valid,
+        error: plugin.error,
+        modelCount: pluginModels.filter((model) => model.pluginId === plugin.id).length,
+        channelCount: pluginChannels.filter((channel) => channel.pluginId === plugin.id).length,
+      }))
+
     return ok({
       companyId,
       roles,
+      pluginStates,
       models: [
         ...rows.map((row) => ({
           id: row.id,
@@ -2975,6 +2994,11 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
               ? 'local'
               : 'empty',
     }
+    // 钉钉是主动连网关的长连接，“已绑定”不等于机器人能收消息；
+    // 把 Stream 的 connected / registered / error 一并交给控制台，避免静默失联。
+    const dingTalkStream = await import('../dingtalk-bot.js')
+      .then((bot) => bot.dingTalkStreamStatus())
+      .catch(() => null)
     return ok({
       organization,
       channels: ['feishu', 'dingtalk', 'wecom'].map((provider) => {
@@ -2995,6 +3019,7 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
           bound: Boolean(row?.tenant_id),
           callbackPath: `/api/channel/webhooks/${provider}`,
           callbackToken: row?.callback_token ?? '',
+          stream: provider === 'dingtalk' ? dingTalkStream : null,
         }
       }),
     })

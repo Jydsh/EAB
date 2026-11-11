@@ -69,6 +69,15 @@ export function isModelHealthy(companyId: string, modelId: string): boolean {
   return companyHealth(companyId).get(modelId)?.healthy === true
 }
 
+/**
+ * 插件把模型摘掉或模型定义变化时，清掉旧健康结论。
+ * 否则同一个 plugin: id 回来时会被当成“已探测可用”，绕过真实回复检验。
+ */
+export function forgetModelHealth(companyId: string, modelIds: readonly string[]): void {
+  const rows = companyHealth(companyId)
+  for (const modelId of modelIds) rows.delete(String(modelId))
+}
+
 export function isModelHealthKnown(companyId: string, modelId: string): boolean {
   return companyHealth(companyId).has(modelId)
 }

@@ -437,6 +437,10 @@ export function dshImCredentials(): {
       const secret = typeof value === 'string' ? value : String(value ?? '')
       if (!secret) throw new Error('dsh-im credential value is empty')
       storeSecret(currentOptions.dbPath, name, secret, 'DSH_DINGTALK_BOT_SECRET')
+      // 落盘后立刻回读：写失败或被并发覆盖时直接报错，避免渠道引用指向空密钥。
+      if (resolveDshImSecret(name) !== secret) {
+        throw new Error(`dsh-im credential 写入后无法回读：${name}`)
+      }
       // configStore.save 紧跟在这之后；等它落盘再回写 EAB 渠道配置并同步通讯录。
       scheduleDingTalkBindingSync()
     },
