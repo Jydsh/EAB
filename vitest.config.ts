@@ -10,6 +10,8 @@ export default defineConfig({
       '@eab/authz': resolvePkg('./packages/authz/src/index.ts'),
       '@eab/workspace': resolvePkg('./packages/workspace/src/index.ts'),
       '@eab/storage': resolvePkg('./packages/storage/src/index.ts'),
+      '@eab/channel': resolvePkg('./packages/channel/src/index.ts'),
+      '@eab/server': resolvePkg('./packages/server/src/index.ts'),
     },
   },
   test: {

@@ -50,18 +50,6 @@
         <div class="side-sessions" id="ws-list"></div>
       </div>
 
-      <div class="side-section" id="side-local" hidden>
-        <div class="side-section-title side-section-title-row">
-          <span>本地空间</span>
-          <div class="side-title-tools">
-            <button class="side-mini-btn" id="local-new-file" type="button" hidden>新建</button>
-            <button class="side-mini-btn" id="local-config" type="button">管理</button>
-          </div>
-        </div>
-        <div class="local-space-summary" id="local-space-summary"></div>
-        <div class="side-sessions local-tree" id="local-tree"></div>
-      </div>
-
       <div class="side-section" id="side-models-section" hidden>
         <div class="side-section-title">可用模型</div>
         <div class="side-models" id="side-models"></div>
@@ -131,8 +119,8 @@
             <div>
               <span class="workspace-eyebrow">PERSONAL PLUGIN WORKSPACE</span>
               <h2>我的工作台</h2>
-              <p class="muted">只显示你自己安装的插件。启停、卸载、查看详情和打开插件页面都只影响你本人，不会碰公司和别人的安装。</p>
             </div>
+            <span class="workspace-scope-badge hint-badge" data-tip="只显示你自己安装的插件。启停、卸载、查看详情和打开插件页面都只影响你本人，不会碰公司和别人的安装。" tabindex="0" aria-label="个人工作台插件范围说明">仅本人可见</span>
           </div>
           <div class="workspace-shell">
             <aside class="ws-plugin-rail" id="my-plugin-rail" aria-label="个人插件列表">
@@ -158,7 +146,7 @@
             <textarea
               id="input"
               rows="1"
-              placeholder="输入消息，Enter 发送，Shift + Enter 换行"
+              placeholder="输入消息，Enter 发送，Shift + Enter 换行；/model 切换模型"
             ></textarea>
             <div class="composer-bar">
               <div class="composer-left">
@@ -167,6 +155,9 @@
                 </button>
                 <button class="icon-btn" id="pick-file" type="button" title="上传文件" aria-label="上传文件">
                   <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-5-5Z" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M14 3v5h5" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>
+                </button>
+                <button class="icon-btn stop-reply" id="stop-reply" type="button" title="停止当前回复" aria-label="停止当前回复" hidden>
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="8" height="8" rx="1.4" fill="currentColor"/></svg>
                 </button>
                 <button class="space-chip" id="space-chip" type="button" aria-haspopup="listbox" aria-expanded="false">
                   <span class="space-dot"></span>
@@ -186,7 +177,7 @@
               </button>
             </div>
           </div>
-          <div class="composer-foot muted" id="composer-foot">回答由所选模型生成；支持 Ctrl+V 粘贴截图/图片，附件随消息提交，不会公网分享</div>
+          <div class="composer-foot muted" id="composer-foot">回答由所选模型生成；输入 /model 可按对话切换模型；支持 Ctrl+V 粘贴截图/图片，附件随消息提交，不会公网分享</div>
         </footer>
       </main>
 
@@ -220,6 +211,21 @@
           </div>
 
           <div class="settings-group">
+            <div class="settings-group-title">对话</div>
+            <div class="settings-row is-static" id="settings-send-mode">
+              <span class="settings-row-icon">⇄</span>
+              <span class="settings-row-text">
+                <strong>回复中再发消息</strong>
+                <em id="settings-send-mode-hint">排队：当前回复结束后，再按顺序发送</em>
+              </span>
+              <div class="settings-segment" id="settings-send-segment" role="radiogroup" aria-label="回复中再发消息">
+                <button type="button" data-send-mode="queue" role="radio" aria-checked="true">排队</button>
+                <button type="button" data-send-mode="interrupt" role="radio" aria-checked="false">打断</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-group">
             <div class="settings-group-title">账号</div>
             <button class="settings-row" id="settings-password" type="button">
               <span class="settings-row-icon">✎</span>
@@ -248,7 +254,6 @@
     <input type="file" id="file-any" multiple hidden />
     <div class="session-menu" id="session-menu" hidden></div>
     <div class="session-menu" id="file-menu" hidden></div>
-    <div class="session-menu" id="local-menu" hidden></div>
 
     <!-- 未登录：只显示登录，不展示任何组织/成员信息 -->
     <div class="login-gate" id="login-gate" hidden>
@@ -337,6 +342,6 @@
         if (gate) gate.hidden = false
       }
     </script>
-    <script src="/chat.js"></script>
+    <script src="/chat.js?v=20261111b"></script>
   </body>
 </html>

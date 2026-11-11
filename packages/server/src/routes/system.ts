@@ -28,6 +28,10 @@ function isAllowedAvatarUrl(value: string): boolean {
   }
 }
 
+function chatSendModeOf(value: unknown): 'queue' | 'interrupt' {
+  return value === 'interrupt' ? 'interrupt' : 'queue'
+}
+
 export function registerSystemRoutes(app: FastifyInstance, deps: ServerDeps): void {
   /**
    * 公开健康检查：只给"活着没、哪个版本"。
@@ -230,6 +234,9 @@ export function registerSystemRoutes(app: FastifyInstance, deps: ServerDeps): vo
     const passwordRow = deps.db
       .prepare('SELECT password_set_at FROM users WHERE id = ?')
       .get(person.id) as { password_set_at?: number | null } | undefined
+    const sendModeRow = deps.db
+      .prepare('SELECT chat_send_mode FROM users WHERE id = ?')
+      .get(person.id) as { chat_send_mode?: string | null } | undefined
     return ok({
       person,
       company: { id: person.companyId, name: person.companyName },
@@ -239,7 +246,21 @@ export function registerSystemRoutes(app: FastifyInstance, deps: ServerDeps): vo
       channelType: subject.channelType,
       capabilities: capabilityList(subject),
       passwordConfigured: passwordRow?.password_set_at != null,
+      chatSendMode: chatSendModeOf(sendModeRow?.chat_send_mode),
     })
+  })
+
+  /** 个人对话偏好：回复中再发消息时排队，或直接打断当前回复。 */
+  app.patch<{ Body: { chatSendMode?: unknown } }>('/api/me/chat-send-mode', async (req) => {
+    const mode = req.body?.chatSendMode
+    if (mode !== 'queue' && mode !== 'interrupt') {
+      throw new EabError(EC.VALIDATION, 'chatSendMode 只能是 queue 或 interrupt')
+    }
+    const { person } = resolveActor(deps.db, deps.config, req, deps.companyId)
+    deps.db
+      .prepare('UPDATE users SET chat_send_mode = ?, updated_at = ? WHERE id = ? AND company_id = ?')
+      .run(mode, Date.now(), person.id, person.companyId)
+    return ok({ chatSendMode: mode })
   })
 
   /**

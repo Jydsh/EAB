@@ -4,7 +4,7 @@ EAB 是一套面向**单公司本地部署**的企业智能体基座：一个进
 
 - 员工入口：`http://127.0.0.1:8787/chat`
 - 管理控制台：`http://127.0.0.1:8788/admin`
-- 当前版本：`2026.11.10`
+- 当前版本：`2026.11.11`
 
 > 单公司边界：一个实例只服务一家公司。钉钉、飞书、企业微信、模型供应商、知识库、插件都在控制台里配置。
 
@@ -38,6 +38,8 @@ node scripts/eab.mjs server
 ```
 
 浏览器打开 `http://127.0.0.1:8788/admin` 用该账号登录；员工打开 `http://127.0.0.1:8787/chat` 用工号/钉钉登录。
+
+> **新部署实例是空数据**：代码仓库只包含程序本身，不包含插件、知识库文档、渠道绑定、模型供应商和密钥、组织成员等运行数据。换一台机器或新用户部署后，需要登录控制台自行安装插件、配置模型与渠道、创建/导入知识库并同步组织；本机的 `.eab-dev` 数据不会随 GitHub 代码一起过去。
 
 > 不想先敲 `node scripts/eab.mjs` 也可以直接执行 `pnpm dev`，两种方式等价；`eab server` 是推荐的统一入口。
 
@@ -179,8 +181,8 @@ EAB_HOST=0.0.0.0 EAB_PORT=8787 EAB_ADMIN_PORT=8788 EAB_CONSOLE_ALLOW_REMOTE=1 ea
 
 EAB 的版本来自 GitHub Release：
 
-- Release tag：`v2026.11.10`
-- Release 资产：源码 zip（`EAB-2026.11.10.zip`）。桌面安装包、`latest.yml`、`.blockmap` 已停止发布。
+- Release tag：`v2026.11.11`
+- Release 资产：源码 zip（`EAB-2026.11.11.zip`）。桌面安装包、`latest.yml`、`.blockmap` 已停止发布。
 
 ### 两种更新方式
 
@@ -240,7 +242,7 @@ pnpm dev                  # 等价于 eab server
 
 1. 改根 `package.json` 的 `version`；
 2. 更新 `README.md` 版本与源码包名；
-3. 提交并打 tag：`git tag v2026.11.10 && git push origin v2026.11.10`；
+3. 提交并打 tag：`git tag v2026.11.11 && git push origin v2026.11.11`；
 4. GitHub Actions 只构建源码 zip 并创建/更新 Release，不再生成桌面安装包；
 5. 控制台/CLI 的版本检查读取该 Release。
 

@@ -129,24 +129,6 @@ export interface PluginRecord {
   readonly userInstall?: PluginUserInstallRecord | null
 }
 
-export interface PluginCatalogEntry {
-  readonly id: string
-  readonly name: string
-  readonly version: string
-  readonly description: string
-  readonly author: string
-  readonly homepage: string
-  readonly tags: readonly string[]
-  /** 安装来源：服务器本地目录（绝对路径或相对仓库根） */
-  readonly sourcePath: string | null
-}
-
-export interface PluginCatalog {
-  readonly path: string
-  readonly entries: readonly PluginCatalogEntry[]
-  readonly error: string | null
-}
-
 export interface PluginEventRecord {
   readonly id: number
   readonly pluginId: string
@@ -170,8 +152,8 @@ function trashDir(): string {
 const KNOWN_SCOPES = new Set<string>(Object.values(SC))
 const ID_PATTERN = /^[a-z][a-z0-9-]{1,40}$/
 
-/** 安装来源：本地目录 / npm 包（可换镜像）/ GitHub 仓库 */
-export type PluginInstallSource = 'local-dir' | 'npm' | 'github'
+/** 安装来源：浏览器上传的文件夹 / 历史本地目录 / npm 包（可换镜像）/ GitHub 仓库 */
+export type PluginInstallSource = 'browser-dir' | 'local-dir' | 'npm' | 'github'
 
 export interface PluginRegistryPreset {
   readonly id: string
@@ -188,9 +170,6 @@ export const PLUGIN_REGISTRIES: readonly PluginRegistryPreset[] = [
   { id: 'huawei', label: '华为云镜像', url: 'https://repo.huaweicloud.com/repository/npm/', hint: '华为云镜像站' },
 ]
 
-const MAX_ARCHIVE_BYTES = 30 * 1024 * 1024
-const MAX_EXTRACT_FILES = 5000
-const MAX_EXTRACT_BYTES = 60 * 1024 * 1024
 const NPM_NAME_PATTERN = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/i
 const NPM_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._+~^*<>=|-]{0,63}$/
 const GITHUB_REPO_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/
@@ -967,23 +946,6 @@ export function uninstallUserPlugin(
 /* ---------------- 生命周期：安装 / 更新 / 卸载 / 事件 ---------------- */
 
 const COPY_SKIP = new Set(['node_modules', '.git', '.tmp', '.trash', '.staging'])
-const MAX_FILES = 300
-const MAX_BYTES = 20 * 1024 * 1024
-
-function measure(dir: string, acc = { files: 0, bytes: 0 }): { files: number; bytes: number } {
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    if (COPY_SKIP.has(entry.name)) continue
-    const full = join(dir, entry.name)
-    if (entry.isDirectory()) {
-      measure(full, acc)
-    } else if (entry.isFile()) {
-      acc.files += 1
-      acc.bytes += statSync(full).size
-    }
-    if (acc.files > MAX_FILES || acc.bytes > MAX_BYTES) break
-  }
-  return acc
-}
 
 /** 把 package.json 的 files 白名单展开成相对文件列表（目录递归，跳过 node_modules 等） */
 function collectSelectedFiles(dir: string, entries: readonly string[]): string[] {
@@ -1004,18 +966,6 @@ function collectSelectedFiles(dir: string, entries: readonly string[]): string[]
   }
   for (const entry of entries) visit(entry)
   return out
-}
-
-function measureFiles(dir: string, files: readonly string[]): { files: number; bytes: number } {
-  const acc = { files: 0, bytes: 0 }
-  for (const rel of files) {
-    const full = join(dir, rel)
-    if (!existsSync(full) || !statSync(full).isFile()) continue
-    acc.files += 1
-    acc.bytes += statSync(full).size
-    if (acc.files > MAX_FILES || acc.bytes > MAX_BYTES) break
-  }
-  return acc
 }
 
 function copySelectedFiles(source: string, target: string, files: readonly string[]): void {
@@ -1169,9 +1119,9 @@ export interface InstallPluginOptions {
   readonly companyId: string
   readonly overwrite?: boolean
   readonly installedBy: string
-  /** 记录用的来源标签：local-dir / npm / github */
+  /** 记录用的来源标签：browser-dir / npm / github / catalog */
   readonly source?: string
-  /** 来源引用：本地路径、npm 包名+镜像、GitHub 仓库+ref */
+  /** 来源引用：浏览器上传的文件夹名、npm 包名+镜像、GitHub 仓库+ref */
   readonly sourceRef?: string
   /**
    * 安装归属：company = 公司级（默认，管理员装，全员可见）
@@ -1240,17 +1190,6 @@ function preparePackage(source: string, logicalId: string): PluginRecord {
 
   const { record } = parseManifest(source, logicalId)
   if (!record.valid) throw new EabError(EC.VALIDATION, `插件清单不合法：${record.error ?? '未知原因'}`)
-
-  const whitelist = record.format === 'dsh' ? record.dsh?.files ?? [] : []
-  const measured = whitelist.length
-    ? measureFiles(source, ['package.json', ...collectSelectedFiles(source, whitelist)])
-    : measure(source)
-  if (measured.files > MAX_FILES || measured.bytes > MAX_BYTES) {
-    throw new EabError(
-      EC.VALIDATION,
-      `插件包太大：${measured.files} 个文件 / ${(measured.bytes / 1024 / 1024).toFixed(1)}MB，上限 ${MAX_FILES} 个 / 20MB`,
-    )
-  }
   return record
 }
 
@@ -1582,12 +1521,7 @@ async function downloadArchive(url: string, dest: string, timeoutMs = 30_000): P
   if (finalUrl.protocol === 'http:' && !isLocalHost(finalUrl.hostname)) {
     throw new EabError(EC.VALIDATION, '下载被重定向到非 https 地址，已拒绝')
   }
-  const declared = Number(response.headers.get('content-length') || 0)
-  if (declared > MAX_ARCHIVE_BYTES) {
-    throw new EabError(EC.VALIDATION, `包太大：${(declared / 1024 / 1024).toFixed(1)}MB，上限 30MB`)
-  }
   const buffer = Buffer.from(await response.arrayBuffer())
-  if (buffer.length > MAX_ARCHIVE_BYTES) throw new EabError(EC.VALIDATION, '包太大（超过 30MB）')
   writeFileSync(dest, buffer)
 }
 
@@ -1614,7 +1548,6 @@ function assertArchiveEntries(archive: string): void {
     .map((line) => line.trim())
     .filter(Boolean)
   if (!entries.length) throw new EabError(EC.VALIDATION, '压缩包是空的')
-  if (entries.length > MAX_EXTRACT_FILES) throw new EabError(EC.VALIDATION, '压缩包文件数过多')
   for (const entry of entries) {
     const normalized = entry.replace(/\\/g, '/')
     if (entry.includes('\\')) throw new EabError(EC.VALIDATION, `压缩包里有反斜杠路径，已拒绝：${entry}`)
@@ -1627,23 +1560,14 @@ function assertArchiveEntries(archive: string): void {
   }
 }
 
-/** 解压后拒绝符号链接，并给整个临时树设体积上限 */
+/** 解压后拒绝符号链接；文件数和体积不做限制 */
 function assertExtractedTree(dir: string): void {
-  let files = 0
-  let bytes = 0
   const visit = (current: string): void => {
     for (const entry of readdirSync(current, { withFileTypes: true })) {
       const full = join(current, entry.name)
       const stat = lstatSync(full)
       if (stat.isSymbolicLink()) throw new EabError(EC.VALIDATION, `压缩包里有符号链接，已拒绝：${entry.name}`)
       if (stat.isDirectory()) visit(full)
-      else if (stat.isFile()) {
-        files += 1
-        bytes += stat.size
-      }
-      if (files > MAX_EXTRACT_FILES || bytes > MAX_EXTRACT_BYTES) {
-        throw new EabError(EC.VALIDATION, '解压后体积过大，已拒绝')
-      }
     }
   }
   visit(dir)
@@ -1962,39 +1886,6 @@ export function listPluginEvents(db: Db, limit = 20, companyId?: string): Plugin
     detail: row.detail,
     at: row.at,
   }))
-}
-
-/** 插件源：`plugins/catalog.json` 是部署侧维护的本地"货架"，控制台只读展示、按 sourcePath 安装 */
-export function readPluginCatalog(): PluginCatalog {
-  const path = join(pluginRootPath, 'catalog.json')
-  if (!existsSync(path)) return { path, entries: [], error: null }
-  try {
-    const raw = JSON.parse(readFileSync(path, 'utf8')) as unknown
-    const list = Array.isArray(raw)
-      ? raw
-      : Array.isArray((raw as { plugins?: unknown }).plugins)
-        ? ((raw as { plugins: unknown[] }).plugins)
-        : []
-    const entries: PluginCatalogEntry[] = []
-    for (const item of list) {
-      const entry = item as Record<string, unknown>
-      const id = asString(entry.id)
-      if (!ID_PATTERN.test(id)) continue
-      entries.push({
-        id,
-        name: asString(entry.name) || id,
-        version: asString(entry.version) || '—',
-        description: asString(entry.description),
-        author: asString(entry.author),
-        homepage: asString(entry.homepage),
-        tags: Array.isArray(entry.tags) ? entry.tags.map(asString).filter(Boolean).slice(0, 8) : [],
-        sourcePath: asString(entry.sourcePath) || null,
-      })
-    }
-    return { path, entries, error: null }
-  } catch (err) {
-    return { path, entries: [], error: `catalog.json 不是合法 JSON：${(err as Error).message}` }
-  }
 }
 
 export function pluginRoot(): string {

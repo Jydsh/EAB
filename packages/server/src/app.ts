@@ -22,7 +22,6 @@ import { registerChannelRoutes } from './routes/channel.js'
 import { registerChatRoutes } from './routes/chat.js'
 import { registerConsoleRoutes } from './routes/console.js'
 import { registerKbRoutes } from './routes/kb.js'
-import { registerLocalSpaceRoutes } from './routes/local-spaces.js'
 import { registerMemoryRoutes } from './routes/memory.js'
 import { registerOrgRoutes } from './routes/org.js'
 import { registerOrgSyncRoutes } from './routes/org-sync.js'
@@ -65,7 +64,7 @@ function isPath(path: string, prefixes: string[]): boolean {
 function installSurfaceGuard(app: FastifyInstance, surface: AppSurface): void {
   if (surface === 'all') return
   const consoleOnly = ['/admin', '/admin.html', '/app.js', '/api/console']
-  const chatOnly = ['/chat', '/chat.html', '/chat.js', '/chat.css', '/api/chat', '/api/memories', '/api/workspace', '/api/local-spaces', '/api/schedules', '/api/auth']
+  const chatOnly = ['/chat', '/chat.html', '/chat.js', '/chat.css', '/api/chat', '/api/memories', '/api/workspace', '/api/schedules', '/api/auth']
   app.addHook('onRequest', async (req, reply) => {
     const path = (req.raw.url ?? '').split('?')[0] ?? ''
     if (surface === 'chat' && isPath(path, consoleOnly)) {
@@ -245,7 +244,6 @@ export function buildApp(deps: ServerDeps, surface: AppSurface = 'all'): Fastify
   registerUpdateRoutes(app, deps)
   registerScheduleRoutes(app, deps)
   registerWorkspaceRoutes(app, deps)
-  registerLocalSpaceRoutes(app, deps)
   registerToolRoutes(app, deps)
 
   app.setNotFoundHandler((req, reply) => {

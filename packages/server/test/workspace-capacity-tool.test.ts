@@ -66,14 +66,6 @@ describe('agent 个人云空间容量工具', () => {
       expect(specs.some((spec) => spec.function.name === 'workspace_send_dingtalk')).toBe(true)
       expect(specs.some((spec) => spec.function.name === 'workspace_rename')).toBe(true)
       expect(specs.some((spec) => spec.function.name === 'workspace_delete')).toBe(true)
-      const localSpecs = toolSpecsForActor(deps.db, actor as unknown as Parameters<typeof executeTool>[1], {
-        kind: 'local',
-        spaceId: 'lsp_test',
-      })
-      expect(localSpecs.some((spec) => spec.function.name === 'workspace_capacity')).toBe(false)
-      expect(localSpecs.some((spec) => spec.function.name === 'workspace_send_dingtalk')).toBe(false)
-      expect(localSpecs.some((spec) => spec.function.name === 'workspace_rename')).toBe(false)
-      expect(localSpecs.some((spec) => spec.function.name === 'workspace_delete')).toBe(false)
       const noneSpecs = toolSpecsForActor(deps.db, actor as unknown as Parameters<typeof executeTool>[1], {
         kind: 'none',
       })

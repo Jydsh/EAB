@@ -28,7 +28,7 @@ import { hashPassword } from '../password.js'
 import { revokeAllSessions } from '../employee-session.js'
 import { storeSecret } from '../secrets.js'
 import { companyAssistantView, resolveAssistantDataDir, saveCompanyAssistant } from '../company-assistant.js'
-import { refreshDingTalkStream, sendDingTalkWelcome } from '../dingtalk-bot.js'
+import { refreshDingTalkStream } from '../dingtalk-bot.js'
 
 function requireConsole(req: FastifyRequest, deps: ServerDeps): void {
   if (!isConsoleRequest(req, deps.config)) {
@@ -60,6 +60,18 @@ function audit(
     ip: req.ip ?? null,
     channel: 'console',
   })
+}
+
+/** 欢迎语里的网页工作台地址：用当前控制台请求的 host，把端口换成员工端端口。 */
+function publicChatUrl(req: FastifyRequest, deps: ServerDeps): string {
+  const forwardedHost = String(req.headers['x-forwarded-host'] ?? '').split(',')[0]?.trim()
+  const rawHost = forwardedHost || String(req.headers.host ?? '').trim()
+  const hostname = rawHost.startsWith('[')
+    ? rawHost.slice(0, rawHost.indexOf(']') + 1)
+    : rawHost.split(':')[0]
+  const proto = String(req.headers['x-forwarded-proto'] ?? '').split(',')[0]?.trim() || 'http'
+  const host = hostname && hostname !== '0.0.0.0' ? hostname : '127.0.0.1'
+  return `${proto === 'https' ? 'https' : 'http'}://${host}:${deps.config.port}/chat`
 }
 
 /** 备份目录：优先用控制台配置的独立路径，没配则跟随数据库同级 backups。 */
@@ -179,7 +191,7 @@ async function readDingTalkOrg(appId: string, corpId: string, appSecret: string)
 }
 
 /** 建公司 + 根部门 + 内置角色副本 + 渠道绑定，再落通讯录。 */
-async function createDingTalkCompany(
+export async function createDingTalkCompany(
   deps: ServerDeps,
   req: FastifyRequest,
   input: {
@@ -192,6 +204,13 @@ async function createDingTalkCompany(
     slug?: string
     actorLabel: string
     action: string
+    /** 普通企业内部应用机器人：手工绑定与扫码共用这些字段 */
+    robotCode?: string | null
+    agentId?: string | null
+    robotMode?: string | null
+    unifiedAppId?: string | null
+    botBoundAt?: number | null
+    botBoundBy?: string | null
     extra?: Record<string, unknown>
   },
 ): Promise<{
@@ -237,7 +256,7 @@ async function createDingTalkCompany(
           ORDER BY path LIMIT 1`,
       )
       .get(existingCompany.id) as { id: string; path: string; depth: number } | undefined
-    if (!root) throw new EabError(EC.CONFLICT, '公司没有根部门，无法绑定组织', { hint: '先删除公司回到空库，再扫码重新建。' })
+    if (!root) throw new EabError(EC.CONFLICT, '公司没有根部门，无法绑定组织', { hint: '先删除公司回到空库，再重新绑定机器人。' })
 
     const now = Date.now()
     const secretRef = storeSecret(deps.config.dbPath, null, input.appSecret, 'EAB_DINGTALK_APP_SECRET')
@@ -255,7 +274,14 @@ async function createDingTalkCompany(
         `UPDATE channel_configs
             SET app_id = ?, corp_id = ?, secret_ref = ?, tenant_id = ?, tenant_name = ?,
                 status = 'bound', enabled = 1, bound_at = COALESCE(bound_at, ?),
-                bound_by_user_id = ?, updated_at = ?
+                bound_by_user_id = ?,
+                robot_code = ?,
+                agent_id = ?,
+                robot_mode = ?,
+                unified_app_id = ?,
+                bot_bound_at = ?,
+                bot_bound_by_user_id = ?,
+                updated_at = ?
           WHERE company_id = ? AND provider = 'dingtalk'`,
       )
       .run(
@@ -266,6 +292,12 @@ async function createDingTalkCompany(
         input.tenant.name,
         now,
         input.actorLabel,
+        input.robotCode ?? null,
+        input.agentId ?? null,
+        input.robotMode ?? null,
+        input.unifiedAppId ?? null,
+        input.botBoundAt ?? null,
+        input.botBoundBy ?? null,
         now,
         existingCompany.id,
       )
@@ -274,8 +306,11 @@ async function createDingTalkCompany(
         .prepare(
           `INSERT INTO channel_configs
              (id, company_id, provider, enabled, status, sync_mode, app_id, corp_id, secret_ref,
-              tenant_id, tenant_name, bound_at, bound_by_user_id, created_at, updated_at)
-           VALUES (?, ?, 'dingtalk', 1, 'bound', 'daily', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              tenant_id, tenant_name, bound_at, bound_by_user_id,
+              robot_code, agent_id, robot_mode, unified_app_id, bot_bound_at, bot_bound_by_user_id,
+              created_at, updated_at)
+           VALUES (?, ?, 'dingtalk', 1, 'bound', 'daily', ?, ?, ?, ?, ?, ?, ?,
+                   ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           `ch_${ulid()}`,
@@ -287,6 +322,12 @@ async function createDingTalkCompany(
           input.tenant.name,
           now,
           input.actorLabel,
+          input.robotCode ?? null,
+          input.agentId ?? null,
+          input.robotMode ?? null,
+          input.unifiedAppId ?? null,
+          input.botBoundAt ?? null,
+          input.botBoundBy ?? null,
           now,
           now,
         )
@@ -381,8 +422,11 @@ async function createDingTalkCompany(
       .prepare(
         `INSERT INTO channel_configs
            (id, company_id, provider, enabled, status, sync_mode, app_id, corp_id, secret_ref,
-            tenant_id, tenant_name, bound_at, bound_by_user_id, created_at, updated_at)
-         VALUES (?, ?, 'dingtalk', 1, 'bound', 'daily', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            tenant_id, tenant_name, bound_at, bound_by_user_id,
+            robot_code, agent_id, robot_mode, unified_app_id, bot_bound_at, bot_bound_by_user_id,
+            created_at, updated_at)
+         VALUES (?, ?, 'dingtalk', 1, 'bound', 'daily', ?, ?, ?, ?, ?, ?, ?,
+                 ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         channelId,
@@ -394,6 +438,12 @@ async function createDingTalkCompany(
         input.tenant.name,
         now,
         input.actorLabel,
+        input.robotCode ?? null,
+        input.agentId ?? null,
+        input.robotMode ?? null,
+        input.unifiedAppId ?? null,
+        input.botBoundAt ?? null,
+        input.botBoundBy ?? null,
         now,
         now,
       )
@@ -956,7 +1006,7 @@ export function registerAdminRoutes(app: FastifyInstance, deps: ServerDeps): voi
       .get() as { id: string; name: string } | undefined
     if (existing) {
       throw new EabError(EC.CONFLICT, '当前是单公司本地部署，只允许一家公司', {
-        hint: `本实例已经有公司「${existing.name}」；需要换组织请先删除它，或走「钉钉扫码绑定组织」。`,
+        hint: `本实例已经有公司「${existing.name}」；需要换组织请先删除它，或到「连接与平台 → 渠道」重新绑定钉钉机器人。`,
       })
     }
 
@@ -1090,6 +1140,8 @@ export function registerAdminRoutes(app: FastifyInstance, deps: ServerDeps): voi
       appId?: string
       appSecret?: string
       corpId?: string
+      robotCode?: string
+      agentId?: string
       companyName?: string
       slug?: string
     }
@@ -1098,9 +1150,12 @@ export function registerAdminRoutes(app: FastifyInstance, deps: ServerDeps): voi
     const appId = String(req.body?.appId ?? '').trim().slice(0, 120)
     const corpId = String(req.body?.corpId ?? '').trim().slice(0, 120)
     const appSecret = String(req.body?.appSecret ?? '').trim()
+    const robotCode = String(req.body?.robotCode ?? '').trim().slice(0, 120) || appId
+    const agentId = String(req.body?.agentId ?? '').trim().slice(0, 120)
     if (!appId) throw new EabError(EC.VALIDATION, '缺少钉钉 AppKey')
     if (!corpId) throw new EabError(EC.VALIDATION, '缺少钉钉企业 CorpId')
     if (!appSecret) throw new EabError(EC.VALIDATION, '缺少钉钉 AppSecret')
+    if (!robotCode) throw new EabError(EC.VALIDATION, '缺少机器人 RobotCode')
 
     const { tenant, remote } = await readDingTalkOrg(appId, corpId, appSecret)
     if (remote.depts.length === 0 && remote.users.length === 0) {
@@ -1108,19 +1163,34 @@ export function registerAdminRoutes(app: FastifyInstance, deps: ServerDeps): voi
         hint: '确认应用的通讯录权限范围已包含要同步的部门与成员。',
       })
     }
-    return ok(
-      await createDingTalkCompany(deps, req, {
-        appId,
-        appSecret,
-        corpId,
-        tenant,
-        remote,
-        companyName: req.body?.companyName,
-        slug: req.body?.slug,
-        actorLabel: 'console:onboard-dingtalk',
-        action: 'platform.company.onboard_dingtalk',
-      }),
+    const created = await createDingTalkCompany(deps, req, {
+      appId,
+      appSecret,
+      corpId,
+      tenant,
+      remote,
+      companyName: req.body?.companyName,
+      slug: req.body?.slug,
+      actorLabel: 'console:onboard-dingtalk',
+      action: 'platform.company.onboard_dingtalk',
+      robotCode,
+      agentId: agentId || null,
+      robotMode: 'STREAM',
+      botBoundAt: Date.now(),
+      botBoundBy: 'console:dingtalk-manual',
+      extra: { robotCode, agentId: agentId || null, binding: 'manual-robot' },
+    })
+
+    // 手工绑定的普通机器人也要立刻接 Stream；失败不阻塞绑定结果。
+    void refreshDingTalkStream(deps).catch((error) =>
+      console.warn('[eab] 手工绑定机器人后启动钉钉 Stream 失败：', (error as Error).message),
     )
+
+    const chatUrl = publicChatUrl(req, deps)
+    return ok({
+      ...created,
+      chatUrl,
+    })
   })
 
   /**
@@ -1306,12 +1376,14 @@ export function registerAdminRoutes(app: FastifyInstance, deps: ServerDeps): voi
         })
       }
 
+      const robotCode = polled.robotCode || appId
+      // 扫码只当普通机器人：不登记 AI 助理的 agentId / unifiedAppId，避免平台默认欢迎语跟着走。
       const robot = {
         clientId: appId,
-        agentId: polled.agentId ?? null,
-        robotCode: polled.robotCode ?? null,
-        mode: polled.mode ?? 'STREAM',
-        unifiedAppId: polled.unifiedAppId ?? null,
+        agentId: null,
+        robotCode,
+        mode: 'STREAM',
+        unifiedAppId: null,
         scannerUserId: polled.userId ?? null,
       }
 
@@ -1329,8 +1401,8 @@ export function registerAdminRoutes(app: FastifyInstance, deps: ServerDeps): voi
         deps.db
           .prepare(
             `UPDATE channel_configs
-                SET app_id = ?, corp_id = ?, secret_ref = ?, tenant_name = ?, agent_id = ?, robot_code = ?,
-                    robot_mode = ?, unified_app_id = ?, bot_bound_at = ?, bot_bound_by_user_id = ?,
+                SET app_id = ?, corp_id = ?, secret_ref = ?, tenant_name = ?, agent_id = NULL, robot_code = ?,
+                    robot_mode = 'STREAM', unified_app_id = NULL, bot_bound_at = ?, bot_bound_by_user_id = ?,
                     status = 'bound', enabled = 1, updated_at = ?
               WHERE company_id = ? AND provider = 'dingtalk'`,
           )
@@ -1339,10 +1411,7 @@ export function registerAdminRoutes(app: FastifyInstance, deps: ServerDeps): voi
             corpId,
             secretRef,
             tenant.name,
-            polled.agentId ?? null,
-            polled.robotCode ?? null,
-            polled.mode ?? 'STREAM',
-            polled.unifiedAppId ?? null,
+            robotCode,
             now,
             'console:dingtalk-qr',
             now,
@@ -1391,15 +1460,14 @@ export function registerAdminRoutes(app: FastifyInstance, deps: ServerDeps): voi
         audit(deps, req, boundRow.company_id, 'platform.channel.bind_robot', 'channel', 'dingtalk', {
           appId,
           corpId,
-          agentId: polled.agentId ?? null,
-          robotCode: polled.robotCode ?? null,
+          agentId: null,
+          robotCode,
           reused: true,
           runId: outcome.runId,
         })
         void refreshDingTalkStream(deps).catch((error) =>
           console.warn('[eab] 换机器人后重建钉钉 Stream 失败：', (error as Error).message),
         )
-        void sendDingTalkWelcome(deps, polled.userId ?? null, company?.name ?? tenant.name).catch(() => undefined)
         return ok(result)
       }
 
@@ -1413,7 +1481,13 @@ export function registerAdminRoutes(app: FastifyInstance, deps: ServerDeps): voi
         slug: req.body?.slug,
         actorLabel: 'console:dingtalk-qr',
         action: 'platform.company.onboard_dingtalk_qr',
-        extra: { agentId: polled.agentId ?? null, robotCode: polled.robotCode ?? null },
+        robotCode,
+        agentId: null,
+        robotMode: 'STREAM',
+        unifiedAppId: null,
+        botBoundAt: Date.now(),
+        botBoundBy: 'console:dingtalk-qr',
+        extra: { agentId: null, robotCode, binding: 'scan-ordinary-robot' },
       })
       const result = { status: 'success', existing: false, ...created, robot }
       deps.db
@@ -1425,24 +1499,14 @@ export function registerAdminRoutes(app: FastifyInstance, deps: ServerDeps): voi
       deps.db
         .prepare(
           `UPDATE channel_configs
-              SET agent_id = ?, robot_code = ?, robot_mode = ?, unified_app_id = ?,
+              SET agent_id = NULL, robot_code = ?, robot_mode = 'STREAM', unified_app_id = NULL,
                   bot_bound_at = ?, bot_bound_by_user_id = ?, updated_at = ?
             WHERE company_id = ? AND provider = 'dingtalk'`,
         )
-        .run(
-          polled.agentId ?? null,
-          polled.robotCode ?? null,
-          polled.mode ?? 'STREAM',
-          polled.unifiedAppId ?? null,
-          Date.now(),
-          'console:dingtalk-qr',
-          Date.now(),
-          created.company.id,
-        )
+        .run(robotCode, Date.now(), 'console:dingtalk-qr', Date.now(), created.company.id)
       void refreshDingTalkStream(deps).catch((error) =>
         console.warn('[eab] 新机器人绑定后启动钉钉 Stream 失败：', (error as Error).message),
       )
-      void sendDingTalkWelcome(deps, polled.userId ?? null, created.company.name).catch(() => undefined)
       return ok(result)
     },
   )

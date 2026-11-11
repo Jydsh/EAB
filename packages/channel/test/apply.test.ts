@@ -206,6 +206,28 @@ describe('applyOrgSync：第一次同步', () => {
 })
 
 describe('applyOrgSync：幂等与变更', () => {
+  it('身份表残留孤儿身份（成员行已丢）时，重建成员而不是撞身份唯一键', () => {
+    const plan = planFor(1)
+    const lin = plan.users.find((user) => user.channelUserId === 'fs_lin')
+    expect(lin).toBeTruthy()
+    db.exec('PRAGMA foreign_keys = OFF')
+    db.prepare(
+      `INSERT INTO user_identities (id, user_id, provider, external_user_id, union_id, bound_at, bound_by, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run('ident_orphan', lin!.id, 'mock', 'fs_lin', 'on_lin', NOW, 'seed', 'pending')
+    db.exec('PRAGMA foreign_keys = ON')
+
+    const outcome = applyOrgSync(db, { plan, now: NOW })
+
+    expect(outcome.stats.usersCreated).toBe(4)
+    expect(outcome.stats.identitiesCreated).toBe(3)
+    expect(userRow('fs_lin').id).toBe(lin!.id)
+    const identityCount = db
+      .prepare("SELECT COUNT(*) AS n FROM user_identities WHERE provider = 'mock' AND external_user_id = 'fs_lin'")
+      .get() as { n: number }
+    expect(Number(identityCount.n)).toBe(1)
+  })
+
   it('同一份通讯录跑第二次：零写入、diff 为空', () => {
     sync(1)
     const second = sync(1)

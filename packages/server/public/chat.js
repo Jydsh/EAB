@@ -234,6 +234,8 @@ const state = {
   sending: false,
   /** 正在流式回复时后来提交的消息：先排队，等当前回复结束再按顺序发送 */
   queue: [],
+  /** queue=按顺序排队；interrupt=新消息打断当前回复 */
+  chatSendMode: 'queue',
   activeController: null,
   attachments: [],
   personas: [],
@@ -247,15 +249,9 @@ const state = {
   liveEventSource: null,
   sessionRefreshTimer: 0,
   files: [],
-  localSpaces: [],
-  localSpaceId: '',
-  localPath: '',
-  localEntries: [],
-  localTruncated: false,
   spaceKind: 'cloud',
   spaceLabel: '云空间',
   plugins: [],
-  pluginCatalog: [],
   pluginData: null,
   pluginSelected: null,
   pluginTab: 'overview',
@@ -673,6 +669,13 @@ async function openSession(sessionId) {
     const data = await api(historyMessagesUrl(sessionId))
     state.sessionId = data.session.id
     applySessionSpace(data.session)
+    const sessionModelId = data.session.modelId || data.session.model_id || ''
+    if (sessionModelId && state.models.some((model) => model.id === sessionModelId)) {
+      setSelected(sessionModelId, { persist: false })
+    } else {
+      setSelected('', { persist: false })
+      if (sessionModelId) banner('本会话原来使用的模型已不可用，已切回自动选择', 'warn')
+    }
     state.historyBefore = Boolean(data.hasMore) ? data.nextBefore || null : null
     state.historyHasMore = Boolean(data.hasMore)
     state.historyLoading = false
@@ -716,6 +719,7 @@ function newSession() {
   hideSettings()
   setChatMode('chat')
   state.sessionId = null
+  setSelected('', { persist: false })
   resetHistoryState()
   $('#chat-title').textContent = '新对话'
   resetThread()
@@ -739,7 +743,6 @@ function showSessionMenu(sessionId, anchor) {
   const session = sessionById(sessionId)
   if (!menu || !session) return
   hideFileMenu()
-  hideLocalMenu()
   menu.innerHTML = `<div class="session-menu-title">${esc(session.title)}</div>
     <button type="button" data-act="rename">重命名</button>
     <button type="button" data-act="delete" class="is-danger">删除</button>`
@@ -943,881 +946,83 @@ function maybeWarnWorkspaceQuota(quota) {
   banner(`${message} 可在侧栏「云空间」查看详情。`, level === 'critical' || level === 'full' ? 'bad' : 'warn')
 }
 
-function currentLocalSpace() {
-  return state.localSpaces.find((item) => item.id === state.localSpaceId) || null
-}
-
-function spaceLabelFor(kind, space) {
-  if (kind === 'local' && space) return `本地 · ${space.name}`
-  if (kind === 'none') return '不使用文件'
-  return '云空间'
+function spaceLabelFor(kind) {
+  return kind === 'none' ? '不使用文件' : '云空间'
 }
 
 function renderSpaceChip() {
   const label = $('#space-chip-label')
   const chip = $('#space-chip')
   if (!label || !chip) return
-  const local = state.spaceKind === 'local' ? currentLocalSpace() : null
-  label.textContent = spaceLabelFor(state.spaceKind, local)
-  chip.classList.toggle('is-local', state.spaceKind === 'local')
-  chip.classList.toggle('is-none', state.spaceKind === 'none')
-  chip.title =
-    state.spaceKind === 'local' && local
-      ? `当前本地空间：${local.rootPath}（${local.mode === 'read_only' ? '只读' : '读写'}）`
-      : state.spaceKind === 'cloud'
-        ? '当前文件空间：云空间（EAB 服务端 · 默认可用）'
-        : '当前不使用文件空间'
-}
-
-function setSpace(kind, spaceId, options = {}) {
-  const local = kind === 'local' ? state.localSpaces.find((item) => item.id === spaceId) : null
-  if (kind === 'local' && !local) {
-    kind = 'cloud'
-    spaceId = ''
-  }
-  if (state.filePreview?.kind === 'local') closeWorkspaceFile()
+  const kind = state.spaceKind === 'none' ? 'none' : 'cloud'
   state.spaceKind = kind
-  if (kind === 'local') state.localSpaceId = String(spaceId)
-  state.localPath = ''
-  state.spaceLabel = spaceLabelFor(kind, local)
-  renderSpaceChip()
-  renderLocalSpaces()
-  if (kind === 'local') loadLocalEntries('')
-  else if (currentLocalSpace()) loadLocalEntries('')
-  if (!options.silent) hideSpaceMenu()
+  state.spaceLabel = spaceLabelFor(kind)
+  label.textContent = state.spaceLabel
+  chip.classList.toggle('is-none', kind === 'none')
+  chip.title = kind === 'none'
+    ? '本轮不读写文件；点击可切换到云空间'
+    : '云空间默认可用；点击可切换为不使用文件空间'
+  chip.setAttribute('aria-label', `文件空间：${state.spaceLabel}`)
 }
 
 function applySessionSpace(session) {
-  const savedKind = session?.space_kind
-  const kind = savedKind === 'local' ? 'local' : savedKind === 'none' ? 'none' : 'cloud'
-  const spaceId = kind === 'local' ? String(session?.space_id || '') : ''
-  const local = kind === 'local' ? state.localSpaces.find((item) => item.id === spaceId) : null
-  state.spaceKind = kind === 'local' && !local ? 'cloud' : kind
-  if (local) state.localSpaceId = spaceId
-  state.localPath = ''
-  state.spaceLabel = spaceLabelFor(state.spaceKind, local)
+  const saved = session?.space_kind
+  state.spaceKind = saved === 'none' ? 'none' : 'cloud'
   renderSpaceChip()
-  renderLocalSpaces()
-  if (currentLocalSpace()) loadLocalEntries('')
+}
+
+function setSpace(kind, _spaceId, options = {}) {
+  state.spaceKind = kind === 'none' ? 'none' : 'cloud'
+  renderSpaceChip()
+  hideSpaceMenu()
+  if (!options.silent) {
+    closeWorkspaceFile()
+    banner(`文件空间已切换为「${spaceLabelFor(state.spaceKind)}」；发送新消息后生效。`, 'ok')
+  }
 }
 
 function hideSpaceMenu() {
   const menu = $('#space-menu')
-  if (!menu) return
-  menu.hidden = true
+  if (menu) menu.hidden = true
   $('#space-chip')?.setAttribute('aria-expanded', 'false')
+}
+
+/** 空间气泡独立绑定：即使当前账号没有可用模型，也能打开/关闭空间菜单 */
+function bindSpacePicker() {
+  const chip = $('#space-chip')
+  const menu = $('#space-menu')
+  if (!chip || !menu) return
+  chip.addEventListener('click', (event) => {
+    event.stopPropagation()
+    const open = menu.hidden
+    if (open) renderSpaceMenu()
+    menu.hidden = !open
+    chip.setAttribute('aria-expanded', open ? 'true' : 'false')
+  })
+  document.addEventListener('click', (event) => {
+    if (!event.target.closest('#space-chip') && !event.target.closest('#space-menu')) hideSpaceMenu()
+  })
 }
 
 function renderSpaceMenu() {
   const menu = $('#space-menu')
   if (!menu) return
-  const local = state.spaceKind === 'local' ? currentLocalSpace() : null
-  const items = [
-    `<button type="button" data-space-kind="cloud" class="${state.spaceKind === 'cloud' ? 'is-active' : ''}">
-      <span class="space-menu-name">云空间</span><span class="space-menu-desc">EAB 服务端 · 默认可用 · 换设备可用</span>
-    </button>`,
-    ...state.localSpaces.map(
-      (space) => `<button type="button" data-space-id="${esc(space.id)}" class="${state.spaceKind === 'local' && state.localSpaceId === space.id ? 'is-active' : ''}">
-        <span class="space-menu-name">${esc(space.name)}</span>
-        <span class="space-menu-desc">${esc(space.rootPath)} · ${space.mode === 'read_only' ? '只读' : '读写'}${
-          space.available ? '' : ' · 目录不可用'
-        }</span>
-      </button>`,
-    ),
-    `<button type="button" data-space-kind="none" class="${state.spaceKind === 'none' ? 'is-active' : ''}">
-      <span class="space-menu-name">不使用文件空间</span><span class="space-menu-desc">纯对话，不读写文件</span>
-    </button>`,
-    `<button type="button" data-space-act="bind" class="space-menu-bind">＋ 绑定本地空间…</button>`,
+  const options = [
+    { kind: 'cloud', label: '云空间', desc: '默认可用，文件保存在云端' },
+    { kind: 'none', label: '不使用文件空间', desc: '本轮只聊天，不读写任何文件' },
   ]
-  menu.innerHTML = items.join('')
-  for (const button of menu.querySelectorAll('[data-space-kind]')) {
-    button.addEventListener('click', () => setSpace(button.dataset.spaceKind, ''))
-  }
-  for (const button of menu.querySelectorAll('[data-space-id]')) {
-    button.addEventListener('click', () => setSpace('local', button.dataset.spaceId))
-  }
-  menu.querySelector('[data-space-act="bind"]')?.addEventListener('click', () => {
-    hideSpaceMenu()
-    openLocalBindModal()
-  })
-  if (local) {
-    const selected = menu.querySelector(`[data-space-id="${CSS.escape(local.id)}"]`)
-    selected?.scrollIntoView({ block: 'nearest' })
-  }
-}
-
-async function loadLocalSpaces() {
-  try {
-    const data = await api(`/api/local-spaces${qs()}`)
-    state.localSpaces = data.items || []
-    const section = $('#side-local')
-    if (section) section.hidden = false
-    if (!state.localSpaces.some((item) => item.id === state.localSpaceId)) {
-      state.localSpaceId = state.localSpaces[0]?.id || ''
-    }
-    if (state.spaceKind === 'local' && !currentLocalSpace()) {
-      setSpace('cloud', '', { silent: true })
-    }
-    renderLocalSpaces()
-    renderSpaceChip()
-    renderSpaceMenu()
-    if (currentLocalSpace()) await loadLocalEntries(state.localPath)
-  } catch (err) {
-    const section = $('#side-local')
-    if (section) section.hidden = true
-    state.localSpaces = []
-    if (state.spaceKind === 'local') setSpace('cloud', '', { silent: true })
-  }
-}
-
-function localBreadcrumb(path) {
-  const segments = String(path || '').split('/').filter(Boolean)
-  const parts = [`<button type="button" class="local-crumb" data-local-path="">根目录</button>`]
-  let built = ''
-  for (const segment of segments) {
-    built = built ? `${built}/${segment}` : segment
-    parts.push(`<button type="button" class="local-crumb" data-local-path="${esc(built)}">${esc(segment)}</button>`)
-  }
-  return parts.join('<span class="local-crumb-sep">/</span>')
-}
-
-function renderLocalSpaces() {
-  const summary = $('#local-space-summary')
-  const tree = $('#local-tree')
-  if (!summary || !tree) return
-  const newFileButton = $('#local-new-file')
-  if (state.localSpaces.length === 0) {
-    if (newFileButton) newFileButton.hidden = true
-    summary.innerHTML = `<div class="local-empty">
-      <p>绑定一个本机目录，AI 才能读写这里的文件。</p>
-      <button class="btn ghost sm" id="local-bind-empty" type="button">绑定目录</button>
-    </div>`
-    tree.innerHTML = ''
-    summary.querySelector('#local-bind-empty')?.addEventListener('click', openLocalBindModal)
-    return
-  }
-  const active = currentLocalSpace()
-  const space = active || state.localSpaces[0]
-  if (newFileButton) newFileButton.hidden = space.mode !== 'read_write'
-  summary.innerHTML = `
-    <div class="local-space-row">
-      <select id="local-space-select" aria-label="选择本地空间">
-        ${state.localSpaces
-          .map(
-            (item) =>
-              `<option value="${esc(item.id)}" ${space.id === item.id ? 'selected' : ''}>${esc(item.name)}</option>`,
-          )
-          .join('')}
-      </select>
-      <span class="local-mode ${space.mode === 'read_only' ? 'is-readonly' : ''}">${
-        space.mode === 'read_only' ? '只读' : '读写'
-      }</span>
-    </div>
-    <div class="local-root" title="${esc(space.rootPath)}">${esc(space.rootPath)}</div>
-    ${
-      active
-        ? `<div class="local-breadcrumb">${localBreadcrumb(state.localPath)}</div>`
-        : `<div class="local-empty-hint">对话时可在输入区选择这个本地空间。</div>`
-    }`
-  const select = summary.querySelector('#local-space-select')
-  select?.addEventListener('change', () => {
-    const spaceId = select.value
-    if (state.spaceKind === 'local') setSpace('local', spaceId)
-    else {
-      state.localSpaceId = spaceId
-      state.localPath = ''
-      renderLocalSpaces()
-      renderSpaceChip()
-      loadLocalEntries('')
-    }
-  })
-  for (const button of summary.querySelectorAll('[data-local-path]')) {
-    button.addEventListener('click', () => {
-      state.localPath = button.dataset.localPath || ''
-      loadLocalEntries(state.localPath)
-    })
-  }
-  if (!active) {
-    tree.innerHTML = ''
-    return
-  }
-  renderLocalTree()
-}
-
-function localEntryIcon(entry) {
-  if (entry.type === 'dir') {
-    return `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" aria-hidden="true"><path d="M1.7 4.3h4.1l1.2 1.4h7.3v7.6H1.7V4.3Z"/><path d="M1.7 4.3V3.1h4.4l1.2 1.2"/></svg>`
-  }
-  return `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" aria-hidden="true"><path d="M3.4 1.9h5l3.2 3.2v9H3.4v-12Z"/><path d="M8.4 1.9v3.2h3.2"/></svg>`
-}
-
-function localEntryByPath(relPath) {
-  return state.localEntries.find((entry) => entry.relPath === relPath)
-}
-
-function renderLocalTree() {
-  const box = $('#local-tree')
-  if (!box) return
-  const space = currentLocalSpace()
-  if (!space) return
-  if (state.localEntries.length === 0) {
-    box.innerHTML = '<div class="muted" style="font-size:12px;padding:4px">这个目录是空的，或没有可显示的文件。</div>'
-    return
-  }
-  const activePath =
-    state.filePreview?.kind === 'local' && state.filePreview.spaceId === space.id
-      ? state.filePreview.relPath
-      : ''
-  const writable = space.mode === 'read_write'
-  box.innerHTML = state.localEntries
+  menu.innerHTML = options
     .map(
-      (entry) => `<div class="side-file local-entry${activePath === entry.relPath ? ' is-active' : ''}" data-local-entry="${esc(entry.relPath)}" data-local-type="${entry.type}">
-        <span class="local-entry-icon${entry.type === 'dir' ? ' is-dir' : ''}" aria-hidden="true">${localEntryIcon(entry)}</span>
-        <button class="side-file-name" type="button" data-local-open="${esc(entry.relPath)}" title="${esc(entry.relPath)}">${esc(entry.name)}</button>
-        ${entry.type === 'file' ? `<span class="side-file-size">${fmtSize(entry.size)}</span>` : ''}
-        <button class="side-file-more" type="button" data-local-more="${esc(entry.relPath)}" title="文件操作" aria-label="文件操作" aria-haspopup="menu">⋯</button>
-      </div>`,
+      (option) => `<button class="space-menu-item${state.spaceKind === option.kind ? ' is-active' : ''}" type="button" data-space-kind="${option.kind}">
+        <span class="space-menu-name">${option.label}</span>
+        <span class="space-menu-desc">${option.desc}</span>
+      </button>`,
     )
-    .join('') + (state.localTruncated ? '<div class="muted local-truncated">目录较多，只显示前 200 项。</div>' : '')
-  for (const button of box.querySelectorAll('[data-local-open]')) {
-    button.addEventListener('click', () => {
-      const entry = localEntryByPath(button.dataset.localOpen)
-      if (!entry) return
-      openLocalEntry(entry)
-    })
-  }
-  for (const button of box.querySelectorAll('[data-local-more]')) {
-    button.addEventListener('click', (event) => {
-      event.stopPropagation()
-      showLocalMenu(button.dataset.localMore, button.getBoundingClientRect())
-    })
-  }
-  for (const row of box.querySelectorAll('[data-local-entry]')) {
-    row.addEventListener('contextmenu', (event) => {
-      event.preventDefault()
-      showLocalMenu(
-        row.dataset.localEntry,
-        { left: event.clientX, top: event.clientY, right: event.clientX, bottom: event.clientY },
-        true,
-      )
-    })
+    .join('')
+  for (const button of menu.querySelectorAll('[data-space-kind]')) {
+    button.addEventListener('click', () => setSpace(button.dataset.spaceKind))
   }
 }
-
-function openLocalEntry(entry) {
-  if (!entry) return
-  if (entry.type === 'dir') {
-    state.localPath = entry.relPath
-    loadLocalEntries(entry.relPath)
-  } else {
-    openLocalFile(entry.relPath)
-  }
-}
-
-function hideLocalMenu() {
-  const menu = $('#local-menu')
-  if (!menu) return
-  menu.hidden = true
-  menu.dataset.localPath = ''
-}
-
-function showLocalMenu(relPath, anchor, atPoint = false) {
-  const menu = $('#local-menu')
-  const entry = localEntryByPath(relPath)
-  if (!menu || !entry) return
-  hideSessionMenu()
-  hideFileMenu()
-  const writable = currentLocalSpace()?.mode === 'read_write'
-  menu.innerHTML = `<div class="session-menu-title">${esc(entry.name)}</div>
-    ${
-      entry.type === 'dir'
-        ? '<button type="button" data-local-act="open">打开目录</button>'
-        : `<button type="button" data-local-act="open">打开</button>
-           ${writable ? '<button type="button" data-local-act="edit">编辑</button>' : ''}
-           ${writable ? '<button type="button" data-local-act="rename">重命名</button>' : ''}
-           <button type="button" data-local-act="download">下载</button>
-           ${writable ? '<button type="button" data-local-act="delete" class="is-danger">删除</button>' : ''}`
-    }`
-  menu.dataset.localPath = relPath
-  menu.hidden = false
-  const box = menu.getBoundingClientRect()
-  const left = atPoint
-    ? Math.min(anchor.left, window.innerWidth - box.width - 8)
-    : Math.min(Math.max(8, anchor.right - box.width), window.innerWidth - box.width - 8)
-  const top = atPoint
-    ? Math.min(anchor.top, window.innerHeight - box.height - 8)
-    : anchor.bottom + 4 + box.height + 8 > window.innerHeight
-      ? Math.max(8, anchor.top - box.height - 4)
-      : anchor.bottom + 4
-  menu.style.left = `${Math.max(8, left)}px`
-  menu.style.top = `${Math.max(8, top)}px`
-}
-
-function downloadLocalEntry(entry) {
-  const space = currentLocalSpace()
-  if (!space || !entry) return
-  const link = document.createElement('a')
-  link.href = localFileUrl(space, entry.relPath)
-  link.download = entry.name
-  document.body.appendChild(link)
-  link.click()
-  link.remove()
-}
-
-async function editLocalEntry(entry) {
-  if (!entry) return
-  await openLocalFile(entry.relPath)
-  if (state.filePreview?.relPath !== entry.relPath) return
-  if (!$('#file-pane-edit').hidden) {
-    beginWorkspaceEdit()
-  } else {
-    banner('这个文件类型不支持在线编辑，请下载后编辑。', 'bad')
-  }
-}
-
-async function loadLocalEntries(path) {
-  const space = currentLocalSpace()
-  if (!space) return
-  state.localPath = String(path || '')
-  try {
-    const data = await api(
-      qsAppend(
-        `/api/local-spaces/${encodeURIComponent(space.id)}/entries?path=${encodeURIComponent(state.localPath)}`,
-      ),
-    )
-    if (state.localSpaceId !== space.id) return
-    state.localEntries = data.entries || []
-    state.localTruncated = Boolean(data.truncated)
-    renderLocalSpaces()
-  } catch (err) {
-    state.localEntries = []
-    state.localTruncated = false
-    const tree = $('#local-tree')
-    if (tree) tree.innerHTML = `<div class="muted" style="font-size:12px;padding:4px">${esc(err.message)}</div>`
-  }
-}
-
-function localFileUrl(space, relPath) {
-  return qsAppend(
-    `/api/local-spaces/${encodeURIComponent(space.id)}/download?path=${encodeURIComponent(relPath)}`,
-  )
-}
-
-async function openLocalFile(relPath) {
-  const space = currentLocalSpace()
-  if (!space) return
-  const token = ++workspacePreviewToken
-  releaseWorkspacePreviewUrl()
-  state.filePreview = {
-    kind: 'local',
-    spaceId: space.id,
-    relPath,
-    name: relPath.split('/').pop() || relPath,
-    size: 0,
-    mode: space.mode,
-  }
-  renderLocalTree()
-  workspacePreviewText = ''
-  workspacePreviewTextLoaded = false
-  const pane = $('#file-pane')
-  pane.hidden = false
-  $('#thread').hidden = true
-  $('#workspace-pane').hidden = true
-  $('.composer').hidden = true
-  $('#file-pane-editor').hidden = true
-  $('#file-pane-body').hidden = false
-  $('#file-pane-kicker').textContent = '本地空间'
-  $('#file-pane-name').textContent = state.filePreview.name
-  $('#file-pane-meta').textContent = `${relPath} · 正在读取…`
-  $('#chat-title').textContent = `本地空间 · ${state.filePreview.name}`
-  $('#file-pane-delete').hidden = space.mode !== 'read_write'
-  $('#file-pane-rename').hidden = true
-  $('#file-pane-edit').hidden = true
-  $('#file-pane-download').hidden = false
-  $('#file-pane-send-dingtalk').hidden = true
-  filePaneMessage('正在读取文件…')
-  try {
-    const data = await api(
-      qsAppend(
-        `/api/local-spaces/${encodeURIComponent(space.id)}/file?path=${encodeURIComponent(relPath)}`,
-      ),
-    )
-    if (token !== workspacePreviewToken || state.filePreview?.relPath !== relPath) return
-    state.filePreview.size = Number(data.size) || 0
-    state.filePreview.mtime = Number(data.mtime) || 0
-    $('#file-pane-meta').textContent = `${fmtSize(data.size)} · ${
-      data.mtime ? new Date(Number(data.mtime)).toLocaleString('zh-CN', { hour12: false }) : '—'
-    } · ${relPath}`
-    $('#file-pane-rename').hidden = space.mode !== 'read_write'
-    if (data.binary) {
-      filePaneMessage('这是二进制文件，不能直接预览；点右上角「下载」查看。')
-      return
-    }
-    workspacePreviewText = String(data.text ?? '')
-    workspacePreviewTextLoaded = true
-    const pre = document.createElement('pre')
-    pre.className = 'file-text-view'
-    pre.textContent = workspacePreviewText || '（空文件）'
-    setFilePaneBody(pre)
-    $('#file-pane-edit').hidden = space.mode !== 'read_write' || Boolean(data.truncated)
-    if (data.truncated) {
-      banner('文件超过 5 MB，只显示前 5 MB；完整内容请下载查看', 'bad')
-    }
-  } catch (err) {
-    if (token !== workspacePreviewToken) return
-    filePaneMessage(`读取失败：${err.message}`, 'bad')
-  }
-}
-
-function openLocalNewFile() {
-  const space = currentLocalSpace() || state.localSpaces[0]
-  if (!space) return
-  if (space.mode !== 'read_write') {
-    banner('当前本地空间是只读的，不能新建文件', 'bad')
-    return
-  }
-  const base = state.localPath || ''
-  const overlay = document.createElement('div')
-  overlay.className = 'modal-overlay'
-  overlay.innerHTML = `<div class="modal local-file-modal">
-    <div class="modal-head"><h3>新建文件</h3><button class="modal-x" type="button" aria-label="关闭">×</button></div>
-    <p class="hint">在「${esc(base || '根目录')}」下创建一个文本文件，创建后会直接进入编辑。</p>
-    <div class="form-grid">
-      <label><span>文件名或相对路径</span><input id="local-new-name" type="text" spellcheck="false" placeholder="例如 notes.md 或 docs/todo.md" /></label>
-    </div>
-    <div class="modal-state" id="local-new-state"></div>
-    <div class="modal-actions"><button class="btn ghost" type="button" id="local-new-cancel">取消</button><button class="btn primary" type="button" id="local-new-save">创建并编辑</button></div>
-  </div>`
-  document.body.appendChild(overlay)
-  const close = () => overlay.remove()
-  const input = overlay.querySelector('#local-new-name')
-  const stateEl = overlay.querySelector('#local-new-state')
-  const saveButton = overlay.querySelector('#local-new-save')
-  const fail = (message) => {
-    stateEl.className = 'modal-state bad'
-    stateEl.textContent = message
-    input.focus()
-    input.select()
-  }
-  const submit = async () => {
-    if (saveButton.disabled) return
-    const raw = input.value.trim().replace(/\\/g, '/')
-    if (!raw) return fail('请输入文件名')
-    if (raw.startsWith('/') || /^[A-Za-z]:/.test(raw)) return fail('请输入本地空间内的相对路径')
-    const parts = raw.split('/')
-    if (parts.some((part) => !part || part === '.' || part === '..')) {
-      return fail('文件名不能包含空段、"." 或 ".."')
-    }
-    if (/[\u0000-\u001f]/.test(raw)) return fail('文件名包含不可见字符')
-    const relPath = [base, ...parts].filter(Boolean).join('/')
-    saveButton.disabled = true
-    saveButton.textContent = '正在创建…'
-    stateEl.className = 'modal-state muted'
-    stateEl.textContent = '正在创建文件…'
-    try {
-      await api(`/api/local-spaces/${encodeURIComponent(space.id)}/file${qs()}`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ path: relPath, text: '', createOnly: true }),
-      })
-      close()
-      await loadLocalEntries(base)
-      await openLocalFile(relPath)
-      beginWorkspaceEdit()
-      banner('文件已创建，可以直接编辑', 'ok')
-    } catch (err) {
-      saveButton.disabled = false
-      saveButton.textContent = '创建并编辑'
-      fail(err.message || '创建文件失败')
-    }
-  }
-  overlay.addEventListener('click', (event) => {
-    if (event.target === overlay) close()
-  })
-  overlay.querySelector('.modal-x').addEventListener('click', close)
-  overlay.querySelector('#local-new-cancel').addEventListener('click', close)
-  saveButton.addEventListener('click', submit)
-  input.addEventListener('keydown', (event) => {
-    if (event.key === 'Enter') {
-      event.preventDefault()
-      submit()
-    }
-  })
-  input.focus()
-}
-
-function renameLocalFile(target) {
-  const preview = state.filePreview
-  const file = target
-    ? { kind: 'local', relPath: target.relPath, name: target.name, size: target.size || 0 }
-    : preview
-  const space = currentLocalSpace()
-  if (!file || file.kind !== 'local' || !space) return
-  if (space.mode !== 'read_write') {
-    banner('当前本地空间是只读的，不能重命名文件', 'bad')
-    return
-  }
-  const wasOpen = preview?.kind === 'local' && preview.relPath === file.relPath
-  const dir = file.relPath.split('/').slice(0, -1).join('/')
-  const overlay = document.createElement('div')
-  overlay.className = 'modal-overlay'
-  overlay.innerHTML = `<div class="modal local-file-modal">
-    <div class="modal-head"><h3>重命名文件</h3><button class="modal-x" type="button" aria-label="关闭">×</button></div>
-    <p class="hint">只改当前目录下的文件名，不移动文件；同名文件已存在时会提示。</p>
-    <div class="form-grid">
-      <label><span>文件名</span><input id="local-rename-name" type="text" spellcheck="false" value="${esc(file.name)}" /></label>
-    </div>
-    <div class="modal-state" id="local-rename-state"></div>
-    <div class="modal-actions"><button class="btn ghost" type="button" id="local-rename-cancel">取消</button><button class="btn primary" type="button" id="local-rename-save">保存</button></div>
-  </div>`
-  document.body.appendChild(overlay)
-  const close = () => overlay.remove()
-  const input = overlay.querySelector('#local-rename-name')
-  const stateEl = overlay.querySelector('#local-rename-state')
-  const saveButton = overlay.querySelector('#local-rename-save')
-  const fail = (message) => {
-    stateEl.className = 'modal-state bad'
-    stateEl.textContent = message
-    input.focus()
-    input.select()
-  }
-  const submit = async () => {
-    if (saveButton.disabled) return
-    const name = input.value.trim()
-    if (!name) return fail('文件名不能为空')
-    if (/[\\/]/.test(name) || name === '.' || name === '..') return fail('文件名不能包含路径分隔符')
-    if (/[\u0000-\u001f]/.test(name)) return fail('文件名包含不可见字符')
-    if (name === file.name) {
-      close()
-      return
-    }
-    const to = dir ? `${dir}/${name}` : name
-    saveButton.disabled = true
-    saveButton.textContent = '正在保存…'
-    stateEl.className = 'modal-state muted'
-    stateEl.textContent = '正在重命名…'
-    try {
-      await api(`/api/local-spaces/${encodeURIComponent(space.id)}/move${qs()}`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ from: file.relPath, to, overwrite: false }),
-      })
-      close()
-      await loadLocalEntries(state.localPath)
-      if (wasOpen) await openLocalFile(to)
-      banner('文件已重命名', 'ok')
-    } catch (err) {
-      saveButton.disabled = false
-      saveButton.textContent = '保存'
-      fail(err.message || '重命名失败')
-    }
-  }
-  overlay.addEventListener('click', (event) => {
-    if (event.target === overlay) close()
-  })
-  overlay.querySelector('.modal-x').addEventListener('click', close)
-  overlay.querySelector('#local-rename-cancel').addEventListener('click', close)
-  saveButton.addEventListener('click', submit)
-  input.addEventListener('keydown', (event) => {
-    if (event.key === 'Enter') {
-      event.preventDefault()
-      submit()
-    }
-  })
-  input.focus()
-  input.select()
-}
-
-function mountLocalFolderBrowser({
-  trigger,
-  input,
-  panel,
-  list,
-  pathLabel,
-  up,
-  choose,
-  hint,
-  close,
-  onChoose,
-  onOpen,
-}) {
-  let currentPath = null
-  let currentParent = null
-  let currentIsRoot = false
-  const render = (data) => {
-    currentPath = data.path || null
-    currentParent = data.parent || null
-    currentIsRoot = Boolean(data.isRoot)
-    pathLabel.textContent = currentPath || '此电脑'
-    up.disabled = !currentPath
-    choose.disabled = !currentPath || currentIsRoot
-    hint.textContent = currentIsRoot
-      ? '请进入磁盘下的具体文件夹再选择'
-      : currentPath
-        ? '将把当前文件夹作为所选目录'
-        : '选择一个磁盘开始'
-    list.replaceChildren()
-    const entries = Array.isArray(data.entries) ? data.entries : []
-    if (entries.length === 0) {
-      const empty = document.createElement('div')
-      empty.className = 'local-browser-empty'
-      empty.textContent = currentPath ? '这个文件夹下没有子文件夹' : '没有找到可浏览的磁盘'
-      list.appendChild(empty)
-      return
-    }
-    for (const entry of entries) {
-      const item = document.createElement('button')
-      item.type = 'button'
-      item.className = 'local-browser-item'
-      const folder = document.createElement('span')
-      folder.className = 'local-browser-folder'
-      folder.setAttribute('aria-hidden', 'true')
-      const label = document.createElement('span')
-      label.className = 'local-browser-name'
-      label.textContent = entry.name
-      const arrow = document.createElement('span')
-      arrow.className = 'local-browser-arrow'
-      arrow.textContent = '›'
-      item.append(folder, label, arrow)
-      item.addEventListener('click', () => load(entry.path))
-      list.appendChild(item)
-    }
-    if (data.truncated) {
-      const note = document.createElement('div')
-      note.className = 'local-browser-empty'
-      note.textContent = '子文件夹过多，只显示前 500 个'
-      list.appendChild(note)
-    }
-  }
-  const load = async (path) => {
-    panel.hidden = false
-    choose.disabled = true
-    up.disabled = true
-    list.innerHTML = '<div class="local-browser-empty">正在读取目录…</div>'
-    const params = new URLSearchParams(location.search)
-    if (path) params.set('path', path)
-    const query = params.toString()
-    try {
-      const data = await api(`/api/local-spaces/browse${query ? `?${query}` : ''}`)
-      render(data)
-    } catch (err) {
-      currentPath = null
-      currentParent = null
-      currentIsRoot = false
-      pathLabel.textContent = '此电脑'
-      up.disabled = false
-      choose.disabled = true
-      hint.textContent = '读取失败，可返回此电脑重新选择'
-      list.innerHTML = ''
-      const empty = document.createElement('div')
-      empty.className = 'local-browser-empty'
-      empty.textContent = err.message
-      list.appendChild(empty)
-    }
-  }
-  trigger?.addEventListener('click', () => {
-    onOpen?.()
-    load(panel.hidden ? input.value.trim() : currentPath || input.value.trim())
-  })
-  up?.addEventListener('click', () => {
-    if (currentPath && currentParent) load(currentParent)
-    else load('')
-  })
-  close?.addEventListener('click', () => {
-    panel.hidden = true
-  })
-  choose?.addEventListener('click', () => {
-    if (!currentPath || currentIsRoot) return
-    input.value = currentPath
-    panel.hidden = true
-    onChoose?.(currentPath)
-  })
-  return { load }
-}
-
-function openLocalBindModal() {
-  const overlay = document.createElement('div')
-  overlay.className = 'modal-overlay'
-  overlay.innerHTML = `<div class="modal local-bind-modal">
-    <div class="modal-head"><h3>绑定本地空间</h3><button class="modal-x" type="button" aria-label="关闭">×</button></div>
-    <div class="local-bind-body">
-      <p class="local-bind-lead">绑定本机上的一个目录。AI 只能在这个目录内读写，不会执行命令；只在你明确要求时删除单个文件，不能删除目录。</p>
-      <div class="local-bind-row">
-        <label class="local-field"><span>空间名称 <em>可选</em></span><input id="local-bind-name" placeholder="默认使用文件夹名" maxlength="40" /></label>
-        <label class="local-field"><span>权限</span><select id="local-bind-mode"><option value="read_write">读写（推荐）</option><option value="read_only">只读</option></select></label>
-      </div>
-      <div class="local-path-block">
-        <div class="local-path-head"><span>本地目录</span><span class="local-path-required">必填</span></div>
-        <div class="local-path-row">
-          <div class="local-path-input">
-            <svg aria-hidden="true" width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M1.8 4.3a1.3 1.3 0 0 1 1.3-1.3h3.1l1.4 1.5h4.3a1.3 1.3 0 0 1 1.3 1.3v6.1a1.3 1.3 0 0 1-1.3 1.3H3.1a1.3 1.3 0 0 1-1.3-1.3V4.3Z" stroke="#667085" stroke-width="1.1"/><path d="M2 6.2h12" stroke="#667085" stroke-width="1.1"/></svg>
-            <input id="local-bind-path" placeholder="选择文件夹后自动填入，也可以粘贴绝对路径" aria-label="本地目录绝对路径" />
-          </div>
-          <button class="btn ghost local-pick" type="button" id="local-bind-pick">
-            <svg aria-hidden="true" width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M1.8 4.3a1.3 1.3 0 0 1 1.3-1.3h3.1l1.4 1.5h4.3a1.3 1.3 0 0 1 1.3 1.3v6.1a1.3 1.3 0 0 1-1.3 1.3H3.1a1.3 1.3 0 0 1-1.3-1.3V4.3Z" stroke="currentColor" stroke-width="1.1"/></svg>
-            选择文件夹
-          </button>
-        </div>
-        <p class="local-path-note">点击“选择文件夹”可在弹窗内浏览本机目录，选好后自动填入绝对路径。</p>
-        <div class="local-folder-browser" id="local-folder-browser" hidden>
-          <div class="local-browser-head">
-            <button class="local-browser-up" type="button" id="local-browser-up" disabled>上一级</button>
-            <div class="local-browser-path" id="local-browser-path">此电脑</div>
-            <button class="local-browser-close" type="button" id="local-browser-close">收起</button>
-          </div>
-          <div class="local-browser-list" id="local-browser-list"></div>
-          <div class="local-browser-foot">
-            <span class="local-browser-hint" id="local-browser-hint">请进入磁盘下的具体文件夹再选择</span>
-            <button class="btn primary sm" type="button" id="local-browser-choose" disabled>选择此文件夹</button>
-          </div>
-        </div>
-      </div>
-      <label class="local-sensitive-row">
-        <input id="local-bind-sensitive" type="checkbox" />
-        <span class="local-sensitive-copy"><strong>允许读取敏感文件</strong><span>.env、私钥、.ssh 等默认不显示，也不会被 AI 读取。</span></span>
-      </label>
-      <div class="modal-state" id="local-bind-state"></div>
-    </div>
-    <div class="modal-actions"><button class="btn ghost" type="button" id="local-bind-cancel">取消</button><button class="btn primary" type="button" id="local-bind-save">绑定</button></div>
-  </div>`
-  document.body.appendChild(overlay)
-  const close = () => overlay.remove()
-  const stateBox = overlay.querySelector('#local-bind-state')
-  overlay.querySelector('.modal-x')?.addEventListener('click', close)
-  overlay.querySelector('#local-bind-cancel')?.addEventListener('click', close)
-  const pathInput = overlay.querySelector('#local-bind-path')
-  const nameInput = overlay.querySelector('#local-bind-name')
-  const pickButton = overlay.querySelector('#local-bind-pick')
-  const browserPanel = overlay.querySelector('#local-folder-browser')
-  const browserList = overlay.querySelector('#local-browser-list')
-  const browserPathLabel = overlay.querySelector('#local-browser-path')
-  const browserUp = overlay.querySelector('#local-browser-up')
-  const browserChoose = overlay.querySelector('#local-browser-choose')
-  const browserHint = overlay.querySelector('#local-browser-hint')
-  mountLocalFolderBrowser({
-    trigger: pickButton,
-    input: pathInput,
-    panel: browserPanel,
-    list: browserList,
-    pathLabel: browserPathLabel,
-    up: browserUp,
-    choose: browserChoose,
-    hint: browserHint,
-    close: overlay.querySelector('#local-browser-close'),
-    onOpen: () => {
-      stateBox.textContent = ''
-      stateBox.className = 'modal-state'
-    },
-    onChoose: (path) => {
-      const folderName = path.split(/[\\/]/).filter(Boolean).pop() || path
-      if (!nameInput.value.trim()) nameInput.value = String(folderName).slice(0, 40)
-      stateBox.textContent = '已选择目录，确认后点「绑定」'
-      stateBox.className = 'modal-state ok'
-    },
-  })
-  overlay.addEventListener('click', (event) => {
-    if (event.target === overlay) close()
-  })
-  overlay.querySelector('#local-bind-save')?.addEventListener('click', async () => {
-    const name = overlay.querySelector('#local-bind-name').value.trim()
-    const path = overlay.querySelector('#local-bind-path').value.trim()
-    const mode = overlay.querySelector('#local-bind-mode').value
-    const allowSensitive = overlay.querySelector('#local-bind-sensitive').checked
-    const button = overlay.querySelector('#local-bind-save')
-    if (!path) {
-      stateBox.textContent = '请填写本地目录绝对路径'
-      stateBox.className = 'modal-state bad'
-      return
-    }
-    button.disabled = true
-    stateBox.textContent = '正在校验目录…'
-    stateBox.className = 'modal-state'
-    try {
-      const data = await api(`/api/local-spaces${qs()}`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ name, path, mode, allowSensitive }),
-      })
-      await loadLocalSpaces()
-      setSpace('local', data.space.id)
-      close()
-      banner(`已绑定本地空间「${data.space.name}」`, 'ok')
-    } catch (err) {
-      stateBox.textContent = err.message
-      stateBox.className = 'modal-state bad'
-    } finally {
-      button.disabled = false
-    }
-  })
-}
-
-function openLocalManager() {
-  if (state.localSpaces.length === 0) {
-    openLocalBindModal()
-    return
-  }
-  const overlay = document.createElement('div')
-  overlay.className = 'modal-overlay'
-  overlay.innerHTML = `<div class="modal local-manager-modal">
-    <div class="modal-head"><h3>本地空间</h3><button class="modal-x" type="button">×</button></div>
-    <p class="hint">每个空间绑定一个本机目录；解绑不会删除磁盘上的文件。</p>
-    <div class="local-manager-list">
-      ${state.localSpaces
-        .map(
-          (space) => `<div class="local-manager-row">
-            <div>
-              <strong>${esc(space.name)}</strong>
-              <div class="muted">${esc(space.rootPath)} · ${space.mode === 'read_only' ? '只读' : '读写'}${
-                space.available ? '' : ' · 目录不可用'
-              }</div>
-            </div>
-            <div class="local-manager-actions">
-              <button class="btn ghost sm" type="button" data-local-choose="${esc(space.id)}">使用</button>
-              <button class="btn ghost sm danger-text" type="button" data-local-unbind="${esc(space.id)}">解绑</button>
-            </div>
-          </div>`,
-        )
-        .join('')}
-    </div>
-    <div class="modal-actions"><button class="btn ghost" type="button" id="local-manager-add">绑定新目录</button><button class="btn primary" type="button" id="local-manager-close">完成</button></div>
-  </div>`
-  document.body.appendChild(overlay)
-  const close = () => overlay.remove()
-  overlay.querySelector('.modal-x')?.addEventListener('click', close)
-  overlay.querySelector('#local-manager-close')?.addEventListener('click', close)
-  overlay.addEventListener('click', (event) => {
-    if (event.target === overlay) close()
-  })
-  overlay.querySelector('#local-manager-add')?.addEventListener('click', () => {
-    close()
-    openLocalBindModal()
-  })
-  for (const button of overlay.querySelectorAll('[data-local-choose]')) {
-    button.addEventListener('click', () => {
-      setSpace('local', button.dataset.localChoose)
-      close()
-    })
-  }
-  for (const button of overlay.querySelectorAll('[data-local-unbind]')) {
-    button.addEventListener('click', async () => {
-      const space = state.localSpaces.find((item) => item.id === button.dataset.localUnbind)
-      if (!space) return
-      if (!confirm(`解绑「${space.name}」？不会删除磁盘文件。`)) return
-      button.disabled = true
-      try {
-        await api(`/api/local-spaces/${encodeURIComponent(space.id)}${qs()}`, { method: 'DELETE' })
-        if (state.localSpaceId === space.id) setSpace('cloud', '', { silent: true })
-        await loadLocalSpaces()
-        close()
-        banner(`已解绑「${space.name}」`, 'ok')
-      } catch (err) {
-        alert(err.message)
-        button.disabled = false
-      }
-    })
-  }
-}
-
 function workspaceFileUrl(file) {
   return `/api/workspace/files/${encodeURIComponent(file.id)}/download${qs()}`
 }
@@ -1881,7 +1086,6 @@ function showFileMenu(fileId, anchor, atPoint = false) {
   const file = fileById(fileId)
   if (!menu || !file) return
   hideSessionMenu()
-  hideLocalMenu()
   const owner = file.ownerUserId === state.me?.person?.id
   menu.innerHTML = `<div class="session-menu-title">${esc(file.name)}</div>
     ${
@@ -2189,19 +1393,6 @@ async function saveWorkspaceEdit() {
   workspacePreviewSaving = true
   $('#file-pane-save').disabled = true
   try {
-    if (file.kind === 'local') {
-      const space = currentLocalSpace()
-      if (!space || space.mode !== 'read_write') throw new Error('这个本地空间是只读的，不能保存')
-      await api(`/api/local-spaces/${encodeURIComponent(space.id)}/file${qs()}`, {
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ path: file.relPath, text, expectedMtime: file.mtime || undefined }),
-      })
-      banner('文件内容已保存到本地空间', 'ok')
-      await loadLocalEntries(state.localPath)
-      await openLocalFile(file.relPath)
-      return
-    }
     await api(`/api/workspace/files${qs()}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -2219,62 +1410,9 @@ async function saveWorkspaceEdit() {
   }
 }
 
-async function deleteLocalPreview(target) {
-  const preview = state.filePreview
-  const file = target
-    ? { kind: 'local', relPath: target.relPath, name: target.name, size: target.size || 0 }
-    : preview
-  const space = currentLocalSpace()
-  if (!file || file.kind !== 'local' || !space) return
-  if (space.mode !== 'read_write') {
-    banner('当前本地空间是只读的，不能删除文件', 'bad')
-    return
-  }
-  const wasOpen = preview?.kind === 'local' && preview.relPath === file.relPath
-  const overlay = document.createElement('div')
-  overlay.className = 'modal-overlay'
-  overlay.innerHTML = `<div class="modal">
-    <div class="modal-head"><h3>删除本地文件</h3><button class="modal-x" type="button">×</button></div>
-    <p class="hint">「${esc(file.name)}」会从本地目录 <strong>永久删除</strong>，不会进入 EAB 回收区，也不能撤销。</p>
-    <div class="modal-state" id="local-delete-state"></div>
-    <div class="modal-actions"><button class="btn ghost" type="button" id="local-delete-cancel">取消</button><button class="btn danger" type="button" id="local-delete-confirm">永久删除</button></div>
-  </div>`
-  document.body.appendChild(overlay)
-  const close = () => overlay.remove()
-  const stateEl = overlay.querySelector('#local-delete-state')
-  overlay.querySelector('.modal-x').addEventListener('click', close)
-  overlay.querySelector('#local-delete-cancel').addEventListener('click', close)
-  overlay.querySelector('#local-delete-confirm').addEventListener('click', async (event) => {
-    const button = event.currentTarget
-    button.disabled = true
-    stateEl.className = 'modal-state muted'
-    stateEl.textContent = '正在删除…'
-    try {
-      await api(
-        qsAppend(
-          `/api/local-spaces/${encodeURIComponent(space.id)}/file?path=${encodeURIComponent(file.relPath)}`,
-        ),
-        { method: 'DELETE' },
-      )
-      close()
-      if (wasOpen && state.filePreview?.kind === 'local' && state.filePreview.relPath === file.relPath) closeWorkspaceFile()
-      await loadLocalEntries(state.localPath)
-      banner('本地文件已删除', 'ok')
-    } catch (err) {
-      button.disabled = false
-      stateEl.className = 'modal-state bad'
-      stateEl.textContent = err.message || '删除失败'
-    }
-  })
-}
-
 async function deleteWorkspacePreview() {
   const file = state.filePreview
   if (!file) return
-  if (file.kind === 'local') {
-    deleteLocalPreview()
-    return
-  }
   deleteWorkspaceFile(file, true)
 }
 
@@ -2282,13 +1420,7 @@ function downloadWorkspacePreview() {
   const file = state.filePreview
   if (!file) return
   const link = document.createElement('a')
-  if (file.kind === 'local') {
-    const space = currentLocalSpace()
-    if (!space) return
-    link.href = localFileUrl(space, file.relPath)
-  } else {
-    link.href = workspaceFileUrl(file)
-  }
+  link.href = workspaceFileUrl(file)
   link.download = file.name
   document.body.appendChild(link)
   link.click()
@@ -2302,7 +1434,6 @@ function bindWorkspaceFilePane() {
     const file = state.filePreview
     if (file && file.id) sendWorkspaceFileToDingTalk(file)
   })
-  $('#file-pane-rename')?.addEventListener('click', renameLocalFile)
   $('#file-pane-edit')?.addEventListener('click', beginWorkspaceEdit)
   $('#file-pane-cancel')?.addEventListener('click', cancelWorkspaceEdit)
   $('#file-pane-save')?.addEventListener('click', saveWorkspaceEdit)
@@ -2680,15 +1811,9 @@ async function loadMyPlugins() {
   rail.innerHTML = '<div class="plugin-empty muted">正在读取插件…</div>'
   detail.innerHTML = '<div class="plugin-empty muted">正在读取插件…</div>'
   try {
-    const [data, catalog] = await Promise.all([
-      api(`/api/my/plugins${qs()}`),
-      api(`/api/plugins${qs()}`).catch(() => ({ plugins: [] })),
-    ])
+    const data = await api(`/api/my/plugins${qs()}`)
     state.pluginData = data
     state.plugins = Array.isArray(data.plugins) ? data.plugins : []
-    state.pluginCatalog = (Array.isArray(catalog.plugins) ? catalog.plugins : []).filter(
-      (plugin) => !plugin.installScope && !state.plugins.some((item) => item.id === plugin.id),
-    )
     if (!state.pluginSelected || !state.plugins.some((item) => item.id === state.pluginSelected)) {
       state.pluginSelected = state.plugins[0]?.id ?? null
       state.pluginTab = 'overview'
@@ -2702,7 +1827,7 @@ async function loadMyPlugins() {
 }
 
 const MY_PLUGIN_SOURCE_LABEL = {
-  'local-dir': '本地目录',
+  'browser-dir': '本机文件夹',
   npm: 'npm 包',
   github: 'GitHub 仓库',
   catalog: '服务器插件目录',
@@ -2747,7 +1872,10 @@ function myPluginPageUrl(data, plugin, page) {
     .split('/')
     .map((part) => encodeURIComponent(part))
     .join('/')
-  return `/plugins/assets/${encodeURIComponent(plugin.id)}/${path}${qs()}`
+  const params = new URLSearchParams(location.search)
+  params.set('scope', 'user')
+  const text = params.toString()
+  return `/plugins/assets/${encodeURIComponent(plugin.id)}/${path}${text ? `?${text}` : ''}`
 }
 
 function myPluginRailItem(plugin) {
@@ -2785,8 +1913,7 @@ function myPluginRailHtml(data) {
     <div class="plugin-rail-head">已安装 <span class="muted">${plugins.length}</span></div>
     <div class="plugin-rail-list">
       ${plugins.length ? plugins.map(myPluginRailItem).join('') : '<div class="plugin-empty">还没有个人插件</div>'}
-    </div>
-    <div class="plugin-rail-foot muted">公司安装的插件不会混进这里。</div>`
+    </div>`
 }
 
 function myPluginOverviewBody(data, plugin) {
@@ -3146,14 +2273,21 @@ function bindMyPluginWorkspace() {
   }
 }
 
-function bindHintTips(root) {
-  const targets = Array.from(root.querySelectorAll('[data-tip]'))
-  if (!targets.length) return () => {}
-  const tip = document.createElement('div')
+function ensureHintTip() {
+  let tip = document.getElementById('hint-tip')
+  if (tip) return tip
+  tip = document.createElement('div')
   tip.className = 'hint-tip'
   tip.id = 'hint-tip'
   tip.setAttribute('role', 'tooltip')
   document.body.appendChild(tip)
+  return tip
+}
+
+function bindHintTips(root) {
+  const targets = Array.from(root.querySelectorAll('[data-tip]'))
+  if (!targets.length) return () => {}
+  const tip = ensureHintTip()
   let current = null
   const hide = () => {
     if (current) current.removeAttribute('aria-describedby')
@@ -3188,12 +2322,33 @@ function bindHintTips(root) {
   }
   return () => {
     hide()
-    tip.remove()
   }
 }
 
+function readFileAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result || ''))
+    reader.onerror = () => reject(new Error(`读取文件失败：${file.name}`))
+    reader.readAsDataURL(file)
+  })
+}
+
+async function readPluginFolderFiles(files) {
+  const out = []
+  for (const file of files) {
+    const rel = String(file.webkitRelativePath || file.name).replace(/\\/g, '/')
+    const parts = rel.split('/').filter(Boolean)
+    const path = parts.length > 1 ? parts.slice(1).join('/') : rel
+    const dataUrl = await readFileAsDataUrl(file)
+    const comma = dataUrl.indexOf(',')
+    if (comma < 0) throw new Error(`读取文件失败：${file.name}`)
+    out.push({ path, data: dataUrl.slice(comma + 1) })
+  }
+  return out
+}
+
 function showPluginInstall() {
-  const catalog = state.pluginCatalog || []
   const installedCount = state.plugins?.length || 0
   const who = state.me?.person?.name || '你'
   const overlay = document.createElement('div')
@@ -3208,13 +2363,9 @@ function showPluginInstall() {
       <button class="modal-x" type="button" aria-label="关闭">×</button>
     </div>
     <div class="install-source-tabs" role="tablist" aria-label="安装来源">
-      <button class="install-source-tab" type="button" data-install-source="local-dir">
+      <button class="install-source-tab" type="button" data-install-source="browser-dir">
         <span class="install-source-icon"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M1.8 4.3a1.3 1.3 0 0 1 1.3-1.3h3.1l1.4 1.5h4.3a1.3 1.3 0 0 1 1.3 1.3v6.1a1.3 1.3 0 0 1-1.3 1.3H3.1a1.3 1.3 0 0 1-1.3-1.3V4.3Z" stroke="currentColor" stroke-width="1.1"/><path d="M2 6.2h12" stroke="currentColor" stroke-width="1.1"/></svg></span>
-        <span><strong>本机目录 <em class="install-tab-badge">推荐</em></strong><small>自己开发 / 离线可用</small></span>
-      </button>
-      <button class="install-source-tab" type="button" data-install-source="catalog">
-        <span class="install-source-icon"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 16 16" fill="none"><rect x="2.2" y="2.2" width="4.6" height="4.6" rx="1" stroke="currentColor" stroke-width="1.1"/><rect x="9.2" y="2.2" width="4.6" height="4.6" rx="1" stroke="currentColor" stroke-width="1.1"/><rect x="2.2" y="9.2" width="4.6" height="4.6" rx="1" stroke="currentColor" stroke-width="1.1"/><rect x="9.2" y="9.2" width="4.6" height="4.6" rx="1" stroke="currentColor" stroke-width="1.1"/></svg></span>
-        <span><strong>已有插件 <em class="install-tab-badge">${catalog.length}</em></strong><small>服务器上已存在的包</small></span>
+        <span><strong>本机文件夹 <em class="install-tab-badge">推荐</em></strong><small>浏览器上传</small></span>
       </button>
       <button class="install-source-tab" type="button" data-install-source="npm">
         <span class="install-source-icon"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M2.2 4.2 8 1.8l5.8 2.4v7.6L8 14.2l-5.8-3V4.2Z" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round"/><path d="M2.6 4.4 8 6.8l5.4-2.4M8 6.8v7" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round"/></svg></span>
@@ -3225,48 +2376,16 @@ function showPluginInstall() {
         <span><strong>GitHub <em class="install-tab-badge">联网</em></strong><small>公开仓库直装</small></span>
       </button>
     </div>
-    <div class="install-panel" data-install-panel="local-dir">
+    <div class="install-panel" data-install-panel="browser-dir">
       <div class="install-section-head">
-        <div class="install-section-title"><strong>插件包目录</strong><span class="hint-badge icon-only" data-tip="选择你电脑上包含 plugin.json 的文件夹。支持 EAB 插件（plugin.json）和 DSH 插件（package.json 带 dsh 段）；目录由运行 EAB 的这台电脑读取。" tabindex="0" aria-label="插件包目录说明"><svg aria-hidden="true" width="12" height="12" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6.2" stroke="currentColor" stroke-width="1.1"/><path d="M8 7.4v3.4" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/><circle cx="8" cy="4.9" r=".8" fill="currentColor"/></svg></span></div>
-        <span class="pi-local-pill">本机路径</span>
+        <div class="install-section-title"><strong>从我的电脑选择插件文件夹</strong><span class="hint-badge icon-only" data-tip="选择包含 plugin.json 的文件夹。支持 EAB 插件（plugin.json）和 DSH 插件（package.json 带 dsh 段）；浏览器只把文件夹里的文件副本上传给服务端，安装结束即删除临时目录。" tabindex="0" aria-label="插件文件夹说明"><svg aria-hidden="true" width="12" height="12" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6.2" stroke="currentColor" stroke-width="1.1"/><path d="M8 7.4v3.4" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/><circle cx="8" cy="4.9" r=".8" fill="currentColor"/></svg></span></div>
+        <span class="pi-local-pill">浏览器上传</span>
       </div>
       <div class="pi-path-row">
-        <div class="local-path-input pi-path-input">
-          <svg aria-hidden="true" width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M1.8 4.3a1.3 1.3 0 0 1 1.3-1.3h3.1l1.4 1.5h4.3a1.3 1.3 0 0 1 1.3 1.3v6.1a1.3 1.3 0 0 1-1.3 1.3H3.1a1.3 1.3 0 0 1-1.3-1.3V4.3Z" stroke="#667085" stroke-width="1.1"/><path d="M2 6.2h12" stroke="#667085" stroke-width="1.1"/></svg>
-          <input id="pi-source-path" class="mono" aria-label="插件包本地目录" placeholder="选择文件夹后自动填入，也可以粘贴绝对路径，例如 D:\\my-plugins\\oncall" />
-        </div>
-        <button class="btn ghost pi-browse" type="button" id="pi-browse">浏览本机…</button>
+        <input id="pi-folder-input" type="file" webkitdirectory directory multiple hidden />
+        <button class="btn ghost pi-browse" type="button" id="pi-pick-folder">选择插件文件夹…</button>
       </div>
       <div class="pi-path-status" id="pi-path-status" hidden></div>
-      <div class="local-folder-browser" id="pi-browser" hidden>
-        <div class="local-browser-head">
-          <button class="local-browser-up" type="button" id="pi-browser-up" disabled>上一级</button>
-          <div class="local-browser-path" id="pi-browser-path">此电脑</div>
-          <button class="local-browser-close" type="button" id="pi-browser-close">收起</button>
-        </div>
-        <div class="local-browser-list" id="pi-browser-list"></div>
-        <div class="local-browser-foot">
-          <span class="local-browser-hint" id="pi-browser-hint">请进入插件包文件夹再选择</span>
-          <button class="btn primary sm" type="button" id="pi-browser-choose" disabled>选择此文件夹</button>
-        </div>
-      </div>
-    </div>
-    <div class="install-panel" data-install-panel="catalog">
-      <div class="install-section-head">
-        <div class="install-section-title"><strong>选择要安装的插件</strong><span class="install-tab-badge hint-badge" data-tip="公司已安装的插件不会混进个人列表" tabindex="0" aria-label="个人列表说明">仅个人</span></div>
-        <span class="install-tab-badge">${catalog.length} 个可选</span>
-      </div>
-      <div class="pi-catalog-list">
-        ${catalog.length ? catalog.map((plugin, index) => `<label class="pi-catalog-item">
-          <input type="radio" name="pi-plugin-id" value="${esc(plugin.id)}" ${index === 0 ? 'checked' : ''} />
-          <span class="pi-catalog-avatar">${esc((plugin.name || plugin.id).slice(0, 1).toUpperCase())}</span>
-          <span class="pi-catalog-copy">
-            <strong>${esc(plugin.name || plugin.id)}</strong>
-            <small>${esc(plugin.description || plugin.id)}</small>
-          </span>
-          <span class="pi-catalog-meta">${esc(plugin.format === 'dsh' ? 'DSH' : 'EAB')} · v${esc(plugin.version || '—')}</span>
-        </label>`).join('') : '<div class="pi-empty">服务器上暂时没有可以安装的插件。</div>'}
-      </div>
     </div>
     <div class="install-panel" data-install-panel="npm">
       <div class="install-grid">
@@ -3287,7 +2406,7 @@ function showPluginInstall() {
         <input type="checkbox" id="pi-overwrite" />
         <span>覆盖同名插件 <em class="install-tab-badge warn hint-badge" data-tip="会替换插件库里的同名目录；已有配置不保证保留。" tabindex="0" aria-label="覆盖风险说明">谨慎</em></span>
       </label>
-      <span class="install-tab-badge hint-badge" id="pi-note" data-tip="本机目录：直接读取你电脑上的插件文件夹，先校验再复制到插件库；适合自己开发和离线安装。" tabindex="0" aria-label="安装来源说明">来源说明</span>
+      <span class="install-tab-badge hint-badge" id="pi-note" data-tip="本机文件夹：浏览器选中你电脑上的插件文件夹，把文件副本上传给服务端校验后安装；适合自己开发和离线安装。" tabindex="0" aria-label="安装来源说明">来源说明</span>
       <span class="install-tab-badge hint-badge" data-tip="① 读取插件目录 → ② 校验清单 → ③ 写入插件库 → ④ 出现在个人工作台" tabindex="0" aria-label="安装流程说明">安装流程</span>
       <span class="install-tab-badge hint-badge" data-tip="安装后可在个人工作台启停或卸载。" tabindex="0" aria-label="安装归属说明">只装到你名下</span>
     </div>
@@ -3313,28 +2432,29 @@ function showPluginInstall() {
   const panels = Array.from(overlay.querySelectorAll('[data-install-panel]'))
   const noteEl = overlay.querySelector('#pi-note')
   const stateEl = overlay.querySelector('#pi-state')
-  const sourcePathInput = overlay.querySelector('#pi-source-path')
+  const folderInput = overlay.querySelector('#pi-folder-input')
+  const pickFolder = overlay.querySelector('#pi-pick-folder')
   const pathStatus = overlay.querySelector('#pi-path-status')
-  let source = 'local-dir'
+  let selectedFolderFiles = []
+  let selectedFolderName = ''
+  let source = 'browser-dir'
 
   const sourceNotes = {
-    'local-dir': '本机目录：直接读取你电脑上的插件文件夹，先校验再复制到插件库；适合自己开发和离线安装。',
-    catalog: '已有插件：从 EAB 服务器上已经存在的插件里选一个，只安装到你个人名下。',
+    'browser-dir': '本机文件夹：浏览器选中你电脑上的插件文件夹，把文件副本上传给服务端校验后安装；适合自己开发和离线安装。',
     npm: 'npm / 镜像：从 registry 拉 tarball 后校验；不执行 npm install、prepare 或任何生命周期脚本。',
     github: 'GitHub：下载仓库 tarball 后校验；仓库里必须有 plugin.json，构建产物需随仓库提交。',
   }
 
-  const syncPathStatus = () => {
-    const value = sourcePathInput.value.trim()
-    if (!value) {
+  const syncFolderStatus = () => {
+    if (selectedFolderFiles.length === 0) {
       pathStatus.hidden = true
       pathStatus.innerHTML = ''
       return
     }
-    const folderName = value.split(/[\\/]/).filter(Boolean).pop() || value
+    const total = selectedFolderFiles.reduce((sum, file) => sum + (file.size || 0), 0)
     pathStatus.hidden = false
     pathStatus.innerHTML = `<span class="pi-path-status-icon"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M1.8 4.3a1.3 1.3 0 0 1 1.3-1.3h3.1l1.4 1.5h4.3a1.3 1.3 0 0 1 1.3 1.3v6.1a1.3 1.3 0 0 1-1.3 1.3H3.1a1.3 1.3 0 0 1-1.3-1.3V4.3Z" stroke="currentColor" stroke-width="1.1"/></svg></span>
-      <span class="pi-path-status-copy"><strong>${esc(folderName)}</strong><small>${esc(value)}</small></span>
+      <span class="pi-path-status-copy"><strong>${esc(selectedFolderName)}</strong><small>${selectedFolderFiles.length} 个文件 · ${esc(fmtSize(total))}</small></span>
       <span class="pill ok">已选择</span>`
   }
 
@@ -3352,29 +2472,21 @@ function showPluginInstall() {
     stateEl.textContent = ''
   }
   for (const tab of tabs) tab.addEventListener('click', () => syncSource(tab.dataset.installSource))
-  sourcePathInput.addEventListener('input', syncPathStatus)
-  syncSource(source)
-
-  mountLocalFolderBrowser({
-    trigger: overlay.querySelector('#pi-browse'),
-    input: sourcePathInput,
-    panel: overlay.querySelector('#pi-browser'),
-    list: overlay.querySelector('#pi-browser-list'),
-    pathLabel: overlay.querySelector('#pi-browser-path'),
-    up: overlay.querySelector('#pi-browser-up'),
-    choose: overlay.querySelector('#pi-browser-choose'),
-    hint: overlay.querySelector('#pi-browser-hint'),
-    close: overlay.querySelector('#pi-browser-close'),
-    onOpen: () => {
-      stateEl.textContent = ''
-      stateEl.className = 'modal-state'
-    },
-    onChoose: () => {
-      syncPathStatus()
-      stateEl.textContent = '已选择插件目录，点「安装插件」继续'
-      stateEl.className = 'modal-state ok'
-    },
+  pickFolder.addEventListener('click', () => {
+    folderInput.value = ''
+    folderInput.click()
   })
+  folderInput.addEventListener('change', () => {
+    selectedFolderFiles = Array.from(folderInput.files || [])
+    const firstPath = String(selectedFolderFiles[0]?.webkitRelativePath || '')
+    selectedFolderName = firstPath.split('/').filter(Boolean)[0] || '插件文件夹'
+    syncFolderStatus()
+    if (selectedFolderFiles.length > 0) {
+      stateEl.className = 'modal-state ok'
+      stateEl.textContent = `已选择「${selectedFolderName}」，点「安装插件」上传并安装`
+    }
+  })
+  syncSource(source)
 
   const submit = overlay.querySelector('#pi-submit')
   submit.addEventListener('click', async () => {
@@ -3382,22 +2494,16 @@ function showPluginInstall() {
       source,
       overwrite: overlay.querySelector('#pi-overwrite').checked,
     }
-    if (source === 'catalog') {
-      body.pluginId = overlay.querySelector('input[name="pi-plugin-id"]:checked')?.value || ''
-      if (!body.pluginId) {
+    if (source === 'browser-dir') {
+      if (selectedFolderFiles.length === 0) {
         stateEl.className = 'modal-state bad'
-        stateEl.textContent = '请选择一个要安装的插件'
+        stateEl.textContent = '请选择一个插件文件夹（含 plugin.json 或 DSH 的 package.json）'
         return
       }
-    }
-    if (source === 'local-dir') {
-      body.sourcePath = sourcePathInput.value.trim()
-      if (!body.sourcePath) {
-        stateEl.className = 'modal-state bad'
-        stateEl.textContent = '请选择插件包目录，或粘贴本机绝对路径'
-        sourcePathInput.focus()
-        return
-      }
+      stateEl.className = 'modal-state muted'
+      stateEl.textContent = '正在读取文件夹并上传…'
+      body.files = await readPluginFolderFiles(selectedFolderFiles)
+      body.folderName = selectedFolderName
     }
     if (source === 'npm') {
       body.packageName = overlay.querySelector('#pi-npm-name').value.trim()
@@ -3465,13 +2571,27 @@ function modelLabel(modelId) {
   return state.models.find((m) => m.id === modelId)?.name ?? modelId
 }
 
-function setSelected(modelId) {
-  state.selected = modelId
-  $('#model-chip-label').textContent = modelLabel(modelId)
+function setSelected(modelId, options = {}) {
+  const visible = modelId ? state.models.find((m) => m.id === modelId) : null
+  state.selected = visible ? visible.id : ''
+  $('#model-chip-label').textContent = modelLabel(state.selected)
   $('#model-menu').hidden = true
   $('#model-chip').setAttribute('aria-expanded', 'false')
   renderModelMenus()
   renderAttachments()
+  if (options.persist !== false && state.sessionId) persistSessionModel(state.selected)
+}
+
+async function persistSessionModel(modelId) {
+  try {
+    await api(`/api/chat/sessions/${encodeURIComponent(state.sessionId)}/model${qs()}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ modelId: modelId || null }),
+    })
+  } catch (err) {
+    banner(`模型已切换，但当前会话没有保存：${err.message || '保存失败'}`, 'warn')
+  }
 }
 
 function renderSideModels() {
@@ -3527,6 +2647,130 @@ function renderModelMenu() {
 function renderModelMenus() {
   renderSideModels()
   renderModelMenu()
+}
+
+/* ---------------- 对话内模型切换 ---------------- */
+
+function compactModelText(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[\s\u3000·_.\-/／（）()]+/g, '')
+}
+
+function modelMatches(query) {
+  const q = compactModelText(query).replace(/模型$/g, '')
+  if (!q) return []
+  const exact = state.models.filter((model) => compactModelText(model.name) === q || compactModelText(model.id) === q)
+  if (exact.length > 0) return exact
+  return state.models.filter((model) => {
+    const name = compactModelText(model.name)
+    const id = compactModelText(model.id)
+    return name.includes(q) || id.includes(q) || (name.length >= 2 && q.includes(name))
+  })
+}
+
+function appendModelCommandNote(text) {
+  setEmptyVisible(false)
+  const node = document.createElement('div')
+  node.className = 'chat-command-note'
+  node.textContent = text
+  $('#thread').appendChild(node)
+  scrollThreadToBottomInstant()
+}
+
+function appendModelCommandCard(title, models, hint = '') {
+  setEmptyVisible(false)
+  const node = document.createElement('div')
+  node.className = 'chat-command-card'
+  const autoRow = state.autoModelId
+    ? `<button class="chat-command-option ${state.selected === '' ? 'is-active' : ''}" type="button" data-model="">
+        <strong>自动选择${state.selected === '' ? ' · 当前' : ''}</strong>
+        <span>${autoName() ? `让系统按你的权限挑，现在会选 ${esc(autoName())}` : '让系统按你的权限挑'}</span>
+      </button>`
+    : ''
+  const rows = models.map((model) => {
+    const active = state.selected === model.id
+    const detail = [model.desc, model.tags && model.tags.length ? modelTagsLabel(model.tags) : '', model.supportsVision ? '图片识别' : '']
+      .filter(Boolean)
+      .join(' · ')
+    return `<button class="chat-command-option ${active ? 'is-active' : ''}" type="button" data-model="${esc(model.id)}">
+      <strong>${esc(model.name)}${active ? ' · 当前' : ''}</strong>
+      <span>${esc(detail || '可用模型')}</span>
+    </button>`
+  })
+  node.innerHTML = `<div class="chat-command-head"><strong>${esc(title)}</strong><span>${esc(hint)}</span></div>
+    <div class="chat-command-list">${autoRow}${rows.join('')}</div>`
+  $('#thread').appendChild(node)
+  node.querySelectorAll('[data-model]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const modelId = button.dataset.model || ''
+      const model = modelId ? state.models.find((item) => item.id === modelId) : null
+      if (modelId && !model) return
+      setSelected(modelId)
+      node.remove()
+      appendModelCommandNote(modelId ? `已切换到「${model.name}」。接下来的消息会使用它。` : `已切回自动选择${autoName() ? `（现在会选「${autoName()}」）` : ''}。`)
+    })
+  })
+  scrollThreadToBottomInstant()
+}
+
+function handleModelCommand(rawText) {
+  const text = String(rawText || '').trim()
+  if (!text || text.length > 160 || state.attachments.length > 0) return false
+  if (/^\/(model|models|模型)$/i.test(text) || /^(切换模型|换模型)$/.test(text)) {
+    appendModelCommandCard(
+      `可用模型（${state.models.length}）`,
+      state.models,
+      '只来自当前身份有权限使用的模型，点选即可切换',
+    )
+    return true
+  }
+  if (/^\/(auto|自动)$/i.test(text)) {
+    setSelected('')
+    appendModelCommandNote(`已切回自动选择${autoName() ? `（现在会选「${autoName()}」）` : ''}。`)
+    return true
+  }
+
+  const patterns = [
+    /^\/model\s+([\s\S]+)$/i,
+    /^切换到\s*([\s\S]+)$/,
+    /^切换模型(?:到|为|成)?\s*([\s\S]+)$/,
+    /^换成\s*([\s\S]+)$/,
+    /^换用\s*([\s\S]+)$/,
+    /^使用\s*([\s\S]+?)\s*模型$/,
+    /^用\s*([\s\S]+?)\s*模型$/,
+  ]
+  let query = ''
+  for (const pattern of patterns) {
+    const match = pattern.exec(text)
+    if (match) {
+      query = String(match[1] || '').trim().replace(/(?:模型|吧|呢|。|！|!)$/g, '').trim()
+      break
+    }
+  }
+  if (!query) return false
+  if (compactModelText(query) === '自动' || compactModelText(query) === 'auto' || compactModelText(query) === '默认') {
+    setSelected('')
+    appendModelCommandNote(`已切回自动选择${autoName() ? `（现在会选「${autoName()}」）` : ''}。`)
+    return true
+  }
+
+  const matches = modelMatches(query)
+  if (matches.length === 0) {
+    appendModelCommandCard(
+      `没有找到「${query}」`,
+      state.models,
+      '只列出当前身份有权限使用的模型，可直接点选',
+    )
+    return true
+  }
+  if (matches.length > 1) {
+    appendModelCommandCard(`找到 ${matches.length} 个匹配「${query}」的模型`, matches, '点选一个切换')
+    return true
+  }
+  setSelected(matches[0].id)
+  appendModelCommandNote(`已切换到「${matches[0].name}」。接下来的消息会使用它。`)
+  return true
 }
 
 /* ---------------- 空态与消息 ---------------- */
@@ -3692,6 +2936,7 @@ function createAiTurn() {
   </div>`
   $('#thread').appendChild(node)
   bindToolToggles(node)
+  scrollThreadToBottomInstant()
 
   const think = node.querySelector('.think-panel')
   const thinkTitle = node.querySelector('.think-title')
@@ -3712,7 +2957,7 @@ function createAiTurn() {
     scrollQueued = true
     requestAnimationFrame(() => {
       scrollQueued = false
-      node.scrollIntoView({ block: 'end', behavior: 'smooth' })
+      scrollThreadToBottomInstant()
     })
   }
   const setStatus = (text) => {
@@ -3809,6 +3054,10 @@ function createAiTurn() {
       const thinking = think.hidden ? '' : ` · 思考 ${formatElapsed((firstAnswerAt || Date.now()) - startedAt)}`
       metaLine.hidden = false
       metaLine.innerHTML = `${channelTag(data.channel)}${esc(`${data.modelName || ''}${data.autoSelected ? ' · 自动选择' : ''}${thinking}${citations}`)}`
+      // 固定模型的会话发生故障转移时，后端已写回接替模型；气泡同步为实际接替模型。
+      if (!data.autoSelected && data.fallbackFromModelId && data.modelId) {
+        setSelected(data.modelId, { persist: false })
+      }
       scroll()
     },
     fail(message, meta) {
@@ -3979,23 +3228,23 @@ function updateSendState() {
   $('#send').disabled = state.models.length === 0 || (!text && state.attachments.length === 0)
 }
 
-/** 当前回复 + 排队消息的状态提示；不显示进度百分比，只说明顺序与可中断。 */
+/** 只在真的出现排队消息时提示；只有一条正在回复的消息时不占输入区。 */
 function renderQueueState() {
   const bar = $('#queue-bar')
   if (!bar) return
   const queued = state.queue.length
-  bar.hidden = !(state.sending || queued > 0)
+  const stopReply = $('#stop-reply')
+  if (stopReply) stopReply.hidden = !state.sending || queued > 0
+  bar.hidden = queued === 0
   if (bar.hidden) return
   const text = state.sending
-    ? queued > 0
-      ? `正在回复，你的消息已排队（前面还有 ${queued} 条）`
-      : '正在回复，你的新消息会按顺序排队'
+    ? `正在回复，后面还有 ${queued} 条排队`
     : `有 ${queued} 条消息等待发送`
   const label = $('#queue-text')
   if (label) label.textContent = text
   const stop = $('#queue-stop')
   if (stop) {
-    stop.textContent = queued > 0 ? '停止当前回复并发送' : '停止当前回复'
+    stop.textContent = '停止当前回复并发送'
     stop.disabled = !state.sending
   }
 }
@@ -4087,6 +3336,12 @@ async function send() {
   const input = $('#input')
   const text = input.value.trim()
   if (!text && state.attachments.length === 0) return
+  if (handleModelCommand(text)) {
+    input.value = ''
+    input.style.height = '44px'
+    updateSendState()
+    return
+  }
 
   const modelId = state.selected || null
   const pending = state.attachments.slice()
@@ -4104,10 +3359,25 @@ async function send() {
     sessionId: state.sessionId,
     node: null,
   }
+
+  // 打断模式：新消息优先。丢掉尚未发送的旧排队项，并中止当前回复；
+  // 当前 drainQueue 的 finally 会接着消费这条新消息。
+  if (state.sending && state.chatSendMode === 'interrupt') {
+    const dropped = state.queue.splice(0)
+    for (const queued of dropped) {
+      queued.node?.remove()
+      for (const file of queued.pending) {
+        if (file.previewUrl) URL.revokeObjectURL(file.previewUrl)
+      }
+    }
+    stopCurrentReply()
+  }
+
   state.queue.push(item)
   input.value = ''
   input.style.height = '44px'
   item.node = appendMessage('me', text, undefined, attachmentMeta)
+  scrollThreadToBottomInstant()
 
   state.attachments = []
   renderAttachments()
@@ -4149,7 +3419,6 @@ async function drainQueue() {
         attachments,
         sessionId: targetSessionId,
         spaceKind: state.spaceKind,
-        spaceId: state.spaceKind === 'local' ? state.localSpaceId : null,
       },
       (event, data) => {
         const sameSession = targetSessionId === null ? state.sessionId === null : state.sessionId === targetSessionId
@@ -4179,7 +3448,6 @@ async function drainQueue() {
           turn.finish(data)
           loadSessions()
           void loadWorkspaceFiles()
-          if (state.spaceKind === 'local') void loadLocalEntries(state.localPath)
         } else if (event === 'error') {
           const err = new Error(data.message || '模型调用失败')
           err.code = data.code
@@ -4248,6 +3516,24 @@ function renderPasswordSettingRow() {
   }
 }
 
+function renderChatSendModeSetting() {
+  const segment = $('#settings-send-segment')
+  const hint = $('#settings-send-mode-hint')
+  if (!segment) return
+  const mode = state.chatSendMode === 'interrupt' ? 'interrupt' : 'queue'
+  for (const button of segment.querySelectorAll('[data-send-mode]')) {
+    const active = button.dataset.sendMode === mode
+    button.classList.toggle('is-active', active)
+    button.setAttribute('aria-checked', active ? 'true' : 'false')
+  }
+  if (hint) {
+    hint.textContent =
+      mode === 'interrupt'
+        ? '打断：立即停止当前回复，优先发送这条新消息'
+        : '排队：当前回复结束后，再按顺序发送'
+  }
+}
+
 function showSettings() {
   const stage = $('#settings-stage')
   if (!stage) return
@@ -4256,6 +3542,7 @@ function showSettings() {
   stage.hidden = false
   $('#open-settings').classList.add('is-active')
   renderSettingsProfile()
+  renderChatSendModeSetting()
 }
 
 function hideSettings() {
@@ -4287,6 +3574,35 @@ function bindSettings() {
   $('#settings-caps').addEventListener('click', showMyCaps)
   $('#settings-password').addEventListener('click', showPasswordModal)
   $('#settings-logout').addEventListener('click', logout)
+  $('#settings-send-segment').addEventListener('click', async (event) => {
+    const button = event.target.closest?.('[data-send-mode]')
+    if (!button) return
+    const next = button.dataset.sendMode
+    if (next !== 'queue' && next !== 'interrupt') return
+    if (next === state.chatSendMode) return
+    const previous = state.chatSendMode
+    state.chatSendMode = next
+    renderChatSendModeSetting()
+    const buttons = [...$('#settings-send-segment').querySelectorAll('button')]
+    for (const item of buttons) item.disabled = true
+    try {
+      const saved = await api('/api/me/chat-send-mode', {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ chatSendMode: next }),
+      })
+      state.chatSendMode = saved.chatSendMode === 'interrupt' ? 'interrupt' : 'queue'
+      if (state.me) state.me.chatSendMode = state.chatSendMode
+      renderChatSendModeSetting()
+      banner(state.chatSendMode === 'interrupt' ? '已改为打断模式' : '已改为排队模式', 'ok')
+    } catch (err) {
+      state.chatSendMode = previous
+      renderChatSendModeSetting()
+      banner(err.message || '保存失败，请重试', 'bad')
+    } finally {
+      for (const item of buttons) item.disabled = false
+    }
+  })
 }
 
 let ssoSdkPromise = null
@@ -4596,6 +3912,7 @@ async function boot() {
     button.addEventListener('click', () => setChatMode(button.dataset.mode))
   }
   bindWorkspaceFilePane()
+  bindSpacePicker()
   setChatMode('chat')
 
   let hasSession = false
@@ -4632,6 +3949,7 @@ async function boot() {
   try {
     me = await api(`/api/me${qs()}`)
     state.me = me
+    state.chatSendMode = me.chatSendMode === 'interrupt' ? 'interrupt' : 'queue'
     state.assistant = me.assistant || { name: 'AI', avatarUrl: '' }
   } catch (err) {
     // as 指向不存在/失效的人 → 回到登录页，而不是显示别人的信息
@@ -4666,7 +3984,6 @@ async function boot() {
     renderAttachments()
     $('#demo-pill').hidden = !models.models.every((model) => model.provider === 'demo')
     await loadSessions()
-    await loadLocalSpaces()
     setupChatEvents()
     if (state.sessions.length > 0) {
       await openSession(state.sessions[0].id)
@@ -4683,6 +4000,7 @@ async function boot() {
   window.addEventListener('resize', queueScrollBottomButtonUpdate)
   $('#send').addEventListener('click', send)
   $('#queue-stop').addEventListener('click', stopCurrentReply)
+  $('#stop-reply').addEventListener('click', stopCurrentReply)
   $('#input').addEventListener('keydown', (event) => {
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault()
@@ -4695,15 +4013,7 @@ async function boot() {
   })
   $('#input').addEventListener('focus', () => $('#composer-box').classList.add('is-focus'))
 
-  // 空间选择：输入框左侧气泡
-  $('#space-chip').addEventListener('click', (event) => {
-    event.stopPropagation()
-    const menu = $('#space-menu')
-    const open = menu.hidden
-    if (open) renderSpaceMenu()
-    menu.hidden = !open
-    $('#space-chip').setAttribute('aria-expanded', open ? 'true' : 'false')
-  })
+  // 空间选择：输入框左侧气泡（已在 boot 早期绑定，保证无模型时也可切换）
   // 云空间角标：悬停 / 聚焦 / 点击都能看到配额信息
   const quotaPopover = $('#ws-quota-popover')
   const quotaBadge = $('#ws-info')
@@ -4730,11 +4040,8 @@ async function boot() {
   quotaBadge?.addEventListener('blur', hideQuota)
   quotaPopover?.addEventListener('mouseenter', showQuota)
   quotaPopover?.addEventListener('mouseleave', hideQuota)
-  $('#local-config')?.addEventListener('click', openLocalManager)
-  $('#local-new-file')?.addEventListener('click', openLocalNewFile)
 
   document.addEventListener('click', (event) => {
-    if (!event.target.closest('#space-chip') && !event.target.closest('#space-menu')) hideSpaceMenu()
     if (!event.target.closest('#ws-info') && !event.target.closest('#ws-quota-popover')) hideQuota()
   })
 
@@ -4818,36 +4125,14 @@ async function boot() {
       link.remove()
     }
   })
-  $('#local-menu').addEventListener('click', async (event) => {
-    const action = event.target.closest('[data-local-act]')
-    if (!action) return
-    const relPath = $('#local-menu').dataset.localPath
-    const entry = localEntryByPath(relPath)
-    hideLocalMenu()
-    if (!entry) return
-    const act = action.dataset.localAct
-    if (act === 'open') {
-      openLocalEntry(entry)
-    } else if (act === 'edit') {
-      await editLocalEntry(entry)
-    } else if (act === 'rename') {
-      renameLocalFile(entry)
-    } else if (act === 'download') {
-      downloadLocalEntry(entry)
-    } else if (act === 'delete') {
-      deleteLocalPreview(entry)
-    }
-  })
   document.addEventListener('click', (event) => {
     if (!event.target.closest('#session-menu') && !event.target.closest('.side-session-more')) hideSessionMenu()
     if (!event.target.closest('#file-menu') && !event.target.closest('.side-file-more')) hideFileMenu()
-    if (!event.target.closest('#local-menu') && !event.target.closest('[data-local-more]')) hideLocalMenu()
   })
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape') {
       hideSessionMenu()
       hideFileMenu()
-      hideLocalMenu()
       hideSpaceMenu()
       hideQuota()
     }
@@ -4855,7 +4140,6 @@ async function boot() {
   window.addEventListener('resize', () => {
     hideSessionMenu()
     hideFileMenu()
-    hideLocalMenu()
     hideSpaceMenu()
     hideQuota()
   })
@@ -4878,4 +4162,5 @@ async function boot() {
 }
 
 bindSettings()
+bindHintTips($('#workspace-pane'))
 boot()

@@ -200,11 +200,17 @@ importers:
       '@eab/storage':
         specifier: workspace:*
         version: link:../storage
+      qrcode:
+        specifier: ^1.5.4
+        version: 1.5.4
 
   packages/domain: {}
 
   packages/server:
     dependencies:
+      '@deepseek-ai/cordis':
+        specifier: 4.1.0
+        version: 4.1.0
       '@eab/authz':
         specifier: workspace:*
         version: link:../authz
@@ -240,6 +246,21 @@ importers:
         version: link:../domain
 
 packages:
+
+  '@deepseek-ai/cordis@4.1.0':
+    resolution: {integrity: sha512-CJrjNyBkKn1SfvBQUcgFYKFnLjS+uKrhdMsbHU60xabvi12d+xQ+IQSNlME5Z+B+4Zi6n4BDknKY94tEPeo47w==}
+    hasBin: true
+    peerDependencies:
+      '@deepseek-ai/cordis-plugin-include': ~1.1.0
+      '@deepseek-ai/cordis-plugin-loader': ~1.1.0
+    peerDependenciesMeta:
+      '@deepseek-ai/cordis-plugin-include':
+        optional: true
+      '@deepseek-ai/cordis-plugin-loader':
+        optional: true
+
+  '@deepseek-ai/cosmokit@1.9.0':
+    resolution: {integrity: sha512-5O1S53mZiJyZYcvxxD0Qv1EY7qFPSxbGyD8CbVK6gw7W9FvcXZj2YIX1ZkOqyQQ3Xt2rFkZDHJv0+V3Zmmp8CA==}
 
   '@esbuild/aix-ppc64@0.21.5':
     resolution: {integrity: sha512-1SDgH6ZSPTlggy1yI6+Dbkiz8xzpHJEVAlF/AM1tHPLsf5STom9rwtjE4hKAF20FfXXNTFqEYXyJNWh1GiZedQ==}
@@ -704,6 +725,9 @@ packages:
     resolution: {integrity: sha512-Khj/vrKCpdbiAWYbJAeSy4D5iep+qwW/86lNoKvdleJYGxgbRE7h87+5d5T9D7gt8NcqhNFpreRgIg8T4bLzKQ==}
     cpu: [x64]
     os: [win32]
+
+  '@standard-schema/spec@1.1.0':
+    resolution: {integrity: sha512-l2aFy5jALhniG5HgqrD6jXLi/rUWrKvqN/qJx6yoJsgKhblVd+iqqU4RCXavm/jPityDo5TCvKMnpjKnOriy0w==}
 
   '@types/estree@1.0.10':
     resolution: {integrity: sha512-lTyOMnOcmRBzdCv6/4zUZCrEhV0xrqQiUZBZtVcbmLHBXKLnN8q89v/wKRF/Q0HbwVsqbIG3o5HDoFl9sduM+g==}
@@ -1318,6 +1342,13 @@ packages:
 
 snapshots:
 
+  '@deepseek-ai/cordis@4.1.0':
+    dependencies:
+      '@deepseek-ai/cosmokit': 1.9.0
+      '@standard-schema/spec': 1.1.0
+
+  '@deepseek-ai/cosmokit@1.9.0': {}
+
   '@esbuild/aix-ppc64@0.21.5':
     optional: true
 
@@ -1571,6 +1602,8 @@ snapshots:
 
   '@rollup/rollup-win32-x64-msvc@4.67.5':
     optional: true
+
+  '@standard-schema/spec@1.1.0': {}
 
   '@types/estree@1.0.10': {}
 

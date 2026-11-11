@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@eab/domain": "workspace:*",
-    "@eab/storage": "workspace:*"
+    "@eab/storage": "workspace:*",
+    "qrcode": "^1.5.4"
   }
 }

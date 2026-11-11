@@ -5,7 +5,18 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>DSH 插件</title>
 <style>
-  :root { color-scheme: light; }
+  :root {
+    color-scheme: light;
+    --dsw-alias-bg: #f6f8f7;
+    --dsw-alias-bg-elevated: #ffffff;
+    --dsw-alias-text: #1f2937;
+    --dsw-alias-text-muted: #6b7280;
+    --dsw-alias-border: #e4e7ec;
+    --dsw-alias-primary: #0f766e;
+    --dsw-alias-primary-soft: #e6f4f2;
+    --dsw-alias-radius: 12px;
+    --dsw-alias-gap: 12px;
+  }
   * { box-sizing: border-box; }
   body { margin: 0; font: 14px/1.55 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif; color: #1f2937; background: #f6f8f7; }
   .ph-top { min-width: 0; display: flex; align-items: center; gap: 12px; padding: 14px 20px; background: #fff; border-bottom: 1px solid #e4e7ec; position: sticky; top: 0; z-index: 5; }
@@ -28,9 +39,17 @@
   .ph-nav button.on .ph-dot { background: #0f766e; }
   .ph-main { padding: 18px 20px 40px; min-width: 0; }
   .ph-panel { background: #fff; border: 1px solid #e4e7ec; border-radius: 12px; padding: 18px; min-height: 360px; }
+  .ph-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .ph-action { display: inline-flex; align-items: center; }
+  .ph-action button { appearance: none; border: 1px solid #d1d5db; background: #fff; color: #374151; border-radius: 8px; padding: 5px 11px; font-size: 12px; cursor: pointer; }
+  .ph-action button:hover { border-color: #0f766e; color: #0f766e; }
   .ph-log { margin-top: 12px; border: 1px solid #e4e7ec; border-radius: 10px; background: #fff; padding: 10px 12px; max-height: 190px; overflow: auto; font: 12px/1.5 ui-monospace, Consolas, monospace; color: #475569; white-space: pre-wrap; }
   .ph-empty { color: #6b7280; padding: 40px 10px; text-align: center; }
   .ph-error { color: #b91c1c; background: #fef2f2; border: 1px solid #fecaca; border-radius: 10px; padding: 10px 12px; margin-bottom: 12px; font-size: 12px; }
+  .ph-slot-error { border: 1px solid #fecaca; background: #fff7f7; border-radius: 10px; padding: 18px; color: #7f1d1d; }
+  .ph-slot-error-title { font-weight: 700; margin-bottom: 6px; }
+  .ph-slot-error-detail { color: #6b7280; font-size: 12px; white-space: pre-wrap; margin-bottom: 12px; }
+  .ph-slot-error-retry { appearance: none; border: 1px solid #fecaca; background: #fff; color: #991b1b; border-radius: 8px; padding: 6px 12px; cursor: pointer; }
   .ph-hidden { display: none; }
 </style>
 </head>
@@ -44,6 +63,7 @@
   <span class="ph-badge" id="ph-format">DSH 插件</span>
   <span class="ph-badge" id="ph-host">host 状态检测中</span>
   <div class="ph-right">
+    <div class="ph-actions" id="ph-detail-actions"></div>
     <button class="ph-btn" id="ph-reload" type="button">重新加载</button>
     <button class="ph-btn" id="ph-log-toggle" type="button">宿主日志</button>
   </div>
@@ -52,6 +72,8 @@
   <aside class="ph-rail">
     <div class="ph-rail-title">插件页面</div>
     <nav class="ph-nav" id="ph-nav"></nav>
+    <div class="ph-rail-title ph-hidden" id="ph-panel-title">侧栏面板</div>
+    <nav class="ph-nav" id="ph-panel-nav"></nav>
     <div class="ph-rail-title ph-hidden" id="ph-settings-title">设置</div>
     <nav class="ph-nav" id="ph-settings-nav"></nav>
   </aside>
@@ -74,6 +96,8 @@
   var company = query.get('company') || '';
   var version = query.get('version') || '';
   var title = query.get('title') || pluginId;
+  /** manifest 的 dsh.client.inject，用来核对运行时模块是否齐全 */
+  var clientInject = (query.get('inject') || '').split(',').map(function (item) { return item.trim(); }).filter(Boolean);
   /** 个人工作台打开时 scope=user：走不带控制台会话的员工接口 */
   var scope = query.get('scope') === 'user' ? 'user' : 'console';
   var asUser = query.get('as') || '';
@@ -92,10 +116,179 @@
   var errorEl = document.getElementById('ph-error');
   var logEl = document.getElementById('ph-log');
   var navEl = document.getElementById('ph-nav');
+  var panelNavEl = document.getElementById('ph-panel-nav');
+  var panelTitleEl = document.getElementById('ph-panel-title');
   var settingsNavEl = document.getElementById('ph-settings-nav');
   var settingsTitleEl = document.getElementById('ph-settings-title');
+  var detailActionsEl = document.getElementById('ph-detail-actions');
   var panelEl = document.getElementById('ph-panel');
   var hostBadge = document.getElementById('ph-host');
+  var pluginApiPrefixes = [];
+  var fetchBridgeInstalled = false;
+  var gatewayBase = scope === 'user'
+    ? '/api/my/plugins/' + encodeURIComponent(pluginId) + '/gateway'
+    : '/api/console/plugins/' + encodeURIComponent(pluginId) + '/gateway';
+
+  /**
+   * DSH client 习惯直接请求同源 `/api/<插件路径>`；EAB 控制台 API 不能走插件网关。
+   * 这里保留 EAB 自有前缀，其余同源 /api/* 全部透明改写到插件网关。
+   * 不再依赖 host 状态里的 routes：插件晚注册路由、SSE、XHR 都不会打空。
+   */
+  var EAB_API_PREFIXES = [
+    '/api/console', '/api/my', '/api/plugins', '/api/auth', '/api/admin',
+    '/api/health', '/api/system', '/api/settings', '/api/workspace', '/api/memory',
+    '/api/chat', '/api/org', '/api/channel', '/api/kb', '/api/quota', '/api/tools',
+    '/api/sync', '/plugins/assets', '/plugin-host.html'
+  ];
+
+  function isEabReserved(path) {
+    return EAB_API_PREFIXES.some(function (prefix) {
+      return path === prefix || path.indexOf(prefix + '/') === 0;
+    });
+  }
+
+  function mapPluginUrl(input) {
+    var raw = typeof input === 'string' ? input : (input && input.url) || '';
+    if (!raw) return '';
+    var url;
+    try { url = new URL(raw, location.href); } catch (_) { return ''; }
+    if (url.origin !== location.origin) return '';
+    if (url.pathname !== '/api' && url.pathname.indexOf('/api/') !== 0) return '';
+    if (isEabReserved(url.pathname)) return '';
+    return gatewayBase + url.pathname + url.search;
+  }
+
+  function bridgeHeaders(headers) {
+    var next = new Headers(headers || {});
+    if (scope !== 'user') next.set('x-eab-console', '1');
+    return next;
+  }
+
+  function installFetchBridge() {
+    if (fetchBridgeInstalled) return;
+    fetchBridgeInstalled = true;
+    var nativeFetch = window.fetch.bind(window);
+    window.fetch = function (input, init) {
+      var mapped = mapPluginUrl(input);
+      if (!mapped) return nativeFetch(input, init);
+      var next = {};
+      if (init) {
+        for (var key in init) {
+          if (Object.prototype.hasOwnProperty.call(init, key)) next[key] = init[key];
+        }
+      }
+      next.headers = bridgeHeaders(next.headers);
+      return nativeFetch(mapped, next);
+    };
+
+    // XMLHttpRequest 也要走同一个网关，否则插件里的 axios / 老代码会 404。
+    var nativeOpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function (method, url) {
+      var mapped = mapPluginUrl(url);
+      this.__eabGateway = Boolean(mapped);
+      return nativeOpen.apply(this, mapped
+        ? [method, mapped].concat(Array.prototype.slice.call(arguments, 2))
+        : arguments);
+    };
+    var nativeSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.send = function (body) {
+      if (this.__eabGateway && scope !== 'user') {
+        try { this.setRequestHeader('x-eab-console', '1'); } catch (_) {}
+      }
+      return nativeSend.call(this, body);
+    };
+
+    // EventSource 不能带自定义头；用 fetch 读 SSE 流，保持 EventSource 的公开形状。
+    var NativeEventSource = window.EventSource;
+    function EabEventSource(url, config) {
+      var self = this;
+      this.url = String(url || '');
+      this.withCredentials = Boolean(config && config.withCredentials);
+      this.readyState = 0;
+      this.onopen = null;
+      this.onmessage = null;
+      this.onerror = null;
+      this.__listeners = {};
+      this.__closed = false;
+      this.__controller = new AbortController();
+      var mapped = mapPluginUrl(this.url) || this.url;
+      nativeFetch(mapped, {
+        headers: bridgeHeaders({ accept: 'text/event-stream' }),
+        credentials: 'same-origin',
+        signal: this.__controller.signal
+      }).then(function (response) {
+        if (!response.ok || !response.body) throw new Error('SSE ' + response.status);
+        self.readyState = 1;
+        if (typeof self.onopen === 'function') self.onopen({ type: 'open' });
+        var reader = response.body.getReader();
+        var decoder = new TextDecoder();
+        var buffer = '';
+        function emit(eventName, data, id) {
+          var event = { type: eventName, data: data, lastEventId: id || '', origin: location.origin };
+          if (typeof self['on' + eventName] === 'function') self['on' + eventName](event);
+          (self.__listeners[eventName] || []).forEach(function (fn) { fn.call(self, event); });
+        }
+        function pump() {
+          return reader.read().then(function (chunk) {
+            if (chunk.done) {
+              self.readyState = 2;
+              return;
+            }
+            buffer += decoder.decode(chunk.value, { stream: true });
+            var frames = buffer.split(/\r?\n\r?\n/);
+            buffer = frames.pop() || '';
+            frames.forEach(function (frame) {
+              var name = 'message', data = [], id = '';
+              frame.split(/\r?\n/).forEach(function (line) {
+                if (line.indexOf('event:') === 0) name = line.slice(6).trim();
+                else if (line.indexOf('data:') === 0) data.push(line.slice(5).replace(/^ /, ''));
+                else if (line.indexOf('id:') === 0) id = line.slice(3).trim();
+              });
+              if (data.length) emit(name, data.join('\n'), id);
+            });
+            return pump();
+          });
+        }
+        return pump();
+      }).catch(function () {
+        if (self.__closed) return;
+        self.readyState = 2;
+        if (typeof self.onerror === 'function') self.onerror({ type: 'error' });
+      });
+    }
+    EabEventSource.prototype.addEventListener = function (name, fn) {
+      if (typeof fn !== 'function') return;
+      (this.__listeners[name] = this.__listeners[name] || []).push(fn);
+    };
+    EabEventSource.prototype.removeEventListener = function (name, fn) {
+      this.__listeners[name] = (this.__listeners[name] || []).filter(function (item) { return item !== fn; });
+    };
+    EabEventSource.prototype.close = function () {
+      this.__closed = true;
+      this.readyState = 2;
+      this.__controller.abort();
+    };
+    EabEventSource.CONNECTING = 0;
+    EabEventSource.OPEN = 1;
+    EabEventSource.CLOSED = 2;
+    window.EventSource = NativeEventSource ? EabEventSource : EabEventSource;
+
+    var nativeBeacon = navigator.sendBeacon && navigator.sendBeacon.bind(navigator);
+    if (nativeBeacon) {
+      navigator.sendBeacon = function (url, data) {
+        var mapped = mapPluginUrl(url);
+        if (!mapped) return nativeBeacon(url, data);
+        nativeFetch(mapped, {
+          method: 'POST',
+          body: data,
+          headers: bridgeHeaders({}),
+          credentials: 'same-origin',
+          keepalive: true
+        }).catch(function () {});
+        return true;
+      };
+    }
+  }
 
   nameEl.textContent = title;
   subEl.textContent = pluginId + (version ? ' · v' + version : '') + ' · DSH 协议' + (scope === 'user' ? ' · 个人安装' : '');
@@ -131,18 +324,27 @@
   }
 
   function loadHostStatus() {
-    fetch(withAs(apiBase + encodeURIComponent(pluginId) + '/host'), {
+    return fetch(withAs(apiBase + encodeURIComponent(pluginId) + '/host'), {
       headers: rpcHeaders(),
       credentials: 'same-origin',
     })
       .then(function (response) { return response.json(); })
       .then(function (payload) {
-        var status = payload && payload.ok ? payload.data.status : null;
+        if (!payload || payload.ok !== true) {
+          hostBadge.textContent = scope === 'user' ? '插件状态不可用' : '控制台会话已失效';
+          hostBadge.classList.add('warn');
+          showError((payload && payload.message) || '读取插件宿主状态失败，请重新登录控制台后再打开。');
+          return;
+        }
+        var status = payload.data && payload.data.status ? payload.data.status : null;
         if (!status) return;
+        pluginApiPrefixes = (status.routes || []).slice();
         if (status.error) {
           hostBadge.textContent = 'host 未就绪';
           hostBadge.classList.add('warn');
-          logEl.textContent = '错误：' + status.error;
+          logEl.textContent = '错误：' + status.error + (status.pendingServices && status.pendingServices.length
+            ? '\n等待服务：' + status.pendingServices.join(',')
+            : '');
         } else {
           hostBadge.textContent = 'host 已运行 · ' + (status.routes || []).length + ' 条通道';
           hostBadge.classList.remove('warn');
@@ -167,16 +369,21 @@
     return;
   }
 
-  host.configure({ id: pluginId, company: company, rpc: postRpc });
-  loadHostStatus();
+  host.configure({ id: pluginId, company: company, rpc: postRpc, inject: clientInject });
+  // 先拿到 host 注册的 API 前缀，再加载插件 client：页面首屏就会打这些接口，
+  // 晚一步安装改写会把第一批请求打到 404。
+  installFetchBridge();
 
   var shell = host.createShell({
     React: React,
     ReactDOM: ReactDOM,
     mount: panelEl,
     nav: navEl,
+    panelNav: panelNavEl,
+    panelTitle: panelTitleEl,
     settingsNav: settingsNavEl,
     settingsTitle: settingsTitleEl,
+    detailActions: detailActionsEl,
     labels: { settings: '设置' },
     onError: showError,
   });
@@ -186,20 +393,35 @@
     return;
   }
 
-  var script = document.createElement('script');
-  script.src = withAs('/plugins/assets/' + encodeURIComponent(pluginId) + '/' + entry.split('/').map(encodeURIComponent).join('/'));
-  script.onerror = function () {
-    showError('client bundle 加载失败：' + script.src + '（确认插件已安装并在本司启用）');
-  };
-  script.onload = function () {
-    try {
-      host.boot();
-      subEl.textContent = pluginId + (version ? ' · v' + version : '') + ' · ' + shell.panelCount() + ' 个页面' + (scope === 'user' ? ' · 个人安装' : '');
-    } catch (error) {
-      showError('插件 client 启动失败：' + (error && error.message ? error.message : error));
-    }
-  };
-  document.body.appendChild(script);
+  function startClient() {
+    var assetUrl = '/plugins/assets/' + encodeURIComponent(pluginId) + '/' + entry.split('/').map(encodeURIComponent).join('/');
+    assetUrl += (assetUrl.indexOf('?') >= 0 ? '&' : '?') + 'scope=' + (scope === 'user' ? 'user' : 'console');
+    var script = document.createElement('script');
+    script.src = withAs(assetUrl);
+    script.onerror = function () {
+      showError('client bundle 加载失败：' + script.src + '（确认插件已安装并在本司启用）');
+    };
+    script.onload = function () {
+      Promise.resolve(host.boot())
+        .then(function (result) {
+          var status = host.status ? host.status() : { errors: [], modules: [] };
+          var errors = (result && result.errors) || status.errors || [];
+          var missing = (status.modules || []).filter(function (item) { return !item.available; });
+          if (errors.length) {
+            showError('插件 client 启动有问题：' + errors.join('；'));
+          } else if (missing.length) {
+            showError('插件声明的 client 模块尚未实现：' + missing.map(function (item) { return item.name; }).join('、') + '。页面可能降级。');
+          }
+          subEl.textContent = pluginId + (version ? ' · v' + version : '') + ' · ' + shell.panelCount() + ' 个页面' + (scope === 'user' ? ' · 个人安装' : '');
+        })
+        .catch(function (error) {
+          showError('插件 client 启动失败：' + (error && error.message ? error.message : error));
+        });
+    };
+    document.body.appendChild(script);
+  }
+
+  loadHostStatus().then(startClient, startClient);
 })();
 </script>
 </body>

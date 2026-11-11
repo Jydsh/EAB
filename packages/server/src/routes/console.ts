@@ -20,7 +20,10 @@ import {
   readWorkspaceQuotaPolicy,
   resolveUserWorkspaceQuota,
 } from '../workspace-quota.js'
-import { applyOrgSync, fetchChannelOrg, fetchDingTalkTenant, mapRemoteOrg } from '@eab/channel'
+import { applyOrgSync, fetchChannelOrg, fetchDingTalkTenant, mapRemoteOrg, pollFeishuScanNative, pollWecomScan, startFeishuScanNative, startWecomScan, verifyFeishuApp } from '@eab/channel'
+import { dispatchPluginRpc } from '../plugin-host.js'
+import { listPluginChannels, listPluginModels, refreshPluginChannel } from '../plugin-models.js'
+import { loadPlugins } from '../plugins.js'
 import { KB_SOURCE_LABEL, listExternalDocs, probeExternalCollection, syncObsidianCollection } from '../kb-external.js'
 import {
   MODEL_CAPABILITIES,
@@ -1636,18 +1639,53 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
     return ok({
       companyId,
       kinds: PROVIDER_KINDS,
-      providers: rows.map((row) => ({
-        id: row.id,
-        kind: row.kind,
-        kindLabel: PROVIDER_KINDS.find((item) => item.kind === row.kind)?.label ?? row.kind,
-        name: row.name,
-        baseUrl: row.base_url,
-        apiKeyEnv: row.api_key_env,
-        keyPresent: row.api_key_env ? secretConfigured(deps.config.dbPath, row.api_key_env) : null,
-        status: row.status,
-        models: Number(row.models),
-      })),
+      providers: [
+        ...rows.map((row) => ({
+          id: row.id,
+          kind: row.kind,
+          kindLabel: PROVIDER_KINDS.find((item) => item.kind === row.kind)?.label ?? row.kind,
+          name: row.name,
+          baseUrl: row.base_url,
+          apiKeyEnv: row.api_key_env,
+          keyPresent: row.api_key_env ? secretConfigured(deps.config.dbPath, row.api_key_env) : null,
+          status: row.status,
+          models: Number(row.models),
+          source: 'db' as const,
+          readonly: false,
+        })),
+        ...listPluginChannels(companyId).map((channel) => ({
+          id: channel.id,
+          kind: 'plugin',
+          kindLabel: 'DSH 插件通道',
+          name: channel.name,
+          baseUrl: '',
+          apiKeyEnv: '',
+          keyPresent: null,
+          status: channel.status,
+          models: channel.models,
+          source: 'plugin' as const,
+          readonly: true,
+          pluginId: channel.pluginId,
+          route: channel.route,
+          configurable: channel.configurable,
+          discovery: channel.discovery,
+          settingsNs: channel.settingsNs,
+          settingsPath: channel.settingsPath,
+        })),
+      ],
     })
+  })
+
+  app.post<{ Params: { id: string } }>('/api/console/plugin-channels/:id/refresh', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const channelId = String(req.params.id)
+    const channels = listPluginChannels(companyId)
+    if (!channels.some((channel) => channel.id === channelId)) {
+      throw new EabError(EC.NOT_FOUND, '插件通道不存在、未启用或尚未完成注册')
+    }
+    const models = await refreshPluginChannel(companyId, channelId)
+    return ok({ channelId, models })
   })
 
   app.post<{
@@ -2169,33 +2207,69 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
       .prepare('SELECT code, name FROM roles WHERE company_id = ? AND deleted_at IS NULL ORDER BY code')
       .all(companyId) as unknown as Array<{ code: string; name: string }>
 
+    const channels = new Map(listPluginChannels(companyId).map((channel) => [channel.id, channel]))
+    const pluginModels = listPluginModels(companyId).map((model) => {
+      const channel = channels.get(model.channelId)
+      return {
+        id: model.id,
+        providerId: model.channelId,
+        providerKind: 'plugin',
+        providerName: channel?.name ?? model.providerName,
+        providerStatus: 'active',
+        name: model.name,
+        modelKey: model.modelKey,
+        tags: model.tags,
+        capabilities: model.capabilities,
+        endpointKind: model.endpointKind,
+        inputModalities: model.inputModalities,
+        outputModalities: model.outputModalities,
+        maxContext: model.maxContext,
+        maxOutputTokens: model.maxOutputTokens,
+        contextCompression: model.contextCompression,
+        embeddingDim: null,
+        config: {},
+        roles: model.roles,
+        priority: model.priority,
+        enabled: true,
+        source: 'plugin' as const,
+        readonly: true,
+        pluginId: model.pluginId,
+        channelId: model.channelId,
+      }
+    })
+
     return ok({
       companyId,
       roles,
-      models: rows.map((row) => ({
-        id: row.id,
-        providerId: row.provider_id,
-        providerKind: row.provider_kind,
-        providerName: row.provider_name,
-        providerStatus: row.provider_status,
-        name: row.name,
-        modelKey: row.model_key,
-        tags: parseList(row.tags),
-        capabilities: capabilitiesOf(row.capabilities ?? null, row.tags),
-        endpointKind: row.endpoint_kind ?? 'chat',
-        inputModalities: parseList(row.input_modalities ?? null),
-        outputModalities: parseList(row.output_modalities ?? null),
-        maxContext: row.max_context ?? null,
-        maxOutputTokens: row.max_output_tokens ?? null,
-        contextCompression: row.context_compression === null || row.context_compression === undefined
-          ? true
-          : Number(row.context_compression) !== 0,
-        embeddingDim: row.embedding_dim ?? null,
-        config: parseObject(row.config_json),
-        roles: parseList(row.roles),
-        priority: Number(row.priority),
-        enabled: row.enabled === 1,
-      })),
+      models: [
+        ...rows.map((row) => ({
+          id: row.id,
+          providerId: row.provider_id,
+          providerKind: row.provider_kind,
+          providerName: row.provider_name,
+          providerStatus: row.provider_status,
+          name: row.name,
+          modelKey: row.model_key,
+          tags: parseList(row.tags),
+          capabilities: capabilitiesOf(row.capabilities ?? null, row.tags),
+          endpointKind: row.endpoint_kind ?? 'chat',
+          inputModalities: parseList(row.input_modalities ?? null),
+          outputModalities: parseList(row.output_modalities ?? null),
+          maxContext: row.max_context ?? null,
+          maxOutputTokens: row.max_output_tokens ?? null,
+          contextCompression: row.context_compression === null || row.context_compression === undefined
+            ? true
+            : Number(row.context_compression) !== 0,
+          embeddingDim: row.embedding_dim ?? null,
+          config: parseObject(row.config_json),
+          roles: parseList(row.roles),
+          priority: Number(row.priority),
+          enabled: row.enabled === 1,
+          source: 'db' as const,
+          readonly: false,
+        })),
+        ...pluginModels,
+      ],
     })
   })
 
@@ -3210,11 +3284,693 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
   )
 
   /**
-   * 钉钉「一键绑定 + 首次同步」。
-   *
-   * 不要求管理员先保存再点同步：一次提交里验凭证、读企业根部门名、写租户绑定、
-   * 拉通讯录并落库。凭证仍只把引用写进 channel_configs，明文进 secrets.json。
+   * 飞书 / 企业微信统一开通：
+   * - 扫码：企业微信直接走官方扫码接口；飞书走 dsh-im 插件的 app registration 流程。
+   * - 手工：填 App ID + App Secret（飞书）或 Bot ID + Secret（企业微信）。
+   * - 组织通讯录：企业微信必须另填 CorpId + CorpSecret；飞书复用 App 凭据。
    */
+  const onboardingProviders = new Set(['feishu', 'wecom'])
+  const pluginIdForFeishu = 'xmanrui-dsh-im'
+
+  const readOnboardingProvider = (raw: unknown): 'feishu' | 'wecom' => {
+    const provider = String(raw ?? '')
+    if (!onboardingProviders.has(provider)) {
+      throw new EabError(EC.VALIDATION, `不支持的渠道：${provider}`, { hint: '本期只统一飞书与企业微信的开通入口' })
+    }
+    return provider as 'feishu' | 'wecom'
+  }
+
+  const writeChannelBinding = (input: {
+    companyId: string
+    provider: 'feishu' | 'wecom'
+    tenantId: string
+    tenantName: string
+    bindMode: 'scan' | 'manual'
+    userId: string
+    appId?: string | null
+    corpId?: string | null
+    secretRef?: string | null
+    botId?: string | null
+    botSecretRef?: string | null
+  }): void => {
+    const now = Date.now()
+    const existing = deps.db
+      .prepare('SELECT id FROM channel_configs WHERE company_id = ? AND provider = ?')
+      .get(input.companyId, input.provider) as { id?: string } | undefined
+    if (existing?.id) {
+      deps.db
+        .prepare(
+          `UPDATE channel_configs
+              SET enabled = 1, status = 'bound', tenant_id = ?, tenant_name = ?, bind_mode = ?,
+                  app_id = COALESCE(?, app_id), corp_id = COALESCE(?, corp_id),
+                  secret_ref = COALESCE(?, secret_ref), bot_id = COALESCE(?, bot_id),
+                  bot_secret_ref = COALESCE(?, bot_secret_ref),
+                  bound_at = COALESCE(bound_at, ?), bot_bound_at = COALESCE(bot_bound_at, ?),
+                  bot_bound_by_user_id = COALESCE(bot_bound_by_user_id, ?),
+                  sync_mode = CASE WHEN sync_mode = 'off' THEN 'daily' ELSE sync_mode END,
+                  updated_at = ?
+            WHERE id = ?`,
+        )
+        .run(
+          input.tenantId,
+          input.tenantName,
+          input.bindMode,
+          input.appId ?? null,
+          input.corpId ?? null,
+          input.secretRef ?? null,
+          input.botId ?? null,
+          input.botSecretRef ?? null,
+          now,
+          now,
+          input.userId,
+          now,
+          existing.id,
+        )
+      return
+    }
+    deps.db
+      .prepare(
+        `INSERT INTO channel_configs
+           (id, company_id, provider, enabled, status, sync_mode, tenant_id, tenant_name,
+            bound_at, bound_by_user_id, bind_mode, app_id, corp_id, secret_ref, bot_id,
+            bot_secret_ref, bot_bound_at, bot_bound_by_user_id, created_at, updated_at)
+         VALUES (?, ?, ?, 1, 'bound', 'daily', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        `ch_${randomUUID().replace(/-/g, '').slice(0, 20)}`,
+        input.companyId,
+        input.provider,
+        input.tenantId,
+        input.tenantName,
+        now,
+        input.userId,
+        input.bindMode,
+        input.appId ?? null,
+        input.corpId ?? null,
+        input.secretRef ?? null,
+        input.botId ?? null,
+        input.botSecretRef ?? null,
+        now,
+        input.userId,
+        now,
+        now,
+      )
+  }
+
+  const dshImAvailable = (companyId: string): boolean => {
+    const plugin = loadPlugins(deps.db, companyId).find((item) => item.id === pluginIdForFeishu)
+    return Boolean(plugin && plugin.enabled && plugin.format === 'dsh')
+  }
+
+  /**
+   * 机器人凭据优先交给 dsh-im；没有装插件、或插件 host 没起来时不让绑定失败，
+   * EAB 仍保存自己的渠道配置，后续装上插件可再走同一条手工绑定补写。
+   */
+  const bindPluginBot = async (
+    companyId: string,
+    provider: 'feishu' | 'wecom',
+    payload: Record<string, unknown>,
+  ): Promise<boolean> => {
+    if (!dshImAvailable(companyId)) return false
+    const method = provider === 'feishu' ? 'bind-credentials' : 'bot.bind-credentials'
+    const rpc = await dispatchPluginRpc(pluginIdForFeishu, provider, { method, payload })
+    if (!rpc.ok) {
+      const code = rpc.error?.code ?? ''
+      if (code === 'host-not-running' || code === 'host-error' || code === 'channel-not-found') return false
+      throw new EabError(
+        EC.UPSTREAM,
+        `${CHANNEL_LABEL[provider]}机器人凭据写入插件失败：${rpc.error?.message ?? '插件不可用'}`,
+        {
+          hint: '确认凭据属于同一个机器人；不需要插件也能先保存到 EAB，稍后可在插件页补装 dsh-im',
+        },
+      )
+    }
+    return true
+  }
+
+  const syncChannelNow = async (companyId: string, provider: 'feishu' | 'wecom') => {
+    const row = deps.db
+      .prepare(
+        `SELECT app_id, corp_id, secret_ref, enabled FROM channel_configs
+          WHERE company_id = ? AND provider = ?`,
+      )
+      .get(companyId, provider) as
+      | { app_id: string | null; corp_id: string | null; secret_ref: string | null; enabled: number }
+      | undefined
+    const appSecret = resolveSecret(deps.config.dbPath, row?.secret_ref)
+    if (!appSecret) {
+      throw new EabError(EC.VALIDATION, '还没有保存通讯录密钥，无法拉取组织架构', {
+        hint: provider === 'wecom'
+          ? '企业微信机器人凭据不能拉通讯录，请在「同步组织」里补 CorpId + CorpSecret'
+          : '请重新填飞书 App Secret，保存后再同步',
+      })
+    }
+    const appId = row?.app_id ?? ''
+    const corpId = row?.corp_id ?? ''
+    if (provider === 'wecom' ? !corpId : !appId) {
+      throw new EabError(EC.VALIDATION, `缺少 ${provider === 'wecom' ? 'CorpId' : 'App ID'}，无法拉取通讯录`)
+    }
+    let remote
+    try {
+      remote = await fetchChannelOrg(provider, {
+        provider,
+        appId,
+        corpId,
+        appSecret,
+      })
+    } catch (error) {
+      throw new EabError(EC.UPSTREAM, `拉取${CHANNEL_LABEL[provider]}通讯录失败：${(error as Error).message}`, {
+        hint: '检查应用凭证、通讯录权限范围（部门/成员是否授权给该应用）以及服务器出网',
+      })
+    }
+    const root = deps.db
+      .prepare(
+        `SELECT id, path, depth FROM departments
+          WHERE company_id = ? AND parent_id IS NULL AND deleted_at IS NULL
+          ORDER BY path LIMIT 1`,
+      )
+      .get(companyId) as { id: string; path: string; depth: number } | undefined
+    if (!root) throw new EabError(EC.VALIDATION, '库里没有公司根部门，无法同步组织')
+    const plan = mapRemoteOrg(remote, {
+      companyId,
+      provider,
+      root,
+      rootChannelDeptIds: provider === 'feishu' ? ['0'] : ['1'],
+    })
+    const outcome = applyOrgSync(deps.db, { plan, now: Date.now(), recycleAfter: 2 })
+    deps.db
+      .prepare(
+        'UPDATE channel_configs SET last_synced_at = ?, last_sync_run_id = ?, last_sync_status = ?, last_sync_error = NULL, updated_at = ? WHERE company_id = ? AND provider = ?',
+      )
+      .run(Date.now(), outcome.runId, 'ok', Date.now(), companyId, provider)
+    return {
+      runId: outcome.runId,
+      departments: remote.depts.length,
+      members: remote.users.length,
+      stats: outcome.stats,
+      diffCount: outcome.diffs.length,
+      diffs: outcome.diffs.slice(0, 60),
+    }
+  }
+
+  app.post<{ Params: { provider: string } }>(
+    '/api/console/channels/:provider/onboard/start',
+    async (req) => {
+      requireConsole(req, deps)
+      const provider = readOnboardingProvider(req.params.provider)
+      const companyId = companyOf(req, deps)
+
+      deps.db
+        .prepare(
+          `UPDATE channel_bind_sessions SET status = 'cancelled'
+            WHERE company_id = ? AND provider = ? AND status IN ('pending', 'scanned')`,
+        )
+        .run(companyId, provider)
+
+      const sessionId = `bnd_${randomUUID().replace(/-/g, '').slice(0, 20)}`
+      const state = `st_${randomUUID().replace(/-/g, '').slice(0, 24)}`
+      const now = Date.now()
+
+      if (provider === 'wecom') {
+        const started = await startWecomScan().catch((error) => {
+          throw new EabError(EC.UPSTREAM, `企业微信扫码初始化失败：${(error as Error).message}`, {
+            hint: '确认服务器能访问 work.weixin.qq.com，然后重新生成二维码',
+          })
+        })
+        deps.db
+          .prepare(
+            `INSERT INTO channel_bind_sessions
+               (id, company_id, provider, state, status, qr_content, qr_image_url, meta_json,
+                created_by_user_id, created_at, expires_at)
+             VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            sessionId,
+            companyId,
+            provider,
+            state,
+            started.qrContent,
+            started.qrDataUrl,
+            JSON.stringify({ kind: 'wecom-qc', scode: started.remoteId }),
+            'console:admin',
+            now,
+            started.expiresAt,
+          )
+        return ok({
+          sessionId,
+          provider,
+          mode: 'scan',
+          qrContent: started.qrContent,
+          qrImageUrl: started.qrDataUrl,
+          expiresAt: started.expiresAt,
+          pollIntervalMs: started.pollIntervalMs,
+        })
+      }
+
+      let verificationUrl = ''
+      let qrCodeDataUrl = ''
+      let attemptId = ''
+      let expiresAt = now + 5 * 60_000
+      let pollIntervalMs = 1_800
+      let meta: Record<string, unknown> = {}
+      if (dshImAvailable(companyId)) {
+        const rpc = await dispatchPluginRpc(pluginIdForFeishu, 'feishu', {
+          method: 'provision.begin',
+          payload: { locale: 'zh-CN' },
+        })
+        if (rpc.ok) {
+          const value = (rpc.value ?? {}) as {
+            provisioning?: Record<string, unknown>
+            verificationUrl?: string
+            qrCodeDataUrl?: string
+            attemptId?: string
+            expiresAt?: number
+            pollIntervalMs?: number
+          }
+          const provisioning = value.provisioning ?? value
+          verificationUrl = String(provisioning?.verificationUrl ?? '')
+          qrCodeDataUrl = String(provisioning?.qrCodeDataUrl ?? '')
+          attemptId = String(provisioning?.attemptId ?? '')
+          expiresAt = Number(provisioning?.expiresAt ?? expiresAt)
+          pollIntervalMs = Number(provisioning?.pollIntervalMs ?? pollIntervalMs)
+          meta = { kind: 'feishu-plugin', attemptId }
+        } else if (!['host-not-running', 'host-error', 'channel-not-found'].includes(rpc.error?.code ?? '')) {
+          throw new EabError(EC.UPSTREAM, `飞书扫码初始化失败：${rpc.error?.message ?? '插件不可用'}`, {
+            hint: '确认 dsh-im 插件的飞书 SDK 依赖完整，或卸载插件后使用 EAB 原生扫码',
+          })
+        }
+      }
+      if (!verificationUrl || !qrCodeDataUrl || !attemptId) {
+        const native = await startFeishuScanNative().catch((error) => {
+          throw new EabError(EC.UPSTREAM, `飞书扫码初始化失败：${(error as Error).message}`, {
+            hint: '确认服务器能访问 accounts.feishu.cn，然后重新生成二维码',
+          })
+        })
+        verificationUrl = native.qrContent
+        qrCodeDataUrl = native.qrDataUrl
+        attemptId = native.remoteId
+        expiresAt = native.expiresAt
+        pollIntervalMs = native.pollIntervalMs
+        meta = { ...native.meta, deviceCode: native.remoteId }
+      }
+      deps.db
+        .prepare(
+          `INSERT INTO channel_bind_sessions
+             (id, company_id, provider, state, status, qr_content, qr_image_url, meta_json,
+              created_by_user_id, created_at, expires_at)
+           VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          sessionId,
+          companyId,
+          provider,
+          state,
+          verificationUrl,
+          qrCodeDataUrl,
+          JSON.stringify(meta),
+          'console:admin',
+          now,
+          expiresAt,
+        )
+      return ok({
+        sessionId,
+        provider,
+        mode: 'scan',
+        qrContent: verificationUrl,
+        qrImageUrl: qrCodeDataUrl,
+        expiresAt,
+        pollIntervalMs,
+      })
+    },
+  )
+
+  app.get<{ Params: { provider: string; sessionId: string } }>(
+    '/api/console/channels/:provider/onboard/:sessionId',
+    async (req) => {
+      requireConsole(req, deps)
+      const provider = readOnboardingProvider(req.params.provider)
+      const companyId = companyOf(req, deps)
+      const row = deps.db
+        .prepare(
+          `SELECT * FROM channel_bind_sessions
+            WHERE id = ? AND company_id = ? AND provider = ?`,
+        )
+        .get(req.params.sessionId, companyId, provider) as
+        | {
+          id: string
+          state: string
+          status: string
+          qr_content: string | null
+          qr_image_url: string | null
+          meta_json: string | null
+          expires_at: number
+        }
+        | undefined
+      if (!row) throw new EabError(EC.NOT_FOUND, '绑定会话不存在或已失效')
+      if (row.status === 'success' || row.status === 'cancelled' || row.status === 'expired') {
+        return ok({ status: row.status })
+      }
+      if (row.expires_at <= Date.now()) {
+        deps.db.prepare(`UPDATE channel_bind_sessions SET status = 'expired' WHERE id = ?`).run(row.id)
+        return ok({ status: 'expired', message: '二维码已过期，请重新生成' })
+      }
+
+      let meta: Record<string, unknown> = {}
+      try {
+        meta = row.meta_json ? JSON.parse(row.meta_json) : {}
+      } catch {
+        meta = {}
+      }
+
+      if (provider === 'wecom') {
+        const scode = String(meta.scode ?? '')
+        if (!scode) return ok({ status: 'failed', message: '扫码会话缺少 scode' })
+        const polled = await pollWecomScan(scode)
+        if (polled.status === 'waiting') return ok({ status: 'waiting' })
+        if (polled.status === 'expired') {
+          deps.db.prepare(`UPDATE channel_bind_sessions SET status = 'expired' WHERE id = ?`).run(row.id)
+          return ok({ status: 'expired', message: polled.message })
+        }
+        if (polled.status === 'failed' || !polled.botId || !polled.botSecret) {
+          deps.db
+            .prepare(`UPDATE channel_bind_sessions SET status = 'error', error_message = ? WHERE id = ?`)
+            .run(polled.message ?? '企业微信扫码授权失败', row.id)
+          return ok({ status: 'failed', message: polled.message })
+        }
+        const botSecretRef = storeSecret(
+          deps.config.dbPath,
+          null,
+          polled.botSecret,
+          'EAB_WECOM_BOT_SECRET',
+        )
+        writeChannelBinding({
+          companyId,
+          provider,
+          tenantId: polled.botId,
+          tenantName: polled.tenantName ?? '企业微信机器人',
+          bindMode: 'scan',
+          userId: 'console:admin',
+          botId: polled.botId,
+          botSecretRef,
+        })
+        deps.db
+          .prepare(
+            `UPDATE channel_bind_sessions SET status = 'success', tenant_id = ?, tenant_name = ?, authorized_at = ? WHERE id = ?`,
+          )
+          .run(polled.botId, polled.tenantName ?? '企业微信机器人', Date.now(), row.id)
+        return ok({
+          status: 'success',
+          tenantName: polled.tenantName,
+          needsOrgCredentials: true,
+          message: '机器人已连接；同步组织架构还需要企业 CorpId + CorpSecret',
+        })
+      }
+
+      if (String(meta.kind ?? '') === 'feishu-native' || meta.deviceCode) {
+        const deviceCode = String(meta.deviceCode ?? meta.attemptId ?? '')
+        if (!deviceCode) {
+          deps.db.prepare(`UPDATE channel_bind_sessions SET status = 'error', error_message = ? WHERE id = ?`).run('扫码会话缺少飞书 deviceCode', row.id)
+          return ok({ status: 'failed', message: '扫码会话缺少飞书 deviceCode' })
+        }
+        let domain: 'feishu' | 'lark' = meta.domain === 'lark' ? 'lark' : 'feishu'
+        const polled = await pollFeishuScanNative(deviceCode, domain).catch((error) => {
+          throw new EabError(EC.UPSTREAM, `飞书扫码轮询失败：${(error as Error).message}`, {
+            hint: '确认服务器能访问 accounts.feishu.cn / accounts.larksuite.com',
+          })
+        })
+        if (polled.domain && polled.domain !== domain) {
+          domain = polled.domain
+          meta.domain = domain
+          deps.db.prepare(`UPDATE channel_bind_sessions SET meta_json = ? WHERE id = ?`).run(JSON.stringify(meta), row.id)
+        }
+        if (polled.status === 'waiting') {
+          if (polled.pollIntervalMs) {
+            return ok({ status: 'waiting', pollIntervalMs: polled.pollIntervalMs, message: polled.message })
+          }
+          return ok({ status: 'waiting' })
+        }
+        if (polled.status !== 'success' || !polled.appId || !polled.appSecret) {
+          const failed = polled.status === 'failed' || polled.status === 'expired'
+          deps.db
+            .prepare(`UPDATE channel_bind_sessions SET status = ?, error_message = ? WHERE id = ?`)
+            .run(polled.status === 'expired' ? 'expired' : (failed ? 'error' : 'pending'), polled.message ?? null, row.id)
+          return ok({ status: failed ? 'failed' : 'waiting', message: polled.message })
+        }
+        const appId = polled.appId
+        const appSecret = polled.appSecret
+        let tenantName = '飞书机器人'
+        try {
+          const verified = await verifyFeishuApp(appId, appSecret, domain)
+          tenantName = verified.tenantName
+        } catch {
+          // 应用刚创建时 bot info 可能短暂不可读；凭据已有效，绑定不因此失败。
+        }
+        const secretRef = storeSecret(deps.config.dbPath, null, appSecret, 'EAB_FEISHU_APP_SECRET')
+        writeChannelBinding({
+          companyId,
+          provider,
+          tenantId: appId,
+          tenantName,
+          bindMode: 'scan',
+          userId: 'console:admin',
+          appId,
+          secretRef,
+        })
+        deps.db
+          .prepare(
+            `UPDATE channel_bind_sessions SET status = 'success', tenant_id = ?, tenant_name = ?, authorized_at = ? WHERE id = ?`,
+          )
+          .run(appId, tenantName, Date.now(), row.id)
+        let syncError: string | null = null
+        try {
+          await syncChannelNow(companyId, provider)
+        } catch (error) {
+          syncError = (error as Error).message
+        }
+        return ok({
+          status: 'success',
+          tenantName,
+          needsOrgCredentials: false,
+          syncError,
+          message: syncError
+            ? `飞书应用已绑定；通讯录同步未完成：${syncError}`
+            : '飞书应用和机器人已绑定，组织架构已同步',
+        })
+      }
+
+      const attemptId = String(meta.attemptId ?? '')
+      if (!attemptId) return ok({ status: 'failed', message: '扫码会话缺少飞书 attemptId' })
+      const rpc = await dispatchPluginRpc(pluginIdForFeishu, 'feishu', {
+        method: 'provision.poll',
+        payload: { attemptId },
+      })
+      if (!rpc.ok) {
+        return ok({ status: 'failed', message: rpc.error?.message ?? '飞书插件轮询失败' })
+      }
+      const raw = (rpc.value ?? {}) as {
+        status?: string
+        message?: string
+        bot?: { name?: string; tenantName?: string; botId?: string }
+        connection?: {
+          status?: string
+          message?: string
+          bot?: { name?: string; tenantName?: string; botId?: string }
+        }
+      }
+      const value = raw.connection ?? raw
+      if (value.status === 'connecting' || value.status === 'provisioning' || value.status === 'disconnected') {
+        return ok({ status: 'waiting' })
+      }
+      if (value.status !== 'connected') {
+        const failed = value.status === 'expired' || value.status === 'failed'
+        deps.db
+          .prepare(`UPDATE channel_bind_sessions SET status = ?, error_message = ? WHERE id = ?`)
+          .run(failed ? 'error' : 'pending', value.message ?? null, row.id)
+        return ok({ status: failed ? 'failed' : 'waiting', message: value.message })
+      }
+      const botId = String(value.bot?.botId ?? '')
+      const tenantName = String(value.bot?.tenantName ?? value.bot?.name ?? '飞书机器人')
+      writeChannelBinding({
+        companyId,
+        provider,
+        tenantId: botId || `feishu-${row.id}`,
+        tenantName,
+        bindMode: 'scan',
+        userId: 'console:admin',
+      })
+      deps.db
+        .prepare(
+          `UPDATE channel_bind_sessions SET status = 'success', tenant_id = ?, tenant_name = ?, authorized_at = ? WHERE id = ?`,
+        )
+        .run(botId || null, tenantName, Date.now(), row.id)
+      return ok({
+        status: 'success',
+        tenantName,
+        needsOrgCredentials: true,
+        message: '飞书机器人已连接；同步组织架构请补 App ID + App Secret',
+      })
+    },
+  )
+
+  app.post<{ Params: { provider: string }; Body: Record<string, unknown> }>(
+    '/api/console/channels/:provider/onboard/manual',
+    async (req) => {
+      requireConsole(req, deps)
+      const provider = readOnboardingProvider(req.params.provider)
+      const companyId = companyOf(req, deps)
+      const body = req.body ?? {}
+      const userId = 'console:admin'
+
+      if (provider === 'feishu') {
+        const appId = String(body.appId ?? '').trim()
+        const appSecret = String(body.appSecret ?? '').trim()
+        const domain = body.domain === 'lark' ? 'lark' : 'feishu'
+        if (!appId || !appSecret) {
+          throw new EabError(EC.VALIDATION, '飞书需要 App ID 和 App Secret', {
+            hint: '在飞书开放平台「凭证与基础信息」里复制',
+          })
+        }
+        const verified = await verifyFeishuApp(appId, appSecret, domain).catch((error) => {
+          throw new EabError(EC.UPSTREAM, `飞书凭证校验失败：${(error as Error).message}`, {
+            hint: '确认 App ID / App Secret 属于同一个应用，且应用已启用',
+          })
+        })
+        const pluginBound = await bindPluginBot(companyId, 'feishu', { appId, appSecret, domain })
+        const secretRef = storeSecret(deps.config.dbPath, null, appSecret, 'EAB_FEISHU_APP_SECRET')
+        writeChannelBinding({
+          companyId,
+          provider,
+          tenantId: appId,
+          tenantName: verified.tenantName,
+          bindMode: 'manual',
+          userId,
+          appId,
+          secretRef,
+        })
+        let sync: unknown = null
+        let syncError: string | null = null
+        try {
+          sync = await syncChannelNow(companyId, provider)
+        } catch (error) {
+          syncError = (error as Error).message
+        }
+        return ok({
+          provider,
+          mode: 'manual',
+          tenantName: verified.tenantName,
+          appName: verified.appName,
+          pluginBound,
+          sync,
+          syncError,
+        })
+      }
+
+      const botId = String(body.botId ?? body.botid ?? '').trim()
+      const botSecret = String(body.botSecret ?? body.secret ?? '').trim()
+      if (!botId || !botSecret) {
+        throw new EabError(EC.VALIDATION, '企业微信机器人需要 Bot ID 和 Secret', {
+          hint: '在企业微信管理后台「智能机器人」里取',
+        })
+      }
+      const corpId = String(body.corpId ?? '').trim()
+      const corpSecret = String(body.corpSecret ?? '').trim()
+      const pluginBound = await bindPluginBot(companyId, 'wecom', { botId, secret: botSecret })
+      const botSecretRef = storeSecret(deps.config.dbPath, null, botSecret, 'EAB_WECOM_BOT_SECRET')
+      const secretRef = corpSecret
+        ? storeSecret(deps.config.dbPath, null, corpSecret, 'EAB_WECOM_CORP_SECRET')
+        : null
+      writeChannelBinding({
+        companyId,
+        provider,
+        tenantId: corpId || botId,
+        tenantName: String(body.tenantName ?? '').trim() || '企业微信机器人',
+        bindMode: 'manual',
+        userId,
+        corpId: corpId || null,
+        secretRef,
+        botId,
+        botSecretRef,
+      })
+      let sync: unknown = null
+      let syncError: string | null = null
+      if (corpId && corpSecret) {
+        try {
+          sync = await syncChannelNow(companyId, provider)
+        } catch (error) {
+          syncError = (error as Error).message
+        }
+      }
+      return ok({
+        provider,
+        mode: 'manual',
+        tenantName: String(body.tenantName ?? '').trim() || '企业微信机器人',
+        pluginBound,
+        sync,
+        syncError,
+        needsOrgCredentials: !corpId || !corpSecret,
+      })
+    },
+  )
+
+  app.post<{ Params: { provider: string }; Body: Record<string, unknown> }>(
+    '/api/console/channels/:provider/org',
+    async (req) => {
+      requireConsole(req, deps)
+      const provider = readOnboardingProvider(req.params.provider)
+      const companyId = companyOf(req, deps)
+      const body = req.body ?? {}
+      if (provider === 'wecom') {
+        const corpId = String(body.corpId ?? '').trim()
+        const corpSecret = String(body.corpSecret ?? '').trim()
+        if (!corpId || !corpSecret) {
+          throw new EabError(EC.VALIDATION, '企业微信同步通讯录需要 CorpId 和 CorpSecret', {
+            hint: '机器人凭据（Bot ID + Secret）不能拉通讯录，必须使用企业应用的通讯录 Secret',
+          })
+        }
+        const secretRef = storeSecret(deps.config.dbPath, null, corpSecret, 'EAB_WECOM_CORP_SECRET')
+        deps.db
+          .prepare(
+            `UPDATE channel_configs
+                SET corp_id = ?, secret_ref = ?, enabled = 1, status = 'bound',
+                    last_sync_status = 'pending', last_sync_error = NULL, updated_at = ?
+              WHERE company_id = ? AND provider = 'wecom'`,
+          )
+          .run(corpId, secretRef, Date.now(), companyId)
+      }
+      if (provider === 'feishu') {
+        const appId = String(body.appId ?? '').trim()
+        const appSecret = String(body.appSecret ?? '').trim()
+        if (appId && appSecret) {
+          const verified = await verifyFeishuApp(appId, appSecret).catch((error) => {
+            throw new EabError(EC.UPSTREAM, `飞书凭证校验失败：${(error as Error).message}`)
+          })
+          const secretRef = storeSecret(deps.config.dbPath, null, appSecret, 'EAB_FEISHU_APP_SECRET')
+          deps.db
+            .prepare(
+              `UPDATE channel_configs
+                  SET app_id = ?, secret_ref = ?, tenant_name = COALESCE(NULLIF(tenant_name, ''), ?),
+                      enabled = 1, status = 'bound', last_sync_status = 'pending', last_sync_error = NULL, updated_at = ?
+                WHERE company_id = ? AND provider = 'feishu'`,
+            )
+            .run(appId, secretRef, verified.tenantName, Date.now(), companyId)
+        }
+      }
+      try {
+        const sync = await syncChannelNow(companyId, provider)
+        return ok({ provider, sync })
+      } catch (error) {
+        deps.db
+          .prepare(
+            `UPDATE channel_configs SET last_sync_status = 'error', last_sync_error = ?, updated_at = ?
+              WHERE company_id = ? AND provider = ?`,
+          )
+          .run((error as Error).message, Date.now(), companyId, provider)
+        throw error
+      }
+    },
+  )
+
+
   app.post<{ Body: { appId?: string; appSecret?: string; corpId?: string; replaceDemo?: boolean } }>(
     '/api/console/channels/dingtalk/bind',
     async (req) => {

@@ -149,14 +149,87 @@ function esc(value) {
 }
 
 /** 把长说明收成小角标；完整文案挂在 data-tip，由统一浮层按需展示。 */
-function hintBadge(label, tip, ariaLabel, extraClass = '') {
+function hintBadge(label, tip, ariaLabel, extraClass = '', id = '') {
   const cls = extraClass ? `hint-badge ${extraClass}` : 'hint-badge'
-  return `<span class="${cls}" data-tip="${esc(tip)}" tabindex="0" aria-label="${esc(ariaLabel || label)}">${esc(label)}</span>`
+  const idAttr = id ? ` id="${esc(id)}"` : ''
+  return `<span class="${cls}"${idAttr} data-tip="${esc(tip)}" tabindex="0" aria-label="${esc(ariaLabel || label)}">${esc(label)}</span>`
 }
 
 /** 独立一行的角标：用于表单说明、弹窗提示等原本占一整段的文案。 */
 function hintNote(label, tip, ariaLabel) {
   return `<div class="hint-note">${hintBadge(label, tip, ariaLabel)}</div>`
+}
+
+const TOP_TOAST_KEY = 'eab_top_toast'
+
+/** 顶部浮动提示：成功类反馈不阻塞页面，自动消失。 */
+function showTopToast(message, options = {}) {
+  const tone = options.tone || 'success'
+  const duration = Number(options.duration) > 0 ? Number(options.duration) : 4500
+  let host = document.querySelector('.top-toast-host')
+  if (!host) {
+    host = document.createElement('div')
+    host.className = 'top-toast-host'
+    document.body.appendChild(host)
+  }
+  const item = document.createElement('div')
+  item.className = `top-toast is-${tone}`
+  item.setAttribute('role', 'status')
+  item.setAttribute('aria-live', 'polite')
+
+  const icon = document.createElement('span')
+  icon.className = 'top-toast-icon'
+  icon.setAttribute('aria-hidden', 'true')
+  icon.innerHTML = '<svg viewBox="0 0 24 24" focusable="false"><path d="m5 12 4 4 10-10"/></svg>'
+
+  const copy = document.createElement('span')
+  copy.className = 'top-toast-copy'
+  copy.textContent = String(message ?? '')
+
+  const close = document.createElement('button')
+  close.className = 'top-toast-close'
+  close.type = 'button'
+  close.setAttribute('aria-label', '关闭提示')
+  close.textContent = '×'
+
+  item.append(icon, copy, close)
+  host.appendChild(item)
+
+  let timer = 0
+  const dismiss = () => {
+    if (!item.isConnected) return
+    item.classList.add('is-leaving')
+    setTimeout(() => {
+      item.remove()
+      if (host && !host.childElementCount) host.remove()
+    }, 180)
+  }
+  timer = setTimeout(dismiss, duration)
+  close.addEventListener('click', () => {
+    clearTimeout(timer)
+    dismiss()
+  })
+}
+
+/** 跳页前把成功提示暂存，目标页 boot 后接着显示。 */
+function queueTopToast(message, options = {}) {
+  try {
+    sessionStorage.setItem(TOP_TOAST_KEY, JSON.stringify({ message, options }))
+  } catch {
+    /* 私密模式 / 存储受限时忽略，不影响绑定结果 */
+  }
+}
+
+function flushQueuedTopToast() {
+  try {
+    const raw = sessionStorage.getItem(TOP_TOAST_KEY)
+    if (!raw) return
+    sessionStorage.removeItem(TOP_TOAST_KEY)
+    const payload = JSON.parse(raw)
+    if (payload && payload.message) showTopToast(payload.message, payload.options || {})
+  } catch {
+    /* 残留内容不合法时直接丢弃 */
+  }
 }
 
 /** 模型表格的统一图标操作；图标本身不带文字，名称挂在浮层与 aria-label。 */
@@ -2478,7 +2551,7 @@ async function loadOverview() {
     { key: 'roles', title: '成员与角色权限', meta: `${roleCount} 个角色 · 在组织页给成员授权`, done: roleCount > 0, action: '检查权限' },
     { key: 'kb', title: '知识库', meta: `${kbCount} 个知识库 · 配置可见范围与文档`, done: kbCount > 0, action: '管理知识库' },
     { key: 'models', title: '模型接入', meta: `${providerCount} 个供应商 · ${modelCount} 个模型`, done: modelCount > 0, action: '接入模型' },
-    { key: 'channels', title: '渠道接入', meta: `${configuredChannels} / 3 已配置`, done: configuredChannels === 3, action: '配置渠道' },
+    { key: 'channels', title: '渠道接入', meta: `${configuredChannels} / 3 已配置`, done: configuredChannels > 0, action: '配置渠道' },
     { key: 'extra', title: '插件', meta: `${pluginCount} 个已安装`, done: pluginCount > 0, action: '插件管理' },
   ]
 
@@ -3897,6 +3970,7 @@ async function openModelModal(model, providers, roles) {
 }
 
 let modelCapabilityPopover = null
+let toolRunPopover = null
 
 function closeModelCapabilityPopover() {
   if (!modelCapabilityPopover) return
@@ -3983,6 +4057,232 @@ function openModelCapabilityPopover(trigger, model, onSave) {
     document.removeEventListener('mousedown', onOutside)
     document.removeEventListener('keydown', onKey)
   }
+}
+
+function toolInputFields(tool) {
+  return tool.source === 'plugin' ? (tool.input?.properties ?? {}) : (tool.input ?? {})
+}
+
+function toolArgsPreview(tool) {
+  const fields = toolInputFields(tool)
+  const keys = Object.keys(fields || {})
+  if (!keys.length) return '{}'
+  const seed = {}
+  for (const key of keys) {
+    const spec = fields[key] || {}
+    seed[key] = Object.prototype.hasOwnProperty.call(spec, 'default') ? spec.default : ''
+  }
+  return JSON.stringify(seed, null, 2)
+}
+
+function toolSchemaHint(tool) {
+  const fields = toolInputFields(tool)
+  const keys = Object.keys(fields || {})
+  if (!keys.length) return '这个工具不需要参数，直接运行即可。'
+  return `可用字段：${keys.map((key) => `${key}${fields[key]?.type ? ` · ${fields[key].type}` : ''}`).join('、')}`
+}
+
+function formatToolResult(value) {
+  let text = ''
+  if (typeof value === 'string') text = value
+  else {
+    try {
+      text = JSON.stringify(value, null, 2) ?? ''
+    } catch {
+      text = String(value ?? '')
+    }
+  }
+  if (!text) text = '（无返回值）'
+  if (text.length > 10000) text = `${text.slice(0, 10000)}\n…结果已截断（共 ${text.length} 字符）`
+  return text
+}
+
+function closeToolRunPopover() {
+  if (!toolRunPopover) return
+  toolRunPopover.__cleanup?.()
+  toolRunPopover.remove()
+  toolRunPopover = null
+}
+
+function openToolRunPopover(trigger, tool) {
+  if (!tool) return
+  closeToolRunPopover()
+  const popover = document.createElement('div')
+  popover.className = 'tool-run-popover'
+  popover.setAttribute('role', 'dialog')
+  popover.setAttribute('aria-label', `试运行 ${tool.name}`)
+  const sourceLabel = tool.source === 'plugin' ? '插件工具' : '内置工具'
+  popover.innerHTML = `
+    <div class="tool-run-head">
+      <div class="tool-run-title">
+        <div class="tool-run-kicker"><span>工具试运行</span><span class="tool-run-tag">${sourceLabel}</span>${tool.dangerous ? '<span class="tool-run-tag is-risk">需审批</span>' : ''}</div>
+        <strong>${esc(tool.name)}</strong>
+        <span class="tool-run-id mono">${esc(tool.id)}</span>
+        <span class="tool-run-desc">${esc(tool.description || '暂无说明')}</span>
+      </div>
+      <div class="tool-run-head-actions">
+        <span class="tool-run-grip" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i></span>
+        <button class="tool-run-close" type="button" aria-label="关闭试运行">×</button>
+      </div>
+    </div>
+    <div class="tool-run-body">
+      <div class="tool-run-label"><strong>参数 JSON</strong><span>留空按 <code>{}</code> 处理</span></div>
+      <textarea class="tool-run-args" id="tool-run-args" spellcheck="false" aria-label="参数 JSON">${esc(toolArgsPreview(tool))}</textarea>
+      <div class="tool-run-schema">${esc(toolSchemaHint(tool))}</div>
+      <div class="tool-run-msg" id="tool-run-msg" hidden></div>
+      <div class="tool-run-result" id="tool-run-result" hidden>
+        <div class="tool-run-result-head"><strong>运行结果</strong><button class="link-btn" type="button" id="tool-run-copy">复制</button></div>
+        <pre id="tool-run-output"></pre>
+      </div>
+    </div>
+    <div class="tool-run-foot">
+      <span>拖动标题可移动 · 参数和结果都会写入审计</span>
+      <div><button class="btn ghost" type="button" id="tool-run-cancel">关闭</button><button class="btn primary" type="button" id="tool-run-go">运行</button></div>
+    </div>`
+  document.body.appendChild(popover)
+  toolRunPopover = popover
+
+  const rect = trigger.getBoundingClientRect()
+  const width = popover.offsetWidth
+  const height = popover.offsetHeight
+  const left = Math.max(12, Math.min(rect.right - width, window.innerWidth - width - 12))
+  const top =
+    rect.bottom + 8 + height <= window.innerHeight - 12
+      ? rect.bottom + 8
+      : Math.max(12, rect.top - height - 8)
+  popover.style.left = `${left}px`
+  popover.style.top = `${top}px`
+
+  const argsEl = popover.querySelector('#tool-run-args')
+  const msg = popover.querySelector('#tool-run-msg')
+  const resultBox = popover.querySelector('#tool-run-result')
+  const output = popover.querySelector('#tool-run-output')
+  const runBtn = popover.querySelector('#tool-run-go')
+  const copyBtn = popover.querySelector('#tool-run-copy')
+  const head = popover.querySelector('.tool-run-head')
+  let running = false
+  let drag = null
+
+  const onDragStart = (event) => {
+    if (event.pointerType === 'mouse' && event.button !== 0) return
+    if (event.target.closest('button, input, textarea, a')) return
+    const current = popover.getBoundingClientRect()
+    drag = {
+      pointerId: event.pointerId,
+      offsetX: event.clientX - current.left,
+      offsetY: event.clientY - current.top,
+    }
+    popover.classList.add('is-dragging')
+    try {
+      head.setPointerCapture(event.pointerId)
+    } catch {}
+    event.preventDefault()
+  }
+  const onDragMove = (event) => {
+    if (!drag || event.pointerId !== drag.pointerId) return
+    const dragWidth = popover.offsetWidth
+    const dragHeight = popover.offsetHeight
+    const left = Math.max(8, Math.min(event.clientX - drag.offsetX, window.innerWidth - dragWidth - 8))
+    const top = Math.max(8, Math.min(event.clientY - drag.offsetY, window.innerHeight - dragHeight - 8))
+    popover.style.left = `${left}px`
+    popover.style.top = `${top}px`
+  }
+  const onDragEnd = (event) => {
+    if (!drag || (event && event.pointerId !== drag.pointerId)) return
+    const pointerId = drag.pointerId
+    drag = null
+    popover.classList.remove('is-dragging')
+    try {
+      head.releasePointerCapture(pointerId)
+    } catch {}
+  }
+  head.addEventListener('pointerdown', onDragStart)
+  head.addEventListener('pointermove', onDragMove)
+  head.addEventListener('pointerup', onDragEnd)
+  head.addEventListener('pointercancel', onDragEnd)
+
+  const setMessage = (text, tone = 'info') => {
+    msg.hidden = !text
+    msg.className = `tool-run-msg is-${tone}`
+    msg.textContent = text || ''
+  }
+
+  const run = async () => {
+    if (running) return
+    let args
+    try {
+      const raw = argsEl.value.trim()
+      args = raw ? JSON.parse(raw) : {}
+      if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error('参数必须是 JSON 对象')
+    } catch (err) {
+      setMessage(`参数不合法：${err.message}`, 'bad')
+      argsEl.focus()
+      return
+    }
+    running = true
+    runBtn.disabled = true
+    runBtn.textContent = '运行中…'
+    resultBox.hidden = true
+    setMessage('正在调用工具…', 'info')
+    const started = performance.now()
+    try {
+      const result = await apiPost(`/api/tools/${encodeURIComponent(tool.id)}/invoke`, { args })
+      output.textContent = formatToolResult(result.result)
+      resultBox.hidden = false
+      setMessage(`运行成功 · ${Math.round(performance.now() - started)} ms`, 'ok')
+    } catch (err) {
+      if (err.code === 'EAB_APPROVAL_REQUIRED') {
+        const approval = err.details?.approvalId ? `（审批单 ${err.details.approvalId}）` : ''
+        setMessage(`需要审批：${err.message || '该工具需要管理员审批'}${approval}；到「审批」页通过后再运行。`, 'warn')
+      } else {
+        setMessage(`运行失败：${err.message || '未知错误'}`, 'bad')
+      }
+    } finally {
+      running = false
+      runBtn.disabled = false
+      runBtn.textContent = '运行'
+    }
+  }
+
+  popover.querySelector('.tool-run-close').addEventListener('click', closeToolRunPopover)
+  popover.querySelector('#tool-run-cancel').addEventListener('click', closeToolRunPopover)
+  runBtn.addEventListener('click', () => void run())
+  argsEl.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+      event.preventDefault()
+      void run()
+    }
+  })
+  copyBtn.addEventListener('click', async () => {
+    const text = output.textContent || ''
+    if (!text) return
+    try {
+      await navigator.clipboard.writeText(text)
+      copyBtn.textContent = '已复制'
+      setTimeout(() => { copyBtn.textContent = '复制' }, 1200)
+    } catch {
+      setMessage('复制失败，请手动选择结果。', 'bad')
+    }
+  })
+  const onOutside = (event) => {
+    if (popover.contains(event.target) || trigger.contains(event.target)) return
+    closeToolRunPopover()
+  }
+  const onKey = (event) => {
+    if (event.key === 'Escape') closeToolRunPopover()
+  }
+  setTimeout(() => {
+    document.addEventListener('mousedown', onOutside)
+    document.addEventListener('keydown', onKey)
+  }, 0)
+  popover.__cleanup = () => {
+    document.removeEventListener('mousedown', onOutside)
+    document.removeEventListener('keydown', onKey)
+  }
+  setTimeout(() => {
+    argsEl.focus()
+    argsEl.setSelectionRange(argsEl.value.length, argsEl.value.length)
+  }, 0)
 }
 
 function formatStressDuration(ms) {
@@ -4210,6 +4510,8 @@ async function loadModels() {
       api('/api/console/model-routes').catch(() => ({ routes: [] })),
     ])
     const providers = providerData.providers
+    const writableProviders = providers.filter((provider) => provider.source !== 'plugin')
+    const pluginProviderCount = providers.length - writableProviders.length
     const models = modelData.models
     const roles = modelData.roles || []
     const enabledModels = models.filter((model) => model.enabled)
@@ -4225,28 +4527,38 @@ async function loadModels() {
 
     const providerRows =
       providers
-        .map(
-          (provider) => `<tr>
+        .map((provider) => {
+          const pluginChannel = provider.source === 'plugin'
+          return `<tr>
             <td>
               <div class="models-provider-cell">
                 <span class="models-provider-mark">${esc((provider.name || '?').slice(0, 1).toUpperCase())}</span>
-                <div><strong>${esc(provider.name)}</strong><div class="desc">${esc(provider.kindLabel)}</div></div>
+                <div><strong>${esc(provider.name)}</strong><div class="desc">${
+                  pluginChannel
+                    ? `插件 ${esc(provider.pluginId || '')} · ${esc(provider.route || '')}`
+                    : esc(provider.kindLabel)
+                }</div></div>
               </div>
             </td>
-            <td class="mono models-endpoint">${esc(provider.baseUrl || '—')}</td>
+            <td class="mono models-endpoint">${esc(pluginChannel ? '随插件宿主注入' : (provider.baseUrl || '—'))}</td>
             <td>${
-              provider.apiKeyEnv
-                ? `<span class="pill ${provider.keyPresent ? 'ok' : 'warn'}">${esc(provider.apiKeyEnv)} ${
-                    provider.keyPresent ? '已注入' : '未注入'
-                  }</span>`
-                : '<span class="muted">不需要</span>'
+              pluginChannel
+                ? '<span class="pill ok">插件托管</span>'
+                : provider.apiKeyEnv
+                  ? `<span class="pill ${provider.keyPresent ? 'ok' : 'warn'}">${esc(provider.apiKeyEnv)} ${
+                      provider.keyPresent ? '已注入' : '未注入'
+                    }</span>`
+                  : '<span class="muted">不需要</span>'
             }</td>
             <td><span class="models-count">${provider.models}</span></td>
-            <td><span class="pill ${provider.status === 'active' ? 'ok' : 'warn'}">${
-              provider.status === 'active' ? '启用' : '停用'
+            <td><span class="pill ${pluginChannel ? 'ok' : (provider.status === 'active' ? 'ok' : 'warn')}">${
+              pluginChannel ? '已注入' : (provider.status === 'active' ? '启用' : '停用')
             }</span></td>
             <td class="model-actions">
-              <button class="btn sm model-action-btn" type="button" data-test="${esc(provider.id)}" data-tip="测试连接：用当前凭证请求一次供应商端点。" aria-label="测试连接">${modelActionIcon('test')}</button>
+              ${
+                pluginChannel
+                  ? `<button class="btn sm model-action-btn" type="button" data-refresh-plugin-channel="${esc(provider.id)}" data-tip="让插件重新探测模型并刷新目录。" aria-label="刷新插件模型">${modelActionIcon('discover')}</button>`
+                  : `<button class="btn sm model-action-btn" type="button" data-test="${esc(provider.id)}" data-tip="测试连接：用当前凭证请求一次供应商端点。" aria-label="测试连接">${modelActionIcon('test')}</button>
               ${
                 provider.kind === 'demo' && !provider.baseUrl
                   ? ''
@@ -4254,17 +4566,21 @@ async function loadModels() {
               }
               <button class="btn sm model-action-btn" type="button" data-edit-provider="${esc(provider.id)}" data-tip="编辑供应商。" aria-label="编辑供应商">${modelActionIcon('edit')}</button>
               <button class="btn sm model-action-btn" type="button" data-toggle-provider="${esc(provider.id)}" data-tip="${provider.status === 'active' ? '停用供应商。' : '启用供应商。'}" aria-label="${provider.status === 'active' ? '停用供应商' : '启用供应商'}">${modelActionIcon('toggle')}</button>
-              <button class="btn sm model-action-btn is-danger" type="button" data-del-provider="${esc(provider.id)}" data-tip="删除供应商及其下模型。" aria-label="删除供应商">${modelActionIcon('delete')}</button>
+              <button class="btn sm model-action-btn is-danger" type="button" data-del-provider="${esc(provider.id)}" data-tip="删除供应商及其下模型。" aria-label="删除供应商">${modelActionIcon('delete')}</button>`
+              }
             </td>
-          </tr>`,
-        )
+          </tr>`
+        })
         .join('') || '<tr><td colspan="6" class="empty">还没有供应商，先接入一个端点</td></tr>'
 
     const routeItems = routeData?.routes ?? []
+    const pluginModelCount = models.filter((model) => model.source === 'plugin' || model.readonly === true).length
     const boundRouteCount = routeItems.filter((item) => item.boundModelId).length
     const routeRows = routeItems
       .map((item) => {
-        const eligible = models.filter((model) => modelSupportsRoutePurpose(model, item.purpose))
+        const eligible = models.filter(
+          (model) => model.readonly !== true && model.source !== 'plugin' && modelSupportsRoutePurpose(model, item.purpose),
+        )
         if (item.boundModelId && !eligible.some((model) => model.id === item.boundModelId)) {
           const bound = models.find((model) => model.id === item.boundModelId)
           if (bound) eligible.push(bound)
@@ -4278,7 +4594,7 @@ async function loadModels() {
                   )}${model.endpointKind ? ` · ${esc(model.endpointKind)}` : ''}</option>`,
               )
               .join('')
-          : '<option value="" selected>没有匹配该用途的模型</option>'
+          : `<option value="" selected>${pluginModelCount ? '插件模型只读，未开放用途绑定' : '没有匹配该用途的模型'}</option>`
         const selectHtml = eligible.length
           ? `<select data-route-purpose="${esc(item.purpose)}">
             <option value="">自动选择</option>
@@ -4311,7 +4627,7 @@ async function loadModels() {
             ${hintBadge('端点说明', '接入端点后会自动读取模型清单；读不到也可以手动添加模型。密钥只保存在服务端，不会回到浏览器。')}
           </div>
           <div class="models-panel-actions">
-            <span class="models-panel-note">${providers.length} 个端点 · ${providers.filter((item) => item.status === 'active').length} 个启用</span>
+            <span class="models-panel-note">${writableProviders.length} 个端点 · ${pluginProviderCount} 个插件通道 · ${providers.filter((item) => item.status === 'active').length} 个启用</span>
             <button class="btn primary" type="button" id="add-provider">添加供应商</button>
           </div>
         </div>
@@ -4329,7 +4645,7 @@ async function loadModels() {
         <div class="models-panel-head">
           <div>
             <h2>用途路由 <span class="models-panel-count">${boundRouteCount}/${routeItems.length}</span></h2>
-            ${hintBadge('路由说明', '把「这次要做什么」绑定到具体模型；留空则按能力和优先级自动挑。变更立即生效，未配置的用途会降级但不阻断现有对话。')}
+            ${hintBadge('路由说明', '把「这次要做什么」绑定到具体模型；留空则按能力和优先级自动挑。变更立即生效，未配置的用途会降级但不阻断现有对话。插件模型只读，暂不参与显式用途绑定。')}
           </div>
           <span class="models-panel-note">${routeItems.length ? '绑定后立即生效' : '迁移后可用'}</span>
         </div>
@@ -4345,7 +4661,7 @@ async function loadModels() {
           </div>
           <div class="models-tools">
             <label class="models-search"><span aria-hidden="true">⌕</span><input id="model-search" type="search" value="${esc(state.modelsSearch)}" placeholder="搜索模型、标识或供应商" autocomplete="off" /></label>
-            <button class="btn primary" type="button" id="add-model"${providers.length ? '' : ' disabled'}>添加模型</button>
+            ${writableProviders.length ? '<button class="btn primary" type="button" id="add-model">添加模型</button>' : ''}
           </div>
         </div>
         <div class="models-filter-bar" id="model-filter"></div>
@@ -4364,7 +4680,7 @@ async function loadModels() {
           <strong>模型与路由，按任务分开管理 ${hintBadge('使用顺序', '先确认模型目录，再按任务绑定用途路由，最后核对供应商端点；密钥只保留在服务端。')}</strong>
         </div>
         <div class="models-summary">
-          <div class="models-summary-card"><span>供应商</span><strong id="stat-providers">${providers.length}</strong><small>个端点</small></div>
+          <div class="models-summary-card"><span>供应商</span><strong id="stat-providers">${providers.length}</strong><small>${writableProviders.length} 个端点 · ${pluginProviderCount} 个插件通道</small></div>
           <div class="models-summary-card"><span>可用模型</span><strong id="stat-enabled">${enabledModels.length}</strong><small>/ ${models.length} 个 · 自动选择 ${esc(autoModel?.name || '—')}</small></div>
           <div class="models-summary-card ${visionModels.length ? 'is-highlight' : ''}"><span>图片识别</span><strong id="stat-vision">${visionModels.length}</strong><small id="stat-vision-note">${visionModels.length ? '工作台可直接粘贴图片' : '尚未标记视觉模型'}</small></div>
           <div class="models-summary-card"><span>模型类型</span><strong id="stat-type">${new Set(models.map((model) => modelTypeOf(model.tags).label)).size}</strong><small>按能力自动归类</small></div>
@@ -4380,7 +4696,7 @@ async function loadModels() {
             meta: `${boundRouteCount}/${routeItems.length} 已绑定`,
             attention: boundRouteCount < routeItems.length,
           },
-          { key: 'providers', label: '供应商与端点', meta: `${providers.length} 个端点` },
+          { key: 'providers', label: '供应商与端点', meta: `${providers.length} 个来源` },
         ],
         state.modelsSection || 'catalog',
       )}
@@ -4420,6 +4736,7 @@ async function loadModels() {
     const modelRowHtml = (model) => {
       const caps = modelCapabilitySummary(model.tags)
       const type = modelTypeOf(model.tags)
+      const readonly = model.readonly === true || model.source === 'plugin'
       const roleChips = model.roles.length
         ? model.roles.length === roles.length
           ? '<span class="chip accent">全部角色</span>'
@@ -4432,13 +4749,13 @@ async function loadModels() {
       return `<tr data-model-row="${esc(model.id)}">
         <td>
           <div class="models-model-cell">
-            <strong>${esc(model.name)}</strong>
+            <strong>${esc(model.name)}${readonly ? '<span class="models-source-tag">插件</span>' : ''}</strong>
             <span class="mono models-model-key">${esc(model.modelKey)}</span>
           </div>
         </td>
         <td>
           <span class="models-provider-pill">${esc(model.providerName)}</span>
-          <div class="desc">${esc(model.providerKind)} · 优先级 ${model.priority}</div>
+          <div class="desc">${readonly ? '插件注入 · 只读' : `${esc(model.providerKind)} · 优先级 ${model.priority}`}</div>
         </td>
         <td><span class="models-type-badge ${type.tone}">${esc(type.label)}</span></td>
         <td class="models-limits-cell">
@@ -4446,13 +4763,21 @@ async function loadModels() {
           <div class="desc">输出 ${model.maxOutputTokens ? tokenLimitLabel(model.maxOutputTokens) : '默认 4K'}</div>
         </td>
         <td>
-          <button class="models-cap-trigger" type="button" data-cap-model="${esc(model.id)}" title="点击设置能力 / 擅长场景">
+          ${
+            readonly
+              ? `<span class="models-caps-readonly" title="能力由插件定义，插件更新后自动变化">${capabilityChipsHtml(model.tags, 3)}</span>`
+              : `<button class="models-cap-trigger" type="button" data-cap-model="${esc(model.id)}" title="点击设置能力 / 擅长场景">
             ${capabilityChipsHtml(model.tags, 3)}
-          </button>
+          </button>`
+          }
         </td>
         <td class="models-roles-cell">${roleChips}</td>
         <td><span class="pill ${model.enabled ? 'ok' : 'warn'}">${model.enabled ? '启用' : '停用'}</span></td>
         <td class="model-actions">
+          ${
+            readonly
+              ? '<span class="muted">随插件启停</span>'
+              : `
           ${
             (model.endpointKind ?? 'chat') === 'chat'
               ? `<button class="btn sm model-action-btn" type="button" data-stress-model="${esc(model.id)}" data-tip="压测：直接调用真实模型，检查端点并发能力。" aria-label="压测">${modelActionIcon('stress')}</button>`
@@ -4461,6 +4786,8 @@ async function loadModels() {
           <button class="btn sm model-action-btn" type="button" data-edit-model="${esc(model.id)}" data-tip="编辑模型。" aria-label="编辑模型">${modelActionIcon('edit')}</button>
           <button class="btn sm model-action-btn" type="button" data-toggle-model="${esc(model.id)}" data-tip="${model.enabled ? '停用模型。' : '启用模型。'}" aria-label="${model.enabled ? '停用模型' : '启用模型'}">${modelActionIcon('toggle')}</button>
           <button class="btn sm model-action-btn is-danger" type="button" data-del-model="${esc(model.id)}" data-tip="删除模型。" aria-label="删除模型">${modelActionIcon('delete')}</button>
+          `
+          }
         </td>
       </tr>`
     }
@@ -4494,7 +4821,7 @@ async function loadModels() {
           ${
             query || state.modelsFilter !== 'all'
               ? '<button class="btn" type="button" data-clear-model-filter>清除筛选</button>'
-              : providers.length
+              : writableProviders.length
                 ? '<button class="btn primary" type="button" data-empty-add-model>添加模型</button>'
                 : ''
           }
@@ -4522,7 +4849,22 @@ async function loadModels() {
     renderModelRows()
 
     view.querySelector('#add-provider')?.addEventListener('click', () => openProviderModal(null))
-    view.querySelector('#add-model')?.addEventListener('click', () => openModelModal(null, providers, modelData.roles))
+    view.querySelector('#add-model')?.addEventListener('click', () => openModelModal(null, writableProviders, modelData.roles))
+    view.querySelectorAll('[data-refresh-plugin-channel]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const channelId = button.dataset.refreshPluginChannel
+        button.disabled = true
+        try {
+          const result = await apiPost(`/api/console/plugin-channels/${encodeURIComponent(channelId)}/refresh`)
+          showTopToast(`插件模型已刷新：${result.models} 个`)
+          loadModels()
+        } catch (err) {
+          showTopToast(err.message || '插件模型刷新失败', { tone: 'warn' })
+        } finally {
+          button.disabled = false
+        }
+      })
+    })
     for (const select of view.querySelectorAll('[data-route-purpose]')) {
       select.addEventListener('change', async () => {
         const row = select.closest('[data-route-row]')
@@ -4568,7 +4910,7 @@ async function loadModels() {
         return
       }
       if (event.target.closest('[data-empty-add-model]')) {
-        openModelModal(null, providers, modelData.roles)
+        openModelModal(null, writableProviders, modelData.roles)
         return
       }
       const capButton = event.target.closest('[data-cap-model]')
@@ -4592,7 +4934,7 @@ async function loadModels() {
       }
       const editButton = event.target.closest('[data-edit-model]')
       if (editButton) {
-        openModelModal(modelById.get(editButton.dataset.editModel), providers, modelData.roles)
+        openModelModal(modelById.get(editButton.dataset.editModel), writableProviders, modelData.roles)
         return
       }
       const toggleButton = event.target.closest('[data-toggle-model]')
@@ -5102,7 +5444,7 @@ async function loadSys() {
         if (!ok) return
         try {
           await apiSend('DELETE', `/api/console/companies/${encodeURIComponent(state.company)}`)
-          alert('公司及其全部数据已删除。可以到「连接与平台 → 渠道」用「钉钉扫码绑定」重新接入一家公司。')
+          alert('公司及其全部数据已删除。可以到「连接与平台 → 渠道」用「绑定钉钉机器人」重新接入一家公司。')
           location.reload()
         } catch (err) {
           alert(err.message)
@@ -5533,42 +5875,103 @@ async function loadSys() {
  */
 function openDingTalkOnboard(onDone) {
   const overlay = modelModal(`
-    <div class="modal-head"><h3>钉钉扫码绑定</h3><button class="modal-x" type="button">×</button></div>
-    ${hintNote('扫码说明', '用手机钉钉扫码，钉钉官方会创建/连接机器人并补齐机器人权限；扫完 EAB 自动把部门与成员同步到当前唯一公司，并让「EAB · 公司名」机器人开始接收私聊。通讯录权限如果钉钉没自动给，会在这里给出一次性批量开通入口。')}
-    <div class="onboard-qr">
-      <div class="onboard-qr-visual">
-        <div class="onboard-qr-frame"><img id="od-qr" alt="钉钉扫码开通二维码" /></div>
-        <div class="onboard-qr-status" id="od-state">正在生成二维码…</div>
-        <div class="onboard-permission" id="od-permission" hidden></div>
-        <div class="onboard-qr-actions">
-          <button class="btn ghost sm" type="button" id="od-refresh">刷新二维码</button>
-          <a class="link-btn" id="od-open" href="#" target="_blank" rel="noreferrer">在浏览器打开扫码页</a>
-        </div>
+    <div class="modal-head dingtalk-bind-head">
+      <div class="dingtalk-bind-title">
+        <span class="dingtalk-bind-eyebrow">渠道接入 · 钉钉</span>
+        <h3>绑定钉钉机器人</h3>
+        <p>企业自建应用 · 绑定后自动同步部门与成员</p>
       </div>
-      <ol class="onboard-steps">
-        <li><strong>手机钉钉扫码</strong><span>扫完后在手机上点「立即连接」。</span></li>
-        <li><strong>确认企业与机器人</strong><span>优先点已有机器人的「立即连接」；选「创建新机器人」时，钉钉会新建应用，通讯录权限可能还要补一次。</span></li>
-        <li><strong>回到这里等结果</strong><span>页面会自动轮询，成功后同步到本实例的唯一公司。</span></li>
-      </ol>
+      <div class="dingtalk-bind-head-actions">
+        <span class="dingtalk-bind-scope">企业内部应用</span>
+        <button class="modal-x" type="button">×</button>
+      </div>
     </div>
-    <details class="onboard-manual">
-      <summary>扫码不方便？改用手工填 AppKey / AppSecret / CorpId</summary>
-      <div class="form-grid" style="margin-top:10px">
-        <label class="field"><span>钉钉 AppKey（Client ID）</span><input id="od-appid" class="mono" placeholder="dingxxxxxxxx" /></label>
-        <label class="field"><span>钉钉 AppSecret</span><input id="od-secret" class="mono" type="password" placeholder="只保存引用，不回显" /></label>
-        <label class="field"><span>企业 CorpId</span><input id="od-corp" class="mono" placeholder="dingxxxxxxxx" /></label>
-        <label class="field"><span>公司名称（可空）</span><input id="od-name" placeholder="默认用钉钉企业名" /></label>
-        <label class="field"><span>slug（可空）</span><input id="od-slug" class="mono" placeholder="默认自动生成" /></label>
+    <div class="dingtalk-bind-lead">
+      <p>扫码或手工填凭证都能完成绑定；扫码时优先选已有普通机器人，不要新建 OpenClaw 机器人。</p>
+      ${hintBadge('绑定说明', '扫码只登记应用凭证与 RobotCode，不写入 AI 助理配置；绑定后 EAB 自己发欢迎语。扫码时优先选已有普通机器人。')}
+    </div>
+    <div class="dingtalk-bind-modes" role="tablist" aria-label="绑定方式">
+      <button class="dingtalk-bind-mode" type="button" id="od-mode-scan" role="tab" aria-selected="false" aria-controls="od-scan-panel">
+        <span class="dingtalk-bind-mode-dot" aria-hidden="true"></span>
+        <span class="dingtalk-bind-mode-copy"><strong>扫码绑定</strong><small>手机钉钉扫码授权</small></span>
+      </button>
+      <button class="dingtalk-bind-mode is-active" type="button" id="od-mode-manual" role="tab" aria-selected="true" aria-controls="od-manual-panel">
+        <span class="dingtalk-bind-mode-dot" aria-hidden="true"></span>
+        <span class="dingtalk-bind-mode-copy"><strong>手工填凭证</strong><small>已有企业内部应用</small></span>
+      </button>
+    </div>
+    <div id="od-scan-panel" hidden>
+      <div class="onboard-qr">
+        <div class="onboard-qr-visual">
+          <div class="onboard-qr-frame"><img id="od-qr" alt="钉钉扫码绑定二维码" /></div>
+          <div class="onboard-qr-status" id="od-scan-status">正在生成二维码…</div>
+          <div class="onboard-permission" id="od-permission" hidden></div>
+          <div class="onboard-qr-actions">
+            <button class="btn ghost sm" type="button" id="od-refresh">刷新二维码</button>
+            <a class="link-btn" id="od-open" href="#" target="_blank" rel="noreferrer">在浏览器打开扫码页</a>
+          </div>
+        </div>
+        <ol class="onboard-steps">
+          <li><strong>手机钉钉扫码</strong><span>扫完后在手机上点「立即连接」。</span></li>
+          <li><strong>选已有机器人，不要点「创建新机器人」</strong><span>「创建新机器人」会建 OpenClaw 智能体，带钉钉平台默认欢迎语；请选「重庆居易智能(EAB)」这类已有普通机器人，再点「立即连接」。</span></li>
+          <li><strong>回来等结果</strong><span>页面会自动同步部门与成员。</span></li>
+        </ol>
       </div>
-      ${hintNote('权限说明', '手工方式要求应用已开通部门、成员、部门成员读权限，且发布过新版本。扫码方式会由钉钉自动补齐权限。')}
-      <div class="modal-actions" style="justify-content:flex-start">
-        <button class="btn" type="button" id="od-save">手工开通并同步</button>
+    </div>
+    <div id="od-manual-panel" class="dingtalk-bind-manual">
+      <section class="dingtalk-bind-section is-primary">
+        <div class="dingtalk-bind-section-head">
+          <span class="dingtalk-bind-step">01</span>
+          <div class="dingtalk-bind-section-title">
+            <h4>应用凭证</h4>
+            <span>钉钉开放平台 → 企业内部应用</span>
+          </div>
+          <span class="dingtalk-bind-required">必填</span>
+        </div>
+        <div class="form-grid dingtalk-bind-grid">
+          <label class="field"><span>AppKey（Client ID）</span><input id="od-appid" class="mono" placeholder="dingxxxxxxxx" autocomplete="off" /></label>
+          <label class="field"><span>AppSecret ${fieldInfo('只保存引用，不回显到页面。')}</span><input id="od-secret" class="mono" type="password" placeholder="粘贴 AppSecret" /></label>
+          <label class="field"><span>企业 CorpId</span><input id="od-corp" class="mono" placeholder="dingxxxxxxxx" autocomplete="off" /></label>
+          <label class="field"><span>机器人 RobotCode ${fieldInfo('在机器人配置页取；留空时按 AppKey 处理。')}</span><input id="od-robot" class="mono" placeholder="通常与 AppKey 相同" autocomplete="off" /></label>
+        </div>
+      </section>
+      <section class="dingtalk-bind-section">
+        <div class="dingtalk-bind-section-head">
+          <span class="dingtalk-bind-step">02</span>
+          <div class="dingtalk-bind-section-title">
+            <h4>可选设置</h4>
+            <span>不填也能完成绑定</span>
+          </div>
+          <span class="dingtalk-bind-optional">可选</span>
+        </div>
+        <div class="form-grid dingtalk-bind-grid">
+          <label class="field"><span>公司名称 ${fieldInfo('留空默认用钉钉企业名。')}</span><input id="od-name" placeholder="默认用钉钉企业名" /></label>
+          <label class="field"><span>slug ${fieldInfo('留空自动生成；用于内部标识。')}</span><input id="od-slug" class="mono" placeholder="默认自动生成" autocomplete="off" /></label>
+          <label class="field"><span>AgentId ${fieldInfo('仅部分钉钉卡片能力用到，可空。')}</span><input id="od-agent" class="mono" placeholder="钉钉应用 AgentId" autocomplete="off" /></label>
+        </div>
+      </section>
+      <div class="dingtalk-bind-note">
+        <span class="dingtalk-bind-note-icon" aria-hidden="true">!</span>
+        <div class="dingtalk-bind-note-copy">
+          <strong>权限与发布</strong>
+          <span>应用需要部门、成员、部门成员读权限，并在「版本管理与发布」发布上线。</span>
+        </div>
+        ${hintBadge('权限说明', '若同步提示缺权限，按钉钉返回的 scope 列表一次申请；发布新版本后再回来继续同步。')}
       </div>
-    </details>
-    <div class="modal-actions">
+    </div>
+    <div class="modal-actions dingtalk-bind-actions">
       <button class="btn ghost" type="button" id="od-cancel">取消</button>
-    </div>`)
+      <button class="btn primary" type="button" id="od-save">绑定并同步</button>
+    </div>
+    <div class="onboard-qr-status" id="od-state" hidden></div>`)
+  overlay.querySelector('.modal')?.classList.add('dingtalk-bind-modal')
   const stateEl = overlay.querySelector('#od-state')
+  const scanStatus = overlay.querySelector('#od-scan-status')
+  const saveBtn = overlay.querySelector('#od-save')
+  const scanPanel = overlay.querySelector('#od-scan-panel')
+  const manualPanel = overlay.querySelector('#od-manual-panel')
+  const modeScan = overlay.querySelector('#od-mode-scan')
+  const modeManual = overlay.querySelector('#od-mode-manual')
   const qrImg = overlay.querySelector('#od-qr')
   const qrFrame = overlay.querySelector('.onboard-qr-frame')
   const qrActions = overlay.querySelector('.onboard-qr-actions')
@@ -5578,7 +5981,7 @@ function openDingTalkOnboard(onDone) {
   let attemptId = ''
   let intervalSec = 2
   let timer = 0
-  let stopped = false
+  let stopped = true
   let busy = false
 
   const stop = () => {
@@ -5590,20 +5993,30 @@ function openDingTalkOnboard(onDone) {
     stop()
     overlay.remove()
   }
+  const finishSuccess = (message, result) => {
+    close()
+    if (typeof onDone === 'function') {
+      showTopToast(message)
+      onDone(result)
+      return
+    }
+    // 没有调用方回调时会跳到组织页；先把提示暂存，目标页 boot 后接着显示。
+    queueTopToast(message)
+    location.href = `/admin?company=${encodeURIComponent(result.company?.id || '')}&goto=org`
+  }
   overlay.querySelector('.modal-x').addEventListener('click', close)
   overlay.querySelector('#od-cancel').addEventListener('click', close)
 
   const showPermission = (result) => {
     stop()
-    // 已经扫过码了，二维码不再需要；隐藏后把整栏让给权限说明，避免弹窗被撑出滚动条
     qrFrame.hidden = true
     qrActions.hidden = true
-    stateEl.className = 'onboard-qr-status warn'
-    stateEl.textContent = result.message || '机器人已建好，但钉钉还没给通讯录读取权限。'
+    scanStatus.className = 'onboard-qr-status warn'
+    scanStatus.textContent = result.message || '机器人已建好，但钉钉还没给通讯录读取权限。'
     const scopes = result.requiredScopes || []
     permissionEl.innerHTML = `
       <strong>还差 ${scopes.length} 个通讯录权限</strong>
-      <p>钉钉扫码会自动补机器人的权限；通讯录读取属于企业内部应用权限，需要企业管理员确认一次。点下面的按钮会一次打开全部通讯录权限，勾选后「批量申请」即可，不用一个个搜。</p>
+      <p>点下面的按钮会一次打开全部通讯录权限，勾选后「批量申请」即可。</p>
       <div class="onboard-permission-links">
         <a class="btn primary sm" href="${esc(result.batchApplyUrl || result.applyUrls?.[scopes[0]] || '#')}" target="_blank" rel="noreferrer">一次打开全部通讯录权限</a>
         <a class="btn ghost sm" href="${esc(result.versionUrl || 'https://open-dev.dingtalk.com/fe/ai')}" target="_blank" rel="noreferrer">去发布新版本</a>
@@ -5614,8 +6027,8 @@ function openDingTalkOnboard(onDone) {
     permissionEl.querySelector('#od-recheck').addEventListener('click', () => {
       permissionEl.hidden = true
       stopped = false
-      stateEl.className = 'onboard-qr-status'
-      stateEl.textContent = '正在重新检查权限并同步…'
+      scanStatus.className = 'onboard-qr-status'
+      scanStatus.textContent = '正在重新检查权限并同步…'
       void poll()
     })
   }
@@ -5626,20 +6039,11 @@ function openDingTalkOnboard(onDone) {
     try {
       const result = await apiPost('/api/console/dingtalk/onboard/status', { attemptId })
       if (result.status === 'success') {
-        stop()
-        close()
-        if (result.existing) {
-          alert(`已把扫码得到的机器人接到「${result.company?.name || '现有公司'}」。`)
-        } else {
-          alert(
-            `已开通「${result.company.name}」：${result.sync?.departments ?? 0} 个部门 / ${result.sync?.members ?? 0} 名成员，机器人已连接。`,
-          )
-        }
-        if (typeof onDone === 'function') {
-          onDone(result)
-        } else {
-          location.href = `/admin?company=${encodeURIComponent(result.company?.id || '')}&goto=org`
-        }
+        const name = result.company?.name || '当前公司'
+        finishSuccess(
+          `已绑定「${name}」：${result.sync?.departments ?? 0} 个部门 / ${result.sync?.members ?? 0} 名成员，部门组织架构同步成功。`,
+          result,
+        )
         return
       }
       if (result.status === 'needs_permission') {
@@ -5648,37 +6052,41 @@ function openDingTalkOnboard(onDone) {
       }
       if (result.status === 'expired') {
         stop()
-        stateEl.className = 'onboard-qr-status bad'
-        stateEl.textContent = '二维码已过期，请点「刷新二维码」重新生成。'
+        scanStatus.className = 'onboard-qr-status bad'
+        scanStatus.textContent = '二维码已过期，请点「刷新二维码」重新生成。'
         refreshBtn.disabled = false
         return
       }
       if (result.status === 'fail') {
         stop()
-        stateEl.className = 'onboard-qr-status bad'
-        stateEl.textContent = result.message || '钉钉侧连接失败，请刷新二维码重试。'
+        scanStatus.className = 'onboard-qr-status bad'
+        scanStatus.textContent = result.message || '钉钉侧连接失败，请刷新二维码重试。'
         refreshBtn.disabled = false
         return
       }
-      stateEl.className = 'onboard-qr-status'
-      stateEl.textContent = '等待手机扫码并在钉钉里点「立即连接」…'
+      scanStatus.className = 'onboard-qr-status'
+      scanStatus.textContent = '等待手机扫码并在钉钉里点「立即连接」…'
     } catch (err) {
       stop()
-      stateEl.className = 'onboard-qr-status bad'
-      stateEl.textContent = `${err.message}${err.code ? `（${err.code}）` : ''}`
+      scanStatus.className = 'onboard-qr-status bad'
+      scanStatus.textContent = `${err.message}${err.code ? `（${err.code}）` : ''}`
       refreshBtn.disabled = false
     } finally {
       busy = false
     }
   }
 
-  const start = async () => {
+  const startScan = async () => {
     stopped = false
     busy = false
     if (timer) clearInterval(timer)
     refreshBtn.disabled = true
-    stateEl.className = 'onboard-qr-status'
-    stateEl.textContent = '正在生成二维码…'
+    qrFrame.hidden = false
+    qrActions.hidden = false
+    permissionEl.hidden = true
+    permissionEl.innerHTML = ''
+    scanStatus.className = 'onboard-qr-status'
+    scanStatus.textContent = '正在生成二维码…'
     try {
       const started = await apiPost('/api/console/dingtalk/onboard/start', {})
       attemptId = started.attemptId
@@ -5686,49 +6094,74 @@ function openDingTalkOnboard(onDone) {
       qrImg.src = started.qrSvg
       qrImg.hidden = false
       openLink.href = started.qrUrl
-      stateEl.textContent = `请用手机钉钉扫码（${Math.round(started.expiresIn / 60)} 分钟内有效）`
+      scanStatus.textContent = `请用手机钉钉扫码（${Math.round(started.expiresIn / 60)} 分钟内有效）`
       refreshBtn.disabled = false
       timer = setInterval(poll, intervalSec * 1000)
     } catch (err) {
-      stateEl.className = 'onboard-qr-status bad'
-      stateEl.textContent = `${err.message}${err.code ? `（${err.code}）` : ''}`
+      scanStatus.className = 'onboard-qr-status bad'
+      scanStatus.textContent = `${err.message}${err.code ? `（${err.code}）` : ''}`
       refreshBtn.disabled = false
     }
   }
 
-  refreshBtn.addEventListener('click', start)
-  start()
+  const showManual = () => {
+    stop()
+    scanPanel.hidden = true
+    manualPanel.hidden = false
+    saveBtn.hidden = false
+    modeScan.className = 'dingtalk-bind-mode'
+    modeScan.setAttribute('aria-selected', 'false')
+    modeManual.className = 'dingtalk-bind-mode is-active'
+    modeManual.setAttribute('aria-selected', 'true')
+    stateEl.hidden = true
+  }
+  const showScan = () => {
+    manualPanel.hidden = true
+    scanPanel.hidden = false
+    saveBtn.hidden = true
+    stateEl.hidden = true
+    modeScan.className = 'dingtalk-bind-mode is-active'
+    modeScan.setAttribute('aria-selected', 'true')
+    modeManual.className = 'dingtalk-bind-mode'
+    modeManual.setAttribute('aria-selected', 'false')
+    if (!attemptId || stopped) void startScan()
+  }
 
-  overlay.querySelector('#od-save').addEventListener('click', async () => {
+  modeScan.addEventListener('click', showScan)
+  modeManual.addEventListener('click', showManual)
+  refreshBtn.addEventListener('click', startScan)
+
+  saveBtn.addEventListener('click', async () => {
     const body = {
       appId: overlay.querySelector('#od-appid').value.trim(),
       appSecret: overlay.querySelector('#od-secret').value.trim(),
       corpId: overlay.querySelector('#od-corp').value.trim(),
+      robotCode: overlay.querySelector('#od-robot').value.trim(),
+      agentId: overlay.querySelector('#od-agent').value.trim(),
       companyName: overlay.querySelector('#od-name').value.trim(),
       slug: overlay.querySelector('#od-slug').value.trim().toLowerCase(),
     }
-    if (!body.appId || !body.appSecret || !body.corpId) {
+    if (!body.appId || !body.appSecret || !body.corpId || !body.robotCode) {
+      stateEl.hidden = false
       stateEl.className = 'onboard-qr-status bad'
-      stateEl.textContent = 'AppKey、AppSecret、CorpId 都要填'
+      stateEl.textContent = 'AppKey、AppSecret、CorpId、RobotCode 都要填'
       return
     }
-    stop()
+    stateEl.hidden = false
     stateEl.className = 'onboard-qr-status'
-    stateEl.textContent = '正在校验凭证并拉取钉钉通讯录…'
-    overlay.querySelector('#od-save').disabled = true
+    stateEl.textContent = '正在校验凭证并同步通讯录…'
+    saveBtn.disabled = true
     try {
       const result = await apiPost('/api/console/companies/onboard-dingtalk', body)
-      close()
-      alert(`已开通「${result.company.name}」：${result.sync.departments} 个部门 / ${result.sync.members} 名成员`)
-      if (typeof onDone === 'function') {
-        onDone(result)
-      } else {
-        location.href = `/admin?company=${encodeURIComponent(result.company.id)}&goto=org`
-      }
+      finishSuccess(
+        `已绑定「${result.company.name}」：${result.sync.departments} 个部门 / ${result.sync.members} 名成员，部门组织架构同步成功。`,
+        result,
+      )
     } catch (err) {
+      stateEl.hidden = false
       stateEl.className = 'onboard-qr-status bad'
       stateEl.textContent = `${err.message}${err.code ? `（${err.code}）` : ''}`
-      overlay.querySelector('#od-save').disabled = false
+      saveBtn.disabled = false
     }
   })
 }
@@ -5765,13 +6198,13 @@ function renderFirstCompany() {
           <p>服务器刚部署时数据库里没有任何公司。创建后，这家公司就是本实例唯一的管理范围；公司总部根部门、内置角色与权限骨架会自动建好。</p>
           <div class="first-run-actions">
             <button class="btn primary" type="button" id="first-company-create">创建第一家公司</button>
-            ${hintBadge('接入说明', '创建后可在「连接与平台 → 渠道」用钉钉扫码接入真实组织。')}
+            ${hintBadge('接入说明', '创建后可在「连接与平台 → 渠道」绑定钉钉普通机器人接入真实组织。')}
           </div>
         </div>
       </div>
       <div class="first-run-steps">
         <div class="first-run-step"><span>01</span><strong>创建公司</strong><p>定义本实例唯一组织，生成公司总部与角色骨架。</p></div>
-        <div class="first-run-step"><span>02</span><strong>接入组织</strong><p>在渠道页扫码绑定钉钉，同步部门和成员。</p></div>
+        <div class="first-run-step"><span>02</span><strong>接入组织</strong><p>在渠道页绑定钉钉普通机器人，同步部门和成员。</p></div>
         <div class="first-run-step"><span>03</span><strong>配置模型</strong><p>接入本地或云端模型，再开始对话与压测。</p></div>
       </div>
     </section>`
@@ -6051,29 +6484,10 @@ async function loadTools() {
         </div>
       </section>`
     for (const button of view.querySelectorAll('[data-tool-test]')) {
-      button.addEventListener('click', async () => {
+      button.addEventListener('click', () => {
         const id = button.dataset.toolTest
         const tool = data.tools.find((item) => item.id === id)
-        const inputFields = tool.source === 'plugin' ? (tool.input?.properties ?? {}) : (tool.input ?? {})
-        const raw = prompt(`给「${tool.name}」传参数（JSON 对象）`, Object.keys(inputFields).length ? JSON.stringify(Object.fromEntries(Object.keys(inputFields).map((key) => [key, ''])), null, 2) : '{}')
-        if (raw === null) return
-        let args = {}
-        try {
-          args = raw.trim() ? JSON.parse(raw) : {}
-        } catch {
-          alert('参数不是合法 JSON')
-          return
-        }
-        try {
-          const result = await apiPost(`/api/tools/${encodeURIComponent(id)}/invoke`, { args })
-          alert(`调用成功：\n${JSON.stringify(result.result, null, 2).slice(0, 1200)}`)
-        } catch (err) {
-          if (err.code === 'EAB_APPROVAL_REQUIRED') {
-            alert(`${err.message}\n审批单：${err.details?.approvalId ?? ''}\n到「审批」页通过后再带 approvalId 调用。`)
-          } else {
-            alert(err.message)
-          }
-        }
+        openToolRunPopover(button, tool)
       })
     }
   } catch (err) {
@@ -6544,7 +6958,7 @@ async function deleteCompany(company) {
   if (!ok) return
   try {
     await apiSend('DELETE', `/api/console/companies/${encodeURIComponent(company.id)}`)
-    alert('公司已删除。请在控制台用「钉钉扫码绑定组织」重新接入。')
+    alert('公司已删除。请在控制台用「绑定钉钉机器人」重新接入。')
     location.replace('/admin')
   } catch (err) {
     alert(err.message || '删除失败')
@@ -7068,22 +7482,20 @@ function bindingCard(item, channel) {
   if (item.bound && demoBinding) {
     actions =
       item.provider === 'dingtalk'
-        ? `<button class="btn sm primary" data-bind-dingtalk>钉钉扫码绑定</button><button class="btn sm" data-unbind="${esc(
+        ? `<button class="btn sm primary" data-bind-dingtalk>绑定钉钉机器人</button><button class="btn sm" data-unbind="${esc(
             item.provider,
           )}">解除演示绑定</button>`
         : `<button class="btn sm" data-unbind="${esc(item.provider)}">解除演示绑定</button>`
   } else if (item.bound) {
     actions = `${
       item.provider === 'dingtalk'
-        ? `<button class="btn sm primary" data-bind-dingtalk>钉钉扫码绑定</button>`
-        : ''
+        ? `<button class="btn sm primary" data-bind-dingtalk>绑定钉钉机器人</button>`
+        : `<button class="btn sm" data-onboard="${esc(item.provider)}" data-mode="manual">配置组织/凭据</button>`
     }<button class="btn sm" data-unbind="${esc(item.provider)}">解绑</button>`
   } else if (item.provider === 'dingtalk') {
-    actions = `<button class="btn sm primary" data-bind-dingtalk>钉钉扫码绑定</button>`
-  } else if (ready) {
-    actions = `<button class="btn sm primary" data-bind="${esc(item.provider)}">扫码绑定</button>`
+    actions = `<button class="btn sm primary" data-bind-dingtalk>绑定钉钉机器人</button>`
   } else {
-    actions = `<button class="btn sm" data-config-channel="${esc(item.provider)}">先配置接入</button>`
+    actions = `<button class="btn sm primary" data-onboard="${esc(item.provider)}" data-mode="scan">扫码绑定</button><button class="btn sm" data-onboard="${esc(item.provider)}" data-mode="manual">手工绑定</button>`
   }
 
   return `<div class="channel-card${item.bound ? ' is-bound' : ''}${demoBinding ? ' is-demo' : ''}">
@@ -7123,7 +7535,7 @@ function renderSync(channels, data, bindings) {
   const paneBinding = `
     <section class="panel channel-pane" id="ch-binding" data-pane="binding">
       <div class="panel-head">
-        <div><h2>企业一键绑定</h2>${hintBadge('绑定说明', '钉钉扫码一次完成绑定与首次同步；飞书 / 企微后续接入。钉钉扫码绑定后会自动拉取部门树与成员；重复绑定同一企业会原地更新并重跑同步。')}</div>
+        <div><h2>企业一键绑定</h2>${hintBadge('绑定说明', '钉钉、飞书、企业微信都支持扫码或手工绑定；飞书、企业微信不装 dsh-im 也能用，装了插件时机器人由插件接管。飞书通讯录复用应用凭据，企业微信通讯录另需 CorpId + CorpSecret。')}</div>
         ${hintBadge('租户规则', '一个租户只归一家公司；绑定关系与同步结果都会写审计。')}
       </div>
       ${
@@ -7324,6 +7736,14 @@ function renderSync(channels, data, bindings) {
 
   for (const button of view.querySelectorAll('button[data-bind]')) {
     button.addEventListener('click', () => startBind(button.dataset.bind, bindings))
+  }
+  for (const button of view.querySelectorAll('button[data-onboard]')) {
+    button.addEventListener('click', () =>
+      openChannelOnboard(button.dataset.onboard, button.dataset.mode || 'scan', async () => {
+        await loadSync()
+        switchChannelTab('binding')
+      }),
+    )
   }
   for (const button of view.querySelectorAll('button[data-bind-dingtalk]')) {
     button.addEventListener('click', () =>
@@ -7609,6 +8029,222 @@ async function startBind(provider, bindings) {
   }
 }
 
+function openChannelOnboard(provider, initialMode, onDone) {
+  const label = provider === 'feishu' ? '飞书' : '企业微信'
+  const manualCopy =
+    provider === 'feishu'
+      ? '填飞书开放平台的 App ID 与 App Secret；保存后会校验并同步通讯录。未装 dsh-im 也能保存，装了会同时交给插件接管消息。'
+      : '机器人用 Bot ID + Secret；同步组织架构还需要企业 CorpId + CorpSecret。未装 dsh-im 也能先保存绑定。'
+  const manualFields =
+    provider === 'feishu'
+      ? `<label class="field"><span>App ID</span><input id="co-appid" class="mono" placeholder="cli_xxxxxxxx" autocomplete="off" /></label>
+         <label class="field"><span>App Secret ${fieldInfo('只保存引用，不回显到页面。')}</span><input id="co-secret" class="mono" type="password" placeholder="粘贴 App Secret" /></label>
+         <label class="field"><span>部署区域</span><select id="co-domain"><option value="feishu">飞书（open.feishu.cn）</option><option value="lark">Lark 国际版</option></select></label>`
+      : `<label class="field"><span>Bot ID</span><input id="co-botid" class="mono" placeholder="企业微信智能机器人 Bot ID" autocomplete="off" /></label>
+         <label class="field"><span>Bot Secret ${fieldInfo('只保存引用，不回显到页面。')}</span><input id="co-botsecret" class="mono" type="password" placeholder="粘贴机器人 Secret" /></label>
+         <label class="field"><span>CorpId ${fieldInfo('可选；要同步组织架构时必填。')}</span><input id="co-corp" class="mono" placeholder="企业微信 CorpId" autocomplete="off" /></label>
+         <label class="field"><span>通讯录 Secret ${fieldInfo('可选；企业应用的通讯录 Secret。')}</span><input id="co-corpsecret" class="mono" type="password" placeholder="粘贴通讯录 Secret" /></label>`
+  const overlay = modelModal(`
+    <div class="modal-head"><h3>${label} · 企业一键绑定</h3><button class="modal-x" type="button">×</button></div>
+    <div class="dingtalk-bind-modal">
+      <div class="dingtalk-bind-modes">
+        <button class="dingtalk-bind-mode" type="button" data-mode="scan"><span class="dingtalk-bind-mode-dot"></span><span class="dingtalk-bind-mode-copy"><strong>扫码绑定</strong><span>扫码授权后自动写入机器人凭据</span></span></button>
+        <button class="dingtalk-bind-mode" type="button" data-mode="manual"><span class="dingtalk-bind-mode-dot"></span><span class="dingtalk-bind-mode-copy"><strong>手工绑定</strong><span>已有应用时直接填凭据</span></span></button>
+      </div>
+      <section class="dingtalk-bind-section" data-panel="scan">
+        <div class="onboard-qr">
+          <div class="onboard-qr-visual">
+            <div class="onboard-qr-frame"><img id="co-qr" alt="${label}扫码绑定二维码" /></div>
+            <div class="onboard-qr-status" id="co-scan-status">正在生成二维码…</div>
+          </div>
+          <div class="onboard-steps">
+            <strong>扫码后发生什么</strong>
+            <ol>
+              <li>用${label}扫描二维码并确认授权。</li>
+              <li>平台会创建/连接机器人，EAB 保存应用/机器人凭据；装了 dsh-im 时同时交给插件接管消息。</li>
+              <li>${provider === 'feishu' ? '通讯录同步使用同一套应用凭据。' : '机器人凭据不能拉通讯录，组织架构需要另填 CorpId + CorpSecret。'}</li>
+            </ol>
+          </div>
+        </div>
+        <div class="onboard-qr-actions">
+          <button class="btn sm" type="button" id="co-refresh">重新生成</button>
+        </div>
+      </section>
+      <section class="dingtalk-bind-section" data-panel="manual" hidden>
+        <div class="bind-guide"><strong>手工绑定</strong><span>${manualCopy}</span></div>
+        <div class="form-grid dingtalk-bind-grid">${manualFields}</div>
+      </section>
+      <div class="onboard-qr-status" id="ch-onboard-state" hidden></div>
+      <div class="modal-actions dingtalk-bind-actions">
+        <button class="btn ghost" type="button" id="co-cancel">取消</button>
+        <button class="btn primary" type="button" id="co-save">保存并绑定</button>
+      </div>
+    </div>`)
+  const stateEl = overlay.querySelector('#ch-onboard-state')
+  const scanStatus = overlay.querySelector('#co-scan-status')
+  const qrImg = overlay.querySelector('#co-qr')
+  const scanPanel = overlay.querySelector('[data-panel="scan"]')
+  const manualPanel = overlay.querySelector('[data-panel="manual"]')
+  const tabs = [...overlay.querySelectorAll('.dingtalk-bind-mode')]
+  const refreshBtn = overlay.querySelector('#co-refresh')
+  const saveBtn = overlay.querySelector('#co-save')
+  let sessionId = ''
+  let timer = 0
+  let pollInterval = 2000
+  let stopped = false
+  let mode = initialMode === 'manual' ? 'manual' : 'scan'
+  overlay.addEventListener('click', (event) => {
+    if (event.target === overlay) {
+      if (timer) clearTimeout(timer)
+      timer = 0
+      stopped = true
+    }
+  })
+
+  const stop = () => {
+    stopped = true
+    if (timer) clearTimeout(timer)
+    timer = 0
+  }
+  const close = () => {
+    stop()
+    overlay.remove()
+  }
+  const setMode = (next) => {
+    mode = next
+    tabs.forEach((tab) => tab.classList.toggle('is-active', tab.dataset.mode === next))
+    scanPanel.hidden = next !== 'scan'
+    manualPanel.hidden = next !== 'manual'
+    saveBtn.hidden = next !== 'manual'
+    if (next === 'scan' && !sessionId) startScan()
+  }
+  const showState = (text, kind = '') => {
+    stateEl.hidden = false
+    stateEl.className = `onboard-qr-status${kind ? ` ${kind}` : ''}`
+    stateEl.textContent = text
+  }
+  const finish = (result) => {
+    close()
+    if (typeof onDone === 'function') onDone(result)
+  }
+  const poll = async () => {
+    if (!sessionId || stopped) return
+    try {
+      const status = await api(`/api/console/channels/${provider}/onboard/${sessionId}`)
+      if (status.status === 'success') {
+        stop()
+        finish(status)
+        return
+      }
+      if (status.status === 'expired' || status.status === 'failed' || status.status === 'error') {
+        stop()
+        scanStatus.className = 'onboard-qr-status bad'
+        scanStatus.textContent = status.message || '扫码失败，请重新生成二维码'
+        return
+      }
+      if (status.pollIntervalMs) {
+        pollInterval = Math.max(1500, Number(status.pollIntervalMs))
+      }
+      scanStatus.className = 'onboard-qr-status'
+      scanStatus.textContent = status.message || '已生成二维码，等待扫码授权…'
+      if (!stopped) timer = setTimeout(poll, pollInterval)
+    } catch (error) {
+      stop()
+      scanStatus.className = 'onboard-qr-status bad'
+      scanStatus.textContent = error.message || '轮询扫码状态失败'
+    }
+  }
+  async function startScan() {
+    stop()
+    stopped = false
+    sessionId = ''
+    scanStatus.className = 'onboard-qr-status'
+    scanStatus.textContent = '正在生成二维码…'
+    qrImg.removeAttribute('src')
+    refreshBtn.disabled = true
+    try {
+      const started = await apiPost(`/api/console/channels/${provider}/onboard/start`, {})
+      sessionId = started.sessionId
+      qrImg.src = started.qrImageUrl
+      scanStatus.textContent = '请用' + label + '扫码并确认授权'
+      const interval = Math.max(1500, Number(started.pollIntervalMs || 2000))
+      pollInterval = interval
+      timer = setTimeout(poll, pollInterval)
+    } catch (error) {
+      scanStatus.className = 'onboard-qr-status bad'
+      scanStatus.textContent = error.message || '二维码生成失败'
+    } finally {
+      refreshBtn.disabled = false
+    }
+  }
+
+  for (const tab of tabs) tab.addEventListener('click', () => setMode(tab.dataset.mode))
+  overlay.querySelector('.modal-x').addEventListener('click', close)
+  overlay.querySelector('#co-cancel').addEventListener('click', close)
+  refreshBtn.addEventListener('click', startScan)
+  saveBtn.addEventListener('click', async () => {
+    const body =
+      provider === 'feishu'
+        ? {
+            appId: overlay.querySelector('#co-appid').value.trim(),
+            appSecret: overlay.querySelector('#co-secret').value.trim(),
+            domain: overlay.querySelector('#co-domain').value,
+          }
+        : {
+            botId: overlay.querySelector('#co-botid').value.trim(),
+            botSecret: overlay.querySelector('#co-botsecret').value.trim(),
+            corpId: overlay.querySelector('#co-corp').value.trim(),
+            corpSecret: overlay.querySelector('#co-corpsecret').value.trim(),
+          }
+    if (provider === 'feishu' && (!body.appId || !body.appSecret)) {
+      showState('App ID 和 App Secret 都要填', 'bad')
+      return
+    }
+    if (provider === 'wecom' && (!body.botId || !body.botSecret)) {
+      if (body.corpId && body.corpSecret) {
+        saveBtn.disabled = true
+        showState('正在用企业通讯录凭据同步组织…')
+        try {
+          const result = await apiPost(`/api/console/channels/${provider}/org`, body)
+          finish(result)
+        } catch (error) {
+          showState(error.message || '同步失败', 'bad')
+          saveBtn.disabled = false
+        }
+        return
+      }
+      showState('Bot ID 和 Bot Secret 都要填；只同步组织请填 CorpId + 通讯录 Secret', 'bad')
+      return
+    }
+    saveBtn.disabled = true
+    showState('正在校验凭证并绑定…')
+    try {
+      const result = await apiPost(`/api/console/channels/${provider}/onboard/manual`, body)
+      if (result.syncError) {
+        showState(`已绑定，但通讯录同步失败：${result.syncError}`, 'warn')
+        saveBtn.disabled = false
+        return
+      }
+      if (result.needsOrgCredentials) {
+        showState('机器人已绑定；同步组织架构还需要补充企业通讯录凭据。', 'warn')
+        saveBtn.disabled = false
+        return
+      }
+      if (result.pluginBound === false) {
+        showState('已绑定到 EAB；当前没有 dsh-im 插件，机器人消息不会由插件接管。装好插件后再保存一次即可交给插件。', 'warn')
+        saveBtn.disabled = false
+        return
+      }
+      finish(result)
+    } catch (error) {
+      showState(error.message || '绑定失败', 'bad')
+      saveBtn.disabled = false
+    }
+  })
+
+  setMode(mode)
+}
+
 function openDingTalkBind(channel, bindings, organization = null) {
   const demoChannel = Boolean(
     channel?.tenantId &&
@@ -7837,6 +8473,7 @@ const PLUGIN_EVENT_LABEL = {
 }
 
 const PLUGIN_SOURCE_LABEL = {
+  'browser-dir': '本机文件夹',
   'local-dir': '本地目录',
   npm: 'npm · 镜像',
   github: 'GitHub',
@@ -7941,37 +8578,6 @@ function pluginCard(plugin) {
   </section>`
 }
 
-function catalogCard(entry) {
-  const installed = entry.installed
-  const pill = !installed
-    ? '<span class="pill">未安装</span>'
-    : entry.updateAvailable
-      ? `<span class="pill warn">可更新 ${esc(entry.installedVersion || '')} → ${esc(entry.version)}</span>`
-      : `<span class="pill ok">已安装 ${esc(entry.version)}</span>`
-  const tags = entry.tags.length ? entry.tags.map((tag) => `<span class="chip">${esc(tag)}</span>`).join('') : ''
-  const source = entry.sourcePath
-    ? `<span class="mono muted">${esc(entry.sourcePath)}</span>`
-    : '<span class="muted">没有声明 sourcePath，只能手动填目录</span>'
-  const action = entry.updateAvailable
-    ? `<button class="btn sm primary" type="button" data-catalog-install="${esc(entry.id)}">更新到 ${esc(entry.version)}</button>`
-    : installed
-      ? '<button class="btn sm" type="button" disabled>已是该版本</button>'
-      : `<button class="btn sm primary" type="button" data-catalog-install="${esc(entry.id)}">安装</button>`
-  return `<section class="panel plugin-card" id="catalog-${esc(entry.id)}">
-    <div class="panel-head">
-      <h2>${esc(entry.name)} <span class="muted mono" style="font-size:12px">${esc(entry.id)}@${esc(entry.version)}</span></h2>
-      ${pill}
-    </div>
-    <div class="legend" style="margin-top:0">${esc(entry.description || '（没有写描述）')}</div>
-    <div class="plugin-actions" style="margin-top:8px">${tags}</div>
-    <div class="kv" style="margin-top:10px">
-      <div><span>作者</span><strong>${esc(entry.author || '未填写')}</strong></div>
-      <div><span>安装来源</span>${source}</div>
-    </div>
-    <div class="plugin-actions">${action}</div>
-  </section>`
-}
-
 function pluginEventDetail(event) {
   const raw = event.detail
   let detail = null
@@ -8049,15 +8655,9 @@ async function openPluginInstall(prefill = {}) {
     <div class="modal-head install-modal-head">
       <div>
         <span class="install-eyebrow">PLUGIN INSTALLER</span>
-        <h3>${existing ? '更新插件' : '安装插件'}</h3>
-        <p class="install-sub">安装到「${esc(companyName)}」 · 本地目录 / npm 国内镜像 / GitHub 三种来源</p>
+        <h3>${existing ? '更新插件' : '安装插件'} ${hintBadge('当前公司', `安装到「${companyName}」 · 本地目录 / npm 国内镜像 / GitHub 三种来源；只记当前公司名下，其他公司看不到，也不共用启停状态。`, '安装范围说明')}</h3>
       </div>
       <button class="modal-x" type="button">×</button>
-    </div>
-
-    <div class="install-scope-bar">
-      <span class="install-scope-dot"></span>
-      <span>安装登记只记在当前公司名下；其他公司看不到，也不会共用启停状态。</span>
     </div>
 
     <div class="install-source-tabs" role="tablist" aria-label="安装来源">
@@ -8076,23 +8676,16 @@ async function openPluginInstall(prefill = {}) {
     </div>
 
     <div class="install-panel" data-install-panel="local-dir">
-      <label class="install-field">插件包目录（服务器绝对路径）
+      <label class="install-field"><span class="install-label">插件包目录（服务器绝对路径） ${hintBadge('包格式', '支持 EAB 插件（plugin.json）和 DSH 插件（package.json 带 dsh 段，含 bundle.patch / client 入口）。目录名不必等于插件 id。', '支持的插件包格式')}</span>
         <input id="pg-local-src" value="${esc(localPrefill)}" placeholder="例如 D:/dsh/dsh-mrrp 或 D:/AI kaifa/EAB/plugins/eab-plugin-oncall" />
-        <span class="install-field-hint">支持 EAB 插件（plugin.json）和 DSH 插件（package.json 带 dsh 段，含 bundle.patch / client 入口）。目录名不必等于插件 id。</span>
       </label>
     </div>
 
     <div class="install-panel" data-install-panel="npm">
-      <div class="install-grid">
-        <label class="install-field install-span-2">npm 包名
-          <input id="pg-npm-name" value="${esc(npmPrefill?.packageName || '')}" placeholder="eab-plugin-oncall 或 @scope/eab-plugin-x" />
-          <span class="install-field-hint">包里必须带 plugin.json；只取内容，不执行 npm install。</span>
-        </label>
-        <label class="install-field">版本 / 标签
-          <input id="pg-npm-version" value="${esc(npmPrefill?.version || '')}" placeholder="留空 = latest；也可填 1.2.3 / beta" />
-        </label>
-      </div>
-      <label class="install-field">镜像源
+      <label class="install-field"><span class="install-label">npm 包名 ${hintBadge('包要求', '包里必须带 plugin.json；只取内容，不执行 npm install、prepare 或生命周期脚本。默认取 registry 的最新版本。', 'npm 包要求')}</span>
+        <input id="pg-npm-name" value="${esc(npmPrefill?.packageName || '')}" placeholder="eab-plugin-oncall 或 @scope/eab-plugin-x" />
+      </label>
+      <label class="install-field"><span class="install-label">镜像源 ${hintBadge('镜像说明', '按需选择 npm registry；国内镜像同步更快。', '镜像源说明', '', 'pg-registry-hint')}</span>
         <select id="pg-npm-registry">
           ${registryOptions}
           <option value="custom"${registryIsPreset ? '' : ' selected'}>自定义 registry…</option>
@@ -8101,14 +8694,12 @@ async function openPluginInstall(prefill = {}) {
       <label class="install-field is-hidden" id="pg-custom-registry-wrap">自定义 registry 地址
         <input id="pg-custom-registry" value="${esc(registryIsPreset ? '' : prefillRegistry)}" placeholder="https://registry.example.com" />
       </label>
-      <div class="install-registry-hint" id="pg-registry-hint"></div>
     </div>
 
     <div class="install-panel" data-install-panel="github">
       <div class="install-grid">
-        <label class="install-field install-span-2">GitHub 仓库
+        <label class="install-field install-span-2"><span class="install-label">GitHub 仓库 ${hintBadge('访问范围', '公开仓库可直接装；私有仓库暂不支持匿名下载。', 'GitHub 仓库访问范围')}</span>
           <input id="pg-github-repo" value="${esc(githubPrefill?.repo || '')}" placeholder="owner/repo，例如 xmanrui/dsh-im" />
-          <span class="install-field-hint">公开仓库可直接装；私有仓库暂不支持匿名下载。</span>
         </label>
         <label class="install-field">分支 / 标签
           <input id="pg-github-ref" value="${esc(githubPrefill?.ref || '')}" placeholder="留空 = 默认分支；也可填 v1.0.0" />
@@ -8136,9 +8727,9 @@ async function openPluginInstall(prefill = {}) {
     </div>
 
     <div class="install-flow">
-      <span>① 取包</span><i>→</i><span>② 解包到临时区</span><i>→</i><span>③ 校验清单 / id / 页面</span><i>→</i><span>④ 落 plugins/&lt;id&gt;</span><i>→</i><span>⑤ 登记版本 / 来源 / 指纹</span>
+      <span>① 取包</span><i>→</i><span>② 解包并校验</span><i>→</i><span>③ 落盘登记</span>
+      <div class="install-note" id="pg-note"></div>
     </div>
-    <div class="install-note" id="pg-note"></div>
     <div class="modal-state" id="pg-state"></div>
     <div class="modal-actions">
       <button class="btn primary" type="button" id="pg-save">${existing ? '更新' : '安装'}</button>
@@ -8167,9 +8758,11 @@ async function openPluginInstall(prefill = {}) {
     const selected = registrySelect.value
     const preset = registries.find((item) => item.url === selected)
     customWrap.classList.toggle('is-hidden', selected !== 'custom')
-    registryHint.textContent = selected === 'custom'
+    const tip = selected === 'custom'
       ? '自定义 registry 需兼容 npm registry API（GET /<package> 返回 dist.tarball）。'
       : `${preset?.label || 'registry'}：${preset?.hint || ''}`
+    registryHint.dataset.tip = tip
+    registryHint.setAttribute('aria-label', `${preset?.label || '自定义 registry'}镜像源说明`)
   }
 
   const syncSource = (next) => {
@@ -8180,7 +8773,7 @@ async function openPluginInstall(prefill = {}) {
       tab.setAttribute('aria-selected', active ? 'true' : 'false')
     }
     for (const panel of panels) panel.classList.toggle('is-hidden', panel.dataset.installPanel !== next)
-    noteEl.textContent = sourceNotes[next] || ''
+    noteEl.innerHTML = hintBadge('安装方式', sourceNotes[next] || '', '安装方式说明')
     stateEl.className = 'modal-state'
     stateEl.textContent = ''
   }
@@ -8207,7 +8800,6 @@ async function openPluginInstall(prefill = {}) {
       }
     } else if (source === 'npm') {
       body.packageName = overlay.querySelector('#pg-npm-name').value.trim()
-      body.version = overlay.querySelector('#pg-npm-version').value.trim()
       body.registry = registrySelect.value === 'custom' ? customInput.value.trim() : registrySelect.value
       if (!body.packageName) {
         stateEl.className = 'modal-state bad'
@@ -8290,7 +8882,8 @@ function pluginPageUrl(data, plugin, page) {
   const version = encodeURIComponent(plugin.version || '')
   const company = encodeURIComponent(data.companyId || '')
   if ((page.kind || 'html') === 'dsh-client') {
-    return `/plugin-host.html?id=${encodeURIComponent(plugin.id)}&entry=${encodeURIComponent(page.file)}&company=${company}&version=${version}&title=${encodeURIComponent(page.title)}`
+    const inject = encodeURIComponent((plugin.dsh?.clientInject || []).join(','))
+    return `/plugin-host.html?id=${encodeURIComponent(plugin.id)}&entry=${encodeURIComponent(page.file)}&company=${company}&version=${version}&title=${encodeURIComponent(page.title)}&inject=${inject}`
   }
   return `/plugins/assets/${encodeURIComponent(plugin.id)}/${page.file}${qs()}`
 }
@@ -8323,17 +8916,6 @@ function pluginRailItem(plugin, selected) {
       <small><span class="mono">${esc(plugin.version)}</span> · ${esc(sub)}</small>
     </span>
     <span class="plugin-rail-dot ${!plugin.valid ? 'bad' : plugin.enabled ? 'ok' : 'warn'}" title="${plugin.valid ? (plugin.enabled ? '启用' : '停用') : '清单不合法'}"></span>
-  </button>`
-}
-
-function pluginCatalogRailItem(entry) {
-  return `<button class="plugin-rail-item is-muted" type="button" data-catalog-open="${esc(entry.id)}">
-    <span class="plugin-rail-avatar ghost">+</span>
-    <span class="plugin-rail-text">
-      <strong>${esc(entry.name)}</strong>
-      <small>${entry.installed ? `可更新 → ${esc(entry.version)}` : `可安装 ${esc(entry.version)}`}</small>
-    </span>
-    <span class="plugin-rail-dot ${entry.updateAvailable ? 'warn' : ''}"></span>
   </button>`
 }
 
@@ -8551,35 +9133,12 @@ function pluginWelcomeHtml(data) {
   </section>`
 }
 
-function pluginCatalogHtml(data) {
-  const entries = data.catalog.plugins.filter((entry) => !entry.installed || entry.updateAvailable)
-  const cards = entries.length
-    ? entries
-        .map(
-          (entry) => `<article class="plugin-catalog-card">
-        <div class="plugin-catalog-head"><strong>${esc(entry.name)}</strong><span class="pill ${entry.updateAvailable ? 'warn' : ''}">${entry.updateAvailable ? `可更新 ${esc(entry.version)}` : `可安装 ${esc(entry.version)}`}</span></div>
-        <div class="mono muted">${esc(entry.id)}@${esc(entry.version)}</div>
-        <p>${esc(entry.description || '（没有写描述）')}</p>
-        <div class="plugin-actions">${(entry.tags || []).map((tag) => `<span class="chip">${esc(tag)}</span>`).join('')}<button class="btn primary sm" type="button" data-catalog-install="${esc(entry.id)}">${entry.updateAvailable ? '更新' : '安装'}</button></div>
-      </article>`,
-        )
-        .join('')
-    : '<div class="empty plugin-empty-inline">插件源里没有当前公司可安装或可更新的条目。</div>'
-  return `<section class="panel plugin-catalog">
-    <div class="panel-head"><h2>插件源</h2><span class="hint">${entries.length} 个可装 / 可更新 · <span class="mono">${esc(data.catalog.path)}</span></span></div>
-    <div class="legend" style="margin-top:0">${data.catalog.error ? esc(data.catalog.error) : hintBadge('来源说明', '本地目录、npm 国内镜像、GitHub 三种来源安装后走同一条校验与登记链路；DSH 插件按 package.json 的 files 白名单复制。')}</div>
-    <div class="plugin-catalog-grid">${cards}</div>
-  </section>`
-}
-
 function pluginRailHtml(data) {
   const companyName = state.companies?.find((item) => item.id === data.companyId)?.name || data.companyId || '当前公司'
   const selected = state.pluginSelected
   const installed = data.plugins
     .map((plugin) => pluginRailItem(plugin, plugin.id === selected))
     .join('')
-  const available = data.catalog.plugins.filter((entry) => !entry.installed || entry.updateAvailable)
-  const catalog = available.map(pluginCatalogRailItem).join('')
   const hosts = (data.hosts || []).filter((host) => !host.error).length
   return `<div class="plugin-scope-block">
       <div class="plugin-scope-kicker">
@@ -8599,8 +9158,7 @@ function pluginRailHtml(data) {
     </div>
     <div class="side-head">已安装 <span class="muted">${data.plugins.length}</span></div>
     <div class="side-list plugin-rail-list">${installed || '<div class="side-note">当前公司还没有安装插件</div>'}</div>
-    <div class="side-head">可安装 / 可更新 <span class="muted">${available.length}</span></div>
-    <div class="side-list plugin-rail-list">${catalog || '<div class="side-note">没有新的可安装条目</div>'}</div>`
+    `
 }
 
 function bindPluginTabs() {
@@ -8655,18 +9213,6 @@ function bindPluginTabs() {
       state.pluginPageKey = null
       renderPluginSide()
       renderPluginView()
-    })
-  }
-  for (const button of document.querySelectorAll('[data-catalog-open]')) {
-    button.addEventListener('click', () => {
-      const entry = state.pluginData?.catalog.plugins.find((item) => item.id === button.dataset.catalogOpen)
-      if (entry) openPluginInstall({ id: entry.id, sourcePath: entry.sourcePath || '' })
-    })
-  }
-  for (const button of document.querySelectorAll('[data-catalog-install]')) {
-    button.addEventListener('click', () => {
-      const entry = state.pluginData?.catalog.plugins.find((item) => item.id === button.dataset.catalogInstall)
-      if (entry) openPluginInstall({ id: entry.id, sourcePath: entry.sourcePath || '' })
     })
   }
   for (const button of document.querySelectorAll('[data-update-plugin]')) {
@@ -9102,6 +9648,7 @@ async function boot() {
     }
   })
 
+  flushQueuedTopToast()
   if (needsFirstCompany) return
   await refresh()
 }

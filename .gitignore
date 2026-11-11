@@ -4,6 +4,7 @@ coverage/
 *.log
 .eab-dev/
 .EAB_HOME/
+plugins/
 plans/
 *.db
 *.db-wal

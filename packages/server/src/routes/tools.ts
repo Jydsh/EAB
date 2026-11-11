@@ -25,17 +25,8 @@ import {
   resolveToolOperationKey,
 } from '../tool-idempotency.js'
 import { retrieveExternalKb } from '../kb-external.js'
-import {
-  deleteLocalFile,
-  findLocalSpaceRow,
-  listLocalEntries,
-  mkdirLocal,
-  moveLocalEntry,
-  readLocalText,
-  writeLocalText,
-  type ActiveSpace,
-} from '../local-space.js'
 import { executePluginTool, pluginToolCatalogFor, pluginToolSpecsFor, resolvePluginToolForActor } from '../plugin-tools.js'
+import type { ActiveSpace } from '../space.js'
 import {
   resolveUserWorkspaceQuota,
   workspaceCapacity,
@@ -208,11 +199,6 @@ function workspaceFileLockKey(
     if (row?.rel_path) path = row.rel_path
   }
   return `workspace:file:${companyId}:${userId}:${path || 'unknown'}`
-}
-
-function localMutationLockKey(space: ActiveSpace): string {
-  const spaceId = space.kind === 'local' ? space.spaceId : 'none'
-  return `local:space:${spaceId}:mutate`
 }
 
 function scheduleCreateLockKey(actor: RequestActor): string {
@@ -439,80 +425,6 @@ export const TOOLS: readonly ToolDef[] = [
     input: {
       fileId: { type: 'string', description: 'workspace.list 返回的文件 id；和 path 二选一' },
       path: { type: 'string', description: '文件相对路径或文件名，例如 安全防护记录表.docx；和 fileId 二选一' },
-    },
-  },
-  {
-    id: 'local.list',
-    name: '列出本地目录',
-    description: '列出当前本地空间某个目录下的文件和子目录（默认忽略 node_modules、.git 等重目录）',
-    scope: SC.LOCAL_SPACE_READ,
-    dangerous: false,
-    input: {
-      path: { type: 'string', description: '相对空间根目录的路径；留空表示根目录' },
-      all: { type: 'boolean', description: '是否包含 node_modules、.git 等重目录，默认 false' },
-    },
-  },
-  {
-    id: 'local.read',
-    name: '读取本地文件',
-    description: '读取当前本地空间里的文本/代码/Markdown 文件正文（最大 5 MB）',
-    scope: SC.LOCAL_SPACE_READ,
-    dangerous: false,
-    input: {
-      path: { type: 'string', description: '相对空间根目录的文件路径', required: true },
-    },
-  },
-  {
-    id: 'local.write',
-    name: '编辑本地文件',
-    description:
-      '在当前本地空间创建或覆盖文本文件，用来编辑本地文本/代码/Markdown。用户说“改一下/编辑/修改/保存这段内容”时调用；先 local.read 读原文，再传完整新内容覆盖。不会删除文件，也不会执行命令。',
-    scope: SC.LOCAL_SPACE_WRITE,
-    dangerous: false,
-    concurrency: 'write',
-    lockKey: (_deps, _actor, _args, space) => localMutationLockKey(space),
-    input: {
-      path: { type: 'string', description: '相对空间根目录的文件路径，例如 src/app.ts', required: true },
-      text: { type: 'string', description: '完整文本内容', required: true },
-    },
-  },
-  {
-    id: 'local.delete',
-    name: '删除本地文件',
-    description:
-      '从当前本地空间永久删除一个文件。只有用户明确说“删除/删掉/清理某个本地文件”时调用；先用 local.list 确认相对路径。只能删文件，不能删目录；删除不可恢复；只读空间不能删。',
-    scope: SC.LOCAL_SPACE_WRITE,
-    dangerous: false,
-    concurrency: 'write',
-    lockKey: (_deps, _actor, _args, space) => localMutationLockKey(space),
-    input: {
-      path: { type: 'string', description: '要删除的文件相对路径，例如 logs/old.log', required: true },
-    },
-  },
-  {
-    id: 'local.move',
-    name: '移动本地文件',
-    description: '在当前本地空间内移动或重命名文件/目录；不删除文件',
-    scope: SC.LOCAL_SPACE_WRITE,
-    dangerous: false,
-    concurrency: 'write',
-    lockKey: (_deps, _actor, _args, space) => localMutationLockKey(space),
-    input: {
-      from: { type: 'string', description: '源相对路径', required: true },
-      to: { type: 'string', description: '目标相对路径', required: true },
-      overwrite: { type: 'boolean', description: '目标存在时是否覆盖，默认 false' },
-    },
-  },
-  {
-    id: 'local.mkdir',
-    name: '新建本地目录',
-    description: '在当前本地空间里创建一个目录',
-    scope: SC.LOCAL_SPACE_WRITE,
-    dangerous: false,
-    concurrency: 'write',
-    lockKey: (_deps, _actor, _args, space) => localMutationLockKey(space),
-    input: {
-      path: { type: 'string', description: '相对空间根目录的目录路径', required: true },
     },
   },
   {
@@ -828,8 +740,6 @@ export const AGENT_CORE_TOOL_IDS: readonly string[] = [
   'schedule.create',
   'workspace.list',
   'workspace.read',
-  'local.list',
-  'local.read',
 ]
 
 export interface ToolSearchHit {
@@ -883,12 +793,6 @@ const TOOL_SEARCH_ALIASES: Record<string, string> = {
   'workspace.send_dingtalk': '发送文件 发文件 发给我 钉钉 send file dingtalk attachment',
   'workspace.rename': '重命名 改名 文件名 rename file',
   'workspace.delete': '删除文件 删掉 清理文件 delete file remove',
-  'local.list': '本地 文件 目录 列表 local file list',
-  'local.read': '本地 读文件 查看 local read file',
-  'local.write': '本地 写文件 保存 编辑 修改 local write edit save file',
-  'local.delete': '本地 删除 删掉 清理 local delete remove file',
-  'local.move': '本地 移动 改名 移动文件 local move rename',
-  'local.mkdir': '本地 新建目录 创建文件夹 local mkdir folder',
   'admin.password.reset': '重置密码 改密码 成员密码 password reset',
 }
 
@@ -965,20 +869,10 @@ export function toolSpecsForAgent(db: Db, actor: Actor, space: ActiveSpace = { k
   return toolSpecsForActor(db, actor, space).filter((spec) => coreNames.has(spec.function.name))
 }
 
-/** 当前空间只暴露对应的一套文件工具，避免模型把云空间和本地目录混用。 */
+/** 云空间是唯一可用的文件空间；none 不暴露文件工具。 */
 function toolAllowedInSpace(toolId: string, space: ActiveSpace): boolean {
-  if (toolId.startsWith('local.')) return space.kind === 'local'
   if (toolId.startsWith('workspace.')) return space.kind === 'cloud'
   return true
-}
-
-function localSpaceForTool(deps: ServerDeps, actor: Actor, space: ActiveSpace) {
-  if (space.kind !== 'local' || !space.spaceId) {
-    throw new EabError(EC.VALIDATION, '当前对话没有选择本地空间')
-  }
-  const row = findLocalSpaceRow(deps.db, actor.subject.companyId, actor.person.id, space.spaceId)
-  if (!row) throw new EabError(EC.NOT_FOUND, '本地空间不存在或已删除')
-  return row
 }
 
 /** 取当前对话对应的钉钉机器人单聊 openConversationId；网页会话或旧会话可能为空。 */
@@ -997,28 +891,6 @@ function openConversationIdForTool(
     )
     .get(sessionId, companyId) as { open_conversation_id: string | null } | undefined
   return String(row?.open_conversation_id ?? '').trim()
-}
-
-function auditLocalTool(
-  deps: ServerDeps,
-  actor: Actor,
-  action: string,
-  spaceId: string,
-  detail: Record<string, unknown>,
-): void {
-  appendAudit(deps.db, {
-    companyId: actor.subject.companyId,
-    actorUserId: actor.subject.userId,
-    action,
-    resourceType: 'local_space',
-    resourceId: spaceId,
-    resourceScope: `local:${spaceId}`,
-    result: 'success',
-    detail,
-    traceId: null,
-    ip: null,
-    channel: 'agent',
-  })
 }
 
 /** 给对话模型用的工具声明：内置工具 + 当前员工已安装且启用插件的工具。 */
@@ -1486,78 +1358,6 @@ export async function executeTool(
           .run(ulid(), actor.subject.companyId, actor.subject.userId, actor.subject.userId, path, basename(path), size, target, Date.now(), Date.now())
       }
       result = { path, size }
-      break
-    }
-    case 'local.list': {
-      const row = localSpaceForTool(deps, actor, space)
-      const listed = listLocalEntries(row, String(args.path ?? ''), {
-        showAll: args.all === true,
-      })
-      auditLocalTool(deps, actor, 'local_file.list', row.id, {
-        path: String(args.path ?? ''),
-        count: listed.entries.length,
-      })
-      result = { space: row.name, path: String(args.path ?? ''), ...listed }
-      break
-    }
-    case 'local.read': {
-      const row = localSpaceForTool(deps, actor, space)
-      const read = readLocalText(row, String(args.path ?? ''))
-      if (read.binary) {
-        throw new EabError(EC.VALIDATION, '这是二进制文件，不能按文本读取；请下载后查看')
-      }
-      auditLocalTool(deps, actor, 'local_file.read', row.id, {
-        path: read.relPath,
-        bytes: read.size,
-        truncated: read.truncated,
-      })
-      result = {
-        space: row.name,
-        path: read.relPath,
-        size: read.size,
-        text: read.text,
-        truncated: read.truncated,
-        encoding: read.encoding,
-      }
-      break
-    }
-    case 'local.write': {
-      const row = localSpaceForTool(deps, actor, space)
-      const written = writeLocalText(row, String(args.path ?? ''), String(args.text ?? ''))
-      auditLocalTool(deps, actor, 'local_file.write', row.id, {
-        path: written.relPath,
-        bytes: written.size,
-      })
-      result = { space: row.name, ...written }
-      break
-    }
-    case 'local.delete': {
-      const row = localSpaceForTool(deps, actor, space)
-      const deleted = deleteLocalFile(row, String(args.path ?? ''))
-      auditLocalTool(deps, actor, 'local_file.delete', row.id, {
-        path: deleted.relPath,
-        bytes: deleted.size,
-      })
-      result = { space: row.name, deleted: true, ...deleted }
-      break
-    }
-    case 'local.move': {
-      const row = localSpaceForTool(deps, actor, space)
-      const moved = moveLocalEntry(
-        row,
-        String(args.from ?? ''),
-        String(args.to ?? ''),
-        args.overwrite === true,
-      )
-      auditLocalTool(deps, actor, 'local_file.move', row.id, moved)
-      result = { space: row.name, ...moved }
-      break
-    }
-    case 'local.mkdir': {
-      const row = localSpaceForTool(deps, actor, space)
-      const created = mkdirLocal(row, String(args.path ?? ''))
-      auditLocalTool(deps, actor, 'local_file.mkdir', row.id, created)
-      result = { space: row.name, ...created }
       break
     }
     case 'admin.password.reset': {

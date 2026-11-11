@@ -24,6 +24,7 @@ import {
 } from './settings.js'
 import { startRetention } from './retention.js'
 import { startScheduleWorker } from './schedule.js'
+import { startModelHealthMonitor } from './model-health.js'
 import { reloadPluginHosts } from './plugin-host.js'
 import { setPluginRoot } from './plugins.js'
 import { checkForUpdate } from './update.js'
@@ -207,6 +208,9 @@ await reloadPluginHosts(db, {
   console.warn('[eab] DSH 插件宿主启动失败：', (error as Error).message)
 })
 
+/** 插件模型定时健康探测：失败模型从对话候选过滤，恢复后自动回来。 */
+const stopModelHealthMonitor = startModelHealthMonitor(config.companyId)
+
 /** 0.0.0.0 时给运维一个可直接复制的局域网地址；只做展示，不参与监听。 */
 function localIpv4(): string | null {
   for (const list of Object.values(networkInterfaces())) {
@@ -256,6 +260,7 @@ void refreshDingTalkStream(deps).catch((error) => {
 
 async function shutdown(): Promise<void> {
   stopScheduleWorker()
+  stopModelHealthMonitor()
   stopDingTalkStream()
   await closeApps(apps)
   processLock.release()

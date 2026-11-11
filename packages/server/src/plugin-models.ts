@@ -1,0 +1,575 @@
+/**
+ * DSH 插件模型注册表。
+ *
+ * 插件通过 `ctx.llm.registerAdapter(routes, adapter)` 注册的是「provider 路由 +
+ * adapter」，不是 EAB `models` 表里的行。这里把 adapter 的 `listModels()` 结果
+ * 投影成 EAB 模型目录里的虚拟模型，ID 统一加 `plugin:` 前缀；对话调用再按这个
+ * ID 找回 adapter，避免插件模型必须落库才能出现在选择器里。
+ */
+import { EC, EabError } from '@eab/domain'
+import type { CallResult, ChatMessage, ModelStreamOptions } from './llm.js'
+
+interface PluginAdapterLike {
+  listModels?: (provider: string) => unknown | Promise<unknown>
+  resolveModel?: (provider: string, model: string) => unknown | Promise<unknown>
+  prepareCall?: (provider: string, model: string) => unknown | Promise<unknown>
+  stream?: (options: Record<string, unknown>) => unknown
+}
+
+interface RegisteredAdapter {
+  pluginId: string
+  routes: Set<string>
+  adapter: PluginAdapterLike
+  revision: number
+  configurable: Map<string, Record<string, unknown>>
+  discovery: ((...args: unknown[]) => unknown) | null
+}
+
+interface PluginModelTarget {
+  provider: string
+  modelId: string
+  pluginId: string
+  channelId: string
+  adapter: PluginAdapterLike
+  info: Record<string, unknown>
+}
+
+export interface PluginModelDefinition {
+  id: string
+  name: string
+  desc: string
+  tags: string[]
+  capabilities: string[]
+  endpointKind: string
+  roles: string[]
+  priority: number
+  provider: string
+  providerName: string
+  modelKey: string
+  maxContext: number | null
+  maxOutputTokens: number | null
+  contextCompression: boolean
+  inputModalities: string[]
+  outputModalities: string[]
+  source: 'plugin'
+  readonly: true
+  pluginId: string
+  channelId: string
+}
+
+export interface PluginChannelDefinition {
+  id: string
+  pluginId: string
+  route: string
+  name: string
+  kind: 'plugin'
+  status: 'active'
+  models: number
+  settingsNs: string | null
+  settingsPath: string[]
+  configurable: boolean
+  discovery: boolean
+}
+
+const adaptersByCompany = new Map<string, RegisteredAdapter[]>()
+const modelsByCompany = new Map<string, Map<string, PluginModelDefinition>>()
+const targetsByCompany = new Map<string, Map<string, PluginModelTarget>>()
+// 插件允许先声明可配置 provider / 模型探测，再注册 adapter；先暂存，等 adapter
+// 到位后合并，避免注册顺序决定控制台能否看到通道。
+const pendingConfigurable = new Map<string, Map<string, Map<string, Record<string, unknown>>>>()
+const pendingDiscovery = new Map<string, Map<string, (...args: unknown[]) => unknown>>()
+
+const ALL_ROLES = [
+  'auditor',
+  'company_admin',
+  'company_sub_admin',
+  'dept_admin',
+  'guest',
+  'kb_admin',
+  'member',
+  'super_admin',
+]
+
+function companyAdapters(companyId: string): RegisteredAdapter[] {
+  let rows = adaptersByCompany.get(companyId)
+  if (!rows) {
+    rows = []
+    adaptersByCompany.set(companyId, rows)
+  }
+  return rows
+}
+
+function companyModels(companyId: string): Map<string, PluginModelDefinition> {
+  let rows = modelsByCompany.get(companyId)
+  if (!rows) {
+    rows = new Map()
+    modelsByCompany.set(companyId, rows)
+  }
+  return rows
+}
+
+function companyTargets(companyId: string): Map<string, PluginModelTarget> {
+  let rows = targetsByCompany.get(companyId)
+  if (!rows) {
+    rows = new Map()
+    targetsByCompany.set(companyId, rows)
+  }
+  return rows
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' ? (value as Record<string, unknown>) : {}
+}
+
+function pluginModelId(provider: string, modelId: string): string {
+  return `plugin:${encodeURIComponent(provider)}:${encodeURIComponent(modelId)}`
+}
+
+function pluginChannelId(pluginId: string, route: string): string {
+  return `plugin:${encodeURIComponent(pluginId)}:${encodeURIComponent(route)}`
+}
+
+function asStringList(value: unknown): string[] {
+  return Array.isArray(value) ? value.map(String) : []
+}
+
+function asCapabilities(info: Record<string, unknown>): string[] {
+  const modalities = Array.isArray(info.inputModalities) ? info.inputModalities.map(String) : []
+  const out = new Set<string>(modalities.includes('image') ? ['vision'] : [])
+  if (Array.isArray(info.capabilities)) for (const item of info.capabilities) out.add(String(item))
+  return [...out]
+}
+
+function toDefinition(
+  provider: string,
+  info: Record<string, unknown>,
+  pluginId: string,
+  channelId: string,
+): PluginModelDefinition {
+  const id = String(info.id ?? '')
+  if (!id) throw new Error('插件模型缺少 id')
+  const context = asRecord(info.context)
+  const capabilities = asCapabilities(info)
+  const tags = [...new Set([...(Array.isArray(info.tags) ? info.tags.map(String) : ['chat']), ...capabilities])]
+  return {
+    id: pluginModelId(provider, id),
+    name: String(info.name ?? id),
+    desc: String(info.description ?? '插件模型'),
+    tags,
+    capabilities,
+    endpointKind: 'chat',
+    roles: ALL_ROLES,
+    priority: 1,
+    provider: 'plugin',
+    providerName: String(info.providerName ?? provider),
+    modelKey: id,
+    maxContext: typeof context.contextWindow === 'number' ? Number(context.contextWindow) : null,
+    maxOutputTokens: typeof info.defaultMaxTokens === 'number' ? Number(info.defaultMaxTokens) : null,
+    contextCompression: false,
+    inputModalities: asStringList(info.inputModalities),
+    outputModalities: asStringList(info.outputModalities),
+    source: 'plugin',
+    readonly: true,
+    pluginId,
+    channelId,
+  }
+}
+
+async function refreshAdapter(companyId: string, registration: RegisteredAdapter): Promise<void> {
+  const revision = (registration.revision ?? 0) + 1
+  registration.revision = revision
+  const models = companyModels(companyId)
+  const targets = companyTargets(companyId)
+  for (const [id, target] of targets) {
+    if (target.adapter === registration.adapter) {
+      targets.delete(id)
+      models.delete(id)
+    }
+  }
+  for (const provider of registration.routes) {
+    let rows: unknown = []
+    try {
+      rows = registration.adapter.listModels ? await registration.adapter.listModels(provider) : []
+    } catch {
+      rows = []
+    }
+    if (registration.revision !== revision) return
+    if (!Array.isArray(rows)) continue
+    const channelId = pluginChannelId(registration.pluginId, provider)
+    for (const raw of rows) {
+      const info = asRecord(raw)
+      try {
+        const definition = toDefinition(provider, info, registration.pluginId, channelId)
+        models.set(definition.id, definition)
+        targets.set(definition.id, {
+          provider,
+          modelId: String(info.id),
+          pluginId: registration.pluginId,
+          channelId,
+          adapter: registration.adapter,
+          info,
+        })
+      } catch {
+        // 单个模型形状不对不影响同一 adapter 的其它模型。
+      }
+    }
+  }
+}
+
+/**
+ * 登记一个插件的 LLM adapter；返回值和 DSH registration 一致，支持 replace / dispose。
+ * pluginId 用于把 adapter 路由归到控制台的「插件通道」，不与 EAB 供应商混淆。
+ */
+export function registerPluginAdapter(
+  companyId: string,
+  pluginId: string,
+  ids: unknown,
+  adapter: unknown,
+): { replace: (next: unknown) => void; dispose: () => void } {
+  const normalized = (Array.isArray(ids) ? ids : [ids]).map(String).filter(Boolean)
+  const existing = companyAdapters(companyId).find((row) => row.adapter === adapter)
+  const registration: RegisteredAdapter = existing ?? {
+    pluginId: String(pluginId),
+    routes: new Set(normalized),
+    adapter: (adapter ?? {}) as PluginAdapterLike,
+    revision: 0,
+    configurable: new Map(),
+    discovery: null,
+  }
+  if (existing) {
+    registration.pluginId = String(pluginId || registration.pluginId)
+    registration.routes = new Set(normalized)
+  } else {
+    companyAdapters(companyId).push(registration)
+  }
+  const pendingMeta = pendingConfigurable.get(companyId)?.get(registration.pluginId)
+  if (pendingMeta) {
+    for (const [route, meta] of pendingMeta) registration.configurable.set(route, meta)
+    pendingConfigurable.get(companyId)?.delete(registration.pluginId)
+  }
+  const pendingProbe = pendingDiscovery.get(companyId)?.get(registration.pluginId)
+  if (pendingProbe && !registration.discovery) {
+    registration.discovery = pendingProbe
+    pendingDiscovery.get(companyId)?.delete(registration.pluginId)
+  }
+  void refreshAdapter(companyId, registration)
+
+  const replace = (next: unknown): void => {
+    registration.routes = new Set((Array.isArray(next) ? next : [next]).map(String).filter(Boolean))
+    void refreshAdapter(companyId, registration)
+  }
+  const dispose = (): void => {
+    const list = companyAdapters(companyId)
+    const index = list.indexOf(registration)
+    if (index >= 0) list.splice(index, 1)
+    const models = companyModels(companyId)
+    const targets = companyTargets(companyId)
+    for (const [id, target] of targets) {
+      if (target.adapter === registration.adapter) {
+        targets.delete(id)
+        models.delete(id)
+      }
+    }
+  }
+  return { replace, dispose }
+}
+
+export function listPluginModels(companyId: string): PluginModelDefinition[] {
+  return [...companyModels(companyId).values()]
+}
+
+/**
+ * 控制台看到的插件通道。一个 adapter 可以注册多条 route，每条 route 是一个
+ * 独立通道；配置元数据来自 `ctx.llm.registerConfigurableProviders`。
+ */
+export function listPluginChannels(companyId: string): PluginChannelDefinition[] {
+  const channels = new Map<string, PluginChannelDefinition>()
+  const models = companyModels(companyId)
+  for (const registration of companyAdapters(companyId)) {
+    for (const route of registration.routes) {
+      const id = pluginChannelId(registration.pluginId, route)
+      const meta = registration.configurable.get(route) ?? {}
+      const settingsPath = Array.isArray(meta.settingsPath) ? meta.settingsPath.map(String) : []
+      const modelCount = [...models.values()].filter((model) => model.channelId === id).length
+      channels.set(id, {
+        id,
+        pluginId: registration.pluginId,
+        route,
+        name: String(meta.displayName ?? meta.name ?? route),
+        kind: 'plugin',
+        status: 'active',
+        models: modelCount,
+        settingsNs: typeof meta.settingsNs === 'string' ? meta.settingsNs : null,
+        settingsPath,
+        configurable: registration.configurable.has(route),
+        discovery: Boolean(registration.discovery),
+      })
+    }
+  }
+  return [...channels.values()]
+}
+
+/** 登记插件声明的可配置 provider，用于控制台显示通道名称与设置归属。 */
+export function registerPluginConfigurableProviders(
+  companyId: string,
+  pluginId: string,
+  list: unknown,
+): () => void {
+  if (!Array.isArray(list)) return () => undefined
+  const rows = list.map(asRecord)
+  const registration = companyAdapters(companyId).find((row) => row.pluginId === String(pluginId))
+  if (!registration) {
+    let byPlugin = pendingConfigurable.get(companyId)
+    if (!byPlugin) {
+      byPlugin = new Map()
+      pendingConfigurable.set(companyId, byPlugin)
+    }
+    let meta = byPlugin.get(String(pluginId))
+    if (!meta) {
+      meta = new Map()
+      byPlugin.set(String(pluginId), meta)
+    }
+    const added: string[] = []
+    for (const row of rows) {
+      const route = String(row.provider ?? row.id ?? '')
+      if (!route) continue
+      meta.set(route, row)
+      added.push(route)
+    }
+    return () => {
+      for (const route of added) {
+        if (meta.get(route) === rows.find((row) => String(row.provider ?? row.id ?? '') === route)) {
+          meta.delete(route)
+        }
+      }
+    }
+  }
+  const added: string[] = []
+  for (const row of rows) {
+    const route = String(row.provider ?? row.id ?? '')
+    if (!route) continue
+    registration.configurable.set(route, row)
+    added.push(route)
+  }
+  return () => {
+    for (const route of added) registration.configurable.delete(route)
+  }
+}
+
+/** 登记插件的模型探测函数；控制台「刷新模型」会调用它并重新投影目录。 */
+export function registerPluginModelDiscovery(
+  companyId: string,
+  pluginId: string,
+  id: string,
+  discover: (...args: unknown[]) => unknown,
+): () => void {
+  const registration = companyAdapters(companyId).find((row) => row.pluginId === String(pluginId))
+  if (!registration) {
+    let byPlugin = pendingDiscovery.get(companyId)
+    if (!byPlugin) {
+      byPlugin = new Map()
+      pendingDiscovery.set(companyId, byPlugin)
+    }
+    byPlugin.set(String(pluginId), discover)
+    return () => {
+      if (byPlugin.get(String(pluginId)) === discover) byPlugin.delete(String(pluginId))
+    }
+  }
+  const previous = registration.discovery
+  registration.discovery = discover
+  void id
+  return () => {
+    if (registration.discovery === discover) registration.discovery = previous
+  }
+}
+
+/** 控制台「刷新模型」：先让插件重新探测，再重读 adapter 的模型目录。 */
+export async function refreshPluginChannel(companyId: string, channelId: string): Promise<number> {
+  const registration = companyAdapters(companyId).find((row) =>
+    [...row.routes].some((route) => pluginChannelId(row.pluginId, route) === String(channelId)),
+  )
+  if (!registration) return 0
+  try {
+    await registration.discovery?.()
+  } catch {
+    // 探测失败仍保留旧模型，控制台只显示刷新后的真实数量。
+  }
+  await refreshAdapter(companyId, registration)
+  return listPluginModels(companyId).filter((model) => model.channelId === String(channelId)).length
+}
+
+export function findPluginModel(companyId: string, id: string): PluginModelDefinition | null {
+  return companyModels(companyId).get(String(id)) ?? null
+}
+
+export function isPluginModelId(id: string): boolean {
+  return String(id).startsWith('plugin:')
+}
+
+function extractUsage(value: unknown): { input: number; output: number } {
+  const usage = asRecord(value)
+  const input = Number(usage.inputTokens ?? usage.promptTokens ?? 0)
+  const output = Number(usage.outputTokens ?? usage.completionTokens ?? 0)
+  return {
+    input: Number.isFinite(input) ? input : 0,
+    output: Number.isFinite(output) ? output : 0,
+  }
+}
+
+function toHarnessMessages(messages: ChatMessage[]): Record<string, unknown>[] {
+  return messages.map((message) => {
+    const content = typeof message.content === 'string'
+      ? [{ type: 'text', text: message.content }]
+      : message.content.map((part) => {
+          if (part.type === 'text') return { type: 'text', text: part.text }
+          if (part.type === 'image_url') {
+            return { type: 'image', attachment: { url: part.image_url.url } }
+          }
+          return part
+        })
+    const toolCalls = (message as unknown as { tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }> }).tool_calls ?? []
+    const blocks = [
+      ...content,
+      ...toolCalls.map((call) => ({
+        type: 'tool-call',
+        id: call.id,
+        name: call.function.name,
+        arguments: call.function.arguments,
+      })),
+    ]
+    return {
+      role: message.role,
+      content: blocks,
+      ...(message.tool_call_id ? { toolCallId: message.tool_call_id } : {}),
+    }
+  })
+}
+
+/**
+ * 插件侧失败统一对外表达为上游错误：插件模型不在 EAB 供应商配置里，落 500
+ * 会让用户误以为是基座故障。
+ */
+function pluginUpstreamError(target: PluginModelTarget, error: unknown): EabError {
+  if (error instanceof EabError) return error
+  const message = error instanceof Error ? error.message : String(error)
+  return new EabError(EC.UPSTREAM, `插件模型「${target.modelId}」调用失败：${message}`, {
+    hint: '检查插件设置里的上游凭据、额度或网络出口；该模型由插件提供，不在 EAB 模型供应商配置中。',
+    details: { modelId: target.modelId, provider: target.provider },
+  })
+}
+
+/**
+ * 按 `plugin:` 模型 ID 调插件 adapter，把 DSH 的扁平 block 流投影成 EAB 的
+ * CallResult / onEvent。未登记的 ID 返回 null，交给原有 EAB 模型路径。
+ */
+export async function callPluginModel(
+  companyId: string,
+  modelId: string,
+  messages: ChatMessage[],
+  options: ModelStreamOptions = {},
+  maxTokens = 4096,
+): Promise<CallResult | null> {
+  const target = companyTargets(companyId).get(String(modelId))
+  if (!target) return null
+  const adapter = target.adapter
+  const callOptions: Record<string, unknown> = {
+    model: target.modelId,
+    messages: toHarnessMessages(messages),
+    tools: options.tools,
+    maxTokens,
+    signal: options.signal,
+  }
+  let prepared: unknown = null
+  try {
+    prepared = adapter.prepareCall ? await adapter.prepareCall(target.provider, target.modelId) : null
+  } catch (error) {
+    throw pluginUpstreamError(target, error)
+  }
+  const preparedRecord = asRecord(prepared)
+  const streamFn = typeof preparedRecord.stream === 'function'
+    ? (preparedRecord.stream as (options: Record<string, unknown>) => AsyncIterable<unknown>)
+    : adapter.stream as ((options: Record<string, unknown>) => AsyncIterable<unknown>) | undefined
+  if (typeof streamFn !== 'function') {
+    throw new EabError(EC.UPSTREAM, `插件模型「${target.modelId}」没有实现 stream()`, {
+      details: { modelId: target.modelId, provider: target.provider },
+    })
+  }
+
+  let text = ''
+  let reasoning = ''
+  let promptTokens = 0
+  let completionTokens = 0
+  let finishKind = ''
+  let finishMessage = ''
+  const toolCalls = new Map<number, { id: string; name: string; arguments: string }>()
+
+  try {
+    for await (const raw of streamFn.call(target.adapter, callOptions)) {
+      const chunk = asRecord(raw)
+      const type = String(chunk.type ?? '')
+      if (type === 'reasoning-delta') {
+        const delta = String(chunk.text ?? '')
+        reasoning += delta
+        if (delta) options.onEvent?.({ type: 'reasoning', text: delta })
+      } else if (type === 'text-delta') {
+        const delta = String(chunk.text ?? '')
+        text += delta
+        if (delta) options.onEvent?.({ type: 'content', text: delta })
+      } else if (type === 'tool-call-delta') {
+        const index = Number(chunk.index ?? 0)
+        const current = toolCalls.get(index) ?? { id: '', name: '', arguments: '' }
+        if (chunk.id) current.id = String(chunk.id)
+        if (chunk.name) current.name = String(chunk.name)
+        if (chunk.argumentsDelta) current.arguments += String(chunk.argumentsDelta)
+        toolCalls.set(index, current)
+      } else if (type === 'block-end') {
+        const block = asRecord(chunk.block)
+        if (String(block.type ?? '') === 'tool-call') {
+          const index = Number(chunk.index ?? 0)
+          toolCalls.set(index, {
+            id: String(block.id ?? ''),
+            name: String(block.name ?? ''),
+            arguments: String(block.arguments ?? '{}'),
+          })
+        }
+      } else if (type === 'usage') {
+        const usage = extractUsage(chunk.usage)
+        promptTokens = usage.input || promptTokens
+        completionTokens = usage.output || completionTokens
+      } else if (type === 'finish') {
+        const reason = asRecord(chunk.reason)
+        finishKind = String(reason.kind ?? '')
+        finishMessage = String(asRecord(reason.failure).message ?? '')
+      }
+    }
+  } catch (error) {
+    throw pluginUpstreamError(target, error)
+  }
+
+  if (options.signal?.aborted) {
+    throw new EabError(EC.UPSTREAM, '请求已取消')
+  }
+  if (finishKind === 'error') {
+    throw new EabError(EC.UPSTREAM, finishMessage || `插件模型「${target.modelId}」调用失败`, {
+      details: { modelId: target.modelId, provider: target.provider },
+    })
+  }
+  if (!text.trim() && toolCalls.size === 0) {
+    throw new EabError(EC.UPSTREAM, finishMessage || `插件模型「${target.modelId}」返回了空内容`, {
+      details: { modelId: target.modelId, provider: target.provider },
+    })
+  }
+  return {
+    text,
+    reasoning,
+    toolCalls: [...toolCalls.values()]
+      .filter((call) => call.name)
+      .map((call, index) => ({
+        id: call.id || `plugin_call_${index}`,
+        type: 'function' as const,
+        function: { name: call.name, arguments: call.arguments || '{}' },
+      })),
+    promptTokens,
+    completionTokens,
+  }
+}

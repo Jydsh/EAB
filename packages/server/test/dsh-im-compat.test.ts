@@ -67,7 +67,8 @@ describe('EAB dsh-im 兼容落盘协议', () => {
     expect(botConfig.bots).toHaveLength(1)
     expect(botConfig.bots[0]).toMatchObject({
       clientId: 'ding1qokwhr1smspersq',
-      secretRef: 'EAB_DINGTALK_APP_SECRET_X',
+      // dsh-dingtalk 只接受它自己的 secretRef 命名；EAB 原 secret_ref 由 resolve 映射。
+      secretRef: expect.stringMatching(/^DSH_DINGTALK_BOT_SECRET_[A-F0-9]{24}$/),
       approvedSenders: [{ staffId: '021724185801860353', displayName: '李鹏' }],
     })
 

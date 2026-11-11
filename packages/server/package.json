@@ -9,6 +9,7 @@
     "dev": "tsx src/main.ts"
   },
   "dependencies": {
+    "@deepseek-ai/cordis": "4.1.0",
     "@eab/authz": "workspace:*",
     "@eab/domain": "workspace:*",
     "@eab/storage": "workspace:*",

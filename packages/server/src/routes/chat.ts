@@ -8,13 +8,14 @@
  */
 import type { FastifyInstance } from 'fastify'
 import { randomUUID } from 'node:crypto'
-import { existsSync } from 'node:fs'
 import { EC, EabError, SC, scopeAllows, resolveVisibleCollections } from '@eab/domain'
 import { appendAudit, loadKbCollectionAcls, type Db } from '@eab/storage'
 import type { ServerDeps } from '../deps.js'
 import { ok } from '../http.js'
 import { resolveActor, type RequestActor } from '../session.js'
-import { callModelStream, callEmbeddings, callRerank, type ChatMessage as LlmMessage, type LlmContent, type LlmContentPart, type LlmToolCall } from '../llm.js'
+import { callModelStream, callEmbeddings, callRerank, type CallResult, type ChatMessage as LlmMessage, type LlmContent, type LlmContentPart, type LlmToolCall } from '../llm.js'
+import { callPluginModel, isPluginModelId, listPluginModels } from '../plugin-models.js'
+import { filterHealthyModels, markModelHealthy, markModelUnhealthy, shouldMarkModelFailure } from '../model-health.js'
 import { resolveModelForPurpose, findModelById, capabilitiesOf, normalizeCapability } from '../model-registry.js'
 import { compressMessagesForContext, estimateTokens } from '../context-window.js'
 import { getCollectionEmbeddingModel, searchChunkVectors, type EmbedFn } from '../kb-vector.js'
@@ -23,7 +24,7 @@ import { executePluginTool, pluginPromptTexts, resolvePluginToolForActor } from 
 import { subscribeChatEvents } from '../chat-events.js'
 import { assertChatQuota } from '../quota.js'
 import { createChatCapacity } from '../chat-capacity.js'
-import { findLocalSpaceRow, type ActiveSpace } from '../local-space.js'
+import type { ActiveSpace } from '../space.js'
 import {
   acquireAgentSessionLock,
   recordAgentStep,
@@ -217,23 +218,47 @@ export function loadModelCatalog(db: Db, companyId: string, allowDemoFallback: b
         ORDER BY m.priority DESC, m.name ASC`,
     )
     .all(companyId) as unknown as CatalogRow[]
-  if (rows.length === 0) return allowDemoFallback ? [...DEMO_CATALOG] : []
-  return rows.map((row) => ({
-    id: row.id,
-    name: row.name,
-    desc: `${row.provider_name} · ${row.model_key}`,
-    tags: parseList(row.tags),
-    capabilities: capabilitiesOf(row.capabilities, row.tags),
-    endpointKind: row.endpoint_kind ?? 'chat',
-    roles: parseList(row.roles),
-    priority: Number(row.priority),
-    provider: row.provider_kind,
-    providerName: row.provider_name,
-    modelKey: row.model_key,
-    maxContext: row.max_context === null ? null : Number(row.max_context),
-    maxOutputTokens: row.max_output_tokens === null ? null : Number(row.max_output_tokens),
-    contextCompression: row.context_compression === null || Number(row.context_compression) !== 0,
+  const pluginModels: ModelDefinition[] = filterHealthyModels(
+    companyId,
+    listPluginModels(companyId),
+  ).map((model) => ({
+    id: model.id,
+    name: model.name,
+    desc: model.desc,
+    tags: model.tags,
+    capabilities: model.capabilities,
+    endpointKind: model.endpointKind,
+    roles: model.roles,
+    priority: model.priority,
+    provider: model.provider,
+    providerName: model.providerName,
+    modelKey: model.modelKey,
+    maxContext: model.maxContext,
+    maxOutputTokens: model.maxOutputTokens,
+    contextCompression: model.contextCompression,
   }))
+  if (rows.length === 0) {
+    return allowDemoFallback ? [...DEMO_CATALOG, ...pluginModels] : pluginModels
+  }
+  return [
+    ...rows.map((row) => ({
+      id: row.id,
+      name: row.name,
+      desc: `${row.provider_name} · ${row.model_key}`,
+      tags: parseList(row.tags),
+      capabilities: capabilitiesOf(row.capabilities, row.tags),
+      endpointKind: row.endpoint_kind ?? 'chat',
+      roles: parseList(row.roles),
+      priority: Number(row.priority),
+      provider: row.provider_kind,
+      providerName: row.provider_name,
+      modelKey: row.model_key,
+      maxContext: row.max_context === null ? null : Number(row.max_context),
+      maxOutputTokens: row.max_output_tokens === null ? null : Number(row.max_output_tokens),
+      contextCompression: row.context_compression === null || Number(row.context_compression) !== 0,
+    })),
+    ...pluginModels,
+  ]
 }
 
 export function visibleModelsFor(catalog: readonly ModelDefinition[], roleCodes: readonly string[]): ModelDefinition[] {
@@ -500,6 +525,7 @@ interface SessionRow {
   source: string | null
   space_kind: string | null
   space_id: string | null
+  model_id?: string | null
   created_at: number
   updated_at: number
   last_message_at: number | null
@@ -526,7 +552,7 @@ export function buildSystemPrompt(opts: {
   /** 当前文件空间说明；用于告诉模型该用哪套文件工具，且不要输出绝对路径 */
   spaceLabel?: string
   /** 当前文件空间类型；与 spaceLabel 一起锁定本轮可用工具，避免跨空间引用 */
-  spaceKind?: 'cloud' | 'local' | 'none'
+  spaceKind?: 'cloud' | 'none'
 }): string {
   const { actor, chatTools, memories, hits, hasAttachments, pluginPrompts = [], spaceLabel, spaceKind } = opts
   const nowLabel = new Intl.DateTimeFormat('zh-CN', {
@@ -540,26 +566,19 @@ export function buildSystemPrompt(opts: {
     hour12: false,
   }).format(new Date())
   const spaceRule =
-    spaceKind === 'local'
+    spaceKind === 'cloud'
       ? [
-          `当前文件空间：${spaceLabel || '本地空间'}。本轮只允许使用本地空间工具（local_ 开头），云空间工具（workspace_ 开头）本轮不可用。`,
-          `不要把云空间、历史对话或其他会话里出现的文件当成当前本地空间的文件；也不要用「云空间」来称呼当前空间，当前空间名称以上一句为准。`,
-          '不要尝试通过 tool_search 或插件寻找访问云空间的工具；用户要云空间文件时，只提示他在输入区切换空间。',
-          '所有文件路径都相对于当前本地空间根目录；不要输出、猜测或编造本地绝对路径。',
+          `当前文件空间：${spaceLabel || '云空间'}。云空间是默认空间，用户没有单独选择也可以使用；本轮只允许使用云空间工具（workspace_ 开头），不存在本地空间工具。`,
+          '不要把历史对话或其他会话里出现的本地目录、本地文件当成云空间文件；回答里提到当前空间时统一说「云空间」。',
+          '用户要操作本地磁盘文件时，说明网页端没有本地文件能力，请把文件上传到对话或保存到云空间，不要假装已经读取了本地文件。',
+          '不要尝试通过 tool_search 或插件寻找访问本地磁盘的工具。',
+          '所有文件路径都相对于云空间根目录；不要输出、猜测或编造本地绝对路径。',
         ].join('\n')
-      : spaceKind === 'cloud'
-        ? [
-            `当前文件空间：${spaceLabel || '云空间'}。云空间是默认空间，用户没有单独选择也可以使用；本轮只允许使用云空间工具（workspace_ 开头），本地空间工具（local_ 开头）本轮不可用。`,
-            '不要把历史对话或其他会话里出现的本地文件当成云空间文件；回答里提到当前空间时统一说「云空间」。',
-            '用户要操作本地磁盘文件时，先请他在输入区选择本地空间，不要假装已经读取了本地文件。',
-            '不要尝试通过 tool_search 或插件寻找访问本地磁盘的工具；用户要本地文件时，只提示他在输入区选择本地空间。',
-            '所有文件路径都相对于云空间根目录；不要输出、猜测或编造本地绝对路径。',
-          ].join('\n')
-        : spaceKind === 'none'
-          ? '当前未选择文件空间：本轮没有任何文件读写工具，云空间和本地空间都不能操作；用户要读写文件时，请先让他选择云空间（可直接使用）或本地空间（必须选择）。'
-          : spaceLabel
-            ? `当前文件空间：${spaceLabel}。本轮只使用与该空间对应的文件工具，不要混用另一个空间的文件或工具；所有文件路径都相对于该空间根目录，不要输出、猜测或编造本地绝对路径。`
-            : ''
+      : spaceKind === 'none'
+        ? '当前未选择文件空间：本轮没有任何文件读写工具，云空间和本地磁盘都不能操作；用户要读写文件时，请先让他选择云空间（可直接使用）。网页端没有本地空间。'
+        : spaceLabel
+          ? `当前文件空间：${spaceLabel}。本轮只使用云空间文件工具；不要引用本地目录、本地文件或历史会话里的文件；所有文件路径都相对于云空间根目录，不要输出、猜测或编造本地绝对路径。`
+          : ''
   return [
     `你是「${actor.person.companyName}」的企业智能助手 EAB（Enterprise Agent Base），当前用户是 ${actor.person.name}（${actor.person.deptName}）。`,
     `当前时间：${nowLabel}（Asia/Shanghai）。用户说“今天/现在/本周”时以此为准；需要精确到秒、换算日程或时区时再调用 time_now，不要靠心算日期和星期。`,
@@ -569,13 +588,11 @@ export function buildSystemPrompt(opts: {
       ? `你可以调用工具获取实时信息或本企业数据（当前已加载：${chatTools.map((tool) => tool.function.name).join('、')}）。需要精确时间、通讯录或知识库检索时优先调用这些工具，拿到结果再回答；计算等未直接列出的能力先按下面的工具搜索规则加载。不要编造工具结果。`
       : '',
     chatTools.some((tool) => tool.function.name === 'tool_search')
-      ? spaceKind === 'local'
-        ? '当前工具列表只是常用工具，不是全部。需要文件发送/重命名/删除、定时任务列表、计算、插件等未直接列出的能力时，先调用 tool_search；但当前在本地空间，query 只能写本地文件/目录相关能力，不要搜云空间工具、云空间容量或“发送到云空间”。工具结果返回后，命中的工具会自动加载为可调用工具，直接继续调用即可。'
-        : spaceKind === 'cloud'
-          ? '当前工具列表只是常用工具，不是全部。需要文件发送/重命名/删除、容量、定时任务列表、计算、插件等未直接列出的能力时，先调用 tool_search；当前在云空间，query 只能写云空间文件/容量相关能力，不要搜本地磁盘工具。工具结果返回后，命中的工具会自动加载为可调用工具，直接继续调用即可。'
-          : spaceKind === 'none'
-            ? '当前工具列表只是常用工具，不是全部；但本轮未选择文件空间，tool_search 不会返回文件读写工具。用户要文件操作时，直接请他在输入区选择云空间（可直接使用）或本地空间（必须选择）。'
-            : '当前工具列表只是常用工具，不是全部。需要文件发送/重命名/删除、容量、定时任务列表、计算、插件等未直接列出的能力时，先调用 tool_search，query 写用户原话或中文/英文能力词；工具结果返回后，命中的工具会自动加载为可调用工具，直接继续调用即可，不要向用户解释工具加载机制，也不要因为当前列表里没有就直接说做不到。'
+      ? spaceKind === 'cloud'
+        ? '当前工具列表只是常用工具，不是全部。需要文件发送/重命名/删除、容量、定时任务列表、计算、插件等未直接列出的能力时，先调用 tool_search；当前在云空间，query 只能写云空间文件/容量相关能力，不要搜本地磁盘工具。工具结果返回后，命中的工具会自动加载为可调用工具，直接继续调用即可。'
+        : spaceKind === 'none'
+          ? '当前工具列表只是常用工具，不是全部；但本轮未选择文件空间，tool_search 不会返回文件读写工具。用户要文件操作时，直接请他在输入区选择云空间（可直接使用）。'
+          : '当前工具列表只是常用工具，不是全部。需要文件发送/重命名/删除、容量、定时任务列表、计算、插件等未直接列出的能力时，先调用 tool_search，query 写用户原话或中文/英文能力词；工具结果返回后，命中的工具会自动加载为可调用工具，直接继续调用即可，不要向用户解释工具加载机制，也不要因为当前列表里没有就直接说做不到。'
       : '',
     chatTools.some((tool) => tool.function.name === 'org_directory')
       ? '遇到“我的组长是谁 / 我在哪个部门 / 公司有哪些部门 / 某部门有谁 / 找某个人”这类组织问题时，直接调用 org_directory 工具，从当前对话推断 intent，不要先让用户输入姓名。工具返回 denied 或没有负责人时，如实说明权限或数据缺失，不要猜。'
@@ -796,6 +813,11 @@ export interface AgentTurnResult {
   rounds: number
   promptTokens: number
   completionTokens: number
+  /** 实际完成本轮回答的模型；发生故障转移时可能与请求模型不同 */
+  usedModelId?: string
+  usedModelName?: string
+  /** 发生故障转移时的原模型 ID；未转移为 null */
+  fallbackFromModelId?: string | null
 }
 
 function summarizeToolResult(value: unknown): string {
@@ -978,6 +1000,16 @@ function toolSearchLoadedNames(payload: unknown): string[] {
 }
 
 /**
+ * 对话展示用的模型名。插件模型不在 models 表，需要从插件目录取；
+ * 找不到时退回 ID，调用方不会因此拿不到可读提示。
+ */
+function modelDisplayName(db: Db, companyId: string, modelId: string): string {
+  const plugin = listPluginModels(companyId).find((model) => model.id === modelId)
+  if (plugin) return plugin.name
+  return findModelById(db, companyId, modelId)?.name ?? modelId
+}
+
+/**
  * 对话 Agent 循环：模型可以多轮「思考 → 调工具 → 看结果 → 继续回答」，最多 4 轮工具调用。
  * 事件通过 emit 实时下发；最终文本、思考内容和工具轨迹一起落库，刷新后还能回看。
  * 返回 null 表示演示供应商，由调用方走本地回声。
@@ -991,7 +1023,7 @@ export async function runAgentTurn(opts: {
   maxTokens?: number
   /** 插件工具需要当前会话 id（例如钉卡片按 sessionId 找发卡对象） */
   sessionId?: string
-  /** 当前文件空间：决定只暴露云空间工具还是本地空间工具 */
+  /** 当前文件空间：决定是否暴露云空间工具；none 不暴露任何文件工具 */
   space?: ActiveSpace
   /** 用户停止生成时用它中止在途模型调用 */
   signal?: AbortSignal
@@ -1008,6 +1040,25 @@ export async function runAgentTurn(opts: {
   sessionLockKey?: string
   /** token 预算，仅作为运行树展示与上限提示 */
   budget?: number
+  /**
+   * 当前身份仍有权限的备用模型 ID，按优先级排列。
+   * 首选模型在“还没有输出任何内容”时失败，会按这个列表依次接管；
+   * 已经输出部分内容后失败不切换，避免把半截回答拼到另一个模型上。
+   */
+  fallbackModelIds?: string[]
+  /**
+   * 渠道机器人可打开：模型调用期间先缓冲 content/reasoning，失败后丢弃并换模型，
+   * 成功后再一次性下发，保证不会出现半截回答。网页默认关闭以保留流式体验。
+   */
+  bufferModelEvents?: boolean
+  /** 故障转移发生时通知调用方，用于提示用户并更新会话模型。 */
+  onModelFailover?: (change: {
+    fromModelId: string
+    toModelId: string
+    fromModelName: string
+    toModelName: string
+    reason: string
+  }) => void
 }): Promise<AgentTurnResult | null> {
   const { deps, actor, modelId, emit } = opts
   const runId = opts.runId ?? randomUUID()
@@ -1075,54 +1126,143 @@ export async function runAgentTurn(opts: {
     const traces: AgentToolTrace[] = []
     let stepSeq = 0
     let text = ''
-  let reasoning = ''
-  let rounds = 0
-  let sawModel = false
+    let reasoning = ''
+    let rounds = 0
+    let sawModel = false
+    let activeModelId = modelId
+    let fallbackFromModelId: string | null = null
+    const failedModelIds = new Set<string>()
+    const fallbackIds = (opts.fallbackModelIds ?? []).filter((id) => id && id !== modelId)
 
-  for (let round = 0; round < 4; round += 1) {
-    if (opts.signal?.aborted) {
-      const abortError = new Error('用户停止了本轮回复')
-      abortError.name = 'AbortError'
-      throw abortError
-    }
-    if (round > 0 && text.trim()) {
-      text += '\n\n'
-      emit({ type: 'content', text: '\n\n' })
-    }
-    rounds = round + 1
-    let roundReasoningStarted = false
-    const result = await callModelStream(
-      deps.db,
-      deps.config.dbPath,
-      actor.subject.companyId,
-      modelId,
-      messages,
-      {
-        tools,
-        signal: opts.signal,
-        onEvent: (event) => {
-          if (event.type === 'reasoning') {
-            if (round > 0 && !roundReasoningStarted && reasoning.trim()) {
-              reasoning += '\n\n'
-              emit({ type: 'reasoning', text: '\n\n' })
+    for (let round = 0; round < 4; round += 1) {
+      if (opts.signal?.aborted) {
+        const abortError = new Error('用户停止了本轮回复')
+        abortError.name = 'AbortError'
+        throw abortError
+      }
+      if (round > 0 && text.trim()) {
+        text += '\n\n'
+        emit({ type: 'content', text: '\n\n' })
+      }
+      rounds = round + 1
+      const candidateIds = [activeModelId, ...fallbackIds].filter(
+        (candidate, index, all) => !failedModelIds.has(candidate) && all.indexOf(candidate) === index,
+      )
+      let result: CallResult | null | undefined
+      let lastModelError: unknown = null
+
+      for (const candidateId of candidateIds) {
+        const attemptTextBefore = text
+        const attemptReasoningBefore = reasoning
+        let attemptEmitted = false
+        let roundReasoningStarted = false
+        const bufferedEvents: Array<{ type: 'reasoning' | 'content'; text: string }> = []
+        const publishEvent = (event: { type: 'reasoning' | 'content'; text: string }): void => {
+          attemptEmitted = true
+          if (opts.bufferModelEvents) bufferedEvents.push(event)
+          else emit(event)
+        }
+        const streamOptions = {
+          tools,
+          signal: opts.signal,
+          onEvent: (event: { type: 'reasoning' | 'content'; text: string }) => {
+            if (event.type === 'reasoning') {
+              if (round > 0 && !roundReasoningStarted && reasoning.trim()) {
+                reasoning += '\n\n'
+                publishEvent({ type: 'reasoning', text: '\n\n' })
+              }
+              roundReasoningStarted = true
+              reasoning += event.text
+              publishEvent({ type: 'reasoning', text: event.text })
+            } else {
+              text += event.text
+              publishEvent({ type: 'content', text: event.text })
             }
-            roundReasoningStarted = true
-            reasoning += event.text
-            emit({ type: 'reasoning', text: event.text })
-          } else {
-            text += event.text
-            emit({ type: 'content', text: event.text })
+          },
+        }
+
+        try {
+          const candidateResult = isPluginModelId(candidateId)
+            ? await callPluginModel(
+                actor.subject.companyId,
+                candidateId,
+                messages,
+                streamOptions,
+                opts.maxTokens ?? maxOutputTokens,
+              )
+            : await callModelStream(
+                deps.db,
+                deps.config.dbPath,
+                actor.subject.companyId,
+                candidateId,
+                messages,
+                streamOptions,
+                opts.maxTokens ?? maxOutputTokens,
+              )
+          if (isPluginModelId(candidateId) && candidateResult === null) {
+            throw new EabError(EC.NOT_FOUND, '插件模型已下线或尚未完成注册', { details: { modelId: candidateId } })
           }
-        },
-      },
-      opts.maxTokens ?? maxOutputTokens,
-    )
-    if (!result) return null
-    sawModel = true
-    promptTokens += result.promptTokens
-    completionTokens += result.completionTokens
-    const calls: LlmToolCall[] = result.toolCalls ?? []
-    if (calls.length === 0) break
+          // 演示供应商返回 null：保持原有本地回声，不进入故障转移。
+          if (!candidateResult) {
+            result = null
+            break
+          }
+          result = candidateResult
+          sawModel = true
+          markModelHealthy(actor.subject.companyId, candidateId)
+          if (candidateId !== activeModelId) {
+            const fromModelId = activeModelId
+            const fromModelName = modelDisplayName(deps.db, actor.subject.companyId, fromModelId)
+            activeModelId = candidateId
+            fallbackFromModelId = fallbackFromModelId ?? fromModelId
+            opts.onModelFailover?.({
+              fromModelId,
+              toModelId: candidateId,
+              fromModelName,
+              toModelName: modelDisplayName(deps.db, actor.subject.companyId, candidateId),
+              reason: lastModelError instanceof Error ? lastModelError.message : '模型暂时没有成功回复',
+            })
+          }
+          // 缓冲模式下成功后才把本轮输出放出；失败尝试的输出已经在 catch 里丢弃。
+          if (opts.bufferModelEvents) {
+            for (const event of bufferedEvents) emit(event)
+          }
+          break
+        } catch (error) {
+          if (opts.signal?.aborted) throw error
+          text = attemptTextBefore
+          reasoning = attemptReasoningBefore
+          if (shouldMarkModelFailure(error)) {
+            markModelUnhealthy(
+              actor.subject.companyId,
+              candidateId,
+              error instanceof Error ? error.message : '模型调用失败',
+            )
+          }
+          failedModelIds.add(candidateId)
+          lastModelError = error
+          // 网页流式模式已经推送过内容时不能安全重放，否则用户会看到两个模型的半截回答。
+          if (attemptEmitted && !opts.bufferModelEvents) throw error
+        }
+      }
+
+      if (result === undefined) {
+        if (!lastModelError) throw new EabError(EC.UPSTREAM, '当前没有可以调用的模型', {
+          details: { modelIds: candidateIds },
+        })
+        if (candidateIds.length > 1) {
+          throw new EabError(EC.UPSTREAM, '当前有权限的模型都暂时无法回复，请稍后再试。', {
+            hint: '已自动尝试完当前身份有权限的模型；请稍后重试，或联系管理员检查模型上游。',
+            details: { modelIds: candidateIds, lastError: lastModelError instanceof Error ? lastModelError.message : 'unknown' },
+          })
+        }
+        throw lastModelError
+      }
+      if (result === null) return null
+      promptTokens += result.promptTokens
+      completionTokens += result.completionTokens
+      const calls: LlmToolCall[] = result.toolCalls ?? []
+      if (calls.length === 0) break
 
     messages.push({ role: 'assistant', content: result.text ?? '', tool_calls: calls })
     for (const call of calls) {
@@ -1161,7 +1301,7 @@ export async function runAgentTurn(opts: {
             deps,
             actor,
             parentRunId: runId,
-            parentModelId: modelId,
+            parentModelId: activeModelId,
             depth,
             space,
             signal: opts.signal,
@@ -1240,7 +1380,18 @@ export async function runAgentTurn(opts: {
   }
 
   if (!sawModel) return null
-  return { runId, text, reasoning, toolCalls: traces, rounds, promptTokens, completionTokens }
+  return {
+    runId,
+    text,
+    reasoning,
+    toolCalls: traces,
+    rounds,
+    promptTokens,
+    completionTokens,
+    usedModelId: activeModelId,
+    usedModelName: modelDisplayName(deps.db, actor.subject.companyId, activeModelId),
+    fallbackFromModelId,
+  }
   }
 }
 
@@ -1265,13 +1416,14 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
     const models = canChat && canUseModel ? visibleModelsFor(catalog, roles) : []
     const defaultRoute = resolveModelForPurpose(deps.db, subject.companyId, 'chat.default')
     const autoModel = defaultRoute ? models.find((model) => model.id === defaultRoute.id) : undefined
+    const firstNativeModel = models.find((model) => !isPluginModelId(model.id))
 
     return ok({
       person,
       roles,
       canChat,
       canUseModel,
-      autoModelId: autoModel?.id ?? (models.length > 0 ? models[0].id : null),
+      autoModelId: autoModel?.id ?? firstNativeModel?.id ?? (models.length > 0 ? models[0].id : null),
       models: models.map((model) => ({
         id: model.id,
         name: model.name,
@@ -1389,10 +1541,17 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
     const actor = resolveActor(deps.db, deps.config, req, deps.companyId)
     const session = deps.db
       .prepare(
-        'SELECT id, title, source, space_kind, space_id FROM chat_sessions WHERE id = ? AND company_id = ? AND user_id = ? AND deleted_at IS NULL',
+        'SELECT id, title, source, space_kind, space_id, model_id FROM chat_sessions WHERE id = ? AND company_id = ? AND user_id = ? AND deleted_at IS NULL',
       )
       .get(req.params.id, actor.subject.companyId, actor.person.id) as
-      | { id: string; title: string; source: string | null; space_kind: string | null; space_id: string | null }
+      | {
+          id: string
+          title: string
+          source: string | null
+          space_kind: string | null
+          space_id: string | null
+          model_id: string | null
+        }
       | undefined
     if (!session) throw new EabError(EC.NOT_FOUND, '会话不存在或已删除')
 
@@ -1436,7 +1595,7 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
     const hasMore = rows.length > limit
     const page = (hasMore ? rows.slice(0, limit) : rows).slice().reverse()
     return ok({
-      session,
+      session: { ...session, modelId: session.model_id },
       messages: page.map((row) => ({
         id: row.id,
         role: row.role,
@@ -1465,6 +1624,46 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
         .run(title, Date.now(), req.params.id, actor.subject.companyId, actor.person.id)
       if (Number(result.changes) === 0) throw new EabError(EC.NOT_FOUND, '会话不存在或已删除')
       return ok({ renamed: true })
+    },
+  )
+
+  app.post<{ Params: { id: string }; Body: { modelId?: string | null } }>(
+    '/api/chat/sessions/:id/model',
+    async (req) => {
+      const actor = resolveActor(deps.db, deps.config, req, deps.companyId)
+      if (!scopeAllows(actor.subject.scopes, SC.CHAT_USE)) {
+        throw new EabError(EC.SCOPE_DENIED, '当前身份没有对话权限（chat:use）')
+      }
+      if (!scopeAllows(actor.subject.scopes, SC.MODEL_USE)) {
+        throw new EabError(EC.FORBIDDEN, '当前身份没有使用模型的权限（model:use）', {
+          details: { requiredScope: SC.MODEL_USE },
+        })
+      }
+      const session = deps.db
+        .prepare(
+          'SELECT id FROM chat_sessions WHERE id = ? AND company_id = ? AND user_id = ? AND deleted_at IS NULL',
+        )
+        .get(req.params.id, actor.subject.companyId, actor.person.id)
+      if (!session) throw new EabError(EC.NOT_FOUND, '会话不存在或已删除')
+
+      const requested = req.body?.modelId === null ? null : String(req.body?.modelId ?? '').trim() || null
+      const catalog = loadModelCatalog(deps.db, actor.subject.companyId, deps.config.devAuth)
+      const available = visibleModelsFor(catalog, [...actor.subject.roles])
+      const model = requested ? available.find((item) => item.id === requested) : null
+      if (requested && !model) {
+        // 不区分“不存在”和“无权使用”，避免通过错误信息探测模型。
+        throw new EabError(EC.FORBIDDEN, '模型不可用或当前身份无权使用', {
+          details: { modelId: requested },
+        })
+      }
+
+      const changed = deps.db
+        .prepare(
+          'UPDATE chat_sessions SET model_id = ?, updated_at = ? WHERE id = ? AND company_id = ? AND user_id = ? AND deleted_at IS NULL',
+        )
+        .run(model?.id ?? null, Date.now(), req.params.id, actor.subject.companyId, actor.person.id)
+      if (Number(changed.changes) === 0) throw new EabError(EC.NOT_FOUND, '会话不存在或已删除')
+      return ok({ modelId: model?.id ?? null, modelName: model?.name ?? null })
     },
   )
 
@@ -1559,10 +1758,8 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
       }>
       /** true 时以 SSE 返回同样的回答（CHAT-02 流式） */
       stream?: boolean
-      /** 本轮使用的文件空间：cloud（默认）/ local / none */
-      spaceKind?: 'cloud' | 'local' | 'none'
-      /** spaceKind=local 时必填 */
-      spaceId?: string | null
+      /** 本轮使用的文件空间：cloud（默认）/ none */
+      spaceKind?: 'cloud' | 'none'
     }
   }>('/api/chat/messages', { bodyLimit: 60 * 1024 * 1024 }, async (req, reply) => {
     const actor = resolveActor(deps.db, deps.config, req, deps.companyId)
@@ -1614,29 +1811,16 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
 
     /**
      * 空间选择只决定这一轮 Agent 拿哪套文件工具：
-     * - cloud： workspace.*
-     * - local：  local.*（必须已绑定且目录仍存在）
+     * - cloud： workspace.*（默认，不选也可用）
      * - none：  不暴露文件工具
+     * 网页端不提供本地空间。
      */
     const rawSpaceKind = req.body?.spaceKind
-    if (rawSpaceKind !== undefined && !['cloud', 'local', 'none'].includes(rawSpaceKind)) {
-      throw new EabError(EC.VALIDATION, 'spaceKind 只能是 cloud / local / none')
+    if (rawSpaceKind !== undefined && !['cloud', 'none'].includes(rawSpaceKind)) {
+      throw new EabError(EC.VALIDATION, 'spaceKind 只能是 cloud / none')
     }
-    let space: ActiveSpace = { kind: rawSpaceKind === 'none' ? 'none' : 'cloud' }
-    let spaceLabel = rawSpaceKind === 'none' ? '未选择文件空间' : '云空间'
-    if (rawSpaceKind === 'local') {
-      const spaceId = String(req.body?.spaceId ?? '').trim()
-      if (!spaceId) throw new EabError(EC.VALIDATION, '选择本地空间时 spaceId 不能为空')
-      const row = findLocalSpaceRow(deps.db, actor.subject.companyId, actor.person.id, spaceId)
-      if (!row) throw new EabError(EC.NOT_FOUND, '本地空间不存在或已删除，请重新选择')
-      if (!existsSync(row.root_realpath)) {
-        throw new EabError(EC.CONFLICT, '本地目录不存在或已离线，请重新绑定或检查磁盘', {
-          details: { spaceId: row.id, rootPath: row.root_path },
-        })
-      }
-      space = { kind: 'local', spaceId: row.id }
-      spaceLabel = `本地空间「${row.name}」`
-    }
+    const space: ActiveSpace = { kind: rawSpaceKind === 'none' ? 'none' : 'cloud' }
+    const spaceLabel = rawSpaceKind === 'none' ? '未选择文件空间' : '云空间'
 
     const roles = [...actor.subject.roles]
     const catalog = loadModelCatalog(deps.db, actor.subject.companyId, deps.config.devAuth)
@@ -1647,19 +1831,34 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
       })
     }
 
-    const requested = req.body?.modelId ?? null
+    const modelIdProvided = Object.prototype.hasOwnProperty.call(req.body ?? {}, 'modelId')
+    const sessionModelId = req.body?.sessionId
+      ? (deps.db
+          .prepare(
+            'SELECT model_id FROM chat_sessions WHERE id = ? AND company_id = ? AND user_id = ? AND deleted_at IS NULL',
+          )
+          .get(req.body.sessionId, actor.subject.companyId, actor.person.id) as
+          | { model_id: string | null }
+          | undefined
+        )?.model_id ?? null
+      : null
+    let requested = modelIdProvided ? (req.body?.modelId ?? null) : sessionModelId
     const hasImageAttachments = attachments.some((item) => Boolean(item.dataUrl))
     const imageModels = available.filter((item) => modelSupportsVision(item.tags, item.capabilities))
-    const model = requested
-      ? available.find((item) => item.id === requested)
-      : hasImageAttachments && imageModels.length
-        ? imageModels[0]
-        : available[0]
+    let model = requested ? available.find((item) => item.id === requested) : undefined
+    if (requested && !model) {
+      // 会话里保存的模型下线/无权后回退自动选择；显式请求则直接拒绝，避免静默换模型。
+      if (!modelIdProvided) {
+        requested = null
+      } else {
+        throw new EabError(EC.FORBIDDEN, '模型不可用或当前身份无权使用', {
+          details: { modelId: requested },
+        })
+      }
+    }
+    const autoSelected = requested === null
     if (!model) {
-      const exists = catalog.some((item) => item.id === requested)
-      throw new EabError(EC.FORBIDDEN, exists ? '当前身份无权使用这个模型' : '模型不存在', {
-        details: { modelId: requested },
-      })
+      model = hasImageAttachments && imageModels.length ? imageModels[0] : available[0]
     }
     if (hasImageAttachments && !modelSupportsVision(model.tags, model.capabilities)) {
       throw new EabError(EC.VALIDATION, `模型「${model.name}」没有开启图片识别能力`, {
@@ -1667,6 +1866,15 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
         details: { modelId: model.id, requiredCapability: 'vision' },
       })
     }
+    const primaryModelId = model.id
+    const fallbackModelIds = available
+      .filter(
+        (item) =>
+          item.id !== primaryModelId &&
+          (!hasImageAttachments || modelSupportsVision(item.tags, item.capabilities)),
+      )
+      .map((item) => item.id)
+    let failoverNote = ''
 
     const capacitySlot = await capacity.acquire(actor.person.id, {
       companyId: actor.subject.companyId,
@@ -1677,10 +1885,13 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
     try {
     sessionId = ensureSession(deps.db, actor, req.body?.sessionId, text || attachments[0]?.name || '新对话')
     deps.db
-      .prepare('UPDATE chat_sessions SET space_kind = ?, space_id = ?, updated_at = ?, last_message_at = ? WHERE id = ?')
+      .prepare(
+        'UPDATE chat_sessions SET space_kind = ?, space_id = ?, model_id = ?, updated_at = ?, last_message_at = ? WHERE id = ?',
+      )
       .run(
         space.kind,
-        space.kind === 'local' ? space.spaceId : null,
+        null,
+        autoSelected ? null : model.id,
         Date.now(),
         Date.now(),
         sessionId,
@@ -1740,14 +1951,13 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
           attachments: attachmentMeta(attachments),
           space: {
             kind: space.kind,
-            id: space.kind === 'local' ? space.spaceId : null,
+            id: null,
             label: spaceLabel,
           },
         }),
         now,
       )
 
-    const autoSelected = requested === null
     const assistantMessageId = `msg_${randomUUID()}`
     const streaming = req.body?.stream === true
     let seq = 0
@@ -1789,6 +1999,12 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
         deps,
         actor,
         modelId: model.id,
+        fallbackModelIds,
+        onModelFailover: (change) => {
+          const next = available.find((item) => item.id === change.toModelId)
+          if (next) model = next
+          failoverNote = `当前模型「${change.fromModelName}」暂时不可用，已自动切换到「${change.toModelName}」。\n\n`
+        },
         messages,
         sessionId,
         space,
@@ -1843,6 +2059,17 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
       throw error
     }
 
+    if (agent?.usedModelId) {
+      const used = available.find((item) => item.id === agent.usedModelId)
+      if (used) model = used
+      if (!autoSelected && agent.fallbackFromModelId && model.id !== agent.fallbackFromModelId) {
+        // 显式选过模型的会话在故障转移后改用接替模型；自动模式仍保持 NULL。
+        deps.db
+          .prepare('UPDATE chat_sessions SET model_id = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL')
+          .run(model.id, Date.now(), sessionId)
+      }
+    }
+
     const attachmentNames = attachments.map((item) => item.name).join('、')
     const demoEcho = [
       '（演示应答 · 这个模型来自演示供应商，还没有接真实 API）',
@@ -1854,7 +2081,7 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
       `你能用的模型共 ${available.length} 个：${available.map((item) => item.name).join('、')}`,
     ].join('\n')
 
-    let answerText = agent?.text?.trim() ?? ''
+    let answerText = agent ? `${failoverNote}${agent.text.trim()}` : ''
     if (!agent) {
       answerText = demoEcho
       if (streaming) {
@@ -1862,8 +2089,8 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
           emitSse('delta', { text: answerText.slice(i, i + 60) })
         }
       }
-    } else if (!answerText) {
-      answerText = '工具调用已完成，但模型没有返回最终答案。请换个问法或稍后重试。'
+    } else if (!agent.text.trim()) {
+      answerText = `${failoverNote}工具调用已完成，但模型没有返回最终答案。请换个问法或稍后重试。`
       if (streaming) emitSse('delta', { text: answerText })
     }
 
@@ -1872,6 +2099,7 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
     const meta = {
       channel: 'web',
       autoSelected,
+      fallbackFromModelId: agent?.fallbackFromModelId ?? null,
       attachments: attachmentMeta(attachments),
       citations: hits.map((hit, index) => ({
         index: index + 1,
@@ -1945,6 +2173,8 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
         text: answerText,
         modelId: model.id,
         modelName: model.name,
+        autoSelected,
+        fallbackFromModelId: agent?.fallbackFromModelId ?? null,
         citations: meta.citations,
         reasoning: meta.reasoning,
         toolCalls: meta.toolCalls,
@@ -1962,6 +2192,7 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
         modelId: model.id,
         modelName: model.name,
         autoSelected,
+        fallbackFromModelId: agent?.fallbackFromModelId ?? null,
         attachments: meta.attachments,
         citations: meta.citations,
         reasoning: meta.reasoning,

@@ -63,8 +63,8 @@ describe('Agent 工具按需加载', () => {
 
   it('搜索结果只返回当前员工和当前空间可用的工具', () => {
     const { deps, actor } = testEnv()
-    const localSearch = searchToolCatalog(deps.db, actor, { kind: 'local', spaceId: 'lsp_test' }, '发送文件到钉钉')
-    expect(localSearch.tools.some((tool) => tool.functionName === 'workspace_send_dingtalk')).toBe(false)
+    const noneSearch = searchToolCatalog(deps.db, actor, { kind: 'none' }, '发送文件到钉钉')
+    expect(noneSearch.tools.some((tool) => tool.functionName === 'workspace_send_dingtalk')).toBe(false)
     const noScopeActor = { ...actor, subject: { ...actor.subject, scopes: new Set([SC.CHAT_USE]) } }
     const noScope = searchToolCatalog(deps.db, noScopeActor as any, { kind: 'cloud' }, '发送文件到钉钉')
     expect(noScope.tools.length).toBe(0)

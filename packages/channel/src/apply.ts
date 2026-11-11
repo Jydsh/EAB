@@ -362,8 +362,14 @@ export function applyOrgSync(db: Db, options: ApplyOrgSyncOptions): SyncOutcome 
       const existingUserId = identityByExternal.get(row.channelUserId)
       const existing = existingUserId ? userById.get(existingUserId) : undefined
       if (!existing) {
+        /**
+         * 身份表里可能残留“成员行已被删掉”的孤儿身份（例如历史清理/恢复只带回了身份）。
+         * 这种身份不能再插一行：provider + external_user_id 是唯一键，会整次同步失败。
+         * 直接复用身份指向的 user_id 重建成员，并跳过身份插入；没有身份时才新建。
+         */
+        const userId = existingUserId ?? row.id
         insertUser.run(
-          row.id,
+          userId,
           plan.companyId,
           row.deptId,
           row.deptPath,
@@ -376,32 +382,36 @@ export function applyOrgSync(db: Db, options: ApplyOrgSyncOptions): SyncOutcome 
           now,
           now,
         )
-        insertIdentity.run(
-          ulid(now),
-          row.id,
-          plan.provider,
-          row.channelUserId,
-          row.unionId,
-          now,
-          `sync:${plan.provider}`,
-        )
-        bridgeIdentity(row.id, row.channelUserId)
+        if (!existingUserId) {
+          insertIdentity.run(
+            ulid(now),
+            userId,
+            plan.provider,
+            row.channelUserId,
+            row.unionId,
+            now,
+            `sync:${plan.provider}`,
+          )
+          stats.identitiesCreated += 1
+        }
+        bridgeIdentity(userId, row.channelUserId)
         stats.usersCreated += 1
-        stats.identitiesCreated += 1
         diffs.push({
           itemType: 'user',
           action: 'user.create',
-          entityId: row.id,
+          entityId: userId,
           before: null,
           after: { name: row.name, deptId: row.deptId, mobile: row.mobile ?? null, channelUserId: row.channelUserId },
         })
-        diffs.push({
-          itemType: 'identity',
-          action: 'identity.create',
-          entityId: row.id,
-          before: null,
-          after: { provider: plan.provider, externalUserId: row.channelUserId, status: 'pending' },
-        })
+        if (!existingUserId) {
+          diffs.push({
+            itemType: 'identity',
+            action: 'identity.create',
+            entityId: userId,
+            before: null,
+            after: { provider: plan.provider, externalUserId: row.channelUserId, status: 'pending' },
+          })
+        }
         continue
       }
 

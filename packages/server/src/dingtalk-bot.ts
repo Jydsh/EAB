@@ -11,6 +11,7 @@
  * 3. 机器人可见文案统一用「EAB + 公司名」，不出现第三方项目名。
  */
 import { randomUUID } from 'node:crypto'
+import { SC, scopeAllows } from '@eab/domain'
 import { appendAudit, type Db } from '@eab/storage'
 import { consumeRobotUserFileSend } from './dingtalk-file-echo.js'
 import { publishChatEvent, type ChatLiveToolEventPayload } from './chat-events.js'
@@ -34,11 +35,12 @@ import {
   type AgentTurnResult,
 } from './routes/chat.js'
 import { toolSpecsForAgent } from './routes/tools.js'
-import type { ActiveSpace } from './local-space.js'
+import type { ActiveSpace } from './space.js'
 import { saveUserWorkspaceFile } from './routes/workspace.js'
 import { prepareDshImCompat, syncDshImSession } from './dsh-im-compat.js'
 import { pluginPromptTexts } from './plugin-tools.js'
 import { assertChatQuota } from './quota.js'
+import { planChannelModelCommand } from './channel-model-command.js'
 import {
   resolveUserWorkspaceQuota,
   workspaceCapacity,
@@ -574,24 +576,7 @@ export async function notifyDingTalkUser(
   }
 }
 
-/** 绑定成功后的第一声招呼：只讲“我是谁、能做什么、去哪里继续”，不报连接状态。 */
-export function buildDingTalkWelcome(companyName: string): string {
-  return [
-    `你好，我是「${companyName}」的 EAB 企业智能助手。`,
-    '制度、部门、负责人可以直接问我；文档、表格、定时任务也可以交给我处理。',
-    '这里和 EAB 网页工作台共用同一段对话，随时可以接着聊。',
-  ].join('\n')
-}
-
-/** 绑定成功后给扫码人发一条 EAB 品牌欢迎语（失败不影响绑定结果）。 */
-export async function sendDingTalkWelcome(
-  deps: ServerDeps,
-  userId: string | null | undefined,
-  companyName: string,
-): Promise<void> {
-  if (!userId) return
-  await notifyDingTalkUser(deps, userId, buildDingTalkWelcome(companyName))
-}
+/** 绑定成功后不发送 EAB 自建欢迎语，使用钉钉平台原生欢迎语。 */
 
 function resolveDingTalkUser(db: Db, companyId: string, externalId: string): string | null {
   const channel = db
@@ -649,7 +634,7 @@ export async function handleDingTalkMessage(
   if (!rawText && imageCodes.length === 0 && fileAttachments.length === 0) {
     return {
       handled: false,
-      text: 'EAB 目前支持文字、图片和文件：可以直接问我制度、部门、组长或工作资料，也可以发图片让我读取内容，或发文件到个人云空间。',
+      text: 'EAB 目前支持文字、图片和文件：可以直接问我制度、部门、组长或工作资料，也可以发图片让我读取内容，或发文件到个人云空间。发送 /model 可以查看并切换你有权限使用的模型，发送 /auto 恢复自动选择。',
       sessionId: null,
       reason: 'empty-text',
     }
@@ -678,7 +663,7 @@ export async function handleDingTalkMessage(
   if (!cfg?.app_id || cfg.status !== 'bound') {
     return {
       handled: false,
-      text: 'EAB 还没有连接企业。请管理员先到 EAB 管理控制台「连接与平台 → 渠道」完成钉钉扫码绑定。',
+      text: 'EAB 还没有连接企业。请管理员先到 EAB 管理控制台「连接与平台 → 渠道」完成钉钉机器人绑定。',
       sessionId: null,
       reason: 'channel-unbound',
     }
@@ -703,6 +688,57 @@ export async function handleDingTalkMessage(
     }
   }
   const actor: RequestActor = actorFor(deps.db, person)
+  if (!scopeAllows(actor.subject.scopes, SC.CHAT_USE)) {
+    return { handled: false, text: '当前身份没有对话权限（chat:use）。', sessionId: null, reason: 'scope-denied' }
+  }
+  if (!scopeAllows(actor.subject.scopes, SC.MODEL_USE)) {
+    return { handled: false, text: '当前身份没有使用模型的权限（model:use）。', sessionId: null, reason: 'scope-denied' }
+  }
+  const catalog = loadModelCatalog(deps.db, actor.subject.companyId, deps.config.devAuth)
+  const available = visibleModelsFor(catalog, [...actor.subject.roles])
+
+  /**
+   * 渠道里的模型切换必须先于额度校验：它不调用模型，也不消耗额度。
+   * 命令只匹配 available（已按当前员工角色过滤），不会探测未授权模型。
+   * 先用 null 当前模型做一次纯解析，只有命中命令才建/取会话，普通消息不提前落会话。
+   */
+  const commandPreview =
+    imageCodes.length === 0 && fileAttachments.length === 0
+      ? planChannelModelCommand(rawText, available, null)
+      : null
+  if (commandPreview) {
+    const commandSessionId = ensureChannelSession(
+      deps.db,
+      actor,
+      'dingtalk',
+      externalId,
+      rawText || '模型切换',
+    )
+    const storedModelId =
+      (deps.db
+        .prepare('SELECT model_id FROM chat_sessions WHERE id = ? AND deleted_at IS NULL')
+        .get(commandSessionId) as { model_id: string | null } | undefined)?.model_id ?? null
+    const currentModelId =
+      storedModelId && available.some((item) => item.id === storedModelId) ? storedModelId : null
+    if (storedModelId && !currentModelId) {
+      // 旧模型下线或角色被收回时先清空，命令列表不能把无权模型 ID 展示出来。
+      deps.db.prepare('UPDATE chat_sessions SET model_id = NULL, updated_at = ? WHERE id = ?').run(Date.now(), commandSessionId)
+    }
+    const modelCommand = planChannelModelCommand(rawText, available, currentModelId)
+    if (modelCommand) {
+      if (modelCommand.modelId !== undefined) {
+        deps.db
+          .prepare('UPDATE chat_sessions SET model_id = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL')
+          .run(modelCommand.modelId, Date.now(), commandSessionId)
+      }
+      return {
+        handled: true,
+        text: modelCommand.text,
+        sessionId: commandSessionId,
+        reason: 'model-command',
+      }
+    }
+  }
 
   /**
    * 渠道侧与网页共用同一份月度额度：钉钉机器人不走 /api/chat/messages，
@@ -782,13 +818,33 @@ export async function handleDingTalkMessage(
         ).count,
       ) === 0
 
-    const catalog = loadModelCatalog(deps.db, actor.subject.companyId, deps.config.devAuth)
-    const available = visibleModelsFor(catalog, [...actor.subject.roles])
-    const model = imageUrls.length > 0 ? available.find((item) => modelSupportsVision(item.tags, item.capabilities)) ?? available[0] : available[0]
+    let modelFallbackNote = ''
+    const sessionModelId =
+      (deps.db
+        .prepare('SELECT model_id FROM chat_sessions WHERE id = ? AND deleted_at IS NULL')
+        .get(sessionId) as { model_id: string | null } | undefined)?.model_id ?? null
+    const preferredModel = sessionModelId ? available.find((item) => item.id === sessionModelId) : undefined
+    if (sessionModelId && !preferredModel) {
+      // 会话里保存的模型下线或当前角色无权后再回退自动，避免每轮继续拿旧 ID。
+      deps.db.prepare('UPDATE chat_sessions SET model_id = NULL, updated_at = ? WHERE id = ?').run(Date.now(), sessionId)
+      modelFallbackNote = '原会话模型已不可用，已切回自动选择。\n\n'
+    }
+    if (imageUrls.length > 0 && preferredModel && !modelSupportsVision(preferredModel.tags, preferredModel.capabilities)) {
+      return {
+        handled: false,
+        text: `当前会话模型「${preferredModel.name}」没有开启图片识别能力。请发送 /model 切换到一个支持图片的模型后再发图片。`,
+        sessionId,
+        reason: 'model-not-vision',
+      }
+    }
+    const autoModel = imageUrls.length > 0
+      ? available.find((item) => modelSupportsVision(item.tags, item.capabilities)) ?? available[0]
+      : available[0]
+    const model = preferredModel ?? autoModel
     if (!model) {
       return {
         handled: false,
-        text: 'EAB 当前还没有可用模型。请管理员到「模型接入」启用一个模型后再试。',
+        text: `${modelFallbackNote}EAB 当前还没有可用模型。请管理员到「模型接入」启用一个模型后再试。`,
         sessionId,
         reason: 'no-model',
       }
@@ -943,6 +999,8 @@ export async function handleDingTalkMessage(
     let rounds = 0
     let promptTokens = 0
     let completionTokens = 0
+    let effectiveModel = model
+    let failoverNote = ''
     const assistantMessageId = `msg_${randomUUID()}`
     const publishDelta = (kind: 'reasoning' | 'content', text: string) => {
       if (!text) return
@@ -954,8 +1012,8 @@ export async function handleDingTalkMessage(
         messageId: assistantMessageId,
         kind,
         text,
-        modelId: model.id,
-        modelName: model.name,
+        modelId: effectiveModel.id,
+        modelName: effectiveModel.name,
       })
     }
     const publishTool = (tool: ChatLiveToolEventPayload) => {
@@ -999,6 +1057,15 @@ export async function handleDingTalkMessage(
         deps,
         actor,
         modelId: model.id,
+        fallbackModelIds: available
+          .filter((item) => item.id !== model.id && (imageUrls.length === 0 || modelSupportsVision(item.tags, item.capabilities)))
+          .map((item) => item.id),
+        bufferModelEvents: true,
+        onModelFailover: (change) => {
+          const next = available.find((item) => item.id === change.toModelId)
+          if (next) effectiveModel = next
+          failoverNote = `当前模型「${change.fromModelName}」暂时不可用，已自动切换到「${change.toModelName}」。\n\n`
+        },
         messages,
         sessionId,
         space: toolSpace,
@@ -1063,6 +1130,15 @@ export async function handleDingTalkMessage(
         },
       })
       if (agentResult) {
+        const usedId = agentResult.usedModelId
+        const used = usedId ? available.find((item) => item.id === usedId) : undefined
+        if (used) effectiveModel = used
+        if (preferredModel && agentResult.fallbackFromModelId && effectiveModel.id !== model.id) {
+          // 用户固定选过模型时，故障转移后的模型写入本会话；自动模式仍保持 NULL。
+          deps.db
+            .prepare('UPDATE chat_sessions SET model_id = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL')
+            .run(effectiveModel.id, Date.now(), sessionId)
+        }
         agentText = agentResult.text.trim()
         toolCallCount = agentResult.toolCalls.length
         rounds = agentResult.rounds
@@ -1082,7 +1158,7 @@ export async function handleDingTalkMessage(
     const greeting = firstMessage && !alreadyBranded
       ? `你好，${actor.person.name}。我是「${actor.person.companyName}」的 EAB 企业智能助手（Enterprise Agent Base）。钉钉这里的对话和 EAB 网页工作台是同一份历史。\n\n`
       : ''
-    const answerText = `${greeting}${agentText}`
+    const answerText = `${modelFallbackNote}${failoverNote}${greeting}${agentText}`
 
     // 卡片成功收口时返回 null，交给调用方跳过 sessionWebhook 纯文本；失败才回退文字。
     let replyText: string | null = answerText
@@ -1153,8 +1229,8 @@ export async function handleDingTalkMessage(
         sessionId,
         actor.person.id,
         answerText,
-        model.id,
-        model.name,
+        effectiveModel.id,
+        effectiveModel.name,
         JSON.stringify(assistantMeta),
         assistantCreatedAt,
       )
@@ -1167,8 +1243,8 @@ export async function handleDingTalkMessage(
         id: assistantMessageId,
         role: 'assistant',
         text: answerText,
-        modelId: model.id,
-        modelName: model.name,
+        modelId: effectiveModel.id,
+        modelName: effectiveModel.name,
         meta: assistantMeta,
         createdAt: new Date(assistantCreatedAt).toISOString(),
       },
@@ -1184,14 +1260,14 @@ export async function handleDingTalkMessage(
       resourceType: 'chat_session',
       resourceId: sessionId,
       result: 'success',
-      detail: { channel: 'dingtalk', modelId: model.id, tools: toolCallCount, rounds },
+      detail: { channel: 'dingtalk', modelId: effectiveModel.id, tools: toolCallCount, rounds },
       channel: 'dingtalk',
       ip: null,
     })
 
     deps.db
       .prepare('UPDATE channel_events SET result_json = ? WHERE provider = ? AND event_key = ?')
-      .run(JSON.stringify({ sessionId, modelId: model.id, durationMs: Date.now() - started }), 'dingtalk', eventKey)
+      .run(JSON.stringify({ sessionId, modelId: effectiveModel.id, durationMs: Date.now() - started }), 'dingtalk', eventKey)
 
     reactionOk = true
     return { handled: true, text: replyText, sessionId, reason: 'ok' }

@@ -59,3 +59,15 @@ export function storeSecret(dbPath: string, ref: string | null | undefined, valu
 export function secretConfigured(dbPath: string, ref: string | null | undefined): boolean {
   return Boolean(resolveSecret(dbPath, ref))
 }
+
+/** 删除一个引用对应的本地密钥；环境变量里的同名项不会被删除。 */
+export function deleteSecret(dbPath: string, ref: string | null | undefined): void {
+  const name = typeof ref === 'string' ? ref.trim() : ''
+  if (!name || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) return
+  const file = secretsPath(dbPath)
+  if (!existsSync(file)) return
+  const current = readFile(file)
+  if (!(name in current)) return
+  delete current[name]
+  writeFileSync(file, `${JSON.stringify(current, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
+}
