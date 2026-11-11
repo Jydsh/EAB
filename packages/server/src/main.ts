@@ -24,8 +24,9 @@ import {
 } from './settings.js'
 import { startRetention } from './retention.js'
 import { startScheduleWorker } from './schedule.js'
-import { startModelHealthMonitor } from './model-health.js'
+import { startModelHealthMonitor, isModelHealthy, probeUnverifiedPluginModels } from './model-health.js'
 import { reloadPluginHosts } from './plugin-host.js'
+import { setPluginModelVisibilityResolver, setPluginModelsChangedListener } from './plugin-models.js'
 import { setPluginRoot } from './plugins.js'
 import { checkForUpdate } from './update.js'
 import { acquireProcessLock, type ProcessLock } from './process-lock.js'
@@ -198,6 +199,21 @@ await Promise.all([
   apps.chat.listen({ host: config.host, port: config.port }),
   apps.console.listen({ host: config.host, port: config.adminPort }),
 ])
+
+/** 插件模型只有在真实回复探测通过后才进入模型目录。 */
+setPluginModelVisibilityResolver((companyId, modelId) => isModelHealthy(companyId, modelId))
+const pluginProbeTimers = new Map<string, ReturnType<typeof setTimeout>>()
+setPluginModelsChangedListener((companyId) => {
+  // adapter 注册发生在插件 apply() 期间，等初始化落定再探测，避免 prepareCall 撞上半初始化状态。
+  const previous = pluginProbeTimers.get(companyId)
+  if (previous) clearTimeout(previous)
+  const timer = setTimeout(() => {
+    pluginProbeTimers.delete(companyId)
+    void probeUnverifiedPluginModels(companyId)
+  }, 800)
+  timer.unref?.()
+  pluginProbeTimers.set(companyId, timer)
+})
 
 /** DSH 插件 host：已安装且启用的插件在这里跑 apply()，把它们的 RPC 通道挂起来 */
 await reloadPluginHosts(db, {

@@ -2,14 +2,19 @@
  * 插件模型健康状态。
  *
  * 插件模型不落 `models` 表，上游可用度只能靠实际调用判断。这里维护进程内健康表：
- * - 定时用最短请求探测插件模型，失败的模型从对话候选里过滤掉；
+ * - 新注册的插件模型默认“未验证”，探测通过后才进入模型目录与对话候选；
+ * - 定时用最短请求探测当前仍启用的插件模型，失败的模型立即从目录隐藏；
  * - 对话里真实调用失败的模型立即标记不可用，成功则恢复；
- * - 健康状态只影响对话候选，不改变控制台的模型目录展示。
+ * - 插件停用/卸载后由调用方移除模型，这里只负责健康状态。
  *
  * 不把探测结果写库：插件路由本身是运行时注册的，重启后重新探测比读旧状态更可靠。
  */
 import { EC, EabError } from '@eab/domain'
-import { callPluginModel, listPluginModels, type PluginModelDefinition } from './plugin-models.js'
+import {
+  callPluginModel,
+  listAllPluginModels,
+  type PluginModelDefinition,
+} from './plugin-models.js'
 import type { ChatMessage } from './llm.js'
 
 interface ModelHealthEntry {
@@ -59,9 +64,13 @@ export function markModelUnhealthy(companyId: string, modelId: string, reason: s
   })
 }
 
-/** 未探测过的模型默认可用，避免服务刚启动时把所有插件模型隐藏掉。 */
+/** 未探测过的模型默认不可用：必须先真实探测通过，才允许出现在模型目录里。 */
 export function isModelHealthy(companyId: string, modelId: string): boolean {
-  return companyHealth(companyId).get(modelId)?.healthy !== false
+  return companyHealth(companyId).get(modelId)?.healthy === true
+}
+
+export function isModelHealthKnown(companyId: string, modelId: string): boolean {
+  return companyHealth(companyId).has(modelId)
 }
 
 /**
@@ -86,37 +95,111 @@ export function shouldMarkModelFailure(error: unknown): boolean {
   return name !== 'AbortError'
 }
 
+const probesInFlight = new Map<string, Promise<boolean>>()
+
 /**
  * 用最小请求探测一个插件模型。探测不经过对话额度，也不落对话消息。
  * 失败包括上游异常、超时、空回复；任一都标记该模型暂时不可用。
+ * 同一个模型的重叠探测共用一个请求，避免启动扫描、注册通知和手动刷新重复消耗额度。
  */
-export async function probePluginModel(
+export function probePluginModel(
   companyId: string,
   modelId: string,
   timeoutMs = 15_000,
 ): Promise<boolean> {
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), Math.max(1_000, timeoutMs))
-  const messages: ChatMessage[] = [{ role: 'user', content: '请只回复两个字：可用' }]
-  try {
-    const result = await callPluginModel(
-      companyId,
-      modelId,
-      messages,
-      { signal: controller.signal },
-      8,
-    )
-    if (!result) throw new EabError(EC.UPSTREAM, '插件模型已下线或尚未完成注册')
-    if (!result.text.trim()) throw new EabError(EC.UPSTREAM, '插件模型返回空回复')
-    markModelHealthy(companyId, modelId)
-    return true
-  } catch (error) {
-    const reason = controller.signal.aborted ? '探测超时' : errorText(error)
-    markModelUnhealthy(companyId, modelId, reason)
-    return false
-  } finally {
-    clearTimeout(timer)
+  const key = `${companyId}:${modelId}`
+  const existing = probesInFlight.get(key)
+  if (existing) return existing
+  const task = (async (): Promise<boolean> => {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), Math.max(1_000, timeoutMs))
+    const messages: ChatMessage[] = [{ role: 'user', content: '请只回复两个字：可用' }]
+    try {
+      const result = await callPluginModel(
+        companyId,
+        modelId,
+        messages,
+        { signal: controller.signal },
+        8,
+      )
+      if (!result) throw new EabError(EC.UPSTREAM, '插件模型已下线或尚未完成注册')
+      if (!result.text.trim()) throw new EabError(EC.UPSTREAM, '插件模型返回空回复')
+      markModelHealthy(companyId, modelId)
+      return true
+    } catch (error) {
+      const reason = controller.signal.aborted ? '探测超时' : errorText(error)
+      markModelUnhealthy(companyId, modelId, reason)
+      return false
+    } finally {
+      clearTimeout(timer)
+    }
+  })()
+  probesInFlight.set(key, task)
+  void task.finally(() => {
+    if (probesInFlight.get(key) === task) probesInFlight.delete(key)
+  })
+  return task
+}
+
+interface ProbeBatchResult {
+  readonly checked: number
+  readonly healthy: number
+  readonly failed: PluginModelDefinition[]
+}
+
+/** 批量探测，限制并发，避免几十个插件模型同时打上游。 */
+async function probeModels(
+  companyId: string,
+  models: readonly PluginModelDefinition[],
+  timeoutMs: number,
+  concurrency = 3,
+): Promise<ProbeBatchResult> {
+  const failed: PluginModelDefinition[] = []
+  let healthy = 0
+  let cursor = 0
+  const worker = async (): Promise<void> => {
+    while (cursor < models.length) {
+      const index = cursor
+      cursor += 1
+      const model = models[index]
+      if (!model) return
+      const ok = await probePluginModel(companyId, model.id, timeoutMs)
+      if (ok) healthy += 1
+      else failed.push(model)
+    }
   }
+  await Promise.all(
+    Array.from({ length: Math.min(Math.max(1, concurrency), models.length) }, () => worker()),
+  )
+  return { checked: models.length, healthy, failed }
+}
+
+/**
+ * 注册/刷新后补探测尚未验证的模型。已经有探测结果的模型不重复探测，
+ * 失败模型由定时监控继续重试；手动刷新通道时走 probePluginChannelModels 强制重测。
+ */
+export async function probeUnverifiedPluginModels(
+  companyId: string,
+  timeoutMs = 15_000,
+): Promise<ProbeBatchResult> {
+  const models = listAllPluginModels(companyId).filter(
+    (model) => !isModelHealthKnown(companyId, model.id),
+  )
+  if (models.length === 0) return { checked: 0, healthy: 0, failed: [] }
+  return probeModels(companyId, models, timeoutMs, 3)
+}
+
+/** 控制台「刷新插件模型」：对这条通道下的模型做一次真实回复探测。 */
+export async function probePluginChannelModels(
+  companyId: string,
+  channelId: string,
+  timeoutMs = 15_000,
+): Promise<ProbeBatchResult> {
+  const models = listAllPluginModels(companyId).filter(
+    (model) => model.channelId === String(channelId),
+  )
+  if (models.length === 0) return { checked: 0, healthy: 0, failed: [] }
+  return probeModels(companyId, models, timeoutMs, 3)
 }
 
 export interface ModelHealthMonitorOptions {
@@ -143,33 +226,37 @@ export function startModelHealthMonitor(
   const timeoutMs = positiveMs(options.timeoutMs, DEFAULT_TIMEOUT_MS)
   let running = false
   let stopped = false
+  let startupRetries = 0
 
   async function probeAll(): Promise<void> {
     if (running || stopped) return
-    const models = listPluginModels(companyId)
-    if (models.length === 0) return
-    running = true
-    const failed: PluginModelDefinition[] = []
-    try {
-      for (const model of models) {
-        if (stopped) break
-        const okModel = await probePluginModel(companyId, model.id, timeoutMs)
-        if (!okModel) failed.push(model)
+    const models = listAllPluginModels(companyId)
+    if (models.length === 0) {
+      // 插件 adapter 的 listModels() 可能晚于启动返回；前几秒补扫几次，避免首轮漏掉。
+      if (startupRetries < 5) {
+        startupRetries += 1
+        const retry = setTimeout(() => void probeAll(), 2_000)
+        retry.unref?.()
       }
-      if (failed.length > 0) {
+      return
+    }
+    running = true
+    try {
+      const result = await probeModels(companyId, models, timeoutMs, 3)
+      if (result.failed.length > 0) {
         console.warn(
-          `[eab] 模型健康检查：${failed.length}/${models.length} 个插件模型暂时不可用：` +
-            failed.map((model) => model.name).join('、'),
+          `[eab] 模型健康检查：${result.failed.length}/${result.checked} 个插件模型暂时不可用：` +
+            result.failed.map((model) => model.name).join('、'),
         )
       } else {
-        console.log(`[eab] 模型健康检查：${models.length} 个插件模型均可用`)
+        console.log(`[eab] 模型健康检查：${result.checked} 个插件模型均可用`)
       }
     } finally {
       running = false
     }
   }
 
-  // 首轮不阻塞启动；探测本身带超时，失败只影响对话候选。
+  // 首轮不阻塞启动；探测本身带超时，失败的模型不会进入模型目录。
   void probeAll()
   const timer = setInterval(() => void probeAll(), intervalMs)
   timer.unref?.()

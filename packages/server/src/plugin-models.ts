@@ -8,6 +8,7 @@
  */
 import { EC, EabError } from '@eab/domain'
 import type { CallResult, ChatMessage, ModelStreamOptions } from './llm.js'
+import { DEFAULT_PLUGIN_MODEL_ROLES } from './plugin-model-settings.js'
 
 interface PluginAdapterLike {
   listModels?: (provider: string) => unknown | Promise<unknown>
@@ -79,16 +80,40 @@ const targetsByCompany = new Map<string, Map<string, PluginModelTarget>>()
 const pendingConfigurable = new Map<string, Map<string, Map<string, Record<string, unknown>>>>()
 const pendingDiscovery = new Map<string, Map<string, (...args: unknown[]) => unknown>>()
 
-const ALL_ROLES = [
-  'auditor',
-  'company_admin',
-  'company_sub_admin',
-  'dept_admin',
-  'guest',
-  'kb_admin',
-  'member',
-  'super_admin',
-]
+type PluginActiveResolver = (companyId: string, pluginId: string) => boolean
+type ModelVisibleResolver = (companyId: string, modelId: string) => boolean
+type PluginModelsChangedListener = (companyId: string) => void
+
+/**
+ * 宿主可以在查询时判断插件是否仍对公司有效。插件卸载/停用后，host 的异步 dispose
+ * 可能晚于下一次模型列表请求；只在 dispose 时删内存会留下“幽灵模型”，所以这里
+ * 每次枚举都再按安装/启停状态过滤一次。
+ */
+let pluginActiveResolver: PluginActiveResolver | null = null
+/** 插件模型只有探测通过才进入目录；未探测默认不可见。 */
+let modelVisibleResolver: ModelVisibleResolver | null = null
+/** adapter 注册/刷新后通知宿主去补做探测。 */
+let modelsChangedListener: PluginModelsChangedListener | null = null
+
+export function setPluginModelActiveResolver(resolver: PluginActiveResolver | null): void {
+  pluginActiveResolver = resolver
+}
+
+export function setPluginModelVisibilityResolver(resolver: ModelVisibleResolver | null): void {
+  modelVisibleResolver = resolver
+}
+
+export function setPluginModelsChangedListener(listener: PluginModelsChangedListener | null): void {
+  modelsChangedListener = listener
+}
+
+function pluginIsActive(companyId: string, pluginId: string): boolean {
+  return pluginActiveResolver ? pluginActiveResolver(companyId, pluginId) : true
+}
+
+function modelIsVisible(companyId: string, modelId: string): boolean {
+  return modelVisibleResolver ? modelVisibleResolver(companyId, modelId) : true
+}
 
 function companyAdapters(companyId: string): RegisteredAdapter[] {
   let rows = adaptersByCompany.get(companyId)
@@ -158,7 +183,7 @@ function toDefinition(
     tags,
     capabilities,
     endpointKind: 'chat',
-    roles: ALL_ROLES,
+    roles: [...DEFAULT_PLUGIN_MODEL_ROLES],
     priority: 1,
     provider: 'plugin',
     providerName: String(info.providerName ?? provider),
@@ -214,6 +239,8 @@ async function refreshAdapter(companyId: string, registration: RegisteredAdapter
       }
     }
   }
+  // 注册/刷新完成后通知宿主补做真实回复探测；模型在探测通过前不会出现在目录里。
+  modelsChangedListener?.(companyId)
 }
 
 /**
@@ -274,8 +301,25 @@ export function registerPluginAdapter(
   return { replace, dispose }
 }
 
+/** 当前公司仍启用插件的全部模型（含探测失败、暂不可见的模型），供健康探测使用。 */
+export function listAllPluginModels(companyId: string): PluginModelDefinition[] {
+  const activeByPlugin = new Map<string, boolean>()
+  return [...companyModels(companyId).values()].filter((model) => {
+    let active = activeByPlugin.get(model.pluginId)
+    if (active === undefined) {
+      active = pluginIsActive(companyId, model.pluginId)
+      activeByPlugin.set(model.pluginId, active)
+    }
+    return active
+  })
+}
+
+/**
+ * 对外可见的插件模型：插件仍启用，并且已经探测通过。
+ * 未探测的模型默认不返回，避免服务刚启动时把尚未验证的插件模型放进对话候选。
+ */
 export function listPluginModels(companyId: string): PluginModelDefinition[] {
-  return [...companyModels(companyId).values()]
+  return listAllPluginModels(companyId).filter((model) => modelIsVisible(companyId, model.id))
 }
 
 /**
@@ -284,13 +328,14 @@ export function listPluginModels(companyId: string): PluginModelDefinition[] {
  */
 export function listPluginChannels(companyId: string): PluginChannelDefinition[] {
   const channels = new Map<string, PluginChannelDefinition>()
-  const models = companyModels(companyId)
+  const models = listPluginModels(companyId)
   for (const registration of companyAdapters(companyId)) {
+    if (!pluginIsActive(companyId, registration.pluginId)) continue
     for (const route of registration.routes) {
       const id = pluginChannelId(registration.pluginId, route)
       const meta = registration.configurable.get(route) ?? {}
       const settingsPath = Array.isArray(meta.settingsPath) ? meta.settingsPath.map(String) : []
-      const modelCount = [...models.values()].filter((model) => model.channelId === id).length
+      const modelCount = models.filter((model) => model.channelId === id).length
       channels.set(id, {
         id,
         pluginId: registration.pluginId,
@@ -399,7 +444,24 @@ export async function refreshPluginChannel(companyId: string, channelId: string)
 }
 
 export function findPluginModel(companyId: string, id: string): PluginModelDefinition | null {
-  return companyModels(companyId).get(String(id)) ?? null
+  const model = companyModels(companyId).get(String(id))
+  if (!model || !pluginIsActive(companyId, model.pluginId)) return null
+  return model
+}
+
+/**
+ * 插件停用/卸载时立即把它的模型摘掉。host 的 root fiber dispose 是异步的，
+ * 单靠 adapter.dispose 可能让下一次模型列表请求仍读到旧模型。
+ */
+export function removePluginModelsForPlugin(companyId: string, pluginId: string): void {
+  const models = companyModels(companyId)
+  const targets = companyTargets(companyId)
+  for (const [id, model] of models) {
+    if (model.pluginId === String(pluginId)) models.delete(id)
+  }
+  for (const [id, target] of targets) {
+    if (target.pluginId === String(pluginId)) targets.delete(id)
+  }
 }
 
 export function isPluginModelId(id: string): boolean {

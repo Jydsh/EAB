@@ -6334,6 +6334,15 @@ table.data tr.clickable { cursor: pointer; }
   background: var(--warn-soft);
   color: var(--warn);
 }
+.models-plugin-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  color: #667085;
+  font-size: 12px;
+  line-height: 1.5;
+}
 .models-compress-field .check {
   padding: 8px 10px;
   background: #fbfdfc;

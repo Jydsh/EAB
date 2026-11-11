@@ -28,20 +28,24 @@ function adapter(options: { fail?: boolean; content?: string }) {
 }
 
 describe('模型健康状态', () => {
-  it('成功恢复、失败过滤；全部失败时返回空数组', () => {
+  it('未探测默认不可用；成功恢复、失败过滤；全部失败时返回空数组', () => {
     const company = 'health-state-test'
     const models = [{ id: 'a' }, { id: 'b' }]
-    expect(filterHealthyModels(company, models)).toEqual(models)
-
-    markModelUnhealthy(company, 'a', 'quota')
-    expect(isModelHealthy(company, 'a')).toBe(false)
-    expect(filterHealthyModels(company, models)).toEqual([{ id: 'b' }])
-
-    markModelUnhealthy(company, 'b', 'timeout')
+    // 新注入的插件模型必须先探测通过，未探测不能进入目录。
     expect(filterHealthyModels(company, models)).toEqual([])
 
     markModelHealthy(company, 'a')
     expect(filterHealthyModels(company, models)).toEqual([{ id: 'a' }])
+
+    markModelUnhealthy(company, 'a', 'quota')
+    expect(isModelHealthy(company, 'a')).toBe(false)
+    expect(filterHealthyModels(company, models)).toEqual([])
+
+    markModelUnhealthy(company, 'b', 'timeout')
+    expect(filterHealthyModels(company, models)).toEqual([])
+
+    markModelHealthy(company, 'b')
+    expect(filterHealthyModels(company, models)).toEqual([{ id: 'b' }])
   })
 
   it('只把模型上游/限流类错误算作不可回复', () => {

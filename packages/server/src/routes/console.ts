@@ -22,7 +22,13 @@ import {
 } from '../workspace-quota.js'
 import { applyOrgSync, fetchChannelOrg, fetchDingTalkTenant, mapRemoteOrg, pollFeishuScanNative, pollWecomScan, startFeishuScanNative, startWecomScan, verifyFeishuApp } from '@eab/channel'
 import { dispatchPluginRpc } from '../plugin-host.js'
-import { listPluginChannels, listPluginModels, refreshPluginChannel } from '../plugin-models.js'
+import { listPluginChannels, listAllPluginModels, listPluginModels, refreshPluginChannel } from '../plugin-models.js'
+import { filterHealthyModels, probePluginChannelModels } from '../model-health.js'
+import {
+  applyPluginModelRoles,
+  loadPluginModelRoleMap,
+  savePluginModelRoles,
+} from '../plugin-model-settings.js'
 import { loadPlugins } from '../plugins.js'
 import { KB_SOURCE_LABEL, listExternalDocs, probeExternalCollection, syncObsidianCollection } from '../kb-external.js'
 import {
@@ -1684,8 +1690,9 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
     if (!channels.some((channel) => channel.id === channelId)) {
       throw new EabError(EC.NOT_FOUND, '插件通道不存在、未启用或尚未完成注册')
     }
-    const models = await refreshPluginChannel(companyId, channelId)
-    return ok({ channelId, models })
+    await refreshPluginChannel(companyId, channelId)
+    const probe = await probePluginChannelModels(companyId, channelId)
+    return ok({ channelId, models: probe.healthy, checked: probe.checked })
   })
 
   app.post<{
@@ -2208,7 +2215,11 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
       .all(companyId) as unknown as Array<{ code: string; name: string }>
 
     const channels = new Map(listPluginChannels(companyId).map((channel) => [channel.id, channel]))
-    const pluginModels = listPluginModels(companyId).map((model) => {
+    const pluginRoleOverrides = loadPluginModelRoleMap(deps.db, companyId)
+    const pluginModels = applyPluginModelRoles(
+      filterHealthyModels(companyId, listPluginModels(companyId)),
+      pluginRoleOverrides,
+    ).map((model) => {
       const channel = channels.get(model.channelId)
       return {
         id: model.id,
@@ -2589,6 +2600,28 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
       },
     })
   })
+
+  app.put<{ Params: { id: string }; Body: { roles?: string[] } }>(
+    '/api/console/models/:id/plugin-settings',
+    async (req) => {
+      requireConsole(req, deps)
+      const companyId = companyOf(req, deps)
+      const id = String(req.params.id)
+      const model = listAllPluginModels(companyId).find((item) => item.id === id)
+      if (!model) throw new EabError(EC.NOT_FOUND, '插件模型不存在、插件已停用或尚未完成注册')
+      if (!Array.isArray(req.body?.roles)) throw new EabError(EC.VALIDATION, 'roles 必须是数组')
+      const roles = [...new Set(req.body.roles.map(String).filter(Boolean))]
+      if (roles.length > 0) {
+        const known = deps.db
+          .prepare('SELECT code FROM roles WHERE company_id = ? AND deleted_at IS NULL')
+          .all(companyId) as unknown as Array<{ code: string }>
+        const unknown = roles.filter((code) => !known.some((item) => item.code === code))
+        if (unknown.length > 0) throw new EabError(EC.VALIDATION, `未知角色：${unknown.join('、')}`)
+      }
+      savePluginModelRoles(deps.db, companyId, id, roles)
+      return ok({ model: { id, roles } })
+    },
+  )
 
   app.delete<{ Params: { id: string } }>('/api/console/models/:id', async (req) => {
     requireConsole(req, deps)

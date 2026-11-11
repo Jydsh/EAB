@@ -3704,7 +3704,10 @@ async function openModelModal(model, providers, roles) {
     return
   }
   const initialTags = model?.tags || []
-  const initialRoleCodes = model ? model.roles || [] : roles.map((role) => role.code)
+  const defaultRoleCodes = roles.some((role) => role.code === 'member')
+    ? ['member']
+    : roles.slice(0, 1).map((role) => role.code)
+  const initialRoleCodes = model ? model.roles || [] : defaultRoleCodes
   const overlay = modelModal(`
     <div class="modal-head">
       <div class="models-modal-title">
@@ -3961,6 +3964,92 @@ async function openModelModal(model, providers, roles) {
       if (model) await apiSend('PATCH', `/api/console/models/${encodeURIComponent(model.id)}`, body)
       else await apiPost('/api/console/models', body)
       close()
+      loadModels()
+    } catch (err) {
+      stateEl.className = 'modal-state bad'
+      stateEl.textContent = err.message || '保存失败'
+    }
+  })
+}
+
+function openPluginModelRoleModal(model, roles) {
+  const initialRoleCodes = model.roles || []
+  const overlay = modelModal(`
+    <div class="modal-head">
+      <div class="models-modal-title">
+        <h3>配置插件模型</h3>
+      </div>
+      <button class="modal-x" type="button">×</button>
+    </div>
+    <div class="models-modal-body">
+      <section class="models-form-section">
+        <div class="models-form-section-head">
+          <strong>${esc(model.name)}</strong>
+          ${fieldInfo('这个模型由插件注入，能力随插件更新；这里只配置哪些角色能看到并使用它。')}
+        </div>
+        <div class="models-plugin-meta">
+          <span class="models-provider-pill">${esc(model.providerName)}</span>
+          <span class="mono">${esc(model.modelKey)}</span>
+          <span class="muted">插件更新或停用后，模型会自动出现或消失。</span>
+        </div>
+      </section>
+      <section class="models-form-section">
+        <div class="models-form-section-head">
+          <strong>可见角色</strong>
+          ${fieldInfo('只勾选允许使用该模型的角色；默认只选普通员工。全不选时任何成员都不能使用。')}
+          <div class="models-multi-actions">
+            <button class="models-inline-btn" type="button" id="pm-role-all">全选</button>
+            <button class="models-inline-btn is-muted" type="button" id="pm-role-clear">全不选</button>
+          </div>
+        </div>
+        <div class="check-grid models-role-grid">
+          ${roles
+            .map(
+              (role) =>
+                `<label class="check"><input type="checkbox" data-pmrole="${esc(role.code)}"${
+                  initialRoleCodes.includes(role.code) ? ' checked' : ''
+                } /><span>${esc(ROLE_LABEL[role.code] || role.name)}</span></label>`,
+            )
+            .join('')}
+        </div>
+        <div class="models-role-state" id="pm-role-state"></div>
+      </section>
+    </div>
+    <div class="modal-state" id="pm-state"></div>
+    <div class="modal-actions">
+      <button class="btn primary" type="button" id="pm-save">保存角色</button>
+      <button class="btn ghost" type="button" id="pm-cancel">取消</button>
+    </div>`)
+  const close = () => overlay.remove()
+  const roleInputs = [...overlay.querySelectorAll('[data-pmrole]')]
+  const roleState = overlay.querySelector('#pm-role-state')
+  const syncRoleState = () => {
+    const count = roleInputs.filter((input) => input.checked).length
+    roleState.className = `models-role-state${count === 0 ? ' is-empty' : ''}`
+    roleState.textContent =
+      count === 0
+        ? '未选择任何角色：保存后这个插件模型不会出现在任何成员的工作台。'
+        : `已授权 ${count} 个角色：只有这些角色的成员能看到并使用这个插件模型。`
+  }
+  for (const input of roleInputs) input.addEventListener('change', syncRoleState)
+  const setAllRoles = (checked) => {
+    for (const input of roleInputs) input.checked = checked
+    syncRoleState()
+  }
+  overlay.querySelector('#pm-role-all').addEventListener('click', () => setAllRoles(true))
+  overlay.querySelector('#pm-role-clear').addEventListener('click', () => setAllRoles(false))
+  syncRoleState()
+  overlay.querySelector('.modal-x').addEventListener('click', close)
+  overlay.querySelector('#pm-cancel').addEventListener('click', close)
+  overlay.querySelector('#pm-save').addEventListener('click', async () => {
+    const stateEl = overlay.querySelector('#pm-state')
+    stateEl.textContent = '保存中…'
+    try {
+      await apiSend('PUT', `/api/console/models/${encodeURIComponent(model.id)}/plugin-settings`, {
+        roles: [...overlay.querySelectorAll('[data-pmrole]:checked')].map((el) => el.dataset.pmrole),
+      })
+      close()
+      showTopToast('插件模型可见角色已保存')
       loadModels()
     } catch (err) {
       stateEl.className = 'modal-state bad'
@@ -4657,7 +4746,7 @@ async function loadModels() {
         <div class="models-panel-head">
           <div>
             <h2>模型目录 <span class="models-panel-count" id="model-count">${models.length}</span></h2>
-            ${hintBadge('能力说明', '按能力管理模型：点击「能力」可直接勾选，保存后立即生效。')}
+            ${hintBadge('能力说明', '按能力管理模型：点击「能力」可直接勾选，保存后立即生效。插件模型要先真实探测通过才会出现在这里；插件停用或卸载后会自动消失。')}
           </div>
           <div class="models-tools">
             <label class="models-search"><span aria-hidden="true">⌕</span><input id="model-search" type="search" value="${esc(state.modelsSearch)}" placeholder="搜索模型、标识或供应商" autocomplete="off" /></label>
@@ -4755,7 +4844,7 @@ async function loadModels() {
         </td>
         <td>
           <span class="models-provider-pill">${esc(model.providerName)}</span>
-          <div class="desc">${readonly ? '插件注入 · 只读' : `${esc(model.providerKind)} · 优先级 ${model.priority}`}</div>
+          <div class="desc">${readonly ? '插件注入 · 角色可配置' : `${esc(model.providerKind)} · 优先级 ${model.priority}`}</div>
         </td>
         <td><span class="models-type-badge ${type.tone}">${esc(type.label)}</span></td>
         <td class="models-limits-cell">
@@ -4776,7 +4865,7 @@ async function loadModels() {
         <td class="model-actions">
           ${
             readonly
-              ? '<span class="muted">随插件启停</span>'
+              ? `<button class="btn sm model-action-btn" type="button" data-edit-plugin-model="${esc(model.id)}" data-tip="配置这个插件模型可见的角色；模型本身随插件启停。" aria-label="配置插件模型角色">${modelActionIcon('edit')}</button>`
               : `
           ${
             (model.endpointKind ?? 'chat') === 'chat'
@@ -4856,7 +4945,11 @@ async function loadModels() {
         button.disabled = true
         try {
           const result = await apiPost(`/api/console/plugin-channels/${encodeURIComponent(channelId)}/refresh`)
-          showTopToast(`插件模型已刷新：${result.models} 个`)
+          showTopToast(
+            result.checked
+              ? `插件模型已探测：${result.models}/${result.checked} 个可正常回复`
+              : '插件通道没有可探测的模型',
+          )
           loadModels()
         } catch (err) {
           showTopToast(err.message || '插件模型刷新失败', { tone: 'warn' })
@@ -4930,6 +5023,12 @@ async function loadModels() {
       if (stressButton) {
         const model = modelById.get(stressButton.dataset.stressModel)
         if (model) openModelStressModal(model, stressButton)
+        return
+      }
+      const pluginEditButton = event.target.closest('[data-edit-plugin-model]')
+      if (pluginEditButton) {
+        const model = modelById.get(pluginEditButton.dataset.editPluginModel)
+        if (model) openPluginModelRoleModal(model, modelData.roles)
         return
       }
       const editButton = event.target.closest('[data-edit-model]')

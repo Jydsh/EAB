@@ -15,6 +15,7 @@ import { ok } from '../http.js'
 import { resolveActor, type RequestActor } from '../session.js'
 import { callModelStream, callEmbeddings, callRerank, type CallResult, type ChatMessage as LlmMessage, type LlmContent, type LlmContentPart, type LlmToolCall } from '../llm.js'
 import { callPluginModel, isPluginModelId, listPluginModels } from '../plugin-models.js'
+import { applyPluginModelRoles, loadPluginModelRoleMap } from '../plugin-model-settings.js'
 import { filterHealthyModels, markModelHealthy, markModelUnhealthy, shouldMarkModelFailure } from '../model-health.js'
 import { resolveModelForPurpose, findModelById, capabilitiesOf, normalizeCapability } from '../model-registry.js'
 import { compressMessagesForContext, estimateTokens } from '../context-window.js'
@@ -218,9 +219,9 @@ export function loadModelCatalog(db: Db, companyId: string, allowDemoFallback: b
         ORDER BY m.priority DESC, m.name ASC`,
     )
     .all(companyId) as unknown as CatalogRow[]
-  const pluginModels: ModelDefinition[] = filterHealthyModels(
-    companyId,
-    listPluginModels(companyId),
+  const pluginModels: ModelDefinition[] = applyPluginModelRoles(
+    filterHealthyModels(companyId, listPluginModels(companyId)),
+    loadPluginModelRoleMap(db, companyId),
   ).map((model) => ({
     id: model.id,
     name: model.name,

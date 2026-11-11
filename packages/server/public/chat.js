@@ -257,12 +257,61 @@ const state = {
   pluginTab: 'overview',
   pluginPageKey: null,
   mode: 'chat',
+  /** 当前实际停留的界面：chat / workspace / settings，刷新后恢复 */
+  view: 'chat',
   filePreview: null,
 }
 
 const HISTORY_PAGE_SIZE = 10
 const HISTORY_TOP_THRESHOLD = 120
 const SCROLL_BOTTOM_THRESHOLD = 180
+const CHAT_LOCATION_STORAGE_KEY = 'eab.chat.location.v1'
+
+function chatLocationStorageKey() {
+  const personId = state.me?.person?.id
+  return personId ? `${CHAT_LOCATION_STORAGE_KEY}.${personId}` : ''
+}
+
+function readChatLocation() {
+  const key = chatLocationStorageKey()
+  if (!key) return null
+  try {
+    const raw = localStorage.getItem(key)
+    if (!raw) return null
+    const parsed = JSON.parse(raw)
+    return {
+      sessionId: typeof parsed?.sessionId === 'string' ? parsed.sessionId : null,
+      view: ['chat', 'workspace', 'settings'].includes(parsed?.view) ? parsed.view : 'chat',
+      mode: parsed?.mode === 'workspace' ? 'workspace' : 'chat',
+    }
+  } catch {
+    return null
+  }
+}
+
+function persistChatLocation() {
+  const key = chatLocationStorageKey()
+  if (!key) return
+  try {
+    localStorage.setItem(
+      key,
+      JSON.stringify({
+        sessionId: state.sessionId || '',
+        view: state.view || 'chat',
+        mode: state.mode === 'workspace' ? 'workspace' : 'chat',
+      }),
+    )
+  } catch {
+    /* 浏览器禁用本地存储时不影响当前页面 */
+  }
+}
+
+function restoreChatLocation(location) {
+  if (!location || location.view === 'chat') return
+  const workspaceBehindSettings = location.view === 'settings' && location.mode === 'workspace'
+  setChatMode(location.view === 'workspace' || workspaceBehindSettings ? 'workspace' : 'chat')
+  if (location.view === 'settings') showSettings()
+}
 
 /* ---------------- 登录态 ---------------- */
 
@@ -668,6 +717,8 @@ async function openSession(sessionId) {
   try {
     const data = await api(historyMessagesUrl(sessionId))
     state.sessionId = data.session.id
+    state.view = 'chat'
+    persistChatLocation()
     applySessionSpace(data.session)
     const sessionModelId = data.session.modelId || data.session.model_id || ''
     if (sessionModelId && state.models.some((model) => model.id === sessionModelId)) {
@@ -724,6 +775,7 @@ function newSession() {
   $('#chat-title').textContent = '新对话'
   resetThread()
   renderSessions()
+  persistChatLocation()
   $('#input').focus()
 }
 
@@ -844,6 +896,7 @@ async function deleteSession(sessionId) {
       $('#chat-title').textContent = '新对话'
       resetHistoryState()
       resetThread()
+      persistChatLocation()
     }
     await loadSessions()
   } catch (err) {
@@ -1787,6 +1840,7 @@ function setChatMode(mode) {
   if (state.filePreview) closeWorkspaceFile()
   const next = mode === 'workspace' ? 'workspace' : 'chat'
   state.mode = next
+  state.view = next
   $('.chat-main').classList.toggle('is-workspace', next === 'workspace')
   $('#thread').hidden = next !== 'chat'
   $('.composer').hidden = next !== 'chat'
@@ -1802,6 +1856,7 @@ function setChatMode(mode) {
   } else {
     $('#chat-title').textContent = state.sessionId ? '对话' : '新对话'
   }
+  persistChatLocation()
 }
 
 async function loadMyPlugins() {
@@ -3425,6 +3480,7 @@ async function drainQueue() {
         if (event === 'meta') {
           if (sameSession) {
             state.sessionId = data.sessionId || state.sessionId
+            persistChatLocation()
             if (data.sessionId) {
               for (const queued of state.queue) {
                 if (!queued.sessionId) queued.sessionId = data.sessionId
@@ -3444,7 +3500,10 @@ async function drainQueue() {
           turn.toolResult(data)
         } else if (event === 'done') {
           sawDone = true
-          if (sameSession) state.sessionId = data.sessionId || state.sessionId
+          if (sameSession) {
+            state.sessionId = data.sessionId || state.sessionId
+            persistChatLocation()
+          }
           turn.finish(data)
           loadSessions()
           void loadWorkspaceFiles()
@@ -3541,6 +3600,8 @@ function showSettings() {
   $('.chat-main').hidden = true
   stage.hidden = false
   $('#open-settings').classList.add('is-active')
+  state.view = 'settings'
+  persistChatLocation()
   renderSettingsProfile()
   renderChatSendModeSetting()
 }
@@ -3552,6 +3613,8 @@ function hideSettings() {
   $('.chat-head').hidden = false
   $('.chat-main').hidden = false
   $('#open-settings').classList.remove('is-active')
+  state.view = state.mode
+  persistChatLocation()
   $('#input').focus()
 }
 
@@ -3985,9 +4048,20 @@ async function boot() {
     $('#demo-pill').hidden = !models.models.every((model) => model.provider === 'demo')
     await loadSessions()
     setupChatEvents()
+    const savedLocation = readChatLocation()
     if (state.sessions.length > 0) {
-      await openSession(state.sessions[0].id)
+      const savedSessionId = savedLocation?.sessionId
+      if (savedSessionId && state.sessions.some((session) => session.id === savedSessionId)) {
+        await openSession(savedSessionId)
+      } else if (savedSessionId === '') {
+        newSession()
+      } else {
+        await openSession(state.sessions[0].id)
+      }
+    } else {
+      newSession()
     }
+    restoreChatLocation(savedLocation)
     await loadWorkspaceFiles()
   } catch (err) {
     renderDenied(err)

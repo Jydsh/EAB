@@ -22,15 +22,17 @@ import { Readable, Writable } from 'node:stream'
 import { finished } from 'node:stream/promises'
 import { Context, type Fiber } from '@deepseek-ai/cordis'
 import type { Db } from '@eab/storage'
-import { listPluginDirectories, readPluginDirectory, type PluginRecord } from './plugins.js'
+import { listPluginDirectories, loadPlugins, readPluginDirectory, type PluginRecord } from './plugins.js'
 import { dshCompatRoot, dshImCredentials, prepareDshImCompat, type DshImOptions } from './dsh-im-compat.js'
 import { clearPluginContributions, registerPluginPrompt, registerPluginTool, unregisterPluginTool } from './plugin-tools.js'
 import {
   listPluginChannels,
-  listPluginModels,
+  listAllPluginModels,
   registerPluginAdapter,
   registerPluginConfigurableProviders,
   registerPluginModelDiscovery,
+  removePluginModelsForPlugin,
+  setPluginModelActiveResolver,
 } from './plugin-models.js'
 
 export interface PluginHostRoute {
@@ -96,6 +98,11 @@ const instances = new Map<string, HostInstance>()
 let loadedDb: Db | null = null
 let loadedOptions: DshImOptions | null = null
 
+// 模型查询时按真实安装/启停状态兜底过滤；host 尚未初始化时一律不可见。
+setPluginModelActiveResolver((companyId, pluginId) =>
+  loadedDb ? pluginEnabledForModels(loadedDb, companyId, pluginId) : false,
+)
+
 function hostKey(companyId: string, pluginId: string): string {
   return `${companyId}:${pluginId}`
 }
@@ -128,6 +135,45 @@ function enabledCompanyIds(db: Db, pluginId: string): string[] {
         .get(companyId, pluginId) as { enabled: number } | undefined
       return !state || state.enabled === 1
     })
+}
+
+/**
+ * 模型目录用的插件有效性判断：插件目录仍在磁盘、清单有效、安装未卸载且未被停用。
+ * 卸载后目录会移入 .trash，仅看 plugin_company_installs 会把“已卸载但数据库残留”的
+ * 插件模型继续暴露出来；这里以 loadPlugins 的实际可见结果为准，并保留个人安装启用。
+ */
+const pluginActiveCache = new Map<string, { db: Db; at: number; ids: Set<string> }>()
+function activePluginIds(db: Db, companyId: string): Set<string> {
+  const cached = pluginActiveCache.get(companyId)
+  if (cached && cached.db === db && Date.now() - cached.at < 1_000) return cached.ids
+  const plugins = loadPlugins(db, companyId)
+  const byId = new Map(plugins.map((plugin) => [plugin.id, plugin]))
+  const ids = new Set(
+    plugins
+      .filter(
+        (plugin) =>
+          plugin.valid &&
+          plugin.enabled &&
+          Boolean(plugin.companyInstall && !plugin.companyInstall.removedAt),
+      )
+      .map((plugin) => plugin.id),
+  )
+  const userRows = db
+    .prepare(
+      `SELECT plugin_id FROM plugin_user_installs
+        WHERE company_id = ? AND removed_at IS NULL AND enabled = 1`,
+    )
+    .all(companyId) as unknown as Array<{ plugin_id: string }>
+  for (const row of userRows) {
+    const plugin = byId.get(row.plugin_id)
+    if (plugin?.valid && plugin.enabled) ids.add(plugin.id)
+  }
+  pluginActiveCache.set(companyId, { db, at: Date.now(), ids })
+  return ids
+}
+
+function pluginEnabledForModels(db: Db, companyId: string, pluginId: string): boolean {
+  return activePluginIds(db, companyId).has(String(pluginId))
 }
 
 function collectProviderRows(db: Db): Array<{ id: string; name: string; kind: string }> {
@@ -829,7 +875,7 @@ export function makeContext(db: Db, instance: HostInstance, options: DshImOption
     },
     listModels: async (providerId: string) => {
       if (String(providerId).startsWith('plugin:')) {
-        const models = listPluginModels(instance.companyId)
+        const models = listAllPluginModels(instance.companyId)
           .filter((model) => model.channelId === String(providerId))
           .map((model) => ({ id: model.modelKey, name: model.name, contextWindow: model.maxContext, maxTokens: model.maxOutputTokens }))
         instance.llmModels += models.length
@@ -1163,6 +1209,9 @@ function withHostEntry(plugin: NormalizedPlugin, record: PluginRecord): Normaliz
 
 function disposeAll(): void {
   for (const instance of instances.values()) {
+    // 先同步摘掉模型，避免 root fiber 异步 dispose 期间列表仍读到已停用插件的模型。
+    pluginActiveCache.delete(instance.companyId)
+    removePluginModelsForPlugin(instance.companyId, instance.id)
     void instance.root?.fiber?.dispose?.()
     for (const dispose of instance.disposers.reverse()) {
       try {

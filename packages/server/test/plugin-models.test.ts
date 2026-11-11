@@ -8,6 +8,7 @@ import {
   registerPluginAdapter,
   registerPluginConfigurableProviders,
   registerPluginModelDiscovery,
+  setPluginModelActiveResolver,
 } from '../src/plugin-models.js'
 
 const COMPANY = 'c_plugin_models_test'
@@ -44,6 +45,8 @@ describe('插件 LLM adapter 注册表', () => {
     expect(models[0]?.capabilities).toContain('vision')
     expect(models[0]?.source).toBe('plugin')
     expect(models[0]?.pluginId).toBe('dsh-demo')
+    // 插件模型默认只给普通员工，不再默认全部角色。
+    expect(models[0]?.roles).toEqual(['member'])
 
     const events: string[] = []
     const result = await callPluginModel(
@@ -111,5 +114,24 @@ describe('插件 LLM adapter 注册表', () => {
       discovery: true,
     })
     registration.dispose()
+  })
+
+  it('插件停用后查询层立即隐藏模型和通道，不依赖异步 dispose', async () => {
+    const company = 'c_plugin_disabled_test'
+    let active = true
+    setPluginModelActiveResolver((_companyId, _pluginId) => active)
+    const registration = registerPluginAdapter(company, 'dsh-disabled', ['demo-route'], makeAdapter())
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      expect(listPluginModels(company)).toHaveLength(1)
+      expect(listPluginChannels(company)).toHaveLength(1)
+
+      active = false
+      expect(listPluginModels(company)).toEqual([])
+      expect(listPluginChannels(company)).toEqual([])
+    } finally {
+      registration.dispose()
+      setPluginModelActiveResolver(null)
+    }
   })
 })
