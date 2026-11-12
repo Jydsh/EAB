@@ -19,7 +19,6 @@ import type { ServerDeps } from './deps.js'
 import { resolveSecret } from './secrets.js'
 import type { ChatMessage as LlmMessage } from './llm.js'
 import {
-  formatClarifyText,
   acquireTurn,
   buildSystemPrompt,
   bumpUsage,
@@ -509,7 +508,7 @@ export async function handleFeishuEvent(
     }
 
     const catalog = loadModelCatalog(deps.db, actor.subject.companyId, deps.config.devAuth)
-    const available = visibleModelsFor(catalog, [...actor.subject.roles], actor.subject.companyId)
+    const available = visibleModelsFor(catalog, [...actor.subject.roles])
     if (available.length === 0) {
       const text =
         'EAB 当前没有你这个角色可用的模型。请管理员到控制台「模型接入」启用一个模型，并确认模型可见角色包含「普通员工」或「外部访客」。'
@@ -668,8 +667,7 @@ export async function handleFeishuEvent(
       firstMessage && !alreadyBranded
         ? `你好，${actor.person.name}。我是「${actor.person.companyName}」的 EAB 企业智能助手。飞书这里的对话和 EAB 网页工作台是同一份历史。\n\n`
         : ''
-    const clarifyText = formatClarifyText(agentResult?.clarify)
-    const answerText = `${failoverNote}${greeting}${clarifyText || agentText}`
+    const answerText = `${failoverNote}${greeting}${agentText}`
     const assistantCreatedAt = Date.now()
     const assistantMessageId = `msg_${randomUUID()}`
     const assistantMeta = {
@@ -685,7 +683,6 @@ export async function handleFeishuEvent(
       reasoning: agentResult?.reasoning ?? '',
       toolCalls: agentResult?.toolCalls ?? [],
       rounds: agentResult?.rounds ?? 0,
-      clarify: agentResult?.clarify ?? null,
     }
     deps.db
       .prepare(
