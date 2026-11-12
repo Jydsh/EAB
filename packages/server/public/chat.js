@@ -231,12 +231,16 @@ const state = {
   autoModelId: null,
   canChat: true,
   selected: '',
-  sending: false,
-  /** 正在流式回复时后来提交的消息：先排队，等当前回复结束再按顺序发送 */
-  queue: [],
+  /** 当前会话选中的思考档位；模型没有思考菜单时为空 */
+  reasoningEffort: '',
+  /** 会话切换序号：连续点击多个会话时只接受最后一次请求的结果 */
+  openSeq: 0,
+  /** 每个会话独立的发送队列、控制器和实时回答节点；null 键表示尚未落库的新对话 */
+  runtimes: new Map(),
+  /** 刷新/重新登录后从服务端取回仍在运行的回合，按 messageId 保存 */
+  activeRunSnapshots: new Map(),
   /** queue=按顺序排队；interrupt=新消息打断当前回复 */
   chatSendMode: 'queue',
-  activeController: null,
   attachments: [],
   personas: [],
   sessionId: null,
@@ -245,7 +249,14 @@ const state = {
   historyHasMore: false,
   historyLoading: false,
   historyMessageIds: new Set(),
+  /** 正在实时更新的 AI 回合，按 assistant messageId 索引；节点可脱离当前会话保留 */
   liveTurns: new Map(),
+  /** 本页 POST 流正在直接渲染的 messageId；EventSource 不重复叠加同一段增量 */
+  localLiveMessageIds: new Set(),
+  /** 当前等待用户在底部输入区选择方向的澄清请求 */
+  pendingClarify: null,
+  /** 多页引导式澄清的当前流程：同一个流程内选择只续跑 Agent，不生成用户消息 */
+  clarifyFlow: null,
   liveEventSource: null,
   sessionRefreshTimer: 0,
   files: [],
@@ -265,7 +276,74 @@ const state = {
 const HISTORY_PAGE_SIZE = 10
 const HISTORY_TOP_THRESHOLD = 120
 const SCROLL_BOTTOM_THRESHOLD = 180
+const DEFAULT_INPUT_PLACEHOLDER = '输入消息，Enter 发送，Shift + Enter 换行；/model 切换模型'
 const CHAT_LOCATION_STORAGE_KEY = 'eab.chat.location.v1'
+
+/**
+ * 发送状态归属到会话，而不是页面全局：
+ * A 会话回复时切到 B，B 仍可独立发送、独立选模型，A 的节点继续在后台更新。
+ */
+function runtimeKey(sessionId) {
+  return sessionId || '__new__'
+}
+
+function runtimeFor(sessionId) {
+  const key = runtimeKey(sessionId)
+  let runtime = state.runtimes.get(key)
+  if (!runtime) {
+    runtime = {
+      key,
+      sessionId: sessionId || null,
+      sending: false,
+      controller: null,
+      queue: [],
+      turn: null,
+      messageId: null,
+      runId: null,
+      title: '',
+    }
+    state.runtimes.set(key, runtime)
+  }
+  return runtime
+}
+
+function currentRuntime() {
+  return runtimeFor(state.sessionId)
+}
+
+function migrateRuntime(runtime, sessionId) {
+  if (!runtime || !sessionId) return runtime
+  const next = runtimeFor(sessionId)
+  if (next !== runtime) {
+    const oldKey = runtime.key
+    runtime.sessionId = sessionId
+    if (next.queue.length > 0) runtime.queue.push(...next.queue)
+    if (next.turn && !runtime.turn) runtime.turn = next.turn
+    state.runtimes.delete(next.key)
+    state.runtimes.delete(oldKey)
+    runtime.key = runtimeKey(sessionId)
+    state.runtimes.set(runtime.key, runtime)
+  }
+  return runtime
+}
+
+function markSessionReadLocally(sessionId) {
+  const session = state.sessions.find((item) => item.id === sessionId)
+  if (session) session.unread = false
+}
+
+function notifySessionRead(sessionId) {
+  if (!sessionId) return
+  markSessionReadLocally(sessionId)
+  renderSessions()
+  void api(`/api/chat/sessions/${encodeURIComponent(sessionId)}/read${qs()}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: '{}',
+  }).catch(() => {
+    /* 已读标记失败不阻塞对话；下次打开会话会再次标记 */
+  })
+}
 
 function chatLocationStorageKey() {
   const personId = state.me?.person?.id
@@ -374,7 +452,7 @@ async function doLogin(event) {
 /* ---------------- 会话历史 ---------------- */
 
 function resetThread() {
-  state.liveTurns.clear()
+  clearClarifyDock({ abort: true })
   const thread = $('#thread')
   for (const child of [...thread.children]) {
     if (child.id !== 'chat-empty') child.remove()
@@ -384,20 +462,43 @@ function resetThread() {
   updateScrollBottomButton()
 }
 
+function sessionUpdatedAt(session) {
+  const raw = session && (session.updatedAt || session.lastMessageAt || session.createdAt)
+  const ts = raw ? Date.parse(raw) : NaN
+  return Number.isFinite(ts) ? ts : 0
+}
+
+/** 会话列表按最近活动倒序；接口已排序，这里再兜底保证本地即时更新也不会乱序。 */
+function sortSessionsByRecent(sessions) {
+  return [...(sessions || [])].sort((a, b) => sessionUpdatedAt(b) - sessionUpdatedAt(a))
+}
+
+function markSessionActive(sessionId) {
+  const session = state.sessions.find((item) => item.id === sessionId)
+  if (!session) return
+  session.updatedAt = new Date().toISOString()
+  state.sessions = sortSessionsByRecent(state.sessions)
+}
+
 function renderSessions() {
   const box = $('#session-list')
-  $('#side-sessions').hidden = state.sessions.length === 0 && !state.me
-  if (state.sessions.length === 0) {
+  const sessions = sortSessionsByRecent(state.sessions)
+  $('#side-sessions').hidden = sessions.length === 0 && !state.me
+  if (sessions.length === 0) {
     box.innerHTML = '<div class="side-session-empty">还没有对话</div>'
     return
   }
-  box.innerHTML = state.sessions
+  box.innerHTML = sessions
     .map((session) => {
       // 左侧已经有「钉钉」来源徽标，标题里不再重复前缀。
       const displayTitle =
         session.source === 'dingtalk' ? String(session.title || '').replace(/^钉钉\s*·\s*/, '') : session.title
       return `<div class="side-session ${session.id === state.sessionId ? 'active' : ''}" data-session="${esc(session.id)}">
         <button class="side-session-main" type="button" data-open="${esc(session.id)}" title="${esc(session.title)}">${
+          session.unread && session.id !== state.sessionId
+            ? '<span class="side-session-unread" aria-label="有新的回复"></span>'
+            : ''
+        }${
           session.source === 'dingtalk' ? '<span class="side-session-source">钉钉</span>' : ''
         }${esc(displayTitle)}</button>
         <button class="side-session-more" type="button" data-more="${esc(session.id)}" title="会话操作" aria-label="会话操作">⋯</button>
@@ -424,7 +525,7 @@ function renderSessions() {
 async function loadSessions() {
   try {
     const data = await api(`/api/chat/sessions${qs()}`)
-    state.sessions = data.sessions || []
+    state.sessions = sortSessionsByRecent(data.sessions || [])
   } catch {
     state.sessions = []
   }
@@ -437,19 +538,26 @@ function appendLiveMessage(message, sessionId) {
   const id = String(message.id || '')
   if (!id || state.historyMessageIds.has(id)) return
   state.historyMessageIds.add(id)
+  if (isHiddenClarifyStep(message)) return
 
   const thread = $('#thread')
   const follow = thread
     ? thread.scrollHeight - thread.scrollTop - thread.clientHeight <= SCROLL_BOTTOM_THRESHOLD + 40
     : false
+  const messageClarify =
+    message.role === 'assistant' && message.meta?.clarify && typeof message.meta.clarify === 'object'
+      ? message.meta.clarify
+      : null
   appendMessage(
     message.role === 'user' ? 'me' : 'ai',
     message.text,
     message.role === 'assistant' && message.modelName ? message.modelName : undefined,
     message.meta && message.meta.attachments,
     message.role === 'assistant' ? message.meta : undefined,
-    { scroll: false, messageId: id, channel: message.meta?.channel },
+    { scroll: false, messageId: id, channel: message.meta?.channel, pendingClarify: Boolean(messageClarify) },
   )
+  if (message.role === 'user') clearClarifyDock()
+  else if (messageClarify) showClarifyDock(messageClarify, { flowMeta: message.meta })
   if (follow) scrollThreadToBottomInstant()
   if (sessionId && sessionId === state.sessionId) scheduleSessionRefresh()
 }
@@ -460,6 +568,89 @@ function scheduleSessionRefresh() {
     state.sessionRefreshTimer = 0
     await loadSessions()
   }, 600)
+}
+
+/** 服务端仍在跑的回合快照；页面刷新/重新登录后据此恢复半截输出。 */
+function runSnapshotOf(payload) {
+  const messageId = String(payload?.messageId || '')
+  if (!messageId) return null
+  let snapshot = state.activeRunSnapshots.get(messageId)
+  if (!snapshot) {
+    snapshot = {
+      runId: payload.runId || '',
+      sessionId: String(payload.sessionId || ''),
+      messageId,
+      modelId: payload.modelId || '',
+      modelName: payload.modelName || '',
+      autoSelected: Boolean(payload.autoSelected),
+      status: 'running',
+      reasoning: '',
+      text: '',
+      toolCalls: [],
+    }
+    state.activeRunSnapshots.set(messageId, snapshot)
+  }
+  return snapshot
+}
+
+/** 为后台回合建立（或取回）可脱离当前会话存在的 AI 节点。 */
+function liveTurnForSnapshot(snapshot, options = {}) {
+  if (!snapshot?.messageId) return null
+  let entry = state.liveTurns.get(snapshot.messageId)
+  if (!entry) {
+    // 同一个会话可能已经由 POST 流创建了气泡；优先复用 runtime.turn，
+    // 避免 EventSource 的增量画到一个隐藏节点上，页面一直停在“正在思考…”。
+    const runtime = state.runtimes.get(runtimeKey(snapshot.sessionId))
+    const reuseTurn =
+      runtime?.messageId === snapshot.messageId && runtime.turn ? runtime.turn : null
+    entry = {
+      turn: reuseTurn || createAiTurn({ append: false }),
+      sessionId: snapshot.sessionId,
+      messageId: snapshot.messageId,
+      hydrated: Boolean(reuseTurn),
+    }
+    state.liveTurns.set(snapshot.messageId, entry)
+  }
+  let hydratedNow = false
+  if (!entry.hydrated && (snapshot.reasoning || snapshot.text || snapshot.toolCalls?.length)) {
+    entry.hydrated = true
+    entry.turn.hydrate(snapshot)
+    hydratedNow = true
+  }
+  /**
+   * 事件是先写进 run 快照再广播的，所以首次创建节点时 hydrate 已经包含
+   * 当前这条增量；调用方不能再重复应用一次，否则正文/工具会多一份。
+   */
+  entry.skipPayload = Boolean(options.fromEvent && hydratedNow)
+  if (snapshot.sessionId === state.sessionId) entry.turn.appendToThread()
+  return entry
+}
+
+/** 切换回某个会话时，把仍在输出/排队的节点重新挂回消息流。 */
+function attachLiveTurnForSession(sessionId) {
+  for (const snapshot of state.activeRunSnapshots.values()) {
+    if (snapshot.sessionId !== sessionId || snapshot.status !== 'running') continue
+    const entry = liveTurnForSnapshot(snapshot)
+    if (entry) entry.turn.appendToThread()
+  }
+  for (const entry of state.liveTurns.values()) {
+    if (entry.sessionId !== sessionId) continue
+    entry.turn.appendToThread()
+  }
+  const runtime = state.runtimes.get(runtimeKey(sessionId))
+  if (runtime?.turn) runtime.turn.appendToThread()
+}
+
+async function loadActiveRuns() {
+  try {
+    const data = await api(`/api/chat/runs/active${qs()}`)
+    for (const run of data.runs || []) {
+      if (!run?.messageId) continue
+      state.activeRunSnapshots.set(run.messageId, run)
+    }
+  } catch {
+    // 恢复失败不阻塞页面；历史消息仍然可用
+  }
 }
 
 /**
@@ -481,61 +672,92 @@ function setupChatEvents() {
     }
     if (!payload?.sessionId) return
 
-    // 钉钉侧模型还在生成：同一会话里先把增量正文/思考过程渲染出来。
+    // 模型正在生成：先把增量记到该消息的快照，再决定是否渲染。
     if (payload.type === 'delta') {
-      if (payload.sessionId !== state.sessionId) {
-        scheduleSessionRefresh()
+      const snapshot = runSnapshotOf(payload)
+      if (!snapshot || !payload.text) return
+      if (payload.kind === 'reasoning') snapshot.reasoning += String(payload.text)
+      else snapshot.text += String(payload.text)
+      if (payload.sessionId !== state.sessionId) return
+      const entry = liveTurnForSnapshot(snapshot, { fromEvent: true })
+      if (!entry) return
+      if (entry.skipPayload) {
+        entry.skipPayload = false
         return
       }
-      if (!payload.messageId || !payload.text) return
-      if (state.historyMessageIds.has(payload.messageId)) return
-      let turn = state.liveTurns.get(payload.messageId)
-      if (!turn) {
-        turn = createAiTurn()
-        state.liveTurns.set(payload.messageId, turn)
-      }
-      if (payload.kind === 'reasoning') turn.reasoning(payload.text)
-      else turn.content(payload.text)
+      if (payload.kind === 'reasoning') entry.turn.reasoning(payload.text)
+      else entry.turn.content(payload.text)
       return
     }
 
-    // 钉钉侧正在调用工具：同一会话里补出工具卡片，避免只在落库后一次性出现。
+    // 工具开始/结束：同样先补快照，当前会话才实时画卡片。
     if (payload.type === 'tool') {
-      if (payload.sessionId !== state.sessionId) {
-        scheduleSessionRefresh()
+      const snapshot = runSnapshotOf(payload)
+      if (!snapshot || !payload.tool) return
+      const tool = payload.tool
+      if (tool.type === 'tool') {
+        snapshot.toolCalls.push({
+          id: tool.id,
+          name: tool.name,
+          toolId: tool.toolId,
+          args: tool.args,
+          status: 'running',
+          summary: '',
+          durationMs: 0,
+        })
+      } else {
+        const trace = snapshot.toolCalls.find((item) => item.id === tool.id)
+        if (trace) {
+          trace.status = tool.status
+          trace.summary = tool.summary
+          trace.durationMs = tool.durationMs
+        }
+      }
+      if (payload.sessionId !== state.sessionId) return
+      const entry = liveTurnForSnapshot(snapshot, { fromEvent: true })
+      if (!entry) return
+      if (entry.skipPayload) {
+        entry.skipPayload = false
         return
       }
-      if (!payload.messageId || !payload.tool) return
-      if (state.historyMessageIds.has(payload.messageId)) return
-      let turn = state.liveTurns.get(payload.messageId)
-      if (!turn) {
-        turn = createAiTurn()
-        state.liveTurns.set(payload.messageId, turn)
-      }
-      if (payload.tool.type === 'tool') turn.tool(payload.tool)
-      else turn.toolResult(payload.tool)
+      if (tool.type === 'tool') entry.turn.tool(tool)
+      else entry.turn.toolResult(tool)
       return
     }
 
     if (payload.type !== 'message' || !payload.message) return
+    if (payload.message.id) state.activeRunSnapshots.delete(String(payload.message.id))
     if (payload.sessionId === state.sessionId) {
       const id = String(payload.message.id || '')
       const liveTurn = id ? state.liveTurns.get(id) : null
       if (liveTurn) {
         state.liveTurns.delete(id)
+        state.localLiveMessageIds.delete(id)
+        state.activeRunSnapshots.delete(id)
         state.historyMessageIds.add(id)
         const meta = payload.message.meta || {}
-        liveTurn.finish({
+        liveTurn.turn.finish({
           text: payload.message.text,
           modelName: payload.message.modelName,
           citations: meta.citations,
           channel: meta.channel,
+          clarify: meta.clarify,
         })
+        if (payload.message.role === 'assistant') notifySessionRead(payload.sessionId)
         scheduleSessionRefresh()
         return
       }
       appendLiveMessage(payload.message, payload.sessionId)
+      if (payload.message.role === 'assistant') notifySessionRead(payload.sessionId)
     } else {
+      // 非当前会话完成回复：先在本页立刻点红点，再向服务端同步未读状态。
+      if (payload.message.role === 'assistant') {
+        const session = state.sessions.find((item) => item.id === payload.sessionId)
+        if (session) {
+          session.unread = true
+          renderSessions()
+        }
+      }
       scheduleSessionRefresh()
     }
   })
@@ -711,40 +933,47 @@ function fillHistoryIfNeeded() {
 }
 
 async function openSession(sessionId) {
-  clearQueuedMessages()
   hideSettings()
   setChatMode('chat')
+  const seq = ++state.openSeq
   try {
     const data = await api(historyMessagesUrl(sessionId))
+    if (seq !== state.openSeq) return
     state.sessionId = data.session.id
     state.view = 'chat'
     persistChatLocation()
     applySessionSpace(data.session)
     const sessionModelId = data.session.modelId || data.session.model_id || ''
+    const sessionEffort = data.session.reasoningEffort || data.session.reasoning_effort || ''
     if (sessionModelId && state.models.some((model) => model.id === sessionModelId)) {
-      setSelected(sessionModelId, { persist: false })
+      setSelected(sessionModelId, { persist: false, reasoningEffort: sessionEffort })
     } else {
-      setSelected('', { persist: false })
+      setSelected('', { persist: false, reasoningEffort: sessionEffort })
       if (sessionModelId) banner('本会话原来使用的模型已不可用，已切回自动选择', 'warn')
     }
     state.historyBefore = Boolean(data.hasMore) ? data.nextBefore || null : null
     state.historyHasMore = Boolean(data.hasMore)
     state.historyLoading = false
     state.historyMessageIds.clear()
+    markSessionReadLocally(data.session.id)
+    renderSessions()
     $('#chat-title').textContent = data.session.title
     resetThread()
     const thread = $('#thread')
+    const pendingClarify = trailingPendingClarify(data.messages)
     if (thread) thread.style.visibility = 'hidden'
     try {
       for (const message of data.messages) {
         if (message.id) state.historyMessageIds.add(message.id)
+        // 多页澄清的中间答复/中间问题只用于续跑，不在聊天记录里显示。
+        if (isHiddenClarifyStep(message)) continue
         appendMessage(
           message.role === 'user' ? 'me' : 'ai',
           message.text,
           message.role === 'assistant' && message.modelName ? message.modelName : undefined,
           message.meta && message.meta.attachments,
           message.role === 'assistant' ? message.meta : undefined,
-          { scroll: false, channel: message.meta?.channel },
+          { scroll: false, channel: message.meta?.channel, pendingClarify: pendingClarify === message },
         )
       }
       if (data.messages.length > 0) {
@@ -754,7 +983,14 @@ async function openSession(sessionId) {
     } finally {
       if (thread) thread.style.visibility = ''
     }
+    attachLiveTurnForSession(data.session.id)
+    if (pendingClarify?.meta?.clarify) {
+      showClarifyDock(pendingClarify.meta.clarify, { flowMeta: pendingClarify.meta })
+    } else {
+      clearClarifyDock()
+    }
     renderSessions()
+    renderQueueState()
     requestAnimationFrame(() => {
       if (state.sessionId === data.session.id) fillHistoryIfNeeded()
       updateScrollBottomButton()
@@ -766,15 +1002,16 @@ async function openSession(sessionId) {
 }
 
 function newSession() {
-  clearQueuedMessages()
   hideSettings()
   setChatMode('chat')
+  state.openSeq += 1
   state.sessionId = null
   setSelected('', { persist: false })
   resetHistoryState()
   $('#chat-title').textContent = '新对话'
   resetThread()
   renderSessions()
+  renderQueueState()
   persistChatLocation()
   $('#input').focus()
 }
@@ -1921,7 +2158,7 @@ function myPluginPageUrl(data, plugin, page) {
       scope: 'user',
     })
     if (currentAs()) params.set('as', currentAs())
-    return `/plugin-host.html?${params.toString()}`
+    return `/plugin-kernel.html?${params.toString()}`
   }
   const path = String(page.file || '')
     .split('/')
@@ -2465,6 +2702,13 @@ function showPluginInstall() {
       <span class="install-tab-badge hint-badge" data-tip="① 读取插件目录 → ② 校验清单 → ③ 写入插件库 → ④ 出现在个人工作台" tabindex="0" aria-label="安装流程说明">安装流程</span>
       <span class="install-tab-badge hint-badge" data-tip="安装后可在个人工作台启停或卸载。" tabindex="0" aria-label="安装归属说明">只装到你名下</span>
     </div>
+    <div class="install-progress" id="pi-progress" hidden aria-live="polite">
+      <div class="install-progress-track"><span class="install-progress-bar"></span></div>
+      <div class="install-progress-meta">
+        <span id="pi-progress-text">正在安装…</span>
+        <span id="pi-progress-time" class="mono">0s</span>
+      </div>
+    </div>
     <div class="modal-state" id="pi-state"></div>
     <div class="modal-actions">
       <button class="btn primary" type="button" id="pi-submit">安装插件</button>
@@ -2473,7 +2717,10 @@ function showPluginInstall() {
   </div>`
   document.body.appendChild(overlay)
   const disposeHintTips = bindHintTips(overlay)
+  let progressTimer = null
   const close = () => {
+    if (progressTimer) clearInterval(progressTimer)
+    progressTimer = null
     disposeHintTips()
     overlay.remove()
   }
@@ -2487,6 +2734,50 @@ function showPluginInstall() {
   const panels = Array.from(overlay.querySelectorAll('[data-install-panel]'))
   const noteEl = overlay.querySelector('#pi-note')
   const stateEl = overlay.querySelector('#pi-state')
+  const progressEl = overlay.querySelector('#pi-progress')
+  const progressText = overlay.querySelector('#pi-progress-text')
+  const progressTime = overlay.querySelector('#pi-progress-time')
+  let progressStartedAt = 0
+  const stopProgressClock = () => {
+    if (progressTimer) clearInterval(progressTimer)
+    progressTimer = null
+  }
+  const setInstalling = (busy) => {
+    overlay.querySelector('.modal').classList.toggle('is-installing', busy)
+    for (const control of overlay.querySelectorAll('.install-source-tab, .install-field input, .install-field select, .install-overwrite-inline input, #pi-pick-folder')) {
+      control.disabled = busy
+    }
+  }
+  const startProgress = (text) => {
+    stopProgressClock()
+    progressStartedAt = Date.now()
+    progressEl.hidden = false
+    progressEl.classList.remove('is-done')
+    progressText.textContent = text
+    progressTime.textContent = '0s'
+    stateEl.className = 'modal-state'
+    stateEl.textContent = ''
+    setInstalling(true)
+    progressTimer = setInterval(() => {
+      const seconds = Math.max(0, Math.floor((Date.now() - progressStartedAt) / 1000))
+      progressTime.textContent = `${seconds}s`
+    }, 500)
+  }
+  const updateProgress = (text) => {
+    progressText.textContent = text
+  }
+  const completeProgress = (text) => {
+    stopProgressClock()
+    progressEl.hidden = false
+    progressEl.classList.add('is-done')
+    progressText.textContent = text
+    progressTime.textContent = '完成'
+  }
+  const failProgress = () => {
+    stopProgressClock()
+    progressEl.hidden = true
+    setInstalling(false)
+  }
   const folderInput = overlay.querySelector('#pi-folder-input')
   const pickFolder = overlay.querySelector('#pi-pick-folder')
   const pathStatus = overlay.querySelector('#pi-path-status')
@@ -2549,16 +2840,10 @@ function showPluginInstall() {
       source,
       overwrite: overlay.querySelector('#pi-overwrite').checked,
     }
-    if (source === 'browser-dir') {
-      if (selectedFolderFiles.length === 0) {
-        stateEl.className = 'modal-state bad'
-        stateEl.textContent = '请选择一个插件文件夹（含 plugin.json 或 DSH 的 package.json）'
-        return
-      }
-      stateEl.className = 'modal-state muted'
-      stateEl.textContent = '正在读取文件夹并上传…'
-      body.files = await readPluginFolderFiles(selectedFolderFiles)
-      body.folderName = selectedFolderName
+    if (source === 'browser-dir' && selectedFolderFiles.length === 0) {
+      stateEl.className = 'modal-state bad'
+      stateEl.textContent = '请选择一个插件文件夹（含 plugin.json 或 DSH 的 package.json）'
+      return
     }
     if (source === 'npm') {
       body.packageName = overlay.querySelector('#pi-npm-name').value.trim()
@@ -2576,20 +2861,36 @@ function showPluginInstall() {
         return
       }
     }
-    stateEl.className = 'modal-state muted'
-    stateEl.textContent = '正在读取并校验插件…'
+    const initialText = source === 'browser-dir'
+      ? '正在读取文件夹并上传…'
+      : source === 'npm'
+        ? '正在从 npm 拉取并校验…'
+        : '正在从 GitHub 下载并校验…'
+    startProgress(initialText)
     submit.disabled = true
     submit.textContent = '安装中…'
     try {
+      if (source === 'browser-dir') {
+        body.files = await readPluginFolderFiles(selectedFolderFiles)
+        body.folderName = selectedFolderName
+        updateProgress('正在上传并校验插件…')
+      }
       await api('/api/my/plugins/install', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(body),
       })
+      completeProgress('安装完成，正在刷新个人工作台…')
+      try {
+        await loadMyPlugins()
+      } catch {
+        // 安装已经成功，列表刷新失败不改变安装结果，也不阻止自动关闭。
+      }
+      await new Promise((resolve) => setTimeout(resolve, 900))
       close()
-      await loadMyPlugins()
       banner('个人插件已安装，入口已出现在工作台', 'ok')
     } catch (err) {
+      failProgress()
       stateEl.className = 'modal-state bad'
       stateEl.textContent = `${err.message}${err.code ? `（${err.code}）` : ''}`
       submit.disabled = false
@@ -2626,26 +2927,130 @@ function modelLabel(modelId) {
   return state.models.find((m) => m.id === modelId)?.name ?? modelId
 }
 
+function thinkingConfigForModel(modelId) {
+  const id = modelId || state.autoModelId || ''
+  const model = state.models.find((item) => item.id === id)
+  const config = model?.thinking
+  if (!config?.enabled || !Array.isArray(config.options) || config.options.length === 0) return null
+  return config
+}
+
+function activeThinkingConfig() {
+  return thinkingConfigForModel(state.selected)
+}
+
+function thinkingDefault(config) {
+  const fallback = config.options[0]?.id || ''
+  return config.options.some((item) => item.id === config.defaultEffort) ? config.defaultEffort : fallback
+}
+
+function thinkingLabel(config, effort) {
+  return config.options.find((item) => item.id === effort)?.label || effort
+}
+
+function renderThinkingMenu(config) {
+  const menu = $('#think-menu')
+  if (!menu) return
+  const options = config.options
+    .map((item) => {
+      const active = item.id === state.reasoningEffort
+      return `<button class="think-option${active ? ' is-active' : ''}" type="button" role="option" aria-selected="${active}" data-think="${esc(item.id)}">
+        <span>
+          <strong>${esc(item.label || item.id)}</strong>
+          <small>${esc(item.hint || '模型声明的思考档位。')}</small>
+        </span>
+        <span class="think-check" aria-hidden="true">${active ? '✓' : ''}</span>
+      </button>`
+    })
+    .join('')
+  menu.innerHTML = options
+}
+
+function syncThinkingChip() {
+  const wrap = $('#think-wrap')
+  const menu = $('#think-menu')
+  const chip = $('#think-chip')
+  if (!wrap || !menu || !chip) return
+  const config = activeThinkingConfig()
+  if (!config) {
+    state.reasoningEffort = ''
+    wrap.hidden = true
+    menu.hidden = true
+    chip.setAttribute('aria-expanded', 'false')
+    return
+  }
+  if (!config.options.some((item) => item.id === state.reasoningEffort)) {
+    state.reasoningEffort = thinkingDefault(config)
+  }
+  wrap.hidden = false
+  $('#think-chip-label').textContent = `思考：${thinkingLabel(config, state.reasoningEffort)}`
+  renderThinkingMenu(config)
+}
+
+function setThinkingEffort(effort, options = {}) {
+  const config = activeThinkingConfig()
+  if (!config || !config.options.some((item) => item.id === effort)) return
+  state.reasoningEffort = effort
+  $('#think-menu').hidden = true
+  $('#think-chip').setAttribute('aria-expanded', 'false')
+  syncThinkingChip()
+  if (options.persist !== false && state.sessionId) {
+    persistSessionModel(state.selected, state.reasoningEffort)
+  }
+}
+
 function setSelected(modelId, options = {}) {
   const visible = modelId ? state.models.find((m) => m.id === modelId) : null
   state.selected = visible ? visible.id : ''
+  const config = thinkingConfigForModel(state.selected)
+  const requested = String(options.reasoningEffort || '').trim()
+  state.reasoningEffort = config
+    ? (config.options.some((item) => item.id === requested) ? requested : thinkingDefault(config))
+    : ''
   $('#model-chip-label').textContent = modelLabel(state.selected)
   $('#model-menu').hidden = true
   $('#model-chip').setAttribute('aria-expanded', 'false')
   renderModelMenus()
   renderAttachments()
-  if (options.persist !== false && state.sessionId) persistSessionModel(state.selected)
+  syncThinkingChip()
+  if (options.persist !== false && state.sessionId) {
+    persistSessionModel(state.selected, state.reasoningEffort)
+  }
 }
 
-async function persistSessionModel(modelId) {
+async function persistSessionModel(modelId, reasoningEffort = state.reasoningEffort) {
   try {
     await api(`/api/chat/sessions/${encodeURIComponent(state.sessionId)}/model${qs()}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ modelId: modelId || null }),
+      body: JSON.stringify({
+        modelId: modelId || null,
+        reasoningEffort: reasoningEffort || null,
+      }),
     })
   } catch (err) {
     banner(`模型已切换，但当前会话没有保存：${err.message || '保存失败'}`, 'warn')
+  }
+}
+
+/**
+ * 接替模型成功后刷新一次目录：服务端会把真实成功的模型排到前面，
+ * 自动模式下一次就直接选它，不再先撞刚失败的模型。
+ */
+async function refreshModelCatalog() {
+  try {
+    const data = await api(`/api/chat/models${qs()}`)
+    if (!data?.models?.length) return
+    state.models = data.models
+    state.autoModelId = data.autoModelId
+    if (state.selected && !state.models.some((model) => model.id === state.selected)) {
+      state.selected = ''
+    }
+    renderModelMenus()
+    $('#model-chip-label').textContent = modelLabel(state.selected)
+    syncThinkingChip()
+  } catch {
+    // 目录刷新失败不影响已经完成的回答，下一轮服务端仍按健康顺序选择。
   }
 }
 
@@ -2664,7 +3069,7 @@ function renderSideModels() {
     rows.push(
       `<button class="side-model ${state.selected === model.id ? 'is-active' : ''}" type="button" data-model="${esc(model.id)}">
         <strong>${esc(model.name)}</strong>
-        <span>${esc(model.desc || '')}${model.tags && model.tags.length ? ` · ${esc(modelTagsLabel(model.tags))}` : ''}</span>
+        <span>${esc(model.desc || '')}${model.tags && model.tags.length ? ` · ${esc(modelTagsLabel(model.tags))}` : ''}${model.thinking?.enabled ? ' · 可调思考' : ''}</span>
       </button>`,
     )
   }
@@ -2689,7 +3094,7 @@ function renderModelMenu() {
     options.push(
       `<button class="model-option ${state.selected === model.id ? 'is-active' : ''}" type="button" data-model="${esc(model.id)}">
         <strong>${esc(model.name)}</strong>
-        <span>${esc(model.desc || '')}${model.supportsVision ? ' · 图片识别' : ''}</span>
+        <span>${esc(model.desc || '')}${model.supportsVision ? ' · 图片识别' : ''}${model.thinking?.enabled ? ' · 可调思考' : ''}</span>
       </button>`,
     )
   }
@@ -2745,7 +3150,7 @@ function appendModelCommandCard(title, models, hint = '') {
     : ''
   const rows = models.map((model) => {
     const active = state.selected === model.id
-    const detail = [model.desc, model.tags && model.tags.length ? modelTagsLabel(model.tags) : '', model.supportsVision ? '图片识别' : '']
+    const detail = [model.desc, model.tags && model.tags.length ? modelTagsLabel(model.tags) : '', model.supportsVision ? '图片识别' : '', model.thinking?.enabled ? '可调思考' : '']
       .filter(Boolean)
       .join(' · ')
     return `<button class="chat-command-option ${active ? 'is-active' : ''}" type="button" data-model="${esc(model.id)}">
@@ -2879,37 +3284,71 @@ function prettyPayload(value) {
   return text.length > 1600 ? `${text.slice(0, 1600)}\n…（已截断）` : text
 }
 
+function oneLinePreview(text, maxLength = 120) {
+  const normalized = String(text || '').replace(/\s+/g, ' ').trim()
+  if (!normalized) return ''
+  return normalized.length > maxLength ? `…${normalized.slice(-maxLength)}` : normalized
+}
+
 function toolStatusText(trace) {
   if (trace.status === 'running') return '执行中'
   if (trace.status === 'error') return '失败'
   return `完成 · ${formatElapsed(trace.durationMs)}`
 }
 
-function toolCardHtml(trace) {
-  const done = trace.status !== 'running'
-  return `<div class="tool-card ${trace.status === 'error' ? 'is-error' : ''} ${done ? 'is-collapsed' : ''}" data-tool-card="${esc(trace.id)}">
-    <button class="tool-head" type="button" aria-expanded="${done ? 'false' : 'true'}">
-      <span class="tool-dot"></span>
+function toolDetailHtml(trace) {
+  return `<div class="tool-detail ${trace.status === 'error' ? 'is-error' : ''}" data-tool-detail="${esc(trace.id)}">
+    <div class="tool-detail-head">
       <strong>${esc(trace.name)}</strong>
-      <span class="tool-status">${esc(toolStatusText(trace))}</span>
-      <span class="tool-chevron">⌄</span>
-    </button>
-    <div class="tool-body">
-      <div class="tool-row"><span>参数</span><pre>${esc(prettyPayload(trace.args))}</pre></div>
-      ${
-        trace.summary
-          ? `<div class="tool-row"><span>${trace.status === 'error' ? '错误' : '结果'}</span><pre>${esc(prettyPayload(trace.summary))}</pre></div>`
-          : ''
-      }
+      <span class="tool-detail-status">${esc(toolStatusText(trace))}</span>
     </div>
+    <div class="tool-row"><span>参数</span><pre>${esc(prettyPayload(trace.args))}</pre></div>
+    ${
+      trace.summary
+        ? `<div class="tool-row"><span>${trace.status === 'error' ? '错误' : '结果'}</span><pre>${esc(prettyPayload(trace.summary))}</pre></div>`
+        : ''
+    }
   </div>`
 }
 
-function thinkPanelHtml(reasoning, collapsed) {
-  return `<div class="think-panel${collapsed ? ' is-collapsed' : ''}">
-    <button class="think-head" type="button" aria-expanded="${collapsed ? 'false' : 'true'}">
+function latestToolPreview(tools) {
+  const running = tools.find((tool) => tool.status === 'running')
+  if (running) return `${running.name} · 执行中`
+  const latest = tools.at(-1)
+  if (!latest) return ''
+  return `${latest.name}${latest.status === 'error' ? ' · 失败' : ''} · ${formatElapsed(latest.durationMs)}`
+}
+
+/** 工具调用收成一张可折叠面板：默认只留标题，执行中再加一行当前工具。 */
+function toolPanelHtml(tools, { active = false, expanded = false } = {}) {
+  if (!Array.isArray(tools) || tools.length === 0) return ''
+  const preview = active
+    ? latestToolPreview(tools)
+    : tools
+        .map((tool) =>
+          tool.durationMs > 0 ? `${tool.name} ${formatElapsed(tool.durationMs)}` : tool.name,
+        )
+        .join(' · ')
+  const totalMs = tools.reduce((sum, tool) => sum + (Number(tool.durationMs) || 0), 0)
+  const statusText = `${tools.length} 个${totalMs > 0 ? ` · ${formatElapsed(totalMs)}` : ''}`
+  return `<div class="tool-panel${active ? ' is-active' : ''}${expanded ? '' : ' is-collapsed'}" data-tool-panel>
+    <button class="tool-head" type="button" aria-expanded="${expanded ? 'true' : 'false'}">
+      <span class="tool-dot"></span>
+      <strong class="tool-title">${active ? '工具调用中…' : '工具调用记录'}</strong>
+      <span class="tool-status">${esc(statusText)}</span>
+      <span class="tool-chevron">⌄</span>
+    </button>
+    ${preview ? `<div class="tool-peek">${esc(preview)}</div>` : ''}
+    <div class="tool-body">${tools.map((trace) => toolDetailHtml(trace)).join('')}</div>
+  </div>`
+}
+
+/** 历史里的思考过程默认收起，只保留标题和可展开的完整内容。 */
+function thinkPanelHtml(reasoning) {
+  return `<div class="think-panel is-collapsed">
+    <button class="think-head" type="button" aria-expanded="false">
       <span class="think-icon">✦</span>
-      <span class="think-title">${collapsed ? '已深度思考' : '正在思考…'}</span>
+      <span class="think-title">已深度思考</span>
       <span class="think-chevron">⌄</span>
     </button>
     <div class="think-body">${esc(reasoning)}</div>
@@ -2921,20 +3360,377 @@ function channelTag(channel) {
   return ''
 }
 
-function historyAiBubble(text, meta, rich) {
+function clarifyInlineNote() {
+  return `<div class="clarify-inline-note"><span class="clarify-mark" aria-hidden="true">?</span><span>正在通过底部引导面板和 Agent 确认方向，请选择或补充。</span></div>`
+}
+
+function historyAiBubble(text, meta, rich, options = {}) {
   const reasoning = String(rich?.reasoning || '').trim()
   const tools = Array.isArray(rich?.toolCalls) ? rich.toolCalls : []
   const channel = channelTag(rich?.channel)
-  return `${reasoning ? thinkPanelHtml(reasoning, true) : ''}
-    ${tools.length > 0 ? `<div class="tool-list">${tools.map((trace) => toolCardHtml(trace)).join('')}</div>` : ''}
-    <div class="answer-text">${renderAnswer(text)}</div>
+  const clarify = rich?.clarify && typeof rich.clarify === 'object' ? rich.clarify : null
+  const body = clarify && options.pendingClarify
+    ? clarifyInlineNote()
+    : `<div class="answer-text">${renderAnswer(text)}</div>`
+  return `${reasoning ? thinkPanelHtml(reasoning) : ''}
+    ${tools.length > 0 ? toolPanelHtml(tools) : ''}
+    ${body}
     ${meta || channel ? `<span class="meta">${channel}${meta ? esc(meta) : ''}</span>` : ''}`
+}
+
+/** AI 没有足够方向时给出的结构化问题 + 可点击方向 + 自定义补充入口。 */
+function clarifyPanelHtml(clarify, options = {}) {
+  if (!clarify || typeof clarify !== 'object') return ''
+  const question = String(clarify.question || '').trim()
+  const optionsList = Array.isArray(clarify.options) ? clarify.options.slice(0, 4) : []
+  if (!question || optionsList.length < 2) return ''
+  const allowCustom = clarify.allowCustom !== false
+  const docked = options.docked === true
+  const step = Math.max(0, Math.trunc(Number(options.step) || 0))
+  const previous = String(options.previous || '').trim()
+  const exitable = options.exitable === true
+  const stepLine =
+    step > 0
+      ? `<div class="clarify-stepline">
+          <span class="clarify-step">第 ${step} 步</span>
+          ${previous ? `<span class="clarify-prev">上一步：${esc(oneLinePreview(previous, 24))}</span>` : ''}
+          ${exitable ? '<button class="clarify-exit" type="button" data-clarify-exit>退出引导</button>' : ''}
+        </div>`
+      : ''
+  return `<div class="clarify-card${docked ? ' is-docked' : ''}" role="group" aria-label="需要你确认方向">
+    ${stepLine}
+    <div class="clarify-head"><span class="clarify-mark" aria-hidden="true">?</span><span>需要你确认方向</span></div>
+    <div class="clarify-question">${esc(question)}</div>
+    <div class="clarify-options">
+      ${optionsList.map((option) => {
+        const label = String(option?.label || '').trim()
+        const description = String(option?.description || '').trim()
+        if (!label) return ''
+        return `<button class="clarify-option" type="button" data-clarify-answer="${esc(label)}">
+          <span class="clarify-option-label">${esc(label)}</span>
+          ${description ? `<span class="clarify-option-desc">${esc(description)}</span>` : ''}
+        </button>`
+      }).join('')}
+    </div>
+    ${
+      allowCustom
+        ? docked
+          ? '<div class="clarify-hint">也可以直接在下方输入框补充自己的方向。</div>'
+          : `<div class="clarify-custom">
+              <input class="clarify-input" type="text" maxlength="200" placeholder="也可以直接补充你的方向…" aria-label="补充你的方向">
+              <button class="clarify-send" type="button">发送</button>
+            </div>`
+        : ''
+    }
+  </div>`
+}
+
+/** 多页澄清的中间消息只作为 Agent 上下文，不进入聊天消息流。 */
+function isHiddenClarifyStep(message) {
+  if (!message?.meta?.clarifyFlowId) return false
+  if (message.role === 'user') return true
+  return message.role === 'assistant' && Boolean(message.meta?.clarify)
+}
+
+function newClarifyFlowId() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return `cf_${crypto.randomUUID()}`
+  }
+  return `cf_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`
+}
+
+/** 当前底部导引流程；历史刷新时用消息 meta 里的 flowId / step 续上同一个流程。 */
+function ensureClarifyFlow(meta) {
+  const incomingId = String(meta?.clarifyFlowId || '').trim()
+  const incomingStep = Number(meta?.clarifyStep)
+  const step =
+    Number.isFinite(incomingStep) && incomingStep > 0 ? Math.min(20, Math.trunc(incomingStep)) : 1
+  if (state.clarifyFlow && (!incomingId || state.clarifyFlow.id === incomingId)) {
+    if (step > state.clarifyFlow.step) state.clarifyFlow.step = step
+    return state.clarifyFlow
+  }
+  if (state.clarifyFlow?.controller) state.clarifyFlow.controller.abort()
+  state.clarifyFlow = {
+    id: incomingId || newClarifyFlowId(),
+    step,
+    answers: [],
+    busy: false,
+    controller: null,
+    sessionId: state.sessionId,
+    modelId: state.selected || null,
+    reasoningEffort: state.reasoningEffort || null,
+  }
+  return state.clarifyFlow
+}
+
+/** 最后一条消息仍是 AI 的方向确认时，刷新后继续在底部输入区等待回答。 */
+function trailingPendingClarify(messages) {
+  if (!Array.isArray(messages)) return null
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]
+    if (message?.role === 'user') return null
+    if (message?.role === 'assistant') {
+      return message.meta?.clarify && typeof message.meta.clarify === 'object' ? message : null
+    }
+  }
+  return null
+}
+
+function showClarifyDock(clarify, options = {}) {
+  const dock = $('#clarify-dock')
+  if (!dock) return
+  const flow = ensureClarifyFlow(options.flowMeta)
+  const step = Number(options.step)
+  if (Number.isFinite(step) && step > 0) flow.step = Math.max(flow.step, Math.trunc(step))
+  const previous = flow.answers.length
+    ? flow.answers[flow.answers.length - 1].answer
+    : String(options.previous || '').trim()
+  const html = clarifyPanelHtml(clarify, {
+    docked: true,
+    step: flow.step,
+    previous,
+    exitable: true,
+  })
+  if (!html) return
+  state.pendingClarify = clarify
+  dock.hidden = false
+  dock.innerHTML = html
+  bindClarifyPanel(dock)
+  const input = $('#input')
+  if (input) input.placeholder = '也可以直接输入你的回答或补充，选择后继续下一步…'
+  scrollThreadToBottomInstant()
+}
+
+function showClarifyBusy(flow, answer) {
+  const dock = $('#clarify-dock')
+  if (!dock) return
+  const nextStep = flow.step + 1
+  dock.hidden = false
+  dock.innerHTML = `<div class="clarify-card is-docked is-busy" role="status" aria-live="polite">
+    <div class="clarify-stepline">
+      <span class="clarify-step">第 ${nextStep} 步</span>
+      <span class="clarify-prev">已选：${esc(oneLinePreview(answer, 24))}</span>
+    </div>
+    <div class="clarify-question">正在把这个选择交给 Agent，继续确认…</div>
+    <div class="clarify-progress" aria-hidden="true">
+      <span class="clarify-progress-dot"></span>
+      <span class="clarify-progress-dot"></span>
+      <span class="clarify-progress-dot"></span>
+    </div>
+  </div>`
+  const input = $('#input')
+  if (input) input.placeholder = '正在继续确认…'
+  scrollThreadToBottomInstant()
+}
+
+function clearClarifyDock(options = {}) {
+  if (options.abort && state.clarifyFlow?.controller) state.clarifyFlow.controller.abort()
+  state.pendingClarify = null
+  state.clarifyFlow = null
+  const dock = $('#clarify-dock')
+  if (dock) {
+    dock.hidden = true
+    dock.innerHTML = ''
+  }
+  const input = $('#input')
+  if (input) input.placeholder = DEFAULT_INPUT_PLACEHOLDER
+}
+
+function bindClarifyPanel(node) {
+  for (const card of node.querySelectorAll('.clarify-card')) {
+    if (card.dataset.bound === 'true') continue
+    card.dataset.bound = 'true'
+    const submit = (value) => {
+      const text = String(value || '').trim()
+      if (!text) return
+      for (const control of card.querySelectorAll('button, input')) control.disabled = true
+      advanceClarifyFlow(text)
+    }
+    for (const option of card.querySelectorAll('.clarify-option')) {
+      option.addEventListener('click', () => submit(option.dataset.clarifyAnswer || option.textContent))
+    }
+    const input = card.querySelector('.clarify-input')
+    const sendButton = card.querySelector('.clarify-send')
+    if (input && sendButton) {
+      sendButton.addEventListener('click', () => submit(input.value))
+      input.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' && !event.isComposing) {
+          event.preventDefault()
+          submit(input.value)
+        }
+      })
+    }
+    const exit = card.querySelector('[data-clarify-exit]')
+    if (exit) {
+      exit.addEventListener('click', () => {
+        clearClarifyDock()
+        banner('已退出这次引导，之后可以直接发消息继续', 'warn')
+      })
+    }
+  }
+}
+
+/** 选择方向或补充内容：先记在当前导引页，再续跑 Agent；不生成普通用户消息。 */
+function advanceClarifyFlow(answer) {
+  const text = String(answer || '').trim()
+  const clarify = state.pendingClarify
+  if (!text || !clarify) return
+  const flow = ensureClarifyFlow()
+  if (flow.busy) return
+  flow.sessionId = flow.sessionId || state.sessionId
+  flow.modelId = flow.modelId || state.selected || null
+  flow.reasoningEffort = flow.reasoningEffort || state.reasoningEffort || null
+  flow.answers.push({ question: String(clarify.question || ''), answer: text })
+  flow.busy = true
+  if (flow.sessionId) {
+    markSessionActive(flow.sessionId)
+    renderSessions()
+  }
+  showClarifyBusy(flow, text)
+  void runClarifyStep(flow, text, clarify)
+}
+
+/** 把一页答案作为隐藏续跑发给 Agent，下一页仍回到同一个底部导引面板。 */
+async function runClarifyStep(flow, answer, answeredClarify) {
+  const runtime = runtimeFor(flow.sessionId ?? state.sessionId)
+  if (runtime.sending) return
+  const controller = new AbortController()
+  flow.controller = controller
+  runtime.controller = controller
+  runtime.sending = true
+  renderQueueState()
+  updateSendState()
+  const targetSessionId = flow.sessionId ?? state.sessionId
+  const nextStep = flow.step + 1
+  const buffered = { reasoning: '', content: '', tools: [], toolResults: [], done: null, clarify: null, messageId: '' }
+  let streamError = null
+  let sawDone = false
+  let messageId = ''
+  try {
+    await streamChat(
+      {
+        modelId: flow.modelId,
+        reasoningEffort: flow.reasoningEffort,
+        text: answer,
+        sessionId: targetSessionId,
+        spaceKind: state.spaceKind,
+        clarifyFlowId: flow.id,
+        clarifyStep: nextStep,
+      },
+      (event, data) => {
+        if (event === 'meta') {
+          messageId = String(data.messageId || '')
+          if (messageId) state.localLiveMessageIds.add(messageId)
+          runtime.runId = data.runId || runtime.runId
+          runtime.messageId = messageId
+          if (data.sessionId) {
+            migrateRuntime(runtime, data.sessionId)
+            flow.sessionId = data.sessionId
+            if (state.sessionId === data.sessionId) {
+              state.sessionId = data.sessionId
+              persistChatLocation()
+              if ($('#chat-title').textContent === '新对话') {
+                $('#chat-title').textContent = '方向确认'
+              }
+            }
+          }
+        } else if (event === 'reasoning') {
+          buffered.reasoning += String(data.text || '')
+        } else if (event === 'delta') {
+          buffered.content += String(data.text || '')
+        } else if (event === 'tool') {
+          buffered.tools.push(data)
+        } else if (event === 'tool_result') {
+          buffered.toolResults.push(data)
+        } else if (event === 'clarify') {
+          buffered.clarify = data.clarify || buffered.clarify
+        } else if (event === 'done') {
+          sawDone = true
+          buffered.done = data
+          if (data.clarify) buffered.clarify = data.clarify
+          if (data.sessionId) {
+            migrateRuntime(runtime, data.sessionId)
+            flow.sessionId = data.sessionId
+            if (state.sessionId === data.sessionId) {
+              state.sessionId = data.sessionId
+              persistChatLocation()
+            }
+          }
+        } else if (event === 'error') {
+          const err = new Error(data.message || '模型调用失败')
+          err.code = data.code
+          streamError = err
+        }
+      },
+      controller.signal,
+    )
+    if (controller.signal.aborted) throw new DOMException('已停止', 'AbortError')
+    if (streamError) throw streamError
+    if (!sawDone) throw new Error('回答流意外中断，请重试')
+
+    if (buffered.clarify) {
+      flow.busy = false
+      flow.step = nextStep
+      state.pendingClarify = buffered.clarify
+      state.clarifyFlow = flow
+      showClarifyDock(buffered.clarify, { step: nextStep })
+      return
+    }
+
+    flow.busy = false
+    flow.controller = null
+    runtime.sending = false
+    runtime.controller = null
+    runtime.runId = null
+    state.clarifyFlow = null
+    state.pendingClarify = null
+    clearClarifyDock()
+    const turn = createAiTurn({ append: runtime.sessionId === state.sessionId })
+    if (buffered.reasoning.trim()) turn.reasoning(buffered.reasoning)
+    for (const event of buffered.tools) turn.tool(event)
+    for (const event of buffered.toolResults) turn.toolResult(event)
+    turn.finish(buffered.done || { text: buffered.content })
+    if (messageId) {
+      state.historyMessageIds.add(messageId)
+      state.localLiveMessageIds.delete(messageId)
+    }
+    loadSessions()
+    renderQueueState()
+    updateSendState()
+  } catch (err) {
+    const aborted = controller.signal.aborted
+    if (state.clarifyFlow === flow) {
+      flow.busy = false
+      flow.controller = null
+      if (flow.answers.length > 0) flow.answers.pop()
+      if (aborted) {
+        showClarifyDock(answeredClarify, { step: flow.step })
+        banner('已停止这次引导，你可以重新选择或补充', 'warn')
+      } else {
+        showClarifyDock(answeredClarify, { step: flow.step })
+        banner(`引导续跑失败：${err.message}`, 'warn')
+      }
+    }
+  } finally {
+    runtime.sending = false
+    runtime.controller = null
+    if (messageId) state.localLiveMessageIds.delete(messageId)
+    updateSendState()
+    renderQueueState()
+    if (runtime.queue.length > 0) {
+      void drainQueue(runtime)
+    } else if (state.sessionId === runtime.sessionId || runtime.sessionId === null) {
+      $('#input').focus()
+    }
+  }
 }
 
 function bindToolToggles(node) {
   for (const button of node.querySelectorAll('.tool-head, .think-head')) {
+    if (button.dataset.bound === 'true') continue
+    button.dataset.bound = 'true'
     button.addEventListener('click', () => {
-      const panel = button.closest('.tool-card, .think-panel')
+      const panel = button.closest('.tool-panel, .tool-card, .think-panel')
       if (!panel) return
       const collapsed = panel.classList.toggle('is-collapsed')
       button.setAttribute('aria-expanded', collapsed ? 'false' : 'true')
@@ -2958,7 +3754,7 @@ function appendMessage(role, text, meta, attachments, rich, options = {}) {
     role === 'me'
       ? `<div class="bubble">${esc(text)}${files}</div>
         <div class="who-me"><span class="who-name">${esc(meName)}</span>${channel}${avatarMarkup(meName, meAvatarUrl(), 'who-badge me')}</div>`
-      : `${aiWhoMarkup()}<div class="bubble ai-turn">${historyAiBubble(text, meta, rich || {})}</div>`
+      : `${aiWhoMarkup()}<div class="bubble ai-turn">${historyAiBubble(text, meta, rich || {}, options)}</div>`
   const thread = $('#thread')
   if (options.prepend) {
     const firstMessage = thread.querySelector('.msg')
@@ -2973,30 +3769,34 @@ function appendMessage(role, text, meta, attachments, rich, options = {}) {
 }
 
 /** 创建一条可实时更新的 AI 回答：思考过程 + 工具卡片 + 最终答案。 */
-function createAiTurn() {
-  setEmptyVisible(false)
+function createAiTurn(options = {}) {
+  const append = options.append !== false
+  if (append) setEmptyVisible(false)
   const node = document.createElement('div')
   node.className = 'msg ai'
   node.innerHTML = `${aiWhoMarkup()}<div class="bubble ai-turn">
-    <div class="think-panel" hidden>
-      <button class="think-head" type="button" aria-expanded="true">
+    <div class="think-panel is-collapsed" hidden>
+      <button class="think-head" type="button" aria-expanded="false">
         <span class="think-icon">✦</span><span class="think-title">正在思考…</span><span class="think-chevron">⌄</span>
       </button>
+      <div class="think-peek" hidden></div>
       <div class="think-body"></div>
     </div>
-    <div class="tool-list" hidden></div>
-    <div class="ai-status"><span class="ai-status-dot"></span><span class="ai-status-text">正在连接模型…</span></div>
+    <div class="tool-slot" hidden></div>
+    <div class="ai-status"><span class="ai-status-dot"></span><span class="ai-status-text">正在思考…</span></div>
     <div class="answer-text"></div>
     <span class="meta" hidden></span>
   </div>`
-  $('#thread').appendChild(node)
-  bindToolToggles(node)
-  scrollThreadToBottomInstant()
-
+  if (append) {
+    $('#thread').appendChild(node)
+    bindToolToggles(node)
+    scrollThreadToBottomInstant()
+  }
   const think = node.querySelector('.think-panel')
   const thinkTitle = node.querySelector('.think-title')
+  const thinkPeek = node.querySelector('.think-peek')
   const thinkBody = node.querySelector('.think-body')
-  const toolList = node.querySelector('.tool-list')
+  const toolPanel = node.querySelector('.tool-slot')
   const status = node.querySelector('.ai-status')
   const statusText = node.querySelector('.ai-status-text')
   const answer = node.querySelector('.answer-text')
@@ -3006,14 +3806,24 @@ function createAiTurn() {
   let rawAnswer = ''
   let answerRenderQueued = false
   let scrollQueued = false
+  const toolTraces = []
 
   const scroll = () => {
+    // 后台会话的节点不在当前消息流里，不能因为它的增量把当前页面滚到底部。
+    if (!node.isConnected) return
     if (scrollQueued) return
     scrollQueued = true
     requestAnimationFrame(() => {
       scrollQueued = false
       scrollThreadToBottomInstant()
     })
+  }
+  // 最后一条内容常常在 end 事件之后才完成排版，补一帧确保工具面板不被输入区遮住。
+  const finalScroll = () => {
+    scroll()
+    setTimeout(() => {
+      if (node.isConnected) scrollThreadToBottomInstant()
+    }, 120)
   }
   const setStatus = (text) => {
     if (!text) {
@@ -3026,11 +3836,25 @@ function createAiTurn() {
   const collapseThink = (done) => {
     if (think.hidden) return
     think.classList.add('is-collapsed')
+    think.classList.remove('is-active')
+    thinkPeek.hidden = true
     think.querySelector('.think-head').setAttribute('aria-expanded', 'false')
     if (done) {
       const thinkingMs = (firstAnswerAt || Date.now()) - startedAt
       thinkTitle.textContent = `已深度思考 · ${formatElapsed(thinkingMs)}`
     }
+  }
+  const renderToolPanel = (active) => {
+    if (toolTraces.length === 0) {
+      toolPanel.hidden = true
+      return
+    }
+    const current = toolPanel.querySelector('.tool-panel')
+    const wasExpanded = current ? !current.classList.contains('is-collapsed') : false
+    toolPanel.hidden = false
+    toolPanel.innerHTML = toolPanelHtml(toolTraces, { active, expanded: wasExpanded })
+    bindToolToggles(node)
+    scroll()
   }
   // 流式阶段也按 Markdown 渲染；每帧最多重排一次，避免逐 token 抖动。
   const renderStreamingAnswer = () => {
@@ -3042,15 +3866,62 @@ function createAiTurn() {
       scroll()
     })
   }
+  const showClarify = (clarify) => {
+    if (!clarifyPanelHtml(clarify, { docked: true })) return
+    setStatus('')
+    collapseThink(true)
+    if (toolTraces.length > 0) {
+      toolPanel.innerHTML = toolPanelHtml(toolTraces, { active: false, expanded: false })
+      toolPanel.hidden = false
+      bindToolToggles(node)
+    }
+    answer.hidden = false
+    answer.classList.add('is-clarify-note')
+    answer.innerHTML = clarifyInlineNote()
+    rawAnswer = ''
+    showClarifyDock(clarify)
+    finalScroll()
+  }
 
   return {
     node,
+    appendToThread() {
+      if (node.isConnected) return
+      setEmptyVisible(false)
+      $('#thread').appendChild(node)
+      bindToolToggles(node)
+      scrollThreadToBottomInstant()
+    },
+    hydrate(snapshot) {
+      if (!snapshot) return
+      if (snapshot.reasoning) this.reasoning(snapshot.reasoning)
+      if (snapshot.text) this.content(snapshot.text)
+      for (const trace of snapshot.toolCalls || []) {
+        this.tool(trace)
+        if (trace.status !== 'running') {
+          this.toolResult({
+            id: trace.id,
+            status: trace.status,
+            summary: trace.summary,
+            durationMs: trace.durationMs,
+          })
+        }
+      }
+      if (snapshot.status === 'error') this.fail(snapshot.error || '回答失败')
+      else if (snapshot.status === 'stopped') this.stop()
+    },
     reasoning(text) {
       if (!text) return
       think.hidden = false
+      think.classList.add('is-active')
       thinkBody.textContent += text
       thinkTitle.textContent = '正在思考…'
-      setStatus('正在思考…')
+      setStatus('')
+      if (think.classList.contains('is-collapsed')) {
+        const peek = oneLinePreview(thinkBody.textContent)
+        thinkPeek.textContent = peek
+        thinkPeek.hidden = !peek
+      }
       thinkBody.scrollTop = thinkBody.scrollHeight
       scroll()
     },
@@ -3058,53 +3929,49 @@ function createAiTurn() {
       if (!text) return
       if (!firstAnswerAt) firstAnswerAt = Date.now()
       if (!rawAnswer) setStatus('')
-      collapseThink(false)
+      collapseThink(true)
+      answer.hidden = false
+      answer.classList.remove('is-clarify-note')
       rawAnswer += text
       renderStreamingAnswer()
     },
     tool(event) {
-      if (toolList.hidden) {
-        toolList.hidden = false
-      }
-      const trace = { id: event.id, name: event.name, toolId: event.toolId, args: event.args, status: 'running', summary: '', durationMs: 0 }
-      toolList.insertAdjacentHTML('beforeend', toolCardHtml(trace))
-      const card = toolList.lastElementChild
-      card.querySelector('.tool-head').addEventListener('click', () => {
-        const collapsed = card.classList.toggle('is-collapsed')
-        card.querySelector('.tool-head').setAttribute('aria-expanded', collapsed ? 'false' : 'true')
-      })
-      setStatus(`正在调用「${event.name}」…`)
-      scroll()
+      toolTraces.push({ id: event.id, name: event.name, toolId: event.toolId, args: event.args, status: 'running', summary: '', durationMs: 0 })
+      setStatus('')
+      renderToolPanel(true)
     },
     toolResult(event) {
-      const card = [...toolList.querySelectorAll('.tool-card')].find((item) => item.dataset.toolCard === event.id)
-      if (!card) return
-      card.classList.toggle('is-error', event.status === 'error')
-      card.classList.add('is-collapsed')
-      const head = card.querySelector('.tool-head')
-      head.setAttribute('aria-expanded', 'false')
-      card.querySelector('.tool-status').textContent = event.status === 'error'
-        ? `失败 · ${formatElapsed(event.durationMs)}`
-        : `完成 · ${formatElapsed(event.durationMs)}`
-      const body = card.querySelector('.tool-body')
-      const resultRow = body.querySelector('.tool-result-row')
-      const row = resultRow || document.createElement('div')
-      if (!resultRow) {
-        row.className = 'tool-row tool-result-row'
-        row.innerHTML = `<span>${event.status === 'error' ? '错误' : '结果'}</span><pre></pre>`
-        body.appendChild(row)
-      }
-      row.querySelector('pre').textContent = prettyPayload(event.summary)
-      setStatus(event.status === 'error' ? `工具「${card.querySelector('strong')?.textContent || ''}」失败` : '')
-      scroll()
+      const trace = toolTraces.find((item) => item.id === event.id)
+      if (!trace) return
+      trace.status = event.status
+      trace.summary = event.summary
+      trace.durationMs = event.durationMs
+      setStatus('')
+      renderToolPanel(toolTraces.some((item) => item.status === 'running'))
+    },
+    clarify(clarify) {
+      showClarify(clarify)
     },
     finish(data) {
       setStatus('')
       collapseThink(true)
-      const finalText = String(data?.text || '').trim()
-      if (finalText) rawAnswer = finalText
-      if (rawAnswer) answer.innerHTML = renderAnswer(rawAnswer)
-      else if (!answer.textContent) answer.textContent = '（没有返回内容）'
+      if (toolTraces.length > 0) {
+        const current = toolPanel.querySelector('.tool-panel')
+        const wasExpanded = current ? !current.classList.contains('is-collapsed') : false
+        toolPanel.innerHTML = toolPanelHtml(toolTraces, { active: false, expanded: wasExpanded })
+        toolPanel.hidden = false
+        bindToolToggles(node)
+      }
+      if (data?.clarify) {
+        showClarify(data.clarify)
+      } else {
+        const finalText = String(data?.text || '').trim()
+        if (finalText) rawAnswer = finalText
+        answer.hidden = false
+        answer.classList.remove('is-clarify-note')
+        if (rawAnswer) answer.innerHTML = renderAnswer(rawAnswer)
+        else if (!answer.textContent) answer.textContent = '（没有返回内容）'
+      }
       const citations = data.citations && data.citations.length ? ` · 引用 ${data.citations.length} 条` : ''
       const thinking = think.hidden ? '' : ` · 思考 ${formatElapsed((firstAnswerAt || Date.now()) - startedAt)}`
       metaLine.hidden = false
@@ -3113,11 +3980,14 @@ function createAiTurn() {
       if (!data.autoSelected && data.fallbackFromModelId && data.modelId) {
         setSelected(data.modelId, { persist: false })
       }
-      scroll()
+      if (data.fallbackFromModelId) void refreshModelCatalog()
+      finalScroll()
     },
     fail(message, meta) {
       setStatus('')
       collapseThink(true)
+      answer.hidden = false
+      answer.classList.remove('is-clarify-note')
       if (!answer.textContent) answer.textContent = message || '回答失败'
       answer.classList.add('is-error')
       if (meta) {
@@ -3129,6 +3999,8 @@ function createAiTurn() {
     stop() {
       setStatus('')
       collapseThink(true)
+      answer.hidden = false
+      answer.classList.remove('is-clarify-note')
       if (!rawAnswer) answer.textContent = '已停止生成'
       metaLine.hidden = false
       metaLine.textContent = '已停止生成'
@@ -3143,7 +4015,7 @@ function appendTyping() {
   node.className = 'msg ai'
   node.innerHTML = `${aiWhoMarkup()}<div class="bubble"><span class="typing"><i></i><i></i><i></i></span></div>`
   $('#thread').appendChild(node)
-  node.scrollIntoView({ block: 'end', behavior: 'smooth' })
+  scrollThreadToBottomInstant()
   return node
 }
 
@@ -3280,19 +4152,22 @@ async function addFiles(fileList) {
 
 function updateSendState() {
   const text = $('#input').value.trim()
-  $('#send').disabled = state.models.length === 0 || (!text && state.attachments.length === 0)
+  const clarifyBusy = Boolean(state.clarifyFlow?.busy)
+  $('#send').disabled =
+    clarifyBusy || state.models.length === 0 || (!text && state.attachments.length === 0)
 }
 
 /** 只在真的出现排队消息时提示；只有一条正在回复的消息时不占输入区。 */
 function renderQueueState() {
   const bar = $('#queue-bar')
   if (!bar) return
-  const queued = state.queue.length
+  const runtime = currentRuntime()
+  const queued = runtime.queue.length
   const stopReply = $('#stop-reply')
-  if (stopReply) stopReply.hidden = !state.sending || queued > 0
+  if (stopReply) stopReply.hidden = !runtime.sending || queued > 0
   bar.hidden = queued === 0
   if (bar.hidden) return
-  const text = state.sending
+  const text = runtime.sending
     ? `正在回复，后面还有 ${queued} 条排队`
     : `有 ${queued} 条消息等待发送`
   const label = $('#queue-text')
@@ -3300,21 +4175,22 @@ function renderQueueState() {
   const stop = $('#queue-stop')
   if (stop) {
     stop.textContent = '停止当前回复并发送'
-    stop.disabled = !state.sending
+    stop.disabled = !runtime.sending
   }
 }
 
-/** 切换会话时丢掉尚未提交的排队消息，避免把旧会话的消息发到新会话。 */
-function clearQueuedMessages() {
-  if (state.queue.length === 0) return
-  for (const item of state.queue) item.node?.remove()
-  state.queue = []
-  renderQueueState()
-}
-
 function stopCurrentReply() {
-  if (!state.sending || !state.activeController) return
-  state.activeController.abort()
+  const runtime = currentRuntime()
+  if (!runtime.sending || !runtime.controller) return
+  // 先通知服务端取消后台回合；只断浏览器连接不会再中止模型。
+  if (runtime.runId) {
+    void api(`/api/chat/runs/${encodeURIComponent(runtime.runId)}/cancel${qs()}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    }).catch(() => {})
+  }
+  runtime.controller.abort()
 }
 
 function autosize() {
@@ -3397,6 +4273,22 @@ async function send() {
     updateSendState()
     return
   }
+  // 引导式澄清还开着时，底部输入框里的内容也算当前这一步的回答；
+  // 直接续跑同一个澄清流程，不落成普通用户消息。
+  if (state.clarifyFlow && state.pendingClarify && state.attachments.length === 0) {
+    if (state.clarifyFlow.busy) return
+    input.value = ''
+    input.style.height = '44px'
+    updateSendState()
+    advanceClarifyFlow(text)
+    return
+  }
+  // 只要用户真正发了消息（包括带附件），底部澄清就完成使命。
+  clearClarifyDock()
+  if (state.sessionId) {
+    markSessionActive(state.sessionId)
+    renderSessions()
+  }
 
   const modelId = state.selected || null
   const pending = state.attachments.slice()
@@ -3406,19 +4298,22 @@ async function send() {
     type: file.type,
   }))
 
+  const runtime = currentRuntime()
   const item = {
     text,
     modelId,
+    reasoningEffort: state.reasoningEffort || null,
     pending,
     attachmentMeta,
     sessionId: state.sessionId,
+    runtimeKey: runtime.key,
     node: null,
   }
 
-  // 打断模式：新消息优先。丢掉尚未发送的旧排队项，并中止当前回复；
-  // 当前 drainQueue 的 finally 会接着消费这条新消息。
-  if (state.sending && state.chatSendMode === 'interrupt') {
-    const dropped = state.queue.splice(0)
+  // 打断模式：新消息优先。只丢当前会话尚未发送的旧排队项，并中止当前会话回复；
+  // 其它会话的回复不受影响。
+  if (runtime.sending && state.chatSendMode === 'interrupt') {
+    const dropped = runtime.queue.splice(0)
     for (const queued of dropped) {
       queued.node?.remove()
       for (const file of queued.pending) {
@@ -3428,7 +4323,7 @@ async function send() {
     stopCurrentReply()
   }
 
-  state.queue.push(item)
+  runtime.queue.push(item)
   input.value = ''
   input.style.height = '44px'
   item.node = appendMessage('me', text, undefined, attachmentMeta)
@@ -3441,28 +4336,38 @@ async function send() {
   }
 
   renderQueueState()
-  void drainQueue()
+  void drainQueue(runtime)
 }
 
-/** 依次消费排队消息；当前回复结束后自动接上一条。 */
-async function drainQueue() {
-  if (state.sending) return
-  const item = state.queue.shift()
+/** 依次消费某个会话的排队消息；各会话独立，互不阻塞。 */
+async function drainQueue(runtime = currentRuntime()) {
+  if (runtime.sending) return
+  const item = runtime.queue.shift()
   if (!item) {
     renderQueueState()
     return
   }
 
-  state.sending = true
+  runtime.sending = true
   const controller = new AbortController()
-  state.activeController = controller
+  runtime.controller = controller
+  runtime.runId = null
+  runtime.messageId = null
   renderQueueState()
   updateSendState()
 
-  const turn = createAiTurn()
-  const targetSessionId = item.sessionId ?? state.sessionId
+  // 队列里的消息可能在等待期间已被切走；回到该会话时才重新挂回消息流。
+  const visibleAtStart = runtime.sessionId ? runtime.sessionId === state.sessionId : state.sessionId === null
+  if (item.node && !item.node.isConnected && visibleAtStart) {
+    $('#thread').appendChild(item.node)
+    setEmptyVisible(false)
+    scrollThreadToBottomInstant()
+  }
+  let turn = createAiTurn({ append: visibleAtStart })
+  runtime.turn = turn
   let streamError = null
   let sawDone = false
+  let messageId = ''
 
   try {
     const attachments = await buildAttachmentPayload(item.pending)
@@ -3470,46 +4375,118 @@ async function drainQueue() {
     await streamChat(
       {
         modelId: item.modelId,
+        reasoningEffort: item.reasoningEffort,
         text: item.text,
         attachments,
-        sessionId: targetSessionId,
+        sessionId: item.sessionId,
         spaceKind: state.spaceKind,
       },
       (event, data) => {
-        const sameSession = targetSessionId === null ? state.sessionId === null : state.sessionId === targetSessionId
+        const isCurrentRun = runtime.sessionId ? runtime.sessionId === state.sessionId : state.sessionId === null
         if (event === 'meta') {
-          if (sameSession) {
-            state.sessionId = data.sessionId || state.sessionId
-            persistChatLocation()
-            if (data.sessionId) {
-              for (const queued of state.queue) {
-                if (!queued.sessionId) queued.sessionId = data.sessionId
-              }
+          messageId = String(data.messageId || '')
+          runtime.messageId = messageId
+          runtime.runId = data.runId || null
+          if (messageId) {
+            state.localLiveMessageIds.add(messageId)
+            // EventSource 可能先于 meta 到达并已经建好实时节点；复用它，
+            // 删掉 POST 刚建的占位节点，避免一个回答两个气泡或增量画到隐藏节点。
+            const existingLive = state.liveTurns.get(messageId)
+            if (existingLive?.turn && existingLive.turn !== turn) {
+              if (turn.node.isConnected) turn.node.remove()
+              turn = existingLive.turn
+              runtime.turn = turn
+              existingLive.hydrated = true
+            } else {
+              state.liveTurns.set(messageId, {
+                turn,
+                sessionId: data.sessionId || runtime.sessionId,
+                messageId,
+                hydrated: true,
+              })
             }
           }
-          if (data.sessionId && $('#chat-title').textContent === '新对话') {
-            $('#chat-title').textContent = (item.text || attachments[0]?.name || '新对话').slice(0, 24)
+          if (data.sessionId) {
+            if (runtime.sessionId && runtime.sessionId !== data.sessionId) {
+              // 服务端可能为旧空会话补了新 id；以服务端为准迁移运行时。
+            }
+            migrateRuntime(runtime, data.sessionId)
+            item.sessionId = data.sessionId
+            for (const queued of runtime.queue) {
+              if (!queued.sessionId) queued.sessionId = data.sessionId
+            }
+            if (state.sessionId === null || state.sessionId === data.sessionId) {
+              state.sessionId = data.sessionId
+              persistChatLocation()
+            }
+            if (isCurrentRun && $('#chat-title').textContent === '新对话') {
+              $('#chat-title').textContent = (item.text || attachments[0]?.name || '新对话').slice(0, 24)
+            }
+            markSessionActive(data.sessionId)
+            renderSessions()
           }
-        } else if (event === 'reasoning') {
-          turn.reasoning(data.text)
-        } else if (event === 'delta') {
-          turn.content(data.text)
-        } else if (event === 'tool') {
-          turn.tool(data)
-        } else if (event === 'tool_result') {
-          turn.toolResult(data)
+          if (!isCurrentRun && turn.node.isConnected) {
+            // 发送瞬间还在当前会话，meta 回来前已经切走；保留在后台，不删节点。
+          }
+        } else if (
+          event === 'reasoning' ||
+          event === 'delta' ||
+          event === 'tool' ||
+          event === 'tool_result'
+        ) {
+          /**
+           * 实时正文和工具轨迹优先由 EventSource 渲染：POST 流和广播流内容相同，
+           * 两处都画会重复；只靠 POST 又会在连接卡住时一直停在“正在思考…”。
+           * EventSource 尚未连上时退回 POST 流；连上后只接收后续增量，不会重复。
+           * POST 仍负责 meta / done / error，EventSource 断开时最终答案由 done 收尾。
+           */
+          const liveEventsReady =
+            typeof EventSource !== 'undefined' && state.liveEventSource?.readyState === EventSource.OPEN
+          if (!liveEventsReady) {
+            if (event === 'reasoning') turn.reasoning(data.text)
+            else if (event === 'delta') turn.content(data.text)
+            else if (event === 'tool') turn.tool(data)
+            else turn.toolResult(data)
+          }
+        } else if (event === 'clarify') {
+          turn.clarify(data.clarify)
         } else if (event === 'done') {
           sawDone = true
-          if (sameSession) {
-            state.sessionId = data.sessionId || state.sessionId
-            persistChatLocation()
+          const id = String(data.messageId || messageId || '')
+          const liveEntry = id ? state.liveTurns.get(id) : null
+          if (liveEntry?.turn && liveEntry.turn !== turn) {
+            // EventSource 已经建好并渲染了实时节点：收编它，删掉 POST 的空占位。
+            if (turn.node.isConnected) turn.node.remove()
+            turn = liveEntry.turn
+            runtime.turn = turn
+          } else if (id && state.historyMessageIds.has(id) && !liveEntry) {
+            // EventSource 已先收到最终消息并完成渲染，POST 只做收尾，不再画第二个气泡。
+            if (turn.node.isConnected) turn.node.remove()
+            turn = liveEntry?.turn || turn
+          }
+          if (id) {
+            state.historyMessageIds.add(id)
+            state.activeRunSnapshots.delete(id)
+            state.localLiveMessageIds.delete(id)
+            state.liveTurns.delete(id)
+          }
+          if (data.sessionId) {
+            migrateRuntime(runtime, data.sessionId)
+            if (state.sessionId === null || state.sessionId === data.sessionId) {
+              state.sessionId = data.sessionId
+              persistChatLocation()
+            }
           }
           turn.finish(data)
+          if (isCurrentRun || runtime.sessionId === state.sessionId) {
+            notifySessionRead(runtime.sessionId)
+          }
           loadSessions()
           void loadWorkspaceFiles()
         } else if (event === 'error') {
           const err = new Error(data.message || '模型调用失败')
           err.code = data.code
+          err.traceId = data.traceId
           streamError = err
         }
       },
@@ -3520,17 +4497,28 @@ async function drainQueue() {
   } catch (err) {
     if (controller.signal.aborted) {
       turn.stop()
+      if (messageId) {
+        state.liveTurns.delete(messageId)
+        state.activeRunSnapshots.delete(messageId)
+      }
     } else {
       turn.fail(`${err.message}${err.code ? `\n（${err.code}）` : ''}`, err.traceId ? `traceId ${err.traceId}` : '请求失败')
+      if (messageId) state.localLiveMessageIds.delete(messageId)
     }
   } finally {
-    state.sending = false
-    if (state.activeController === controller) state.activeController = null
+    runtime.sending = false
+    runtime.controller = null
+    runtime.runId = null
+    if (runtime.turn === turn) runtime.turn = null
+    if (messageId) state.localLiveMessageIds.delete(messageId)
     updateSendState()
     renderQueueState()
-    if (state.queue.length > 0) {
-      void drainQueue()
-    } else {
+    if (runtime.queue.length > 0) {
+      void drainQueue(runtime)
+    } else if (
+      (runtime.sessionId && runtime.sessionId === state.sessionId) ||
+      (!runtime.sessionId && state.sessionId === null)
+    ) {
       $('#input').focus()
     }
   }
@@ -4048,6 +5036,7 @@ async function boot() {
     $('#demo-pill').hidden = !models.models.every((model) => model.provider === 'demo')
     await loadSessions()
     setupChatEvents()
+    await loadActiveRuns()
     const savedLocation = readChatLocation()
     if (state.sessions.length > 0) {
       const savedSessionId = savedLocation?.sessionId
@@ -4124,12 +5113,38 @@ async function boot() {
     const menu = $('#model-menu')
     const open = menu.hidden
     menu.hidden = !open
+    if (open) {
+      $('#think-menu').hidden = true
+      $('#think-chip').setAttribute('aria-expanded', 'false')
+    }
     $('#model-chip').setAttribute('aria-expanded', open ? 'true' : 'false')
   })
   document.addEventListener('click', (event) => {
     if (!event.target.closest('#model-chip') && !event.target.closest('#model-menu')) {
       $('#model-menu').hidden = true
       $('#model-chip').setAttribute('aria-expanded', 'false')
+    }
+  })
+
+  // 思考档位：只有模型开放思考选项时才出现
+  $('#think-chip').addEventListener('click', () => {
+    const menu = $('#think-menu')
+    const open = menu.hidden
+    menu.hidden = !open
+    if (open) {
+      $('#model-menu').hidden = true
+      $('#model-chip').setAttribute('aria-expanded', 'false')
+    }
+    $('#think-chip').setAttribute('aria-expanded', open ? 'true' : 'false')
+  })
+  $('#think-menu').addEventListener('click', (event) => {
+    const button = event.target.closest('[data-think]')
+    if (button) setThinkingEffort(button.dataset.think)
+  })
+  document.addEventListener('click', (event) => {
+    if (!event.target.closest('#think-wrap')) {
+      $('#think-menu').hidden = true
+      $('#think-chip').setAttribute('aria-expanded', 'false')
     }
   })
 

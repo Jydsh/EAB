@@ -108,6 +108,16 @@ function readInt(raw: string | undefined, fallback: number, name: string): numbe
   return value
 }
 
+/** 0 表示不限制；用于“每用户同时在途”这类可关闭的闸门。 */
+function readNonNegativeInt(raw: string | undefined, fallback: number, name: string): number {
+  if (raw === undefined || raw === '') return fallback
+  const value = Number(raw)
+  if (!Number.isInteger(value) || value < 0) {
+    throw new EabError(EC.VALIDATION, `环境变量 ${name} 必须是非负整数，当前是 ${raw}`)
+  }
+  return value
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   const settings = readConsoleSettings()
   const port = readInt(
@@ -162,7 +172,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     chatMaxConcurrent: readInt(env.EAB_CHAT_MAX_CONCURRENT, 8, 'EAB_CHAT_MAX_CONCURRENT'),
     chatQueueLimit: readInt(env.EAB_CHAT_QUEUE_LIMIT, 100, 'EAB_CHAT_QUEUE_LIMIT'),
     chatQueueTimeoutMs: readInt(env.EAB_CHAT_QUEUE_TIMEOUT_MS, 240_000, 'EAB_CHAT_QUEUE_TIMEOUT_MS'),
-    chatUserMaxInFlight: readInt(env.EAB_CHAT_USER_MAX_IN_FLIGHT, 2, 'EAB_CHAT_USER_MAX_IN_FLIGHT'),
+    // 0 = 不限制；每个会话独立回复，用户开多个对话时不应该被“同时最多 2 条”挡住。
+    chatUserMaxInFlight: readNonNegativeInt(
+      env.EAB_CHAT_USER_MAX_IN_FLIGHT,
+      0,
+      'EAB_CHAT_USER_MAX_IN_FLIGHT',
+    ),
     chatUserMessagesPerMinute: readInt(env.EAB_CHAT_USER_MESSAGES_PER_MINUTE, 20, 'EAB_CHAT_USER_MESSAGES_PER_MINUTE'),
     chatModelMaxConcurrent: readInt(env.EAB_CHAT_MODEL_MAX_CONCURRENT, 4, 'EAB_CHAT_MODEL_MAX_CONCURRENT'),
     chatCompanyMaxConcurrent: readInt(env.EAB_CHAT_COMPANY_MAX_CONCURRENT, 8, 'EAB_CHAT_COMPANY_MAX_CONCURRENT'),

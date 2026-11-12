@@ -6,9 +6,12 @@ import {
   forgetModelHealth,
   isModelHealthy,
   markModelHealthy,
+  markModelPreferred,
   markModelUnhealthy,
+  preferredModelId,
   probePluginModel,
   shouldMarkModelFailure,
+  sortModelsForChat,
 } from '../src/model-health.js'
 
 function pluginId(provider: string, model: string): string {
@@ -47,6 +50,21 @@ describe('模型健康状态', () => {
 
     markModelHealthy(company, 'b')
     expect(filterHealthyModels(company, models)).toEqual([{ id: 'b' }])
+  })
+
+  it('真实成功的模型排到最前，真实失败的模型降级并清掉首选', () => {
+    const company = 'health-order-test'
+    const models = [{ id: 'a' }, { id: 'b' }, { id: 'c' }]
+    markModelHealthy(company, 'a')
+    markModelHealthy(company, 'b')
+    markModelPreferred(company, 'b')
+
+    expect(sortModelsForChat(company, models).map((model) => model.id)).toEqual(['b', 'a', 'c'])
+    expect(preferredModelId(company)).toBe('b')
+
+    markModelUnhealthy(company, 'b', 'timeout')
+    expect(preferredModelId(company)).toBeNull()
+    expect(sortModelsForChat(company, models).map((model) => model.id)).toEqual(['a', 'c', 'b'])
   })
 
   it('只把模型上游/限流类错误算作不可回复', () => {

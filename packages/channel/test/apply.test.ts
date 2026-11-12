@@ -261,6 +261,31 @@ describe('applyOrgSync：幂等与变更', () => {
     expect(userRow('fs_zhao').status).toBe('departed')
     expect(userRow('fs_liu').status).toBe('active')
   })
+
+  it('解绑后身份 revoked、成员软删；重新同步按原 user_id 恢复并激活身份', () => {
+    sync(1)
+    const lin = userRow('fs_lin')
+    db.prepare('UPDATE users SET deleted_at = ?, status = ? WHERE id = ?').run(NOW, 'disabled', lin.id)
+    db.prepare(
+      "UPDATE user_identities SET status = 'revoked' WHERE provider = 'mock' AND external_user_id = 'fs_lin'",
+    ).run()
+
+    const rebound = sync(1)
+    expect(rebound.stats.identitiesRestored).toBe(1)
+    expect(userRow('fs_lin').id).toBe(lin.id)
+    expect(userRow('fs_lin').status).toBe('active')
+    const identity = db
+      .prepare(
+        "SELECT status FROM user_identities WHERE provider = 'mock' AND external_user_id = 'fs_lin'",
+      )
+      .get() as { status: string }
+    expect(identity.status).toBe('active')
+    const user = db
+      .prepare('SELECT deleted_at, status FROM users WHERE id = ?')
+      .get(lin.id) as { deleted_at: number | null; status: string }
+    expect(user.deleted_at).toBeNull()
+    expect(user.status).toBe('active')
+  })
 })
 
 describe('applyOrgSync：缺失不误删', () => {

@@ -46,6 +46,23 @@ describe('网页对话并发闸门', () => {
     await expect(capacity.acquire('u1')).rejects.toThrow('发送太快')
   })
 
+  it('maxInFlightPerUser 为 0 时同一用户可同时开多个会话', async () => {
+    const capacity = createChatCapacity({
+      maxConcurrent: 10,
+      queueLimit: 10,
+      queueTimeoutMs: 500,
+      maxInFlightPerUser: 0,
+      messagesPerMinute: 100,
+    })
+
+    const slots = await Promise.all(
+      Array.from({ length: 5 }, () => capacity.acquire('u1')),
+    )
+    expect(capacity.stats().active).toBe(5)
+    for (const slot of slots) slot.release()
+    expect(capacity.stats().active).toBe(0)
+  })
+
   it('排队等待超时会释放名额，不会永久占住', async () => {
     const capacity = createChatCapacity({
       maxConcurrent: 1,

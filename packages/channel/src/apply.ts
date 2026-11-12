@@ -59,6 +59,7 @@ interface UserDbRow {
 interface IdentityRow {
   user_id: string
   external_user_id: string
+  status: string
 }
 
 interface PathRepairResult {
@@ -170,6 +171,7 @@ export function applyOrgSync(db: Db, options: ApplyOrgSyncOptions): SyncOutcome 
 
   const deptByChannel = new Map<string, DeptDbRow>()
   const identityByExternal = new Map<string, string>()
+  const identityStatusByExternal = new Map<string, string>()
   const userById = new Map<string, UserDbRow>()
 
   const rootDept = options.companyRootDeptId
@@ -197,9 +199,12 @@ export function applyOrgSync(db: Db, options: ApplyOrgSyncOptions): SyncOutcome 
     }
 
     const identities = db
-      .prepare('SELECT user_id, external_user_id FROM user_identities WHERE provider = ?')
+      .prepare('SELECT user_id, external_user_id, status FROM user_identities WHERE provider = ?')
       .all(plan.provider) as unknown as IdentityRow[]
-    for (const row of identities) identityByExternal.set(row.external_user_id, row.user_id)
+    for (const row of identities) {
+      identityByExternal.set(row.external_user_id, row.user_id)
+      identityStatusByExternal.set(row.external_user_id, row.status)
+    }
 
     if (identities.length > 0) {
       const userIds = identities.map((row) => row.user_id)
@@ -325,7 +330,7 @@ export function applyOrgSync(db: Db, options: ApplyOrgSyncOptions): SyncOutcome 
     const updateUser = db.prepare(
       `UPDATE users
           SET dept_id = ?, dept_path = ?, name = ?, title = ?, employee_no = ?, mobile = ?, avatar = ?, status = ?,
-              missing_at = ?, missing_runs = ?, recycled_at = ?, updated_at = ?
+              missing_at = ?, missing_runs = ?, recycled_at = ?, deleted_at = NULL, updated_at = ?
         WHERE id = ? AND company_id = ?`,
     )
     const insertIdentity = db.prepare(
@@ -356,6 +361,15 @@ export function applyOrgSync(db: Db, options: ApplyOrgSyncOptions): SyncOutcome 
         plan.provider,
         externalId,
       )
+    }
+    const restoreIdentity = db.prepare(
+      'UPDATE user_identities SET status = ? WHERE provider = ? AND external_user_id = ?',
+    )
+    const reviveRevokedIdentity = (externalId: string) => {
+      if (identityStatusByExternal.get(externalId) !== 'revoked') return
+      restoreIdentity.run('active', plan.provider, externalId)
+      identityStatusByExternal.set(externalId, 'active')
+      stats.identitiesRestored += 1
     }
 
     for (const row of plan.users) {
@@ -395,6 +409,7 @@ export function applyOrgSync(db: Db, options: ApplyOrgSyncOptions): SyncOutcome 
           stats.identitiesCreated += 1
         }
         bridgeIdentity(userId, row.channelUserId)
+        reviveRevokedIdentity(row.channelUserId)
         stats.usersCreated += 1
         diffs.push({
           itemType: 'user',
@@ -417,6 +432,7 @@ export function applyOrgSync(db: Db, options: ApplyOrgSyncOptions): SyncOutcome 
 
       const targetStatus = row.status === 'departed' ? 'departed' : 'active'
       bridgeIdentity(existing.id, row.channelUserId)
+      reviveRevokedIdentity(row.channelUserId)
       /** 上游没给手机号（常见于钉钉未开「企业员工手机号信息」权限）时保留库里已有值，不覆盖手工补的号码 */
       const nextMobile = row.mobile === undefined ? existing.mobile : row.mobile
       /** 头像同理：钉钉用默认头像时不返回 avatar，不能把库里已经抓到的地址清空 */

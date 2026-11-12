@@ -21,7 +21,7 @@ import { randomUUID } from 'node:crypto'
 import type { Db } from '@eab/storage'
 import { EC, EabError, SC } from '@eab/domain'
 import type { ServerDeps } from './deps.js'
-import { actorFor, findPerson, type RequestActor } from './session.js'
+import { actorFor, findActivePerson, type RequestActor } from './session.js'
 import { resolveModelForPurpose } from './model-registry.js'
 import { publishChatEvent } from './chat-events.js'
 import { dingTalkRecipientOf, sendDingTalkTextToUser } from './dingtalk-outbound.js'
@@ -639,8 +639,8 @@ export function setSchedulePaused(db: Db, actor: RequestActor, id: string, pause
 
 /** 执行一个到期任务；结果写入 chat_messages，并按 channel 回推。 */
 async function runSchedule(deps: ServerDeps, row: ScheduleRow, runId: string): Promise<{ resultText: string; delivered: boolean; deliveryError?: string }> {
-  const person = findPerson(deps.db, row.user_id)
-  if (!person) throw new EabError(EC.NOT_FOUND, '任务创建人已不存在')
+  const person = findActivePerson(deps.db, row.user_id)
+  if (!person) throw new EabError(EC.NOT_FOUND, '任务创建人已停用或不存在')
   if (person.companyId !== row.company_id) throw new EabError(EC.FORBIDDEN, '任务与创建人不在同一公司')
   const actor = actorFor(deps.db, person)
   if (!actor.subject.scopes.has(SC.SCHEDULE_WRITE)) {
@@ -650,8 +650,8 @@ async function runSchedule(deps: ServerDeps, row: ScheduleRow, runId: string): P
   // 动态导入避免 schedule -> chat -> tools -> schedule 的静态循环。
   const chat = await import('./routes/chat.js')
   const { toolSpecsForAgent } = await import('./routes/tools.js')
-  const catalog = chat.loadModelCatalog(deps.db, row.company_id, deps.config.devAuth)
-  const visible = chat.visibleModelsFor(catalog, [...actor.subject.roles])
+  const catalog = chat.loadModelCatalog(deps.db, row.company_id, deps.config.devAuth, row.user_id)
+  const visible = chat.visibleModelsFor(catalog, [...actor.subject.roles], row.company_id)
   const routed = resolveModelForPurpose(deps.db, row.company_id, 'chat.default')
   const model = (routed && visible.find((item) => item.id === routed.id)) ?? visible[0]
   if (!model) throw new EabError(EC.CONFLICT, '当前身份没有可用模型，定时任务无法执行')
@@ -775,7 +775,9 @@ async function runSchedule(deps: ServerDeps, row: ScheduleRow, runId: string): P
   })
 
   const fallback = '（定时任务已执行，但当前模型来自演示供应商，没有返回真实结果）'
-  const resultText = agent?.text?.trim() || fallback
+  const resultText = agent?.clarify
+    ? chat.formatClarifyText(agent.clarify)
+    : agent?.text?.trim() || fallback
   const assistantMessageId = `msg_${randomUUID()}`
   const finishedAt = Date.now()
   deps.db
@@ -798,6 +800,7 @@ async function runSchedule(deps: ServerDeps, row: ScheduleRow, runId: string): P
         reasoning: agent?.reasoning ?? '',
         tools: trace,
         runId,
+        clarify: agent?.clarify ?? null,
       }),
       finishedAt,
     )
@@ -816,7 +819,7 @@ async function runSchedule(deps: ServerDeps, row: ScheduleRow, runId: string): P
       text: resultText,
       modelId: model.id,
       modelName: model.name,
-      meta: { channel: row.channel, scheduleId: row.id, scheduled: true, reasoning: agent?.reasoning ?? '', tools: trace, runId },
+      meta: { channel: row.channel, scheduleId: row.id, scheduled: true, reasoning: agent?.reasoning ?? '', tools: trace, runId, clarify: agent?.clarify ?? null },
       createdAt: new Date(finishedAt).toISOString(),
     },
   })

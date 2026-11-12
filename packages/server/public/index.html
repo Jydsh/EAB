@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>EAB 管理控制台</title>
-    <link rel="stylesheet" href="/app.css" />
+    <link rel="stylesheet" href="/app.css?v=20261112b" />
   </head>
   <body>
     <!-- 顶栏：品牌 + 当前公司 + 服务状态 + 退出。控制台不登录组织成员，这里没有"我是谁"。 -->
@@ -20,6 +20,7 @@
       <div class="who">
         <span id="health-dot" class="dot" title="服务状态"></span>
         <span id="health-text" class="health-text">连接中</span>
+        <button class="update-badge" id="update-badge" type="button" hidden></button>
         <span class="who-divider"></span>
         <div class="account" id="account">
           <button class="account-btn" id="account-toggle" type="button" aria-haspopup="true" aria-expanded="false">
@@ -89,6 +90,6 @@
       </main>
     </div>
 
-    <script src="/app.js"></script>
+    <script src="/app.js?v=20261112b"></script>
   </body>
 </html>

@@ -13,16 +13,40 @@ import { appendAudit, loadKbCollectionAcls, type Db } from '@eab/storage'
 import type { ServerDeps } from '../deps.js'
 import { ok } from '../http.js'
 import { resolveActor, type RequestActor } from '../session.js'
-import { callModelStream, callEmbeddings, callRerank, type CallResult, type ChatMessage as LlmMessage, type LlmContent, type LlmContentPart, type LlmToolCall } from '../llm.js'
+import { callModelStream, callEmbeddings, callRerank, type CallResult, type ChatMessage as LlmMessage, type LlmContent, type LlmContentPart, type LlmToolCall, type ModelStreamOptions } from '../llm.js'
 import { callPluginModel, isPluginModelId, listPluginModels } from '../plugin-models.js'
 import { applyPluginModelRoles, loadPluginModelRoleMap } from '../plugin-model-settings.js'
-import { filterHealthyModels, markModelHealthy, markModelUnhealthy, shouldMarkModelFailure } from '../model-health.js'
+import {
+  filterHealthyModels,
+  markModelHealthy,
+  markModelPreferred,
+  markModelUnhealthy,
+  preferredModelId,
+  shouldMarkModelFailure,
+  sortModelsForChat,
+} from '../model-health.js'
 import { resolveModelForPurpose, findModelById, capabilitiesOf, normalizeCapability } from '../model-registry.js'
+import {
+  resolveThinkingEffort,
+  thinkingBudgetCeiling,
+  thinkingConfigOf,
+  type ThinkingConfig,
+} from '../thinking.js'
 import { compressMessagesForContext, estimateTokens } from '../context-window.js'
 import { getCollectionEmbeddingModel, searchChunkVectors, type EmbedFn } from '../kb-vector.js'
 import { executeTool, resolveToolByFunctionName, toolSpecsForActor, toolSpecsForAgent, type ChatToolSpec } from './tools.js'
 import { executePluginTool, pluginPromptTexts, resolvePluginToolForActor } from '../plugin-tools.js'
-import { subscribeChatEvents } from '../chat-events.js'
+import { publishChatEvent, subscribeChatEvents } from '../chat-events.js'
+import {
+  activeChatRuns,
+  beginChatRun,
+  cancelChatRun,
+  completeChatRun,
+  finishChatRun,
+  noteChatRunDelta,
+  noteChatRunTool,
+  noteChatRunToolResult,
+} from '../chat-runs.js'
 import { assertChatQuota } from '../quota.js'
 import { createChatCapacity } from '../chat-capacity.js'
 import type { ActiveSpace } from '../space.js'
@@ -121,6 +145,8 @@ export interface ModelDefinition {
   readonly maxOutputTokens?: number | null
   /** 上下文超限时是否压缩较早历史，默认 true */
   readonly contextCompression?: boolean
+  /** 模型开放给员工选择的思考档位；null 表示不显示思考选择器 */
+  readonly thinking?: ThinkingConfig | null
 }
 
 const VISION_TAGS = new Set([
@@ -190,6 +216,16 @@ function parseList(raw: string | null): string[] {
   }
 }
 
+function parseObject(raw: string | null | undefined): Record<string, unknown> {
+  if (!raw) return {}
+  try {
+    const value = JSON.parse(raw) as unknown
+    return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {}
+  } catch {
+    return {}
+  }
+}
+
 interface CatalogRow {
   id: string
   name: string
@@ -204,13 +240,19 @@ interface CatalogRow {
   max_context: number | null
   max_output_tokens: number | null
   context_compression: number | null
+  config_json: string | null
 }
 
-export function loadModelCatalog(db: Db, companyId: string, allowDemoFallback: boolean): ModelDefinition[] {
+export function loadModelCatalog(
+  db: Db,
+  companyId: string,
+  allowDemoFallback: boolean,
+  userId?: string,
+): ModelDefinition[] {
   const rows = db
     .prepare(
       `SELECT m.id, m.name, m.model_key, m.tags, m.capabilities, m.endpoint_kind, m.roles, m.priority,
-              m.max_context, m.max_output_tokens, m.context_compression,
+              m.max_context, m.max_output_tokens, m.context_compression, m.config_json,
               p.kind AS provider_kind, p.name AS provider_name
          FROM models m
          JOIN model_providers p ON p.id = m.provider_id
@@ -220,7 +262,7 @@ export function loadModelCatalog(db: Db, companyId: string, allowDemoFallback: b
     )
     .all(companyId) as unknown as CatalogRow[]
   const pluginModels: ModelDefinition[] = applyPluginModelRoles(
-    filterHealthyModels(companyId, listPluginModels(companyId)),
+    filterHealthyModels(companyId, listPluginModels(companyId, userId)),
     loadPluginModelRoleMap(db, companyId),
   ).map((model) => ({
     id: model.id,
@@ -237,6 +279,7 @@ export function loadModelCatalog(db: Db, companyId: string, allowDemoFallback: b
     maxContext: model.maxContext,
     maxOutputTokens: model.maxOutputTokens,
     contextCompression: model.contextCompression,
+    thinking: model.thinking,
   }))
   if (rows.length === 0) {
     return allowDemoFallback ? [...DEMO_CATALOG, ...pluginModels] : pluginModels
@@ -257,15 +300,21 @@ export function loadModelCatalog(db: Db, companyId: string, allowDemoFallback: b
       maxContext: row.max_context === null ? null : Number(row.max_context),
       maxOutputTokens: row.max_output_tokens === null ? null : Number(row.max_output_tokens),
       contextCompression: row.context_compression === null || Number(row.context_compression) !== 0,
+      thinking: thinkingConfigOf(parseObject(row.config_json)),
     })),
     ...pluginModels,
   ]
 }
 
-export function visibleModelsFor(catalog: readonly ModelDefinition[], roleCodes: readonly string[]): ModelDefinition[] {
-  return catalog
+export function visibleModelsFor(
+  catalog: readonly ModelDefinition[],
+  roleCodes: readonly string[],
+  companyId?: string,
+): ModelDefinition[] {
+  const visible = catalog
     .filter((model) => model.roles.length > 0 && model.roles.some((role) => roleCodes.includes(role)))
     .sort((a, b) => b.priority - a.priority)
+  return companyId ? sortModelsForChat(companyId, visible) : visible
 }
 
 export interface ChunkHit {
@@ -530,6 +579,8 @@ interface SessionRow {
   created_at: number
   updated_at: number
   last_message_at: number | null
+  last_read_at?: number | null
+  unread?: number | boolean
 }
 
 interface MessageRow {
@@ -595,11 +646,22 @@ export function buildSystemPrompt(opts: {
           ? '当前工具列表只是常用工具，不是全部；但本轮未选择文件空间，tool_search 不会返回文件读写工具。用户要文件操作时，直接请他在输入区选择云空间（可直接使用）。'
           : '当前工具列表只是常用工具，不是全部。需要文件发送/重命名/删除、容量、定时任务列表、计算、插件等未直接列出的能力时，先调用 tool_search，query 写用户原话或中文/英文能力词；工具结果返回后，命中的工具会自动加载为可调用工具，直接继续调用即可，不要向用户解释工具加载机制，也不要因为当前列表里没有就直接说做不到。'
       : '',
+    chatTools.some((tool) => tool.function.name === 'ask_user')
+      ? '如果用户没有说明目标、方向或范围（例如“帮我看看”“随便给点建议”“我不知道从哪开始”），不要靠猜直接长篇回答；必须先调用 ask_user 提一个简短问题，给出 2–4 个具体方向，并保留用户自己补充的入口。只把问题写在正文、没有调用 ask_user，用户就看不到可点击方向，视为没有完成澄清。用户已经说明明确任务时直接执行或回答，不要为了问而问；单次回复最多调用一次 ask_user。用户回答后如果仍缺少关键信息，可以继续用 ask_user 递进确认，下一页只问一个维度，不要重复已经回答的内容。'
+      : '',
     chatTools.some((tool) => tool.function.name === 'org_directory')
-      ? '遇到“我的组长是谁 / 我在哪个部门 / 公司有哪些部门 / 某部门有谁 / 找某个人”这类组织问题时，直接调用 org_directory 工具，从当前对话推断 intent，不要先让用户输入姓名。工具返回 denied 或没有负责人时，如实说明权限或数据缺失，不要猜。'
+      ? 'org_directory 只用于回答“我的组长是谁 / 我在哪个部门 / 公司有哪些部门 / 某部门有谁 / 找某个人 / 通讯录”这类人员与组织关系问题。用户问业务记录、检查、台账、工单、数量、统计、录入情况时，不要调用 org_directory，即使问题里出现线路、工区、站点、班组等组织名称。'
       : '',
     chatTools.some((tool) => tool.function.name === 'schedule_create')
       ? '用户要“几点提醒我 / 每天/每周/每隔多久执行一次任务”时，直接调用 schedule_create，不要自己心算时间，也不要说“我做不到定时”。把用户的完整任务写进 prompt；短时提醒可用 after_seconds，重复任务可用 every_seconds（最少 300 秒）。创建后把下次执行时间用中文回给用户。查看/删除任务前先用 tool_search 搜 schedule_list / schedule_delete，加载后再调用，只能操作当前员工自己的任务。'
+      : '',
+    pluginPrompts.length > 0
+      ? [
+          '当前已加载插件业务工具。工具选择优先级：',
+          '1. 用户问业务数据、记录、检查、台账、统计、数量、录入情况、接口数据时，优先调用插件工具；先看插件说明里的列表/调用方式，不要用通讯录或知识库工具代替真实业务数据。',
+          '2. 组织通讯录只回答人员、部门、上下级、成员关系；不能因为问题里出现“东环线/工区/站点/班组”等名称就当成通讯录查询。',
+          '3. 不确定该用哪个工具时，调用 tool_search，query 使用用户完整原话（不要只拆“录入/有几条”等单个词），命中后直接调用结果中的工具。',
+        ].join('\n')
       : '',
     pluginPrompts.length > 0 ? `插件工具约定：\n${pluginPrompts.join('\n\n')}` : '',
     hasAttachments
@@ -800,11 +862,70 @@ export interface AgentToolTrace {
   durationMs: number
 }
 
+/**
+ * 引导式澄清：模型没有足够方向时，先给用户一个问题、2–4 个可点击方向，
+ * 并允许用户自己补充。选项由前端渲染成按钮，不是把文字写进回答里。
+ */
+export interface ClarifyOption {
+  id: string
+  label: string
+  description?: string
+}
+
+export interface ClarifyRequest {
+  question: string
+  options: ClarifyOption[]
+  allowCustom: boolean
+}
+
+/** 独立于业务工具注册表的对话交互工具；在 Agent 循环里拦截，不执行真实副作用。 */
+const CLARIFY_TOOL_NAME = 'ask_user'
+
+const CLARIFY_TOOL_SPEC: ChatToolSpec = {
+  type: 'function',
+  function: {
+    name: CLARIFY_TOOL_NAME,
+    description:
+      '当用户没有说明目标、方向或范围，直接回答只能靠猜时，必须先调用本工具向用户提出一个澄清问题，并给出 2–4 个可点击方向；只把问题写成普通正文、不调用本工具，用户看不到选项。用户已经说清楚任务时不要调用，直接执行或回答；每轮最多调用一次。',
+    parameters: {
+      type: 'object',
+      properties: {
+        question: {
+          type: 'string',
+          description: '一个简短、具体的问题，说明需要用户确认什么；不要写成长篇说明。',
+        },
+        options: {
+          type: 'array',
+          description: '2–4 个用户可以点击的候选方向；每个方向用一句短语表达，不要互相重叠。',
+          minItems: 2,
+          maxItems: 4,
+          items: {
+            type: 'object',
+            properties: {
+              label: { type: 'string', description: '按钮上的简短方向，建议 2–12 个字。' },
+              description: { type: 'string', description: '可选的补充说明，帮助用户判断这个方向。' },
+            },
+            required: ['label'],
+            additionalProperties: false,
+          },
+        },
+        allowCustom: {
+          type: 'boolean',
+          description: '是否允许用户不用选项、直接输入自己的方向；默认 true。',
+        },
+      },
+      required: ['question', 'options'],
+      additionalProperties: false,
+    },
+  },
+}
+
 export type AgentEvent =
   | { type: 'reasoning'; text: string }
   | { type: 'content'; text: string }
   | { type: 'tool'; id: string; name: string; toolId: string; args: Record<string, unknown> }
   | { type: 'tool_result'; id: string; status: 'done' | 'error'; summary: string; durationMs: number }
+  | { type: 'clarify'; clarify: ClarifyRequest }
 
 export interface AgentTurnResult {
   runId: string
@@ -814,6 +935,8 @@ export interface AgentTurnResult {
   rounds: number
   promptTokens: number
   completionTokens: number
+  /** 本轮以澄清问题结束时存在；用户回答后作为下一条消息继续。 */
+  clarify?: ClarifyRequest
   /** 实际完成本轮回答的模型；发生故障转移时可能与请求模型不同 */
   usedModelId?: string
   usedModelName?: string
@@ -833,6 +956,108 @@ function parseToolArgs(raw: string): Record<string, unknown> {
   } catch {
     return {}
   }
+}
+
+/** 把模型给的 options 统一成前端可渲染的 2–4 个方向。 */
+function parseClarifyRequest(args: Record<string, unknown>): ClarifyRequest | null {
+  const question = String(args.question ?? '').replace(/\s+/g, ' ').trim().slice(0, 240)
+  if (!question) return null
+
+  let rawOptions: unknown = args.options
+  if (typeof rawOptions === 'string') {
+    const text = rawOptions.trim()
+    if (!text) return null
+    try {
+      rawOptions = JSON.parse(text)
+    } catch {
+      rawOptions = text.split(/\r?\n|｜|\|/).map((item) => item.trim()).filter(Boolean)
+    }
+  }
+  if (!Array.isArray(rawOptions)) return null
+
+  const options: ClarifyOption[] = []
+  for (const item of rawOptions) {
+    const label = typeof item === 'string'
+      ? item.replace(/\s+/g, ' ').trim()
+      : String((item as Record<string, unknown> | null)?.label ?? '').replace(/\s+/g, ' ').trim()
+    if (!label) continue
+    const description = typeof item === 'object' && item !== null
+      ? String((item as Record<string, unknown>).description ?? '').replace(/\s+/g, ' ').trim().slice(0, 120)
+      : ''
+    if (options.some((option) => option.label === label)) continue
+    options.push({
+      id: `option-${options.length + 1}`,
+      label: label.slice(0, 60),
+      ...(description ? { description } : {}),
+    })
+    if (options.length >= 4) break
+  }
+  if (options.length < 2) return null
+
+  const allowCustom = args.allowCustom === undefined ? true : args.allowCustom !== false && args.allowCustom !== 'false'
+  return { question, options, allowCustom }
+}
+
+/**
+ * 模型有时会把澄清问题只写成正文。这里识别“短问句”并在下一调用里强制走
+ * ask_user，避免用户只看到一句问题、没有可点击方向；正常长回答不会命中。
+ */
+function looksLikeClarifyQuestion(text: string): boolean {
+  const compact = String(text || '').replace(/\s+/g, '').trim()
+  if (!compact || compact.length > 180 || !/[？?]$/.test(compact)) return false
+  if (/[。！!]/.test(compact.slice(0, -1))) return false
+  return /(你|您).*(哪|什么|怎么|如何|希望|想先|方向|方面|开始|安排|帮我)|请告诉我|要不要我|需要我帮/i.test(compact)
+}
+
+function lastUserText(messages: readonly LlmMessage[]): string {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]
+    if (message.role !== 'user') continue
+    if (typeof message.content === 'string') return message.content.trim()
+    return message.content
+      .filter((part) => part.type === 'text')
+      .map((part) => part.text)
+      .join('\n')
+      .trim()
+  }
+  return ''
+}
+
+/** 真正“没说明方向”的短请求，才允许用通用方向兜底。 */
+function looksLikeVagueRequest(text: string): boolean {
+  const compact = String(text || '').replace(/\s+/g, '').trim()
+  if (!compact || compact.length > 80) return false
+  if (/随便|都行|看着办|没想好|不确定|不太清楚|迷茫|不知道|从哪|先做什么|该做什么|怎么安排|有什么建议|给点建议/.test(compact)) {
+    return true
+  }
+  return /^(帮我看看|看看吧|你说呢|怎么办|咋办)[？?]?$/.test(compact)
+}
+
+/**
+ * 模型只写了澄清问题、没有给出结构化方向时的兜底。问题仍用模型原文，
+ * 方向取当前工作台最常用的四类能力，保证用户能点击或手动补充，而不是
+ * 停留在一句无法操作的正文问句上。
+ */
+function fallbackClarify(question: string): ClarifyRequest {
+  return {
+    question: question.trim(),
+    allowCustom: true,
+    options: [
+      { id: 'fallback-work', label: '梳理今日工作重点', description: '一起列出今天要做的事并排优先级' },
+      { id: 'fallback-org', label: '查看组织信息', description: '查我的部门、组长或同事信息' },
+      { id: 'fallback-kb', label: '查找公司资料', description: '在知识库里找制度、流程或相关文档' },
+      { id: 'fallback-remind', label: '设个提醒或待办', description: '帮你创建定时提醒或安排事项' },
+    ],
+  }
+}
+
+/** 渠道消息没有可点击卡片时，把澄清方向和“可补充”说明一起发给用户。 */
+export function formatClarifyText(clarify: ClarifyRequest | null | undefined): string {
+  if (!clarify) return ''
+  const options = clarify.options
+    .map((option, index) => `${index + 1}. ${option.label}${option.description ? `：${option.description}` : ''}`)
+    .join('\n')
+  return `${clarify.question}\n\n${options}${clarify.allowCustom ? '\n\n也可以直接回复你自己的方向。' : ''}`
 }
 
 interface SubAgentTask {
@@ -896,9 +1121,14 @@ async function spawnSubAgents(opts: {
   }
   const maxParallel = Math.max(1, Math.min(8, opts.deps.config.agentMaxParallel ?? 4))
   const tasks = opts.tasks.slice(0, maxParallel)
-  const catalog = loadModelCatalog(opts.deps.db, opts.actor.subject.companyId, opts.deps.config.devAuth)
+  const catalog = loadModelCatalog(
+    opts.deps.db,
+    opts.actor.subject.companyId,
+    opts.deps.config.devAuth,
+    opts.actor.subject.userId,
+  )
   const allowedModels = new Set(
-    visibleModelsFor(catalog, [...opts.actor.subject.roles]).map((model) => model.id),
+    visibleModelsFor(catalog, [...opts.actor.subject.roles], opts.actor.subject.companyId).map((model) => model.id),
   )
   // 父回合已经通过的模型允许子 Agent 继续使用；只对显式覆盖的模型再做可见性校验。
   allowedModels.add(opts.parentModelId)
@@ -1010,6 +1240,41 @@ function modelDisplayName(db: Db, companyId: string, modelId: string): string {
   return findModelById(db, companyId, modelId)?.name ?? modelId
 }
 
+/** 当前候选模型开放给员工选择的思考档位。 */
+function thinkingConfigForModel(db: Db, companyId: string, modelId: string): ThinkingConfig | null {
+  const plugin = listPluginModels(companyId).find((model) => model.id === modelId)
+  if (plugin) return plugin.thinking
+  return thinkingConfigOf(findModelById(db, companyId, modelId)?.config ?? {})
+}
+
+/**
+ * 把「员工选的档位 + 模型配置」换算成本次调用的参数。
+ *
+ * - effort 策略：把档位交给上游原生参数（OpenAI 是 reasoning_effort，
+ *   Anthropic/Gemini 是 thinking 预算）；DSH 插件则由插件自己换算。
+ * - budget 策略：不发思考字段，直接把档位变成 max_tokens 上限，
+ *   适合会忽略 reasoning_effort 的网关。
+ */
+function thinkingCallPlan(
+  config: ThinkingConfig | null,
+  requested: string | undefined,
+  baseMaxTokens: number,
+): { effort?: string; maxTokens: number; maxTokensCap?: number } {
+  const effort = resolveThinkingEffort(config, requested)
+  if (!effort) return { maxTokens: baseMaxTokens }
+  if (config?.strategy === 'budget' && effort !== 'disabled') {
+    const ceiling = thinkingBudgetCeiling(effort)
+    if (ceiling) {
+      return {
+        maxTokens: Math.min(baseMaxTokens, ceiling),
+        maxTokensCap: ceiling,
+      }
+    }
+    return { maxTokens: baseMaxTokens }
+  }
+  return { effort, maxTokens: baseMaxTokens }
+}
+
 /**
  * 对话 Agent 循环：模型可以多轮「思考 → 调工具 → 看结果 → 继续回答」，最多 4 轮工具调用。
  * 事件通过 emit 实时下发；最终文本、思考内容和工具轨迹一起落库，刷新后还能回看。
@@ -1022,6 +1287,8 @@ export async function runAgentTurn(opts: {
   messages: LlmMessage[]
   emit: (event: AgentEvent) => void
   maxTokens?: number
+  /** 会话选中的思考档位；模型不支持时按模型默认档位回落。 */
+  reasoningEffort?: string
   /** 插件工具需要当前会话 id（例如钉卡片按 sessionId 找发卡对象） */
   sessionId?: string
   /** 当前文件空间：决定是否暴露云空间工具；none 不暴露任何文件工具 */
@@ -1108,13 +1375,25 @@ export async function runAgentTurn(opts: {
     const space = opts.space ?? { kind: 'cloud' }
     // 一次用户消息内的稳定回合 id：同一回合模型重复发出相同工具调用时只执行一次。
     const turnId = randomUUID()
-    // 全量工具只用于“可加载目录”和权限校验；真正发给模型的是核心工具 + tool_search。
-    const allTools = toolSpecsForActor(deps.db, actor, space)
-    let tools = toolSpecsForAgent(deps.db, actor, space)
+    // ask_user 是对话交互工具，不放进业务工具目录；始终随本轮工具一起提供，
+    // 由下面的工具循环拦截，不会执行真实副作用，也不能被 tool_search 隐藏。
+    const allTools = [...toolSpecsForActor(deps.db, actor, space), CLARIFY_TOOL_SPEC]
+    const lastUserContent = [...opts.messages].reverse().find((message) => message.role === 'user')?.content
+    const currentQuestion = typeof lastUserContent === 'string' ? lastUserContent : ''
+    let tools = [
+      ...toolSpecsForAgent(deps.db, actor, space, currentQuestion),
+      CLARIFY_TOOL_SPEC,
+    ]
     const allowedToolNames = new Set(allTools.map((tool) => tool.function.name))
     const activeToolNames = new Set(tools.map((tool) => tool.function.name))
     const modelProfile = findModelById(deps.db, actor.subject.companyId, modelId)
-    const maxOutputTokens = opts.maxTokens ?? modelProfile?.maxOutputTokens ?? 4096
+    const baseMaxOutputTokens = opts.maxTokens ?? modelProfile?.maxOutputTokens ?? 4096
+    const primaryCallPlan = thinkingCallPlan(
+      thinkingConfigForModel(deps.db, actor.subject.companyId, modelId),
+      opts.reasoningEffort,
+      baseMaxOutputTokens,
+    )
+    const maxOutputTokens = primaryCallPlan.maxTokens
     let messages: LlmMessage[] = [...opts.messages]
     if (modelProfile?.maxContext && modelProfile.contextCompression !== false) {
       const compressed = compressMessagesForContext(messages, {
@@ -1132,6 +1411,7 @@ export async function runAgentTurn(opts: {
     let sawModel = false
     let activeModelId = modelId
     let fallbackFromModelId: string | null = null
+    let clarifyRepairUsed = false
     const failedModelIds = new Set<string>()
     const fallbackIds = (opts.fallbackModelIds ?? []).filter((id) => id && id !== modelId)
 
@@ -1163,9 +1443,20 @@ export async function runAgentTurn(opts: {
           if (opts.bufferModelEvents) bufferedEvents.push(event)
           else emit(event)
         }
+        const candidateProfile = candidateId === activeModelId
+          ? modelProfile
+          : findModelById(deps.db, actor.subject.companyId, candidateId)
+        const candidateBaseMax = opts.maxTokens ?? candidateProfile?.maxOutputTokens ?? baseMaxOutputTokens
+        const callPlan = thinkingCallPlan(
+          thinkingConfigForModel(deps.db, actor.subject.companyId, candidateId),
+          opts.reasoningEffort,
+          candidateBaseMax,
+        )
         const streamOptions = {
           tools,
           signal: opts.signal,
+          ...(callPlan.effort ? { reasoningEffort: callPlan.effort } : {}),
+          ...(callPlan.maxTokensCap ? { maxTokensCap: callPlan.maxTokensCap } : {}),
           onEvent: (event: { type: 'reasoning' | 'content'; text: string }) => {
             if (event.type === 'reasoning') {
               if (round > 0 && !roundReasoningStarted && reasoning.trim()) {
@@ -1189,7 +1480,7 @@ export async function runAgentTurn(opts: {
                 candidateId,
                 messages,
                 streamOptions,
-                opts.maxTokens ?? maxOutputTokens,
+                callPlan.maxTokens,
               )
             : await callModelStream(
                 deps.db,
@@ -1198,7 +1489,7 @@ export async function runAgentTurn(opts: {
                 candidateId,
                 messages,
                 streamOptions,
-                opts.maxTokens ?? maxOutputTokens,
+                callPlan.maxTokens,
               )
           if (isPluginModelId(candidateId) && candidateResult === null) {
             throw new EabError(EC.NOT_FOUND, '插件模型已下线或尚未完成注册', { details: { modelId: candidateId } })
@@ -1211,6 +1502,7 @@ export async function runAgentTurn(opts: {
           result = candidateResult
           sawModel = true
           markModelHealthy(actor.subject.companyId, candidateId)
+          markModelPreferred(actor.subject.companyId, candidateId)
           if (candidateId !== activeModelId) {
             const fromModelId = activeModelId
             const fromModelName = modelDisplayName(deps.db, actor.subject.companyId, fromModelId)
@@ -1263,7 +1555,154 @@ export async function runAgentTurn(opts: {
       promptTokens += result.promptTokens
       completionTokens += result.completionTokens
       const calls: LlmToolCall[] = result.toolCalls ?? []
+
+      // 修复“只把澄清问题写成正文”的情况：先强制模型用 ask_user 重答一次；
+      // 若上游不支持强制工具调用，再把原文问题包装成服务端兜底卡片。
+      if (calls.length === 0 && !clarifyRepairUsed && looksLikeClarifyQuestion(result.text)) {
+        clarifyRepairUsed = true
+        const originalText = result.text
+        const originalReasoning = reasoning
+        const vagueRequest = looksLikeVagueRequest(lastUserText(messages))
+        try {
+          const repairProfile = findModelById(deps.db, actor.subject.companyId, activeModelId)
+          const repairPlan = thinkingCallPlan(
+            thinkingConfigForModel(deps.db, actor.subject.companyId, activeModelId),
+            opts.reasoningEffort,
+            opts.maxTokens ?? repairProfile?.maxOutputTokens ?? maxOutputTokens,
+          )
+          const repairOptions: ModelStreamOptions = {
+            tools,
+            signal: opts.signal,
+            toolChoice: { type: 'function', function: { name: CLARIFY_TOOL_NAME } },
+            ...(repairPlan.effort ? { reasoningEffort: repairPlan.effort } : {}),
+            ...(repairPlan.maxTokensCap ? { maxTokensCap: repairPlan.maxTokensCap } : {}),
+          }
+          const repaired = isPluginModelId(activeModelId)
+            ? await callPluginModel(
+                actor.subject.companyId,
+                activeModelId,
+                messages,
+                repairOptions,
+                repairPlan.maxTokens,
+              )
+            : await callModelStream(
+                deps.db,
+                deps.config.dbPath,
+                actor.subject.companyId,
+                activeModelId,
+                messages,
+                repairOptions,
+                repairPlan.maxTokens,
+              )
+          if (repaired) {
+            promptTokens += repaired.promptTokens
+            completionTokens += repaired.completionTokens
+            const repairCalls: LlmToolCall[] = repaired.toolCalls ?? []
+            const repairClarify = repairCalls.find((call) => call.function.name === CLARIFY_TOOL_NAME)
+            const clarify = repairClarify ? parseClarifyRequest(parseToolArgs(repairClarify.function.arguments)) : null
+            if (clarify) {
+              text = clarify.question
+              emit({ type: 'clarify', clarify })
+              return {
+                runId,
+                text: clarify.question,
+                reasoning: originalReasoning,
+                toolCalls: traces,
+                rounds,
+                promptTokens,
+                completionTokens,
+                clarify,
+                usedModelId: activeModelId,
+                usedModelName: modelDisplayName(deps.db, actor.subject.companyId, activeModelId),
+                fallbackFromModelId,
+              }
+            }
+          }
+        } catch {
+          // 强制工具调用不被上游支持时，退回原始正文；不要把模型标记为不可用。
+        }
+        // 修复调用没有拿到结构化选项时，仅对“确实没说明方向”的用户请求用服务端兜底，
+        // 避免把普通追问硬转成通用方向。
+        const fallback = vagueRequest ? fallbackClarify(originalText) : null
+        if (fallback?.question) {
+          text = fallback.question
+          reasoning = originalReasoning
+          emit({ type: 'clarify', clarify: fallback })
+          return {
+            runId,
+            text: fallback.question,
+            reasoning,
+            toolCalls: traces,
+            rounds,
+            promptTokens,
+            completionTokens,
+            clarify: fallback,
+            usedModelId: activeModelId,
+            usedModelName: modelDisplayName(deps.db, actor.subject.companyId, activeModelId),
+            fallbackFromModelId,
+          }
+        }
+        text = originalText
+        reasoning = originalReasoning
+      }
       if (calls.length === 0) break
+
+      // 澄清是“本轮结束、等用户回答”的交互，不进入普通工具执行队列。
+      const clarifyCall = calls.find((call) => call.function.name === CLARIFY_TOOL_NAME)
+      if (clarifyCall) {
+        const clarify = parseClarifyRequest(parseToolArgs(clarifyCall.function.arguments))
+        if (clarify) {
+          emit({ type: 'clarify', clarify })
+          return {
+            runId,
+            text: clarify.question,
+            reasoning,
+            toolCalls: traces,
+            rounds,
+            promptTokens,
+            completionTokens,
+            clarify,
+            usedModelId: activeModelId,
+            usedModelName: modelDisplayName(deps.db, actor.subject.companyId, activeModelId),
+            fallbackFromModelId,
+          }
+        }
+        // 模型给的方向不合法（少于两个等）时不把它当普通工具执行，也不报工具错误；
+        // 用户确实没说方向时，用服务端兜底把问题补成可点击的方向，避免只留一句正文问句。
+        const invalidText = String(result.text ?? '').trim() || '请告诉我你想先处理哪件事？'
+        const invalidClarify =
+          looksLikeVagueRequest(lastUserText(messages)) && looksLikeClarifyQuestion(invalidText)
+            ? fallbackClarify(invalidText)
+            : null
+        if (invalidClarify) {
+          emit({ type: 'clarify', clarify: invalidClarify })
+          return {
+            runId,
+            text: invalidClarify.question,
+            reasoning,
+            toolCalls: traces,
+            rounds,
+            promptTokens,
+            completionTokens,
+            clarify: invalidClarify,
+            usedModelId: activeModelId,
+            usedModelName: modelDisplayName(deps.db, actor.subject.companyId, activeModelId),
+            fallbackFromModelId,
+          }
+        }
+        return {
+          runId,
+          text: invalidText,
+          reasoning,
+          toolCalls: traces,
+          rounds,
+          promptTokens,
+          completionTokens,
+          usedModelId: activeModelId,
+          usedModelName: modelDisplayName(deps.db, actor.subject.companyId, activeModelId),
+          fallbackFromModelId,
+        }
+      }
 
     messages.push({ role: 'assistant', content: result.text ?? '', tool_calls: calls })
     for (const call of calls) {
@@ -1273,6 +1712,13 @@ export async function runAgentTurn(opts: {
       const toolId = def?.id ?? (pluginTool ? `plugin:${pluginTool.pluginId}:${pluginTool.name}` : functionName)
       const toolName = def?.name ?? pluginTool?.name ?? functionName
       const args = parseToolArgs(call.function.arguments)
+      if (functionName === 'tool_search' && currentQuestion) {
+        const asked = String((args as { query?: unknown }).query ?? '').trim()
+        // 模型有时只拿“录入/几条”这种碎片词搜索，命中不到插件业务工具；
+        // 统一补上用户完整原话，保证检索覆盖整句意图。
+        if (!asked) (args as { query?: string }).query = currentQuestion
+        else if (!asked.includes(currentQuestion)) (args as { query?: string }).query = `${currentQuestion} ${asked}`
+      }
       const traceId = `${round + 1}-${call.id}`
       const trace: AgentToolTrace = {
         id: traceId,
@@ -1403,7 +1849,7 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
       maxConcurrent: deps.config.chatMaxConcurrent ?? 8,
       queueLimit: deps.config.chatQueueLimit ?? 100,
       queueTimeoutMs: deps.config.chatQueueTimeoutMs ?? 240_000,
-      maxInFlightPerUser: deps.config.chatUserMaxInFlight ?? 2,
+      maxInFlightPerUser: deps.config.chatUserMaxInFlight ?? 0,
       messagesPerMinute: deps.config.chatUserMessagesPerMinute ?? 20,
       modelMaxConcurrent: deps.config.chatModelMaxConcurrent ?? 4,
       companyMaxConcurrent: deps.config.chatCompanyMaxConcurrent ?? deps.config.chatMaxConcurrent ?? 8,
@@ -1413,10 +1859,14 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
     const roles = [...subject.roles]
     const canChat = scopeAllows(subject.scopes, SC.CHAT_USE)
     const canUseModel = scopeAllows(subject.scopes, SC.MODEL_USE)
-    const catalog = loadModelCatalog(deps.db, subject.companyId, deps.config.devAuth)
-    const models = canChat && canUseModel ? visibleModelsFor(catalog, roles) : []
+    const catalog = loadModelCatalog(deps.db, subject.companyId, deps.config.devAuth, subject.userId)
+    const models = canChat && canUseModel
+      ? visibleModelsFor(catalog, roles, subject.companyId)
+      : []
     const defaultRoute = resolveModelForPurpose(deps.db, subject.companyId, 'chat.default')
-    const autoModel = defaultRoute ? models.find((model) => model.id === defaultRoute.id) : undefined
+    const preferred = preferredModelId(subject.companyId)
+    const preferredModel = preferred ? models.find((model) => model.id === preferred) : undefined
+    const autoModel = preferredModel ?? (defaultRoute ? models.find((model) => model.id === defaultRoute.id) : undefined)
     const firstNativeModel = models.find((model) => !isPluginModelId(model.id))
 
     return ok({
@@ -1436,6 +1886,7 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
         provider: model.provider,
         providerName: model.providerName,
         modelKey: model.modelKey,
+        thinking: model.thinking ?? null,
       })),
     })
   })
@@ -1447,10 +1898,16 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
     }
     const rows = deps.db
       .prepare(
-        `SELECT id, title, source, created_at, updated_at, last_message_at
+        `SELECT id, title, source, created_at, updated_at, last_message_at, last_read_at,
+                EXISTS(
+                  SELECT 1 FROM chat_messages m
+                   WHERE m.session_id = chat_sessions.id
+                     AND m.role = 'assistant'
+                     AND m.created_at > COALESCE(chat_sessions.last_read_at, 0)
+                ) AS unread
            FROM chat_sessions
           WHERE company_id = ? AND user_id = ? AND deleted_at IS NULL
-          ORDER BY COALESCE(last_message_at, updated_at) DESC LIMIT 50`,
+          ORDER BY COALESCE(last_message_at, updated_at) DESC, created_at DESC LIMIT 50`,
       )
       .all(actor.subject.companyId, actor.person.id) as unknown as SessionRow[]
     return ok({
@@ -1458,10 +1915,51 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
         id: row.id,
         title: row.title,
         source: row.source ?? 'web',
+        unread: Boolean(row.unread),
         createdAt: new Date(Number(row.created_at)).toISOString(),
         updatedAt: new Date(Number(row.last_message_at ?? row.updated_at)).toISOString(),
       })),
     })
+  })
+
+  /** 当前会话完成回复后前端显式标记已读；进入会话时也由消息接口自动标记。 */
+  app.post<{ Params: { id: string } }>('/api/chat/sessions/:id/read', async (req) => {
+    const actor = resolveActor(deps.db, deps.config, req, deps.companyId)
+    if (!scopeAllows(actor.subject.scopes, SC.CHAT_USE)) {
+      throw new EabError(EC.SCOPE_DENIED, '当前身份没有对话权限（chat:use）')
+    }
+    const changed = deps.db
+      .prepare(
+        `UPDATE chat_sessions SET last_read_at = ?
+          WHERE id = ? AND company_id = ? AND user_id = ? AND deleted_at IS NULL`,
+      )
+      .run(Date.now(), req.params.id, actor.subject.companyId, actor.person.id)
+    if (Number(changed.changes) === 0) throw new EabError(EC.NOT_FOUND, '会话不存在或已删除')
+    return ok({ read: true })
+  })
+
+  /** 页面刷新/重新登录后取仍在运行的回合，先补快照再接 EventSource。 */
+  app.get('/api/chat/runs/active', async (req) => {
+    const actor = resolveActor(deps.db, deps.config, req, deps.companyId)
+    if (!scopeAllows(actor.subject.scopes, SC.CHAT_USE)) {
+      throw new EabError(EC.SCOPE_DENIED, '当前身份没有对话权限（chat:use）')
+    }
+    return ok({
+      runs: activeChatRuns(actor.subject.companyId, actor.person.id),
+    })
+  })
+
+  /** 只有用户主动点停止才取消；关页面/刷新/切会话都不会走到这里。 */
+  app.post<{ Params: { runId: string } }>('/api/chat/runs/:runId/cancel', async (req) => {
+    const actor = resolveActor(deps.db, deps.config, req, deps.companyId)
+    if (!scopeAllows(actor.subject.scopes, SC.CHAT_USE)) {
+      throw new EabError(EC.SCOPE_DENIED, '当前身份没有对话权限（chat:use）')
+    }
+    const cancelled = cancelChatRun(req.params.runId, {
+      companyId: actor.subject.companyId,
+      userId: actor.person.id,
+    })
+    return ok({ cancelled })
   })
 
   /**
@@ -1542,7 +2040,7 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
     const actor = resolveActor(deps.db, deps.config, req, deps.companyId)
     const session = deps.db
       .prepare(
-        'SELECT id, title, source, space_kind, space_id, model_id FROM chat_sessions WHERE id = ? AND company_id = ? AND user_id = ? AND deleted_at IS NULL',
+        'SELECT id, title, source, space_kind, space_id, model_id, reasoning_effort FROM chat_sessions WHERE id = ? AND company_id = ? AND user_id = ? AND deleted_at IS NULL',
       )
       .get(req.params.id, actor.subject.companyId, actor.person.id) as
       | {
@@ -1552,6 +2050,7 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
           space_kind: string | null
           space_id: string | null
           model_id: string | null
+          reasoning_effort: string | null
         }
       | undefined
     if (!session) throw new EabError(EC.NOT_FOUND, '会话不存在或已删除')
@@ -1595,8 +2094,18 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
 
     const hasMore = rows.length > limit
     const page = (hasMore ? rows.slice(0, limit) : rows).slice().reverse()
+    // 打开会话（加载最新一页）即视为看过；翻更早历史不改变“已读到最新”的位置。
+    if (!before) {
+      deps.db
+        .prepare('UPDATE chat_sessions SET last_read_at = ? WHERE id = ? AND user_id = ?')
+        .run(Date.now(), session.id, actor.person.id)
+    }
     return ok({
-      session: { ...session, modelId: session.model_id },
+      session: {
+        ...session,
+        modelId: session.model_id,
+        reasoningEffort: session.reasoning_effort,
+      },
       messages: page.map((row) => ({
         id: row.id,
         role: row.role,
@@ -1628,7 +2137,10 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
     },
   )
 
-  app.post<{ Params: { id: string }; Body: { modelId?: string | null } }>(
+  app.post<{
+    Params: { id: string }
+    Body: { modelId?: string | null; reasoningEffort?: string | null }
+  }>(
     '/api/chat/sessions/:id/model',
     async (req) => {
       const actor = resolveActor(deps.db, deps.config, req, deps.companyId)
@@ -1648,8 +2160,13 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
       if (!session) throw new EabError(EC.NOT_FOUND, '会话不存在或已删除')
 
       const requested = req.body?.modelId === null ? null : String(req.body?.modelId ?? '').trim() || null
-      const catalog = loadModelCatalog(deps.db, actor.subject.companyId, deps.config.devAuth)
-      const available = visibleModelsFor(catalog, [...actor.subject.roles])
+      const catalog = loadModelCatalog(
+        deps.db,
+        actor.subject.companyId,
+        deps.config.devAuth,
+        actor.subject.userId,
+      )
+      const available = visibleModelsFor(catalog, [...actor.subject.roles], actor.subject.companyId)
       const model = requested ? available.find((item) => item.id === requested) : null
       if (requested && !model) {
         // 不区分“不存在”和“无权使用”，避免通过错误信息探测模型。
@@ -1658,13 +2175,46 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
         })
       }
 
+      const rawEffort = req.body?.reasoningEffort === undefined
+        ? null
+        : String(req.body.reasoningEffort ?? '').trim()
+      let reasoningEffort: string | null = null
+      if (rawEffort) {
+        if (!/^[a-zA-Z0-9_-]{1,40}$/.test(rawEffort)) {
+          throw new EabError(EC.VALIDATION, '思考档位格式不正确')
+        }
+        if (model) {
+          if (!model.thinking) {
+            throw new EabError(EC.VALIDATION, '该模型没有开放思考选项')
+          }
+          reasoningEffort = resolveThinkingEffort(model.thinking, rawEffort) || null
+        } else {
+          // 自动选模时会话还没有具体模型；这里先存员工选择，
+          // 真正发消息时再按当时选中的模型校验并回落到默认档位。
+          reasoningEffort = rawEffort
+        }
+      }
+
       const changed = deps.db
         .prepare(
-          'UPDATE chat_sessions SET model_id = ?, updated_at = ? WHERE id = ? AND company_id = ? AND user_id = ? AND deleted_at IS NULL',
+          `UPDATE chat_sessions
+              SET model_id = ?, reasoning_effort = ?, updated_at = ?
+            WHERE id = ? AND company_id = ? AND user_id = ? AND deleted_at IS NULL`,
         )
-        .run(model?.id ?? null, Date.now(), req.params.id, actor.subject.companyId, actor.person.id)
+        .run(
+          model?.id ?? null,
+          reasoningEffort,
+          Date.now(),
+          req.params.id,
+          actor.subject.companyId,
+          actor.person.id,
+        )
       if (Number(changed.changes) === 0) throw new EabError(EC.NOT_FOUND, '会话不存在或已删除')
-      return ok({ modelId: model?.id ?? null, modelName: model?.name ?? null })
+      return ok({
+        modelId: model?.id ?? null,
+        modelName: model?.name ?? null,
+        reasoningEffort,
+      })
     },
   )
 
@@ -1761,6 +2311,12 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
       stream?: boolean
       /** 本轮使用的文件空间：cloud（默认）/ none */
       spaceKind?: 'cloud' | 'none'
+      /** 多页引导式澄清：同一流程 id；选择答案作为隐藏续跑消息写入 */
+      clarifyFlowId?: string
+      /** 多页引导式澄清：当前页序号，用于前端显示“第 N 步” */
+      clarifyStep?: number
+      /** 本轮思考档位；不传时沿用会话保存的档位 */
+      reasoningEffort?: string | null
     }
   }>('/api/chat/messages', { bodyLimit: 60 * 1024 * 1024 }, async (req, reply) => {
     const actor = resolveActor(deps.db, deps.config, req, deps.companyId)
@@ -1785,6 +2341,16 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
 
     const text = String(req.body?.text ?? '').trim()
     if (text.length > 4000) throw new EabError(EC.VALIDATION, '单条消息最多 4000 字')
+    // 引导式澄清的后续页：用户选择作为隐藏的续跑消息写入，不作为普通聊天消息展示。
+    // flowId 只用于把同一组多页澄清串起来，step 用于前端显示“第 N 步”。
+    const clarifyFlowId =
+      typeof req.body?.clarifyFlowId === 'string' ? req.body.clarifyFlowId.trim().slice(0, 80) : ''
+    const clarifyStepRaw = Number(req.body?.clarifyStep)
+    const clarifyStep =
+      Number.isFinite(clarifyStepRaw) && clarifyStepRaw > 0
+        ? Math.min(20, Math.trunc(clarifyStepRaw))
+        : 0
+    const clarifyTrace = clarifyFlowId ? { clarifyFlowId, clarifyStep } : {}
     const rawAttachments = req.body?.attachments
     if (rawAttachments !== undefined && !Array.isArray(rawAttachments)) {
       throw new EabError(EC.VALIDATION, 'attachments 必须是数组')
@@ -1824,8 +2390,13 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
     const spaceLabel = rawSpaceKind === 'none' ? '未选择文件空间' : '云空间'
 
     const roles = [...actor.subject.roles]
-    const catalog = loadModelCatalog(deps.db, actor.subject.companyId, deps.config.devAuth)
-    const available = visibleModelsFor(catalog, roles)
+    const catalog = loadModelCatalog(
+      deps.db,
+      actor.subject.companyId,
+      deps.config.devAuth,
+      actor.subject.userId,
+    )
+    const available = visibleModelsFor(catalog, roles, actor.subject.companyId)
     if (available.length === 0) {
       throw new EabError(EC.FORBIDDEN, '当前身份没有任何可用模型，请联系管理员授权', {
         details: { requiredScope: SC.MODEL_USE },
@@ -1833,16 +2404,17 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
     }
 
     const modelIdProvided = Object.prototype.hasOwnProperty.call(req.body ?? {}, 'modelId')
-    const sessionModelId = req.body?.sessionId
+    const sessionState = req.body?.sessionId
       ? (deps.db
           .prepare(
-            'SELECT model_id FROM chat_sessions WHERE id = ? AND company_id = ? AND user_id = ? AND deleted_at IS NULL',
+            'SELECT model_id, reasoning_effort FROM chat_sessions WHERE id = ? AND company_id = ? AND user_id = ? AND deleted_at IS NULL',
           )
           .get(req.body.sessionId, actor.subject.companyId, actor.person.id) as
-          | { model_id: string | null }
+          | { model_id: string | null; reasoning_effort: string | null }
           | undefined
-        )?.model_id ?? null
+        ) ?? null
       : null
+    const sessionModelId = sessionState?.model_id ?? null
     let requested = modelIdProvided ? (req.body?.modelId ?? null) : sessionModelId
     const hasImageAttachments = attachments.some((item) => Boolean(item.dataUrl))
     const imageModels = available.filter((item) => modelSupportsVision(item.tags, item.capabilities))
@@ -1867,6 +2439,11 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
         details: { modelId: model.id, requiredCapability: 'vision' },
       })
     }
+    // 会话里的档位可能来自上一个模型：按当前模型重新校验，过期选择回落默认档位。
+    const requestedEffort = Object.prototype.hasOwnProperty.call(req.body ?? {}, 'reasoningEffort')
+      ? String(req.body?.reasoningEffort ?? '').trim()
+      : String(sessionState?.reasoning_effort ?? '').trim()
+    const reasoningEffort = resolveThinkingEffort(model.thinking ?? null, requestedEffort)
     const primaryModelId = model.id
     const fallbackModelIds = available
       .filter(
@@ -1887,12 +2464,15 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
     sessionId = ensureSession(deps.db, actor, req.body?.sessionId, text || attachments[0]?.name || '新对话')
     deps.db
       .prepare(
-        'UPDATE chat_sessions SET space_kind = ?, space_id = ?, model_id = ?, updated_at = ?, last_message_at = ? WHERE id = ?',
+        `UPDATE chat_sessions
+            SET space_kind = ?, space_id = ?, model_id = ?, reasoning_effort = ?, updated_at = ?, last_message_at = ?
+          WHERE id = ?`,
       )
       .run(
         space.kind,
         null,
         autoSelected ? null : model.id,
+        reasoningEffort || null,
         Date.now(),
         Date.now(),
         sessionId,
@@ -1913,7 +2493,7 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
       content: string
     }>
     const history = historyOf(deps.db, sessionId)
-    const chatTools = toolSpecsForAgent(deps.db, actor, space)
+    const chatTools = [...toolSpecsForAgent(deps.db, actor, space, text), CLARIFY_TOOL_SPEC]
     const pluginPrompts = pluginPromptTexts(deps.db, actor)
     const system = buildSystemPrompt({
       actor,
@@ -1949,6 +2529,7 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
         model.name,
         JSON.stringify({
           channel: 'web',
+          ...clarifyTrace,
           attachments: attachmentMeta(attachments),
           space: {
             kind: space.kind,
@@ -1960,10 +2541,26 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
       )
 
     const assistantMessageId = `msg_${randomUUID()}`
+    const chatRunId = `run_${randomUUID()}`
     const streaming = req.body?.stream === true
+    if (streaming) {
+      beginChatRun({
+        runId: chatRunId,
+        companyId: actor.subject.companyId,
+        userId: actor.person.id,
+        sessionId,
+        messageId: assistantMessageId,
+        modelId: model.id,
+        modelName: model.name,
+        autoSelected,
+        controller: abortController,
+      })
+    }
     let seq = 0
     const emitSse = (event: string, data: Record<string, unknown>) => {
       if (!streaming) return
+      // 页面关掉/刷新后连接已销毁，继续 write 只会堆缓冲；后台快照照常记录。
+      if (reply.raw.destroyed || reply.raw.writableEnded) return
       seq += 1
       try {
         reply.raw.write(`id: ${seq}\nevent: ${event}\ndata: ${JSON.stringify({ seq, ...data })}\n\n`)
@@ -1980,18 +2577,22 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
         connection: 'keep-alive',
         'x-accel-buffering': 'no',
       })
-      reply.raw.write(
-        `event: meta\ndata: ${JSON.stringify({
-          sessionId,
-          messageId: assistantMessageId,
-          modelId: model.id,
-          modelName: model.name,
-          autoSelected,
-        })}\n\n`,
-      )
-      // 浏览器点「停止当前回复并发送」会断开 SSE；断开后中止模型流，
-      // 避免旧 turn 继续跑、继续写库，下一轮才能干净地接上。
-      reply.raw.on('close', () => abortController.abort())
+      if (!reply.raw.destroyed && !reply.raw.writableEnded) {
+        reply.raw.write(
+          `event: meta\ndata: ${JSON.stringify({
+            sessionId,
+            messageId: assistantMessageId,
+            runId: chatRunId,
+            modelId: model.id,
+            modelName: model.name,
+            autoSelected,
+          })}\n\n`,
+        )
+      }
+      /**
+       * 连接断开不再中止模型：切会话、刷新、关页面、重新登录都只是少了一个
+       * 观看者，后台回合继续跑并落库；只有 /api/chat/runs/:id/cancel 会取消。
+       */
     }
 
     let agent: AgentTurnResult | null = null
@@ -2000,6 +2601,7 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
         deps,
         actor,
         modelId: model.id,
+        reasoningEffort: reasoningEffort || undefined,
         fallbackModelIds,
         onModelFailover: (change) => {
           const next = available.find((item) => item.id === change.toModelId)
@@ -2011,10 +2613,17 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
         space,
         signal: streaming ? abortController.signal : undefined,
         emit: (event) => {
-          if (event.type === 'reasoning') emitSse('reasoning', { text: event.text })
-          else if (event.type === 'content') emitSse('delta', { text: event.text })
-          else if (event.type === 'tool') {
+          if (event.type === 'reasoning') {
+            emitSse('reasoning', { text: event.text })
+            noteChatRunDelta(chatRunId, 'reasoning', event.text)
+          } else if (event.type === 'content') {
+            emitSse('delta', { text: event.text })
+            noteChatRunDelta(chatRunId, 'content', event.text)
+          } else if (event.type === 'tool') {
             emitSse('tool', { id: event.id, name: event.name, toolId: event.toolId, args: event.args })
+            noteChatRunTool(chatRunId, event)
+          } else if (event.type === 'clarify') {
+            emitSse('clarify', { clarify: event.clarify })
           } else {
             emitSse('tool_result', {
               id: event.id,
@@ -2022,13 +2631,15 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
               summary: event.summary,
               durationMs: event.durationMs,
             })
+            noteChatRunToolResult(chatRunId, event)
           }
         },
       })
     } catch (error) {
       if (turnToken) releaseTurn(sessionId, turnToken)
-      // 用户主动停止（SSE 断开）不是失败：不写失败审计、不再往断开的连接写事件。
       if (abortController.signal.aborted) {
+        finishChatRun(chatRunId, 'stopped')
+        // 用户主动停止：不写失败审计、不再往断开的连接写事件。
         if (streaming) {
           try {
             reply.raw.end()
@@ -2038,6 +2649,11 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
           return reply
         }
       }
+      finishChatRun(
+        chatRunId,
+        'error',
+        error instanceof EabError ? error.message : '模型调用失败',
+      )
       appendAudit(deps.db, {
         companyId: actor.subject.companyId,
         actorUserId: actor.person.id,
@@ -2099,6 +2715,7 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
     // 网页里发出的消息标记为 web，不回写钉钉，也不进入钉钉的上下文。
     const meta = {
       channel: 'web',
+      ...clarifyTrace,
       autoSelected,
       fallbackFromModelId: agent?.fallbackFromModelId ?? null,
       attachments: attachmentMeta(attachments),
@@ -2115,6 +2732,7 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
       tokens: agent ? { prompt: agent.promptTokens, completion: agent.completionTokens } : null,
       reasoning: agent?.reasoning ?? '',
       toolCalls: agent?.toolCalls ?? [],
+      clarify: agent?.clarify ?? null,
       rounds: agent?.rounds ?? 0,
     }
     deps.db
@@ -2137,6 +2755,25 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
     deps.db
       .prepare('UPDATE chat_sessions SET updated_at = ?, last_message_at = ? WHERE id = ?')
       .run(Date.now(), Date.now(), sessionId)
+    if (streaming) {
+      completeChatRun(chatRunId)
+      // 后台回合完成时也广播一次最终消息：当前页面收尾、其它已打开页面刷新列表。
+      publishChatEvent({
+        type: 'message',
+        companyId: actor.subject.companyId,
+        userId: actor.person.id,
+        sessionId,
+        message: {
+          id: assistantMessageId,
+          role: 'assistant',
+          text: answerText,
+          modelId: model.id,
+          modelName: model.name,
+          meta,
+          createdAt: new Date().toISOString(),
+        },
+      })
+    }
     bumpUsage(
       deps.db,
       actor.subject.companyId,
@@ -2171,6 +2808,7 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
       emitSse('done', {
         sessionId,
         messageId: assistantMessageId,
+        runId: chatRunId,
         text: answerText,
         modelId: model.id,
         modelName: model.name,
@@ -2179,8 +2817,15 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
         citations: meta.citations,
         reasoning: meta.reasoning,
         toolCalls: meta.toolCalls,
+        clarify: meta.clarify,
       })
-      reply.raw.end()
+      if (!reply.raw.destroyed) {
+        try {
+          reply.raw.end()
+        } catch {
+          // 客户端已经断开
+        }
+      }
       return reply
     }
 
@@ -2198,6 +2843,7 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
         citations: meta.citations,
         reasoning: meta.reasoning,
         toolCalls: meta.toolCalls,
+        clarify: meta.clarify,
         createdAt: new Date().toISOString(),
       },
     })

@@ -48,13 +48,26 @@ function depsWithFeishu(): { deps: ServerDeps; dbPath: string } {
   return { deps, dbPath }
 }
 
-function mockFeishu(callbacks: string[], scopes: string[]): void {
+function mockFeishu(callbacks: string[], scopes: string[], versionEvents: string[] = []): void {
   vi.stubGlobal(
     'fetch',
     vi.fn(async (url: string | URL) => {
       const target = String(url)
       if (target.includes('tenant_access_token')) {
         return new Response(JSON.stringify({ code: 0, tenant_access_token: 't-test' }), { status: 200 })
+      }
+      if (target.includes('/app_versions/')) {
+        return new Response(
+          JSON.stringify({
+            code: 0,
+            data: {
+              app_version: {
+                event_infos: versionEvents.map((event) => ({ event_type: event })),
+              },
+            },
+          }),
+          { status: 200 },
+        )
       }
       return new Response(
         JSON.stringify({
@@ -78,7 +91,7 @@ function mockFeishu(callbacks: string[], scopes: string[]): void {
 describe('飞书接入自检', () => {
   it('长连接已连上但没订阅接收消息事件时，明确指出缺 im.message.receive_v1', async () => {
     const { deps } = depsWithFeishu()
-    mockFeishu(['card.action.trigger'], ['im:message:send_as_bot', 'im:message.p2p_msg:readonly'])
+    mockFeishu(['card.action.trigger'], ['im:message:send_as_bot', 'im:message.p2p_msg:readonly'], [])
     const result = await checkFeishuSetup(deps, true)
     expect(result.ok).toBe(false)
     expect(result.missingEvents).toEqual(['im.message.receive_v1'])
@@ -88,15 +101,18 @@ describe('飞书接入自检', () => {
   it('订阅和权限齐全时自检通过', async () => {
     const { deps } = depsWithFeishu()
     mockFeishu(
-      ['im.message.receive_v1'],
+      ['card.action.trigger'],
       [
         'im:message:send_as_bot',
         'im:message.p2p_msg:readonly',
         'im:message.group_at_msg:readonly',
       ],
+      ['im.message.receive_v1'],
     )
     const result = await checkFeishuSetup(deps, true)
     expect(result.ok).toBe(true)
+    expect(result.subscribedEvents).toContain('im.message.receive_v1')
+    expect(result.missingEvents).toEqual([])
     expect(result.issues).toEqual([])
     expect(result.callbackType).toBe('websocket')
   })

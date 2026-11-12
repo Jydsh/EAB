@@ -26,6 +26,8 @@
   .ph-badge { white-space: nowrap; display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px; border-radius: 999px; background: #f0fdfa; color: #0f766e; border: 1px solid #ccfbf1; font-size: 12px; }
   .ph-badge.warn { background: #fffbeb; color: #b45309; border-color: #fde68a; }
   .ph-right { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+  .ph-session { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: #6b7280; }
+  .ph-session select { max-width: 210px; border: 1px solid #d1d5db; background: #fff; color: #374151; border-radius: 8px; padding: 5px 8px; font-size: 12px; }
   .ph-btn { white-space: nowrap; appearance: none; border: 1px solid #d1d5db; background: #fff; color: #374151; border-radius: 8px; padding: 5px 11px; font-size: 12px; cursor: pointer; }
   .ph-btn:hover { border-color: #0f766e; color: #0f766e; }
   .ph-body { display: grid; grid-template-columns: 210px minmax(0, 1fr); min-height: calc(100vh - 63px); }
@@ -63,6 +65,10 @@
   <span class="ph-badge" id="ph-format">DSH 插件</span>
   <span class="ph-badge" id="ph-host">host 状态检测中</span>
   <div class="ph-right">
+    <div class="ph-session" id="ph-session-wrap">
+      <span>会话</span>
+      <select id="ph-session" aria-label="当前 DSH 会话"></select>
+    </div>
     <div class="ph-actions" id="ph-detail-actions"></div>
     <button class="ph-btn" id="ph-reload" type="button">重新加载</button>
     <button class="ph-btn" id="ph-log-toggle" type="button">宿主日志</button>
@@ -98,6 +104,7 @@
   var title = query.get('title') || pluginId;
   /** manifest 的 dsh.client.inject，用来核对运行时模块是否齐全 */
   var clientInject = (query.get('inject') || '').split(',').map(function (item) { return item.trim(); }).filter(Boolean);
+  var pluginRouteSpecs = [];
   /** 个人工作台打开时 scope=user：走不带控制台会话的员工接口 */
   var scope = query.get('scope') === 'user' ? 'user' : 'console';
   var asUser = query.get('as') || '';
@@ -123,6 +130,8 @@
   var detailActionsEl = document.getElementById('ph-detail-actions');
   var panelEl = document.getElementById('ph-panel');
   var hostBadge = document.getElementById('ph-host');
+  var sessionWrap = document.getElementById('ph-session-wrap');
+  var sessionSelect = document.getElementById('ph-session');
   var pluginApiPrefixes = [];
   var fetchBridgeInstalled = false;
   var gatewayBase = scope === 'user'
@@ -130,21 +139,37 @@
     : '/api/console/plugins/' + encodeURIComponent(pluginId) + '/gateway';
 
   /**
-   * DSH client 习惯直接请求同源 `/api/<插件路径>`；EAB 控制台 API 不能走插件网关。
-   * 这里保留 EAB 自有前缀，其余同源 /api/* 全部透明改写到插件网关。
-   * 不再依赖 host 状态里的 routes：插件晚注册路由、SSE、XHR 都不会打空。
+   * DSH 插件直接请求自己的同源路径（`/api/<x>`、`/<plugin-id>/api` 等），
+   * 这些请求要透明改写到 EAB 的插件网关。EAB 自有页面和接口保持原样。
    */
   var EAB_API_PREFIXES = [
     '/api/console', '/api/my', '/api/plugins', '/api/auth', '/api/admin',
     '/api/health', '/api/system', '/api/settings', '/api/workspace', '/api/memory',
     '/api/chat', '/api/org', '/api/channel', '/api/kb', '/api/quota', '/api/tools',
-    '/api/sync', '/plugins/assets', '/plugin-host.html'
+    '/api/sync', '/plugins/assets', '/plugin-host.html', '/dsh-runtime.js',
+    '/admin', '/chat', '/vendor', '/app.js', '/app.css', '/chat.js', '/chat.css'
   ];
 
   function isEabReserved(path) {
+    if (path === '/') return true;
     return EAB_API_PREFIXES.some(function (prefix) {
       return path === prefix || path.indexOf(prefix + '/') === 0;
     });
+  }
+
+  function matchesPluginRoute(path) {
+    return pluginRouteSpecs.some(function (spec) {
+      if (!spec || typeof spec.path !== 'string') return false;
+      if (spec.kind === 'exact') return path === spec.path;
+      return path === spec.path || path.indexOf(spec.path + '/') === 0;
+    });
+  }
+
+  function isPluginRequestPath(path) {
+    if (isEabReserved(path)) return false;
+    if (path === '/api' || path.indexOf('/api/') === 0) return true;
+    if (path === '/' + pluginId || path.indexOf('/' + pluginId + '/') === 0) return true;
+    return matchesPluginRoute(path);
   }
 
   function mapPluginUrl(input) {
@@ -153,8 +178,7 @@
     var url;
     try { url = new URL(raw, location.href); } catch (_) { return ''; }
     if (url.origin !== location.origin) return '';
-    if (url.pathname !== '/api' && url.pathname.indexOf('/api/') !== 0) return '';
-    if (isEabReserved(url.pathname)) return '';
+    if (!isPluginRequestPath(url.pathname)) return '';
     return gatewayBase + url.pathname + url.search;
   }
 
@@ -323,6 +347,47 @@
     });
   }
 
+  /**
+   * DSH 的会话协议：插件通过 localStorage['dsh.sessions.current'] 读取当前会话。
+   * EAB 没有 DSH 的会话列表，这里把宿主返回的 EAB 会话同步进去，插件页才能拿
+   * 到 sessionId 去请求自己的 host 接口；切换下拉框即切换会话。
+   */
+  function applySessionContext(sessions) {
+    var list = Array.isArray(sessions) ? sessions.filter(function (item) {
+      return item && typeof item.id === 'string' && item.id;
+    }) : [];
+    if (!list.length) {
+      sessionWrap.classList.add('ph-hidden');
+      return;
+    }
+    sessionWrap.classList.remove('ph-hidden');
+    var stored = '';
+    try {
+      var raw = localStorage.getItem('dsh.sessions.current');
+      var parsed = raw ? JSON.parse(raw) : null;
+      if (parsed && typeof parsed.sessionId === 'string') stored = parsed.sessionId;
+    } catch (error) { /* 忽略损坏的本地会话 */ }
+    var chosen = stored && list.some(function (item) { return item.id === stored; }) ? stored : list[0].id;
+    sessionSelect.innerHTML = '';
+    list.forEach(function (item) {
+      var option = document.createElement('option');
+      option.value = item.id;
+      option.textContent = item.title || item.id.slice(0, 12);
+      sessionSelect.appendChild(option);
+    });
+    sessionSelect.value = chosen;
+    try {
+      localStorage.setItem('dsh.sessions.current', JSON.stringify({ sessionId: chosen }));
+    } catch (error) { /* 浏览器禁用存储时插件会走无会话降级 */ }
+    sessionSelect.onchange = function () {
+      var next = sessionSelect.value;
+      try {
+        localStorage.setItem('dsh.sessions.current', JSON.stringify({ sessionId: next }));
+      } catch (error) { /* 忽略 */ }
+      location.reload();
+    };
+  }
+
   function loadHostStatus() {
     return fetch(withAs(apiBase + encodeURIComponent(pluginId) + '/host'), {
       headers: rpcHeaders(),
@@ -338,7 +403,12 @@
         }
         var status = payload.data && payload.data.status ? payload.data.status : null;
         if (!status) return;
+        applySessionContext(status.sessions || []);
         pluginApiPrefixes = (status.routes || []).slice();
+        pluginRouteSpecs = Array.isArray(status.routeSpecs) ? status.routeSpecs.slice() : Object.keys(pluginApiPrefixes).map(function (key) {
+          var path = pluginApiPrefixes[key];
+          return { path: path, kind: 'prefix', methods: ['GET', 'POST'] };
+        });
         if (status.error) {
           hostBadge.textContent = 'host 未就绪';
           hostBadge.classList.add('warn');
@@ -406,7 +476,7 @@
         .then(function (result) {
           var status = host.status ? host.status() : { errors: [], modules: [] };
           var errors = (result && result.errors) || status.errors || [];
-          var missing = (status.modules || []).filter(function (item) { return !item.available; });
+          var missing = (status.modules || []).filter(function (item) { return item.imported && !item.available; });
           if (errors.length) {
             showError('插件 client 启动有问题：' + errors.join('；'));
           } else if (missing.length) {

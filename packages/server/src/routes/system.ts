@@ -170,7 +170,7 @@ export function registerSystemRoutes(app: FastifyInstance, deps: ServerDeps): vo
           maxConcurrent: deps.config.chatMaxConcurrent ?? 8,
           queueLimit: deps.config.chatQueueLimit ?? 100,
           queueTimeoutMs: deps.config.chatQueueTimeoutMs ?? 240_000,
-          userMaxInFlight: deps.config.chatUserMaxInFlight ?? 2,
+          userMaxInFlight: deps.config.chatUserMaxInFlight ?? 0,
           userMessagesPerMinute: deps.config.chatUserMessagesPerMinute ?? 20,
           modelMaxConcurrent: deps.config.chatModelMaxConcurrent ?? 4,
           companyMaxConcurrent: deps.config.chatCompanyMaxConcurrent ?? deps.config.chatMaxConcurrent ?? 8,

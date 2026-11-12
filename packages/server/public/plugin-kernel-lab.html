@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>EAB × DSH kernel lab</title>
+<script type="importmap">
+{
+  "imports": {
+    "@deepseek-ai/cosmokit": "/vendor/dsh-kernel/cosmokit.js",
+    "@deepseek-ai/cordis": "/vendor/dsh-kernel/cordis.js",
+    "@deepseek-ai/dsh-client-ui-slots": "/vendor/dsh-kernel/slots.js"
+  }
+}
+</script>
+<style>
+  :root { color-scheme: light; --bd:#d9e0e6; --muted:#6b7280; --brand:#0f766e; --bg:#f5f7f8; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.5 "Segoe UI","Microsoft YaHei",system-ui,sans-serif; color:#1f2937; background:var(--bg); }
+  .lab { display:grid; grid-template-columns:240px minmax(0,1fr); min-height:100vh; }
+  .rail { background:#fff; border-right:1px solid var(--bd); padding:18px 12px; }
+  .brand { font-weight:700; font-size:15px; margin:0 8px 4px; }
+  .sub { color:var(--muted); font-size:12px; margin:0 8px 16px; }
+  .rail h3 { font-size:11px; letter-spacing:.08em; color:#94a3b8; text-transform:uppercase; margin:14px 8px 8px; }
+  .slot-sidebar { display:flex; flex-direction:column; gap:4px; }
+  .main { padding:18px 22px; min-width:0; }
+  .status { border:1px solid var(--bd); background:#fff; border-radius:10px; padding:10px 12px; margin-bottom:14px; font:12px/1.5 ui-monospace, Consolas, monospace; color:#475569; white-space:pre-wrap; }
+  .status.err { border-color:#fecaca; background:#fef2f2; color:#b91c1c; }
+  .panel { background:#fff; border:1px solid var(--bd); border-radius:12px; padding:18px; min-height:420px; }
+  .empty { color:var(--muted); padding:36px 8px; text-align:center; }
+  .slot-list { display:flex; flex-direction:column; gap:4px; }
+  .slot-list button { text-align:left; border:1px solid transparent; background:transparent; border-radius:8px; padding:7px 9px; cursor:pointer; color:#374151; }
+  .slot-list button:hover { background:#f0fdfa; border-color:#ccfbf1; color:var(--brand); }
+  .slot-list button.on { background:#e6f4f2; border-color:#99f6e4; color:var(--brand); font-weight:600; }
+</style>
+</head>
+<body>
+<div id="lab-root"></div>
+<div id="lab-fatal" class="status err" style="display:none;margin:16px"></div>
+
+<!-- React UMD must be present before the official client bundles are required. -->
+<script src="/vendor/react.production.min.js"></script>
+<script src="/vendor/react-dom.production.min.js"></script>
+
+<!-- Minimal lazy-CJS loader: the official bundles only call __ModuleLoader__.load({id, factory}). -->
+<script>
+(function () {
+  var factories = new Map()
+  var cache = new Map()
+  var seed = Object.create(null)
+  window.__DSH_SEED__ = seed
+
+  function requireModule(name) {
+    if (Object.prototype.hasOwnProperty.call(seed, name)) return seed[name]
+    if (cache.has(name)) return cache.get(name)
+    var factory = factories.get(name)
+    if (typeof factory !== 'function') {
+      throw new Error('module not found: ' + name)
+    }
+    var exported = factory(requireModule)
+    cache.set(name, exported)
+    return exported
+  }
+
+  requireModule.async = function (name) {
+    return Promise.resolve(requireModule(name))
+  }
+  requireModule.resolve = function (name) { return name }
+  requireModule.asset = function (name) { return name }
+
+  window.__ModuleLoader__ = {
+    load: function (entry) {
+      if (!entry || typeof entry.id !== 'string' || typeof entry.factory !== 'function') {
+        throw new Error('invalid module loader entry')
+      }
+      factories.set(entry.id, entry.factory)
+    },
+    require: requireModule,
+  }
+})()
+</script>
+
+<!-- Official DSH client bundles. They register factories only; nothing materializes yet. -->
+<script src="/vendor/dsh-kernel/renderer.js"></script>
+<script src="/vendor/dsh-kernel/cy-api.js"></script>
+
+<script type="module">
+import * as Cordis from '@deepseek-ai/cordis'
+import * as Slots from '@deepseek-ai/dsh-client-ui-slots'
+
+const seed = window.__DSH_SEED__
+const React = window.React
+const ReactDOM = window.ReactDOM
+const h = React.createElement
+
+seed['react'] = React
+seed['react-dom'] = ReactDOM
+seed['react-dom/client'] = { createRoot: ReactDOM.createRoot }
+const jsxCreate = (type, props, key) => {
+  const { children, ...rest } = props || {}
+  const config = key === undefined ? rest : { ...rest, key }
+  if (children === undefined) return React.createElement(type, config)
+  return React.createElement(type, config, ...(Array.isArray(children) ? children : [children]))
+}
+seed['react/jsx-runtime'] = {
+  Fragment: React.Fragment,
+  jsx: jsxCreate,
+  jsxs: jsxCreate,
+}
+seed['@deepseek-ai/cordis'] = Cordis
+seed['@deepseek-ai/dsh-client-ui-slots'] = Slots
+
+const statusEl = document.createElement('div')
+statusEl.className = 'status'
+statusEl.textContent = 'kernel: booting…'
+document.body.insertBefore(statusEl, document.getElementById('lab-root'))
+
+function fatal(error) {
+  statusEl.className = 'status err'
+  statusEl.textContent = 'kernel: failed\n' + (error && error.stack ? error.stack : String(error))
+  const fatalEl = document.getElementById('lab-fatal')
+  fatalEl.style.display = 'block'
+  fatalEl.textContent = String(error && error.message ? error.message : error)
+}
+
+// Minimal locale facade: the shape DSH page plugins actually use.
+const dictionaries = new Map()
+let localeRevision = 0
+const localeListeners = new Set()
+let localeSnapshot = { revision: 0 }
+function bumpLocale() {
+  localeRevision += 1
+  localeSnapshot = { revision: localeRevision }
+  localeListeners.forEach((fn) => fn())
+}
+function makeLocale() {
+  return {
+    register(namespace, dictionary) {
+      dictionaries.set(namespace, { ...(dictionary || {}) })
+      bumpLocale()
+      return () => {
+        dictionaries.delete(namespace)
+        bumpLocale()
+      }
+    },
+    getSnapshot() {
+      return localeSnapshot
+    },
+    subscribe(fn) {
+      localeListeners.add(fn)
+      return () => localeListeners.delete(fn)
+    },
+    bind(namespace) {
+      return (key, params) => {
+        let value = dictionaries.get(namespace)?.[key]
+        if (value === undefined) value = key
+        if (params && typeof value === 'string') {
+          value = value.replace(/\{(\w+)\}/g, (_, name) => String(params[name] ?? `{${name}}`))
+        }
+        return value
+      }
+    },
+  }
+}
+
+// Minimal layout facade: EAB chooses which keyed main panel is visible.
+let activePanel = 'dsh-cy-api'
+const panelListeners = new Set()
+function setActivePanel(id) {
+  activePanel = id
+  for (const fn of panelListeners) fn()
+}
+function makeLayout() {
+  return {
+    selectPanel(id) { setActivePanel(id) },
+    get panelInfo() { return { activePanelId: activePanel } },
+    subscribe(fn) { panelListeners.add(fn); return () => panelListeners.delete(fn) },
+    toggleSidebar() {},
+    openRightbar() {},
+    closeRightbar() {},
+  }
+}
+
+function useActivePanel() {
+  const [value, setValue] = React.useState(activePanel)
+  React.useEffect(() => {
+    const fn = () => setValue(activePanel)
+    panelListeners.add(fn)
+    return () => panelListeners.delete(fn)
+  }, [])
+  return value
+}
+
+function Root(props) {
+  const renderSlot = props.renderSlot
+  const panel = useActivePanel()
+  const entries = props.__slotRegistry?.entries?.('main') ?? []
+  const sidebar = renderSlot('sidebar.panellist', { activePanelId: panel })
+  const main = renderSlot('main', {}, { entryKey: panel })
+  return h('div', { className: 'lab' }, [
+    h('aside', { className: 'rail', key: 'rail' }, [
+      h('div', { className: 'brand', key: 'brand' }, 'EAB × DSH'),
+      h('div', { className: 'sub', key: 'sub' }, 'official slot kernel lab'),
+      h('h3', { key: 'h3' }, '插件页面'),
+      h('div', { className: 'slot-sidebar', key: 'sidebar' }, sidebar),
+      h('h3', { key: 'h3b' }, '已注册 main'),
+      h('div', { className: 'status', key: 'entries' }, entries.length
+        ? entries.map((entry) => (entry.options?.key || entry.options?.id || entry.id || '(no key)')).join('\n')
+        : '(none)'),
+    ]),
+    h('main', { className: 'main', key: 'main' }, [
+      h('div', { className: 'panel', key: 'panel' }, main),
+    ]),
+  ])
+}
+
+async function boot() {
+  const ctx = new Cordis.Context()
+  const locale = makeLocale()
+  ctx.reflect.provide('locale', locale)
+  ctx.reflect.provide('layout', makeLayout())
+
+  const renderer = window.__ModuleLoader__.require('@deepseek-ai/dsh-client-ui-renderer')
+  await ctx.plugin(renderer)
+  statusEl.textContent = 'kernel: renderer active'
+
+  const disposeRoot = ctx.slots.register({
+    name: 'root',
+    children: {
+      'main': { kind: 'keyed', scope: 'root' },
+      'sidebar.panellist': { kind: 'list', scope: 'root' },
+      'settings.section': { kind: 'list', scope: 'root' },
+      'plugins.detail.actions': { kind: 'list', scope: 'root' },
+      'conversation.view': { kind: 'list', scope: 'root' },
+      'conversation.chat.assistant-actions': { kind: 'list', scope: 'root' },
+      'conversation.input.overlay': { kind: 'list', scope: 'root' },
+      'plugins.bundle.config': { kind: 'keyed', scope: 'root' },
+    },
+    inject: () => ({ __slotRegistry: ctx.slots }),
+  }, Root)
+  statusEl.textContent = 'kernel: root declared'
+
+  const cyApi = window.__ModuleLoader__.require('dsh-cy-api')
+  await ctx.plugin(cyApi)
+  statusEl.textContent = 'kernel: dsh-cy-api active'
+
+  ctx.slots.installLocale(locale)
+
+  // The official renderer always mounts root through the 'session' scope adapter.
+  // EAB's web chat has no DSH session yet, so this lab installs a session-less binding.
+  const emptyBinding = { key: undefined }
+  const emptySession = {
+    getSnapshot: () => emptyBinding,
+    subscribe: () => () => {},
+  }
+  ctx.slots.installScope('session', {
+    current: emptySession,
+    bindingSource: () => emptySession,
+  })
+
+  const mount = ctx.uiRenderer.mount
+  if (typeof mount !== 'function') throw new Error('uiRenderer.mount missing')
+  const host = document.getElementById('lab-root')
+  host.innerHTML = ''
+  const disposeMount = mount(host)
+  statusEl.textContent = 'kernel: mounted\nmain entries: ' +
+    ctx.slots.entries('main').map((entry) => entry.options?.key || '(no key)').join(', ')
+  window.__LAB__ = { ctx, disposeRoot, disposeMount, setActivePanel }
+}
+
+boot().catch(fatal)
+</script>
+</body>
+</html>

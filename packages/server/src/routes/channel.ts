@@ -15,6 +15,9 @@ import { EC, EabError, SC, ulid } from '@eab/domain'
 import type { ServerDeps } from '../deps.js'
 import { ok, requireScope } from '../http.js'
 import { resolveActor } from '../session.js'
+import { executeChannelUnbind, previewChannelUnbind } from '../channel-unbind.js'
+import { refreshFeishuStream } from '../feishu-bot.js'
+import { refreshDingTalkStream } from '../dingtalk-bot.js'
 
 export type BindableProvider = 'feishu' | 'dingtalk' | 'wecom'
 
@@ -314,13 +317,12 @@ export function registerChannelRoutes(app: FastifyInstance, deps: ServerDeps): v
     return ok({ session: sessionPayload(readSession(scope, row.id)), bindings: listBindings(scope) })
   })
 
-  /** 解绑：只停同步、清租户引用，不删本公司已同步的组织数据 */
-  app.post('/api/channel/unbind', async (req) => {
+  /** 解绑预览：只读，给出将删除的部门/成员/角色数量，供控制台二次确认 */
+  app.get('/api/channel/unbind/preview', async (req) => {
     const { subject } = resolveActor(deps.db, deps.config, req)
     requireScope(subject, SC.CHANNEL_MANAGE)
     const scope = forCompany(deps, subject.companyId)
-    const body = (req.body ?? {}) as { provider?: unknown }
-    const provider = parseProvider(body.provider)
+    const provider = parseProvider((req.query as { provider?: unknown } | undefined)?.provider)
 
     const current = findBinding(scope, provider)
     if (!current?.tenant_id) {
@@ -329,15 +331,48 @@ export function registerChannelRoutes(app: FastifyInstance, deps: ServerDeps): v
       })
     }
 
-    deps.db
-      .prepare(
-        `UPDATE channel_configs
-            SET tenant_id = NULL, tenant_name = NULL, bound_at = NULL, bound_by_user_id = NULL,
-                enabled = 0, status = 'unbound', sync_mode = 'off', updated_at = ?
-          WHERE company_id = ? AND provider = ?`,
-      )
-      .run(Date.now(), deps.companyId, provider)
+    return ok(previewChannelUnbind(deps.db, scope.companyId, provider))
+  })
 
-    return ok({ bindings: listBindings(scope) })
+  /**
+   * 解绑：按 1B/2B/3A 清理该渠道带来的组织、成员、角色和身份。
+   * 必须带 confirm:true，避免旧页面或脚本误触发不可逆清理。
+   */
+  app.post('/api/channel/unbind', async (req) => {
+    const { subject } = resolveActor(deps.db, deps.config, req)
+    requireScope(subject, SC.CHANNEL_MANAGE)
+    const scope = forCompany(deps, subject.companyId)
+    const body = (req.body ?? {}) as { provider?: unknown; confirm?: unknown }
+    const provider = parseProvider(body.provider)
+    if (body.confirm !== true) {
+      throw new EabError(EC.VALIDATION, '解绑会删除该渠道的部门、成员和角色，请先确认', {
+        hint: '请求体需要带 confirm: true。',
+      })
+    }
+
+    const current = findBinding(scope, provider)
+    if (!current?.tenant_id) {
+      throw new EabError(EC.CONFLICT, `本公司还没有绑定${providerLabel(provider)}`, {
+        hint: '未绑定就无需解绑。',
+      })
+    }
+
+    const result = executeChannelUnbind(deps.db, {
+      companyId: scope.companyId,
+      provider,
+      actorUserId: subject.userId,
+      ip: req.ip ?? null,
+    })
+
+    // 解绑已提交；连接刷新失败不影响数据库结果，只把状态带回控制台
+    let streamRefreshFailed = false
+    try {
+      if (provider === 'feishu') await refreshFeishuStream(scope)
+      if (provider === 'dingtalk') await refreshDingTalkStream(scope)
+    } catch {
+      streamRefreshFailed = true
+    }
+
+    return ok({ bindings: listBindings(scope), ...result, streamRefreshFailed })
   })
 }

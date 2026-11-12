@@ -74,18 +74,31 @@ function toPerson(row: UserRow): PersonRow {
   }
 }
 
-/** 列出成员：不传 companyId 就是整个平台（开发预览的身份下拉要跨公司才看得见隔离） */
+/** 列出可继续使用的成员：不传 companyId 就是整个平台（开发预览的身份下拉要跨公司才看得见隔离） */
 export function listPersonas(db: Db, companyId?: string): PersonRow[] {
+  const active = "AND u.status = 'active' AND u.disabled_at IS NULL"
   const rows = companyId
     ? (db
-        .prepare(`${PERSON_SELECT} AND u.company_id = ? ORDER BY c.name, d.path, u.name`)
+        .prepare(`${PERSON_SELECT} ${active} AND u.company_id = ? ORDER BY c.name, d.path, u.name`)
         .all(companyId) as unknown as UserRow[])
-    : (db.prepare(`${PERSON_SELECT} ORDER BY c.name, d.path, u.name`).all() as unknown as UserRow[])
+    : (db.prepare(`${PERSON_SELECT} ${active} ORDER BY c.name, d.path, u.name`).all() as unknown as UserRow[])
   return rows.map(toPerson)
 }
 
 export function findPerson(db: Db, userId: string): PersonRow | null {
   const row = db.prepare(`${PERSON_SELECT} AND u.id = ?`).get(userId) as unknown as UserRow | undefined
+  return row ? toPerson(row) : null
+}
+
+/**
+ * 平台内可继续使用的成员。
+ * 组织同步把离职/连续缺失成员置为 disabled/departed 后，网页会话、渠道机器人
+ * 和定时任务都必须按这个判断拒绝，而不是只看 deleted_at。
+ */
+export function findActivePerson(db: Db, userId: string): PersonRow | null {
+  const row = db
+    .prepare(`${PERSON_SELECT} AND u.status = 'active' AND u.disabled_at IS NULL AND u.id = ?`)
+    .get(userId) as unknown as UserRow | undefined
   return row ? toPerson(row) : null
 }
 
@@ -188,7 +201,7 @@ export function resolveActor(
    */
   const query = (req.query ?? {}) as Record<string, string | undefined>
   if (config.devAuth && typeof query.as === 'string' && query.as.length > 0) {
-    const previewPerson = findPerson(db, query.as)
+    const previewPerson = findActivePerson(db, query.as)
     if (!previewPerson) {
       throw new EabError(EC.NOT_FOUND, `找不到成员: ${query.as}`, { hint: '检查 ?as= 传的 userId' })
     }
@@ -198,7 +211,7 @@ export function resolveActor(
 
   const sessionUserId = readSessionUserId(db, req)
   if (sessionUserId) {
-    const sessionPerson = findPerson(db, sessionUserId)
+    const sessionPerson = findActivePerson(db, sessionUserId)
     if (!sessionPerson) throw new EabError(EC.AUTH_REQUIRED, '会话对应的成员已不存在')
     assertSingleCompany(db, sessionPerson, canonicalCompanyId)
     return actorFor(db, sessionPerson)
@@ -216,7 +229,7 @@ export function resolveActor(
   // 单公司模式：只在这家公司里找默认成员
   const fallback = personas.find((item) => item.companyId === canonicalCompanyId) ?? personas[0]!
   const wanted = query.as ?? fallback.id
-  const person = findPerson(db, wanted)
+  const person = findActivePerson(db, wanted)
   if (!person) {
     throw new EabError(EC.NOT_FOUND, `找不到成员: ${wanted}`, { hint: '检查 ?as= 传的 userId' })
   }

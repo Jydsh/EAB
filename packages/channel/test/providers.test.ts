@@ -58,6 +58,35 @@ describe('真实通讯录 provider', () => {
     })
   })
 
+  it('飞书：根部门名称是空字符串时补成可映射的根部门，不阻断同步', async () => {
+    const fetchMock = vi.fn(async (input: string | URL) => {
+      const url = String(input)
+      if (url.includes('tenant_access_token')) return json({ code: 0, tenant_access_token: 't' })
+      if (url.includes('/contact/v3/departments')) {
+        return json({
+          code: 0,
+          data: {
+            items: [
+              { department_id: '0', parent_department_id: '0', name: '', order: 0 },
+              { department_id: 'd1', parent_department_id: '0', name: '研发中心', order: 1 },
+            ],
+            has_more: false,
+          },
+        })
+      }
+      if (url.includes('/users/find_by_department')) {
+        return json({ code: 0, data: { items: [], has_more: false } })
+      }
+      throw new Error(`未预期的请求：${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const org = await fetchChannelOrg('feishu', { provider: 'feishu', appId: 'app', appSecret: 'secret' })
+    expect(org.depts).toHaveLength(2)
+    expect(org.depts[0]).toMatchObject({ channelDeptId: '0', name: '根部门' })
+    expect(org.depts[1]).toMatchObject({ channelDeptId: 'd1', name: '研发中心' })
+  })
+
   it('企业微信：无凭证时明确报错，不发请求', async () => {
     const fetchMock = vi.fn()
     vi.stubGlobal('fetch', fetchMock)

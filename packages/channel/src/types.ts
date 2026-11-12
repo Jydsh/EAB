@@ -115,6 +115,7 @@ export interface SyncStats {
   usersDisabled: number
   usersRestored: number
   identitiesCreated: number
+  identitiesRestored: number
   orphans: number
   unassignedUsers: number
   unchanged: number
@@ -158,6 +159,7 @@ export function emptyStats(): SyncStats {
     usersDisabled: 0,
     usersRestored: 0,
     identitiesCreated: 0,
+    identitiesRestored: 0,
     orphans: 0,
     unassignedUsers: 0,
     unchanged: 0,

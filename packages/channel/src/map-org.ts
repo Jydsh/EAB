@@ -22,9 +22,15 @@ export interface MapOrgOptions {
   readonly root: CompanyRootDept
   /**
    * 渠道自己用来代表"公司根"的部门 ID（飞书是 `0`）。
-   * 这类部门不建行，它的子部门直接挂到 EAB 的公司根 —— 否则会出现"甲科技/甲科技"两层同名根。
+   * 默认不建行，它的子部门直接挂到 EAB 的公司根 —— 否则会出现"甲科技/甲科技"两层同名根。
+   * 当 groupChannelRoot=true 时，这个渠道根会变成 EAB 公司根下的一个渠道分组节点，
+   * 让飞书/企微的成员在组织架构里能按渠道来源区分。
    */
   readonly rootChannelDeptIds?: readonly string[]
+  /** 为 true 时把渠道根建成当前公司下的渠道分组节点；钉钉保持原结构 */
+  readonly groupChannelRoot?: boolean
+  /** 渠道分组节点显示名称，例如「飞书 · Ai无限可能」 */
+  readonly channelRootName?: string
 }
 
 /** 各家用来表示"我是顶层"的 parent 值；'0' 是钉钉/企微常见写法，'root' 是飞书沙箱里出现过的 */
@@ -55,12 +61,15 @@ function resolveParent(
   dept: RemoteDept,
   byId: ReadonlyMap<string, RemoteDept>,
   rootChannelIds: ReadonlySet<string>,
+  groupChannelRoot: boolean,
 ): ResolvedParent {
   const raw = (dept.parentChannelDeptId ?? '').trim()
   if (raw.length === 0) return { parentChannelId: null, orphan: false }
   if (raw === dept.channelDeptId) return { parentChannelId: null, orphan: false }
-  // 渠道自己的"公司根"不建行：钉钉/企微是 1，飞书是 0；它的子部门直接挂 EAB 公司根
-  if (rootChannelIds.has(raw)) return { parentChannelId: null, orphan: false }
+  // 渠道自己的"公司根"默认不建行；分组模式下它是一级节点，子部门应挂在它下面。
+  if (rootChannelIds.has(raw)) {
+    return groupChannelRoot ? { parentChannelId: raw, orphan: false } : { parentChannelId: null, orphan: false }
+  }
   if (EMPTY_PARENT_MARKERS.has(raw.toLowerCase())) return { parentChannelId: null, orphan: false }
   if (byId.has(raw)) return { parentChannelId: raw, orphan: false }
   // 父部门没出现在返回里：可能是没授权可见，也可能是数据脏。挂根 + 记 orphan，不猜层级
@@ -75,7 +84,9 @@ function countRootChannels(byId: ReadonlyMap<string, RemoteDept>, rootChannelIds
 
 export function mapRemoteOrg(remote: RemoteOrg, options: MapOrgOptions): SyncPlan {
   const { companyId, provider, root } = options
-  const rootChannelIds = new Set((options.rootChannelDeptIds ?? []).map((id) => id.trim()))
+  const rootChannelIds = new Set((options.rootChannelDeptIds ?? []).map((id) => id.trim()).filter(Boolean))
+  const groupChannelRoot = options.groupChannelRoot === true && rootChannelIds.size === 1
+  const channelRootId = groupChannelRoot ? [...rootChannelIds][0] : ''
 
   const byId = new Map<string, RemoteDept>()
   for (const dept of remote.depts) {
@@ -90,6 +101,16 @@ export function mapRemoteOrg(remote: RemoteOrg, options: MapOrgOptions): SyncPla
       throw new EabError(EC.VALIDATION, `部门 ${id} 没有名称`)
     }
     byId.set(id, dept)
+  }
+
+  if (groupChannelRoot) {
+    const base = byId.get(channelRootId)
+    byId.set(channelRootId, {
+      channelDeptId: channelRootId,
+      parentChannelDeptId: null,
+      name: (options.channelRootName ?? '').trim() || base?.name?.trim() || '渠道组织',
+      order: -1,
+    })
   }
 
   // 部门负责人：优先用部门字段；钉钉从成员的 leader_in_dept 反推（同一部门取第一个标记为 leader 的人）
@@ -112,10 +133,10 @@ export function mapRemoteOrg(remote: RemoteOrg, options: MapOrgOptions): SyncPla
   const roots: RemoteDept[] = []
 
   for (const dept of byId.values()) {
-    const rawParent = resolveParent(dept, byId, rootChannelIds)
-    // 父是渠道自己的"公司根"（飞书 `0`）→ 视作挂在 EAB 公司根下
+    const rawParent = resolveParent(dept, byId, rootChannelIds, groupChannelRoot)
+    // 父是渠道自己的"公司根"（飞书 `0`）→ 默认视作挂在 EAB 公司根下；分组模式下保留父子关系
     const resolved: ResolvedParent =
-      rawParent.parentChannelId !== null && rootChannelIds.has(rawParent.parentChannelId)
+      !groupChannelRoot && rawParent.parentChannelId !== null && rootChannelIds.has(rawParent.parentChannelId)
         ? { parentChannelId: null, orphan: false }
         : rawParent
     parentOf.set(dept.channelDeptId.trim(), resolved)
@@ -181,8 +202,8 @@ export function mapRemoteOrg(remote: RemoteOrg, options: MapOrgOptions): SyncPla
   const rootLevel: RemoteDept[] = []
   for (const dept of roots) {
     const channelId = dept.channelDeptId.trim()
-    if (rootChannelIds.has(channelId)) {
-      // 渠道自己的根部门不建行，它的子部门直接成为本地根下的一级部门
+    if (!groupChannelRoot && rootChannelIds.has(channelId)) {
+      // 默认模式：渠道自己的根部门不建行，它的子部门直接成为本地根下的一级部门
       rootLevel.push(...(childrenOf.get(channelId) ?? []))
       continue
     }
@@ -193,7 +214,8 @@ export function mapRemoteOrg(remote: RemoteOrg, options: MapOrgOptions): SyncPla
     walk(dept, root.id, root.path, root.depth + 1)
   }
 
-  if (deptRows.length !== byId.size - countRootChannels(byId, rootChannelIds)) {
+  const expectedDeptRows = groupChannelRoot ? byId.size : byId.size - countRootChannels(byId, rootChannelIds)
+  if (deptRows.length !== expectedDeptRows) {
     // 没被 DFS 走到的节点说明关系成环，属于渠道数据错误，宁可整次同步失败
     const missing = [...byId.keys()].filter((key) => !rowByChannelId.has(key) && !rootChannelIds.has(key))
     throw new EabError(EC.VALIDATION, '渠道部门关系不连通，疑似成环', { details: { channelDeptIds: missing } })

@@ -118,6 +118,54 @@ describe('插件 LLM adapter 注册表', () => {
     registration.dispose()
   })
 
+  it('插件声明 reasoning 时投影成思考菜单，并把员工的档位原样传给 adapter', async () => {
+    const company = 'c_plugin_reasoning_test'
+    const calls: Record<string, unknown>[] = []
+    const adapter = {
+      listModels: async (provider: string) => [
+        { provider, id: 'demo/reasoner', name: '推理模型', inputModalities: ['text'] },
+      ],
+      resolveModel: async (provider: string, model: string) => ({
+        provider,
+        id: model,
+        name: '推理模型',
+        reasoning: {
+          efforts: [
+            { id: 'low', name: '轻量推理', description: '少想一点' },
+            { id: 'high', name: '深度推理', description: '多想一点' },
+          ],
+          defaultEffort: 'high',
+        },
+      }),
+      prepareCall: async (provider: string, model: string) => ({
+        model: { provider, id: model, name: '推理模型' },
+        stream: (options: Record<string, unknown>) => {
+          calls.push(options)
+          return stream()
+        },
+      }),
+      stream: () => stream(),
+    }
+    const registration = registerPluginAdapter(company, 'dsh-reasoning', ['demo-route'], adapter)
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      const model = listPluginModels(company)[0]
+      expect(model?.thinking?.enabled).toBe(true)
+      expect(model?.thinking?.source).toBe('plugin')
+      expect(model?.thinking?.defaultEffort).toBe('high')
+      expect(model?.thinking?.options.map((option) => option.id)).toEqual(['low', 'high'])
+      expect(model?.thinking?.options.map((option) => option.label)).toEqual(['轻量推理', '深度推理'])
+      expect(model?.thinking?.options[0]?.hint).toBe('少想一点')
+
+      await callPluginModel(company, model!.id, [{ role: 'user', content: '嗨' }], {
+        reasoningEffort: 'low',
+      })
+      expect(calls[0]?.reasoningEffort).toBe('low')
+    } finally {
+      registration.dispose()
+    }
+  })
+
   it('插件停用后查询层立即隐藏模型和通道，不依赖异步 dispose', async () => {
     const company = 'c_plugin_disabled_test'
     let active = true

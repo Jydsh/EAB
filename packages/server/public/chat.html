@@ -4,8 +4,8 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>EAB 工作台</title>
-    <link rel="stylesheet" href="/app.css" />
-    <link rel="stylesheet" href="/chat.css" />
+    <link rel="stylesheet" href="/app.css?v=20261112e" />
+    <link rel="stylesheet" href="/chat.css?v=20261112e" />
   </head>
   <body class="chat-body">
     <!-- 左侧：账号与可用模型。桌面网页对话产品的常规布局，右侧只放对话。 -->
@@ -137,6 +137,7 @@
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </button>
           <div class="attach-strip" id="attach-strip" hidden></div>
+          <div class="clarify-dock" id="clarify-dock" hidden></div>
           <div class="queue-bar" id="queue-bar" hidden>
             <span class="queue-dot" aria-hidden="true"></span>
             <span id="queue-text">正在回复，你的新消息会按顺序排队</span>
@@ -171,13 +172,21 @@
                   <span class="caret">▾</span>
                 </button>
                 <div class="model-menu" id="model-menu" hidden></div>
+                <div class="think-wrap" id="think-wrap" hidden>
+                  <button class="think-chip" id="think-chip" type="button" aria-haspopup="listbox" aria-expanded="false">
+                    <span class="think-mark" aria-hidden="true">◐</span>
+                    <span id="think-chip-label">思考：均衡</span>
+                    <span class="caret">▾</span>
+                  </button>
+                  <div class="think-menu" id="think-menu" role="listbox" hidden></div>
+                </div>
               </div>
               <button class="send-btn" id="send" type="button" title="发送" aria-label="发送">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 11.5 20 4l-7.4 16-2.1-6.3-6.5-2.2Z" fill="none" stroke="currentColor" stroke-width="1.7"/></svg>
               </button>
             </div>
           </div>
-          <div class="composer-foot muted" id="composer-foot">回答由所选模型生成；输入 /model 可按对话切换模型；支持 Ctrl+V 粘贴截图/图片，附件随消息提交，不会公网分享</div>
+          <div class="composer-foot muted" id="composer-foot">回答由所选模型生成；输入 /model 可按对话切换模型；模型开放思考选项时，可用「思考」气泡切换档位；支持 Ctrl+V 粘贴截图/图片，附件随消息提交，不会公网分享</div>
         </footer>
       </main>
 
@@ -342,6 +351,6 @@
         if (gate) gate.hidden = false
       }
     </script>
-    <script src="/chat.js?v=20261111b"></script>
+    <script src="/chat.js?v=20261112e"></script>
   </body>
 </html>

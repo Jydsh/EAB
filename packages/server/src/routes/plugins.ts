@@ -17,6 +17,7 @@ import type { ServerDeps } from '../deps.js'
 import { ok, requireScope } from '../http.js'
 import { dispatchPluginRpc, dispatchPluginWeb, listPluginHostStatuses, pluginHostStatus, refreshPluginHosts } from '../plugin-host.js'
 import { pluginToolCatalogFor } from '../plugin-tools.js'
+import { userScope } from '../plugin-scope.js'
 import {
   installPluginFromGithub,
   installPluginFromNpm,
@@ -25,6 +26,7 @@ import {
   loadPlugins,
   loadPluginsForUser,
   loadPersonalPluginsForUser,
+  loadAdminPersonalPlugins,
   PLUGIN_REGISTRIES,
   pluginRoot,
   resolvePluginAsset,
@@ -51,6 +53,29 @@ const ASSET_TYPES: Record<string, string> = {
   '.woff2': 'font/woff2',
   '.txt': 'text/plain; charset=utf-8',
   '.md': 'text/plain; charset=utf-8',
+}
+
+/**
+ * DSH 插件页需要当前的会话身份：dsh-context 等插件直接读取
+ * `localStorage['dsh.sessions.current']`，没有会话就永远停在“正在读取会话日志”。
+ * 控制台按公司给出最近会话；个人插件页只给本人会话，避免把别人的会话 id 暴露出去。
+ */
+function pluginSessionsFor(
+  db: ServerDeps['db'],
+  companyId: string,
+  userId?: string | null,
+): Array<{ id: string; title: string; updatedAt: number }> {
+  const sql = userId
+    ? `SELECT id, title, updated_at FROM chat_sessions
+        WHERE company_id = ? AND user_id = ? AND deleted_at IS NULL
+        ORDER BY updated_at DESC LIMIT 50`
+    : `SELECT id, title, updated_at FROM chat_sessions
+        WHERE company_id = ? AND deleted_at IS NULL
+        ORDER BY updated_at DESC LIMIT 50`
+  const rows = (userId
+    ? db.prepare(sql).all(companyId, userId)
+    : db.prepare(sql).all(companyId)) as unknown as Array<{ id: string; title: string; updated_at: number }>
+  return rows.map((row) => ({ id: row.id, title: row.title, updatedAt: row.updated_at }))
 }
 
 /**
@@ -220,7 +245,7 @@ export function registerPluginRoutes(app: FastifyInstance, deps: ServerDeps): vo
     requireScope(subject, SC.PLUGIN_LIST)
     const plugins = loadPersonalPluginsForUser(deps.db, subject.companyId, subject.userId)
     const pluginIds = new Set(plugins.map((plugin) => plugin.id))
-    const tools = pluginToolCatalogFor(deps.db, { subject }).filter((tool) => pluginIds.has(tool.pluginId))
+    const tools = pluginToolCatalogFor(deps.db, { subject }, { scope: 'user' }).filter((tool) => pluginIds.has(tool.pluginId))
     const toolsByPlugin = new Map<string, typeof tools>()
     for (const tool of tools) {
       const rows = toolsByPlugin.get(tool.pluginId) ?? []
@@ -228,7 +253,7 @@ export function registerPluginRoutes(app: FastifyInstance, deps: ServerDeps): vo
       toolsByPlugin.set(tool.pluginId, rows)
     }
     const hosts = new Map(
-      listPluginHostStatuses([...pluginIds]).map((host) => [
+      listPluginHostStatuses([...pluginIds], subject.companyId, userScope(subject.userId)).map((host) => [
         host.id,
         { loaded: host.loaded, error: host.error, routes: host.routes, startedAt: host.startedAt },
       ]),
@@ -255,15 +280,24 @@ export function registerPluginRoutes(app: FastifyInstance, deps: ServerDeps): vo
       (item) => item.id === req.params.id,
     )
     if (!plugin) throw new EabError(EC.NOT_FOUND, `你还没有安装插件：${req.params.id}`)
-    const status = pluginHostStatus(plugin.id, subject.companyId)
+    const status = pluginHostStatus(plugin.id, subject.companyId, userScope(subject.userId))
     return ok({
       status: status
-        ? { loaded: status.loaded, error: status.error, routes: status.routes, startedAt: status.startedAt }
+        ? {
+            loaded: status.loaded,
+            error: status.error,
+            routes: status.routes,
+            routeSpecs: status.routeSpecs,
+            startedAt: status.startedAt,
+            sessions: pluginSessionsFor(deps.db, subject.companyId, subject.userId),
+          }
         : {
             loaded: false,
             error: plugin.format === 'dsh' ? 'host 还没加载（插件可能未启用，或没有 host 入口）' : null,
             routes: [],
+            routeSpecs: [],
             startedAt: null,
+            sessions: pluginSessionsFor(deps.db, subject.companyId, subject.userId),
           },
     })
   })
@@ -288,7 +322,7 @@ export function registerPluginRoutes(app: FastifyInstance, deps: ServerDeps): vo
       if (!plugin.enabled) throw new EabError(EC.FORBIDDEN, '插件已停用，启用后才能调用页面数据')
       const channel = String(req.body?.channel ?? '').trim()
       if (!channel) throw new EabError(EC.VALIDATION, '缺少 channel')
-      return ok(await dispatchPluginRpc(plugin.id, channel, req.body?.call ?? {}, subject.companyId))
+      return ok(await dispatchPluginRpc(plugin.id, channel, req.body?.call ?? {}, subject.companyId, userScope(subject.userId)))
     },
   )
 
@@ -321,7 +355,7 @@ export function registerPluginRoutes(app: FastifyInstance, deps: ServerDeps): vo
         headers: { 'content-type': req.headers['content-type'] ?? 'application/json' },
         body,
         query,
-      }, subject.companyId)
+      }, subject.companyId, userScope(subject.userId))
       reply.status(response.status)
       response.headers.forEach((value, key) => {
         if (key !== 'content-length') reply.header(key, value)
@@ -427,7 +461,11 @@ export function registerPluginRoutes(app: FastifyInstance, deps: ServerDeps): vo
   app.post<{ Params: { id: string } }>('/api/my/plugins/:id/uninstall', async (req) => {
     const { subject } = resolveActor(deps.db, deps.config, req)
     requireScope(subject, SC.PLUGIN_LIST)
-    const result = uninstallUserPlugin(deps.db, subject.companyId, subject.userId, req.params.id)
+    const result = uninstallUserPlugin(deps.db, subject.companyId, subject.userId, req.params.id, {
+      dbPath: deps.config.dbPath,
+      dataDir: deps.config.dataDir,
+      dshHomeDir: deps.config.dshHomeDir,
+    })
     await refreshPluginHosts(deps.db, dshOptions(deps))
     return ok(result)
   })
@@ -456,7 +494,13 @@ export function registerPluginRoutes(app: FastifyInstance, deps: ServerDeps): vo
     ensureConsole(req, deps)
     const { subject } = resolveActor(deps.db, deps.config, req)
     const discovered = loadPlugins(deps.db, subject.companyId)
-    const plugins = discovered.filter((plugin) => plugin.install && !plugin.install.removedAt)
+    // 公司插件列表只认公司安装记录；只有个人安装、或部署侧放在 plugins/ 但无人认领的包，
+    // 都不算“公司已安装”。个人安装单独走 personalPlugins 只读列表。
+    const plugins = discovered.filter(
+      (plugin) => plugin.companyInstall && !plugin.companyInstall.removedAt,
+    )
+    const personalPlugins = loadAdminPersonalPlugins(deps.db, subject.companyId)
+    const personalUsers = new Set(personalPlugins.map((plugin) => plugin.userId))
     const visibleIds = new Set(discovered.map((plugin) => plugin.id))
     const events = listPluginEvents(deps.db, 30, subject.companyId).filter(
       (event) => event.companyId === subject.companyId || visibleIds.has(event.pluginId),
@@ -464,6 +508,8 @@ export function registerPluginRoutes(app: FastifyInstance, deps: ServerDeps): vo
     return ok({
       companyId: subject.companyId,
       plugins: plugins.map((plugin) => serializePlugin(plugin, true)),
+      /** 个人插件：按员工归属只读展示，不进入上面的公司安装列表，也不允许控制台操作 */
+      personalPlugins,
       events,
       stats: {
         discovered: discovered.length,
@@ -471,6 +517,9 @@ export function registerPluginRoutes(app: FastifyInstance, deps: ServerDeps): vo
         enabled: plugins.filter((plugin) => plugin.enabled).length,
         invalid: plugins.filter((plugin) => !plugin.valid).length,
         dsh: plugins.filter((plugin) => plugin.format === 'dsh').length,
+        personalInstalled: personalPlugins.length,
+        personalEnabled: personalPlugins.filter((plugin) => plugin.valid && plugin.enabled).length,
+        personalUsers: personalUsers.size,
       },
       /** DSH 插件 host 运行状态（RPC 通道是否已挂载、启动报错、日志尾巴） */
       hosts: listPluginHostStatuses(plugins.map((plugin) => plugin.id)),
@@ -597,19 +646,23 @@ export function registerPluginRoutes(app: FastifyInstance, deps: ServerDeps): vo
     const { subject } = resolveActor(deps.db, deps.config, req)
     const status = pluginHostStatus(req.params.id, subject.companyId)
     return ok({
-      status: status ?? {
-        id: req.params.id,
-        companyId: subject.companyId,
-        loaded: false,
-        state: 'pending',
-        pendingServices: [],
-        hostEntry: null,
-        startedAt: null,
-        error: 'host 未加载（插件未安装 / 未启用 / 没有 host 入口）',
-        routes: [],
-        logs: [],
-        llmProviders: 0,
-        llmModels: 0,
+      status: {
+        ...(status ?? {
+          id: req.params.id,
+          companyId: subject.companyId,
+          loaded: false,
+          state: 'pending',
+          pendingServices: [],
+          hostEntry: null,
+          startedAt: null,
+          error: 'host 未加载（插件未安装 / 未启用 / 没有 host 入口）',
+          routes: [],
+          routeSpecs: [],
+          logs: [],
+          llmProviders: 0,
+          llmModels: 0,
+        }),
+        sessions: pluginSessionsFor(deps.db, subject.companyId),
       },
     })
   })
@@ -627,7 +680,12 @@ export function registerPluginRoutes(app: FastifyInstance, deps: ServerDeps): vo
   }>('/api/console/plugins/:id/rpc', async (req) => {
     ensureConsole(req, deps)
     const { subject } = resolveActor(deps.db, deps.config, req)
-    const plugin = loadPlugins(deps.db, subject.companyId).find((item) => item.id === req.params.id)
+    const plugin = loadPluginsForUser(
+      deps.db,
+      subject.companyId,
+      subject.userId,
+      true,
+    ).find((item) => item.id === req.params.id)
     if (!plugin || plugin.format !== 'dsh') {
       throw new EabError(EC.NOT_FOUND, `不是已安装的 DSH 插件：${req.params.id}`)
     }
@@ -696,7 +754,14 @@ export function registerPluginRoutes(app: FastifyInstance, deps: ServerDeps): vo
             : resolveActor(deps.db, deps.config, req).subject
       requireScope(subject, SC.PLUGIN_LIST)
 
-      const plugins = loadPluginsForUser(deps.db, subject.companyId, subject.userId)
+      const plugins = loadPluginsForUser(
+        deps.db,
+        subject.companyId,
+        subject.userId,
+        // 控制台是公司管理员视角：除公司插件外，也允许预览本公司的个人插件页面，
+        // 否则个人插件在控制台打开时 client bundle 一律 404。
+        scope !== 'user',
+      )
       const asset = resolvePluginAsset(plugins, req.params.id, req.params['*'])
       if (!asset) throw new EabError(EC.NOT_FOUND, '插件资源不存在或插件未启用')
 

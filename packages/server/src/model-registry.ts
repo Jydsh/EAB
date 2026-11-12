@@ -8,6 +8,7 @@
  * - `model_routes` 允许管理员把一个用途显式绑到某个模型，未绑定则按能力和优先级自动挑。
  */
 import type { Db } from '@eab/storage'
+import { thinkingConfigOf, type ThinkingConfig } from './thinking.js'
 
 export const MODEL_CAPABILITIES = [
   'chat',
@@ -69,6 +70,7 @@ export interface ModelCapabilityRecord {
   readonly contextCompression: boolean
   readonly embeddingDim: number | null
   readonly config: Record<string, unknown>
+  readonly thinking: ThinkingConfig | null
 }
 
 const CAPABILITY_ALIASES: Record<string, string> = {
@@ -181,6 +183,7 @@ const MODEL_SELECT = `
 
 function toRecord(row: ModelRow): ModelCapabilityRecord {
   const capabilities = capabilitiesOf(row.capabilities, row.tags)
+  const config = parseJsonObject(row.config_json)
   return {
     id: row.id,
     name: row.name,
@@ -197,7 +200,8 @@ function toRecord(row: ModelRow): ModelCapabilityRecord {
     maxOutputTokens: row.max_output_tokens === null ? null : Number(row.max_output_tokens),
     contextCompression: row.context_compression === null || Number(row.context_compression) !== 0,
     embeddingDim: row.embedding_dim === null ? null : Number(row.embedding_dim),
-    config: parseJsonObject(row.config_json),
+    config,
+    thinking: thinkingConfigOf(config),
   }
 }
 

@@ -178,7 +178,9 @@ async function fetchFeishuOrg(cfg: ChannelConfig): Promise<RemoteOrg> {
       depts.push({
         channelDeptId: id,
         parentChannelDeptId: String(item.parent_department_id ?? '0') === '0' ? '0' : String(item.parent_department_id),
-        name: String(item.name ?? '未命名部门'),
+        // 飞书根部门 `0` 的平台返回名称是空字符串；它不会建成 EAB 部门行，但 mapRemoteOrg
+        // 会先校验名称，不能把空名称当成普通部门传给映射层。
+        name: String(item.name ?? '').trim() || (id === '0' ? '根部门' : '未命名部门'),
         order: Number(item.order ?? 0),
       })
     }

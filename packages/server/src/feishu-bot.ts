@@ -14,7 +14,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { ulid } from '@eab/domain'
 import { appendAudit, type Db } from '@eab/storage'
-import { actorFor, findPerson, type RequestActor } from './session.js'
+import { actorFor, findActivePerson, type RequestActor } from './session.js'
 import type { ServerDeps } from './deps.js'
 import { resolveSecret } from './secrets.js'
 import type { ChatMessage as LlmMessage } from './llm.js'
@@ -166,7 +166,32 @@ export async function checkFeishuSetup(deps: ServerDeps, force = false): Promise
       return finishSetupCheck(empty(`飞书自检失败：${appBody.msg || `HTTP ${appRes.status}`}`))
     }
     const scopes = (app.scopes ?? []).map((item) => item.scope ?? '').filter(Boolean)
-    const subscribedEvents = app.callback_info?.subscribed_callbacks ?? []
+    const callbackEvents = app.callback_info?.subscribed_callbacks ?? []
+    let versionEvents: string[] = []
+    if (app.online_version_id) {
+      try {
+        const versionRes = await fetch(
+          `https://open.feishu.cn/open-apis/application/v6/applications/${encodeURIComponent(cfg.app_id)}/app_versions/${encodeURIComponent(app.online_version_id)}?lang=zh_cn`,
+          {
+            headers: { authorization: `Bearer ${tokenBody.tenant_access_token}` },
+            signal: AbortSignal.timeout(10_000),
+          },
+        )
+        const versionBody = (await versionRes.json()) as {
+          code?: number
+          data?: { app_version?: { event_infos?: Array<{ event_type?: string }> } }
+        }
+        if (versionBody.code === 0) {
+          versionEvents = (versionBody.data?.app_version?.event_infos ?? [])
+            .map((item) => item.event_type ?? '')
+            .filter(Boolean)
+        }
+      } catch {
+        // 版本详情读取失败时退回卡片回调字段，至少不把已知信息丢掉。
+      }
+    }
+    // 事件订阅属于版本能力，不等于 callback_info.subscribed_callbacks（后者只有卡片回调）。
+    const subscribedEvents = [...new Set([...versionEvents, ...callbackEvents])]
     const callbackType = app.callback_info?.callback_type ?? null
 
     const hasSendScope = scopes.includes('im:message') || scopes.includes('im:message:send_as_bot')
@@ -507,7 +532,12 @@ export async function handleFeishuEvent(
       return finish(deps, eventKey, { handled: true, text, sessionId: null, reason: 'identity-unbound' })
     }
 
-    const catalog = loadModelCatalog(deps.db, actor.subject.companyId, deps.config.devAuth)
+    const catalog = loadModelCatalog(
+      deps.db,
+      actor.subject.companyId,
+      deps.config.devAuth,
+      actor.subject.userId,
+    )
     const available = visibleModelsFor(catalog, [...actor.subject.roles])
     if (available.length === 0) {
       const text =
@@ -593,7 +623,7 @@ export async function handleFeishuEvent(
       .all(actor.subject.companyId, actor.person.id, actor.subject.deptId, actor.subject.companyId) as unknown as Array<{
       content: string
     }>
-    const chatTools = toolSpecsForAgent(deps.db, actor, { kind: 'none' })
+    const chatTools = toolSpecsForAgent(deps.db, actor, { kind: 'none' }, rawText)
     const system = buildSystemPrompt({
       actor,
       chatTools,
@@ -788,17 +818,29 @@ function resolveFeishuActor(db: Db, companyId: string, externalId: string): Requ
          JOIN users u ON u.id = ci.user_id
         WHERE ci.provider = 'feishu' AND ci.external_id = ? AND ci.revoked_at IS NULL
           AND u.company_id = ? AND u.deleted_at IS NULL
+          AND u.status = 'active' AND u.disabled_at IS NULL
         LIMIT 1`,
     )
     .get(externalId, companyId) as { user_id: string } | undefined
   if (bound?.user_id) {
-    const person = findPerson(db, bound.user_id)
+    const person = findActivePerson(db, bound.user_id)
     return person ? actorFor(db, person) : null
   }
 
+  // 身份仍在但成员已停用/删除时，不再走“自动建成员”兜底，否则会把离职成员重新激活。
+  const blocked = db
+    .prepare(
+      `SELECT 1 AS hit
+         FROM channel_identities ci
+        WHERE ci.provider = 'feishu' AND ci.external_id = ? AND ci.revoked_at IS NULL
+        LIMIT 1`,
+    )
+    .get(externalId) as { hit: number } | undefined
+  if (blocked) return null
+
   const userId = provisionFeishuUser(db, companyId, externalId)
   if (!userId) return null
-  const person = findPerson(db, userId)
+  const person = findActivePerson(db, userId)
   return person ? actorFor(db, person) : null
 }
 
@@ -839,16 +881,13 @@ function provisionFeishuUser(db: Db, companyId: string, openId: string): string 
   const userId = `u_feishu_${createHash('sha256').update(`${companyId}:${openId}`).digest('hex').slice(0, 16)}`
   const name = `飞书用户 ${openId.slice(-6)}`
   const now = Date.now()
-  const existingUser = db.prepare('SELECT id FROM users WHERE id = ? AND company_id = ?').get(userId, companyId) as
-    | { id: string }
-    | undefined
+  const existingUser = db
+    .prepare('SELECT id, status, deleted_at FROM users WHERE id = ? AND company_id = ?')
+    .get(userId, companyId) as { id: string; status: string; deleted_at: number | null } | undefined
   if (existingUser?.id) {
-    db.prepare('UPDATE users SET deleted_at = NULL, status = ?, updated_at = ? WHERE id = ? AND company_id = ?').run(
-      'active',
-      now,
-      userId,
-      companyId,
-    )
+    // 已停用/已删除的成员不能被一条飞书消息重新激活，必须由管理员在控制台恢复。
+    if (existingUser.status !== 'active' || existingUser.deleted_at !== null) return null
+    db.prepare('UPDATE users SET updated_at = ? WHERE id = ? AND company_id = ?').run(now, userId, companyId)
   } else {
     db.prepare(
       `INSERT INTO users

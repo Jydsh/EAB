@@ -46,6 +46,41 @@ describe('mapRemoteOrg：部门树', () => {
     expect(plan.depts[0]?.path).toBe('/c1/d_mock_rd/')
   })
 
+  it('groupChannelRoot 时把飞书根建成公司下的渠道分组节点，成员跟着进入该节点', () => {
+    const remote: RemoteOrg = {
+      depts: [
+        { channelDeptId: '0', parentChannelDeptId: '0', name: '根部门', order: 0 },
+        { channelDeptId: 'rd', parentChannelDeptId: '0', name: '研发中心', order: 1 },
+      ],
+      users: [
+        {
+          channelUserId: 'ou_1',
+          name: '飞书成员',
+          channelDeptIds: ['0'],
+          status: 'active',
+        },
+      ],
+    }
+
+    const plan = mapRemoteOrg(remote, {
+      ...base,
+      rootChannelDeptIds: ['0'],
+      groupChannelRoot: true,
+      channelRootName: '飞书 · 测试企业',
+    })
+    const byChannel = new Map(plan.depts.map((row) => [row.channelDeptId, row]))
+
+    expect(byChannel.get('0')?.id).toBe('d_mock_0')
+    expect(byChannel.get('0')?.name).toBe('飞书 · 测试企业')
+    expect(byChannel.get('0')?.parentId).toBe('d_root')
+    expect(byChannel.get('0')?.path).toBe('/c1/d_mock_0/')
+    expect(byChannel.get('rd')?.parentId).toBe('d_mock_0')
+    expect(byChannel.get('rd')?.path).toBe('/c1/d_mock_0/d_mock_rd/')
+    expect(plan.users[0]?.deptId).toBe('d_mock_0')
+    expect(plan.users[0]?.deptPath).toBe('/c1/d_mock_0/')
+    expect(plan.unassignedUsers).toEqual([])
+  })
+
   it('钉钉根部门 1 不在返回里时，子部门挂公司根且不记 orphan', () => {
     const remote: RemoteOrg = {
       depts: [

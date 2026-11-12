@@ -1,0 +1,466 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>DSH 插件</title>
+<script type="importmap">
+{
+  "imports": {
+    "react": "/vendor/dsh-kernel/react-esm.js",
+    "react-dom": "/vendor/dsh-kernel/react-dom-esm.js",
+    "react/jsx-runtime": "/vendor/dsh-kernel/react-jsx-runtime.js",
+    "@deepseek-ai/cosmokit": "/vendor/dsh-kernel/cosmokit.js",
+    "@deepseek-ai/cordis": "/vendor/dsh-kernel/cordis.js",
+    "@deepseek-ai/dsh-client-ui-slots": "/vendor/dsh-kernel/slots.js",
+    "@deepseek-ai/dsh-client-ui-renderer": "/vendor/dsh-kernel/renderer.js",
+    "@deepseek-ai/dsh-client-ui-primitives": "/vendor/dsh-kernel/primitives.js"
+  }
+}
+</script>
+<link rel="stylesheet" href="/vendor/dsh-kernel/primitives.css" />
+<style>
+  :root {
+    color-scheme: light;
+    --dsw-alias-bg: #f6f8f7;
+    --dsw-alias-bg-elevated: #ffffff;
+    --dsw-alias-text: #1f2937;
+    --dsw-alias-text-muted: #6b7280;
+    --dsw-alias-border: #e4e7ec;
+    --dsw-alias-primary: #0f766e;
+    --dsw-alias-primary-soft: #e6f4f2;
+    --dsw-alias-radius: 12px;
+    --dsw-alias-gap: 12px;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.55 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif; color: #1f2937; background: #f6f8f7; }
+  .pk-top { min-width: 0; display: flex; align-items: center; gap: 12px; padding: 14px 20px; background: #fff; border-bottom: 1px solid #e4e7ec; position: sticky; top: 0; z-index: 5; }
+  .pk-mark { width: 34px; height: 34px; border-radius: 10px; background: #e6f4f2; color: #0f766e; display: grid; place-items: center; font-weight: 700; }
+  .pk-name { font-weight: 700; font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pk-sub { color: #6b7280; font-size: 12px; margin-top: 2px; }
+  .pk-badge { white-space: nowrap; display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px; border-radius: 999px; background: #f0fdfa; color: #0f766e; border: 1px solid #ccfbf1; font-size: 12px; }
+  .pk-badge.warn { background: #fffbeb; color: #b45309; border-color: #fde68a; }
+  .pk-right { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+  .pk-btn { white-space: nowrap; appearance: none; border: 1px solid #d1d5db; background: #fff; color: #374151; border-radius: 8px; padding: 5px 11px; font-size: 12px; cursor: pointer; }
+  .pk-btn:hover { border-color: #0f766e; color: #0f766e; }
+  .pk-shell { display: grid; grid-template-columns: 220px minmax(0, 1fr); min-height: calc(100vh - 63px); }
+  .pk-kernel-shell { display: grid; grid-template-columns: 220px minmax(0, 1fr); min-height: calc(100vh - 63px); }
+  .pk-kernel-rail { background: #fff; border-right: 1px solid #e4e7ec; padding: 14px 10px; min-width: 0; }
+  .pk-kernel-main { padding: 18px 20px 40px; min-width: 0; }
+  .pk-kernel-tabs { display: flex; gap: 6px; margin-bottom: 10px; }
+  .pk-kernel-tab { appearance: none; border: 1px solid #d1d5db; background: #fff; color: #6b7280; border-radius: 8px; padding: 4px 12px; font-size: 12px; cursor: pointer; }
+  .pk-kernel-tab.active { border-color: #0f766e; color: #0f766e; background: #f0fdfa; }
+  .pk-kernel-panel { background: #fff; border: 1px solid #e4e7ec; border-radius: 12px; padding: 18px; min-height: 360px; }
+  .pk-rail { background: #fff; border-right: 1px solid #e4e7ec; padding: 14px 10px; min-width: 0; }
+  .pk-rail-title { font-size: 11px; letter-spacing: .08em; color: #94a3b8; padding: 4px 10px 8px; text-transform: uppercase; }
+  .pk-main { padding: 18px 20px 40px; min-width: 0; }
+  .pk-panel { background: #fff; border: 1px solid #e4e7ec; border-radius: 12px; padding: 18px; min-height: 360px; }
+  .pk-error { color: #b91c1c; background: #fef2f2; border: 1px solid #fecaca; border-radius: 10px; padding: 10px 12px; margin-bottom: 12px; font-size: 12px; white-space: pre-wrap; }
+  .pk-hidden { display: none; }
+  .pk-empty { color: #6b7280; padding: 40px 10px; text-align: center; }
+</style>
+</head>
+<body>
+<div class="pk-top">
+  <div class="pk-mark">D</div>
+  <div>
+    <div class="pk-name" id="pk-name">DSH 插件</div>
+    <div class="pk-sub" id="pk-sub">正在加载插件…</div>
+  </div>
+  <span class="pk-badge" id="pk-format">DSH 插件</span>
+  <span class="pk-badge warn" id="pk-status">内核启动中</span>
+  <div class="pk-right">
+    <button class="pk-btn" id="pk-reload" type="button">重新加载</button>
+  </div>
+</div>
+<div class="pk-error pk-hidden" id="pk-error"></div>
+<div id="pk-root">
+  <div class="pk-empty">正在准备 DSH 官方插件内核…</div>
+</div>
+
+<script src="/vendor/react.production.min.js"></script>
+<script src="/vendor/react-dom.production.min.js"></script>
+
+<script>
+(() => {
+  'use strict'
+  const query = new URLSearchParams(location.search)
+  const pluginId = query.get('id') || ''
+  const entry = query.get('entry') || ''
+  const company = query.get('company') || ''
+  const version = query.get('version') || ''
+  const title = query.get('title') || pluginId
+  const scope = query.get('scope') === 'user' ? 'user' : 'console'
+  const asUser = query.get('as') || ''
+  const gatewayBase = scope === 'user'
+    ? '/api/my/plugins/' + encodeURIComponent(pluginId) + '/gateway'
+    : '/api/console/plugins/' + encodeURIComponent(pluginId) + '/gateway'
+
+  const nameEl = document.getElementById('pk-name')
+  const subEl = document.getElementById('pk-sub')
+  const statusEl = document.getElementById('pk-status')
+  const errorEl = document.getElementById('pk-error')
+  const mountEl = document.getElementById('pk-root')
+
+  nameEl.textContent = title
+  subEl.textContent = pluginId + (version ? ' · v' + version : '') + (scope === 'user' ? ' · 个人安装' : '')
+  document.title = title + ' · DSH 插件'
+
+  function showError(message) {
+    errorEl.textContent = message
+    errorEl.classList.remove('pk-hidden')
+  }
+
+  document.getElementById('pk-reload').addEventListener('click', () => location.reload())
+
+  // EAB 同源插件请求统一转到插件网关；EAB 自身 API 和静态资源保持原样。
+  const EAB_RESERVED = [
+    '/api/console', '/api/my', '/api/plugins', '/api/auth', '/api/admin',
+    '/api/health', '/api/system', '/api/settings', '/api/workspace', '/api/memory',
+    '/api/chat', '/api/org', '/api/channel', '/api/kb', '/api/quota', '/api/tools',
+    '/api/sync', '/plugins/assets', '/plugin-host.html', '/plugin-kernel.html',
+    '/dsh-runtime.js', '/admin', '/chat', '/vendor', '/app.js', '/app.css',
+    '/chat.js', '/chat.css'
+  ]
+  function isReserved(path) {
+    if (path === '/') return true
+    return EAB_RESERVED.some((prefix) => path === prefix || path.indexOf(prefix + '/') === 0)
+  }
+  function isPluginPath(path) {
+    if (isReserved(path)) return false
+    if (path === '/api' || path.indexOf('/api/') === 0) return true
+    if (path === '/' + pluginId || path.indexOf('/' + pluginId + '/') === 0) return true
+    return false
+  }
+  function mapPluginUrl(input) {
+    const raw = typeof input === 'string' ? input : (input && input.url) || ''
+    if (!raw) return ''
+    let url
+    try { url = new URL(raw, location.href) } catch (_) { return '' }
+    if (url.origin !== location.origin) return ''
+    if (!isPluginPath(url.pathname)) return ''
+    return gatewayBase + url.pathname + url.search
+  }
+  function bridgeHeaders(headers) {
+    const next = new Headers(headers || {})
+    if (scope !== 'user') next.set('x-eab-console', '1')
+    return next
+  }
+  function postRpc(channel, call) {
+    const rpcUrl = (scope === 'user'
+      ? '/api/my/plugins/' + encodeURIComponent(pluginId) + '/rpc'
+      : '/api/console/plugins/' + encodeURIComponent(pluginId) + '/rpc')
+      + (asUser ? '?as=' + encodeURIComponent(asUser) : '')
+    return fetch(rpcUrl, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: bridgeHeaders({ 'content-type': 'application/json' }),
+      body: JSON.stringify({ channel, call }),
+    }).then(async (response) => {
+      const payload = await response.json().catch(() => null)
+      if (!payload || payload.ok !== true) throw new Error((payload && (payload.message || payload.error)) || 'RPC 请求失败')
+      return payload.data
+    })
+  }
+  const connection = {
+    rpc: {
+      call(_path, channel, call, signal) {
+        if (signal && signal.aborted) return Promise.reject(new DOMException('Aborted', 'AbortError'))
+        return postRpc(channel, call)
+      },
+      register() { return () => {} },
+    },
+    fetch: { register() { return () => {} } },
+  }
+
+  function readSelectedSessionId() {
+    try {
+      const fromQuery = new URLSearchParams(location.search).get('session')
+      if (fromQuery) return fromQuery
+      const raw = localStorage.getItem('dsh.sessions.current')
+      if (!raw) return ''
+      const value = JSON.parse(raw)
+      return value && typeof value.sessionId === 'string' ? value.sessionId : ''
+    } catch (_) {
+      return ''
+    }
+  }
+  let sessionSnapshot = { current: readSelectedSessionId() }
+  const sessions = {
+    refresh: async () => {
+      sessionSnapshot = { current: readSelectedSessionId() }
+      return []
+    },
+    getSnapshot: () => sessionSnapshot,
+    refreshProjections: async () => undefined,
+    subscribe: () => () => {},
+  }
+  function installFetchBridge() {
+    const nativeFetch = window.fetch.bind(window)
+    window.fetch = function (input, init) {
+      const mapped = mapPluginUrl(input)
+      if (!mapped) return nativeFetch(input, init)
+      const next = {}
+      if (init) for (const key in init) if (Object.prototype.hasOwnProperty.call(init, key)) next[key] = init[key]
+      next.headers = bridgeHeaders(next.headers)
+      return nativeFetch(mapped, next)
+    }
+    const nativeOpen = XMLHttpRequest.prototype.open
+    XMLHttpRequest.prototype.open = function (method, url) {
+      const mapped = mapPluginUrl(url)
+      this.__eabGateway = Boolean(mapped)
+      return nativeOpen.apply(this, mapped ? [method, mapped].concat(Array.prototype.slice.call(arguments, 2)) : arguments)
+    }
+    const nativeSend = XMLHttpRequest.prototype.send
+    XMLHttpRequest.prototype.send = function (body) {
+      if (this.__eabGateway && scope !== 'user') {
+        try { this.setRequestHeader('x-eab-console', '1') } catch (_) {}
+      }
+      return nativeSend.call(this, body)
+    }
+  }
+  installFetchBridge()
+
+  // 官方 DSH client bundle 通过 window.__ModuleLoader__.load({id, factory}) 注册。
+  const factories = new Map()
+  const cache = new Map()
+  const seed = Object.create(null)
+  const jsxCreate = (type, props, key) => {
+    const { children, ...rest } = props || {}
+    const config = key === undefined ? rest : { ...rest, key }
+    if (children === undefined) return React.createElement(type, config)
+    return React.createElement(type, config, ...(Array.isArray(children) ? children : [children]))
+  }
+  seed.react = window.React
+  seed['react-dom'] = window.ReactDOM
+  seed['react-dom/client'] = { createRoot: window.ReactDOM.createRoot }
+  seed['react/jsx-runtime'] = { Fragment: React.Fragment, jsx: jsxCreate, jsxs: jsxCreate }
+  function requireModule(name) {
+    if (seed[name] !== undefined) return seed[name]
+    if (cache.has(name)) return cache.get(name)
+    const factory = factories.get(name)
+    if (factory) {
+      const module = { exports: {} }
+      cache.set(name, module.exports)
+      const result = factory((next) => requireModule(next))
+      const exports = result === undefined ? module.exports : result
+      cache.set(name, exports)
+      return exports
+    }
+    throw new Error('缺少 DSH client 模块：' + name)
+  }
+  window.__ModuleLoader__ = {
+    load(definition) {
+      if (!definition || !definition.id || typeof definition.factory !== 'function') throw new Error('非法的 ModuleLoader 注册')
+      factories.set(definition.id, definition.factory)
+    },
+    require: requireModule,
+    has(name) { return seed[name] !== undefined || factories.has(name) || cache.has(name) },
+  }
+
+  function loadScript(url) {
+    return new Promise((resolve, reject) => {
+      const script = document.createElement('script')
+      script.src = url
+      script.onload = () => resolve()
+      script.onerror = () => reject(new Error('client bundle 加载失败：' + url))
+      document.body.appendChild(script)
+    })
+  }
+
+  // locale facade：官方 renderer 和插件都通过这个 face 取词条。
+  const dictionaries = new Map()
+  let localeRevision = 0
+  let localeSnapshot = { revision: 0 }
+  const localeListeners = new Set()
+  function bumpLocale() {
+    localeRevision += 1
+    localeSnapshot = { revision: localeRevision }
+    localeListeners.forEach((fn) => fn())
+  }
+  const locale = {
+    register(namespace, localeOrDicts, dict) {
+      // DSH 官方签名为 register(ns, locale, dict) 或 register(ns, { de: {...}, en: {...} })。
+      // 旧实现把整个对象当成扁平词条，导致插件页面只显示 key。
+      const locales = new Map()
+      if (typeof localeOrDicts === 'string') {
+        if (dict && typeof dict === 'object') locales.set(localeOrDicts.toLowerCase(), { ...dict })
+      } else if (localeOrDicts && typeof localeOrDicts === 'object') {
+        for (const [localeId, entries] of Object.entries(localeOrDicts)) {
+          if (entries && typeof entries === 'object' && !Array.isArray(entries)) {
+            locales.set(String(localeId).toLowerCase(), { ...entries })
+          }
+        }
+      }
+      dictionaries.set(namespace, locales)
+      bumpLocale()
+      return () => { dictionaries.delete(namespace); bumpLocale() }
+    },
+    getSnapshot() { return localeSnapshot },
+    subscribe(fn) { localeListeners.add(fn); return () => localeListeners.delete(fn) },
+    bind(namespace) {
+      return (key, params) => {
+        const locales = dictionaries.get(namespace)
+        let value
+        if (locales) {
+          const ordered = []
+          for (const id of ['zh', 'zh-cn', 'en']) if (locales.has(id)) ordered.push(locales.get(id))
+          for (const [id, entries] of locales) if (!['zh', 'zh-cn', 'en'].includes(id)) ordered.push(entries)
+          for (const entries of ordered) {
+            if (Object.prototype.hasOwnProperty.call(entries, key)) { value = entries[key]; break }
+          }
+        }
+        if (value === undefined) value = key
+        if (params && typeof value === 'string') value = value.replace(/\{(\w+)\}/g, (_, name) => String(params[name] ?? `{${name}}`))
+        return value
+      }
+    },
+  }
+
+  // layout facade：插件调用 selectPanel 时切换 main 的 keyed 面板。
+  let activePanel = ''
+  const panelListeners = new Set()
+  function setActivePanel(id) {
+    if (typeof id !== 'string' || !id) return
+    activePanel = id
+    panelListeners.forEach((fn) => fn())
+  }
+  const layout = {
+    selectPanel(id) { setActivePanel(id) },
+    get panelInfo() { return { activePanelId: activePanel } },
+    subscribe(fn) { panelListeners.add(fn); return () => panelListeners.delete(fn) },
+    toggleSidebar() {},
+    openRightbar() {},
+    closeRightbar() {},
+  }
+
+  const h = React.createElement
+  function useActivePanel() {
+    const [value, setValue] = React.useState(activePanel)
+    React.useEffect(() => {
+      const fn = () => setValue(activePanel)
+      panelListeners.add(fn)
+      return () => panelListeners.delete(fn)
+    }, [])
+    return value
+  }
+
+  function Root(props) {
+    const renderSlot = props.renderSlot
+    const registry = props.__slotRegistry
+    const panel = useActivePanel()
+    const mainEntries = registry && registry.entries ? registry.entries('main') : []
+    const keys = mainEntries.map((entry) => entry.options?.key).filter(Boolean)
+    const active = keys.indexOf(panel) >= 0 ? panel : (keys[0] || '')
+    if (active && active !== activePanel) setActivePanel(active)
+    const hasMain = keys.length > 0
+    const hasSettings = !!(registry && registry.entries && registry.entries('settings.section').length)
+    const [view, setView] = React.useState(hasMain ? 'main' : 'settings')
+    const showSettings = view === 'settings' && hasSettings
+    const sidebar = renderSlot('sidebar.panellist', { activePanelId: active })
+    // main 与 settings/config 是不同视图，不能同时渲染，否则同一个插件页会出现两份。
+    const main = showSettings ? null : (active ? renderSlot('main', {}, { entryKey: active }) : null)
+    const settings = showSettings ? renderSlot('settings.section') : null
+    const config = (!hasMain && !showSettings) ? renderSlot('plugins.bundle.config', {}, { entryKey: pluginId }) : null
+    const tabs = (hasMain && hasSettings)
+      ? h('div', { className: 'pk-kernel-tabs', key: 'tabs' }, [
+          h('button', { key: 'main', type: 'button', className: 'pk-kernel-tab' + (!showSettings ? ' active' : ''), onClick: () => setView('main') }, '页面'),
+          h('button', { key: 'settings', type: 'button', className: 'pk-kernel-tab' + (showSettings ? ' active' : ''), onClick: () => setView('settings') }, '设置'),
+        ])
+      : null
+    return h('div', { className: 'pk-kernel-shell' }, [
+      h('div', { className: 'pk-kernel-rail', key: 'rail' }, sidebar),
+      h('div', { className: 'pk-kernel-main', key: 'main' }, [
+        tabs,
+        main || settings || h('div', { className: 'pk-empty', key: 'empty' }, '插件还没有注册 main 页面。'),
+        config,
+      ]),
+    ])
+  }
+
+  async function boot() {
+    const Cordis = await import('@deepseek-ai/cordis')
+    const Slots = await import('@deepseek-ai/dsh-client-ui-slots')
+    seed['@deepseek-ai/cordis'] = Cordis
+    seed['@deepseek-ai/dsh-client-ui-slots'] = Slots
+    seed['@deepseek-ai/dsh-client-ui-primitives'] = await import('/vendor/dsh-kernel/primitives.js')
+    await loadScript('/vendor/dsh-kernel/renderer.js')
+    const ctx = new Cordis.Context()
+    // 兼容层：EAB 的服务表是直接放在 ctx 上的，没有走 Cordis loader 的 inject 服务注册。
+    // 插件用 ctx.inject(['layout'], cb) 等待页面壳时，直接以当前 ctx 执行回调。
+    try {
+      ctx.inject = (keys, callback) => {
+        if (typeof callback !== 'function') return Promise.resolve(undefined)
+        callback(ctx)
+        return () => {}
+      }
+    } catch (_) {}
+    ctx.reflect.provide('locale', locale)
+    ctx.reflect.provide('layout', layout)
+    ctx.reflect.provide('connection', connection)
+    ctx.reflect.provide('sessions', sessions)
+
+    const renderer = requireModule('@deepseek-ai/dsh-client-ui-renderer')
+    await ctx.plugin(renderer)
+    ctx.slots.installLocale(locale)
+
+    const emptyBinding = { key: undefined }
+    const emptySession = { getSnapshot: () => emptyBinding, subscribe: () => () => {} }
+    ctx.slots.installScope('session', { current: emptySession, bindingSource: () => emptySession })
+
+    ctx.slots.register({
+      name: 'root',
+      children: {
+        main: { kind: 'keyed', scope: 'root' },
+        'sidebar.panellist': { kind: 'list', scope: 'root' },
+        'settings.section': { kind: 'list', scope: 'root' },
+        'plugins.detail.actions': { kind: 'list', scope: 'root' },
+        'plugins.bundle.config': { kind: 'keyed', scope: 'root' },
+        'conversation.view': { kind: 'list', scope: 'root' },
+        'conversation.chat.assistant-actions': { kind: 'list', scope: 'root' },
+        'conversation.input.overlay': { kind: 'list', scope: 'root' },
+      },
+      inject: () => ({ __slotRegistry: ctx.slots }),
+    }, Root)
+
+    if (!entry || entry.indexOf('..') >= 0 || entry.charAt(0) === '/' || /^[A-Za-z]:/.test(entry)) {
+      throw new Error('插件没有声明合法的 client 入口（exports["./client"]）。')
+    }
+    const assetUrl = '/plugins/assets/' + encodeURIComponent(pluginId) + '/' + entry.split('/').map(encodeURIComponent).join('/')
+      + '?scope=' + (scope === 'user' ? 'user' : 'console')
+    await loadScript(assetUrl)
+    const factory = factories.get(pluginId)
+    if (!factory) throw new Error('client bundle 没有注册 ModuleLoader 模块：' + pluginId)
+    let plugin = factory((name) => requireModule(name))
+    if (plugin && plugin.default && (plugin.apply || plugin.inject)) plugin = plugin.default
+    // DSH client 包可能带 Cordis 的 __internals（已经包装过的插件对象）。
+    // EAB 这里要自己接管 ctx.inject 兼容，所以先还原成普通 { apply, inject }。
+    if (plugin && plugin.__internals) {
+      plugin = { name: plugin.name, inject: plugin.inject, apply: plugin.apply }
+    }
+    await ctx.plugin(plugin)
+    // Cordis 的 ctx.inject(...) 回调在依赖服务就绪后的后续微任务里执行；
+    // 给插件一次注册 slot 的机会，再挂载 renderer，否则首帧会看到 0 个页面。
+    await new Promise((resolve) => setTimeout(resolve, 500))
+
+    statusEl.textContent = '内核已就绪'
+    statusEl.classList.remove('warn')
+    mountEl.innerHTML = ''
+    ctx.uiRenderer.mount(mountEl)
+    subEl.textContent = pluginId + (version ? ' · v' + version : '') + ' · ' + (mainEntryCount(ctx) || 0) + ' 个页面' + (scope === 'user' ? ' · 个人安装' : '')
+  }
+
+  function mainEntryCount(ctx) {
+    try { return ctx.slots.entries('main').length } catch (_) { return 0 }
+  }
+
+  boot().catch((error) => {
+    statusEl.textContent = '内核启动失败'
+    statusEl.classList.add('warn')
+    showError((error && error.stack) || String(error))
+    mountEl.innerHTML = '<div class="pk-empty">插件页面没有启动。</div>'
+  })
+})()
+</script>
+</body>
+</html>

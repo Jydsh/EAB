@@ -15,12 +15,13 @@ import { SC, scopeAllows } from '@eab/domain'
 import { appendAudit, type Db } from '@eab/storage'
 import { consumeRobotUserFileSend } from './dingtalk-file-echo.js'
 import { publishChatEvent, type ChatLiveToolEventPayload } from './chat-events.js'
-import { findPerson, actorFor, type RequestActor } from './session.js'
+import { findActivePerson, findPerson, actorFor, type RequestActor } from './session.js'
 import type { ServerDeps } from './deps.js'
 import { resolveSecret } from './secrets.js'
 import type { ChatMessage as LlmMessage, LlmContent } from './llm.js'
 import {
   acquireTurn,
+  formatClarifyText,
   buildSystemPrompt,
   bumpUsage,
   ensureChannelSession,
@@ -678,8 +679,24 @@ export async function handleDingTalkMessage(
       reason: 'identity-unbound',
     }
   }
-  const person = findPerson(deps.db, userId)
-  if (!person || person.companyId !== deps.companyId) {
+  const person = findActivePerson(deps.db, userId)
+  if (!person) {
+    if (findPerson(deps.db, userId)) {
+      return {
+        handled: false,
+        text: '这个钉钉账号对应的 EAB 成员已离职或已停用，不能继续使用平台。如需恢复，请联系管理员在控制台确认成员状态。',
+        sessionId: null,
+        reason: 'member-disabled',
+      }
+    }
+    return {
+      handled: false,
+      text: '这个钉钉账号不属于当前 EAB 实例的唯一公司，暂时不能对话。',
+      sessionId: null,
+      reason: 'company-mismatch',
+    }
+  }
+  if (person.companyId !== deps.companyId) {
     return {
       handled: false,
       text: '这个钉钉账号不属于当前 EAB 实例的唯一公司，暂时不能对话。',
@@ -694,8 +711,13 @@ export async function handleDingTalkMessage(
   if (!scopeAllows(actor.subject.scopes, SC.MODEL_USE)) {
     return { handled: false, text: '当前身份没有使用模型的权限（model:use）。', sessionId: null, reason: 'scope-denied' }
   }
-  const catalog = loadModelCatalog(deps.db, actor.subject.companyId, deps.config.devAuth)
-  const available = visibleModelsFor(catalog, [...actor.subject.roles])
+  const catalog = loadModelCatalog(
+    deps.db,
+    actor.subject.companyId,
+    deps.config.devAuth,
+    actor.subject.userId,
+  )
+  const available = visibleModelsFor(catalog, [...actor.subject.roles], actor.subject.companyId)
 
   /**
    * 渠道里的模型切换必须先于额度校验：它不调用模型，也不消耗额度。
@@ -922,7 +944,7 @@ export async function handleDingTalkMessage(
     }>
     // A2UI 卡能展示钉盘 File 组件；建卡失败时退回 sampleFile 文件消息。
     const toolSpace: ActiveSpace = { kind: 'cloud', channel: card ? 'dingtalk-a2ui' : 'dingtalk-file' }
-    const chatTools = toolSpecsForAgent(deps.db, actor, toolSpace)
+    const chatTools = toolSpecsForAgent(deps.db, actor, toolSpace, promptText)
     const pluginPrompts = pluginPromptTexts(deps.db, actor)
     const system = buildSystemPrompt({
       actor,
@@ -1158,7 +1180,8 @@ export async function handleDingTalkMessage(
     const greeting = firstMessage && !alreadyBranded
       ? `你好，${actor.person.name}。我是「${actor.person.companyName}」的 EAB 企业智能助手（Enterprise Agent Base）。钉钉这里的对话和 EAB 网页工作台是同一份历史。\n\n`
       : ''
-    const answerText = `${modelFallbackNote}${failoverNote}${greeting}${agentText}`
+    const clarifyText = formatClarifyText(agentResult?.clarify)
+    const answerText = `${modelFallbackNote}${failoverNote}${greeting}${clarifyText || agentText}`
 
     // 卡片成功收口时返回 null，交给调用方跳过 sessionWebhook 纯文本；失败才回退文字。
     let replyText: string | null = answerText
@@ -1217,6 +1240,7 @@ export async function handleDingTalkMessage(
       reasoning: (agentResult?.reasoning || cardState.reasoning || '').trim(),
       toolCalls: agentResult?.toolCalls ?? [],
       rounds,
+      clarify: agentResult?.clarify ?? null,
     }
     deps.db
       .prepare(

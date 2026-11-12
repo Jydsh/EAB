@@ -8,7 +8,7 @@
  */
 import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { extname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify'
 import { EC, EabError, toEabError } from '@eab/domain'
@@ -43,9 +43,22 @@ const CONTENT_TYPES: Record<string, string> = {
   'chat.js': 'text/javascript; charset=utf-8',
   'chat.css': 'text/css; charset=utf-8',
   'plugin-host.html': 'text/html; charset=utf-8',
+  'plugin-kernel.html': 'text/html; charset=utf-8',
   'dsh-runtime.js': 'text/javascript; charset=utf-8',
+  'plugin-kernel-lab.html': 'text/html; charset=utf-8',
   'vendor/react.production.min.js': 'text/javascript; charset=utf-8',
   'vendor/react-dom.production.min.js': 'text/javascript; charset=utf-8',
+}
+
+/** 静态文件按扩展名兜底；显式表优先，避免新增 lab 文件时反复补白名单。 */
+const EXTENSION_CONTENT_TYPES: Record<string, string> = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.map': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
 }
 
 /** 服务面：员工对话页 / 管理控制台。`all` 只给测试与老装配用。 */
@@ -126,9 +139,17 @@ function installBodyBudgetGuard(app: FastifyInstance, deps: ServerDeps): void {
 function servePublic(name: string, reply: FastifyReply): FastifyReply {
   const publicDir = process.env.EAB_PUBLIC_DIR || fileURLToPath(new URL('../public', import.meta.url))
   const body = readFileSync(join(publicDir, name))
-  reply.type(CONTENT_TYPES[name] ?? 'application/octet-stream')
+  reply.type(CONTENT_TYPES[name] ?? EXTENSION_CONTENT_TYPES[extname(name)] ?? 'application/octet-stream')
   reply.header('cache-control', 'no-store')
   return reply.send(body)
+}
+
+/** 只允许读取 lab 自己的静态目录，避免把整个 public 变成通配静态站。 */
+function serveKernelVendor(file: string, reply: FastifyReply): FastifyReply {
+  if (!/^[A-Za-z0-9._-]+\.(?:js|css)$/u.test(file)) {
+    return reply.code(404).send({ ok: false, code: 'EAB_NOT_FOUND', message: 'unknown kernel asset' })
+  }
+  return servePublic(`vendor/dsh-kernel/${file}`, reply)
 }
 
 function toChat(req: FastifyRequest, reply: FastifyReply): FastifyReply {
@@ -160,7 +181,7 @@ export function buildApp(deps: ServerDeps, surface: AppSurface = 'all'): Fastify
           maxConcurrent: deps.config.chatMaxConcurrent ?? 8,
           queueLimit: deps.config.chatQueueLimit ?? 100,
           queueTimeoutMs: deps.config.chatQueueTimeoutMs ?? 240_000,
-          maxInFlightPerUser: deps.config.chatUserMaxInFlight ?? 2,
+          maxInFlightPerUser: deps.config.chatUserMaxInFlight ?? 0,
           messagesPerMinute: deps.config.chatUserMessagesPerMinute ?? 20,
           modelMaxConcurrent: deps.config.chatModelMaxConcurrent ?? 4,
           companyMaxConcurrent: deps.config.chatCompanyMaxConcurrent ?? deps.config.chatMaxConcurrent ?? 8,
@@ -201,6 +222,14 @@ export function buildApp(deps: ServerDeps, surface: AppSurface = 'all'): Fastify
       )
     }
   }
+
+  // Phase 0 插件内核原型：只服务 lab 页面和它自己的内核静态文件。
+  app.get('/plugin-kernel-lab.html', async (_req, reply) => servePublic('plugin-kernel-lab.html', reply))
+  // 正式插件页：官方 Cordis + slots + renderer 内核；员工端与控制台共用同一份页面。
+  app.get('/plugin-kernel.html', async (_req, reply) => servePublic('plugin-kernel.html', reply))
+  app.get('/vendor/dsh-kernel/:file', async (req, reply) =>
+    serveKernelVendor((req.params as { file: string }).file, reply),
+  )
 
   /**
    * 管理控制台是服务器侧的管理面，不登录任何组织成员：

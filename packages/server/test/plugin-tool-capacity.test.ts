@@ -3,6 +3,9 @@ import { executePluginTool, pluginToolSemaphore } from '../src/plugin-tools.js'
 
 function fakeTool(pluginId: string, execute: (args: Record<string, unknown>) => unknown) {
   return {
+    instanceKey: pluginId,
+    companyId: 'c1',
+    scope: { kind: 'company' } as const,
     pluginId,
     name: 'slow_tool',
     description: 'test',

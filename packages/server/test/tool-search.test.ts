@@ -44,6 +44,22 @@ describe('Agent 工具按需加载', () => {
     expect(all.some((tool) => tool.function.name === 'workspace_send_dingtalk')).toBe(true)
   })
 
+  it('业务数据问题不加载通讯录，问人/组织时才加载', () => {
+    const { deps, actor } = testEnv()
+    const business = toolSpecsForAgent(deps.db, actor, { kind: 'cloud' }, '重庆东环线录入了几条检查政治')
+    const businessWithGroupName = toolSpecsForAgent(
+      deps.db,
+      actor,
+      { kind: 'cloud' },
+      '东环线班组最近录入了多少条检查整治记录',
+    )
+    const org = toolSpecsForAgent(deps.db, actor, { kind: 'cloud' }, '东环线组的组长是谁')
+
+    expect(business.some((tool) => tool.function.name === 'org_directory')).toBe(false)
+    expect(businessWithGroupName.some((tool) => tool.function.name === 'org_directory')).toBe(false)
+    expect(org.some((tool) => tool.function.name === 'org_directory')).toBe(true)
+  })
+
   it('按中文场景搜索能命中文件发送、定时任务和计算工具', async () => {
     const { deps, actor } = testEnv()
     const send = (await executeTool(deps, actor, 'tool.search', { query: '把文件发到钉钉' })) as {

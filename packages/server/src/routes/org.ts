@@ -43,7 +43,12 @@ interface MemberRow {
   employee_no: string | null
   email: string | null
   mobile: string | null
-  external_user_id: string | null
+}
+
+interface MemberIdentityRow {
+  user_id: string
+  provider: string
+  external_user_id: string
 }
 
 interface MemberRoleRow {
@@ -123,18 +128,32 @@ export function registerOrgRoutes(app: FastifyInstance, deps: ServerDeps): void 
     const members = deps.db
       .prepare(
         `SELECT u.id, u.name, u.title, u.dept_id, u.dept_path, d.name AS dept_name, u.status,
-                u.employee_no, u.email, u.mobile,
-                (SELECT ui.external_user_id
-                   FROM user_identities ui
-                  WHERE ui.user_id = u.id AND ui.provider = 'dingtalk'
-                  ORDER BY ui.id
-                  LIMIT 1) AS external_user_id
+                u.employee_no, u.email, u.mobile
            FROM users u
            JOIN departments d ON d.id = u.dept_id
           WHERE u.company_id = ? AND u.deleted_at IS NULL
           ORDER BY d.path, u.name`,
       )
       .all(subject.companyId) as unknown as MemberRow[]
+
+    const identityRows = deps.db
+      .prepare(
+        `SELECT ui.user_id, ui.provider, ui.external_user_id
+           FROM user_identities ui
+           JOIN users u ON u.id = ui.user_id
+          WHERE u.company_id = ? AND u.deleted_at IS NULL AND ui.status <> 'revoked'
+          ORDER BY ui.user_id,
+                   CASE ui.provider WHEN 'dingtalk' THEN 0 WHEN 'feishu' THEN 1 WHEN 'wecom' THEN 2 ELSE 3 END,
+                   ui.id`,
+      )
+      .all(subject.companyId) as unknown as MemberIdentityRow[]
+
+    const identitiesByUser = new Map<string, Array<{ provider: string; externalUserId: string }>>()
+    for (const row of identityRows) {
+      const list = identitiesByUser.get(row.user_id) ?? []
+      list.push({ provider: row.provider, externalUserId: row.external_user_id })
+      identitiesByUser.set(row.user_id, list)
+    }
 
     const roleRows = deps.db
       .prepare(
@@ -153,21 +172,26 @@ export function registerOrgRoutes(app: FastifyInstance, deps: ServerDeps): void 
     }
 
     return ok({
-      members: members.map((member) => ({
-        id: member.id,
-        name: member.name,
-        title: member.title,
-        deptId: member.dept_id,
-        deptPath: member.dept_path,
-        deptName: member.dept_name,
-        status: member.status,
-        employeeNo: member.employee_no,
-        email: member.email,
-        mobile: member.mobile,
-        /** 钉钉 UserID：企业机器人回调靠它认人，页面上也要能看见 */
-        externalUserId: member.external_user_id,
-        roles: rolesByUser.get(member.id) ?? [],
-      })),
+      members: members.map((member) => {
+        const identities = identitiesByUser.get(member.id) ?? []
+        return {
+          id: member.id,
+          name: member.name,
+          title: member.title,
+          deptId: member.dept_id,
+          deptPath: member.dept_path,
+          deptName: member.dept_name,
+          status: member.status,
+          employeeNo: member.employee_no,
+          email: member.email,
+          mobile: member.mobile,
+          /** 渠道身份：钉钉 UserID / 飞书 OpenID / 企业微信 UserID，页面按来源分别展示 */
+          identities,
+          channelProvider: identities[0]?.provider ?? null,
+          externalUserId: identities[0]?.externalUserId ?? null,
+          roles: rolesByUser.get(member.id) ?? [],
+        }
+      }),
     })
   })
 }

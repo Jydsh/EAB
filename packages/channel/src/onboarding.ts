@@ -140,6 +140,17 @@ interface FeishuBotResponse {
   }
 }
 
+interface FeishuTenantResponse {
+  code?: number
+  msg?: string
+  data?: {
+    tenant?: {
+      tenant_key?: string
+      name?: string
+    }
+  }
+}
+
 interface FeishuRegistrationResponse {
   device_code?: unknown
   verification_uri_complete?: unknown
@@ -272,7 +283,7 @@ export async function pollFeishuScanNative(
   appId: string,
   appSecret: string,
   domain: 'feishu' | 'lark' = 'feishu',
-): Promise<{ appName: string; openId: string; activateStatus: number; tenantName: string }> {
+): Promise<{ appName: string; openId: string; activateStatus: number; tenantId: string; tenantName: string }> {
   const origin = domain === 'lark' ? 'https://open.larksuite.com' : 'https://open.feishu.cn'
   const tokenResponse = await fetch(`${origin}/open-apis/auth/v3/tenant_access_token/internal`, {
     method: 'POST',
@@ -291,10 +302,25 @@ export async function pollFeishuScanNative(
     throw new Error(botBody.msg || `飞书机器人信息读取失败 HTTP ${botResponse.status}`)
   }
   const bot = botBody.bot
+  let tenantId = appId
+  let tenantName = text(bot.app_name) || text(bot.bot_name) || '飞书企业'
+  try {
+    const tenantResponse = await fetch(`${origin}/open-apis/tenant/v2/tenant/query`, {
+      headers: { authorization: `Bearer ${tokenBody.tenant_access_token}` },
+    })
+    const tenantBody = (await tenantResponse.json()) as FeishuTenantResponse
+    if (tenantResponse.ok && tenantBody.code === 0 && tenantBody.data?.tenant) {
+      tenantId = text(tenantBody.data.tenant.tenant_key) || tenantId
+      tenantName = text(tenantBody.data.tenant.name) || tenantName
+    }
+  } catch {
+    // 租户信息读取失败不阻断绑定；App ID 仍可作为临时标识，后续重新扫码会补齐。
+  }
   return {
     appName: text(bot.app_name) || text(bot.bot_name) || '飞书机器人',
     openId: text(bot.open_id),
     activateStatus: Number(bot.activate_status ?? 0),
-    tenantName: text(bot.app_name) || text(bot.bot_name) || '飞书企业',
+    tenantId,
+    tenantName,
   }
 }

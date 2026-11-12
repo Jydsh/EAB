@@ -21,6 +21,7 @@ import {
   resolveUserWorkspaceQuota,
 } from '../workspace-quota.js'
 import { applyOrgSync, fetchChannelOrg, fetchDingTalkTenant, mapRemoteOrg, pollFeishuScanNative, pollWecomScan, startFeishuScanNative, startWecomScan, verifyFeishuApp } from '@eab/channel'
+import { resolveOrgSyncIntervalMs, syncChannelOrg, type ChannelProvider } from '../org-sync-scheduler.js'
 import { dispatchPluginRpc } from '../plugin-host.js'
 import { listPluginChannels, listAllPluginModels, listPluginModels, refreshPluginChannel } from '../plugin-models.js'
 import { filterHealthyModels, probePluginChannelModels } from '../model-health.js'
@@ -45,6 +46,7 @@ import {
 } from '../model-registry.js'
 import { collectionVectorStats, latestKbIndexJob, startKbIndexJob } from '../kb-vector.js'
 import { callModel } from '../llm.js'
+import { readThinkingConfig, storedThinkingConfig, thinkingConfigOf } from '../thinking.js'
 import { createModelStressState, modelStressSnapshot, runModelStress, type ModelStressState } from '../model-stress.js'
 import {
   clearSessionCookie,
@@ -135,6 +137,16 @@ function parseObject(raw: string | null | undefined): Record<string, unknown> {
   } catch {
     return {}
   }
+}
+
+/** 保存前把思考配置收敛成稳定结构；未开启时直接删掉这个字段。 */
+function normalizeModelConfig(config: Record<string, unknown>): Record<string, unknown> {
+  const next = { ...config }
+  const thinking = readThinkingConfig(next.thinking)
+  const stored = storedThinkingConfig(thinking)
+  if (stored) next.thinking = stored
+  else delete next.thinking
+  return next
 }
 
 function stringArrayField(value: unknown, field: string): string[] | undefined {
@@ -321,6 +333,29 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
       depts: number
       collections: number
     }>
+    const channelRows = deps.db
+      .prepare(
+        `SELECT provider, enabled, status, tenant_id, tenant_name
+           FROM channel_configs
+          WHERE company_id = ?
+          ORDER BY CASE provider WHEN 'dingtalk' THEN 0 WHEN 'feishu' THEN 1 WHEN 'wecom' THEN 2 ELSE 3 END`,
+      )
+      .all(deps.companyId) as unknown as Array<{
+      provider: string
+      enabled: number
+      status: string
+      tenant_id: string | null
+      tenant_name: string | null
+    }>
+    const channelLabel: Record<string, string> = { dingtalk: '钉钉', feishu: '飞书', wecom: '企业微信' }
+    const channels = channelRows.map((row) => ({
+      provider: row.provider,
+      label: channelLabel[row.provider] ?? row.provider,
+      enabled: Number(row.enabled) === 1,
+      status: row.status,
+      tenantId: row.tenant_id,
+      tenantName: row.tenant_name,
+    }))
     return ok({
       singleCompany: true,
       companies: rows.map((row) => ({
@@ -328,6 +363,7 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
         name: row.name,
         status: row.status,
         counts: { users: Number(row.users), depts: Number(row.depts), collections: Number(row.collections) },
+        channels,
       })),
       defaultCompanyId: rows[0]?.id ?? null,
     })
@@ -2241,6 +2277,7 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
         contextCompression: model.contextCompression,
         embeddingDim: null,
         config: {},
+        thinking: model.thinking,
         roles: model.roles,
         priority: model.priority,
         enabled: true,
@@ -2292,6 +2329,7 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
             : Number(row.context_compression) !== 0,
           embeddingDim: row.embedding_dim ?? null,
           config: parseObject(row.config_json),
+          thinking: thinkingConfigOf(parseObject(row.config_json)),
           roles: parseList(row.roles),
           priority: Number(row.priority),
           enabled: row.enabled === 1,
@@ -2381,7 +2419,9 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
     }
     const contextCompression = req.body?.contextCompression === false ? 0 : 1
     const embeddingDim = optionalIntField(req.body?.embeddingDim, 'embeddingDim') ?? null
-    const config = req.body?.config && typeof req.body.config === 'object' ? req.body.config : {}
+    const config = normalizeModelConfig(
+      req.body?.config && typeof req.body.config === 'object' ? req.body.config : {},
+    )
     const priority = Number(req.body?.priority ?? 10)
     if (!Number.isFinite(priority)) throw new EabError(EC.VALIDATION, 'priority 必须是数字')
 
@@ -2434,6 +2474,7 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
         contextCompression: contextCompression !== 0,
         embeddingDim,
         config,
+        thinking: thinkingConfigOf(config),
         priority: Math.trunc(priority),
       },
     })
@@ -2560,10 +2601,11 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
       req.body?.embeddingDim === undefined
         ? row.embedding_dim ?? null
         : optionalIntField(req.body.embeddingDim, 'embeddingDim') ?? null
-    const config =
+    const config = normalizeModelConfig(
       req.body?.config && typeof req.body.config === 'object'
         ? req.body.config
-        : parseObject(row.config_json)
+        : parseObject(row.config_json),
+    )
     const priority = req.body?.priority === undefined ? Number(row.priority) : Number(req.body.priority)
     if (!Number.isFinite(priority)) throw new EabError(EC.VALIDATION, 'priority 必须是数字')
     const enabled = req.body?.enabled === undefined ? row.enabled === 1 : req.body.enabled
@@ -2614,6 +2656,7 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
         contextCompression,
         embeddingDim,
         config,
+        thinking: thinkingConfigOf(config),
         priority: Math.trunc(priority),
         enabled,
       },
@@ -3009,6 +3052,10 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
         ? await feishuBot.checkFeishuSetup(deps).catch(() => null)
         : null
     return ok({
+      autoSync: {
+        enabled: true,
+        intervalMs: resolveOrgSyncIntervalMs(),
+      },
       organization,
       channels: ['feishu', 'dingtalk', 'wecom'].map((provider) => {
         const row = byProvider.get(provider)
@@ -3300,71 +3347,13 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
       const companyId = companyOf(req, deps)
       const provider = String(req.params.provider)
       if (!CHANNEL_PROVIDERS.has(provider)) throw new EabError(EC.VALIDATION, `不支持的渠道：${provider}`)
-      const row = deps.db
-        .prepare(
-          `SELECT app_id, corp_id, secret_ref, enabled FROM channel_configs
-            WHERE company_id = ? AND provider = ?`,
-        )
-        .get(companyId, provider) as
-        | { app_id: string | null; corp_id: string | null; secret_ref: string | null; enabled: number }
-        | undefined
-      const appSecret = resolveSecret(deps.config.dbPath, row?.secret_ref)
-      if (!appSecret) {
-        throw new EabError(EC.VALIDATION, '还没有保存应用密钥，无法拉取通讯录', {
-          hint: '先在渠道接入里填 App ID / 企业 ID 与密钥，保存后再同步',
-        })
-      }
-      const appId = row?.app_id ?? ''
-      const corpId = row?.corp_id ?? ''
-      if (provider === 'wecom' ? !corpId : !appId) {
-        throw new EabError(EC.VALIDATION, `缺少 ${provider === 'wecom' ? '企业 ID' : 'App ID'}，无法拉取通讯录`)
-      }
-
-      let remote
-      try {
-        remote = await fetchChannelOrg(provider, {
-          provider: provider as 'feishu' | 'dingtalk' | 'wecom',
-          appId,
-          corpId,
-          appSecret,
-        })
-      } catch (err) {
-        throw new EabError(EC.UPSTREAM, `拉取${CHANNEL_LABEL[provider]}通讯录失败：${(err as Error).message}`, {
-          hint: '检查应用凭证、通讯录权限范围（部门/成员是否授权给该应用）以及服务器出网',
-        })
-      }
-
-      const root = deps.db
-        .prepare(
-          `SELECT id, path, depth FROM departments
-            WHERE company_id = ? AND parent_id IS NULL AND deleted_at IS NULL
-            ORDER BY path LIMIT 1`,
-        )
-        .get(companyId) as { id: string; path: string; depth: number } | undefined
-      if (!root) throw new EabError(EC.VALIDATION, '库里没有公司根部门，无法同步组织')
-
-      const plan = mapRemoteOrg(remote, {
+      const result = await syncChannelOrg(
+        deps.db,
+        deps.config,
         companyId,
-        provider: provider as 'feishu' | 'dingtalk' | 'wecom',
-        root,
-        rootChannelDeptIds: provider === 'feishu' ? ['0'] : ['1'],
-      })
-      const outcome = applyOrgSync(deps.db, { plan, now: Date.now(), recycleAfter: 2 })
-      deps.db
-        .prepare('UPDATE channel_configs SET last_synced_at = ?, last_sync_run_id = ?, updated_at = ? WHERE company_id = ? AND provider = ?')
-        .run(Date.now(), outcome.runId, Date.now(), companyId, provider)
-
-      return ok({
-        runId: outcome.runId,
-        provider,
-        mode: 'full',
-        departments: remote.depts.length,
-        members: remote.users.length,
-        mobileCount: plan.users.filter((user) => Boolean(user.mobile)).length,
-        stats: outcome.stats,
-        diffCount: outcome.diffs.length,
-        diffs: outcome.diffs.slice(0, 60),
-      })
+        provider as ChannelProvider,
+      )
+      return ok(result)
     },
   )
 
@@ -3504,67 +3493,14 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
   }
 
   const syncChannelNow = async (companyId: string, provider: 'feishu' | 'wecom') => {
-    const row = deps.db
-      .prepare(
-        `SELECT app_id, corp_id, secret_ref, enabled FROM channel_configs
-          WHERE company_id = ? AND provider = ?`,
-      )
-      .get(companyId, provider) as
-      | { app_id: string | null; corp_id: string | null; secret_ref: string | null; enabled: number }
-      | undefined
-    const appSecret = resolveSecret(deps.config.dbPath, row?.secret_ref)
-    if (!appSecret) {
-      throw new EabError(EC.VALIDATION, '还没有保存通讯录密钥，无法拉取组织架构', {
-        hint: provider === 'wecom'
-          ? '企业微信机器人凭据不能拉通讯录，请在「同步组织」里补 CorpId + CorpSecret'
-          : '请重新填飞书 App Secret，保存后再同步',
-      })
-    }
-    const appId = row?.app_id ?? ''
-    const corpId = row?.corp_id ?? ''
-    if (provider === 'wecom' ? !corpId : !appId) {
-      throw new EabError(EC.VALIDATION, `缺少 ${provider === 'wecom' ? 'CorpId' : 'App ID'}，无法拉取通讯录`)
-    }
-    let remote
-    try {
-      remote = await fetchChannelOrg(provider, {
-        provider,
-        appId,
-        corpId,
-        appSecret,
-      })
-    } catch (error) {
-      throw new EabError(EC.UPSTREAM, `拉取${CHANNEL_LABEL[provider]}通讯录失败：${(error as Error).message}`, {
-        hint: '检查应用凭证、通讯录权限范围（部门/成员是否授权给该应用）以及服务器出网',
-      })
-    }
-    const root = deps.db
-      .prepare(
-        `SELECT id, path, depth FROM departments
-          WHERE company_id = ? AND parent_id IS NULL AND deleted_at IS NULL
-          ORDER BY path LIMIT 1`,
-      )
-      .get(companyId) as { id: string; path: string; depth: number } | undefined
-    if (!root) throw new EabError(EC.VALIDATION, '库里没有公司根部门，无法同步组织')
-    const plan = mapRemoteOrg(remote, {
-      companyId,
-      provider,
-      root,
-      rootChannelDeptIds: provider === 'feishu' ? ['0'] : ['1'],
-    })
-    const outcome = applyOrgSync(deps.db, { plan, now: Date.now(), recycleAfter: 2 })
-    deps.db
-      .prepare(
-        'UPDATE channel_configs SET last_synced_at = ?, last_sync_run_id = ?, last_sync_status = ?, last_sync_error = NULL, updated_at = ? WHERE company_id = ? AND provider = ?',
-      )
-      .run(Date.now(), outcome.runId, 'ok', Date.now(), companyId, provider)
+    const result = await syncChannelOrg(deps.db, deps.config, companyId, provider)
     return {
-      runId: outcome.runId,
-      departments: remote.depts.length,
-      members: remote.users.length,
-      stats: outcome.stats,
-      diffCount: outcome.diffs.length,
-      diffs: outcome.diffs.slice(0, 60),
+      runId: result.runId,
+      departments: result.departments,
+      members: result.members,
+      stats: result.stats,
+      diffCount: result.diffCount,
+      diffs: result.diffs,
     }
   }
 
@@ -3813,9 +3749,11 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
         }
         const appId = polled.appId
         const appSecret = polled.appSecret
+        let tenantId = appId
         let tenantName = '飞书机器人'
         try {
           const verified = await verifyFeishuApp(appId, appSecret, domain)
+          tenantId = verified.tenantId || appId
           tenantName = verified.tenantName
         } catch {
           // 应用刚创建时 bot info 可能短暂不可读；凭据已有效，绑定不因此失败。
@@ -3824,7 +3762,7 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
         writeChannelBinding({
           companyId,
           provider,
-          tenantId: appId,
+          tenantId,
           tenantName,
           bindMode: 'scan',
           userId: 'console:admin',
@@ -3835,7 +3773,7 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
           .prepare(
             `UPDATE channel_bind_sessions SET status = 'success', tenant_id = ?, tenant_name = ?, authorized_at = ? WHERE id = ?`,
           )
-          .run(appId, tenantName, Date.now(), row.id)
+          .run(tenantId, tenantName, Date.now(), row.id)
         let syncError: string | null = null
         try {
           await syncChannelNow(companyId, provider)
@@ -3935,7 +3873,7 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
         writeChannelBinding({
           companyId,
           provider,
-          tenantId: appId,
+          tenantId: verified.tenantId || appId,
           tenantName: verified.tenantName,
           bindMode: 'manual',
           userId,
@@ -4043,11 +3981,11 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
           deps.db
             .prepare(
               `UPDATE channel_configs
-                  SET app_id = ?, secret_ref = ?, tenant_name = COALESCE(NULLIF(tenant_name, ''), ?),
+                  SET app_id = ?, secret_ref = ?, tenant_id = ?, tenant_name = ?,
                       enabled = 1, status = 'bound', last_sync_status = 'pending', last_sync_error = NULL, updated_at = ?
                 WHERE company_id = ? AND provider = 'feishu'`,
             )
-            .run(appId, secretRef, verified.tenantName, Date.now(), companyId)
+            .run(appId, secretRef, verified.tenantId || appId, verified.tenantName, Date.now(), companyId)
         }
       }
       try {

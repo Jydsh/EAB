@@ -12,6 +12,7 @@ import { EC, EabError, SC, ulid, type Scope } from '@eab/domain'
 import { appendAudit } from '@eab/storage'
 import { assertScoped, buildScopeFilter, predicateToSql } from '@eab/authz'
 import type { Db } from '@eab/storage'
+import type { ToolParameterSchema } from '../llm.js'
 import { safeJoin } from '@eab/workspace'
 import type { ServerDeps } from '../deps.js'
 import { ok, requireScope } from '../http.js'
@@ -75,6 +76,12 @@ export interface ToolExecutionContext {
   idempotencyKey?: string
 }
 
+/**
+ * 工具参数声明保留 JSON Schema 结构：除了普通字符串参数，也允许澄清选项这类数组参数。
+ * 这里只描述发给模型的 schema，实际参数仍由各工具自行校验。
+ */
+export type ChatToolParameterSchema = ToolParameterSchema
+
 export interface ChatToolSpec {
   type: 'function'
   function: {
@@ -82,7 +89,7 @@ export interface ChatToolSpec {
     description: string
     parameters: {
       type: 'object'
-      properties: Record<string, { type: string; description: string }>
+      properties: Record<string, ChatToolParameterSchema>
       required: string[]
       additionalProperties: false
     }
@@ -845,7 +852,7 @@ export function searchToolCatalog(
       parameters: Object.entries(spec.function.parameters.properties ?? {}).map(([key, value]) => ({
         name: key,
         type: value.type,
-        description: value.description,
+        description: value.description ?? '',
         required: required.includes(key),
       })),
       score,
@@ -864,9 +871,44 @@ export function searchToolCatalog(
 }
 
 /** Agent 首轮只提交核心工具 + tool_search，其余按需加载。 */
-export function toolSpecsForAgent(db: Db, actor: Actor, space: ActiveSpace = { kind: 'cloud' }): ChatToolSpec[] {
+export function toolSpecsForAgent(
+  db: Db,
+  actor: Actor,
+  space: ActiveSpace = { kind: 'cloud' },
+  query = '',
+): ChatToolSpec[] {
   const coreNames = new Set(AGENT_CORE_TOOL_IDS.map(toolFunctionName))
-  return toolSpecsForActor(db, actor, space).filter((spec) => coreNames.has(spec.function.name))
+  const specs = toolSpecsForActor(db, actor, space)
+  /**
+   * 通讯录是核心工具，但只在问题确实在问人/部门/上下级时下发。
+   * 业务数据问题（录入了几条检查整治、台账、统计）里常出现“东环线/工区/站点”
+   * 这类组织名称，模型容易把它当成通讯录查询；按完整问题判断意图后隐藏它，
+   * 能避免截图里“检查整治 → 组织通讯录”的误选。
+   */
+  const cleanQuery = String(query || '').trim()
+  const businessIntent =
+    /(检查|整治|台账|记录|录入|统计|数量|几条|多少条|明细|报表|工单|数据|接口|明细|汇总|填报)/.test(
+      cleanQuery,
+    )
+  const wantsOrg =
+    !cleanQuery ||
+    (!businessIntent &&
+      /(通讯录|组织架构|组织关系|部门|科室|班组|小组|组长|副组长|负责人|上级|下级|领导|同事|成员|人名|姓名|工号|岗位|职务|找谁|谁是|有谁|哪些人|人员名单|联系方式|人数|多少人|几个人|几人)/.test(
+        cleanQuery,
+      ))
+  const allowedCore = new Set([...coreNames].filter((name) => wantsOrg || name !== 'org_directory'))
+  /**
+   * 插件工具不能只依赖 tool_search：插件通常是业务数据入口，模型按
+   * “查工区/班次/某个组织的数据”搜索时，工具名和描述未必命中业务词。
+   * 因此把当前员工已启用插件的工具直接随首轮工具下发；内置工具仍按需加载。
+   */
+  const pluginNames = new Set(
+    pluginToolSpecsFor(db, actor).map((spec) => {
+      const fn = spec.function as { name?: unknown } | undefined
+      return String(fn?.name ?? '')
+    }),
+  )
+  return specs.filter((spec) => allowedCore.has(spec.function.name) || pluginNames.has(spec.function.name))
 }
 
 /** 云空间是唯一可用的文件空间；none 不暴露文件工具。 */

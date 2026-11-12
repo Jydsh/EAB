@@ -11,6 +11,20 @@ const ROLE_LABEL = {
   guest: '外部访客',
 }
 
+const CHANNEL_SOURCE_LABEL = {
+  dingtalk: '钉钉',
+  feishu: '飞书',
+  wecom: '企业微信',
+  local: '本地',
+}
+
+/** 与后端 thinking.ts 对齐的三档；控制台模型弹窗与对话页共用这套文案。 */
+const THINKING_LEVELS = [
+  { id: 'light', label: '精简', hint: '更少思考，更快回答。' },
+  { id: 'balanced', label: '均衡', hint: '默认档位，兼顾速度与质量。' },
+  { id: 'deep', label: '深思', hint: '更充分的推理，输出上限跟随模型。' },
+]
+
 const MODE_LABEL = {
   all: '全员可见',
   roles: '仅指定角色',
@@ -60,7 +74,7 @@ const state = {
   /** 当前业务域（顶部一级导航）；页面列表由 DOMAINS 决定 */
   domain: 'overview',
   /** 复杂页面的页内分组：一次只展开一组，避免所有配置挤在一屏 */
-  modelsSection: 'catalog',
+  modelsSection: 'providers',
   systemSection: 'runtime',
   quotaScope: 'company',
   quotaMonth: '',
@@ -77,6 +91,7 @@ const state = {
   /** 插件页：当前选中的插件、详情标签、当前页面 */
   pluginData: null,
   pluginSelected: null,
+  personalPluginSelected: null,
   pluginTab: 'overview',
   pluginPageKey: null,
 }
@@ -88,7 +103,7 @@ const PAGES = {
   roles: { title: '角色管理', sub: '角色权限、数据范围与成员配置', render: () => loadRoles() },
   access: { title: '权限矩阵', sub: '成员 × 知识库可见性核对', render: () => loadMatrix() },
   kb: { title: '知识库', sub: '知识库、可见范围与文档', render: () => loadKb() },
-  models: { title: '模型接入', sub: '模型目录、用途路由与供应商端点', render: () => loadModels() },
+  models: { title: '模型接入', sub: '供应商端点、模型目录与用途路由', render: () => loadModels() },
   tools: { title: '工具', sub: '智能体可调用的工具与审批要求', render: () => loadTools() },
   channels: { title: '渠道', sub: '飞书 / 钉钉 / 企业微信接入', render: () => loadSync() },
   company: { title: '公司资料', sub: '公司标识、状态与绑定关系', render: () => loadCompanyProfile() },
@@ -399,6 +414,22 @@ function closeCompanyPicker() {
   if (button) button.setAttribute('aria-expanded', 'false')
 }
 
+/** 公司来源标识：同一家公司下钉钉 / 飞书 / 企业微信分别绑定，顶栏和公司选项都要能看出渠道来源 */
+function companyChannelSources(company) {
+  const rows = Array.isArray(company?.channels) ? company.channels : []
+  const byProvider = new Map(rows.map((row) => [row.provider, row]))
+  return ['dingtalk', 'feishu', 'wecom']
+    .map((provider) => {
+      const row = byProvider.get(provider)
+      const label = CHANNEL_SOURCE_LABEL[provider] || provider
+      const bound = row?.status === 'bound'
+      const tenant = String(row?.tenantName ?? '').trim()
+      const title = tenant ? `${label} · ${tenant}` : `${label} · ${bound ? '已绑定' : '未绑定'}`
+      return `<span class="company-source${bound ? ' is-bound' : ''}" title="${esc(title)}">${esc(label)}</span>`
+    })
+    .join('')
+}
+
 function renderCompanyPicker() {
   const picker = $('#company-picker')
   if (!picker) return
@@ -418,6 +449,7 @@ function renderCompanyPicker() {
           <strong>${esc(empty ? '未接入公司' : only?.name ?? '未接入公司')}</strong>
           ${empty ? '' : `<code>${esc(only?.id ?? '')}</code>`}
         </span>
+        ${empty ? '' : `<span class="company-sources" aria-label="渠道来源">${companyChannelSources(only)}</span>`}
         <span class="company-single-tag${empty ? ' is-waiting' : ''}">${empty ? '待创建' : '唯一组织'}</span>
       </div>`
     picker.onclick = null
@@ -432,6 +464,7 @@ function renderCompanyPicker() {
       return `<button class="company-option${active ? ' is-active' : ''}" type="button" role="option" aria-selected="${active}" data-company="${esc(company.id)}">
         <span class="company-option-main"><strong>${esc(company.name)}</strong><code>${esc(company.id)}</code></span>
         <span class="company-option-meta">${users} 成员 · ${depts} 部门</span>
+        <span class="company-sources" aria-label="渠道来源">${companyChannelSources(company)}</span>
         ${active ? '<span class="company-option-check">当前</span>' : ''}
       </button>`
     })
@@ -1523,11 +1556,21 @@ async function loadMembers(container) {
       return state.includeSubdepts ? m.deptPath.startsWith(state.deptFilter) : m.deptPath === state.deptFilter
     })
     const rows = members
-      .map(
-        (m) => `<tr>
-        <td class="name-cell"><strong>${esc(m.name)}</strong><div class="desc">${esc(m.title || '—')}</div>${
-          m.externalUserId ? `<div class="desc mono">钉钉 UserID：${esc(m.externalUserId)}</div>` : ''
-        }</td>
+      .map((m) => {
+        const identities = Array.isArray(m.identities) && m.identities.length
+          ? m.identities
+          : m.externalUserId
+            ? [{ provider: 'dingtalk', externalUserId: m.externalUserId }]
+            : []
+        const identityRows = identities
+          .map((identity) => {
+            const label = CHANNEL_SOURCE_LABEL[identity.provider] || identity.provider
+            return `<div class="desc mono"><span class="pill">${esc(label)}</span> ${esc(label)} ID：${esc(identity.externalUserId)}</div>`
+          })
+          .join('')
+        const titleLine = m.title ? `<div class="desc">${esc(m.title)}</div>` : ''
+        return `<tr>
+        <td class="name-cell"><strong>${esc(m.name)}</strong>${titleLine}${identityRows}</td>
         <td>${esc(m.deptName)}<div class="desc mono">${esc(m.deptPath)}</div></td>
         <td>${(m.roles || []).map((r) => `<span class="chip accent">${esc(ROLE_LABEL[r.code] || r.code)}</span>`).join(' ')}</td>
         <td><span class="pill ${m.status === 'active' ? 'ok' : m.status === 'disabled' ? 'warn' : 'danger'}">${esc(
@@ -1538,8 +1581,8 @@ async function loadMembers(container) {
           <button class="row-action" type="button" data-member-edit="${esc(m.id)}" title="编辑成员资料">编辑</button>
           <button class="row-action icon" type="button" data-member-more="${esc(m.id)}" title="更多操作" aria-haspopup="true">⋯</button>
         </div></td>
-      </tr>`,
-      )
+      </tr>`
+      })
       .join('')
 
     const roleCounts = new Map()
@@ -2390,7 +2433,13 @@ function openMemberEdit(member) {
     <div class="form-grid">
       <label class="field"><span>姓名</span><input id="e-name" value="${esc(member.name)}" /></label>
       <label class="field"><span>工号</span><input class="mono" value="${esc(member.employeeNo || '—')}" disabled /></label>
-      <label class="field"><span>钉钉 UserID</span><input class="mono" value="${esc(member.externalUserId || '—')}" disabled /></label>
+      <label class="field"><span>渠道身份</span><input class="mono" value="${esc(
+        member.identities?.length
+          ? member.identities
+              .map((identity) => `${CHANNEL_SOURCE_LABEL[identity.provider] || identity.provider}：${identity.externalUserId}`)
+              .join(' / ')
+          : member.externalUserId || '—',
+      )}" disabled /></label>
       <label class="field"><span>部门</span><select id="e-dept">${deptSelectOptions(member.deptPath)}</select></label>
       <label class="field"><span>岗位</span><input id="e-title" value="${esc(member.title || '')}" /></label>
       <label class="field"><span>邮箱</span><input id="e-email" type="email" value="${esc(member.email || '')}" /></label>
@@ -3708,6 +3757,13 @@ async function openModelModal(model, providers, roles) {
     ? ['member']
     : roles.slice(0, 1).map((role) => role.code)
   const initialRoleCodes = model ? model.roles || [] : defaultRoleCodes
+  const initialThinking =
+    model?.thinking && model.thinking.enabled && Array.isArray(model.thinking.options)
+      ? model.thinking
+      : null
+  const initialThinkIds = initialThinking?.options?.map((item) => item.id) || []
+  const initialThinkDefault = initialThinking?.defaultEffort || 'balanced'
+  const initialThinkStrategy = initialThinking?.strategy === 'budget' ? 'budget' : 'effort'
   const overlay = modelModal(`
     <div class="modal-head">
       <div class="models-modal-title">
@@ -3786,6 +3842,39 @@ async function openModelModal(model, providers, roles) {
           <label class="check"><input id="m-compress" type="checkbox"${model ? (model.contextCompression !== false ? ' checked' : '') : ' checked'} /><span>上下文超限时自动压缩较早历史 ${fieldInfo('只在填写上下文上限后生效；较早对话会压成摘要，最近消息保留原文，不会额外调用模型。')}</span></label>
         </div>
       </section>
+      <section class="models-form-section">
+        <div class="models-form-section-head">
+          <strong>思考选项</strong>
+          ${fieldInfo('开放后，员工可以在对话输入框旁按模型切换「精简 / 均衡 / 深思」；档位会真实下发，不是提示词。')}
+        </div>
+        <label class="check models-think-switch">
+          <input id="m-think-enabled" type="checkbox"${initialThinking ? ' checked' : ''} />
+          <span>允许员工选择思考档位 ${fieldInfo('仅对话类模型生效；未开放时不显示选择器，也不会向上游发送思考参数。')}</span>
+        </label>
+        <div class="models-think-fields" id="m-think-fields"${initialThinking ? '' : ' hidden'}>
+          <div class="models-think-grid">
+            ${THINKING_LEVELS.map(
+              (level) => `<label class="models-cap-option models-think-option">
+                <input type="checkbox" data-think-level="${level.id}"${initialThinkIds.includes(level.id) ? ' checked' : ''} />
+                <span><strong>${esc(level.label)}</strong><small>${esc(level.hint)}</small></span>
+              </label>`,
+            ).join('')}
+          </div>
+          <div class="form-cols">
+            <label class="field"><span>默认档位</span><select id="m-think-default">
+              ${THINKING_LEVELS.map(
+                (level) =>
+                  `<option value="${level.id}"${initialThinkDefault === level.id ? ' selected' : ''}>${esc(level.label)}</option>`,
+              ).join('')}
+            </select></label>
+            <label class="field"><span>生效方式 ${fieldInfo('原生思考参数适合直接支持 reasoning_effort / thinking 的供应商；输出预算适合会忽略思考参数的网关。')}</span><select id="m-think-strategy">
+              <option value="effort"${initialThinkStrategy === 'effort' ? ' selected' : ''}>原生思考参数</option>
+              <option value="budget"${initialThinkStrategy === 'budget' ? ' selected' : ''}>输出预算上限</option>
+            </select></label>
+          </div>
+          <div class="models-think-note" id="m-think-note"></div>
+        </div>
+      </section>
       <section class="models-form-section models-cap-section">
         <div class="models-cap-section-head">
           <div><span>能力 / 擅长场景 ${fieldInfo('可多选；勾选即决定顶部类型、筛选和图片可用性。')}</span></div>
@@ -3840,6 +3929,33 @@ async function openModelModal(model, providers, roles) {
   const dimField = overlay.querySelector('#m-dim-field')
   const roleInputs = [...overlay.querySelectorAll('[data-mrole]')]
   const roleState = overlay.querySelector('#m-role-state')
+  const thinkEnabled = overlay.querySelector('#m-think-enabled')
+  const thinkFields = overlay.querySelector('#m-think-fields')
+  const thinkInputs = [...overlay.querySelectorAll('[data-think-level]')]
+  const thinkDefault = overlay.querySelector('#m-think-default')
+  const thinkStrategy = overlay.querySelector('#m-think-strategy')
+  const thinkNote = overlay.querySelector('#m-think-note')
+  const syncThinkState = () => {
+    thinkFields.hidden = !thinkEnabled.checked
+    const checked = thinkInputs.filter((input) => input.checked).map((input) => input.dataset.thinkLevel)
+    for (const input of thinkInputs) {
+      input.closest('.models-think-option')?.classList.toggle('is-on', input.checked)
+    }
+    for (const option of thinkDefault.options) option.disabled = !checked.includes(option.value)
+    if (!checked.includes(thinkDefault.value)) {
+      const first = checked[0] || ''
+      thinkDefault.value = first
+    }
+    thinkNote.className = `models-think-note ${checked.length === 0 ? 'is-empty' : ''}`
+    if (checked.length === 0) {
+      thinkNote.innerHTML = '<strong>至少选一个档位</strong><span>未选择档位时无法保存；关闭开关可让该模型不显示思考选择器。</span>'
+      return
+    }
+    thinkNote.innerHTML =
+      thinkStrategy.value === 'budget'
+        ? '<strong>输出预算方式</strong><span>精简 / 均衡分别限制为 2048 / 8192 tokens 输出；深思不额外限制。适合忽略 reasoning_effort 的网关。</span>'
+        : '<strong>原生思考参数</strong><span>精简 / 均衡 / 深思会映射为低 / 中 / 高，交给供应商的 reasoning_effort 或 thinking 预算。</span>'
+  }
   const syncDimField = () => {
     dimField.hidden = endpoint.value !== 'embeddings'
   }
@@ -3920,6 +4036,17 @@ async function openModelModal(model, providers, roles) {
     syncDimField()
   })
   endpoint.addEventListener('change', syncDimField)
+  thinkEnabled.addEventListener('change', () => {
+    if (thinkEnabled.checked && thinkInputs.every((input) => !input.checked)) {
+      const balanced = thinkInputs.find((input) => input.dataset.thinkLevel === 'balanced')
+      if (balanced) balanced.checked = true
+    }
+    if (thinkEnabled.checked && !thinkStrategy.value) thinkStrategy.value = 'effort'
+    syncThinkState()
+  })
+  for (const input of thinkInputs) input.addEventListener('change', syncThinkState)
+  thinkDefault.addEventListener('change', syncThinkState)
+  thinkStrategy.addEventListener('change', syncThinkState)
   for (const input of roleInputs) input.addEventListener('change', syncRoleState)
   const setAllRoles = (checked) => {
     for (const input of roleInputs) input.checked = checked
@@ -3941,10 +4068,30 @@ async function openModelModal(model, providers, roles) {
   syncPreview()
   syncDimField()
   syncRoleState()
+  syncThinkState()
   overlay.querySelector('.modal-x').addEventListener('click', close)
   overlay.querySelector('#m-cancel').addEventListener('click', close)
   overlay.querySelector('#m-save').addEventListener('click', async () => {
     const stateEl = overlay.querySelector('#m-state')
+    const thinkIds = thinkInputs.filter((input) => input.checked).map((input) => input.dataset.thinkLevel)
+    if (thinkEnabled.checked && thinkIds.length === 0) {
+      stateEl.className = 'modal-state bad'
+      stateEl.textContent = '思考选项至少选择一个档位，或关闭「允许员工选择思考档位」'
+      return
+    }
+    const config = {
+      ...(model?.config && typeof model.config === 'object' ? model.config : {}),
+    }
+    if (thinkEnabled.checked) {
+      config.thinking = {
+        enabled: true,
+        options: thinkIds,
+        defaultEffort: thinkIds.includes(thinkDefault.value) ? thinkDefault.value : thinkIds[0],
+        strategy: thinkStrategy.value === 'budget' ? 'budget' : 'effort',
+      }
+    } else {
+      delete config.thinking
+    }
     stateEl.textContent = '保存中…'
     const body = {
       name: overlay.querySelector('#m-name').value.trim(),
@@ -3958,6 +4105,7 @@ async function openModelModal(model, providers, roles) {
       maxContext: overlay.querySelector('#m-context').value ? Number(overlay.querySelector('#m-context').value) : null,
       maxOutputTokens: overlay.querySelector('#m-output').value ? Number(overlay.querySelector('#m-output').value) : null,
       contextCompression: overlay.querySelector('#m-compress').checked,
+      config,
       roles: [...overlay.querySelectorAll('[data-mrole]:checked')].map((el) => el.dataset.mrole),
     }
     try {
@@ -4625,7 +4773,7 @@ async function loadModels() {
                 <span class="models-provider-mark">${esc((provider.name || '?').slice(0, 1).toUpperCase())}</span>
                 <div><strong>${esc(provider.name)}</strong><div class="desc">${
                   pluginChannel
-                    ? `插件 ${esc(provider.pluginId || '')} · ${esc(provider.route || '')}`
+                    ? `插件 ${esc(provider.pluginId || '')}<br>${esc(provider.route || '')}`
                     : esc(provider.kindLabel)
                 }</div></div>
               </div>
@@ -4796,7 +4944,7 @@ async function loadModels() {
       <div class="models-overview">
         <div class="models-overview-copy">
           <span class="models-eyebrow">MODEL ROUTER</span>
-          <strong>模型与路由，按任务分开管理 ${hintBadge('使用顺序', '先确认模型目录，再按任务绑定用途路由，最后核对供应商端点；密钥只保留在服务端。')}</strong>
+          <strong>模型与路由，按任务分开管理 ${hintBadge('使用顺序', '先绑定供应商与端点，再确认模型目录，最后按任务绑定用途路由；密钥只保留在服务端。')}</strong>
         </div>
         <div class="models-summary">
           <div class="models-summary-card"><span>供应商</span><strong id="stat-providers">${providers.length}</strong><small>${writableProviders.length} 个端点 · ${pluginProviderCount} 个插件通道</small></div>
@@ -4808,6 +4956,7 @@ async function loadModels() {
 
       ${sectionNavHtml(
         [
+          { key: 'providers', label: '供应商与端点', meta: `${providers.length} 个来源` },
           { key: 'catalog', label: '模型目录', meta: `${models.length} 个模型` },
           {
             key: 'routes',
@@ -4815,9 +4964,8 @@ async function loadModels() {
             meta: `${boundRouteCount}/${routeItems.length} 已绑定`,
             attention: boundRouteCount < routeItems.length,
           },
-          { key: 'providers', label: '供应商与端点', meta: `${providers.length} 个来源` },
         ],
-        state.modelsSection || 'catalog',
+        state.modelsSection || 'providers',
       )}
       <div class="section-panels">
         ${catalogPanel}
@@ -4825,7 +4973,7 @@ async function loadModels() {
         ${providerPanel}
       </div>`
 
-    mountSectionNav(view, state.modelsSection, 'catalog', (key) => {
+    mountSectionNav(view, state.modelsSection, 'providers', (key) => {
       state.modelsSection = key
     })
 
@@ -4856,6 +5004,9 @@ async function loadModels() {
       const caps = modelCapabilitySummary(model.tags)
       const type = modelTypeOf(model.tags)
       const readonly = model.readonly === true || model.source === 'plugin'
+      const thinkTag = model.thinking?.enabled
+        ? `<span class="models-source-tag is-think" title="员工可在对话页切换思考档位">可调思考</span>`
+        : ''
       const roleChips = model.roles.length
         ? model.roles.length === roles.length
           ? '<span class="chip accent">全部角色</span>'
@@ -4868,7 +5019,7 @@ async function loadModels() {
       return `<tr data-model-row="${esc(model.id)}">
         <td>
           <div class="models-model-cell">
-            <strong>${esc(model.name)}${readonly ? '<span class="models-source-tag">插件</span>' : ''}</strong>
+            <strong>${esc(model.name)}${readonly ? '<span class="models-source-tag">插件</span>' : ''}${thinkTag}</strong>
             <span class="mono models-model-key">${esc(model.modelKey)}</span>
           </div>
         </td>
@@ -5377,22 +5528,42 @@ async function loadSys() {
             <span class="net-switch-text">允许局域网登录</span>
           </label>
         </div>
-        <div class="net-listen-head">
-          <strong>监听地址与端口</strong>
-          <span>保存后自动切换监听，不用重启</span>
-        </div>
-        <div class="form-grid net-form">
-          <label class="field"><span>监听地址</span>
-            <input id="net-host" value="${esc(network.host)}" placeholder="127.0.0.1 或 0.0.0.0" ${locked.host ? 'disabled' : ''} />
-          </label>
-          <label class="field"><span>员工对话端口</span>
-            <input id="net-chat-port" type="number" min="1" max="65535" value="${esc(String(network.chatPort))}" ${locked.chatPort ? 'disabled' : ''} />
-          </label>
-          <label class="field"><span>管理控制台端口</span>
-            <input id="net-admin-port" type="number" min="1" max="65535" value="${esc(String(network.adminPort))}" ${locked.adminPort ? 'disabled' : ''} />
-          </label>
-          <div class="panel-actions net-actions">
-            <button class="btn sm primary" type="button" id="net-save" ${locked.host && locked.chatPort && locked.adminPort ? 'disabled' : ''}>保存并切换</button>
+        <div class="net-listen-card">
+          <div class="net-listen-head">
+            <div class="net-listen-title">
+              <strong>监听地址与端口</strong>
+              <span>三项一起保存，保存后即时生效</span>
+            </div>
+            <span class="net-listen-badge">热切换</span>
+          </div>
+          <div class="net-form-grid">
+            <div class="net-field${locked.host ? ' is-locked' : ''}">
+              <div class="net-field-head">
+                <label class="net-field-label" for="net-host">监听地址</label>
+                <span class="net-field-tag${locked.host ? ' is-locked' : ''}" id="net-host-hint" title="127.0.0.1 仅本机；0.0.0.0 允许局域网访问">${locked.host ? 'EAB_HOST 固定' : '本机 / 局域网'}</span>
+              </div>
+              <input id="net-host" value="${esc(network.host)}" placeholder="127.0.0.1 或 0.0.0.0" autocomplete="off" spellcheck="false" aria-describedby="net-host-hint" ${locked.host ? 'disabled' : ''} />
+            </div>
+            <div class="net-field${locked.chatPort ? ' is-locked' : ''}">
+              <div class="net-field-head">
+                <label class="net-field-label" for="net-chat-port">员工对话端口</label>
+                <span class="net-field-tag${locked.chatPort ? ' is-locked' : ''}" id="net-chat-hint" title="员工端 /chat 使用">${locked.chatPort ? 'EAB_PORT 固定' : '员工端 /chat'}</span>
+              </div>
+              <input id="net-chat-port" type="number" inputmode="numeric" min="1" max="65535" value="${esc(String(network.chatPort))}" aria-describedby="net-chat-hint" ${locked.chatPort ? 'disabled' : ''} />
+            </div>
+            <div class="net-field${locked.adminPort ? ' is-locked' : ''}">
+              <div class="net-field-head">
+                <label class="net-field-label" for="net-admin-port">管理控制台端口</label>
+                <span class="net-field-tag${locked.adminPort ? ' is-locked' : ''}" id="net-admin-hint" title="管理员端 /admin 使用">${locked.adminPort ? 'EAB_ADMIN_PORT 固定' : '管理员端 /admin'}</span>
+              </div>
+              <input id="net-admin-port" type="number" inputmode="numeric" min="1" max="65535" value="${esc(String(network.adminPort))}" aria-describedby="net-admin-hint" ${locked.adminPort ? 'disabled' : ''} />
+            </div>
+          </div>
+          <div class="net-form-foot">
+            <span class="net-form-note">保存后自动重建监听，不需要重启服务</span>
+            <div class="panel-actions net-actions">
+              <button class="btn sm primary net-save-btn" type="button" id="net-save" ${locked.host && locked.chatPort && locked.adminPort ? 'disabled' : ''}>保存并切换</button>
+            </div>
           </div>
         </div>
         <div class="inline-note" id="net-state" style="margin-top:10px"></div>
@@ -5942,6 +6113,7 @@ async function loadSys() {
         setUpdateNote('正在检查 GitHub Release…')
         try {
           updateNow = await apiPost('/api/console/update/check', {})
+          void refreshUpdateBadge()
           refreshUpdateView()
           setUpdateNote(
             updateNow.error
@@ -7490,6 +7662,7 @@ const STAT_LABEL = {
   usersDisabled: '成员禁用',
   usersRestored: '成员恢复',
   identitiesCreated: '渠道身份(pending)',
+  identitiesRestored: '渠道身份恢复',
   unchanged: '无变化',
   orphans: '孤儿部门',
   unassignedUsers: '无部门成员',
@@ -7560,7 +7733,10 @@ function channelConfigCard(item, options = {}) {
           : '待配置'
   const stream = item.stream
   const isFeishu = item.provider === 'feishu'
-  const streamOk = Boolean(stream?.running && stream.connected && (isFeishu || stream.registered))
+  // 钉钉网关当前会正常推送消息，但部分版本不回传 REGISTERED 系统回执；
+  // registered 只能作为诊断信息，不能作为“未连接”的判据，否则会出现
+  // 手机端能收发、控制台却一直显示未连接。以 WebSocket connected 为准。
+  const streamOk = Boolean(stream?.running && stream.connected)
   const streamBadge = stream
     ? streamOk
       ? `<span class="pill ok">${isFeishu ? '长连接已连接' : 'Stream 已连接'}</span>`
@@ -7579,11 +7755,15 @@ function channelConfigCard(item, options = {}) {
                 : '钉钉 Stream 未运行；手机消息暂时不会进入 EAB。'),
         )}</div>`
       : ''
+  const feishuCheck = item.feishuCheck
+  // 自检通过就按“健康渠道”收口：只保留状态角标，不铺开检查清单和通过说明。
+  // 只有缺配置、连接异常或自检发现问题时，才展示事件订阅提醒和接入指引。
+  const feishuHealthy = Boolean(isFeishu && feishuCheck?.ok)
   const feishuEventNote =
-    isFeishu && stream?.connected && !stream?.lastEventAt
+    isFeishu && !feishuHealthy && stream?.connected && !stream?.lastEventAt
       ? `<div class="inline-note" style="margin-top:8px">飞书长连接已连上，但 EAB 还没收到任何消息事件。请在飞书开放平台确认已订阅 <code>im.message.receive_v1</code>，并给应用开通机器人能力与发消息权限。</div>`
       : ''
-  const feishuGuide = isFeishu
+  const feishuGuide = isFeishu && !feishuHealthy
     ? `<div class="inline-note" style="margin-top:8px">
         <strong>飞书接入检查清单</strong>
         <ul style="margin:6px 0 0 18px;padding:0">
@@ -7594,12 +7774,9 @@ function channelConfigCard(item, options = {}) {
         </ul>
       </div>`
     : ''
-  const feishuCheck = item.feishuCheck
-  const feishuCheckNote = isFeishu && feishuCheck
-    ? `<div class="inline-note" style="margin-top:8px;border-left:3px solid ${
-        feishuCheck.ok ? 'var(--ok, #12805c)' : 'var(--warn, #b45309)'
-      };padding-left:10px">
-        <strong>飞书自检 · ${feishuCheck.ok ? '通过' : '发现问题'}</strong>
+  const feishuCheckNote = isFeishu && feishuCheck && !feishuCheck.ok
+    ? `<div class="inline-note" style="margin-top:8px;border-left:3px solid var(--warn, #b45309);padding-left:10px">
+        <strong>飞书自检 · 发现问题</strong>
         ${
           feishuCheck.error
             ? `<div style="margin-top:4px">${esc(feishuCheck.error)}</div>`
@@ -7607,8 +7784,19 @@ function channelConfigCard(item, options = {}) {
               ? `<ul style="margin:6px 0 0 18px;padding:0">${feishuCheck.issues
                   .map((issue) => `<li>${esc(issue)}</li>`)
                   .join('')}</ul>`
-              : '<div style="margin-top:4px">已订阅消息事件，收消息/发消息权限齐全，长连接可用。</div>'
+              : '<div style="margin-top:4px">请检查飞书应用的事件订阅、权限和发布状态。</div>'
         }
+      </div>`
+    : ''
+  // 企业微信同样只在缺配置时给指引；凭证齐全后只保留状态和基础字段。
+  const wecomReady = Boolean(item.provider === 'wecom' && item.appSecretConfigured && (item.appId || item.corpId))
+  const wecomGuide = item.provider === 'wecom' && !wecomReady
+    ? `<div class="inline-note" style="margin-top:8px">
+        <strong>企业微信接入检查</strong>
+        <ul style="margin:6px 0 0 18px;padding:0">
+          <li>填写企业 CorpId 与应用 Secret；启用机器人消息时还需要 AgentId。</li>
+          <li>保存后点「测试连接」；要同步通讯录时，再补通讯录 Secret。</li>
+        </ul>
       </div>`
     : ''
   const badges = [
@@ -7643,11 +7831,11 @@ function channelConfigCard(item, options = {}) {
       <span class="pill ${missingSecret ? 'warn' : bound || configured ? 'ok' : 'warn'}">${topState}</span>
     </div>
     <div class="channel-flags">${badges}</div>
-    ${streamNote}${feishuEventNote}${feishuCheckNote}${feishuGuide}
+    ${streamNote}${feishuEventNote}${feishuCheckNote}${feishuGuide}${wecomGuide}
     <dl class="channel-fields">
       <div><dt>App ID</dt><dd>${esc(item.appId || '—')}</dd></div>
       <div><dt>Agent ID</dt><dd>${esc(item.agentId || '—')}</dd></div>
-      <div><dt>企业 ID</dt><dd>${esc(item.corpId || '—')}</dd></div>
+      <div><dt>企业 ID</dt><dd>${esc(item.corpId || item.tenantId || '—')}</dd></div>
       <div><dt>Webhook</dt><dd class="mono">${esc(item.webhookUrl ? `${item.webhookUrl.slice(0, 42)}…` : '—')}</dd></div>
     </dl>
     ${callback}
@@ -7712,6 +7900,16 @@ function renderSync(channels, data, bindings) {
   const bindingList = bindings?.bindings ?? []
   const boundChannels = list.filter((item) => Boolean(item.bound))
   const unboundChannels = list.filter((item) => !item.bound)
+  const autoSync = channels?.autoSync
+  const autoSyncIntervalMs = Number(autoSync?.intervalMs ?? 0)
+  const autoSyncEvery = autoSyncIntervalMs >= 3_600_000
+    ? `每 ${Number((autoSyncIntervalMs / 3_600_000).toFixed(1))} 小时`
+    : autoSyncIntervalMs >= 60_000
+      ? `每 ${Math.round(autoSyncIntervalMs / 60_000)} 分钟`
+      : ''
+  const autoSyncNote = `后台自动同步${autoSync?.enabled === false ? '未开启' : '已开启'}${
+    autoSyncEvery ? `，${autoSyncEvery}` : ''
+  }。只同步已绑定渠道；离职或连续两次未出现在通讯录的成员会被停用，原登录会话随之失效。`
   const bindingChannels = [...bindingList].sort((a, b) => Number(Boolean(b.bound)) - Number(Boolean(a.bound)))
   const primaryChannels = boundChannels.length ? boundChannels : list
   const secondaryChannels = boundChannels.length ? unboundChannels : []
@@ -7728,9 +7926,7 @@ function renderSync(channels, data, bindings) {
   const runs = (data?.runs ?? []).filter(syncVisible).map(runRow).join('')
   const syncTotal = Number(data?.total ?? (data?.runs ?? []).length)
 
-  const readyChannels = list.filter(
-    (item) => item.appSecretConfigured && (item.provider === 'wecom' ? item.corpId : item.appId),
-  )
+  const syncableChannels = boundChannels
 
   const paneBinding = `
     <section class="panel channel-pane" id="ch-binding" data-pane="binding">
@@ -7793,16 +7989,17 @@ function renderSync(channels, data, bindings) {
       </div>
       <div class="sync-actions">
         ${
-          readyChannels.length
-            ? readyChannels
+          syncableChannels.length
+            ? syncableChannels
                 .map(
                   (item) =>
                     `<button class="btn primary" type="button" data-sync-channel="${esc(item.provider)}">同步${esc(item.label)}通讯录</button>`,
                 )
                 .join('')
-            : '<span class="hint">先在「渠道接入」里保存应用凭证，才能从飞书 / 钉钉 / 企业微信拉取通讯录。</span>'
+            : '<span class="hint">还没有已绑定的渠道。先在「企业绑定」里完成绑定，绑定后这里才显示对应的同步按钮。</span>'
         }
       </div>
+      <div class="inline-note">${esc(autoSyncNote)}</div>
       <div id="sync-result"></div>
     </section>`
 
@@ -7940,6 +8137,7 @@ function renderSync(channels, data, bindings) {
   for (const button of view.querySelectorAll('button[data-onboard]')) {
     button.addEventListener('click', () =>
       openChannelOnboard(button.dataset.onboard, button.dataset.mode || 'scan', async () => {
+        await loadCompanies().catch(() => {})
         await loadSync()
         switchChannelTab('binding')
       }),
@@ -7948,22 +8146,20 @@ function renderSync(channels, data, bindings) {
   for (const button of view.querySelectorAll('button[data-bind-dingtalk]')) {
     button.addEventListener('click', () =>
       openDingTalkOnboard(async () => {
+        await loadCompanies().catch(() => {})
         await loadSync()
         switchChannelTab('binding')
       }),
     )
   }
   for (const button of view.querySelectorAll('button[data-unbind]')) {
-    button.addEventListener('click', async () => {
-      button.disabled = true
-      try {
-        await apiPost('/api/channel/unbind', { provider: button.dataset.unbind })
+    button.addEventListener('click', () =>
+      openUnbindConfirm(button.dataset.unbind, async () => {
+        await loadCompanies().catch(() => {})
         await loadSync()
-      } catch (err) {
-        button.disabled = false
-        renderDenied($('#sync-result') || view, err)
-      }
-    })
+        switchChannelTab('binding')
+      }),
+    )
   }
 
   for (const button of view.querySelectorAll('button[data-sync-channel]')) {
@@ -8217,6 +8413,71 @@ function closeBindModal() {
   }
   const overlay = document.querySelector('.modal-overlay')
   if (overlay) overlay.remove()
+}
+
+async function openUnbindConfirm(provider, onDone) {
+  let preview
+  try {
+    preview = await api(`/api/channel/unbind/preview?provider=${encodeURIComponent(provider)}`)
+  } catch (err) {
+    showTopToast(err.message || '解绑预览失败', { tone: 'bad' })
+    return
+  }
+
+  const rows = [
+    ['删除部门', preview.departments],
+    ['删除成员', preview.users],
+    ['删除角色授权', preview.roles],
+    ['删除权限覆盖', preview.overrides],
+    ['撤销网页会话', preview.sessions],
+    ['归档工作区', preview.workspaces],
+    ['清理渠道身份', preview.identities],
+  ]
+  const warnings = (preview.warnings || [])
+    .map((item) => `<p>${esc(item)}</p>`)
+    .join('')
+
+  const overlay = modelModal(`
+    <div class="modal-head"><h3>解绑${esc(preview.label)}</h3><button class="modal-x" type="button">×</button></div>
+    <div class="field-stack">
+      <p class="muted">解绑会停止同步，并删除该渠道同步进来的组织与人员。EAB 自己创建、没有该渠道身份的成员不会被删除；如果他们在该渠道部门下，会先移到公司根部门。</p>
+      <div class="kv">
+        ${rows.map(([label, value]) => `<div><span>${label}</span><strong>${value}</strong></div>`).join('')}
+      </div>
+      <div class="banner warn">
+        <strong>不可逆：</strong>角色授权会被物理删除，重新绑定后需要重新授权；聊天历史保留，个人工作区文件只归档不删除。
+        ${warnings}
+      </div>
+    </div>
+    <div class="modal-state" id="unbind-state"></div>
+    <div class="modal-actions">
+      <button class="btn" id="unbind-cancel" type="button">取消</button>
+      <button class="btn danger" id="unbind-confirm" type="button">确认解绑并清理</button>
+    </div>
+  `)
+
+  const close = () => overlay.remove()
+  overlay.querySelector('.modal-x').addEventListener('click', close)
+  overlay.querySelector('#unbind-cancel').addEventListener('click', close)
+  const confirmButton = overlay.querySelector('#unbind-confirm')
+  confirmButton.addEventListener('click', async () => {
+    confirmButton.disabled = true
+    const stateEl = overlay.querySelector('#unbind-state')
+    stateEl.className = 'modal-state'
+    stateEl.textContent = '正在清理渠道数据…'
+    try {
+      const result = await apiPost('/api/channel/unbind', { provider, confirm: true })
+      close()
+      showTopToast(
+        `已解绑${preview.label}：删除 ${result.removed?.departments ?? 0} 个部门、${result.removed?.users ?? 0} 名成员、${result.removed?.roles ?? 0} 条角色授权`,
+      )
+      await onDone?.()
+    } catch (err) {
+      stateEl.className = 'modal-state bad'
+      stateEl.textContent = err.message || '解绑失败'
+      confirmButton.disabled = false
+    }
+  })
 }
 
 async function startBind(provider, bindings) {
@@ -8930,6 +9191,13 @@ async function openPluginInstall(prefill = {}) {
       <span>① 取包</span><i>→</i><span>② 解包并校验</span><i>→</i><span>③ 落盘登记</span>
       <div class="install-note" id="pg-note"></div>
     </div>
+    <div class="install-progress" id="pg-progress" hidden aria-live="polite">
+      <div class="install-progress-track"><span class="install-progress-bar"></span></div>
+      <div class="install-progress-meta">
+        <span id="pg-progress-text">正在安装…</span>
+        <span id="pg-progress-time" class="mono">0s</span>
+      </div>
+    </div>
     <div class="modal-state" id="pg-state"></div>
     <div class="modal-actions">
       <button class="btn primary" type="button" id="pg-save">${existing ? '更新' : '安装'}</button>
@@ -8937,12 +9205,61 @@ async function openPluginInstall(prefill = {}) {
     </div>`)
 
   overlay.querySelector('.modal').classList.add('plugin-install-modal')
-  const close = () => overlay.remove()
+  const close = () => {
+    if (progressTimer) clearInterval(progressTimer)
+    overlay.remove()
+  }
   const tabs = Array.from(overlay.querySelectorAll('[data-install-source]'))
   const panels = Array.from(overlay.querySelectorAll('[data-install-panel]'))
   const noteEl = overlay.querySelector('#pg-note')
   const stateEl = overlay.querySelector('#pg-state')
   const saveBtn = overlay.querySelector('#pg-save')
+  const progressEl = overlay.querySelector('#pg-progress')
+  const progressText = overlay.querySelector('#pg-progress-text')
+  const progressTime = overlay.querySelector('#pg-progress-time')
+  let progressTimer = null
+  let progressStartedAt = 0
+
+  const stopProgressClock = () => {
+    if (progressTimer) clearInterval(progressTimer)
+    progressTimer = null
+  }
+  const setInstalling = (busy) => {
+    overlay.querySelector('.modal').classList.toggle('is-installing', busy)
+    for (const control of overlay.querySelectorAll('.install-source-tab, .install-field input, .install-field select, .install-check input')) {
+      control.disabled = busy
+    }
+  }
+  const startProgress = (text) => {
+    stopProgressClock()
+    progressStartedAt = Date.now()
+    progressEl.hidden = false
+    progressEl.classList.remove('is-done')
+    progressText.textContent = text
+    progressTime.textContent = '0s'
+    stateEl.className = 'modal-state'
+    stateEl.textContent = ''
+    setInstalling(true)
+    progressTimer = setInterval(() => {
+      const seconds = Math.max(0, Math.floor((Date.now() - progressStartedAt) / 1000))
+      progressTime.textContent = `${seconds}s`
+    }, 500)
+  }
+  const updateProgress = (text) => {
+    progressText.textContent = text
+  }
+  const completeProgress = (text) => {
+    stopProgressClock()
+    progressEl.hidden = false
+    progressEl.classList.add('is-done')
+    progressText.textContent = text
+    progressTime.textContent = '完成'
+  }
+  const failProgress = () => {
+    stopProgressClock()
+    progressEl.hidden = true
+    setInstalling(false)
+  }
   const registrySelect = overlay.querySelector('#pg-npm-registry')
   const customWrap = overlay.querySelector('#pg-custom-registry-wrap')
   const customInput = overlay.querySelector('#pg-custom-registry')
@@ -9022,21 +9339,28 @@ async function openPluginInstall(prefill = {}) {
       }
     }
 
-    stateEl.className = 'modal-state'
-    stateEl.textContent = source === 'npm'
+    const originText = source === 'npm'
       ? '正在从 npm 拉取 tarball 并解包（不执行安装脚本）…'
       : source === 'github'
         ? '正在从 GitHub 下载仓库 tarball 并解包…'
-        : '安装中：复制 → 校验 → 登记…'
+        : '正在安装：复制 → 校验 → 登记…'
+    startProgress(originText)
     saveBtn.disabled = true
+    saveBtn.textContent = existing ? '更新中…' : '安装中…'
     try {
       await apiPost('/api/console/plugins/install', body)
-      stateEl.className = 'modal-state good'
-      stateEl.textContent = '安装完成，正在刷新插件列表…'
-      await loadPlugins()
+      completeProgress('安装完成，正在刷新插件列表…')
+      try {
+        await loadPlugins()
+      } catch {
+        // 安装已经成功，列表刷新失败不改变安装结果，也不阻止自动关闭。
+      }
+      await new Promise((resolve) => setTimeout(resolve, 900))
       close()
     } catch (err) {
+      failProgress()
       saveBtn.disabled = false
+      saveBtn.textContent = existing ? '更新' : '安装'
       stateEl.className = 'modal-state bad'
       stateEl.textContent = err.message || '安装失败'
     }
@@ -9083,7 +9407,7 @@ function pluginPageUrl(data, plugin, page) {
   const company = encodeURIComponent(data.companyId || '')
   if ((page.kind || 'html') === 'dsh-client') {
     const inject = encodeURIComponent((plugin.dsh?.clientInject || []).join(','))
-    return `/plugin-host.html?id=${encodeURIComponent(plugin.id)}&entry=${encodeURIComponent(page.file)}&company=${company}&version=${version}&title=${encodeURIComponent(page.title)}&inject=${inject}`
+    return `/plugin-kernel.html?id=${encodeURIComponent(plugin.id)}&entry=${encodeURIComponent(page.file)}&company=${company}&version=${version}&title=${encodeURIComponent(page.title)}&inject=${inject}`
   }
   return `/plugins/assets/${encodeURIComponent(plugin.id)}/${page.file}${qs()}`
 }
@@ -9116,6 +9440,18 @@ function pluginRailItem(plugin, selected) {
       <small><span class="mono">${esc(plugin.version)}</span> · ${esc(sub)}</small>
     </span>
     <span class="plugin-rail-dot ${!plugin.valid ? 'bad' : plugin.enabled ? 'ok' : 'warn'}" title="${plugin.valid ? (plugin.enabled ? '启用' : '停用') : '清单不合法'}"></span>
+  </button>`
+}
+
+function personalPluginRailItem(plugin, selected) {
+  const initial = (plugin.name || plugin.pluginId || '?').trim().slice(0, 1).toUpperCase()
+  return `<button class="plugin-rail-item is-personal${selected ? ' is-active' : ''}" type="button" data-select-personal-plugin="${esc(plugin.key)}">
+    <span class="plugin-rail-avatar">${esc(initial)}</span>
+    <span class="plugin-rail-text">
+      <strong>${esc(plugin.name)}</strong>
+      <small><span class="plugin-personal-badge">个人</span> ${esc(plugin.userName)} · <span class="mono">${esc(plugin.version)}</span></small>
+    </span>
+    <span class="plugin-rail-dot ${!plugin.valid ? 'bad' : plugin.enabled ? 'ok' : 'warn'}" title="${plugin.valid ? (plugin.enabled ? '个人启用' : '个人停用') : '清单不合法'}"></span>
   </button>`
 }
 
@@ -9311,21 +9647,77 @@ function pluginDetailHtml(data, plugin) {
   </section>`
 }
 
+function personalPluginDetailHtml(plugin) {
+  const initial = (plugin.name || plugin.pluginId || '?').trim().slice(0, 1).toUpperCase()
+  const status = !plugin.valid
+    ? '<span class="pill danger">清单异常</span>'
+    : plugin.enabled
+      ? '<span class="pill ok">个人启用</span>'
+      : '<span class="pill warn">个人停用</span>'
+  const source = plugin.source ? (PLUGIN_SOURCE_LABEL[plugin.source] || plugin.source) : '—'
+  return `<section class="panel plugin-detail plugin-personal-detail">
+    <div class="plugin-detail-head">
+      <div class="plugin-title">
+        <div class="plugin-avatar">${esc(initial)}</div>
+        <div class="plugin-title-text">
+          <div class="plugin-title-row"><h2>${esc(plugin.name)}</h2>${pluginFormatBadge(plugin)}<span class="plugin-personal-badge">个人插件</span>${status}</div>
+          <div class="plugin-subline"><span class="mono">${esc(plugin.pluginId)}@${esc(plugin.version)}</span><span class="muted">· 归属：${esc(plugin.userName)}</span></div>
+        </div>
+      </div>
+      <div class="plugin-detail-actions">
+        <button class="btn ghost sm" type="button" data-close-plugin>收起</button>
+      </div>
+    </div>
+    <div class="plugin-personal-notice">
+      <strong>后台只读</strong>
+      <span>这个插件由 ${esc(plugin.userName)} 在个人工作台安装，只对本人可见、只影响本人。后台不能安装、更新、启停、卸载或修改它的设置。</span>
+    </div>
+    <div class="plugin-overview">
+      <div class="plugin-block">
+        <h3>归属与安装</h3>
+        <div class="kv plugin-kv">
+          <div><span>安装人</span><strong>${esc(plugin.userName)}</strong></div>
+          <div><span>安装归属</span><strong>个人 · 仅本人</strong></div>
+          <div><span>当前状态</span><strong>${plugin.valid ? (plugin.enabled ? '个人启用' : '个人停用') : '清单异常'}</strong></div>
+          <div><span>首次安装</span><strong>${esc(fmtPluginTime(plugin.installedAt))}</strong></div>
+          <div><span>最后更新</span><strong>${esc(fmtPluginTime(plugin.updatedAt))}</strong></div>
+          <div><span>来源类型</span><strong>${esc(source)}</strong></div>
+        </div>
+      </div>
+      <div class="plugin-block">
+        <h3>插件信息</h3>
+        <div class="kv plugin-kv">
+          <div><span>版本</span><strong class="mono">${esc(plugin.version)}</strong></div>
+          <div><span>格式</span><strong>${plugin.format === 'dsh' ? 'DSH' : 'EAB'}</strong></div>
+          <div><span>作者</span><strong>${esc(plugin.author || '未填写')}</strong></div>
+          <div><span>贡献页面</span><strong>${plugin.pages} 页</strong></div>
+        </div>
+        <div class="plugin-personal-desc"><span>说明</span><strong>${esc(plugin.description || '未填写')}</strong></div>
+        ${plugin.scopes?.length ? `<div class="plugin-inject-row"><span>声明权限</span><div>${plugin.scopes.map((scope) => `<span class="chip" title="${esc(scope)}">${esc(scope)}</span>`).join('')}</div></div>` : ''}
+      </div>
+    </div>
+    ${plugin.valid ? '' : `<div class="banner danger" style="margin-top:12px"><strong>${esc(plugin.error || '清单不合法')}</strong><span>个人插件清单异常；由安装人本人在个人工作台修复或卸载，后台不代操作。</span></div>`}
+  </section>`
+}
+
 function pluginWelcomeHtml(data) {
   const hosts = (data.hosts || []).filter((host) => !host.error).length
   const hasPlugins = data.plugins.length > 0
+  const personalCount = data.stats.personalInstalled || 0
   return `<section class="panel plugin-welcome">
     <div class="plugin-welcome-mark">P</div>
     <span class="install-eyebrow">PLUGIN WORKSPACE</span>
-    <h2>${hasPlugins ? '从左侧选择一个插件' : '当前公司还没有安装插件'}</h2>
+    <h2>${hasPlugins ? '从左侧选择一个公司插件' : '当前公司还没有安装插件'}</h2>
     <div class="hint-note" style="justify-content:center">${hintBadge(
       hasPlugins ? '工作区说明' : '安装来源',
-      hasPlugins ? '点击左侧插件，右侧会展开它的概览、页面、版本、设置和生命周期记录。' : '可以安装本地目录、npm 国内镜像、GitHub 仓库里的 EAB 插件，或直接装 D 盘里的 DSH 插件。',
+      hasPlugins ? '公司插件由后台统一安装、启停、卸载；个人插件在左侧单独只读展示。' : '可以安装本地目录、npm 国内镜像、GitHub 仓库里的 EAB 插件，或直接装 D 盘里的 DSH 插件。',
     )}</div>    <div class="plugin-welcome-stats">
-      <div><strong>${data.stats.installed}</strong><span>已安装</span></div>
-      <div><strong>${data.stats.enabled}</strong><span>启用</span></div>
+      <div><strong>${data.stats.installed}</strong><span>公司已装</span></div>
+      <div><strong>${data.stats.enabled}</strong><span>公司启用</span></div>
       <div><strong>${hosts}</strong><span>host 运行</span></div>
+      <div><strong>${personalCount}</strong><span>个人安装</span></div>
     </div>
+    ${personalCount ? `<div class="plugin-personal-welcome">个人插件属于员工本人，只在其个人工作台管理；后台仅查看归属与状态。</div>` : ''}
     <div class="plugin-welcome-actions">
       <button class="btn primary" type="button" data-install-plugin>安装插件…</button>
       <button class="btn ghost" type="button" data-reload-plugins>重新扫描</button>
@@ -9339,11 +9731,16 @@ function pluginRailHtml(data) {
   const installed = data.plugins
     .map((plugin) => pluginRailItem(plugin, plugin.id === selected))
     .join('')
+  const personal = data.personalPlugins || []
+  const personalSelected = state.personalPluginSelected
+  const personalItems = personal
+    .map((plugin) => personalPluginRailItem(plugin, plugin.key === personalSelected))
+    .join('')
   const hosts = (data.hosts || []).filter((host) => !host.error).length
   return `<div class="plugin-scope-block">
       <div class="plugin-scope-kicker">
         <span class="plugin-scope-eyebrow">当前公司</span>
-        ${hintBadge('归属说明', '安装 / 启停 / 卸载只记在本司名下。')}
+        ${hintBadge('归属说明', '公司插件：安装 / 启停 / 卸载记在本司名下；个人插件：只属于员工本人，后台只读。')}
       </div>
       <strong>${esc(companyName)}</strong>
     </div>
@@ -9356,8 +9753,11 @@ function pluginRailHtml(data) {
       <button class="btn primary sm" type="button" data-install-plugin>安装插件…</button>
       <button class="btn ghost sm" type="button" data-reload-plugins>刷新</button>
     </div>
-    <div class="side-head">已安装 <span class="muted">${data.plugins.length}</span></div>
+    <div class="side-head">公司插件 <span class="muted">${data.plugins.length}</span></div>
     <div class="side-list plugin-rail-list">${installed || '<div class="side-note">当前公司还没有安装插件</div>'}</div>
+    <div class="side-head plugin-personal-head">个人插件 <span class="muted">${personal.length}</span> <span class="plugin-readonly-tag">只读</span></div>
+    <div class="plugin-rail-personal-note">员工个人工作台安装，只属于本人；后台不能启停、卸载或改设置。</div>
+    <div class="side-list plugin-rail-list plugin-personal-list">${personalItems || '<div class="side-note">还没有员工安装个人插件</div>'}</div>
     `
 }
 
@@ -9371,6 +9771,7 @@ function bindPluginTabs() {
   for (const button of document.querySelectorAll('[data-close-plugin]')) {
     button.addEventListener('click', () => {
       state.pluginSelected = null
+      state.personalPluginSelected = null
       state.pluginTab = 'overview'
       state.pluginPageKey = null
       renderPluginSide()
@@ -9409,6 +9810,17 @@ function bindPluginTabs() {
   for (const button of document.querySelectorAll('[data-select-plugin]')) {
     button.addEventListener('click', () => {
       state.pluginSelected = button.dataset.selectPlugin
+      state.personalPluginSelected = null
+      state.pluginTab = 'overview'
+      state.pluginPageKey = null
+      renderPluginSide()
+      renderPluginView()
+    })
+  }
+  for (const button of document.querySelectorAll('[data-select-personal-plugin]')) {
+    button.addEventListener('click', () => {
+      state.personalPluginSelected = button.dataset.selectPersonalPlugin
+      state.pluginSelected = null
       state.pluginTab = 'overview'
       state.pluginPageKey = null
       renderPluginSide()
@@ -9454,6 +9866,14 @@ function renderPluginView() {
   const data = state.pluginData
   if (!data) return
   const view = $('#view')
+  const personal = state.personalPluginSelected
+    ? (data.personalPlugins || []).find((item) => item.key === state.personalPluginSelected) || null
+    : null
+  if (personal) {
+    view.innerHTML = personalPluginDetailHtml(personal)
+    bindPluginTabs()
+    return
+  }
   const plugin = state.pluginSelected
     ? data.plugins.find((item) => item.id === state.pluginSelected) || null
     : null
@@ -9473,7 +9893,14 @@ async function loadPlugins() {
     if (state.pluginSelected && !data.plugins.some((item) => item.id === state.pluginSelected)) {
       state.pluginSelected = null
     }
-    if (!state.pluginSelected) {
+    if (
+      state.personalPluginSelected &&
+      !(data.personalPlugins || []).some((item) => item.key === state.personalPluginSelected)
+    ) {
+      state.personalPluginSelected = null
+    }
+    if (state.personalPluginSelected) state.pluginSelected = null
+    if (!state.pluginSelected && !state.personalPluginSelected) {
       state.pluginTab = 'overview'
       state.pluginPageKey = null
     }
@@ -9751,6 +10178,22 @@ function setupAccount() {
   })
 }
 
+async function refreshUpdateBadge() {
+  const badge = document.querySelector('#update-badge')
+  if (!badge) return
+  try {
+    const status = await api('/api/console/update')
+    const hasUpdate = Boolean(status?.hasUpdate && status.latest)
+    badge.hidden = !hasUpdate
+    if (hasUpdate) {
+      badge.textContent = `新版本 v${status.latest}`
+      badge.title = `当前 v${status.current}，点击查看版本更新`
+    }
+  } catch {
+    badge.hidden = true
+  }
+}
+
 async function boot() {
   const initialPage = new URLSearchParams(location.search).get('goto')
   if (initialPage && PAGES[initialPage]) {
@@ -9766,6 +10209,14 @@ async function boot() {
     $('#health-dot').classList.add('bad')
     $('#health-text').textContent = '服务异常'
   }
+
+  const updateBadge = $('#update-badge')
+  updateBadge?.addEventListener('click', () => {
+    state.systemSection = 'data'
+    navigate('system')
+  })
+  void refreshUpdateBadge()
+  setInterval(() => void refreshUpdateBadge(), 5 * 60 * 1000)
 
   try {
     await loadCompanies()

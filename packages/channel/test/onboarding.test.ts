@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { pollFeishuScanNative, startFeishuScanNative } from '../src/onboarding.js'
+import { pollFeishuScanNative, startFeishuScanNative, verifyFeishuApp } from '../src/onboarding.js'
 
 function json(body: unknown): Response {
   return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } })
@@ -50,5 +50,23 @@ describe('飞书原生扫码（不依赖插件）', () => {
   it('poll 等待时返回 waiting', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => json({ error: 'authorization_pending' })))
     expect((await pollFeishuScanNative('dc_1')).status).toBe('waiting')
+  })
+
+  it('校验应用时读取真实 tenant_key 和企业名称，而不是把 App ID 当企业 ID', async () => {
+    const fetchMock = vi.fn(async (url: string | URL) => {
+      const target = String(url)
+      if (target.includes('tenant_access_token')) return json({ code: 0, tenant_access_token: 't' })
+      if (target.includes('/bot/v3/info')) return json({ code: 0, bot: { app_name: 'Hermes 小黑' } })
+      if (target.includes('/tenant/v2/tenant/query')) {
+        return json({ code: 0, data: { tenant: { tenant_key: '1accbd20865b9c8c', name: 'Ai无限可能' } } })
+      }
+      throw new Error(`未预期的请求：${target}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const verified = await verifyFeishuApp('cli_new', 'secret_new')
+    expect(verified.tenantId).toBe('1accbd20865b9c8c')
+    expect(verified.tenantName).toBe('Ai无限可能')
+    expect(verified.appName).toBe('Hermes 小黑')
   })
 })

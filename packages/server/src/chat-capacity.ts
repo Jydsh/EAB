@@ -75,7 +75,11 @@ export function createChatCapacity(options: ChatCapacityOptions): ChatCapacity {
   const maxConcurrent = positiveInt(options.maxConcurrent, 8)
   const queueLimit = positiveInt(options.queueLimit, 100)
   const queueTimeoutMs = positiveInt(options.queueTimeoutMs, 240_000)
-  const maxInFlightPerUser = positiveInt(options.maxInFlightPerUser, 2)
+  // 0 表示不限制单个用户同时在途的回合数；负数/非法值回落到 2。
+  const maxInFlightPerUser =
+    Number.isInteger(options.maxInFlightPerUser) && options.maxInFlightPerUser >= 0
+      ? options.maxInFlightPerUser
+      : 2
   const messagesPerMinute = positiveInt(options.messagesPerMinute, 20)
   const modelMaxConcurrent = positiveInt(options.modelMaxConcurrent ?? 4, 4)
   const companyMaxConcurrent = positiveInt(options.companyMaxConcurrent ?? maxConcurrent, maxConcurrent)
@@ -189,7 +193,7 @@ export function createChatCapacity(options: ChatCapacityOptions): ChatCapacity {
       if (user.timestamps.length >= messagesPerMinute) {
         throw reject(userId, '发送太快了，请稍后再发', `每分钟最多 ${messagesPerMinute} 条消息`)
       }
-      if (user.inFlight >= maxInFlightPerUser) {
+      if (maxInFlightPerUser > 0 && user.inFlight >= maxInFlightPerUser) {
         throw reject(
           userId,
           '你已有回答正在生成，请等当前回复结束后再发',

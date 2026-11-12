@@ -14,6 +14,7 @@
  */
 import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
+import { pluginDataRoot, userScope } from './plugin-scope.js'
 import {
   copyFileSync,
   cpSync,
@@ -98,6 +99,27 @@ export interface PluginUserInstallRecord {
   readonly installedAt: number
   readonly updatedAt: number
   readonly removedAt: number | null
+}
+
+/** 管理后台只读查看的个人插件安装：按“员工 + 插件”一条，不混入公司安装。 */
+export interface AdminPersonalPluginRecord {
+  readonly key: string
+  readonly userId: string
+  readonly userName: string
+  readonly pluginId: string
+  readonly name: string
+  readonly version: string
+  readonly description: string
+  readonly author: string
+  readonly format: 'eab' | 'dsh'
+  readonly pages: number
+  readonly scopes: readonly string[]
+  readonly valid: boolean
+  readonly error: string | null
+  readonly enabled: boolean
+  readonly installedAt: number
+  readonly updatedAt: number
+  readonly source: string | null
 }
 
 export interface PluginRecord {
@@ -703,6 +725,19 @@ function NEW_SCOPE_OK(scope: string): boolean {
      activeOwners.set(row.plugin_id, set)
    }
 
+   // 个人安装归属也参与“谁能看到”的判断：没有公司安装、只有某人个人安装的包，
+   // 不能作为“未认领插件”出现在其他员工或公司插件列表里。
+   const personalOwned = new Set(
+     (
+       db
+         .prepare(
+           `SELECT DISTINCT plugin_id FROM plugin_user_installs
+             WHERE company_id = ? AND removed_at IS NULL`,
+         )
+         .all(companyId) as unknown as Array<{ plugin_id: string }>
+     ).map((row) => row.plugin_id),
+   )
+
    const installRows = db
      .prepare(
        `SELECT plugin_id, version, source, source_ref, checksum, installed_by, installed_at, updated_at, removed_at
@@ -753,6 +788,9 @@ function NEW_SCOPE_OK(scope: string): boolean {
          if (owned.removedAt) return []
        } else if (owners.size > 0) {
          return []
+       } else if (personalOwned.has(record.id)) {
+         // 个人插件只对安装人可见，由 loadPluginsForUser 的 personalOnly 分支补回
+         return []
        }
        const stored = enabledMap.get(record.id)
        return [{
@@ -767,15 +805,24 @@ function NEW_SCOPE_OK(scope: string): boolean {
  }
 
 /** 员工视角：公司级插件 + 本人个人插件；本人没装且公司没装的条目会以“可安装”出现 */
-export function loadPluginsForUser(db: Db, companyId: string, userId: string): PluginRecord[] {
+export function loadPluginsForUser(
+  db: Db,
+  companyId: string,
+  userId: string,
+  includeAllUsers = false,
+): PluginRecord[] {
   const base = loadPlugins(db, companyId)
   const rows = db
     .prepare(
-      `SELECT company_id, user_id, plugin_id, enabled, installed_at, updated_at, removed_at
-         FROM plugin_user_installs
-        WHERE company_id = ? AND user_id = ?`,
+      includeAllUsers
+        ? `SELECT company_id, user_id, plugin_id, enabled, installed_at, updated_at, removed_at
+             FROM plugin_user_installs
+            WHERE company_id = ?`
+        : `SELECT company_id, user_id, plugin_id, enabled, installed_at, updated_at, removed_at
+             FROM plugin_user_installs
+            WHERE company_id = ? AND user_id = ?`,
     )
-    .all(companyId, userId) as unknown as Array<{
+    .all(...(includeAllUsers ? [companyId] : [companyId, userId])) as unknown as Array<{
     company_id: string
     user_id: string
     plugin_id: string
@@ -851,6 +898,76 @@ export function loadPersonalPluginsForUser(db: Db, companyId: string, userId: st
   )
 }
 
+/** 管理后台只读：列出本司所有员工的个人插件安装，一条记录只属于一个员工。 */
+export function loadAdminPersonalPlugins(db: Db, companyId: string): AdminPersonalPluginRecord[] {
+  const rows = db
+    .prepare(
+      `SELECT ui.user_id, ui.plugin_id, ui.enabled, ui.installed_at, ui.updated_at,
+              COALESCE(u.name, '') AS user_name
+         FROM plugin_user_installs ui
+         LEFT JOIN users u ON u.id = ui.user_id AND u.company_id = ui.company_id
+        WHERE ui.company_id = ? AND ui.removed_at IS NULL
+        ORDER BY ui.updated_at DESC, ui.user_id, ui.plugin_id`,
+    )
+    .all(companyId) as unknown as Array<{
+    user_id: string
+    plugin_id: string
+    enabled: number
+    installed_at: number
+    updated_at: number
+    user_name: string
+  }>
+
+  const parsed = new Map<string, { record: PluginRecord | null; error: string | null }>()
+  const readRecord = (pluginId: string) => {
+    const cached = parsed.get(pluginId)
+    if (cached) return cached
+    const dir = join(pluginRootPath, pluginId)
+    if (!existsSync(dir) || !statSync(dir).isDirectory()) {
+      const missing = { record: null, error: '插件目录不存在，可能已被移除' }
+      parsed.set(pluginId, missing)
+      return missing
+    }
+    try {
+      const { record } = parseManifest(dir, pluginId)
+      const value = { record, error: record.error }
+      parsed.set(pluginId, value)
+      return value
+    } catch (err) {
+      const failed = {
+        record: null,
+        error: err instanceof Error ? err.message : '插件清单读取失败',
+      }
+      parsed.set(pluginId, failed)
+      return failed
+    }
+  }
+
+  return rows.map((row) => {
+    const { record, error } = readRecord(row.plugin_id)
+    const install = installRecordOf(db, row.plugin_id)
+    return {
+      key: `${row.user_id}:${row.plugin_id}`,
+      userId: row.user_id,
+      userName: row.user_name || row.user_id,
+      pluginId: row.plugin_id,
+      name: record?.name || row.plugin_id,
+      version: record?.version || install?.version || '—',
+      description: record?.description || '',
+      author: record?.author || '',
+      format: record?.format || 'eab',
+      pages: record?.pages.length || 0,
+      scopes: record?.scopes || [],
+      valid: Boolean(record?.valid) && !error,
+      error,
+      enabled: row.enabled === 1,
+      installedAt: Number(row.installed_at),
+      updatedAt: Number(row.updated_at),
+      source: install?.source || null,
+    } satisfies AdminPersonalPluginRecord
+  })
+}
+
 /** 取某个插件里某个页面文件的绝对路径；越界 / 未启用 / 不存在都返回 null */
 export function resolvePluginAsset(
   plugins: readonly PluginRecord[],
@@ -916,13 +1033,14 @@ export function setUserPluginEnabled(
   })
 }
 
-/** 个人卸载：只解除本人，公司级安装和其他员工不受影响 */
+/** 个人卸载：只解除本人，删除本人实例数据；公司级安装和其他员工不受影响 */
 export function uninstallUserPlugin(
   db: Db,
   companyId: string,
   userId: string,
   pluginId: string,
-): { pluginId: string; removed: boolean } {
+  dataOptions?: { dbPath: string; dataDir?: string; dshHomeDir?: string },
+): { pluginId: string; removed: boolean; dataRoot: string | null } {
   const row = userInstallOf(db, companyId, userId, pluginId)
   if (!row || row.removedAt) {
     throw new EabError(EC.NOT_FOUND, `你还没有安装插件：${pluginId}`)
@@ -933,14 +1051,52 @@ export function uninstallUserPlugin(
         SET removed_at = ?, updated_at = ?
       WHERE company_id = ? AND user_id = ? AND plugin_id = ? AND removed_at IS NULL`,
   ).run(now, now, companyId, userId, pluginId)
+  // 个人实例的 DSH_HOME 只属于这个员工；卸载时整棵目录删除。
+  // 公司实例的 DSH_HOME（dsh-home 根）和其他员工的 scopes 子目录不在这个路径下。
+  let dataRoot: string | null = null
+  if (dataOptions) {
+    dataRoot = pluginDataRoot(dataOptions, companyId, userScope(userId))
+    rmSync(dataRoot, { recursive: true, force: true })
+  }
+  let trashPath: string | null = null
+  const stillUsedByCompany = activeCompanyOwners(db, pluginId) > 0
+  const stillUsedByUser = activeUserOwners(db, pluginId) > 0
+  // 最后一个归属人卸载后，包目录也要移走；否则会以“未认领插件”重新出现在别人列表里。
+  if (!stillUsedByCompany && !stillUsedByUser) {
+    const dir = join(pluginRootPath, pluginId)
+    if (existsSync(dir)) {
+      const { record } = parseManifest(dir, pluginId)
+      mkdirSync(trashDir(), { recursive: true })
+      trashPath = join(trashDir(), `${pluginId}-${Date.now()}`)
+      renameSync(dir, trashPath)
+      const existing = installRecordOf(db, pluginId)
+      db.prepare(
+        `INSERT INTO plugin_installs
+           (plugin_id, version, source, source_ref, checksum, installed_by, installed_at, updated_at, removed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (plugin_id)
+         DO UPDATE SET removed_at = excluded.removed_at, updated_at = excluded.updated_at`,
+      ).run(
+        pluginId,
+        record.version,
+        existing?.source ?? 'disk',
+        existing?.sourceRef ?? dir,
+        existing?.checksum ?? record.checksum,
+        userId,
+        existing?.installedAt ?? now,
+        now,
+        now,
+      )
+    }
+  }
   recordPluginEvent(db, {
     pluginId,
     companyId,
     event: 'uninstall',
     actorId: userId,
-    detail: JSON.stringify({ scope: 'user', userId }),
+    detail: JSON.stringify({ scope: 'user', userId, trashPath, dataRoot }),
   })
-  return { pluginId, removed: true }
+  return { pluginId, removed: true, dataRoot }
 }
 
 /* ---------------- 生命周期：安装 / 更新 / 卸载 / 事件 ---------------- */
@@ -1220,55 +1376,63 @@ function commitPluginPackage(
     const existingUser = isUserScope && options.userId
       ? userInstallOf(db, options.companyId, options.userId, dirName)
       : null
-    const userOwners = isUserScope ? activeUserOwners(db, dirName) : 0
+    const userOwners = activeUserOwners(db, dirName)
     const destExists = existsSync(dest)
     const currentActive = Boolean(existingCompany && !existingCompany.removedAt)
+    const currentUserActive = Boolean(existingUser && !existingUser.removedAt)
     let replaced = false
+    /** 共享目录没有替换时，返回目录里真实在用的插件，而不是本次上传的暂存副本。 */
+    let installedRecord: PluginRecord | null = null
 
     if (isUserScope && !options.userId) {
       throw new EabError(EC.VALIDATION, '个人插件安装缺少员工身份')
     }
 
-    if (destExists && !currentActive) {
-      // 磁盘上的目录不属于当前公司的公司级安装：别家公司装了 / 当前公司曾卸载但目录还在 / 部署侧手工放置
+    if (destExists) {
       const { record: onDisk } = parseManifest(dest, dirName)
+      installedRecord = onDisk
       if (onDisk.checksum !== staged.checksum) {
-        if (owners > 0 || userOwners > 0) {
-          throw new EabError(EC.CONFLICT, `插件 ${dirName} 已被其他安装占用为 ${onDisk.version}，当前来源是 ${staged.version}`, {
-            hint: '共享目录不能由一次安装单独覆盖；请让已安装的公司或个人先卸载，或改用相同版本安装。',
-            details: { onDiskVersion: onDisk.version, requestedVersion: staged.version, owners, userOwners },
+        // 包目录是公司安装和个人安装共用的，只能保留一个版本。
+        // 当前安装人自己的旧归属不算“别人”，其他任何活跃归属都会阻止单独覆盖。
+        const ownActive = isUserScope ? (currentUserActive ? 1 : 0) : (currentActive ? 1 : 0)
+        const otherOwners = Math.max(0, owners + userOwners - ownActive)
+        const sameVersion = onDisk.version === staged.version
+        // 公司安装和个人安装共用一份同版本包时，不能因为另一个归属已经装了同版本，
+        // 就把新归属挡在安装入口外；同版本直接复用现有共享包，只登记新归属。
+        const reuseSharedForSameVersion = sameVersion && otherOwners > 0
+        if (otherOwners > 0 && !reuseSharedForSameVersion) {
+          const message = sameVersion
+            ? `插件 ${dirName} 的 ${onDisk.version} 版本已有其他归属在使用，但内容指纹不同，不能覆盖共享包`
+            : `插件 ${dirName} 当前共享版本是 ${onDisk.version}，不能由这次安装单独替换为 ${staged.version}`
+          throw new EabError(EC.CONFLICT, message, {
+            hint: sameVersion
+              ? '同一版本的内容指纹不同，不能直接覆盖共享包；请确认包来源，或先让其他归属卸载后再覆盖。'
+              : '同一个插件包被公司安装和多个个人安装共用；已有其他归属在使用该版本时，请先让其他归属卸载，或按相同版本安装。',
+            details: {
+              onDiskVersion: onDisk.version,
+              requestedVersion: staged.version,
+              owners,
+              userOwners,
+              otherOwners,
+              onDiskChecksum: onDisk.checksum,
+              requestedChecksum: staged.checksum,
+            },
           })
         }
-        if (!options.overwrite) {
-          throw new EabError(EC.VALIDATION, `插件 ${dirName} 目录已存在（未被任何安装认领）；替换请显式确认覆盖`)
+        if (!reuseSharedForSameVersion && !options.overwrite) {
+          throw new EabError(EC.VALIDATION, `插件 ${dirName} 目录已存在；替换为 ${staged.version} 请显式确认覆盖`)
         }
-        mkdirSync(trashDir(), { recursive: true })
-        trashPath = join(trashDir(), `${dirName}-${Date.now()}`)
-        renameSync(dest, trashPath)
-        renameSync(staging, dest)
-        replaced = true
+        if (!reuseSharedForSameVersion) {
+          mkdirSync(trashDir(), { recursive: true })
+          trashPath = join(trashDir(), `${dirName}-${Date.now()}`)
+          renameSync(dest, trashPath)
+          renameSync(staging, dest)
+          replaced = true
+          installedRecord = null
+        }
       }
-      // 指纹相同：只登记当前安装归属，不动物理目录
-    } else if (destExists && currentActive) {
-      const { record: onDisk } = parseManifest(dest, dirName)
-      if (onDisk.checksum !== staged.checksum) {
-        if (!options.overwrite) {
-          throw new EabError(EC.VALIDATION, `插件 ${dirName} 已存在；更新请显式确认覆盖`)
-        }
-        if (owners > 1) {
-          throw new EabError(EC.CONFLICT, `插件 ${dirName} 正被 ${owners} 家公司使用，不能单独覆盖`, {
-            hint: '先让其他公司卸载该插件，或等共享版本统一升级。',
-            details: { owners },
-          })
-        }
-        mkdirSync(trashDir(), { recursive: true })
-        trashPath = join(trashDir(), `${dirName}-${Date.now()}`)
-        renameSync(dest, trashPath)
-        renameSync(staging, dest)
-        replaced = true
-      }
-      // 指纹相同：只登记本次安装归属，不动物理目录
-    } else if (!destExists) {
+      // 指纹相同：只登记当前安装归属，不动物理目录；公司/个人可以共用同一个包。
+    } else {
       renameSync(staging, dest)
       replaced = false
     }
@@ -1370,7 +1534,7 @@ function commitPluginPackage(
     }
     if (existsSync(staging)) rmSync(staging, { recursive: true, force: true })
     return {
-      plugin: { ...staged, enabled: true, install },
+      plugin: { ...(installedRecord ?? staged), enabled: true, install },
       replaced,
       sourcePath: sourceRef,
       trashPath,
@@ -1787,6 +1951,21 @@ export function uninstallPluginPackage(db: Db, pluginId: string, actorId: string
       hint: '要先使用请先安装；要彻底移除请让已安装的公司卸载。',
     })
   }
+  if (!ownRecord) {
+    const personalOwners = activeUserOwners(db, pluginId)
+    throw new EabError(
+      EC.NOT_FOUND,
+      personalOwners > 0
+        ? `插件 ${pluginId} 只有员工个人安装，控制台不能卸载`
+        : `当前公司没有安装插件 ${pluginId}`,
+      {
+        hint:
+          personalOwners > 0
+            ? '个人插件由员工本人在个人工作台卸载；控制台只读查看，不代操作。'
+            : '控制台只能卸载已登记到当前公司的插件。',
+      },
+    )
+  }
   if (ownRecord?.removedAt) {
     throw new EabError(EC.NOT_FOUND, `当前公司没有安装插件 ${pluginId}`)
   }
@@ -1806,9 +1985,11 @@ export function uninstallPluginPackage(db: Db, pluginId: string, actorId: string
   ).run(companyId, pluginId, actorId, ownRecord?.installedAt ?? now, now, now)
 
   const ownersAfter = activeCompanyOwners(db, pluginId)
+  const personalOwners = activeUserOwners(db, pluginId)
   const shared = ownersAfter > 0
   let trashPath: string | null = null
-  if (!shared) {
+  // 还有公司或员工在用这个包时，不能把目录移走；公司卸载只解除公司归属。
+  if (!shared && personalOwners === 0) {
     mkdirSync(trashDir(), { recursive: true })
     trashPath = join(trashDir(), `${pluginId}-${Date.now()}`)
     renameSync(dir, trashPath)
@@ -1837,7 +2018,7 @@ export function uninstallPluginPackage(db: Db, pluginId: string, actorId: string
     companyId,
     event: 'uninstall',
     actorId,
-    detail: JSON.stringify({ trashPath, version: record.version, shared }),
+    detail: JSON.stringify({ trashPath, version: record.version, shared, personalOwners }),
   })
 
   return { pluginId, trashPath, version: record.version, shared }

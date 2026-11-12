@@ -25,6 +25,14 @@ interface ModelHealthEntry {
 }
 
 const healthByCompany = new Map<string, Map<string, ModelHealthEntry>>()
+/**
+ * 最近一次真实对话成功的模型。
+ *
+ * 健康探测只能说明“模型能返回一句话”，不能代表长一点的对话一定成功。
+ * 因此真实对话失败后，即使探测又把模型标成可用，下一次自动模式也应先走
+ * 刚刚真实接替成功的模型，而不是重新撞一遍坏模型。
+ */
+const preferredByCompany = new Map<string, string>()
 
 function companyHealth(companyId: string): Map<string, ModelHealthEntry> {
   let rows = healthByCompany.get(companyId)
@@ -62,6 +70,43 @@ export function markModelUnhealthy(companyId: string, modelId: string, reason: s
     failures: (previous?.failures ?? 0) + 1,
     lastError: reason.slice(0, 300),
   })
+  if (preferredByCompany.get(companyId) === modelId) preferredByCompany.delete(companyId)
+}
+
+/**
+ * 真实对话成功：记录这个模型为当前自动模式的首选。
+ * 探测成功只调用 markModelHealthy，不会调用这里，避免探测把“刚失败过的模型”又顶回首位。
+ */
+export function markModelPreferred(companyId: string, modelId: string): void {
+  preferredByCompany.set(companyId, modelId)
+}
+
+/** 当前自动模式应优先尝试的真实成功模型；没有则返回 null。 */
+export function preferredModelId(companyId: string): string | null {
+  return preferredByCompany.get(companyId) ?? null
+}
+
+/**
+ * 给对话候选排序：最近真实成功过的模型排在最前，真实失败过的模型排到最后。
+ * 未知模型保持原优先级顺序；插件未知模型本来就会被过滤掉。
+ * 该排序只影响对话，不改控制台的模型目录。
+ */
+export function sortModelsForChat<T extends { id: string }>(companyId: string, models: readonly T[]): T[] {
+  const preferred = preferredModelId(companyId)
+  return [...models]
+    .map((model, index) => ({
+      model,
+      index,
+      rank: model.id === preferred && isModelHealthy(companyId, model.id)
+        ? -1
+        : isModelHealthy(companyId, model.id)
+          ? 0
+          : isModelHealthKnown(companyId, model.id)
+            ? 2
+            : 0,
+    }))
+    .sort((a, b) => a.rank - b.rank || a.index - b.index)
+    .map((item) => item.model)
 }
 
 /** 未探测过的模型默认不可用：必须先真实探测通过，才允许出现在模型目录里。 */
@@ -75,7 +120,10 @@ export function isModelHealthy(companyId: string, modelId: string): boolean {
  */
 export function forgetModelHealth(companyId: string, modelIds: readonly string[]): void {
   const rows = companyHealth(companyId)
-  for (const modelId of modelIds) rows.delete(String(modelId))
+  for (const modelId of modelIds) {
+    rows.delete(String(modelId))
+    if (preferredByCompany.get(companyId) === modelId) preferredByCompany.delete(companyId)
+  }
 }
 
 export function isModelHealthKnown(companyId: string, modelId: string): boolean {

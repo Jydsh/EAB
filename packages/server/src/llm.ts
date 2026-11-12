@@ -7,6 +7,11 @@
 import { EC, EabError } from '@eab/domain'
 import type { Db } from '@eab/storage'
 import { resolveSecret, secretConfigured } from './secrets.js'
+import {
+  anthropicThinkingBudget,
+  geminiThinkingBudget,
+  providerReasoningEffort,
+} from './thinking.js'
 
 export interface LlmToolCall {
   readonly id: string
@@ -88,6 +93,18 @@ function geminiParts(content: LlmContent): GeminiPart[] {
   return parts.length ? parts : [{ text: '' }]
 }
 
+export interface ToolParameterSchema {
+  type: string
+  description?: string
+  items?: ToolParameterSchema
+  properties?: Record<string, ToolParameterSchema>
+  required?: string[]
+  additionalProperties?: boolean
+  enum?: string[]
+  minItems?: number
+  maxItems?: number
+}
+
 export interface ToolSpec {
   type: 'function'
   function: {
@@ -95,7 +112,7 @@ export interface ToolSpec {
     description: string
     parameters: {
       type: 'object'
-      properties: Record<string, { type: string; description: string }>
+      properties: Record<string, ToolParameterSchema>
       required: string[]
       additionalProperties: false
     }
@@ -112,8 +129,20 @@ export interface CallResult {
 
 export type ModelStreamEvent = { type: 'reasoning'; text: string } | { type: 'content'; text: string }
 
+export type ToolChoice =
+  | 'auto'
+  | 'none'
+  | 'required'
+  | { type: 'function'; function: { name: string } }
+
 export interface ModelCallOptions {
   tools?: ToolSpec[]
+  /** 默认 auto；澄清修复时强制模型调用 ask_user。 */
+  toolChoice?: ToolChoice
+  /** 已解析的思考档位；由模型配置和会话选择共同决定。 */
+  reasoningEffort?: string
+  /** budget 策略下，重试也不得突破的 max_tokens 上限。 */
+  maxTokensCap?: number
 }
 
 export interface ModelStreamOptions extends ModelCallOptions {
@@ -228,7 +257,9 @@ async function callOpenAi(
   messages: ChatMessage[],
   maxTokens: number,
   tools: ToolSpec[] = [],
+  reasoningEffort?: string,
 ): Promise<CallResult> {
+  const wireEffort = reasoningEffort ? providerReasoningEffort(reasoningEffort) : undefined
   const res = await fetchModelWithRetry(`${trimBase(base)}/chat/completions`, {
     method: 'POST',
     headers: {
@@ -240,6 +271,7 @@ async function callOpenAi(
       messages,
       max_tokens: maxTokens,
       temperature: 0.4,
+      ...(wireEffort ? { reasoning_effort: wireEffort } : {}),
       ...(tools.length > 0 ? { tools, tool_choice: 'auto' } : {}),
     }),
     signal: AbortSignal.timeout(90_000),
@@ -287,15 +319,22 @@ async function callAzure(
   deployment: string,
   messages: ChatMessage[],
   maxTokens: number,
+  reasoningEffort?: string,
 ): Promise<CallResult> {
   if (!base) throw new EabError(EC.VALIDATION, 'Azure OpenAI 需要填写资源 Endpoint')
   if (!key) throw new EabError(EC.VALIDATION, 'Azure OpenAI 没有可用密钥')
+  const wireEffort = reasoningEffort ? providerReasoningEffort(reasoningEffort) : undefined
   const res = await fetchModelWithRetry(
     `${trimBase(base)}/openai/deployments/${encodeURIComponent(deployment)}/chat/completions?api-version=2024-06-01`,
     {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'api-key': key },
-      body: JSON.stringify({ messages, max_tokens: maxTokens, temperature: 0.4 }),
+      body: JSON.stringify({
+        messages,
+        max_tokens: maxTokens,
+        temperature: 0.4,
+        ...(wireEffort ? { reasoning_effort: wireEffort } : {}),
+      }),
       signal: AbortSignal.timeout(90_000),
     },
   )
@@ -321,10 +360,12 @@ async function callAnthropic(
   modelKey: string,
   messages: ChatMessage[],
   maxTokens: number,
+  reasoningEffort?: string,
 ): Promise<CallResult> {
   if (!key) throw new EabError(EC.VALIDATION, 'Anthropic 没有可用密钥')
   const system = messages.filter((item) => item.role === 'system').map((item) => contentAsText(item.content)).join('\n')
   const rest = messages.filter((item) => item.role !== 'system')
+  const thinkingBudget = reasoningEffort ? anthropicThinkingBudget(reasoningEffort, maxTokens) : undefined
   const res = await fetchModelWithRetry(`${trimBase(base)}/messages`, {
     method: 'POST',
     headers: {
@@ -335,6 +376,7 @@ async function callAnthropic(
     body: JSON.stringify({
       model: modelKey,
       max_tokens: maxTokens,
+      ...(thinkingBudget ? { thinking: { type: 'enabled', budget_tokens: thinkingBudget } } : {}),
       ...(system ? { system } : {}),
       messages: rest.map((item) => ({ role: item.role, content: anthropicContent(item.content) })),
     }),
@@ -345,7 +387,11 @@ async function callAnthropic(
     content?: Array<{ type?: string; text?: string }>
     usage?: { input_tokens?: number; output_tokens?: number }
   }
-  const text = (json.content ?? []).map((part) => part.text ?? '').join('')
+  // 扩展思考会额外返回 thinking block；正文只取 text，避免把推理内容拼进答案。
+  const text = (json.content ?? [])
+    .filter((part) => part.type !== 'thinking' && part.type !== 'redacted_thinking')
+    .map((part) => part.text ?? '')
+    .join('')
   if (!text.trim()) throw new EabError(EC.UPSTREAM, 'Anthropic 返回了空内容')
   return {
     text,
@@ -360,6 +406,7 @@ async function callGemini(
   modelKey: string,
   messages: ChatMessage[],
   maxTokens: number,
+  reasoningEffort?: string,
 ): Promise<CallResult> {
   if (!key) throw new EabError(EC.VALIDATION, 'Gemini 没有可用密钥')
   const system = messages.filter((item) => item.role === 'system').map((item) => contentAsText(item.content)).join('\n')
@@ -369,6 +416,7 @@ async function callGemini(
       role: item.role === 'assistant' ? 'model' : 'user',
       parts: geminiParts(item.content),
     }))
+  const thinkingBudget = reasoningEffort ? geminiThinkingBudget(reasoningEffort) : undefined
   const res = await fetchModelWithRetry(
     `${trimBase(base)}/models/${encodeURIComponent(modelKey)}:generateContent?key=${encodeURIComponent(key)}`,
     {
@@ -377,7 +425,11 @@ async function callGemini(
       body: JSON.stringify({
         contents,
         ...(system ? { systemInstruction: { parts: [{ text: system }] } } : {}),
-        generationConfig: { maxOutputTokens: maxTokens, temperature: 0.4 },
+        generationConfig: {
+          maxOutputTokens: maxTokens,
+          temperature: 0.4,
+          ...(thinkingBudget === undefined ? {} : { thinkingConfig: { thinkingBudget } }),
+        },
       }),
       signal: AbortSignal.timeout(90_000),
     },
@@ -413,6 +465,7 @@ async function callOpenAiStream(
 ): Promise<CallResult> {
   const timeout = AbortSignal.timeout(120_000)
   const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout
+  const wireEffort = options.reasoningEffort ? providerReasoningEffort(options.reasoningEffort) : undefined
   const res = await fetchModelWithRetry(`${trimBase(base)}/chat/completions`, {
     method: 'POST',
     headers: {
@@ -425,7 +478,10 @@ async function callOpenAiStream(
       max_tokens: maxTokens,
       temperature: 0.4,
       stream: true,
-      ...(options.tools && options.tools.length > 0 ? { tools: options.tools, tool_choice: 'auto' } : {}),
+      ...(wireEffort ? { reasoning_effort: wireEffort } : {}),
+      ...(options.tools && options.tools.length > 0
+        ? { tools: options.tools, tool_choice: options.toolChoice ?? 'auto' }
+        : {}),
     }),
     signal,
   })
@@ -553,7 +609,7 @@ export async function callModelStream(
   const key = apiKeyOf(provider, dbPath)
 
   if (provider.kind === 'anthropic' || provider.kind === 'gemini' || provider.kind === 'azure_openai') {
-    const result = await callModel(db, dbPath, companyId, modelId, messages, maxTokens)
+    const result = await callModel(db, dbPath, companyId, modelId, messages, maxTokens, options)
     if (result?.reasoning) options.onEvent?.({ type: 'reasoning', text: result.reasoning })
     if (result?.text) options.onEvent?.({ type: 'content', text: result.text })
     return result
@@ -564,7 +620,10 @@ export async function callModelStream(
     if (error instanceof EabError && error.message === '模型只输出了推理内容，没有生成最终答复') {
       // 推理模型在长任务上可能把预算全用在 thinking 上。用翻倍预算重试一次，
       // 并丢弃第二次的 reasoning 事件，避免前端看到重复思考过程。
-      const retryTokens = Math.min(maxTokens * 2, 16_384)
+      // budget 策略下不得超过档位上限，否则「精简」会被悄悄放大。
+      const cap = options.maxTokensCap ?? 16_384
+      const retryTokens = Math.min(maxTokens * 2, 16_384, cap)
+      if (retryTokens <= maxTokens) throw error
       return await callOpenAiStream(base, key, provider.modelKey, messages, retryTokens, {
         ...options,
         onEvent: (event) => {
@@ -585,6 +644,7 @@ export async function callModel(
   modelId: string,
   messages: ChatMessage[],
   maxTokens = 4096,
+  options: ModelCallOptions = {},
 ): Promise<CallResult | null> {
   const provider = providerOf(db, companyId, modelId)
   if (provider.kind === 'demo') return null
@@ -593,15 +653,15 @@ export async function callModel(
   const key = apiKeyOf(provider, dbPath)
 
   if (provider.kind === 'anthropic') {
-    return callAnthropic(base, key, provider.modelKey, messages, maxTokens)
+    return callAnthropic(base, key, provider.modelKey, messages, maxTokens, options.reasoningEffort)
   }
   if (provider.kind === 'gemini') {
-    return callGemini(base, key, provider.modelKey, messages, maxTokens)
+    return callGemini(base, key, provider.modelKey, messages, maxTokens, options.reasoningEffort)
   }
   if (provider.kind === 'azure_openai') {
-    return callAzure(base, key, provider.modelKey, messages, maxTokens)
+    return callAzure(base, key, provider.modelKey, messages, maxTokens, options.reasoningEffort)
   }
-  return callOpenAi(base, key, provider.modelKey, messages, maxTokens)
+  return callOpenAi(base, key, provider.modelKey, messages, maxTokens, options.tools ?? [], options.reasoningEffort)
 }
 
 export interface EmbeddingResult {

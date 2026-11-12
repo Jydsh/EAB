@@ -25,6 +25,7 @@ import {
 } from './settings.js'
 import { startRetention } from './retention.js'
 import { startScheduleWorker } from './schedule.js'
+import { startOrgSyncScheduler } from './org-sync-scheduler.js'
 import { startModelHealthMonitor, isModelHealthy, probeUnverifiedPluginModels, forgetModelHealth } from './model-health.js'
 import { reloadPluginHosts } from './plugin-host.js'
 import { setPluginModelVisibilityResolver, setPluginModelsChangedListener, startPluginModelCatalogSync } from './plugin-models.js'
@@ -228,7 +229,7 @@ await reloadPluginHosts(db, {
   dshHomeDir: config.dshHomeDir,
   companyId: config.companyId,
 }).catch((error) => {
-  console.warn('[eab] DSH 插件宿主启动失败：', (error as Error).message)
+  console.warn('[eab] DSH 插件宿主启动失败：', (error as Error).stack ?? (error as Error).message)
 })
 
 /** 插件模型定时健康探测：失败模型从对话候选过滤，恢复后自动回来。 */
@@ -236,6 +237,12 @@ const stopModelHealthMonitor = startModelHealthMonitor(config.companyId)
 
 /** 插件模型目录定时重读：插件把不再免费的模型摘掉后，EAB 目录跟随清理。 */
 const stopPluginModelCatalogSync = startPluginModelCatalogSync(config.companyId)
+
+/**
+ * 已绑定渠道的通讯录定时同步：默认每 2 小时一次，启动后延迟 1 分钟首跑。
+ * 成员被上游标记离职或连续两次缺失后会停用，员工会话随即失效。
+ */
+const stopOrgSyncScheduler = startOrgSyncScheduler(db, config, config.companyId)
 
 /** 0.0.0.0 时给运维一个可直接复制的局域网地址；只做展示，不参与监听。 */
 function localIpv4(): string | null {
@@ -247,11 +254,30 @@ function localIpv4(): string | null {
   return null
 }
 
-/** 启动后异步检查 GitHub Release；失败只记录日志，不阻塞服务。 */
-void checkForUpdate(false).then((status) => {
-  if (status.error) console.warn(`[eab] 版本检查失败：${status.error}`)
-  else if (status.hasUpdate) console.log(`[eab] 发现新版本 v${status.latest}（当前 v${status.current}），可在控制台「系统 → 版本更新」查看`)
-})
+/**
+ * 启动后异步检查 GitHub Release，并定时复查；失败只记录日志，不阻塞服务。
+ * 定时检查让服务运行期间新发布的 Release 也能进入控制台版本提醒。
+ */
+let announcedUpdateVersion: string | null = null
+function reportUpdateStatus(status: Awaited<ReturnType<typeof checkForUpdate>>, source: string): void {
+  if (status.error) {
+    if (source === '启动') console.warn(`[eab] 版本检查失败：${status.error}`)
+    return
+  }
+  if (status.hasUpdate && status.latest) {
+    if (announcedUpdateVersion !== status.latest) {
+      announcedUpdateVersion = status.latest
+      console.log(`[eab] 发现新版本 v${status.latest}（当前 v${status.current}），可在控制台「系统 → 数据与运维 → 版本更新」查看`)
+    }
+  } else {
+    announcedUpdateVersion = null
+  }
+}
+void checkForUpdate(false).then((status) => reportUpdateStatus(status, '启动'))
+// 每 10 分钟强制刷新一次，服务运行期间新发布的 Release 也能被发现；定时器不阻止进程退出。
+setInterval(() => {
+  void checkForUpdate(true).then((status) => reportUpdateStatus(status, '定时'))
+}, 10 * 60 * 1000).unref()
 
 console.log('')
 const accessHost = config.host === '0.0.0.0' || config.host === '::' ? localIpv4() ?? config.host : config.host
@@ -299,6 +325,7 @@ async function shutdown(): Promise<void> {
   stopScheduleWorker()
   stopModelHealthMonitor()
   stopPluginModelCatalogSync()
+  stopOrgSyncScheduler()
   stopDingTalkStreamMonitor()
   stopDingTalkStream()
   stopFeishuStreamMonitor()

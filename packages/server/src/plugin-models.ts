@@ -9,6 +9,11 @@
 import { EC, EabError } from '@eab/domain'
 import type { CallResult, ChatMessage, ModelStreamOptions } from './llm.js'
 import { DEFAULT_PLUGIN_MODEL_ROLES } from './plugin-model-settings.js'
+import { companyScope, pluginInstanceKey, type PluginScope } from './plugin-scope.js'
+import {
+  thinkingConfigFromDeclaredReasoning,
+  type ThinkingConfig,
+} from './thinking.js'
 
 interface PluginAdapterLike {
   listModels?: (provider: string) => unknown | Promise<unknown>
@@ -19,6 +24,10 @@ interface PluginAdapterLike {
 
 interface RegisteredAdapter {
   pluginId: string
+  /** (companyId, pluginId, scope) 的实例键；公司/个人同名插件各注册各的 adapter。 */
+  instanceKey: string
+  scope: PluginScope
+  userId: string | null
   routes: Set<string>
   adapter: PluginAdapterLike
   revision: number
@@ -35,6 +44,7 @@ interface PluginModelTarget {
   channelId: string
   adapter: PluginAdapterLike
   info: Record<string, unknown>
+  instanceKey: string
 }
 
 export interface PluginModelDefinition {
@@ -54,10 +64,16 @@ export interface PluginModelDefinition {
   contextCompression: boolean
   inputModalities: string[]
   outputModalities: string[]
+  /** 插件声明的思考档位；没有声明时对话页不显示思考选择器。 */
+  thinking: ThinkingConfig | null
   source: 'plugin'
   readonly: true
   pluginId: string
   channelId: string
+  /** 模型所属实例：公司实例对全员可见，个人实例只对本人可见。 */
+  instanceKey: string
+  scope: 'company' | 'user'
+  userId: string | null
 }
 
 export interface PluginChannelDefinition {
@@ -72,6 +88,9 @@ export interface PluginChannelDefinition {
   settingsPath: string[]
   configurable: boolean
   discovery: boolean
+  instanceKey: string
+  scope: 'company' | 'user'
+  userId: string | null
 }
 
 const adaptersByCompany = new Map<string, RegisteredAdapter[]>()
@@ -153,12 +172,16 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' ? (value as Record<string, unknown>) : {}
 }
 
-function pluginModelId(provider: string, modelId: string): string {
-  return `plugin:${encodeURIComponent(provider)}:${encodeURIComponent(modelId)}`
+function instanceToken(scope: PluginScope): string {
+  return scope.kind === 'company' ? '' : `user:${encodeURIComponent(scope.userId)}:`
 }
 
-function pluginChannelId(pluginId: string, route: string): string {
-  return `plugin:${encodeURIComponent(pluginId)}:${encodeURIComponent(route)}`
+function pluginModelId(provider: string, modelId: string, scope: PluginScope): string {
+  return `plugin:${instanceToken(scope)}${encodeURIComponent(provider)}:${encodeURIComponent(modelId)}`
+}
+
+function pluginChannelId(pluginId: string, route: string, scope: PluginScope): string {
+  return `plugin:${instanceToken(scope)}${encodeURIComponent(pluginId)}:${encodeURIComponent(route)}`
 }
 
 function asStringList(value: unknown): string[] {
@@ -177,6 +200,8 @@ function toDefinition(
   info: Record<string, unknown>,
   pluginId: string,
   channelId: string,
+  reasoning: unknown,
+  registration: RegisteredAdapter,
 ): PluginModelDefinition {
   const id = String(info.id ?? '')
   if (!id) throw new Error('插件模型缺少 id')
@@ -184,7 +209,7 @@ function toDefinition(
   const capabilities = asCapabilities(info)
   const tags = [...new Set([...(Array.isArray(info.tags) ? info.tags.map(String) : ['chat']), ...capabilities])]
   return {
-    id: pluginModelId(provider, id),
+    id: pluginModelId(provider, id, registration.scope),
     name: String(info.name ?? id),
     desc: String(info.description ?? '插件模型'),
     tags,
@@ -200,10 +225,14 @@ function toDefinition(
     contextCompression: false,
     inputModalities: asStringList(info.inputModalities),
     outputModalities: asStringList(info.outputModalities),
+    thinking: thinkingConfigFromDeclaredReasoning(reasoning),
     source: 'plugin',
     readonly: true,
     pluginId,
     channelId,
+    instanceKey: registration.instanceKey,
+    scope: registration.scope.kind,
+    userId: registration.userId,
   }
 }
 
@@ -263,7 +292,7 @@ async function refreshAdapter(
 
   for (const route of routes) {
     if (failed.has(route)) continue
-    const channelId = pluginChannelId(registration.pluginId, route)
+    const channelId = pluginChannelId(registration.pluginId, route, registration.scope)
     // 同一 route 只有成功读到目录时才整体替换，未变化的内容不会触发探测。
     for (const [id, target] of [...targets]) {
       if (target.adapter === registration.adapter && target.provider === route) {
@@ -273,16 +302,30 @@ async function refreshAdapter(
     }
     for (const raw of fetched.get(route) ?? []) {
       const info = asRecord(raw)
+      const modelId = String(info.id ?? '')
+      if (!modelId) continue
+      // 档位菜单是模型级声明：DSH 的 resolveModel 会返回 reasoning.efforts。
+      // 单个模型解析失败不影响目录投影，只是这个模型不显示思考选择器。
+      let reasoning: unknown
+      if (registration.adapter.resolveModel) {
+        try {
+          const resolved = asRecord(await registration.adapter.resolveModel(route, modelId))
+          reasoning = resolved.reasoning
+        } catch {
+          reasoning = undefined
+        }
+      }
       try {
-        const definition = toDefinition(route, info, registration.pluginId, channelId)
+        const definition = toDefinition(route, info, registration.pluginId, channelId, reasoning, registration)
         models.set(definition.id, definition)
         targets.set(definition.id, {
           provider: route,
-          modelId: String(info.id),
+          modelId,
           pluginId: registration.pluginId,
           channelId,
           adapter: registration.adapter,
           info,
+          instanceKey: registration.instanceKey,
         })
       } catch {
         // 单个模型形状不对不影响同一 adapter 的其它模型。
@@ -318,11 +361,16 @@ export function registerPluginAdapter(
   pluginId: string,
   ids: unknown,
   adapter: unknown,
+  scope: PluginScope = companyScope(),
 ): { replace: (next: unknown) => void; dispose: () => void } {
   const normalized = (Array.isArray(ids) ? ids : [ids]).map(String).filter(Boolean)
+  const instanceKey = pluginInstanceKey(companyId, pluginId, scope)
   const existing = companyAdapters(companyId).find((row) => row.adapter === adapter)
   const registration: RegisteredAdapter = existing ?? {
     pluginId: String(pluginId),
+    instanceKey,
+    scope,
+    userId: scope.kind === 'user' ? scope.userId : null,
     routes: new Set(normalized),
     adapter: (adapter ?? {}) as PluginAdapterLike,
     revision: 0,
@@ -332,19 +380,22 @@ export function registerPluginAdapter(
   }
   if (existing) {
     registration.pluginId = String(pluginId || registration.pluginId)
+    registration.instanceKey = instanceKey
+    registration.scope = scope
+    registration.userId = scope.kind === 'user' ? scope.userId : null
     registration.routes = new Set(normalized)
   } else {
     companyAdapters(companyId).push(registration)
   }
-  const pendingMeta = pendingConfigurable.get(companyId)?.get(registration.pluginId)
+  const pendingMeta = pendingConfigurable.get(companyId)?.get(instanceKey)
   if (pendingMeta) {
     for (const [route, meta] of pendingMeta) registration.configurable.set(route, meta)
-    pendingConfigurable.get(companyId)?.delete(registration.pluginId)
+    pendingConfigurable.get(companyId)?.delete(instanceKey)
   }
-  const pendingProbe = pendingDiscovery.get(companyId)?.get(registration.pluginId)
+  const pendingProbe = pendingDiscovery.get(companyId)?.get(instanceKey)
   if (pendingProbe && !registration.discovery) {
     registration.discovery = pendingProbe
-    pendingDiscovery.get(companyId)?.delete(registration.pluginId)
+    pendingDiscovery.get(companyId)?.delete(instanceKey)
   }
   void refreshAdapter(companyId, registration)
 
@@ -389,22 +440,30 @@ export function listAllPluginModels(companyId: string): PluginModelDefinition[] 
 /**
  * 对外可见的插件模型：插件仍启用，并且已经探测通过。
  * 未探测的模型默认不返回，避免服务刚启动时把尚未验证的插件模型放进对话候选。
+ *
+ * 不传 userId 时只返回公司实例；传了才并入该成员自己的个人实例模型。
+ * 个人模型绝不能出现在其他成员的候选列表里。
  */
-export function listPluginModels(companyId: string): PluginModelDefinition[] {
-  return listAllPluginModels(companyId).filter((model) => modelIsVisible(companyId, model.id))
+export function listPluginModels(companyId: string, userId?: string): PluginModelDefinition[] {
+  return listAllPluginModels(companyId).filter((model) => {
+    if (!modelIsVisible(companyId, model.id)) return false
+    if (model.scope === 'company') return true
+    return Boolean(userId && model.userId === String(userId))
+  })
 }
 
 /**
  * 控制台看到的插件通道。一个 adapter 可以注册多条 route，每条 route 是一个
  * 独立通道；配置元数据来自 `ctx.llm.registerConfigurableProviders`。
  */
-export function listPluginChannels(companyId: string): PluginChannelDefinition[] {
+export function listPluginChannels(companyId: string, userId?: string): PluginChannelDefinition[] {
   const channels = new Map<string, PluginChannelDefinition>()
-  const models = listPluginModels(companyId)
+  const models = listPluginModels(companyId, userId)
   for (const registration of companyAdapters(companyId)) {
     if (!pluginIsActive(companyId, registration.pluginId)) continue
+    if (registration.scope.kind === 'user' && registration.userId !== String(userId ?? '')) continue
     for (const route of registration.routes) {
-      const id = pluginChannelId(registration.pluginId, route)
+      const id = pluginChannelId(registration.pluginId, route, registration.scope)
       const meta = registration.configurable.get(route) ?? {}
       const settingsPath = Array.isArray(meta.settingsPath) ? meta.settingsPath.map(String) : []
       const modelCount = models.filter((model) => model.channelId === id).length
@@ -420,6 +479,9 @@ export function listPluginChannels(companyId: string): PluginChannelDefinition[]
         settingsPath,
         configurable: registration.configurable.has(route),
         discovery: Boolean(registration.discovery),
+        instanceKey: registration.instanceKey,
+        scope: registration.scope.kind,
+        userId: registration.userId,
       })
     }
   }
@@ -431,20 +493,22 @@ export function registerPluginConfigurableProviders(
   companyId: string,
   pluginId: string,
   list: unknown,
+  scope: PluginScope = companyScope(),
 ): () => void {
   if (!Array.isArray(list)) return () => undefined
   const rows = list.map(asRecord)
-  const registration = companyAdapters(companyId).find((row) => row.pluginId === String(pluginId))
+  const instanceKey = pluginInstanceKey(companyId, pluginId, scope)
+  const registration = companyAdapters(companyId).find((row) => row.instanceKey === instanceKey)
   if (!registration) {
     let byPlugin = pendingConfigurable.get(companyId)
     if (!byPlugin) {
       byPlugin = new Map()
       pendingConfigurable.set(companyId, byPlugin)
     }
-    let meta = byPlugin.get(String(pluginId))
+    let meta = byPlugin.get(instanceKey)
     if (!meta) {
       meta = new Map()
-      byPlugin.set(String(pluginId), meta)
+      byPlugin.set(instanceKey, meta)
     }
     const added: string[] = []
     for (const row of rows) {
@@ -479,17 +543,19 @@ export function registerPluginModelDiscovery(
   pluginId: string,
   id: string,
   discover: (...args: unknown[]) => unknown,
+  scope: PluginScope = companyScope(),
 ): () => void {
-  const registration = companyAdapters(companyId).find((row) => row.pluginId === String(pluginId))
+  const instanceKey = pluginInstanceKey(companyId, pluginId, scope)
+  const registration = companyAdapters(companyId).find((row) => row.instanceKey === instanceKey)
   if (!registration) {
     let byPlugin = pendingDiscovery.get(companyId)
     if (!byPlugin) {
       byPlugin = new Map()
       pendingDiscovery.set(companyId, byPlugin)
     }
-    byPlugin.set(String(pluginId), discover)
+    byPlugin.set(instanceKey, discover)
     return () => {
-      if (byPlugin.get(String(pluginId)) === discover) byPlugin.delete(String(pluginId))
+      if (byPlugin.get(instanceKey) === discover) byPlugin.delete(instanceKey)
     }
   }
   const previous = registration.discovery
@@ -503,7 +569,7 @@ export function registerPluginModelDiscovery(
 /** 控制台「刷新模型」：先让插件重新探测，再重读 adapter 的模型目录。 */
 export async function refreshPluginChannel(companyId: string, channelId: string): Promise<number> {
   const registration = companyAdapters(companyId).find((row) =>
-    [...row.routes].some((route) => pluginChannelId(row.pluginId, route) === String(channelId)),
+    [...row.routes].some((route) => pluginChannelId(row.pluginId, route, row.scope) === String(channelId)),
   )
   if (!registration) return 0
   try {
@@ -512,7 +578,9 @@ export async function refreshPluginChannel(companyId: string, channelId: string)
     // 探测失败仍保留旧模型，控制台只显示刷新后的真实数量。
   }
   await refreshAdapter(companyId, registration)
-  return listPluginModels(companyId).filter((model) => model.channelId === String(channelId)).length
+  return listPluginModels(companyId, registration.userId ?? undefined).filter(
+    (model) => model.channelId === String(channelId),
+  ).length
 }
 
 export interface PluginModelSyncResult {
@@ -594,18 +662,32 @@ export function findPluginModel(companyId: string, id: string): PluginModelDefin
  * 插件停用/卸载时立即把它的模型摘掉。host 的 root fiber dispose 是异步的，
  * 单靠 adapter.dispose 可能让下一次模型列表请求仍读到旧模型。
  */
-export function removePluginModelsForPlugin(companyId: string, pluginId: string): void {
+export function removePluginModelsForPlugin(
+  companyId: string,
+  pluginId: string,
+  scope: PluginScope = companyScope(),
+): void {
   const models = companyModels(companyId)
   const targets = companyTargets(companyId)
+  const instanceKey = pluginInstanceKey(companyId, pluginId, scope)
   const removed: string[] = []
   for (const [id, model] of models) {
-    if (model.pluginId === String(pluginId)) {
+    if (model.pluginId === String(pluginId) && model.instanceKey === instanceKey) {
       models.delete(id)
       removed.push(id)
     }
   }
   for (const [id, target] of targets) {
-    if (target.pluginId === String(pluginId)) targets.delete(id)
+    if (target.pluginId === String(pluginId) && target.instanceKey === instanceKey) targets.delete(id)
+  }
+  const registrations = companyAdapters(companyId)
+  const registrationIndex = registrations.findIndex((row) => row.instanceKey === instanceKey)
+  if (registrationIndex >= 0) registrations.splice(registrationIndex, 1)
+  for (const [key] of pendingConfigurable.get(companyId) ?? []) {
+    if (key === instanceKey) pendingConfigurable.get(companyId)?.delete(key)
+  }
+  for (const [key] of pendingDiscovery.get(companyId) ?? []) {
+    if (key === instanceKey) pendingDiscovery.get(companyId)?.delete(key)
   }
   if (removed.length) {
     modelsChangedListener?.(companyId, { added: [], removed, updated: [] })
@@ -686,9 +768,11 @@ export async function callPluginModel(
     model: target.modelId,
     messages: toHarnessMessages(messages),
     tools: options.tools,
+    toolChoice: options.toolChoice,
     maxTokens,
     signal: options.signal,
   }
+  if (options.reasoningEffort) callOptions.reasoningEffort = options.reasoningEffort
   let prepared: unknown = null
   try {
     prepared = adapter.prepareCall ? await adapter.prepareCall(target.provider, target.modelId) : null

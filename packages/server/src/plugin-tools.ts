@@ -12,6 +12,7 @@
 import type { Db } from '@eab/storage'
 import { EC, EabError, SC } from '@eab/domain'
 import { KeyedSemaphore, LockAbortedError, SemaphoreQueueFullError, SemaphoreTimeoutError } from './concurrency.js'
+import { listActorPluginInstances, pluginInstanceKey, type PluginScope } from './plugin-scope.js'
 
 export interface PluginToolActor {
   readonly subject: {
@@ -22,6 +23,10 @@ export interface PluginToolActor {
 }
 
 export interface PluginToolRegistration {
+  /** 实例键：(companyId, pluginId, scope)；同名插件的公司/个人实例互不覆盖。 */
+  readonly instanceKey: string
+  readonly companyId: string
+  readonly scope: PluginScope
   readonly pluginId: string
   readonly name: string
   readonly description: string
@@ -35,8 +40,8 @@ interface PromptEntry {
   readonly text: string | (() => string)
 }
 
-const toolsByPlugin = new Map<string, Map<string, PluginToolRegistration>>()
-const promptsByPlugin = new Map<string, Map<string, PromptEntry>>()
+const toolsByInstance = new Map<string, Map<string, PluginToolRegistration>>()
+const promptsByInstance = new Map<string, Map<string, PromptEntry>>()
 
 /** 插件工具并发上限；按插件隔离，避免一个插件递归/死循环拖垮整个服务。 */
 export const pluginToolSemaphore = new KeyedSemaphore()
@@ -83,16 +88,24 @@ function definitionsOf(nameOrDefinition: unknown, maybeDefinition: unknown): { n
   return null
 }
 
-function ownerOf(name: string): string | null {
-  for (const [pluginId, tools] of toolsByPlugin) {
-    if (tools.has(name)) return pluginId
-  }
-  return null
+function ownerOf(instanceKey: string, name: string): string | null {
+  const tools = toolsByInstance.get(instanceKey)
+  return tools?.has(name) ? instanceKey : null
 }
 
-/** 注册一个插件工具；同名工具先到先得，后注册的返回空 disposer 并由宿主日志提醒 */
+/**
+ * 注册一个插件工具。
+ *
+ * 工具归属到实例而不是插件 id：公司安装和个人安装各自注册自己的工具，
+ * 同名工具在不同实例里可以并存，执行时按当前员工可用的实例选择。
+ */
 export function registerPluginTool(
-  pluginId: string, nameOrDefinition: unknown, maybeDefinition?: unknown,
+  instanceKey: string,
+  companyId: string,
+  pluginId: string,
+  scope: PluginScope,
+  nameOrDefinition: unknown,
+  maybeDefinition?: unknown,
 ): { ok: boolean; name: string; dispose: () => void; reason?: string } {
   const parsed = definitionsOf(nameOrDefinition, maybeDefinition)
   if (!parsed) return { ok: false, name: '', dispose: () => undefined, reason: '工具定义缺少 name' }
@@ -102,12 +115,14 @@ export function registerPluginTool(
   if (typeof definition.execute !== 'function') {
     return { ok: false, name, dispose: () => undefined, reason: '工具缺少 execute()' }
   }
-  const existing = ownerOf(name)
-  if (existing && existing !== pluginId) {
-    return { ok: false, name, dispose: () => undefined, reason: `工具名已被插件 ${existing} 占用` }
+  if (ownerOf(instanceKey, name)) {
+    return { ok: false, name, dispose: () => undefined, reason: '同一插件实例里工具名重复' }
   }
-  const list = toolsByPlugin.get(pluginId) ?? new Map<string, PluginToolRegistration>()
+  const list = toolsByInstance.get(instanceKey) ?? new Map<string, PluginToolRegistration>()
   const registration: PluginToolRegistration = {
+    instanceKey,
+    companyId,
+    scope,
     pluginId,
     name,
     description: String(definition.description ?? definition.title ?? name),
@@ -115,108 +130,87 @@ export function registerPluginTool(
     execute: definition.execute as PluginToolRegistration['execute'],
   }
   list.set(name, registration)
-  toolsByPlugin.set(pluginId, list)
+  toolsByInstance.set(instanceKey, list)
   return {
     ok: true,
     name,
     dispose: () => {
       list.delete(name)
-      if (list.size === 0) toolsByPlugin.delete(pluginId)
+      if (list.size === 0) toolsByInstance.delete(instanceKey)
     },
   }
 }
 
-export function unregisterPluginTool(pluginId: string, name: unknown): void {
+export function unregisterPluginTool(instanceKey: string, name: unknown): void {
   const toolName = safeToolName(name)
-  const list = toolsByPlugin.get(pluginId)
+  const list = toolsByInstance.get(instanceKey)
   if (!list) return
   list.delete(toolName)
-  if (list.size === 0) toolsByPlugin.delete(pluginId)
+  if (list.size === 0) toolsByInstance.delete(instanceKey)
 }
 
 /** 注册插件对系统提示的贡献（如「什么时候该发钉钉卡片」） */
-export function registerPluginPrompt(pluginId: string, entry: unknown): void {
+export function registerPluginPrompt(instanceKey: string, entry: unknown): void {
   if (!entry || typeof entry !== 'object') return
   const raw = entry as Record<string, unknown>
   const name = String(raw.name ?? '').trim()
   const text = raw.text
   if (!name || (typeof text !== 'string' && typeof text !== 'function')) return
-  const list = promptsByPlugin.get(pluginId) ?? new Map<string, PromptEntry>()
+  const list = promptsByInstance.get(instanceKey) ?? new Map<string, PromptEntry>()
   list.set(name, {
     name,
     order: Number.isFinite(Number(raw.order)) ? Number(raw.order) : 100,
     text: text as string | (() => string),
   })
-  promptsByPlugin.set(pluginId, list)
+  promptsByInstance.set(instanceKey, list)
 }
 
-/** 插件卸载/停用/宿主重扫时调用，工具和提示一起摘掉 */
-export function clearPluginContributions(pluginId: string): void {
-  toolsByPlugin.delete(pluginId)
-  promptsByPlugin.delete(pluginId)
-}
-
-function tableExists(db: Db, table: string): boolean {
-  try {
-    const row = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(table) as
-      | { name?: string }
-      | undefined
-    return row?.name === table
-  } catch {
-    return false
-  }
+/** 插件实例卸载/停用/宿主重扫时调用；只摘掉该实例的贡献。 */
+export function clearPluginContributions(instanceKey: string): void {
+  toolsByInstance.delete(instanceKey)
+  promptsByInstance.delete(instanceKey)
 }
 
 /**
- * 当前公司/当前员工真正可用的插件 id：
- * 公司级安装且未卸载、且没有被公司级状态停用；或个人级安装且启用。
- * 任何一边都不要求目录还在——目录被删时 host 已重启，注册项也已被清空。
+ * 当前公司/当前员工真正可用的插件实例：
+ * 公司级安装且未被公司级状态停用；或个人级安装且启用。
+ * 个人实例排在前面：同名插件同时存在公司/个人安装时，个人配置和数据优先。
  */
+function actorInstanceKeys(db: Db, actor: Pick<PluginToolActor, 'subject'>): string[] {
+  const rows = listActorPluginInstances(db, actor.subject.companyId, actor.subject.userId)
+    .sort((a, b) => {
+      const aUser = a.scope.kind === 'user' ? 0 : 1
+      const bUser = b.scope.kind === 'user' ? 0 : 1
+      if (aUser !== bUser) return aUser - bUser
+      return a.pluginId.localeCompare(b.pluginId)
+    })
+  return rows.map((row) => pluginInstanceKey(row.companyId, row.pluginId, row.scope))
+}
+
+/** 兼容旧调用：当前操作者可用的插件 id 集合（不区分实例）。 */
 export function enabledPluginIds(db: Db, actor: Pick<PluginToolActor, 'subject'>): Set<string> {
-  const companyId = actor.subject.companyId
-  const userId = actor.subject.userId
   const ids = new Set<string>()
-  if (!tableExists(db, 'plugin_company_installs')) return ids
-  try {
-    const companyRows = db
-      .prepare(
-        `SELECT pci.plugin_id AS plugin_id
-           FROM plugin_company_installs pci
-          WHERE pci.company_id = ? AND pci.removed_at IS NULL
-            AND NOT EXISTS (
-              SELECT 1 FROM plugin_states ps
-               WHERE ps.company_id = pci.company_id AND ps.plugin_id = pci.plugin_id AND ps.enabled = 0
-            )`,
-      )
-      .all(companyId) as unknown as Array<{ plugin_id: string }>
-    for (const row of companyRows) if (row.plugin_id) ids.add(row.plugin_id)
-    if (tableExists(db, 'plugin_user_installs')) {
-      const userRows = db
-        .prepare(
-          `SELECT pui.plugin_id AS plugin_id FROM plugin_user_installs pui
-            WHERE pui.company_id = ? AND pui.user_id = ? AND pui.removed_at IS NULL AND pui.enabled = 1
-              AND NOT EXISTS (
-                SELECT 1 FROM plugin_states ps
-                 WHERE ps.company_id = pui.company_id AND ps.plugin_id = pui.plugin_id AND ps.enabled = 0
-              )`,
-        )
-        .all(companyId, userId) as unknown as Array<{ plugin_id: string }>
-      for (const row of userRows) if (row.plugin_id) ids.add(row.plugin_id)
-    }
-  } catch {
-    return ids
+  for (const row of listActorPluginInstances(db, actor.subject.companyId, actor.subject.userId)) {
+    ids.add(row.pluginId)
   }
   return ids
 }
 
 export function pluginToolSpecsFor(db: Db, actor: PluginToolActor): Array<Record<string, unknown>> {
+  // 可见性策略：
+  // - 个人实例只属于安装人：actorInstanceKeys 只并入当前 userId 的个人实例；
+  // - 公司实例属于当前公司，但仍要求角色具备 `agent:tool:invoke`；
+  // - 内置工具的可见性由 routes/tools.ts 按各工具自己的 scope 逐项判断。
   if (!actor.subject.scopes.has(SC.AGENT_TOOL_INVOKE)) return []
-  const enabled = enabledPluginIds(db, actor)
   const specs: Array<Record<string, unknown>> = []
-  for (const pluginId of enabled) {
-    const tools = toolsByPlugin.get(pluginId)
+  const seen = new Set<string>()
+  for (const instanceKey of actorInstanceKeys(db, actor)) {
+    const tools = toolsByInstance.get(instanceKey)
     if (!tools) continue
     for (const tool of tools.values()) {
+      // 公司和个人实例可能暴露同名工具；function 名不能重复，个人实例先入列。
+      if (seen.has(tool.name)) continue
+      seen.add(tool.name)
       specs.push({
         type: 'function',
         function: {
@@ -230,14 +224,13 @@ export function pluginToolSpecsFor(db: Db, actor: PluginToolActor): Array<Record
   return specs
 }
 
-/** 按模型给出的 function 名找当前员工可用的插件工具；重名/停用/未安装一律找不到 */
+/** 按模型给出的 function 名找当前员工可用的插件工具；优先本人实例，再公司实例 */
 export function resolvePluginToolForActor(
   db: Db, actor: PluginToolActor, functionName: string,
 ): PluginToolRegistration | null {
   if (!actor.subject.scopes.has(SC.AGENT_TOOL_INVOKE)) return null
-  const enabled = enabledPluginIds(db, actor)
-  for (const pluginId of enabled) {
-    const tool = toolsByPlugin.get(pluginId)?.get(functionName)
+  for (const instanceKey of actorInstanceKeys(db, actor)) {
+    const tool = toolsByInstance.get(instanceKey)?.get(functionName)
     if (tool) return tool
   }
   return null
@@ -253,7 +246,7 @@ export async function executePluginTool(
   const timeoutMs = Math.max(1, options.timeoutMs ?? 60_000)
   let release: (() => void) | null = null
   try {
-    release = await pluginToolSemaphore.acquire(tool.pluginId, {
+    release = await pluginToolSemaphore.acquire(tool.instanceKey, {
       limit: maxConcurrent,
       queueLimit: 50,
       timeoutMs: 30_000,
@@ -292,10 +285,9 @@ export async function executePluginTool(
 /** 插件给系统提示的贡献；执行时会实时调用 text()，拿到插件当前配置 */
 export function pluginPromptTexts(db: Db, actor: PluginToolActor): string[] {
   if (!actor.subject.scopes.has(SC.AGENT_TOOL_INVOKE)) return []
-  const enabled = enabledPluginIds(db, actor)
   const entries: Array<{ order: number; name: string; text: string }> = []
-  for (const pluginId of enabled) {
-    const prompts = promptsByPlugin.get(pluginId)
+  for (const instanceKey of actorInstanceKeys(db, actor)) {
+    const prompts = promptsByInstance.get(instanceKey)
     if (!prompts) continue
     for (const entry of prompts.values()) {
       let text = ''
@@ -310,8 +302,12 @@ export function pluginPromptTexts(db: Db, actor: PluginToolActor): string[] {
   return entries.sort((a, b) => a.order - b.order || a.name.localeCompare(b.name)).map((entry) => entry.text)
 }
 
-/** 控制台「工具」页可展示的插件工具清单 */
-export function pluginToolCatalogFor(db: Db, actor: PluginToolActor): Array<{
+/** 控制台「工具」页可展示的插件工具清单；可按实例类型只看个人或公司 */
+export function pluginToolCatalogFor(
+  db: Db,
+  actor: PluginToolActor,
+  options: { scope?: 'company' | 'user' } = {},
+): Array<{
   id: string
   pluginId: string
   name: string
@@ -319,7 +315,6 @@ export function pluginToolCatalogFor(db: Db, actor: PluginToolActor): Array<{
   available: boolean
   input: Record<string, unknown>
 }> {
-  const enabled = enabledPluginIds(db, actor)
   const rows: Array<{
     id: string
     pluginId: string
@@ -328,13 +323,14 @@ export function pluginToolCatalogFor(db: Db, actor: PluginToolActor): Array<{
     available: boolean
     input: Record<string, unknown>
   }> = []
-  for (const pluginId of enabled) {
-    const tools = toolsByPlugin.get(pluginId)
+  for (const instanceKey of actorInstanceKeys(db, actor)) {
+    const tools = toolsByInstance.get(instanceKey)
     if (!tools) continue
     for (const tool of tools.values()) {
+      if (options.scope && tool.scope.kind !== options.scope) continue
       rows.push({
-        id: `plugin:${pluginId}:${tool.name}`,
-        pluginId,
+        id: `plugin:${tool.instanceKey}:${tool.name}`,
+        pluginId: tool.pluginId,
         name: tool.name,
         description: tool.description,
         available: actor.subject.scopes.has(SC.AGENT_TOOL_INVOKE),

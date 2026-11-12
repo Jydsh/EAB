@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { SC } from '@eab/domain'
 import { migrate, openDatabase } from '@eab/storage'
-import { isModelHealthy } from '../src/model-health.js'
+import { isModelHealthy, preferredModelId, sortModelsForChat } from '../src/model-health.js'
 import { listPluginModels, registerPluginAdapter } from '../src/plugin-models.js'
 import { runAgentTurn } from '../src/routes/chat.js'
 
@@ -105,6 +105,10 @@ describe('对话模型故障转移', () => {
       expect(events[0]?.toModelId).toBe(goodId)
       expect(isModelHealthy(COMPANY, badId)).toBe(false)
       expect(isModelHealthy(COMPANY, goodId)).toBe(true)
+      // 下一轮自动模式应直接走刚刚接替成功的模型，而不是再撞一遍坏模型。
+      expect(preferredModelId(COMPANY)).toBe(goodId)
+      expect(sortModelsForChat(COMPANY, [{ id: badId }, { id: goodId }]).map((model) => model.id))
+        .toEqual([goodId, badId])
     } finally {
       registration.dispose()
       d.db.close()
