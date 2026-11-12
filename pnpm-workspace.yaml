@@ -6,3 +6,5 @@ packages:
 # 否则 vitest 起不来，而报错信息只说 "Ignored build scripts"。
 allowBuilds:
   esbuild: true
+  # 飞书长连接 SDK 的 protobuf 运行时需要在安装时生成/校验代码
+  protobufjs: true

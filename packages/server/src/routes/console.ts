@@ -2999,6 +2999,15 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
     const dingTalkStream = await import('../dingtalk-bot.js')
       .then((bot) => bot.dingTalkStreamStatus())
       .catch(() => null)
+    // 飞书也是主动连开放平台的长连接；绑定成功但事件订阅/权限没配时，
+    // 控制台必须能看到“已连接但 0 条事件”，而不是只显示已绑定。
+    const feishuBot = await import('../feishu-bot.js').catch(() => null)
+    const feishuStream = feishuBot?.feishuStreamStatus() ?? null
+    // 动态读取开放平台真实订阅/权限，长连接正常也不代表会收到消息事件。
+    const feishuCheck =
+      feishuBot && rows.some((row) => row.provider === 'feishu' && row.enabled && row.status === 'bound')
+        ? await feishuBot.checkFeishuSetup(deps).catch(() => null)
+        : null
     return ok({
       organization,
       channels: ['feishu', 'dingtalk', 'wecom'].map((provider) => {
@@ -3019,7 +3028,8 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
           bound: Boolean(row?.tenant_id),
           callbackPath: `/api/channel/webhooks/${provider}`,
           callbackToken: row?.callback_token ?? '',
-          stream: provider === 'dingtalk' ? dingTalkStream : null,
+          stream: provider === 'dingtalk' ? dingTalkStream : provider === 'feishu' ? feishuStream : null,
+          feishuCheck: provider === 'feishu' ? feishuCheck : null,
         }
       }),
     })
@@ -3044,11 +3054,18 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
 
     const existing = deps.db
       .prepare(
-        `SELECT id, secret_ref, webhook_secret_ref, callback_token, enabled
+        `SELECT id, secret_ref, webhook_secret_ref, callback_token, enabled, status
            FROM channel_configs WHERE company_id = ? AND provider = ?`,
       )
       .get(companyId, provider) as
-      | { id: string; secret_ref: string | null; webhook_secret_ref: string | null; callback_token: string | null; enabled: number }
+      | {
+          id: string
+          secret_ref: string | null
+          webhook_secret_ref: string | null
+          callback_token: string | null
+          enabled: number
+          status: string
+        }
       | undefined
 
     const appId = String(req.body?.appId ?? '').trim().slice(0, 120)
@@ -3078,7 +3095,10 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
     const callbackToken = existing?.callback_token ?? randomUUID().replace(/-/g, '')
     const enabled = req.body?.enabled === undefined ? Boolean(existing?.enabled) : req.body.enabled
     const configured = Boolean(appId || webhookUrl)
-    const status = configured ? 'configured' : 'unconfigured'
+    // 已绑定的渠道改 AppSecret 时不能把 status 退回 configured，
+    // 否则飞书/钉钉长连接会因“未绑定”直接停掉。
+    const status =
+      existing?.status === 'bound' ? 'bound' : configured ? 'configured' : 'unconfigured'
     const now = Date.now()
     const id = existing?.id ?? `ch_${randomUUID()}`
 
@@ -3127,6 +3147,13 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
           now,
           now,
         )
+    }
+
+    if (provider === 'feishu') {
+      // 改 App ID/Secret 后不重启进程也能切换长连接；失败不阻塞保存结果。
+      void import('../feishu-bot.js')
+        .then((bot) => bot.refreshFeishuStream(deps))
+        .catch((error) => console.warn('[eab] 保存飞书配置后启动长连接失败：', (error as Error).message))
     }
 
     return ok({
@@ -3404,6 +3431,11 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
           now,
           existing.id,
         )
+      if (input.provider === 'feishu') {
+        void import('../feishu-bot.js')
+          .then((bot) => bot.refreshFeishuStream(deps))
+          .catch((error) => console.warn('[eab] 飞书绑定后启动长连接失败：', (error as Error).message))
+      }
       return
     }
     deps.db
@@ -3433,6 +3465,11 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
         now,
         now,
       )
+    if (input.provider === 'feishu') {
+      void import('../feishu-bot.js')
+        .then((bot) => bot.refreshFeishuStream(deps))
+        .catch((error) => console.warn('[eab] 飞书绑定后启动长连接失败：', (error as Error).message))
+    }
   }
 
   const dshImAvailable = (companyId: string): boolean => {
@@ -4473,12 +4510,28 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
       }
 
       if (provider === 'feishu') {
+        /**
+         * 飞书要求回调 3 秒内返回，模型回答不能在这里同步等；
+         * 先 ack，再后台复用长连接同一份 handleFeishuEvent 处理并用开放平台 API 回复。
+         */
+        void import('../feishu-bot.js')
+          .then((bot) =>
+            bot.handleFeishuEvent(deps, body as never, {
+              eventKey,
+              eventRecorded: true,
+              skipRateLimit: true,
+            }),
+          )
+          .catch((error) => console.warn('[eab] 飞书回调处理失败：', (error as Error).message))
         return ok({
           received: true,
-          replied: false,
+          queued: true,
+          replied: 'async',
           bound: Boolean(binding),
           senderId: senderId || null,
-          note: binding ? '飞书消息事件已接收（已绑定成员）' : '飞书消息事件已接收；发送者未绑定 EAB 账号',
+          note: binding
+            ? '飞书消息事件已接收，正在后台生成回复'
+            : '飞书消息事件已接收；发送者未绑定 EAB 账号，若公司没有飞书通讯录会自动建立访客身份',
         })
       }
 

@@ -12,6 +12,7 @@ import type { FastifyInstance } from 'fastify'
 import { migrate, openDatabase } from '@eab/storage'
 import { buildApp } from './app.js'
 import { refreshDingTalkStream, startDingTalkStreamMonitor, stopDingTalkStream } from './dingtalk-bot.js'
+import { refreshFeishuStream, startFeishuStreamMonitor, stopFeishuStream } from './feishu-bot.js'
 import { cleanupTemp } from './routes/workspace.js'
 import { loadConfig } from './config.js'
 import { COMPANY_ID, COMPANY_NAME, ensureDemoData, ensureDemoPasswords, ensureModelCatalog } from './dev-seed.js'
@@ -285,12 +286,23 @@ void refreshDingTalkStream(deps).catch((error) => {
 /** 每 30 秒巡检一次：密钥缺失、网关断开、客户端卡死都要在控制台可见并自动重建。 */
 const stopDingTalkStreamMonitor = startDingTalkStreamMonitor(deps)
 
+/**
+ * 飞书同理：本地没有公网回调，默认用长连接接收 im.message.receive_v1；
+ * 飞书渠道独立巡检，不能因为钉钉正常就跳过飞书。
+ */
+void refreshFeishuStream(deps).catch((error) => {
+  console.warn('[eab] 飞书长连接启动失败：', (error as Error).message)
+})
+const stopFeishuStreamMonitor = startFeishuStreamMonitor(deps)
+
 async function shutdown(): Promise<void> {
   stopScheduleWorker()
   stopModelHealthMonitor()
   stopPluginModelCatalogSync()
   stopDingTalkStreamMonitor()
   stopDingTalkStream()
+  stopFeishuStreamMonitor()
+  stopFeishuStream()
   await closeApps(apps)
   processLock.release()
   db.close()

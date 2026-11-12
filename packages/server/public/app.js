@@ -7559,21 +7559,58 @@ function channelConfigCard(item, options = {}) {
           ? '仅配置了 Webhook'
           : '待配置'
   const stream = item.stream
-  const streamOk = Boolean(stream?.running && stream.connected && stream.registered)
+  const isFeishu = item.provider === 'feishu'
+  const streamOk = Boolean(stream?.running && stream.connected && (isFeishu || stream.registered))
   const streamBadge = stream
     ? streamOk
-      ? '<span class="pill ok">Stream 已连接</span>'
-      : '<span class="pill warn">Stream 未连接</span>'
+      ? `<span class="pill ok">${isFeishu ? '长连接已连接' : 'Stream 已连接'}</span>`
+      : `<span class="pill warn">${isFeishu ? '长连接未连接' : 'Stream 未连接'}</span>`
     : ''
   const streamNote =
     stream && !streamOk
       ? `<div class="channel-stream-note">${esc(
           stream.error ||
             (stream.running
-              ? '钉钉 Stream 正在建立连接；若持续未连接，请检查网络或重新保存 AppSecret。'
-              : '钉钉 Stream 未运行；手机消息暂时不会进入 EAB。'),
+              ? isFeishu
+                ? '飞书长连接正在建立；若持续未连接，请检查 App ID/App Secret、网络和飞书应用是否已发布。'
+                : '钉钉 Stream 正在建立连接；若持续未连接，请检查网络或重新保存 AppSecret。'
+              : isFeishu
+                ? '飞书长连接未运行；手机消息暂时不会进入 EAB。'
+                : '钉钉 Stream 未运行；手机消息暂时不会进入 EAB。'),
         )}</div>`
       : ''
+  const feishuEventNote =
+    isFeishu && stream?.connected && !stream?.lastEventAt
+      ? `<div class="inline-note" style="margin-top:8px">飞书长连接已连上，但 EAB 还没收到任何消息事件。请在飞书开放平台确认已订阅 <code>im.message.receive_v1</code>，并给应用开通机器人能力与发消息权限。</div>`
+      : ''
+  const feishuGuide = isFeishu
+    ? `<div class="inline-note" style="margin-top:8px">
+        <strong>飞书接入检查清单</strong>
+        <ul style="margin:6px 0 0 18px;padding:0">
+          <li>应用能力：已开启「机器人」；应用版本已发布，可用范围包含你当前使用的账号。</li>
+          <li>事件订阅：已订阅 <code>im.message.receive_v1</code>；事件接收方式选「长连接」（本机部署无需公网地址）。</li>
+          <li>权限：<code>im:message</code>（获取与发送消息）或 <code>im:message:send_as_bot</code>（以机器人身份发消息）；图片/文件再加 <code>im:resource</code>。</li>
+          <li>群聊：需要机器人被 @ 才会回复；单聊无需 @。</li>
+        </ul>
+      </div>`
+    : ''
+  const feishuCheck = item.feishuCheck
+  const feishuCheckNote = isFeishu && feishuCheck
+    ? `<div class="inline-note" style="margin-top:8px;border-left:3px solid ${
+        feishuCheck.ok ? 'var(--ok, #12805c)' : 'var(--warn, #b45309)'
+      };padding-left:10px">
+        <strong>飞书自检 · ${feishuCheck.ok ? '通过' : '发现问题'}</strong>
+        ${
+          feishuCheck.error
+            ? `<div style="margin-top:4px">${esc(feishuCheck.error)}</div>`
+            : feishuCheck.issues?.length
+              ? `<ul style="margin:6px 0 0 18px;padding:0">${feishuCheck.issues
+                  .map((issue) => `<li>${esc(issue)}</li>`)
+                  .join('')}</ul>`
+              : '<div style="margin-top:4px">已订阅消息事件，收消息/发消息权限齐全，长连接可用。</div>'
+        }
+      </div>`
+    : ''
   const badges = [
     item.appId
       ? `<span class="pill ok">应用凭证</span>`
@@ -7606,7 +7643,7 @@ function channelConfigCard(item, options = {}) {
       <span class="pill ${missingSecret ? 'warn' : bound || configured ? 'ok' : 'warn'}">${topState}</span>
     </div>
     <div class="channel-flags">${badges}</div>
-    ${streamNote}
+    ${streamNote}${feishuEventNote}${feishuCheckNote}${feishuGuide}
     <dl class="channel-fields">
       <div><dt>App ID</dt><dd>${esc(item.appId || '—')}</dd></div>
       <div><dt>Agent ID</dt><dd>${esc(item.agentId || '—')}</dd></div>

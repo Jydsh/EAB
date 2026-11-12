@@ -711,7 +711,7 @@ export function historyOf(
   db: Db,
   sessionId: string,
   limit = 16,
-  onlyChannel?: 'web' | 'dingtalk',
+  onlyChannel?: 'web' | 'dingtalk' | 'feishu' | 'wecom',
 ): Array<{ role: 'user' | 'assistant'; content: string }> {
   // 钉钉侧只回放钉钉来源消息，避免网页里补问的内容被当成钉钉上下文；
   // 网页侧不传 onlyChannel，仍能看到完整会话（含钉钉消息）。
