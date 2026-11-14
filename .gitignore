@@ -13,3 +13,4 @@ console-*.png
 chat-*.png
 .DS_Store
 Thumbs.db
+*.tsbuildinfo
