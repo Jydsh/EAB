@@ -6,7 +6,9 @@ import {
   listAgentRuns,
   recordAgentStep,
   startAgentRun,
+  sweepOrphanAgentRuns,
 } from '../src/agent-runtime.js'
+import { isRunAlive } from '../src/backends/coordination.js'
 
 function db() {
   const database = openDatabase({ path: ':memory:' })
@@ -90,5 +92,30 @@ describe('Agent 运行树', () => {
     const runs = listAgentRuns(database, 'c1')
     expect(runs.find((run) => run.id === parent.id)?.status).toBe('cancelled')
     expect(runs.find((run) => run.id === child.id)?.status).toBe('cancelled')
+  })
+
+  it('启动清理只回收没有心跳的僵尸 run，活着的 run 不动', async () => {
+    const database = db()
+    // 模拟上次进程异常退出遗留：库里是 running，但没有心跳
+    database
+      .prepare(
+        `INSERT INTO agent_runs
+          (id, company_id, user_id, agent_id, status, spent_tokens, started_at, created_at)
+         VALUES ('zombie-run', 'c1', 'u1', 'eab-main', 'running', 0, ?, ?)`,
+      )
+      .run(Date.now() - 3_600_000, Date.now() - 3_600_000)
+
+    const live = startAgentRun(database, { ...base, id: 'live-run' })
+    expect(await isRunAlive('live-run')).toBe(true)
+
+    const swept = await sweepOrphanAgentRuns(database)
+    expect(swept).toBe(1)
+
+    const rows = database
+      .prepare(`SELECT id, status FROM agent_runs ORDER BY id`)
+      .all() as unknown as Array<{ id: string; status: string }>
+    expect(rows.find((row) => row.id === 'zombie-run')?.status).toBe('cancelled')
+    expect(rows.find((row) => row.id === 'live-run')?.status).toBe('running')
+    live.finish('succeeded')
   })
 })

@@ -1,4 +1,4 @@
-/*
+﻿/*
  * 员工工作台（对话页）。
  *
  * 产品口径（12.7）：员工只对话。身份来自登录（开发期用 ?as= 预览），模型只列有权用的。
@@ -74,9 +74,41 @@ function isAnswerBlockStart(lines, index) {
   return false
 }
 
+/** 归一化代码块内容，用于识别“文件正文被重复贴进回复”的情况。 */
+function normalizeAnswerCodeBlock(value, alreadyEscaped = false) {
+  const text = String(value ?? '').replace(/\r\n?/g, '\n')
+  return (alreadyEscaped ? text : esc(text)).replace(/^\n+|\n+$/g, '').trim()
+}
+
+/** 去掉“内容如下：”这类只为引出被隐藏文件正文的尾句，避免气泡里留下空引子。 */
+function trimFileContentCodeLeadIn(html) {
+  const trimmed = html.replace(
+    /(?:，|,)?\s*(?:文件)?(?:内容|正文)(?:如下|为|是)?\s*[：:]?(<\/p>)$/,
+    '。$1',
+  )
+  return /^<p>\s*(?:。)?\s*<\/p>$/.test(trimmed) ? '' : trimmed
+}
+
+/** 写入成功的工作区文件正文；消息气泡里的同名代码块由顶部吊顶卡/文件预览承担，不再重复展示。 */
+function writtenFileContentBlocks(tools) {
+  const blocks = new Set()
+  for (const trace of Array.isArray(tools) ? tools : []) {
+    if (String(trace?.toolId || '') !== 'workspace.write') continue
+    if (String(trace?.status || '') !== 'done') continue
+    const args = trace?.args
+    if (!args || typeof args !== 'object') continue
+    for (const key of ['content', 'text', 'body', 'data']) {
+      const value = args[key]
+      if (typeof value === 'string' && value.trim()) blocks.add(normalizeAnswerCodeBlock(value))
+    }
+  }
+  return blocks
+}
+
 /** Markdown：标题、列表、表格、引用、分隔线、代码块、行内代码、加粗、斜体、链接。 */
-function renderAnswer(text) {
+function renderAnswer(text, options = {}) {
   const source = esc(String(text ?? '').replace(/\r\n?/g, '\n'))
+  const omitCodeBlocks = options.omitCodeBlocks instanceof Set ? options.omitCodeBlocks : null
   const codeBlocks = []
   const body = source.replace(/```[^\n]*\n?([\s\S]*?)```/g, (_, code) => {
     const index = codeBlocks.length
@@ -96,6 +128,15 @@ function renderAnswer(text) {
     const codeMatch = /^\u0000CODE(\d+)\u0000$/.exec(line.trim())
     if (codeMatch) {
       const code = codeBlocks[Number(codeMatch[1])] ?? ''
+      if (omitCodeBlocks && omitCodeBlocks.has(normalizeAnswerCodeBlock(code, true))) {
+        if (output.length) {
+          const trimmed = trimFileContentCodeLeadIn(output[output.length - 1])
+          if (trimmed) output[output.length - 1] = trimmed
+          else output.pop()
+        }
+        index += 1
+        continue
+      }
       output.push(`<pre class="answer-code">${code}</pre>`)
       index += 1
       continue
@@ -209,6 +250,32 @@ function banner(message, tone = 'ok') {
   window.setTimeout(() => el.remove(), 3200)
 }
 
+let loginRedirectStarted = false
+
+function isAuthProbePath(path) {
+  const raw = String(path || '')
+  return raw.startsWith('/api/auth/') || raw.startsWith('/api/dev/personas')
+}
+
+/**
+ * 员工会话缺失或过期：不再把 401 交给页面提示，直接回到登录页。
+ * 保留 company，去掉可能失效的 as，避免重新进入预览身份。
+ */
+function redirectToLogin() {
+  if (loginRedirectStarted) return
+  loginRedirectStarted = true
+  const params = new URLSearchParams()
+  const company = new URLSearchParams(location.search).get('company')
+  if (company) params.set('company', company)
+  params.set('login', '1')
+  location.replace(`/chat?${params.toString()}`)
+}
+
+/** 返回一个永不结束的 Promise：跳转已发起，调用方不应再显示错误或弹提示。 */
+function waitForLoginRedirect() {
+  return new Promise(() => {})
+}
+
 async function api(path, options) {
   const response = await fetch(path, options)
   const payload = await response.json().catch(() => null)
@@ -219,6 +286,10 @@ async function api(path, options) {
     err.hint = payload && (payload.error?.hint || payload.hint)
     err.traceId = payload && (payload.error?.traceId || payload.traceId)
     err.status = response.status
+    if (response.status === 401 && !isAuthProbePath(path)) {
+      redirectToLogin()
+      return waitForLoginRedirect()
+    }
     throw err
   }
   return payload.data
@@ -255,8 +326,10 @@ const state = {
   localLiveMessageIds: new Set(),
   /** 当前等待用户在底部输入区选择方向的澄清请求 */
   pendingClarify: null,
-  /** 多页引导式澄清的当前流程：同一个流程内选择只续跑 Agent，不生成用户消息 */
+  /** 多页引导式澄清的当前流程：复用同一条 AI 消息继续推进，不新增用户气泡 */
   clarifyFlow: null,
+  /** 右键“编辑后重发”暂存的消息；下一次发送会先回退并替换它 */
+  messageEdit: null,
   liveEventSource: null,
   sessionRefreshTimer: 0,
   files: [],
@@ -267,15 +340,51 @@ const state = {
   pluginSelected: null,
   pluginTab: 'overview',
   pluginPageKey: null,
+  workspaceKind: 'plugins',
+  skills: [],
+  skillData: null,
+  skillSelected: null,
   mode: 'chat',
   /** 当前实际停留的界面：chat / workspace / settings，刷新后恢复 */
   view: 'chat',
   filePreview: null,
+  /** 当前对话回合的子 Agent 团队；key 为 childId，同一子 Agent 复用同一窗口 */
+  agentRuns: new Map(),
+  /** 父 Agent 名称，用于团队标题 */
+  agentParentName: '',
+  /** 当前回合的根 run */
+  agentParentRunId: '',
+  /** 团队列表里被选中、详情窗口正在展示的子 Agent */
+  agentSelectedId: '',
+  /** 右侧工作台当前面板：team / file */
+  workbenchTab: 'team',
+  /** 团队与文件是否并排显示 */
+  workbenchSplit: false,
+  /** 顶部吊顶卡片当前跟踪的文件操作；不随 AI 气泡销毁，整个会话内保留。 */
+  fileActivity: null,
+  fileDockClosed: false,
+  /** 本轮对话结束后，吊顶卡不再常驻，避免和最终回答抢注意力。 */
+  fileDockSettled: false,
+  /** 右侧文件预览打开时，顶部吊顶卡让位给预览；关闭预览后恢复。 */
+  fileDockPreviewSuppressed: false,
+  previewSelection: null,
 }
 
 const HISTORY_PAGE_SIZE = 10
 const HISTORY_TOP_THRESHOLD = 120
-const SCROLL_BOTTOM_THRESHOLD = 180
+const SCROLL_STICK_THRESHOLD = 8
+const SIDEBAR_COLLAPSED_KEY = 'eab.chat.sidebarCollapsed'
+const FILE_SPLIT_RATIO_KEY = 'eab.chat.fileSplitRatio'
+/** 右栏（Agent 团队 / 文件）与对话之间的宽度比例，独立于文件预览记住 */
+const TEAM_SPLIT_RATIO_KEY = 'eab.chat.teamSplitRatio'
+const TEAM_LIST_WIDTH_KEY = 'eab.chat.teamListWidth'
+const SIDE_SECTION_RATIO_KEY = 'eab.chat.sideSectionRatio'
+/** 用户主动上滚后，流式输出不再抢滚动；滚回触底附近才恢复跟随。 */
+let threadScrollPinned = true
+let threadScrollLastTop = 0
+let threadHasNewBelow = false
+/** 引导问题等待用户选择的最长时间；超时自动采用第一个方向。 */
+const CLARIFY_AUTO_SELECT_MS = 180000
 const DEFAULT_INPUT_PLACEHOLDER = '输入消息，Enter 发送，Shift + Enter 换行；/model 切换模型'
 const CHAT_LOCATION_STORAGE_KEY = 'eab.chat.location.v1'
 
@@ -416,7 +525,6 @@ function showLogin() {
     if (node) node.hidden = true
   }
   $('#composer-box').style.display = 'none'
-  $('#composer-foot').textContent = '登录后可开始对话'
 }
 
 async function renderLogin() {
@@ -453,6 +561,7 @@ async function doLogin(event) {
 
 function resetThread() {
   clearClarifyDock({ abort: true })
+  clearFileActivity()
   const thread = $('#thread')
   for (const child of [...thread.children]) {
     if (child.id !== 'chat-empty') child.remove()
@@ -480,12 +589,26 @@ function markSessionActive(sessionId) {
   state.sessions = sortSessionsByRecent(state.sessions)
 }
 
+/**
+ * 会话是否仍在生成。当前页看 runtime，其它页看服务端运行快照；
+ * 两者都覆盖后才能让左侧列表在切页/后台回复时保持同步。
+ */
+function sessionIsRunning(sessionId) {
+  const runtime = state.runtimes.get(runtimeKey(sessionId))
+  if (runtime?.sending) return true
+  for (const snapshot of state.activeRunSnapshots.values()) {
+    if (snapshot.sessionId === sessionId && snapshot.status === 'running') return true
+  }
+  return false
+}
+
 function renderSessions() {
   const box = $('#session-list')
   const sessions = sortSessionsByRecent(state.sessions)
   $('#side-sessions').hidden = sessions.length === 0 && !state.me
   if (sessions.length === 0) {
     box.innerHTML = '<div class="side-session-empty">还没有对话</div>'
+    syncSideSectionSplit()
     return
   }
   box.innerHTML = sessions
@@ -493,11 +616,14 @@ function renderSessions() {
       // 左侧已经有「钉钉」来源徽标，标题里不再重复前缀。
       const displayTitle =
         session.source === 'dingtalk' ? String(session.title || '').replace(/^钉钉\s*·\s*/, '') : session.title
+      const running = sessionIsRunning(session.id)
       return `<div class="side-session ${session.id === state.sessionId ? 'active' : ''}" data-session="${esc(session.id)}">
         <button class="side-session-main" type="button" data-open="${esc(session.id)}" title="${esc(session.title)}">${
-          session.unread && session.id !== state.sessionId
-            ? '<span class="side-session-unread" aria-label="有新的回复"></span>'
-            : ''
+          running
+            ? '<span class="side-session-running" role="status" aria-label="正在回复" title="正在回复"></span>'
+            : session.unread && session.id !== state.sessionId
+              ? '<span class="side-session-unread" aria-label="有新的回复" title="有新的回复"></span>'
+              : ''
         }${
           session.source === 'dingtalk' ? '<span class="side-session-source">钉钉</span>' : ''
         }${esc(displayTitle)}</button>
@@ -520,6 +646,7 @@ function renderSessions() {
       showSessionMenu(row.dataset.session, row.getBoundingClientRect())
     })
   }
+  syncSideSectionSplit()
 }
 
 async function loadSessions() {
@@ -532,18 +659,64 @@ async function loadSessions() {
   renderSessions()
 }
 
+/** 同一 messageId 的后续结果：更新原气泡，而不是再追加一条。 */
+function updateKnownMessage(message, sessionId) {
+  if (!message || !message.id) return false
+  const id = String(message.id)
+  const thread = $('#thread')
+  if (!thread) return false
+  const node = Array.from(thread.querySelectorAll('.msg')).find((item) => item.dataset.messageId === id)
+  if (!node) return false
+  const role = message.role === 'user' ? 'me' : 'ai'
+  node.chatMessage = {
+    id,
+    role: message.role,
+    text: String(message.text || ''),
+    createdAt: message.createdAt || new Date().toISOString(),
+  }
+  setMessageTime(node, message.createdAt)
+  const bubble = node.querySelector('.bubble')
+  if (!bubble) return false
+  if (role === 'me') {
+    bubble.textContent = String(message.text || '')
+  } else {
+    bubble.innerHTML = historyAiBubble(
+      String(message.text || ''),
+      message.modelName || '',
+      message.meta || {},
+      {
+        createdAt: message.createdAt,
+        messageId: id,
+        channel: message.meta?.channel,
+      },
+    )
+    bindToolToggles(node)
+  }
+  refreshMessageActions(node)
+  syncMessageActionAvailability()
+  queueScrollBottomButtonUpdate()
+  return true
+}
+
 /** 钉钉侧刚写入的消息：同一会话就追加到当前对话，其它会话只更新左侧列表。 */
 function appendLiveMessage(message, sessionId) {
   if (!message || (message.role !== 'user' && message.role !== 'assistant')) return
   const id = String(message.id || '')
-  if (!id || state.historyMessageIds.has(id)) return
+  if (!id) return
+  // 引导续跑复用原 assistant 消息 ID：已渲染过就就地替换正文/思考/工具，不再长新气泡。
+  if (updateKnownMessage(message, sessionId)) return
+  if (state.localLiveMessageIds.has(id)) return
+  // 当前页面正在接收本地 SSE 的这一轮：最终消息由本地 turn 收尾，避免再叠加一条。
+  if (message.role === 'assistant' && sessionId && sessionId === state.sessionId) {
+    const runtime = runtimeFor(sessionId)
+    if (runtime.sending) return
+  }
   state.historyMessageIds.add(id)
+  // 多页引导的中间选择/追问只用于续跑，不进入聊天消息流。
   if (isHiddenClarifyStep(message)) return
 
   const thread = $('#thread')
-  const follow = thread
-    ? thread.scrollHeight - thread.scrollTop - thread.clientHeight <= SCROLL_BOTTOM_THRESHOLD + 40
-    : false
+  const follow = Boolean(thread && threadScrollPinned)
   const messageClarify =
     message.role === 'assistant' && message.meta?.clarify && typeof message.meta.clarify === 'object'
       ? message.meta.clarify
@@ -554,11 +727,12 @@ function appendLiveMessage(message, sessionId) {
     message.role === 'assistant' && message.modelName ? message.modelName : undefined,
     message.meta && message.meta.attachments,
     message.role === 'assistant' ? message.meta : undefined,
-    { scroll: false, messageId: id, channel: message.meta?.channel, pendingClarify: Boolean(messageClarify) },
+    { scroll: false, messageId: id, channel: message.meta?.channel, pendingClarify: Boolean(messageClarify), createdAt: message.createdAt },
   )
   if (message.role === 'user') clearClarifyDock()
-  else if (messageClarify) showClarifyDock(messageClarify, { flowMeta: message.meta })
+  else if (messageClarify) showClarifyDock(messageClarify, { flowMeta: message.meta, auto: true })
   if (follow) scrollThreadToBottomInstant()
+  else markThreadNewContent()
   if (sessionId && sessionId === state.sessionId) scheduleSessionRefresh()
 }
 
@@ -597,12 +771,20 @@ function runSnapshotOf(payload) {
 function liveTurnForSnapshot(snapshot, options = {}) {
   if (!snapshot?.messageId) return null
   let entry = state.liveTurns.get(snapshot.messageId)
+  if (!entry && state.historyMessageIds.has(snapshot.messageId)) {
+    // 该消息已经落库并渲染，迟到的运行快照不能再长出一个空节点。
+    return null
+  }
   if (!entry) {
     // 同一个会话可能已经由 POST 流创建了气泡；优先复用 runtime.turn，
     // 避免 EventSource 的增量画到一个隐藏节点上，页面一直停在“正在思考…”。
     const runtime = state.runtimes.get(runtimeKey(snapshot.sessionId))
     const reuseTurn =
-      runtime?.messageId === snapshot.messageId && runtime.turn ? runtime.turn : null
+      runtime?.turn && runtime.sending && snapshot.sessionId === runtime.sessionId
+        ? runtime.turn
+        : runtime?.messageId === snapshot.messageId && runtime.turn
+          ? runtime.turn
+          : null
     entry = {
       turn: reuseTurn || createAiTurn({ append: false }),
       sessionId: snapshot.sessionId,
@@ -610,6 +792,16 @@ function liveTurnForSnapshot(snapshot, options = {}) {
       hydrated: Boolean(reuseTurn),
     }
     state.liveTurns.set(snapshot.messageId, entry)
+    if (entry.turn.node) {
+      entry.turn.node.dataset.messageId = snapshot.messageId
+      entry.turn.node.chatMessage = {
+        id: snapshot.messageId,
+        role: 'assistant',
+        text: String(snapshot.text || ''),
+        createdAt: new Date().toISOString(),
+      }
+      refreshMessageActions(entry.turn.node)
+    }
   }
   let hydratedNow = false
   if (!entry.hydrated && (snapshot.reasoning || snapshot.text || snapshot.toolCalls?.length)) {
@@ -674,8 +866,15 @@ function setupChatEvents() {
 
     // 模型正在生成：先把增量记到该消息的快照，再决定是否渲染。
     if (payload.type === 'delta') {
+      if (payload.sessionId === state.sessionId) {
+        const runtime = runtimeFor(payload.sessionId)
+        if (runtime.sending && runtime.turn) return
+      }
+      if (payload.messageId && state.localLiveMessageIds.has(String(payload.messageId))) return
+      const wasKnown = state.activeRunSnapshots.has(String(payload.messageId || ''))
       const snapshot = runSnapshotOf(payload)
       if (!snapshot || !payload.text) return
+      if (!wasKnown && payload.sessionId !== state.sessionId) renderSessions()
       if (payload.kind === 'reasoning') snapshot.reasoning += String(payload.text)
       else snapshot.text += String(payload.text)
       if (payload.sessionId !== state.sessionId) return
@@ -692,8 +891,15 @@ function setupChatEvents() {
 
     // 工具开始/结束：同样先补快照，当前会话才实时画卡片。
     if (payload.type === 'tool') {
+      if (payload.sessionId === state.sessionId) {
+        const runtime = runtimeFor(payload.sessionId)
+        if (runtime.sending && runtime.turn) return
+      }
+      if (payload.messageId && state.localLiveMessageIds.has(String(payload.messageId))) return
+      const wasKnown = state.activeRunSnapshots.has(String(payload.messageId || ''))
       const snapshot = runSnapshotOf(payload)
       if (!snapshot || !payload.tool) return
+      if (!wasKnown && payload.sessionId !== state.sessionId) renderSessions()
       const tool = payload.tool
       if (tool.type === 'tool') {
         snapshot.toolCalls.push({
@@ -735,20 +941,44 @@ function setupChatEvents() {
         state.localLiveMessageIds.delete(id)
         state.activeRunSnapshots.delete(id)
         state.historyMessageIds.add(id)
+        if (liveTurn.turn.node) {
+          liveTurn.turn.node.dataset.messageId = id
+          liveTurn.turn.node.chatMessage = {
+            id,
+            role: 'assistant',
+            text: String(payload.message.text || ''),
+            createdAt: payload.message.createdAt || new Date().toISOString(),
+          }
+          setMessageTime(liveTurn.turn.node, payload.message.createdAt)
+          refreshMessageActions(liveTurn.turn.node)
+        }
         const meta = payload.message.meta || {}
+        // EventSource 的最终消息也携带完整 reasoning / toolCalls；不能只传正文，
+        // 否则实时气泡收尾后会丢掉“已深度思考”和工具调用记录（刷新后才恢复）。
         liveTurn.turn.finish({
           text: payload.message.text,
+          modelId: payload.message.modelId,
           modelName: payload.message.modelName,
+          autoSelected: meta.autoSelected === true,
+          fallbackFromModelId: meta.fallbackFromModelId || null,
           citations: meta.citations,
           channel: meta.channel,
+          reasoning: meta.reasoning || '',
+          toolCalls: Array.isArray(meta.toolCalls) ? meta.toolCalls : [],
           clarify: meta.clarify,
+          createdAt: payload.message.createdAt,
         })
+        syncMessageActionAvailability()
         if (payload.message.role === 'assistant') notifySessionRead(payload.sessionId)
+        renderSessions()
         scheduleSessionRefresh()
         return
       }
       appendLiveMessage(payload.message, payload.sessionId)
-      if (payload.message.role === 'assistant') notifySessionRead(payload.sessionId)
+      if (payload.message.role === 'assistant') {
+        notifySessionRead(payload.sessionId)
+        renderSessions()
+      }
     } else {
       // 非当前会话完成回复：先在本页立刻点红点，再向服务端同步未读状态。
       if (payload.message.role === 'assistant') {
@@ -770,12 +1000,48 @@ function setupChatEvents() {
 
 let scrollBottomButtonFrame = 0
 
-function updateScrollBottomButton() {
+function threadDistanceToBottom(thread = $('#thread')) {
+  if (!thread) return 0
+  return thread.scrollHeight - thread.scrollTop - thread.clientHeight
+}
+
+function pinThreadToBottom() {
+  threadScrollPinned = true
+  threadHasNewBelow = false
+  queueScrollBottomButtonUpdate()
+}
+
+/** 切回对话页时按当前真实位置校准贴底状态，避免旧位置仍被当成“正在跟随”。 */
+function syncThreadScrollState() {
   const thread = $('#thread')
+  if (!thread) return
+  threadScrollLastTop = thread.scrollTop
+  threadScrollPinned = threadDistanceToBottom(thread) <= SCROLL_STICK_THRESHOLD
+  if (threadScrollPinned) threadHasNewBelow = false
+  updateScrollBottomButton()
+}
+
+function unpinThreadFromBottom() {
+  threadScrollPinned = false
+  queueScrollBottomButtonUpdate()
+}
+
+/** 用户正在看旧内容时只记录“下方有新内容”，不改变滚动位置。 */
+function markThreadNewContent() {
+  if (threadScrollPinned) return
+  threadHasNewBelow = true
+  queueScrollBottomButtonUpdate()
+}
+
+function updateScrollBottomButton() {
   const button = $('#scroll-bottom')
-  if (!thread || !button) return
-  const distanceToBottom = thread.scrollHeight - thread.scrollTop - thread.clientHeight
-  button.hidden = distanceToBottom <= SCROLL_BOTTOM_THRESHOLD
+  if (!button) return
+  // 贴底时内容增长可能让距离暂时变大，不能因此闪出按钮。
+  button.hidden = threadScrollPinned
+  button.classList.toggle('has-new', threadHasNewBelow)
+  const label = threadHasNewBelow ? '有新内容，回到最新消息' : '回到最新消息'
+  button.title = label
+  button.setAttribute('aria-label', label)
 }
 
 function queueScrollBottomButtonUpdate() {
@@ -789,6 +1055,7 @@ function queueScrollBottomButtonUpdate() {
 function scrollThreadToBottomSmooth() {
   const thread = $('#thread')
   if (!thread) return
+  pinThreadToBottom()
   thread.scrollTo({ top: thread.scrollHeight, behavior: 'smooth' })
   queueScrollBottomButtonUpdate()
 }
@@ -796,14 +1063,17 @@ function scrollThreadToBottomSmooth() {
 function scrollThreadToBottomInstant() {
   const thread = $('#thread')
   if (!thread) return
+  pinThreadToBottom()
   const previous = thread.style.scrollBehavior
   // 容器 CSS 是 smooth；切会话要“直接落在底部”，不能从顶部再滑过去。
   thread.style.scrollBehavior = 'auto'
   thread.scrollTop = thread.scrollHeight
+  threadScrollLastTop = thread.scrollTop
   queueScrollBottomButtonUpdate()
   requestAnimationFrame(() => {
     if (!thread.isConnected) return
     thread.scrollTop = thread.scrollHeight
+    threadScrollLastTop = thread.scrollTop
     if (previous) thread.style.scrollBehavior = previous
     else thread.style.removeProperty('scroll-behavior')
     updateScrollBottomButton()
@@ -885,13 +1155,15 @@ async function loadOlderMessages() {
     const previousTop = thread.scrollTop
     for (let index = newMessages.length - 1; index >= 0; index -= 1) {
       const message = newMessages[index]
+      // 多页澄清的中间答复/中间问题只用于续跑，不在聊天记录里显示。
+      if (isHiddenClarifyStep(message)) continue
       appendMessage(
         message.role === 'user' ? 'me' : 'ai',
         message.text,
         message.role === 'assistant' && message.modelName ? message.modelName : undefined,
         message.meta && message.meta.attachments,
         message.role === 'assistant' ? message.meta : undefined,
-        { scroll: false, prepend: true, channel: message.meta?.channel },
+        { scroll: false, prepend: true, channel: message.meta?.channel, messageId: message.id, createdAt: message.createdAt },
       )
     }
     thread.scrollTop = previousTop + (thread.scrollHeight - previousHeight)
@@ -920,6 +1192,17 @@ async function loadOlderMessages() {
 
 function onThreadScroll() {
   const thread = $('#thread')
+  if (!thread) return
+  const top = thread.scrollTop
+  const distance = threadDistanceToBottom(thread)
+  // 程序滚动到底只会让 top 变大；top 变小说明用户主动上滚，立刻停止跟随。
+  if (top < threadScrollLastTop - 1) {
+    unpinThreadFromBottom()
+  } else if (top > threadScrollLastTop + 1 && distance <= SCROLL_STICK_THRESHOLD) {
+    // 用户向下滚到接近底部，或程序滚动落到底部时恢复跟随。
+    pinThreadToBottom()
+  }
+  threadScrollLastTop = top
   updateScrollBottomButton()
   if (!thread || state.historyLoading || !state.historyHasMore || !state.historyBefore) return
   if (thread.scrollTop <= HISTORY_TOP_THRESHOLD) loadOlderMessages()
@@ -935,6 +1218,8 @@ function fillHistoryIfNeeded() {
 async function openSession(sessionId) {
   hideSettings()
   setChatMode('chat')
+  resetAgentRuns()
+  if (state.messageEdit) cancelMessageEdit({ clearInput: true, silent: true })
   const seq = ++state.openSeq
   try {
     const data = await api(historyMessagesUrl(sessionId))
@@ -973,7 +1258,7 @@ async function openSession(sessionId) {
           message.role === 'assistant' && message.modelName ? message.modelName : undefined,
           message.meta && message.meta.attachments,
           message.role === 'assistant' ? message.meta : undefined,
-          { scroll: false, channel: message.meta?.channel, pendingClarify: pendingClarify === message },
+          { scroll: false, channel: message.meta?.channel, pendingClarify: pendingClarify === message, messageId: message.id, createdAt: message.createdAt },
         )
       }
       if (data.messages.length > 0) {
@@ -985,7 +1270,7 @@ async function openSession(sessionId) {
     }
     attachLiveTurnForSession(data.session.id)
     if (pendingClarify?.meta?.clarify) {
-      showClarifyDock(pendingClarify.meta.clarify, { flowMeta: pendingClarify.meta })
+      showClarifyDock(pendingClarify.meta.clarify, { flowMeta: pendingClarify.meta, auto: true })
     } else {
       clearClarifyDock()
     }
@@ -1004,9 +1289,11 @@ async function openSession(sessionId) {
 function newSession() {
   hideSettings()
   setChatMode('chat')
+  if (state.messageEdit) cancelMessageEdit({ clearInput: true, silent: true })
   state.openSeq += 1
   state.sessionId = null
   setSelected('', { persist: false })
+  resetAgentRuns()
   resetHistoryState()
   $('#chat-title').textContent = '新对话'
   resetThread()
@@ -1043,6 +1330,182 @@ function showSessionMenu(sessionId, anchor) {
   const top = below + box.height + 8 > window.innerHeight ? Math.max(8, anchor.top - box.height - 4) : below
   menu.style.left = `${left}px`
   menu.style.top = `${top}px`
+}
+
+function hideMessageMenu() {
+  const menu = $('#message-menu')
+  if (!menu) return
+  menu.hidden = true
+  menu.dataset.message = ''
+}
+
+function showMessageMenu(node, x, y) {
+  const menu = $('#message-menu')
+  if (!menu || !node) return
+  const data = node.chatMessage || null
+  const id = String(data?.id || node.dataset.messageId || '')
+  if (!id) return
+  const role = data?.role === 'user' || node.classList.contains('me') ? 'user' : 'assistant'
+  const text = String(data?.text || node.querySelector('.bubble')?.innerText || '').trim()
+  const busy = sessionReplyBusy()
+  const preview = text ? text.replace(/\s+/g, ' ').slice(0, 48) : role === 'user' ? '我的消息' : 'AI 回答'
+  hideSessionMenu()
+  hideFileMenu()
+  menu.innerHTML = `<div class="session-menu-title">${esc(preview)}</div>
+    ${
+      role === 'user'
+        ? `<button type="button" data-message-act="edit" ${busy ? 'disabled' : ''}>编辑后重发</button>
+           <button type="button" data-message-act="recall" ${busy ? 'disabled' : ''}>撤回</button>`
+        : ''
+    }
+    <button type="button" data-message-act="delete" class="is-danger" ${busy ? 'disabled' : ''}>删除</button>
+    ${busy ? '<div class="session-menu-hint">回复结束后可操作</div>' : ''}`
+  menu.dataset.message = id
+  menu.hidden = false
+  const box = menu.getBoundingClientRect()
+  const left = Math.min(Math.max(8, x), window.innerWidth - box.width - 8)
+  const top = Math.min(Math.max(8, y), window.innerHeight - box.height - 8)
+  menu.style.left = `${left}px`
+  menu.style.top = `${top}px`
+}
+
+function messageDeleteUrl(id, mode) {
+  return qsAppend(`/api/chat/messages/${encodeURIComponent(id)}?mode=${encodeURIComponent(mode)}`)
+}
+
+async function deleteMessageApi(id, mode) {
+  return api(messageDeleteUrl(id, mode), {
+    method: 'DELETE',
+    headers: { 'content-type': 'application/json' },
+    body: '{}',
+  })
+}
+
+function removeDeletedMessageNodes(ids) {
+  const removed = new Set((ids || []).map((id) => String(id)))
+  if (removed.size === 0) return
+  const thread = $('#thread')
+  if (thread) {
+    for (const node of thread.querySelectorAll('.msg[data-message-id]')) {
+      if (removed.has(String(node.dataset.messageId))) node.remove()
+    }
+  }
+  for (const id of removed) {
+    state.historyMessageIds.delete(id)
+    state.liveTurns.delete(id)
+    state.activeRunSnapshots.delete(id)
+    state.localLiveMessageIds.delete(id)
+  }
+  const first = thread?.querySelector('.msg[data-message-id]')
+  state.historyBefore = first?.dataset.messageId || null
+  if (thread && !thread.querySelector('.msg')) setEmptyVisible(true)
+  updateScrollBottomButton()
+}
+
+function renderMessageEditBar() {
+  const bar = $('#message-edit-bar')
+  if (!bar) return
+  bar.hidden = !state.messageEdit
+}
+
+function cancelMessageEdit({ clearInput = false, silent = false } = {}) {
+  const had = Boolean(state.messageEdit)
+  state.messageEdit = null
+  renderMessageEditBar()
+  const input = $('#input')
+  if (had && clearInput && input) {
+    input.value = ''
+    input.style.height = '44px'
+    input.dispatchEvent(new Event('input', { bubbles: true }))
+  }
+  if (had && !silent) banner('已取消编辑')
+}
+
+function beginEditMessage(message) {
+  const id = String(message?.id || '')
+  const text = String(message?.text || '')
+  if (!id) return
+  if (sessionReplyBusy()) {
+    banner('回复结束后再编辑消息', 'warn')
+    return
+  }
+  state.messageEdit = { id, sessionId: state.sessionId, text }
+  const input = $('#input')
+  if (input) {
+    input.value = text
+    input.style.height = '44px'
+    input.dispatchEvent(new Event('input', { bubbles: true }))
+    input.focus()
+    input.setSelectionRange(text.length, text.length)
+  }
+  renderMessageEditBar()
+}
+
+async function recallMessage(message) {
+  const id = String(message?.id || '')
+  if (!id) return
+  if (sessionReplyBusy()) {
+    banner('回复结束后再撤回消息', 'warn')
+    return
+  }
+  const confirmed = await openConfirmCard({
+    eyebrow: '撤回消息',
+    title: '撤回这条提问？',
+    targetLabel: '消息',
+    target: String(message.text || '').slice(0, 40),
+    message: '撤回后会删除这条提问和紧随其后的回答，并把原文放回输入框；后续消息不会被删除。',
+    confirmText: '撤回',
+  })
+  if (!confirmed) return
+  try {
+    const result = await deleteMessageApi(id, 'turn')
+    removeDeletedMessageNodes(result.deletedIds)
+    const input = $('#input')
+    if (input) {
+      input.value = String(message.text || '')
+      input.style.height = '44px'
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+      input.focus()
+    }
+    banner('已撤回，原文已放回输入框', 'ok')
+    void loadSessions()
+  } catch (err) {
+    banner(`撤回失败：${err.message}`, 'bad')
+  }
+}
+
+async function deleteMessage(message) {
+  const id = String(message?.id || '')
+  if (!id) return
+  if (sessionReplyBusy()) {
+    banner('回复结束后再删除消息', 'warn')
+    return
+  }
+  const isUser = message.role === 'user'
+  const confirmed = await openConfirmCard({
+    eyebrow: '删除消息',
+    title: isUser ? '删除这条提问和回答？' : '删除这条回答？',
+    targetLabel: isUser ? '提问' : '回答',
+    target: String(message.text || '').slice(0, 40),
+    message: isUser ? '会同时删除这条提问和紧随其后的回答；后续消息保留。' : '只删除这一条回答，不影响其它消息。',
+  })
+  if (!confirmed) return
+  try {
+    const result = await deleteMessageApi(id, isUser ? 'turn' : 'message')
+    removeDeletedMessageNodes(result.deletedIds)
+    banner('已删除消息', 'ok')
+    void loadSessions()
+  } catch (err) {
+    banner(`删除失败：${err.message}`, 'bad')
+  }
+}
+
+function handleMessageAction(action, message) {
+  const act = String(action || '')
+  if (!message?.id || !act) return
+  if (act === 'edit') beginEditMessage(message)
+  else if (act === 'recall') recallMessage(message)
+  else if (act === 'delete') deleteMessage(message)
 }
 
 function openConfirmCard({ eyebrow = '危险操作', title, targetLabel = '目标', target, message, confirmText = '删除', cancelText = '取消' }) {
@@ -1327,6 +1790,7 @@ function renderWorkspaceFiles() {
   if (!box) return
   if (state.files.length === 0) {
     box.innerHTML = '<div class="muted" style="font-size:12px;padding:4px">还没有文件。点「上传」，或让对话把内容写进云空间。</div>'
+    syncSideSectionSplit()
     return
   }
   const activeId = state.filePreview?.id
@@ -1358,6 +1822,7 @@ function renderWorkspaceFiles() {
       )
     })
   }
+  syncSideSectionSplit()
 }
 
 function fileById(fileId) {
@@ -1524,6 +1989,424 @@ async function sendWorkspaceFileToDingTalk(file) {
   }
 }
 
+/* ---------------- 多 Agent 运行台 ---------------- */
+
+function agentStatusText(status) {
+  if (status === 'waiting') return '等待父 Agent 回答'
+  if (status === 'done') return '已完成 · 待命'
+  if (status === 'failed') return '失败'
+  if (status === 'cancelled') return '已取消'
+  return '运行中'
+}
+
+function agentStatusClass(status) {
+  if (status === 'waiting') return 'is-waiting'
+  if (status === 'done') return 'is-done'
+  if (status === 'failed') return 'is-failed'
+  if (status === 'cancelled') return 'is-cancelled'
+  return 'is-running'
+}
+
+/** 子 Agent 完成、且这么久没有新任务，就从团队栏注销（执行资源早已释放）。 */
+const AGENT_TEAM_IDLE_MS = 120000
+
+function syncWorkbenchLayout() {
+  const rail = $('#workbench-rail')
+  const teamPane = $('#team-pane')
+  const filePane = $('#file-pane')
+  const main = $('.chat-main')
+  if (!rail || !teamPane || !filePane || !main) return
+
+  const inChat = state.mode === 'chat'
+  const hasTeam = inChat && state.agentRuns.size > 0
+  const hasFile = inChat && Boolean(state.filePreview)
+  rail.hidden = !(hasTeam || hasFile)
+
+  // 当前面板没有内容时自动切到另一个，避免打开一个空白面板。
+  if (state.workbenchTab === 'team' && !hasTeam && hasFile) state.workbenchTab = 'file'
+  if (state.workbenchTab === 'file' && !hasFile && hasTeam) state.workbenchTab = 'team'
+
+  const showTeam = hasTeam && (state.workbenchSplit || state.workbenchTab === 'team')
+  const showFile = hasFile && (state.workbenchSplit || state.workbenchTab === 'file')
+  teamPane.hidden = !showTeam
+  filePane.hidden = !showFile
+  $('#workbench-body')?.classList.toggle('is-split', state.workbenchSplit && showTeam && showFile)
+
+  const tabs = $('#workbench-tabs')
+  if (tabs) {
+    tabs.hidden = !hasTeam && !hasFile
+    tabs.querySelectorAll('[data-workbench-tab]').forEach((tab) => {
+      const name = tab.getAttribute('data-workbench-tab')
+      const available = name === 'team' ? hasTeam : hasFile
+      tab.hidden = !available
+      const selected = state.workbenchSplit || state.workbenchTab === name
+      tab.classList.toggle('is-active', selected)
+      tab.setAttribute('aria-selected', selected ? 'true' : 'false')
+    })
+    const count = $('#workbench-team-count')
+    if (count) {
+      const total = state.agentRuns.size
+      count.hidden = total === 0
+      count.textContent = String(total)
+    }
+    const split = $('#workbench-split')
+    if (split) {
+      split.hidden = !(hasTeam && hasFile)
+      split.classList.toggle('is-active', state.workbenchSplit)
+      split.setAttribute('aria-pressed', state.workbenchSplit ? 'true' : 'false')
+    }
+  }
+
+  if (inChat) main.classList.toggle('is-split-preview', !rail.hidden)
+  // 右栏（团队或文件）出现时就是可拖拽分栏，鼠标拖分界线即可改两边宽度。
+  main.classList.toggle('is-workbench-open', !rail.hidden)
+  main.classList.toggle('is-team-only', !rail.hidden && hasTeam && !hasFile)
+  main.classList.toggle('is-team-file', !rail.hidden && hasTeam && hasFile)
+  const resizer = $('#file-split-resizer')
+  if (resizer) resizer.hidden = !(inChat && !rail.hidden)
+}
+
+function beginParentAgentTurn(runId) {
+  const next = String(runId || '').trim()
+  if (next) state.agentParentRunId = next
+  const title = $('#chat-title')?.textContent?.trim()
+  state.agentParentName = title && title !== '新对话' ? title : '当前对话'
+  renderAgentDock()
+}
+
+/** 一次任务结束后安排注销：空闲期内没有新事件就把窗口移出团队。 */
+function scheduleAgentRetire(childId, updatedAt) {
+  const run = state.agentRuns.get(childId)
+  if (!run) return
+  if (run.retireTimer) clearTimeout(run.retireTimer)
+  const wait = Math.max(0, updatedAt + AGENT_TEAM_IDLE_MS - Date.now())
+  run.retireTimer = setTimeout(() => {
+    const current = state.agentRuns.get(childId)
+    if (!current) return
+    if ((current.status || 'running') === 'running') return
+    if (Date.now() - (current.updatedAt || 0) < AGENT_TEAM_IDLE_MS - 1000) {
+      scheduleAgentRetire(childId, current.updatedAt || Date.now())
+      return
+    }
+    state.agentRuns.delete(childId)
+    renderAgentDock()
+  }, wait)
+}
+
+function pushThreadEntry(thread, entry) {
+  const last = thread[thread.length - 1]
+  // 流式输出碎片合并成一条，避免每几个字一个气泡。
+  if (entry.kind === 'content' && last && last.kind === 'content') {
+    last.text = `${last.text}${entry.text}`
+    return
+  }
+  thread.push(entry)
+  if (thread.length > 200) thread.splice(0, thread.length - 200)
+}
+
+function updateAgentEvent(data) {
+  if (!data || data.type !== 'agent' || !data.childId) return
+  const previous = state.agentRuns.get(data.childId) || {}
+  const thread = Array.isArray(previous.thread) ? previous.thread.slice() : []
+  const next = {
+    ...previous,
+    childId: data.childId,
+    key: data.key || previous.key || '',
+    parentRunId: data.parentRunId || previous.parentRunId || '',
+    runId: data.runId || previous.runId || '',
+    agentId: data.agentId || previous.agentId || '',
+    index: Number(data.index) || previous.index || state.agentRuns.size + 1,
+    attempt: Number(data.attempt) || previous.attempt || 0,
+    title: data.title || previous.title || '子 Agent',
+    modelId: data.modelId || previous.modelId || '',
+    modelName: data.modelName || previous.modelName || '',
+    modelReason: data.modelReason || previous.modelReason || '',
+    status: data.status === 'unregistered' ? 'done' : (data.status || previous.status || 'running'),
+    assign: data.action === 'assign' ? String(data.text || '').slice(0, 600) : previous.assign || '',
+    text: previous.text || '',
+    steps: Array.isArray(previous.steps) ? previous.steps.slice() : [],
+    thread,
+    error: data.error || previous.error || '',
+    durationMs: Number(data.durationMs) || previous.durationMs || 0,
+    toolCount: Number.isFinite(Number(data.toolCount)) ? Number(data.toolCount) : (previous.toolCount || 0),
+    updatedAt: Date.now(),
+    retireTimer: previous.retireTimer,
+  }
+
+  if (data.action === 'assign') {
+    pushThreadEntry(thread, { kind: 'assign', text: String(data.text || '（派发任务）'), at: Date.now() })
+    // 新任务派下来 → 取消上一次的注销计划，并把窗口展开看过程。
+    if (next.retireTimer) {
+      clearTimeout(next.retireTimer)
+      next.retireTimer = null
+    }
+    next.status = 'running'
+  } else if (data.action === 'content') {
+    next.text = `${next.text}${data.text || ''}`.slice(-4000)
+    pushThreadEntry(thread, { kind: 'content', text: String(data.text || ''), at: Date.now() })
+  } else if (data.action === 'report') {
+    next.text = `${next.text}${next.text ? '\n' : ''}${data.text || ''}`.slice(-4000)
+    pushThreadEntry(thread, { kind: 'report', text: String(data.text || ''), at: Date.now(), error: data.error || '' })
+  } else if (data.action === 'question') {
+    // 子 Agent 主动向父 Agent 提问：本轮暂停，等父 Agent 回复后继续。
+    next.status = 'waiting'
+    next.text = String(data.text || '').slice(0, 2400)
+    pushThreadEntry(thread, { kind: 'question', text: next.text || '（需要父 Agent 回答）', at: Date.now() })
+    if (next.retireTimer) {
+      clearTimeout(next.retireTimer)
+      next.retireTimer = null
+    }
+  } else if (data.action === 'done') {
+    if (data.text) next.text = String(data.text).slice(0, 2400)
+    next.status = data.status === 'unregistered' ? 'done' : (data.status || 'done')
+    const last = thread[thread.length - 1]
+    const plain = (value) => String(value || '').replace(/\s+/g, '').trim()
+    // 流式正文已经展示过同一段最终答案时，不再追加一条重复气泡。
+    if (last && last.kind === 'content' && data.text && plain(last.text) === plain(data.text)) {
+      last.final = true
+      last.status = next.status
+    } else {
+      pushThreadEntry(thread, {
+        kind: 'done',
+        text: String(data.text || data.error || (next.status === 'failed' ? '执行失败' : '任务完成')),
+        at: Date.now(),
+        status: next.status,
+      })
+    }
+  }
+
+  if (data.action === 'tool' && data.tool) {
+    const stepId = String(data.tool.id || '')
+    if (stepId && !next.steps.some((step) => step.id === stepId)) {
+      next.steps.push({
+        id: stepId,
+        name: data.tool.name || data.tool.toolId || '工具调用',
+        toolId: data.tool.toolId || '',
+        status: 'running',
+        summary: '',
+        durationMs: 0,
+      })
+      pushThreadEntry(thread, {
+        kind: 'tool',
+        id: stepId,
+        text: data.tool.name || data.tool.toolId || '工具调用',
+        at: Date.now(),
+        status: 'running',
+      })
+    }
+  }
+  if (data.action === 'tool_result' && data.tool) {
+    const stepId = String(data.tool.id || '')
+    const step = next.steps.find((item) => item.id === stepId)
+    if (step) {
+      step.status = data.status === 'failed' ? 'error' : 'done'
+      step.summary = data.summary || ''
+      step.durationMs = Number(data.durationMs) || 0
+    }
+    const entry = thread.find((item) => item.kind === 'tool' && item.id === stepId)
+    if (entry) {
+      entry.status = data.status === 'failed' ? 'error' : 'done'
+      entry.summary = data.summary || ''
+      entry.durationMs = Number(data.durationMs) || 0
+    }
+  }
+
+  state.agentRuns.set(data.childId, next)
+  // 新派发的子 Agent 直接成为详情窗口的焦点，用户不用再找
+  if (
+    data.action === 'assign' ||
+    data.action === 'question' ||
+    !state.agentSelectedId ||
+    !state.agentRuns.has(state.agentSelectedId)
+  ) {
+    state.agentSelectedId = data.childId
+  }
+  renderAgentDock()
+  if (data.action === 'done') scheduleAgentRetire(data.childId, next.updatedAt)
+}
+
+function agentThreadEntryHtml(entry) {
+  const time = entry.at ? new Date(entry.at).toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit' }) : ''
+  if (entry.kind === 'assign') {
+    return `<div class="agent-chat-row is-parent">
+      <div class="agent-chat-main">
+        <div class="agent-chat-meta"><span>父 Agent · 派发</span>${time ? `<time>${esc(time)}</time>` : ''}</div>
+        <div class="agent-chat-bubble is-parent">${esc(entry.text)}</div>
+      </div>
+      <span class="agent-chat-avatar is-parent" aria-hidden="true">父</span>
+    </div>`
+  }
+  if (entry.kind === 'question') {
+    return `<div class="agent-chat-row is-agent">
+      <span class="agent-chat-avatar is-agent" aria-hidden="true">子</span>
+      <div class="agent-chat-main">
+        <div class="agent-chat-meta"><span>子 Agent · 提问</span>${time ? `<time>${esc(time)}</time>` : ''}</div>
+        <div class="agent-chat-bubble is-question">${esc(entry.text)}</div>
+      </div>
+    </div>`
+  }
+  if (entry.kind === 'report') {
+    return `<div class="agent-chat-row is-agent">
+      <span class="agent-chat-avatar is-agent" aria-hidden="true">子</span>
+      <div class="agent-chat-main">
+        <div class="agent-chat-meta"><span>子 Agent · 过程记录</span>${time ? `<time>${esc(time)}</time>` : ''}</div>
+        <div class="agent-chat-bubble is-report${entry.error ? ' is-error' : ''}">${esc(entry.text)}</div>
+      </div>
+    </div>`
+  }
+  if (entry.kind === 'content') {
+    const label = entry.final ? '子 Agent · 回报' : '子 Agent'
+    return `<div class="agent-chat-row is-agent">
+      <span class="agent-chat-avatar is-agent" aria-hidden="true">子</span>
+      <div class="agent-chat-main">
+        <div class="agent-chat-meta"><span>${label}</span>${time ? `<time>${esc(time)}</time>` : ''}</div>
+        <div class="agent-chat-bubble is-agent${entry.final ? ' is-final' : ''}">${esc(entry.text)}</div>
+      </div>
+    </div>`
+  }
+  if (entry.kind === 'tool') {
+    const mark = entry.status === 'error' ? '✕' : entry.status === 'running' ? '◐' : '✓'
+    const detail = entry.summary || (entry.status === 'running' ? '执行中…' : '')
+    const seconds = entry.durationMs > 0 ? ` · ${formatElapsed(entry.durationMs)}` : ''
+    return `<div class="agent-chat-tool is-${entry.status === 'error' ? 'error' : entry.status === 'running' ? 'running' : 'done'}">
+      <span class="agent-chat-tool-mark" aria-hidden="true">${mark}</span>
+      <strong title="${esc(entry.text)}">${esc(entry.text)}</strong>
+      <span title="${esc(detail)}">${esc(detail)}${seconds}</span>
+    </div>`
+  }
+  if (entry.kind === 'done') {
+    const label = entry.status === 'failed' ? '子 Agent · 失败' : entry.status === 'cancelled' ? '子 Agent · 已取消' : '子 Agent · 完成'
+    return `<div class="agent-chat-row is-agent">
+      <span class="agent-chat-avatar is-agent${entry.status === 'failed' ? ' is-error' : ''}" aria-hidden="true">子</span>
+      <div class="agent-chat-main">
+        <div class="agent-chat-meta"><span>${label}</span>${time ? `<time>${esc(time)}</time>` : ''}</div>
+        <div class="agent-chat-bubble is-done${entry.status === 'failed' ? ' is-error' : ''}">${esc(entry.text || label)}</div>
+      </div>
+    </div>`
+  }
+  return ''
+}
+
+/** 列表行的短状态，详情里用完整文案 */
+function agentStatusShort(status) {
+  if (status === 'waiting') return '待回复'
+  if (status === 'done') return '待命'
+  if (status === 'failed') return '失败'
+  if (status === 'cancelled') return '已取消'
+  return '运行中'
+}
+
+/** 团队列表里的一行：左边编号，右边标题 + 进度，状态靠右 */
+function agentListRowHtml(run, selected) {
+  const status = run.status || 'running'
+  const time = run.durationMs ? formatElapsed(run.durationMs) : ''
+  const meta = [run.key, `${run.toolCount || 0} 次工具`, time].filter(Boolean).join(' · ')
+  return `<button class="agent-row ${agentStatusClass(status)}${selected ? ' is-selected' : ''}" type="button" role="listitem" data-agent-select="${esc(run.childId)}" aria-current="${selected ? 'true' : 'false'}" title="${esc(run.title)}">
+    <span class="agent-row-index">${String(run.index || 1).padStart(2, '0')}</span>
+    <span class="agent-row-body">
+      <span class="agent-row-line">
+        <strong class="agent-row-title">${esc(run.title)}</strong>
+        <span class="agent-row-state"><span class="agent-status-dot" aria-hidden="true"></span>${agentStatusShort(status)}</span>
+      </span>
+      <span class="agent-row-meta">${esc(meta)}</span>
+    </span>
+  </button>`
+}
+
+/** 右侧预览：一个子 Agent 与父 Agent 的对话流，父右子左。 */
+function agentDetailHtml(run) {
+  const status = run.status || 'running'
+  const thread = (run.thread || []).map(agentThreadEntryHtml).join('')
+  const model = run.modelName || run.modelId || '自动分配'
+  const key = run.key || ''
+  const facts = [
+    `<span class="agent-chat-fact" title="${esc(run.modelReason || '')}"><b>${esc(model)}</b></span>`,
+    `<span class="agent-chat-fact">${Number(run.toolCount) || 0} 次工具</span>`,
+    run.durationMs ? `<span class="agent-chat-fact">${formatElapsed(run.durationMs)}</span>` : '',
+  ].filter(Boolean).join('')
+  const hint = status === 'waiting'
+    ? '子 Agent 正在等父 Agent 回答'
+    : status === 'running'
+      ? '子 Agent 正在工作，过程会实时出现在这里'
+      : '本轮结束；继续对话会复用这个子 Agent 的上下文'
+  return `<article class="agent-chat-panel ${agentStatusClass(status)}" data-agent-child="${esc(run.childId)}" aria-label="${esc(run.title)}，${agentStatusText(status)}">
+    <header class="agent-chat-head">
+      <div class="agent-chat-head-main">
+        <span class="agent-chat-index">AGENT ${String(run.index || 1).padStart(2, '0')}</span>
+        <strong class="agent-chat-title" title="${esc(run.title)}">${esc(run.title)}</strong>
+        ${key ? `<span class="agent-chat-key" title="父 Agent 用这个 key 继续对话">${esc(key)}</span>` : ''}
+      </div>
+      <span class="agent-chat-state"><span class="agent-status-dot" aria-hidden="true"></span>${agentStatusText(status)}</span>
+    </header>
+    <div class="agent-chat-facts">${facts}</div>
+    <div class="agent-chat-thread" role="log" aria-live="polite">
+      ${thread || `<p class="agent-chat-placeholder">${status === 'running' ? '等待子 Agent 的第一条消息…' : '还没有对话记录。'}</p>`}
+    </div>
+    <footer class="agent-chat-foot">
+      <span class="agent-chat-hint">${esc(hint)}</span>
+      ${run.error ? `<span class="agent-chat-error" title="${esc(run.error)}">${esc(run.error)}</span>` : ''}
+      ${status === 'running' || status === 'waiting' ? '' : `<button class="agent-chat-continue" type="button" data-agent-continue="${esc(key)}" title="让父 Agent 继续和这个子 Agent 对话">继续对话</button>`}
+    </footer>
+  </article>`
+}
+
+function renderAgentDock() {
+  const pane = $('#team-pane')
+  const list = $('#team-list')
+  const detail = $('#team-detail')
+  const split = $('#team-split')
+  const summary = $('#team-summary')
+  if (!pane || !list || !detail) return
+  const runs = [...state.agentRuns.values()].sort((a, b) => (a.index || 0) - (b.index || 0))
+  const empty = $('#team-empty')
+  if (empty) empty.hidden = runs.length > 0
+  if (split) split.hidden = runs.length === 0
+  if (runs.length === 0) {
+    state.agentSelectedId = ''
+    list.innerHTML = ''
+    detail.innerHTML = ''
+    if (summary) summary.textContent = '等待派发'
+  } else {
+    const active = runs.filter((run) => (run.status || 'running') === 'running').length
+    const waiting = runs.filter((run) => run.status === 'waiting').length
+    if (summary) {
+      summary.textContent = waiting > 0
+        ? `${active} 工作中 · ${waiting} 待回答 · 共 ${runs.length} 个`
+        : active > 0
+          ? `${active} 工作中 · 共 ${runs.length} 个子 Agent`
+          : `${runs.length} 个子 Agent · 已全部完成`
+    }
+    const parent = $('#team-manager-name')
+    if (parent) parent.textContent = `父 Agent · ${state.agentParentName || '当前对话'}`
+    // 选中项失效（被注销）时回落到运行中的第一个，否则第一个
+    const previousSelectedId = state.agentSelectedId
+    let selected = runs.find((run) => run.childId === state.agentSelectedId)
+    if (!selected) {
+      selected = runs.find((run) => (run.status || 'running') === 'running')
+        || runs.find((run) => run.status === 'waiting')
+        || runs[0]
+      state.agentSelectedId = selected.childId
+    }
+    // 切到别的 Agent 时从顶部读，避免沿用上一个窗口的滚动位置
+    const scrollTop = selected.childId === previousSelectedId ? detail.scrollTop : 0
+    list.innerHTML = runs.map((run) => agentListRowHtml(run, run.childId === selected.childId)).join('')
+    detail.innerHTML = agentDetailHtml(selected)
+    detail.scrollTop = scrollTop
+  }
+  syncWorkbenchLayout()
+}
+
+function resetAgentRuns() {
+  for (const run of state.agentRuns.values()) {
+    if (run.retireTimer) clearTimeout(run.retireTimer)
+  }
+  state.agentRuns.clear()
+  state.agentSelectedId = ''
+  state.agentParentRunId = ''
+  state.agentParentName = ''
+  renderAgentDock()
+}
+
 /* ---------------- 个人工作区：右侧文件预览与编辑 ---------------- */
 
 let workspacePreviewText = ''
@@ -1531,6 +2414,84 @@ let workspacePreviewTextLoaded = false
 let workspacePreviewObjectUrl = ''
 let workspacePreviewSaving = false
 let workspacePreviewToken = 0
+/** 模型正在生成的文件内容草稿；只在右侧预览层展示，不参与磁盘写入。 */
+let fileStreamDraft = null
+/** 当前预览的字符揭示动画；tool 参数一次性到达时也保留打字机可见性。 */
+let fileStreamReveal = null
+let onlyOfficeScriptPromise = null
+let onlyOfficeEditor = null
+let onlyOfficeMode = 'view'
+/** 编辑态收到云端新版本时，警告条绑定的文件 id；空表示没有待刷新提示。 */
+let filePaneSyncFileId = ''
+
+function isOfficeLike(file) {
+  return /\.(docx?|docm|dotx?|rtf|xlsx?|xlsm|xltx?|pptx?|pptm|potx?|odt|ods|odp|ott|ots|otp)$/i.test(
+    file?.name || '',
+  )
+}
+
+function destroyOnlyOfficeEditor() {
+  if (onlyOfficeEditor) {
+    try {
+      onlyOfficeEditor.destroyEditor()
+    } catch {
+      /* 编辑器已经关闭或脚本还没完成初始化 */
+    }
+    onlyOfficeEditor = null
+  }
+}
+
+function loadOnlyOfficeApi(scriptUrl) {
+  if (window.DocsAPI) return Promise.resolve()
+  if (onlyOfficeScriptPromise) return onlyOfficeScriptPromise
+  onlyOfficeScriptPromise = new Promise((resolve, reject) => {
+    const script = document.createElement('script')
+    script.src = scriptUrl
+    script.async = true
+    script.onload = () => resolve()
+    script.onerror = () => {
+      onlyOfficeScriptPromise = null
+      reject(new Error('OnlyOffice 脚本加载失败，请检查文档服务地址'))
+    }
+    document.head.appendChild(script)
+  })
+  return onlyOfficeScriptPromise
+}
+
+async function openWorkspaceOffice(file, mode) {
+  const token = workspacePreviewToken
+  const owner = file.ownerUserId === state.me?.person?.id
+  destroyOnlyOfficeEditor()
+  filePaneMessage(mode === 'edit' ? '正在准备编辑…' : '正在加载文档…')
+  try {
+    const result = await api(
+      qsAppend(`/api/workspace/files/${encodeURIComponent(file.id)}/office-config?mode=${mode === 'edit' ? 'edit' : 'view'}`),
+    )
+    if (token !== workspacePreviewToken || state.filePreview?.id !== file.id) return
+    if (!result?.configured) {
+      filePaneMessage(result?.reason || 'OnlyOffice 文档服务未配置')
+      return
+    }
+    const holder = document.createElement('div')
+    holder.id = 'onlyoffice-editor'
+    holder.className = 'onlyoffice-editor'
+    setFilePaneBody(holder)
+    await loadOnlyOfficeApi(result.scriptUrl)
+    if (token !== workspacePreviewToken || state.filePreview?.id !== file.id) return
+    onlyOfficeMode = result.mode
+    onlyOfficeEditor = new window.DocsAPI.DocEditor('onlyoffice-editor', result.config)
+    const edit = $('#file-pane-edit')
+    if (edit) {
+      edit.hidden = !owner
+      edit.textContent = onlyOfficeMode === 'edit' ? '预览' : '编辑'
+      edit.title = onlyOfficeMode === 'edit' ? '切换为只读预览' : '在线编辑并保存回云空间'
+    }
+  } catch (err) {
+    if (token !== workspacePreviewToken) return
+    filePaneMessage(`文档服务加载失败：${err.message}`, 'bad')
+  }
+}
+
 
 function isImageLike(file) {
   const mime = file.mime || file.type || ''
@@ -1556,6 +2517,121 @@ function filePaneMessage(message, tone = 'muted') {
   text.textContent = message
   holder.appendChild(text)
   setFilePaneBody(holder)
+  hidePreviewSelection()
+}
+
+function hideFilePaneSyncNotice() {
+  filePaneSyncFileId = ''
+  const notice = $('#file-pane-sync-notice')
+  if (notice) notice.hidden = true
+  const text = $('#file-pane-sync-text')
+  if (text) text.textContent = ''
+}
+
+function showFilePaneSyncNotice(fileId, message) {
+  const notice = $('#file-pane-sync-notice')
+  const text = $('#file-pane-sync-text')
+  if (!notice || !text) return
+  filePaneSyncFileId = fileId || ''
+  text.textContent = message
+  notice.hidden = false
+  const button = $('#file-pane-refresh')
+  if (button) {
+    button.disabled = false
+    button.textContent = '刷新到云端版本'
+  }
+}
+
+async function refreshFilePaneToCloudVersion() {
+  const fileId = filePaneSyncFileId || String(state.filePreview?.id || '')
+  if (!fileId) return
+  const file = state.files.find((item) => item.id === fileId)
+  const name = file?.name ? `《${file.name}》` : '当前文档'
+  const confirmed = window.confirm(
+    `刷新到云端版本会关闭 ${name} 当前编辑器，编辑器里还没保存的修改不会合并，会直接丢失。\n\n` +
+      '请先点插件“保存到云空间”，或撤销未保存的修改，再刷新。\n\n' +
+      '确定现在放弃当前编辑内容并刷新到云端版本吗？',
+  )
+  if (!confirmed) return
+  const button = $('#file-pane-refresh')
+  if (button) {
+    button.disabled = true
+    button.textContent = '正在刷新…'
+  }
+  try {
+    // 先抬高刷新水位：关闭旧编辑器触发的保存回调若仍是旧版本，服务端会丢弃，
+    // 避免旧内容覆盖刚多出来的云端版本。
+    await api(`/api/workspace/office/${encodeURIComponent(fileId)}/refresh-guard`, {
+      method: 'POST',
+    })
+    hideFilePaneSyncNotice()
+    await loadWorkspaceFiles()
+    const latest = state.files.find((item) => item.id === fileId)
+    if (!latest) {
+      closeWorkspaceFile()
+      banner('文件已不存在，无法刷新到云端版本', 'bad')
+      return
+    }
+    await openWorkspaceFile(fileId, { mode: 'edit' })
+    banner('已刷新到云端版本', 'ok')
+  } catch (err) {
+    banner(`刷新到云端版本失败：${err.message}`, 'bad')
+  } finally {
+    if (button) {
+      button.disabled = false
+      button.textContent = '刷新到云端版本'
+    }
+  }
+}
+
+function hidePreviewSelection() {
+  state.previewSelection = null
+  const button = $('#file-selection-action')
+  if (button) button.hidden = true
+}
+
+/**
+ * 普通文本/表格预览在父页面 DOM 内，可以直接读取 selection；
+ * OnlyOffice 在跨域 iframe 里，父页面拿不到它内部的选区，因此这里只对本地预览生效。
+ */
+function refreshPreviewSelection() {
+  const body = $('#file-pane-body')
+  const button = $('#file-selection-action')
+  const file = state.filePreview
+  if (!body || !button || !file) {
+    hidePreviewSelection()
+    return
+  }
+  const selection = window.getSelection()
+  const text = String(selection?.toString?.() || '').replace(/\s+/g, ' ').trim()
+  const anchor = selection?.anchorNode
+  if (!text || !anchor || !body.contains(anchor)) {
+    hidePreviewSelection()
+    return
+  }
+  state.previewSelection = { fileId: file.id, fileName: file.name, text: text.slice(0, 800) }
+  button.hidden = false
+  button.textContent = '引用选中内容并修改'
+}
+
+function quotePreviewSelection() {
+  const selected = state.previewSelection
+  const input = $('#input')
+  if (!selected || !input) return
+  if (state.mode !== 'chat') {
+    setChatMode('chat')
+    if (state.filePreview?.id) void openWorkspaceFile(state.filePreview.id, { split: true })
+  }
+  const truncated = String(selected.text).length >= 800 ? '\n（选中的内容较长，已截取前 800 字）' : ''
+  input.value = `请修改《${selected.fileName}》中的这段内容：\n"""${selected.text}"""${truncated}\n\n修改要求：`
+  input.style.height = '44px'
+  input.dispatchEvent(new Event('input', { bubbles: true }))
+  input.focus()
+  const end = input.value.length
+  input.setSelectionRange(end, end)
+  hidePreviewSelection()
+  const selection = window.getSelection()
+  selection?.removeAllRanges?.()
 }
 
 function releaseWorkspacePreviewUrl() {
@@ -1565,40 +2641,100 @@ function releaseWorkspacePreviewUrl() {
   }
 }
 
-async function openWorkspaceFile(id) {
+function previewKindForFile(file) {
+  if (isOfficeLike(file)) return 'office'
+  if (isTextLike(file)) return 'text'
+  if (isImageLike(file)) return 'image'
+  if (isPdfLike(file)) return 'pdf'
+  return 'none'
+}
+
+async function fetchPreviewCapability(file) {
+  try {
+    return await api(`/api/workspace/files/${encodeURIComponent(file.id)}/preview-capability`)
+  } catch {
+    // 老服务或网络抖动时退回本地类型判断，打开失败由现有错误提示兜住。
+    return null
+  }
+}
+
+/** 本轮要上报的「右侧预览文件」：没有打开预览时返回 undefined，服务端据此忽略。 */
+function activePreviewFilePayload() {
+  const file = state.filePreview
+  if (!file || state.mode !== 'chat') return undefined
+  return {
+    id: String(file.id || ''),
+    name: String(file.name || ''),
+    relPath: file.relPath ? String(file.relPath) : undefined,
+  }
+}
+
+async function openWorkspaceFile(id, options = {}) {
   const file = state.files.find((item) => item.id === id)
   if (!file) {
     banner('文件已不存在，列表可能刚被刷新', 'bad')
     await loadWorkspaceFiles()
     return
   }
+  const requestSeq = ++workspacePreviewToken
+  const capability = await fetchPreviewCapability(file)
+  if (requestSeq !== workspacePreviewToken) return
+  const kind = capability?.kind || previewKindForFile(file)
+  if (kind === 'none') {
+    // 没有可用预览能力时不创建面板，也不让右栏出现空白占位。
+    banner(capability?.reason || `《${file.name}》暂不支持在线预览，请下载后查看。`, 'warn')
+    return
+  }
+  if (fileStreamDraft && fileStreamDraft.fileId !== file.id) finishStreamingFilePreview()
   releaseWorkspacePreviewUrl()
-  const token = ++workspacePreviewToken
+  destroyOnlyOfficeEditor()
+  hideFilePaneSyncNotice()
+  const token = requestSeq
+  const split = state.mode === 'chat' && options.split !== false
   state.filePreview = file
   workspacePreviewText = ''
   workspacePreviewTextLoaded = false
+  hidePreviewSelection()
   const pane = $('#file-pane')
   pane.hidden = false
-  $('#thread').hidden = true
+  suppressFileDockForPreview()
+  const chatMain = $('.chat-main')
+  chatMain.classList.add('is-file-preview')
+  chatMain.classList.toggle('is-split-preview', split)
+  if (split) restoreFileSplitRatio()
+  syncWorkbenchLayout()
+  // 对话内预览保留左栏对话和输入区，只把右侧让给文件；工作台/窄屏仍走整页预览。
+  $('#thread').hidden = !split
   $('#workspace-pane').hidden = true
-  $('.composer').hidden = true
+  $('.composer').hidden = !split
   $('#file-pane-editor').hidden = true
   $('#file-pane-body').hidden = false
-  $('#file-pane-kicker').textContent = '云空间'
+  $('#file-pane-kicker').textContent = split ? '对话内预览' : '云空间'
   $('#file-pane-name').textContent = file.name
   const meta = [fmtSize(file.size), `更新于 ${workspaceFileDate(file.updatedAt)}`, file.shared ? '共享文件' : '个人文件', file.relPath]
   $('#file-pane-meta').textContent = meta.filter(Boolean).join(' · ')
-  $('#chat-title').textContent = `云空间 · ${file.name}`
+  if (!split) $('#chat-title').textContent = `云空间 · ${file.name}`
+  else $('#chat-title').textContent = state.sessionId ? '对话' : '新对话'
   const owner = file.ownerUserId === state.me?.person?.id
   $('#file-pane-rename').hidden = true
   $('#file-pane-edit').hidden = true
+  $('#file-pane-edit').textContent = '编辑'
+  $('#file-pane-edit').title = '编辑文件内容'
   $('#file-pane-delete').hidden = !owner
   $('#file-pane-download').hidden = false
   $('#file-pane-send-dingtalk').hidden = false
   renderWorkspaceFiles()
+  if (isOfficeLike(file)) {
+    await openWorkspaceOffice(file, options.mode === 'edit' ? 'edit' : 'view')
+    return
+  }
   filePaneMessage('正在读取文件…')
   try {
     const response = await fetch(workspaceFileUrl(file), { credentials: 'same-origin' })
+    if (response.status === 401) {
+      redirectToLogin()
+      return waitForLoginRedirect()
+    }
     if (!response.ok) throw new Error(`读取文件失败（HTTP ${response.status}）`)
     const blob = await response.blob()
     if (token !== workspacePreviewToken || state.filePreview?.id !== file.id) return
@@ -1609,11 +2745,13 @@ async function openWorkspaceFile(id) {
         return
       }
       const text = await blob.text()
-      workspacePreviewText = text
+      const liveDraft = fileStreamDraft && fileStreamDraft.fileId === file.id ? fileStreamDraft : null
+      const shownText = liveDraft ? liveDraft.text : text
+      workspacePreviewText = shownText
       workspacePreviewTextLoaded = true
       const pre = document.createElement('pre')
-      pre.className = 'file-text-view'
-      pre.textContent = text || '（空文件）'
+      pre.className = `file-text-view${liveDraft ? ' is-streaming' : ''}`
+      pre.textContent = shownText || '（空文件）'
       setFilePaneBody(pre)
       $('#file-pane-edit').hidden = !owner
       return
@@ -1643,13 +2781,63 @@ async function openWorkspaceFile(id) {
   }
 }
 
+function updateFileFullscreenButton() {
+  const pane = $('#file-pane')
+  const button = $('#file-pane-fullscreen')
+  if (!button) return
+  const active = Boolean(
+    pane && (document.fullscreenElement === pane || document.body.classList.contains('is-file-preview-fullscreen')),
+  )
+  button.classList.toggle('is-active', active)
+  button.setAttribute('aria-pressed', String(active))
+  button.title = active ? '退出全屏预览' : '全屏预览'
+  button.setAttribute('aria-label', active ? '退出全屏预览' : '全屏预览')
+  const label = $('#file-pane-fullscreen-label')
+  if (label) label.textContent = active ? '退出全屏' : '全屏'
+}
+
+async function exitFilePreviewFullscreen() {
+  const pane = $('#file-pane')
+  document.body.classList.remove('is-file-preview-fullscreen')
+  if (pane && document.fullscreenElement === pane && document.exitFullscreen) {
+    try {
+      await document.exitFullscreen()
+    } catch {
+      /* 浏览器可能已经退出全屏 */
+    }
+  }
+  updateFileFullscreenButton()
+}
+
+async function toggleFilePreviewFullscreen() {
+  const pane = $('#file-pane')
+  if (!pane || pane.hidden) return
+  if (document.fullscreenElement === pane) {
+    await exitFilePreviewFullscreen()
+    return
+  }
+  if (document.body.classList.contains('is-file-preview-fullscreen')) {
+    await exitFilePreviewFullscreen()
+    return
+  }
+  document.body.classList.add('is-file-preview-fullscreen')
+  updateFileFullscreenButton()
+}
+
 function closeWorkspaceFile() {
+  void exitFilePreviewFullscreen()
+  finishStreamingFilePreview()
   workspacePreviewToken += 1
   state.filePreview = null
   workspacePreviewText = ''
   workspacePreviewTextLoaded = false
   releaseWorkspacePreviewUrl()
+  destroyOnlyOfficeEditor()
+  hideFilePaneSyncNotice()
   $('#file-pane').hidden = true
+  $('#file-split-resizer').hidden = true
+  $('.chat-main').classList.remove('is-file-preview')
+  hidePreviewSelection()
   $('#file-pane-editor').hidden = true
   $('#file-pane-rename').hidden = true
   $('#file-pane-body').hidden = false
@@ -1657,8 +2845,10 @@ function closeWorkspaceFile() {
   $('#thread').hidden = state.mode !== 'chat'
   $('.composer').hidden = state.mode !== 'chat'
   $('#workspace-pane').hidden = state.mode !== 'workspace'
-  $('#chat-title').textContent = state.mode === 'workspace' ? '' : state.sessionId ? '对话' : '新对话'
+  $('#chat-title').textContent = state.mode === 'workspace' ? '工作台' : state.sessionId ? '对话' : '新对话'
+  syncWorkbenchLayout()
   renderWorkspaceFiles()
+  restoreFileDockAfterPreview()
 }
 
 function beginWorkspaceEdit() {
@@ -1706,25 +2896,144 @@ async function deleteWorkspacePreview() {
   deleteWorkspaceFile(file, true)
 }
 
-function downloadWorkspacePreview() {
-  const file = state.filePreview
-  if (!file) return
+async function downloadWorkspaceFile(file) {
+  const response = await fetch(workspaceFileUrl(file), { credentials: 'same-origin' })
+  if (response.status === 401) {
+    redirectToLogin()
+    return waitForLoginRedirect()
+  }
+  if (!response.ok) throw new Error(`下载失败（HTTP ${response.status}）`)
+  const blob = await response.blob()
+  const url = URL.createObjectURL(blob)
   const link = document.createElement('a')
-  link.href = workspaceFileUrl(file)
+  link.href = url
   link.download = file.name
   document.body.appendChild(link)
   link.click()
   link.remove()
+  setTimeout(() => URL.revokeObjectURL(url), 2000)
+}
+
+function downloadWorkspacePreview() {
+  const file = state.filePreview
+  if (!file) return
+  downloadWorkspaceFile(file).catch((err) => banner(err.message, 'bad'))
+}
+
+/** 右侧工作台：团队 / 文件 / 并排。两个面板同级，团队不在文件预览里面。 */
+function bindWorkbenchTabs() {
+  const tabs = $('#workbench-tabs')
+  if (tabs) {
+    tabs.addEventListener('click', (event) => {
+      const tab = event.target.closest('[data-workbench-tab]')
+      if (!tab) return
+      state.workbenchSplit = false
+      state.workbenchTab = tab.getAttribute('data-workbench-tab') === 'file' ? 'file' : 'team'
+      syncWorkbenchLayout()
+    })
+  }
+  $('#workbench-split')?.addEventListener('click', () => {
+    state.workbenchSplit = !state.workbenchSplit
+    syncWorkbenchLayout()
+  })
+  // 子 Agent 列表：点哪一行，右边的详情窗口就切到哪个 Agent 的工作过程。
+  $('#team-list')?.addEventListener('click', (event) => {
+    const row = event.target.closest('[data-agent-select]')
+    if (!row) return
+    const childId = row.getAttribute('data-agent-select') || ''
+    if (!state.agentRuns.has(childId)) return
+    state.agentSelectedId = childId
+    renderAgentDock()
+  })
+  // 「继续派活」：把这个子 Agent 的 key 写进输入框，父 Agent 拿到后就会用 agent_task 复用它
+  $('#team-detail')?.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-agent-continue]')
+    if (!button) return
+    const key = button.getAttribute('data-agent-continue') || ''
+    const input = $('#input')
+    if (!input) return
+    const prefix = key ? `让子 Agent「${key}」继续做：` : '让刚才的子 Agent 继续做：'
+    if (!input.value.trim()) input.value = prefix
+    else if (!input.value.includes(key)) input.value = `${prefix}${input.value}`
+    input.focus()
+    input.setSelectionRange(input.value.length, input.value.length)
+    input.dispatchEvent(new Event('input', { bubbles: true }))
+  })
 }
 
 function bindWorkspaceFilePane() {
   $('#file-pane-close')?.addEventListener('click', closeWorkspaceFile)
   $('#file-pane-download')?.addEventListener('click', downloadWorkspacePreview)
+  $('#file-pane-refresh')?.addEventListener('click', () => {
+    void refreshFilePaneToCloudVersion()
+  })
+  window.addEventListener('message', (event) => {
+    // OnlyOffice 插件嵌在文档服务器里，跨域不能直接调用 EAB；令牌过期时由它
+    // 请求顶层页面重新打开当前预览，保存成功时由它请求刷新为查看态。
+    const messageType = event.data && event.data.type
+    if (messageType !== 'eab:onlyoffice:reopen' && messageType !== 'eab:onlyoffice:saved') return
+    let origin
+    try {
+      origin = new URL(event.origin)
+    } catch {
+      return
+    }
+    const expectedPort = window.location.port || (window.location.protocol === 'https:' ? '443' : '80')
+    if (origin.port !== expectedPort) return
+    const file = state.filePreview
+    if (!file || !isOfficeLike(file)) return
+    if (messageType === 'eab:onlyoffice:saved') {
+      if (String(event.data.fileId || '') !== String(file.id)) return
+      refreshWorkspaceAfterPluginSave(file, event.data)
+      return
+    }
+    const mode = onlyOfficeMode === 'edit' ? 'edit' : 'view'
+    const reopen = async () => {
+      await loadWorkspaceFiles()
+      const latest = state.files.find((item) => item.id === file.id)
+      if (!latest) {
+        banner('文件已不存在，无法重新打开预览', 'bad')
+        return
+      }
+      return openWorkspaceFile(latest.id, { mode }).catch((err) =>
+        banner(`重新打开预览失败：${err.message}`, 'bad'),
+      )
+    }
+    if (mode !== 'edit') {
+      void reopen()
+      return
+    }
+    // 与 S3 刷新共用同一水位保护：关闭旧编辑器前先抬高 cutoff，
+    // 旧会话即使因关闭触发保存回调，也不能覆盖云端新版本。
+    void api(`/api/workspace/office/${encodeURIComponent(file.id)}/refresh-guard`, {
+      method: 'POST',
+    })
+      .then(reopen)
+      .catch((err) => banner(`重新打开预览失败：${err.message}`, 'bad'))
+  })
+  $('#file-pane-fullscreen')?.addEventListener('click', () => {
+    void toggleFilePreviewFullscreen()
+  })
+  document.addEventListener('fullscreenchange', updateFileFullscreenButton)
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return
+    if (!document.body.classList.contains('is-file-preview-fullscreen')) return
+    document.body.classList.remove('is-file-preview-fullscreen')
+    updateFileFullscreenButton()
+  })
   $('#file-pane-send-dingtalk')?.addEventListener('click', () => {
     const file = state.filePreview
     if (file && file.id) sendWorkspaceFileToDingTalk(file)
   })
-  $('#file-pane-edit')?.addEventListener('click', beginWorkspaceEdit)
+  $('#file-pane-edit')?.addEventListener('click', () => {
+    const file = state.filePreview
+    if (!file) return
+    if (isOfficeLike(file)) {
+      openWorkspaceOffice(file, onlyOfficeMode === 'edit' ? 'view' : 'edit')
+      return
+    }
+    beginWorkspaceEdit()
+  })
   $('#file-pane-cancel')?.addEventListener('click', cancelWorkspaceEdit)
   $('#file-pane-save')?.addEventListener('click', saveWorkspaceEdit)
   $('#file-pane-delete')?.addEventListener('click', deleteWorkspacePreview)
@@ -1895,7 +3204,7 @@ async function showMemories() {
       : '<span class="hint">还没有记忆。把偏好或长期事项写下来，确认后下轮对话会自动带上。</span>'
     overlay.innerHTML = `<div class="modal">
       <div class="modal-head"><h3>我的记忆</h3><button class="modal-x" type="button">×</button></div>
-      <div class="hint">只有你确认过的记忆会进入对话上下文；模型不能自己写长期记忆。</div>
+      <div class="hint">只有确认过的记忆会进入对话上下文；模型可提交团队学习候选，但需要管理员确认后才会全公司生效。</div>
       <div class="modal-section-title">已有记忆 <span>${items.length} 条</span></div>
       <div class="mini-list">${rows}</div>
       <div class="field-stack" style="padding-top:12px">
@@ -2073,6 +3382,19 @@ function showPasswordModal() {
 
 /* ---------------- 工作台：对话 / 个人插件 ---------------- */
 
+/** 顶部标题跟随当前页面：工作台显示「工作台」，对话显示会话标题（没有就显示 对话 / 新对话） */
+function syncChatTitle() {
+  const el = $('#chat-title')
+  if (!el) return
+  if (state.mode === 'workspace') {
+    el.textContent = '工作台'
+    return
+  }
+  const sessions = Array.isArray(state.sessions) ? state.sessions : []
+  const current = state.sessionId ? sessions.find((item) => item.id === state.sessionId) : null
+  el.textContent = (current && current.title) || (state.sessionId ? '对话' : '新对话')
+}
+
 function setChatMode(mode) {
   if (state.filePreview) closeWorkspaceFile()
   const next = mode === 'workspace' ? 'workspace' : 'chat'
@@ -2088,10 +3410,12 @@ function setChatMode(mode) {
     button.setAttribute('aria-selected', active ? 'true' : 'false')
   }
   if (next === 'workspace') {
-    $('#chat-title').textContent = ''
-    loadMyPlugins()
+    syncChatTitle()
+    if (state.workspaceKind === 'skills') loadMySkills()
+    else loadMyPlugins()
   } else {
-    $('#chat-title').textContent = state.sessionId ? '对话' : '新对话'
+    syncChatTitle()
+    syncThreadScrollState()
   }
   persistChatLocation()
 }
@@ -2112,6 +3436,7 @@ async function loadMyPlugins() {
       state.pluginPageKey = null
     }
     renderMyPluginWorkspace()
+    warmMyPluginKernel(data)
   } catch (err) {
     rail.innerHTML = `<div class="plugin-empty bad">读取插件失败：${esc(err.message)}</div>`
     detail.innerHTML = `<div class="plugin-empty bad">读取插件失败：${esc(err.message)}</div>`
@@ -2137,6 +3462,16 @@ function myPluginStatus(plugin) {
   return { label: '已启用', tone: 'ok' }
 }
 
+/** 个人插件操作按当前账号角色授权；权限数据未加载时先按锁定处理。 */
+function myPluginCan(action) {
+  return state.pluginData?.permissions?.[action] === true
+}
+
+function myPluginLockedNote(action) {
+  const labels = { install: '安装个人插件', configure: '启停个人插件', uninstall: '卸载个人插件' }
+  return `<div class="plugin-note plugin-permission-note">当前账号的角色没有「${labels[action] || action}」权限，操作已锁定；请联系管理员在控制台「角色管理」里授权。</div>`
+}
+
 function myPluginStatusPill(plugin) {
   const status = myPluginStatus(plugin)
   return `<span class="pill ${status.tone}">${esc(status.label)}</span>`
@@ -2144,6 +3479,72 @@ function myPluginStatusPill(plugin) {
 
 function myPluginSourceLabel(plugin) {
   return MY_PLUGIN_SOURCE_LABEL[plugin.install?.source] || plugin.install?.source || '个人安装'
+}
+
+let myPluginKernelWarmStarted = false
+const prefetchedMyPluginAssets = new Set()
+
+/** 个人插件 client bundle 的稳定 URL；v= 版本、h= 校验和，同版本覆盖更新也能失效。 */
+function myPluginClientAssetUrl(plugin, page) {
+  const path = String(page.file || '')
+    .split('/')
+    .map((part) => encodeURIComponent(part))
+    .join('/')
+  const version = encodeURIComponent(plugin.version || '')
+  const checksum = encodeURIComponent(plugin.checksum || '')
+  const versionKey = version ? `&v=${version}` : ''
+  const checksumKey = checksum ? `&h=${checksum}` : ''
+  return `/plugins/assets/${encodeURIComponent(plugin.id)}/${path}?scope=user${versionKey}${checksumKey}`
+}
+
+function prefetchMyPluginClientBundles(plugins) {
+  for (const plugin of plugins || []) {
+    if (!plugin.valid || !plugin.enabled) continue
+    for (const page of plugin.pages || []) {
+      if ((page.kind || 'html') !== 'dsh-client') continue
+      const url = myPluginClientAssetUrl(plugin, page)
+      if (prefetchedMyPluginAssets.has(url)) continue
+      prefetchedMyPluginAssets.add(url)
+      fetch(url, { credentials: 'include', cache: 'force-cache' }).catch(() => {})
+    }
+  }
+}
+
+function warmMyPluginKernel(data) {
+  if (!data || !data.companyId) return
+  const run = () => {
+    // 共享内核只启动一次；每轮个人插件列表刷新只补拉新增/升级的 bundle。
+    if (!myPluginKernelWarmStarted) {
+      myPluginKernelWarmStarted = true
+      const frame = document.createElement('iframe')
+      const params = new URLSearchParams({ warm: '1', scope: 'user', company: data.companyId || '' })
+      if (currentAs()) params.set('as', currentAs())
+      frame.src = `/plugin-kernel.html?${params.toString()}`
+      frame.title = 'DSH 插件内核预热'
+      frame.tabIndex = -1
+      frame.setAttribute('aria-hidden', 'true')
+      frame.style.cssText = 'position:absolute;width:1px;height:1px;left:-10px;top:-10px;opacity:0;pointer-events:none;border:0'
+      let cleaned = false
+      const cleanup = () => {
+        if (cleaned) return
+        cleaned = true
+        frame.remove()
+        window.removeEventListener('message', onMessage)
+      }
+      const onMessage = (event) => {
+        if (event.origin !== location.origin) return
+        if (event.source !== frame.contentWindow) return
+        if (event.data && event.data.type === 'eab-plugin-kernel-warm') cleanup()
+      }
+      window.addEventListener('message', onMessage)
+      frame.addEventListener('load', () => setTimeout(cleanup, 8000), { once: true })
+      document.body.appendChild(frame)
+    }
+
+    prefetchMyPluginClientBundles(data.plugins || [])
+  }
+  if (typeof window.requestIdleCallback === 'function') window.requestIdleCallback(run, { timeout: 2000 })
+  else setTimeout(run, 800)
 }
 
 function myPluginPageUrl(data, plugin, page) {
@@ -2157,6 +3558,7 @@ function myPluginPageUrl(data, plugin, page) {
       title: page.title || plugin.name || plugin.id,
       scope: 'user',
     })
+    if (plugin.checksum) params.set('h', plugin.checksum)
     if (currentAs()) params.set('as', currentAs())
     return `/plugin-kernel.html?${params.toString()}`
   }
@@ -2188,21 +3590,23 @@ function myPluginRailHtml(data) {
   const plugins = data.plugins || state.plugins || []
   const stats = data.stats || { installed: plugins.length, enabled: 0, tools: 0 }
   const who = state.me?.person?.name || '个人空间'
-  return `<div class="plugin-scope-block">
-      <span class="plugin-scope-eyebrow">个人空间</span>
-      <strong>${esc(who)}</strong>
-      <small>只显示你自己安装的插件</small>
+  return `<div class="plugin-rail-top">
+      <div class="plugin-scope-block">
+        <span class="plugin-scope-eyebrow">个人空间</span>
+        <strong>${esc(who)}</strong>
+        <small>只显示你自己安装的插件</small>
+      </div>
+      <div class="plugin-rail-metrics">
+        <div><strong>${stats.installed}</strong><span>已装</span></div>
+        <div><strong>${stats.enabled}</strong><span>启用</span></div>
+        <div><strong>${stats.tools}</strong><span>工具</span></div>
+      </div>
+      <div class="plugin-rail-actions">
+        <button class="btn primary sm" type="button" data-my-plugin-install ${myPluginCan('install') ? '' : 'disabled title="当前角色没有安装个人插件权限"'}>＋ 安装插件</button>
+        <button class="btn ghost sm" type="button" data-my-plugin-refresh>刷新</button>
+      </div>
     </div>
-    <div class="plugin-rail-metrics">
-      <div><strong>${stats.installed}</strong><span>已装</span></div>
-      <div><strong>${stats.enabled}</strong><span>启用</span></div>
-      <div><strong>${stats.tools}</strong><span>工具</span></div>
-    </div>
-    <div class="plugin-rail-actions">
-      <button class="btn ghost sm" type="button" data-my-plugin-install>安装插件…</button>
-      <button class="btn ghost sm" type="button" data-my-plugin-refresh>刷新</button>
-    </div>
-    <div class="plugin-rail-head">已安装 <span class="muted">${plugins.length}</span></div>
+    <div class="plugin-rail-head">已安装 <span class="muted">${plugins.length}</span><span class="plugin-rail-head-hint" title="点击卡片切换下方详情" aria-label="点击卡片切换下方详情"><svg aria-hidden="true" width="10" height="10" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6.2" stroke="currentColor" stroke-width="1.2"/><path d="M8 7.4v3.6" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/><circle cx="8" cy="4.6" r=".9" fill="currentColor"/></svg></span></div>
     <div class="plugin-rail-list">
       ${plugins.length ? plugins.map(myPluginRailItem).join('') : '<div class="plugin-empty">还没有个人插件</div>'}
     </div>`
@@ -2251,7 +3655,7 @@ function myPluginOverviewBody(data, plugin) {
       <h3>运行状态</h3>
       <div class="plugin-kv">
         <div><span>启用状态</span><strong>${esc(myPluginStatus(plugin).label)}</strong></div>
-        <div><span>对话模型</span><strong>${tools.length ? `${tools.length} 个工具已注册` : '没有工具，只提供页面'}</strong></div>
+        <div><span>对话模型</span><strong>${tools.length ? `${tools.length} 个工具 · ${tools.filter((tool) => tool.available).length} 个已授权` : '没有工具，只提供页面'}</strong></div>
         <div><span>DSH 宿主</span><strong>${plugin.format === 'dsh' ? (plugin.host?.loaded ? '已运行' : plugin.host?.error || '未运行') : '不需要'}</strong></div>
       </div>
       <div class="plugin-note">停用或卸载个人安装后，这个插件由个人安装贡献的工具会从你的工具列表移除；如果公司也安装并启用了同一插件，公司那份仍可能对全员可用。</div>
@@ -2267,8 +3671,8 @@ function myPluginPagesBody(data, plugin) {
   if (!plugin.enabled) {
     return `<div class="plugin-page-blocked">
       <div><strong>插件已停用</strong><span>启用后才能在个人工作台里打开页面。</span></div>
-      <button class="btn primary sm" type="button" data-my-plugin-toggle data-next-enabled="1">启用插件</button>
-    </div>`
+      <button class="btn primary sm" type="button" data-my-plugin-toggle data-next-enabled="1" ${myPluginCan('configure') ? '' : 'disabled title="当前角色没有启停个人插件权限"'}>启用插件</button>
+    </div>${myPluginCan('configure') ? '' : myPluginLockedNote('configure')}`
   }
   if (!pages.length) {
     return `<div class="plugin-note">这个插件没有声明页面，只提供工具或后台能力。</div>`
@@ -2292,13 +3696,13 @@ function myPluginToolsBody(plugin) {
   if (!plugin.enabled) {
     return `<div class="plugin-page-blocked">
       <div><strong>插件已停用</strong><span>启用后，插件注册的工具才会出现在对话模型的工具列表里。</span></div>
-      <button class="btn primary sm" type="button" data-my-plugin-toggle data-next-enabled="1">启用插件</button>
-    </div>`
+      <button class="btn primary sm" type="button" data-my-plugin-toggle data-next-enabled="1" ${myPluginCan('configure') ? '' : 'disabled title="当前角色没有启停个人插件权限"'}>启用插件</button>
+    </div>${myPluginCan('configure') ? '' : myPluginLockedNote('configure')}`
   }
   if (!tools.length) {
     return `<div class="plugin-note">这个插件没有注册工具；它的能力可能在页面里，或者只提供宿主通道。</div>`
   }
-  return `<div class="plugin-note">这些工具已经注册给对话模型，由个人安装提供。停用或卸载个人安装后会从你的个人工具集移除；公司级安装的同一插件不受影响。</div>
+  return `<div class="plugin-note">这些是你个人安装的插件注册的工具，只有你能看到、也只有你能用，不需要角色授权。停用或卸载个人安装后会从你的个人工具集移除；公司级安装的同一插件不受影响。</div>
     <div class="ws-tool-list">
       ${tools
         .map((tool) => {
@@ -2309,7 +3713,7 @@ function myPluginToolsBody(plugin) {
             .join('')
           return `<article class="ws-tool-row">
             <div class="ws-tool-main">
-              <div class="ws-tool-head"><code>${esc(tool.name)}</code><span class="pill ${tool.available ? 'ok' : 'warn'}">${tool.available ? '已注册给模型' : '当前账号无调用权限'}</span></div>
+              <div class="ws-tool-head"><code>${esc(tool.name)}</code><span class="pill ${tool.available ? 'ok' : 'warn'}">${tool.available ? '本人可用' : '当前账号不可用'}</span></div>
               <p>${esc(tool.description || '没有描述')}</p>
               <div class="ws-tool-params">${params || '<span class="muted">无参数</span>'}</div>
             </div>
@@ -2355,13 +3759,15 @@ function myPluginSettingsBody(plugin) {
       : `<div class="plugin-note">这是静态页面插件，不需要 DSH 宿主。</div>`
   return `<div class="plugin-setting-row">
       <div><strong>个人启用</strong><span>只影响你自己；停用后个人安装的页面入口和工具会收起，公司安装的同一插件不受影响。</span></div>
-      <button class="btn ${plugin.enabled ? 'ghost' : 'primary'} sm" type="button" data-my-plugin-toggle data-next-enabled="${plugin.enabled ? '0' : '1'}">${plugin.enabled ? '停用' : '启用'}</button>
+      <button class="btn ${plugin.enabled ? 'ghost' : 'primary'} sm" type="button" data-my-plugin-toggle data-next-enabled="${plugin.enabled ? '0' : '1'}" ${myPluginCan('configure') ? '' : 'disabled title="当前角色没有启停个人插件权限"'}>${plugin.enabled ? '停用' : '启用'}</button>
     </div>
+    ${myPluginCan('configure') ? '' : myPluginLockedNote('configure')}
     ${hostBlock}
     <div class="plugin-danger-zone">
       <div><strong>卸载个人插件</strong><span>只解除你自己的安装。公司级安装和别人的工作台不受影响。</span></div>
-      <button class="btn ghost sm danger-text" type="button" data-my-plugin-uninstall>卸载…</button>
-    </div>`
+      <button class="btn ghost sm danger-text" type="button" data-my-plugin-uninstall ${myPluginCan('uninstall') ? '' : 'disabled title="当前角色没有卸载个人插件权限"'}>卸载…</button>
+    </div>
+    ${myPluginCan('uninstall') ? '' : myPluginLockedNote('uninstall')}`
 }
 
 function myPluginDetailHtml(data, plugin) {
@@ -2394,6 +3800,13 @@ function myPluginDetailHtml(data, plugin) {
   const pageAction = (plugin.pages || []).length
     ? `<button class="btn ghost sm" type="button" data-my-plugin-page-first ${plugin.enabled ? '' : 'disabled title="先启用插件"'}>打开页面</button>`
     : ''
+  const lockedActions = [
+    myPluginCan('configure') ? '' : '启停个人插件',
+    myPluginCan('uninstall') ? '' : '卸载个人插件',
+  ].filter(Boolean)
+  const permissionNote = lockedActions.length
+    ? `<div class="plugin-note plugin-permission-note">当前账号的角色没有「${lockedActions.join('」「')}」权限，相关按钮已锁定；请联系管理员在控制台「角色管理」里授权。</div>`
+    : ''
   return `<section class="panel plugin-detail">
     <div class="plugin-detail-head">
       <div class="plugin-title">
@@ -2405,10 +3818,11 @@ function myPluginDetailHtml(data, plugin) {
       </div>
       <div class="plugin-detail-actions">
         ${pageAction}
-        <button class="btn ghost sm" type="button" data-my-plugin-toggle data-next-enabled="${plugin.enabled ? '0' : '1'}">${plugin.enabled ? '停用' : '启用'}</button>
-        <button class="btn ghost sm danger-text" type="button" data-my-plugin-uninstall>卸载…</button>
+        <button class="btn ghost sm" type="button" data-my-plugin-toggle data-next-enabled="${plugin.enabled ? '0' : '1'}" ${myPluginCan('configure') ? '' : 'disabled title="当前角色没有启停个人插件权限"'}>${plugin.enabled ? '停用' : '启用'}</button>
+        <button class="btn ghost sm danger-text" type="button" data-my-plugin-uninstall ${myPluginCan('uninstall') ? '' : 'disabled title="当前角色没有卸载个人插件权限"'}>卸载…</button>
       </div>
     </div>
+    ${permissionNote}
     <div class="plugin-tabs" role="tablist">${tabHtml}</div>
     <div id="plugin-tab-body">${body}</div>
   </section>`
@@ -2428,9 +3842,10 @@ function myPluginWelcomeHtml(data) {
       <div><strong>${stats.tools}</strong><span>可用工具</span></div>
     </div>
     <div class="plugin-welcome-actions">
-      <button class="btn primary" type="button" data-my-plugin-install>安装个人插件</button>
+      <button class="btn primary" type="button" data-my-plugin-install ${myPluginCan('install') ? '' : 'disabled title="当前角色没有安装个人插件权限"'}>安装个人插件</button>
       <button class="btn ghost" type="button" data-my-plugin-refresh>刷新</button>
     </div>
+    ${myPluginCan('install') ? '' : myPluginLockedNote('install')}
   </div>`
 }
 
@@ -2565,6 +3980,571 @@ function bindMyPluginWorkspace() {
   }
 }
 
+/* ---------------- 工作台：个人技能 ---------------- */
+
+const SKILL_LEVEL_LABEL = {
+  L0: 'L0 纯提示词',
+  L1: 'L1 只读工具',
+  L2: 'L2 写入工具',
+  L3: 'L3 页面 / 后台',
+}
+
+const SKILL_RISK_LABEL = {
+  low: '低风险',
+  medium: '中风险',
+  high: '高风险',
+  critical: '严重风险',
+}
+
+function mySkillRiskTone(risk) {
+  if (risk === 'low') return 'ok'
+  if (risk === 'medium') return 'warn'
+  return 'danger'
+}
+
+function mySkillStatus(skill) {
+  if (!skill.valid) return { label: '已拦截', tone: 'danger' }
+  if (!skill.enabled) return { label: '已停用', tone: 'warn' }
+  if (skill.risk === 'medium') return { label: '已启用 · 中风险', tone: 'warn' }
+  return { label: '已启用', tone: 'ok' }
+}
+
+function mySkillCan(action) {
+  return state.skillData?.permissions?.[action] === true
+}
+
+function mySkillLockedNote(action) {
+  const labels = { install: '安装个人技能', configure: '启停个人技能', uninstall: '卸载个人技能' }
+  return `<div class="plugin-note plugin-permission-note">当前账号的角色没有「${labels[action] || action}」权限，操作已锁定；请联系管理员在控制台「角色管理」里授权。</div>`
+}
+
+function mySkillStatusPill(skill) {
+  const status = mySkillStatus(skill)
+  return `<span class="pill ${status.tone}">${esc(status.label)}</span>`
+}
+
+function mySkillRailItem(skill) {
+  const status = mySkillStatus(skill)
+  const active = skill.id === state.skillSelected
+  return `<button class="plugin-rail-item ${active ? 'is-active' : ''} ${skill.enabled && skill.valid ? '' : 'is-muted'}" type="button" data-my-skill-select="${esc(skill.id)}">
+    <span class="plugin-rail-avatar ${skill.enabled && skill.valid ? '' : 'ghost'}">${esc((skill.name || skill.id).slice(0, 1).toUpperCase())}</span>
+    <span class="plugin-rail-text">
+      <strong>${esc(skill.name || skill.id)}</strong>
+      <small>${esc(skill.level || 'L0')} · v${esc(skill.version || '—')} · ${esc(status.label)}</small>
+    </span>
+    <span class="plugin-rail-dot ${status.tone === 'ok' ? 'ok' : status.tone === 'warn' ? 'warn' : 'bad'}" aria-hidden="true"></span>
+  </button>`
+}
+
+function mySkillRailHtml(data) {
+  const skills = data.skills || state.skills || []
+  const stats = data.stats || { installed: skills.length, enabled: 0, valid: 0, blocked: 0 }
+  const who = state.me?.person?.name || '个人空间'
+  return `<div class="plugin-rail-top">
+      <div class="plugin-scope-block">
+        <span class="plugin-scope-eyebrow">个人技能</span>
+        <strong>${esc(who)}</strong>
+        <small>只显示你自己安装的技能</small>
+      </div>
+      <div class="plugin-rail-metrics">
+        <div><strong>${stats.installed}</strong><span>已装</span></div>
+        <div><strong>${stats.enabled}</strong><span>启用</span></div>
+        <div><strong>${stats.blocked || 0}</strong><span>拦截</span></div>
+      </div>
+      <div class="plugin-rail-actions">
+        <button class="btn primary sm" type="button" data-my-skill-install ${mySkillCan('install') ? '' : 'disabled title="当前角色没有安装个人技能权限"'}>＋ 安装技能</button>
+        <button class="btn ghost sm" type="button" data-my-skill-refresh>刷新</button>
+      </div>
+    </div>
+    <div class="plugin-rail-head">已安装 <span class="muted">${skills.length}</span><span class="plugin-rail-head-hint" title="点击卡片切换下方详情" aria-label="点击卡片切换下方详情"><svg aria-hidden="true" width="10" height="10" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6.2" stroke="currentColor" stroke-width="1.2"/><path d="M8 7.4v3.6" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/><circle cx="8" cy="4.6" r=".9" fill="currentColor"/></svg></span></div>
+    <div class="plugin-rail-list">
+      ${skills.length ? skills.map(mySkillRailItem).join('') : '<div class="plugin-empty">还没有个人技能</div>'}
+    </div>`
+}
+
+function mySkillFindingsHtml(skill) {
+  const findings = skill.findings || []
+  if (!findings.length) {
+    return `<div class="plugin-note">安装扫描、启用检查和文件指纹校验均通过；技能只注入业务说明，不执行脚本。</div>`
+  }
+  return `<div class="ws-tool-list">
+    ${findings
+      .slice(0, 12)
+      .map(
+        (finding) => `<article class="ws-tool-row">
+          <div class="ws-tool-main">
+            <div class="ws-tool-head"><code>${esc(finding.code)}</code><span class="pill ${finding.severity === 'critical' || finding.severity === 'high' ? 'danger' : 'warn'}">${esc(finding.category || finding.severity)}</span></div>
+            <p>${esc(finding.message)}</p>
+            <div class="ws-tool-params"><span class="chip">${esc(finding.file)}:${esc(finding.line)}</span>${finding.excerpt ? `<span class="chip">${esc(finding.excerpt.slice(0, 80))}</span>` : ''}</div>
+          </div>
+        </article>`,
+      )
+      .join('')}
+  </div>`
+}
+
+function mySkillDetailHtml(data, skill) {
+  const status = mySkillStatus(skill)
+  const scopes = skill.scopes || []
+  const tools = skill.tools || []
+  const triggers = skill.triggers || []
+  const references = skill.references || []
+  const install = skill.install || {}
+  const blocked = !skill.valid
+  return `<section class="panel plugin-detail">
+    <div class="plugin-detail-head">
+      <div class="plugin-title">
+        <span class="plugin-avatar">${esc((skill.name || skill.id).slice(0, 1).toUpperCase())}</span>
+        <div class="plugin-title-text">
+          <div class="plugin-title-row"><h2>${esc(skill.name || skill.id)}</h2><span class="plugin-format-badge">SKILL</span><span class="pill ${mySkillRiskTone(skill.risk)}">${esc(SKILL_RISK_LABEL[skill.risk] || skill.risk)}</span>${mySkillStatusPill(skill)}</div>
+          <div class="plugin-subline"><span>v${esc(skill.version || '—')}</span><span>${esc(skill.author || '未知作者')}</span><span>${esc(SKILL_LEVEL_LABEL[skill.level] || skill.level)}</span></div>
+        </div>
+      </div>
+      <div class="plugin-detail-actions">
+        <button class="btn ghost sm" type="button" data-my-skill-toggle data-next-enabled="${skill.enabled ? '0' : '1'}" ${mySkillCan('configure') && !blocked ? '' : 'disabled title="当前角色没有启停个人技能权限"'}>${skill.enabled ? '停用' : '启用'}</button>
+        <button class="btn ghost sm danger-text" type="button" data-my-skill-uninstall ${mySkillCan('uninstall') ? '' : 'disabled title="当前角色没有卸载个人技能权限"'}>卸载…</button>
+      </div>
+    </div>
+    <div class="plugin-block">
+      <h3>技能概况</h3>
+      <div class="plugin-kv">
+        <div><span>技能 ID</span><strong class="mono">${esc(skill.id)}</strong></div>
+        <div><span>能力等级</span><strong>${esc(SKILL_LEVEL_LABEL[skill.level] || skill.level)}</strong></div>
+        <div><span>声明权限</span><strong>${esc(scopes.join('、') || '无')}</strong></div>
+        <div><span>触发词</span><strong>${esc(triggers.join('、') || '无')}</strong></div>
+        <div><span>声明工具</span><strong>${esc(tools.join('、') || '无')}</strong></div>
+        <div><span>安装范围</span><strong>个人安装（只影响我）</strong></div>
+        <div><span>安装方式</span><strong>${esc(install.source === 'browser-dir' ? '本机文件夹' : install.source || '个人安装')}</strong></div>
+        <div><span>安装时间</span><strong>${esc(workspaceFileDate(install.installedAt))}</strong></div>
+        <div><span>校验和</span><span class="mono">${esc(skill.checksum || '—')}</span></div>
+      </div>
+      <div class="plugin-note">${esc(skill.description || '没有技能说明')}</div>
+    </div>
+    <div class="plugin-block">
+      <h3>安全与隔离</h3>
+      ${blocked ? `<div class="plugin-page-blocked"><strong>技能已被拦截</strong><span>${esc(skill.error || '技能包没有通过安全扫描')}。检查 .quarantine 中的记录，修复后重新安装。</span></div>` : ''}
+      <div class="plugin-kv">
+        <div><span>风险结论</span><strong>${esc(SKILL_RISK_LABEL[skill.risk] || skill.risk)}</span></div>
+        <div><span>checksum</span><span class="mono">${esc(skill.checksum || '—')}</span></div>
+        <div><span>加载状态</span><strong>${skill.valid ? '扫描通过' : '拒绝加载'}</strong></div>
+        <div><span>可执行脚本</span><strong>第一版禁止</strong></div>
+      </div>
+      ${mySkillFindingsHtml(skill)}
+    </div>
+    <div class="plugin-block">
+      <h3>引用文件</h3>
+      <div class="plugin-page-list"><span>references/assets</span><div>${references.length ? references.map((file) => `<span class="chip">${esc(file)}</span>`).join('') : '<span class="muted">没有引用或素材文件</span>'}</div></div>
+    </div>
+    <div class="plugin-block">
+      <h3>运行状态</h3>
+      <div class="plugin-kv">
+        <div><span>启用状态</span><strong>${esc(status.label)}</strong></div>
+        <div><span>对话注入</span><strong>${skill.valid && skill.enabled ? '已注入业务说明' : '未注入'}</strong></div>
+        <div><span>工具调用</span><strong>仍受 agent:tool:invoke 与工具白名单约束</strong></div>
+      </div>
+      <div class="plugin-danger-zone">
+        <div><strong>卸载个人技能</strong><span>只解除你自己的安装，不删除技能目录、审计和隔离记录。</span></div>
+        <button class="btn ghost sm danger-text" type="button" data-my-skill-uninstall ${mySkillCan('uninstall') ? '' : 'disabled title="当前角色没有卸载个人技能权限"'}>卸载…</button>
+      </div>
+    </div>
+  </section>`
+}
+
+function mySkillWelcomeHtml(data) {
+  const skills = data.skills || []
+  const stats = data.stats || { installed: 0, enabled: 0, valid: 0, blocked: 0 }
+  const empty = skills.length === 0
+  return `<div class="plugin-welcome">
+    <div class="plugin-welcome-mark">S</div>
+    <h2>${empty ? '还没有个人技能' : '从左侧选择一个技能'}</h2>
+    <p>${empty ? '技能包由 skill.json 和 SKILL.md 组成；安装前会先扫描破坏命令、越权指令、凭证读取和外发行为，高风险包直接拦截。' : '左侧列出的是你本人安装的技能，点一个可以查看风险结论、引用文件、启停和卸载。'}</p>
+    <div class="plugin-welcome-stats">
+      <div><strong>${stats.installed}</strong><span>已安装</span></div>
+      <div><strong>${stats.enabled}</strong><span>已启用</span></div>
+      <div><strong>${stats.blocked || 0}</strong><span>被拦截</span></div>
+    </div>
+    <div class="plugin-welcome-actions">
+      <button class="btn primary" type="button" data-my-skill-install ${mySkillCan('install') ? '' : 'disabled title="当前角色没有安装个人技能权限"'}>安装个人技能</button>
+      <button class="btn ghost" type="button" data-my-skill-refresh>刷新</button>
+    </div>
+    ${mySkillCan('install') ? '' : mySkillLockedNote('install')}
+  </div>`
+}
+
+function renderMySkillWorkspace() {
+  const rail = $('#my-plugin-rail')
+  const detail = $('#my-plugin-detail')
+  if (!rail || !detail) return
+  const data = state.skillData || { skills: state.skills, stats: null }
+  rail.innerHTML = mySkillRailHtml(data)
+  const skill = (data.skills || []).find((item) => item.id === state.skillSelected)
+  detail.innerHTML = skill ? mySkillDetailHtml(data, skill) : mySkillWelcomeHtml(data)
+  bindMySkillWorkspace()
+}
+
+async function loadMySkills() {
+  const rail = $('#my-plugin-rail')
+  const detail = $('#my-plugin-detail')
+  if (!rail || !detail) return
+  rail.innerHTML = '<div class="plugin-empty muted">正在读取技能…</div>'
+  detail.innerHTML = '<div class="plugin-empty muted">正在读取技能…</div>'
+  try {
+    const data = await api(`/api/my/skills${qs()}`)
+    state.skillData = data
+    state.skills = Array.isArray(data.skills) ? data.skills : []
+    if (!state.skillSelected || !state.skills.some((item) => item.id === state.skillSelected)) {
+      state.skillSelected = state.skills[0]?.id ?? null
+    }
+    renderMySkillWorkspace()
+  } catch (err) {
+    rail.innerHTML = `<div class="plugin-empty bad">读取技能失败：${esc(err.message)}</div>`
+    detail.innerHTML = `<div class="plugin-empty bad">读取技能失败：${esc(err.message)}</div>`
+  }
+}
+
+function openMySkillUninstall(skill) {
+  const overlay = document.createElement('div')
+  overlay.className = 'modal-overlay'
+  overlay.innerHTML = `<div class="modal plugin-install-modal">
+    <div class="modal-head">
+      <div><h3>卸载「${esc(skill.name || skill.id)}」</h3><span class="muted">只解除你自己的个人安装</span></div>
+      <button class="modal-x" type="button">×</button>
+    </div>
+    <div class="plugin-danger-zone" style="margin-top:4px">
+      <div><strong>确认从个人工作台卸载？</strong><span>技能目录、审计记录和隔离记录都会保留；之后可以重新安装。</span></div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn ghost" type="button" data-my-skill-uninstall-cancel>取消</button>
+      <button class="btn danger" type="button" data-my-skill-uninstall-confirm>卸载</button>
+    </div>
+  </div>`
+  document.body.appendChild(overlay)
+  const close = () => overlay.remove()
+  overlay.addEventListener('click', (event) => {
+    if (event.target === overlay || event.target.closest('[data-my-skill-uninstall-cancel]') || event.target.closest('.modal-x')) close()
+  })
+  overlay.querySelector('[data-my-skill-uninstall-confirm]').addEventListener('click', async (event) => {
+    const button = event.currentTarget
+    button.disabled = true
+    try {
+      await api(`/api/my/skills/${encodeURIComponent(skill.id)}${qs()}`, { method: 'DELETE' })
+      close()
+      state.skillSelected = null
+      await loadMySkills()
+      banner('已卸载个人技能', 'ok')
+    } catch (err) {
+      button.disabled = false
+      banner(`卸载失败：${err.message}`, 'bad')
+    }
+  })
+}
+
+function showSkillInstall() {
+  const overlay = document.createElement('div')
+  overlay.className = 'modal-overlay'
+  overlay.innerHTML = `<div class="modal plugin-install-modal">
+    <div class="modal-head install-modal-head">
+      <div><span class="install-eyebrow">PERSONAL SKILL INSTALLER</span><h3>安装个人技能</h3><span class="muted">只影响你自己</span></div>
+      <button class="modal-x" type="button">×</button>
+    </div>
+    <div class="install-source-tabs" role="tablist" aria-label="个人技能安装来源">
+      <button class="install-source-tab is-active" type="button" data-si-source="browser-dir">
+        <span class="install-source-icon">⌂</span><span><strong>本机文件夹</strong><small>选择已有技能包</small></span>
+      </button>
+      <button class="install-source-tab" type="button" data-si-source="git">
+        <span class="install-source-icon">◐</span><span><strong>GitHub 仓库</strong><small>仓库 + 分支 / 子目录</small></span>
+      </button>
+      <button class="install-source-tab" type="button" data-si-source="http">
+        <span class="install-source-icon">⇣</span><span><strong>压缩包 URL</strong><small>tar.gz / zip 直链</small></span>
+      </button>
+    </div>
+    <div class="install-panel" data-si-panel="browser-dir">
+      <input id="si-folder-input" type="file" webkitdirectory directory multiple hidden />
+      <div class="plugin-install-actions">
+        <button class="btn ghost" type="button" id="si-pick-folder">选择技能文件夹…</button>
+        <span class="muted" id="si-folder-name">未选择</span>
+      </div>
+    </div>
+    <div class="install-panel is-hidden" data-si-panel="git">
+      <div class="install-grid">
+        <label class="install-field install-span-2"><span class="install-label">GitHub 仓库</span>
+          <input id="si-git-repo" placeholder="owner/repo，例如 Jydsh/eab-skills" autocomplete="off" />
+        </label>
+        <label class="install-field"><span class="install-label">分支 / 标签</span>
+          <input id="si-git-ref" placeholder="留空 = 默认分支" autocomplete="off" />
+        </label>
+        <label class="install-field"><span class="install-label">仓库内子目录</span>
+          <input id="si-git-subdir" placeholder="可选，例如 skills/fixed-field-edit" autocomplete="off" />
+        </label>
+      </div>
+    </div>
+    <div class="install-panel is-hidden" data-si-panel="http">
+      <label class="install-field"><span class="install-label">技能压缩包 URL</span>
+        <input id="si-http-url" placeholder="https://example.com/skills/fixed-field-edit.tar.gz" autocomplete="off" />
+      </label>
+    </div>
+    <div class="install-options">
+      <label class="install-check">
+        <input type="checkbox" id="si-overwrite" />
+        <span><strong>覆盖同名技能</strong><small>已安装同一技能 id 时替换为新包；不勾选会提示冲突。</small></span>
+      </label>
+    </div>
+    <div class="install-flow">
+      <span id="si-flow-first">① 读取文件夹</span><i>→</i><span>② 静态安全扫描</span><i>→</i><span>③ 安装到个人</span>
+      <div class="install-note" id="si-note"></div>
+    </div>
+    <div class="install-progress" id="si-progress" hidden aria-live="polite">
+      <div class="install-progress-track"><span class="install-progress-bar"></span></div>
+      <div class="install-progress-meta"><span id="si-progress-text">正在安装…</span><span id="si-progress-time" class="mono">0s</span></div>
+    </div>
+    <div class="modal-state" id="si-state"></div>
+    <div class="modal-actions">
+      <button class="btn ghost" type="button" data-si-cancel>取消</button>
+      <button class="btn primary" type="button" id="si-submit" disabled>安装技能</button>
+    </div>
+  </div>`
+  document.body.appendChild(overlay)
+  const close = () => {
+    if (progressTimer) clearInterval(progressTimer)
+    overlay.remove()
+  }
+  const stateEl = overlay.querySelector('#si-state')
+  const submit = overlay.querySelector('#si-submit')
+  const nameEl = overlay.querySelector('#si-folder-name')
+  const noteEl = overlay.querySelector('#si-note')
+  const flowFirst = overlay.querySelector('#si-flow-first')
+  const progressEl = overlay.querySelector('#si-progress')
+  const progressText = overlay.querySelector('#si-progress-text')
+  const progressTime = overlay.querySelector('#si-progress-time')
+  const tabs = Array.from(overlay.querySelectorAll('[data-si-source]'))
+  const panels = Array.from(overlay.querySelectorAll('[data-si-panel]'))
+  let entries = []
+  let source = 'browser-dir'
+  let progressTimer = null
+  let progressStartedAt = 0
+
+  const sourceNotes = {
+    'browser-dir': '本机文件夹：浏览器只上传文件副本，服务端落到临时目录扫描；安装后立即删除临时目录。',
+    git: 'GitHub：下载仓库 tarball 后解包；仓库里必须有 skill.json 和 SKILL.md。只取内容，不执行仓库脚本。',
+    http: '压缩包 URL：只支持 tar.gz / zip；解包后照常静态扫描。默认只允许公网 https。',
+  }
+  const setInstalling = (busy) => {
+    for (const control of overlay.querySelectorAll('.install-source-tab, .install-field input, .install-check input, #si-pick-folder')) control.disabled = busy
+  }
+  const stopProgressClock = () => {
+    if (progressTimer) clearInterval(progressTimer)
+    progressTimer = null
+  }
+  const startProgress = (text) => {
+    stopProgressClock()
+    progressStartedAt = Date.now()
+    progressEl.hidden = false
+    progressEl.classList.remove('is-done')
+    progressText.textContent = text
+    progressTime.textContent = '0s'
+    stateEl.className = 'modal-state'
+    stateEl.textContent = ''
+    setInstalling(true)
+    progressTimer = setInterval(() => {
+      const seconds = Math.max(0, Math.floor((Date.now() - progressStartedAt) / 1000))
+      progressTime.textContent = `${seconds}s`
+    }, 500)
+  }
+  const failProgress = () => {
+    stopProgressClock()
+    progressEl.hidden = true
+    setInstalling(false)
+  }
+  const syncSubmit = () => {
+    submit.disabled = source === 'browser-dir' && entries.length === 0
+  }
+  const syncSource = (next) => {
+    source = next
+    for (const tab of tabs) {
+      const active = tab.dataset.siSource === next
+      tab.classList.toggle('is-active', active)
+      tab.setAttribute('aria-selected', active ? 'true' : 'false')
+    }
+    for (const panel of panels) panel.classList.toggle('is-hidden', panel.dataset.siPanel !== next)
+    noteEl.innerHTML = `${String(sourceNotes[next] || '')}`
+    flowFirst.textContent = next === 'browser-dir' ? '① 读取文件夹' : '① 下载并解包'
+    stateEl.className = 'modal-state'
+    stateEl.textContent = ''
+    syncSubmit()
+  }
+  const apply = (list, label) => {
+    entries = list
+    nameEl.textContent = `${label} · ${list.length} 个文件`
+    stateEl.className = 'modal-state ok'
+    stateEl.textContent = list.length ? '已选择，点「安装技能」上传并扫描' : ''
+    syncSubmit()
+  }
+  overlay.addEventListener('click', (event) => {
+    if (event.target === overlay || event.target.closest('[data-si-cancel]') || event.target.closest('.modal-x')) close()
+  })
+  for (const tab of tabs) tab.addEventListener('click', () => syncSource(tab.dataset.siSource))
+  const pick = overlay.querySelector('#si-pick-folder')
+  const input = overlay.querySelector('#si-folder-input')
+  pick.addEventListener('click', async () => {
+    if (typeof window.showDirectoryPicker === 'function') {
+      try {
+        const dir = await window.showDirectoryPicker({ id: 'eab-skill-folder', mode: 'read' })
+        apply(await collectDirectoryEntries(dir, `${dir.name}/`, []), dir.name)
+      } catch (err) {
+        if (err && err.name === 'AbortError') return
+        stateEl.className = 'modal-state bad'
+        stateEl.textContent = `读取文件夹失败：${err?.message || err}`
+      }
+      return
+    }
+    input.value = ''
+    input.click()
+  })
+  input.addEventListener('change', () => {
+    const files = Array.from(input.files || [])
+    apply(files.map((file) => ({ rel: String(file.webkitRelativePath || file.name), file })), files[0]?.webkitRelativePath?.split('/')[0] || '技能文件夹')
+  })
+  syncSource(source)
+
+  submit.addEventListener('click', async () => {
+    const body = {
+      source,
+      overwrite: overlay.querySelector('#si-overwrite').checked,
+    }
+    if (source === 'git') {
+      body.repo = overlay.querySelector('#si-git-repo').value.trim()
+      body.ref = overlay.querySelector('#si-git-ref').value.trim()
+      body.subdir = overlay.querySelector('#si-git-subdir').value.trim()
+      if (!body.repo) {
+        stateEl.className = 'modal-state bad'
+        stateEl.textContent = '请填 GitHub 仓库（owner/repo）'
+        return
+      }
+    } else if (source === 'http') {
+      body.url = overlay.querySelector('#si-http-url').value.trim()
+      if (!body.url) {
+        stateEl.className = 'modal-state bad'
+        stateEl.textContent = '请填写技能压缩包 URL'
+        return
+      }
+    } else {
+      if (!entries.length) {
+        stateEl.className = 'modal-state bad'
+        stateEl.textContent = '请选择技能文件夹'
+        return
+      }
+      stateEl.className = 'modal-state'
+      stateEl.textContent = '正在读取文件夹…'
+      body.files = await readPluginFolderFiles(entries)
+    }
+    startProgress(source === 'git'
+      ? '正在从 GitHub 下载仓库 tarball 并解包…'
+      : source === 'http'
+        ? '正在下载技能压缩包并解包…'
+        : '正在上传并扫描技能包…')
+    submit.textContent = '安装中…'
+    try {
+      await api(`/api/my/skills/install${qs()}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      stopProgressClock()
+      progressEl.classList.add('is-done')
+      progressText.textContent = '安装完成，正在刷新技能列表…'
+      progressTime.textContent = '完成'
+      try {
+        await loadMySkills()
+      } catch {
+        // 安装已成功；刷新失败不改变结果。
+      }
+      await new Promise((resolve) => setTimeout(resolve, 700))
+      close()
+      state.skillSelected = null
+      banner('已安装个人技能', 'ok')
+    } catch (err) {
+      failProgress()
+      submit.disabled = false
+      submit.textContent = '安装技能'
+      if (err?.details?.approvalId || err?.code === 'EAB_APPROVAL_REQUIRED') {
+        stateEl.className = 'modal-state'
+        stateEl.textContent = `已提交安装审批：${err.message || '等待管理员通过'}`
+      } else {
+        stateEl.className = 'modal-state bad'
+        stateEl.textContent = `安装失败：${err.message}`
+      }
+    }
+  })
+}
+
+function bindMySkillWorkspace() {
+  for (const button of document.querySelectorAll('[data-my-skill-select]')) {
+    button.onclick = () => {
+      state.skillSelected = button.dataset.mySkillSelect
+      renderMySkillWorkspace()
+    }
+  }
+  for (const button of document.querySelectorAll('[data-my-skill-toggle]')) {
+    button.onclick = async () => {
+      const enabled = button.dataset.nextEnabled === '1'
+      button.disabled = true
+      try {
+        await api(`/api/my/skills/${encodeURIComponent(state.skillSelected)}/state${qs()}`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ enabled }),
+        })
+        await loadMySkills()
+        banner(enabled ? '已启用技能' : '已停用技能', 'ok')
+      } catch (err) {
+        button.disabled = false
+        banner(`启停失败：${err.message}`, 'bad')
+      }
+    }
+  }
+  for (const button of document.querySelectorAll('[data-my-skill-install]')) button.onclick = showSkillInstall
+  for (const button of document.querySelectorAll('[data-my-skill-refresh]')) button.onclick = () => loadMySkills()
+  for (const button of document.querySelectorAll('[data-my-skill-uninstall]')) {
+    button.onclick = () => {
+      const skill = state.skills.find((item) => item.id === state.skillSelected)
+      if (skill) openMySkillUninstall(skill)
+    }
+  }
+}
+
+function setWorkspaceKind(kind) {
+  const next = kind === 'skills' ? 'skills' : 'plugins'
+  if (state.workspaceKind === next) return
+  state.workspaceKind = next
+  for (const button of document.querySelectorAll('#workspace-kind-switch [data-workspace-kind]')) {
+    const active = button.dataset.workspaceKind === next
+    button.classList.toggle('is-active', active)
+    button.setAttribute('aria-selected', active ? 'true' : 'false')
+  }
+  const eyebrow = $('#workspace-eyebrow')
+  const title = $('#workspace-title')
+  const badge = $('#workspace-scope-badge')
+  if (eyebrow) eyebrow.textContent = next === 'skills' ? 'PERSONAL SKILL WORKSPACE' : 'PERSONAL PLUGIN WORKSPACE'
+  if (title) title.textContent = next === 'skills' ? '技能工作台' : '我的工作台'
+  if (badge) {
+    badge.textContent = next === 'skills' ? '仅本人技能' : '仅本人可见'
+    badge.dataset.tip =
+      next === 'skills'
+        ? '只显示你自己安装的技能。安装、启停、卸载和风险详情都只影响你本人；高风险包会被拦截并写入隔离记录。'
+        : '只显示你自己安装的插件。启停、卸载、查看详情和打开插件页面都只影响你本人，不会碰公司和别人的安装。'
+  }
+  if (state.mode === 'workspace') {
+    if (next === 'skills') loadMySkills()
+    else loadMyPlugins()
+  }
+}
+
+function bindWorkspaceKindSwitch() {
+  for (const button of document.querySelectorAll('#workspace-kind-switch [data-workspace-kind]')) {
+    button.onclick = () => setWorkspaceKind(button.dataset.workspaceKind)
+  }
+}
+
 function ensureHintTip() {
   let tip = document.getElementById('hint-tip')
   if (tip) return tip
@@ -2626,10 +4606,26 @@ function readFileAsDataUrl(file) {
   })
 }
 
-async function readPluginFolderFiles(files) {
+/** 目录选择器（showDirectoryPicker）用：递归收集文件，跳过依赖/版本库目录，避免把 node_modules 一起传上去 */
+const PLUGIN_FOLDER_SKIP = new Set(['node_modules', '.git', '.svn', '.hg'])
+
+async function collectDirectoryEntries(dirHandle, prefix, out, limit = 4000) {
+  for await (const entry of dirHandle.values()) {
+    if (out.length >= limit) throw new Error(`这个文件夹里文件超过 ${limit} 个，请确认选的是插件目录本身`)
+    if (entry.kind === 'directory') {
+      if (PLUGIN_FOLDER_SKIP.has(entry.name)) continue
+      await collectDirectoryEntries(entry, `${prefix}${entry.name}/`, out, limit)
+      continue
+    }
+    out.push({ rel: `${prefix}${entry.name}`, file: await entry.getFile() })
+  }
+  return out
+}
+
+async function readPluginFolderFiles(entries) {
   const out = []
-  for (const file of files) {
-    const rel = String(file.webkitRelativePath || file.name).replace(/\\/g, '/')
+  for (const { rel: rawRel, file } of entries) {
+    const rel = String(rawRel || file.name).replace(/\\/g, '/')
     const parts = rel.split('/').filter(Boolean)
     const path = parts.length > 1 ? parts.slice(1).join('/') : rel
     const dataUrl = await readFileAsDataUrl(file)
@@ -2670,7 +4666,7 @@ function showPluginInstall() {
     </div>
     <div class="install-panel" data-install-panel="browser-dir">
       <div class="install-section-head">
-        <div class="install-section-title"><strong>从我的电脑选择插件文件夹</strong><span class="hint-badge icon-only" data-tip="选择包含 plugin.json 的文件夹。支持 EAB 插件（plugin.json）和 DSH 插件（package.json 带 dsh 段）；浏览器只把文件夹里的文件副本上传给服务端，安装结束即删除临时目录。" tabindex="0" aria-label="插件文件夹说明"><svg aria-hidden="true" width="12" height="12" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6.2" stroke="currentColor" stroke-width="1.1"/><path d="M8 7.4v3.4" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/><circle cx="8" cy="4.9" r=".8" fill="currentColor"/></svg></span></div>
+        <div class="install-section-title"><strong>从我的电脑选择插件文件夹</strong><span class="hint-badge icon-only" data-tip="选择包含 plugin.json 的文件夹。支持 EAB 插件（plugin.json）和 DSH 插件（package.json 带 dsh 段）；只上传文件夹里的文件副本，安装结束即删除临时目录；会自动跳过 node_modules、.git 等依赖目录。" tabindex="0" aria-label="插件文件夹说明"><svg aria-hidden="true" width="12" height="12" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6.2" stroke="currentColor" stroke-width="1.1"/><path d="M8 7.4v3.4" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/><circle cx="8" cy="4.9" r=".8" fill="currentColor"/></svg></span></div>
         <span class="pi-local-pill">浏览器上传</span>
       </div>
       <div class="pi-path-row">
@@ -2781,7 +4777,7 @@ function showPluginInstall() {
   const folderInput = overlay.querySelector('#pi-folder-input')
   const pickFolder = overlay.querySelector('#pi-pick-folder')
   const pathStatus = overlay.querySelector('#pi-path-status')
-  let selectedFolderFiles = []
+  let selectedFolderEntries = []
   let selectedFolderName = ''
   let source = 'browser-dir'
 
@@ -2792,15 +4788,15 @@ function showPluginInstall() {
   }
 
   const syncFolderStatus = () => {
-    if (selectedFolderFiles.length === 0) {
+    if (selectedFolderEntries.length === 0) {
       pathStatus.hidden = true
       pathStatus.innerHTML = ''
       return
     }
-    const total = selectedFolderFiles.reduce((sum, file) => sum + (file.size || 0), 0)
+    const total = selectedFolderEntries.reduce((sum, entry) => sum + (entry.file.size || 0), 0)
     pathStatus.hidden = false
     pathStatus.innerHTML = `<span class="pi-path-status-icon"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M1.8 4.3a1.3 1.3 0 0 1 1.3-1.3h3.1l1.4 1.5h4.3a1.3 1.3 0 0 1 1.3 1.3v6.1a1.3 1.3 0 0 1-1.3 1.3H3.1a1.3 1.3 0 0 1-1.3-1.3V4.3Z" stroke="currentColor" stroke-width="1.1"/></svg></span>
-      <span class="pi-path-status-copy"><strong>${esc(selectedFolderName)}</strong><small>${selectedFolderFiles.length} 个文件 · ${esc(fmtSize(total))}</small></span>
+      <span class="pi-path-status-copy"><strong>${esc(selectedFolderName)}</strong><small>${selectedFolderEntries.length} 个文件 · ${esc(fmtSize(total))}</small></span>
       <span class="pill ok">已选择</span>`
   }
 
@@ -2818,19 +4814,35 @@ function showPluginInstall() {
     stateEl.textContent = ''
   }
   for (const tab of tabs) tab.addEventListener('click', () => syncSource(tab.dataset.installSource))
-  pickFolder.addEventListener('click', () => {
+  const applyFolderSelection = (entries) => {
+    selectedFolderEntries = entries
+    selectedFolderName = String(entries[0]?.rel || '').split('/').filter(Boolean)[0] || '插件文件夹'
+    syncFolderStatus()
+    if (entries.length > 0) {
+      stateEl.className = 'modal-state ok'
+      stateEl.textContent = `已选择「${selectedFolderName}」，共 ${entries.length} 个文件，点「安装插件」上传并安装`
+    }
+  }
+  pickFolder.addEventListener('click', async () => {
+    // 新版 Chrome/Edge 优先用目录选择器：它不会再弹浏览器原生的「将 N 个文件上传到此网站？」确认
+    if (typeof window.showDirectoryPicker === 'function') {
+      try {
+        const dir = await window.showDirectoryPicker({ id: 'eab-plugin-folder', mode: 'read' })
+        const entries = await collectDirectoryEntries(dir, `${dir.name}/`, [])
+        applyFolderSelection(entries)
+      } catch (err) {
+        if (err && err.name === 'AbortError') return
+        stateEl.className = 'modal-state bad'
+        stateEl.textContent = `读取文件夹失败：${err?.message || err}`
+      }
+      return
+    }
     folderInput.value = ''
     folderInput.click()
   })
   folderInput.addEventListener('change', () => {
-    selectedFolderFiles = Array.from(folderInput.files || [])
-    const firstPath = String(selectedFolderFiles[0]?.webkitRelativePath || '')
-    selectedFolderName = firstPath.split('/').filter(Boolean)[0] || '插件文件夹'
-    syncFolderStatus()
-    if (selectedFolderFiles.length > 0) {
-      stateEl.className = 'modal-state ok'
-      stateEl.textContent = `已选择「${selectedFolderName}」，点「安装插件」上传并安装`
-    }
+    const files = Array.from(folderInput.files || [])
+    applyFolderSelection(files.map((file) => ({ rel: String(file.webkitRelativePath || file.name), file })))
   })
   syncSource(source)
 
@@ -2840,7 +4852,7 @@ function showPluginInstall() {
       source,
       overwrite: overlay.querySelector('#pi-overwrite').checked,
     }
-    if (source === 'browser-dir' && selectedFolderFiles.length === 0) {
+    if (source === 'browser-dir' && selectedFolderEntries.length === 0) {
       stateEl.className = 'modal-state bad'
       stateEl.textContent = '请选择一个插件文件夹（含 plugin.json 或 DSH 的 package.json）'
       return
@@ -2871,7 +4883,7 @@ function showPluginInstall() {
     submit.textContent = '安装中…'
     try {
       if (source === 'browser-dir') {
-        body.files = await readPluginFolderFiles(selectedFolderFiles)
+        body.files = await readPluginFolderFiles(selectedFolderEntries)
         body.folderName = selectedFolderName
         updateProgress('正在上传并校验插件…')
       }
@@ -3319,6 +5331,777 @@ function latestToolPreview(tools) {
   return `${latest.name}${latest.status === 'error' ? ' · 失败' : ''} · ${formatElapsed(latest.durationMs)}`
 }
 
+/* ---------------- Agent 文件操作预览 ---------------- */
+
+const FILE_OPERATION_TOOLS = new Set([
+  'workspace.write',
+  'workspace.edit',
+  'office.replace',
+  'office.insert',
+  'office.format',
+  'office.comment',
+  'workspace.read',
+  'workspace.rename',
+  'workspace.delete',
+  'workspace.send_dingtalk',
+])
+
+const OFFICE_OPERATION_KINDS = {
+  'office.replace': 'edit',
+  'office.insert': 'insert',
+  'office.format': 'format',
+  'office.comment': 'comment',
+}
+
+const FILE_OPERATION_COPY = {
+  write: { action: '写入文件', running: '正在写入', done: '已保存', error: '写入失败' },
+  edit: { action: '局部修改文件', running: '正在修改', done: '已修改', error: '修改失败' },
+  insert: { action: '插入文档内容', running: '正在插入', done: '已插入', error: '插入失败' },
+  format: { action: '设置文档格式', running: '正在设置格式', done: '已设置格式', error: '设置格式失败' },
+  comment: { action: '添加文档批注', running: '正在添加批注', done: '已添加批注', error: '添加批注失败' },
+  read: { action: '读取文件', running: '正在读取', done: '已读取', error: '读取失败' },
+  rename: { action: '重命名文件', running: '正在重命名', done: '已重命名', error: '重命名失败' },
+  delete: { action: '删除文件', running: '正在删除', done: '已删除', error: '删除失败' },
+  send: { action: '发送文件', running: '正在发送', done: '已发送', error: '发送失败' },
+}
+
+function parseToolSummaryObject(trace) {
+  const raw = String(trace?.summary || '').trim()
+  if (!raw.startsWith('{')) return null
+  try {
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null
+  } catch {
+    // 摘要超过服务端 1200 字上限时会被截断；至少把 fileId 取出来，预览按钮仍可用。
+    const fileId = raw.match(/"fileId"\s*:\s*"([^"]+)"/)?.[1]
+    return fileId ? { fileId } : null
+  }
+}
+
+function baseFileName(path) {
+  const value = String(path || '').trim()
+  if (!value) return ''
+  return value.split(/[\\/]/).pop() || value
+}
+
+function fileBadgeLabel(name) {
+  const ext = String(name || '').split('.').pop()?.toLowerCase() || ''
+  if (['doc', 'docx', 'docm', 'rtf', 'odt'].includes(ext)) return { label: 'DOC', tone: 'doc' }
+  if (['xls', 'xlsx', 'xlsm', 'csv', 'ods'].includes(ext)) return { label: 'XLS', tone: 'sheet' }
+  if (['ppt', 'pptx', 'pptm', 'odp'].includes(ext)) return { label: 'PPT', tone: 'slide' }
+  if (ext === 'pdf') return { label: 'PDF', tone: 'pdf' }
+  if (['md', 'markdown', 'txt', 'log', 'json', 'yml', 'yaml'].includes(ext)) return { label: 'TXT', tone: 'text' }
+  return { label: 'FILE', tone: 'file' }
+}
+
+function isOfficeFileName(name) {
+  return /\.(?:doc|docx|docm|xls|xlsx|xlsm|ppt|pptx|pptm|odt|ods|odp)(?:$)/i.test(String(name || ''))
+}
+
+/**
+ * 从尚未闭合的 JSON 参数里取出字符串字段。
+ * 模型流式生成 tool_call.arguments 时，text 往往只有开头一半；
+ * 不能直接 JSON.parse，所以逐字符解析并处理 \"、\n、\uXXXX。
+ */
+function partialJsonStringField(raw, key) {
+  const source = String(raw || '')
+  const marker = `"${key}"`
+  let searchFrom = 0
+  while (searchFrom < source.length) {
+    const keyAt = source.indexOf(marker, searchFrom)
+    if (keyAt < 0) return ''
+    let i = keyAt + marker.length
+    while (i < source.length && /\s/.test(source[i])) i += 1
+    if (source[i] !== ':') {
+      searchFrom = keyAt + marker.length
+      continue
+    }
+    i += 1
+    while (i < source.length && /\s/.test(source[i])) i += 1
+    if (source[i] !== '"') return ''
+    i += 1
+    let result = ''
+    while (i < source.length) {
+      const char = source[i]
+      if (char === '"') return result
+      if (char !== '\\') {
+        result += char
+        i += 1
+        continue
+      }
+      const next = source[i + 1]
+      if (next === undefined) return result
+      if (next === 'n') {
+        result += '\n'
+        i += 2
+        continue
+      }
+      if (next === 'r') {
+        result += '\r'
+        i += 2
+        continue
+      }
+      if (next === 't') {
+        result += '\t'
+        i += 2
+        continue
+      }
+      if (next === 'b') {
+        result += '\b'
+        i += 2
+        continue
+      }
+      if (next === 'f') {
+        result += '\f'
+        i += 2
+        continue
+      }
+      if (next === 'u') {
+        const hex = source.slice(i + 2, i + 6)
+        if (!/^[0-9a-f]{4}$/i.test(hex)) return result
+        result += String.fromCharCode(parseInt(hex, 16))
+        i += 6
+        continue
+      }
+      result += next
+      i += 2
+    }
+    return result
+  }
+  return ''
+}
+
+function partialWorkspaceWriteArgs(raw) {
+  return {
+    path: partialJsonStringField(raw, 'path') || partialJsonStringField(raw, 'relPath'),
+    text:
+      partialJsonStringField(raw, 'text') ||
+      partialJsonStringField(raw, 'content') ||
+      partialJsonStringField(raw, 'body') ||
+      partialJsonStringField(raw, 'data'),
+  }
+}
+
+function isWorkspaceWriteToolName(name) {
+  return /workspace[._]write/i.test(String(name || ''))
+}
+
+function isOfficeReplaceToolName(name) {
+  return /office[._]replace/i.test(String(name || ''))
+}
+
+function isOfficeInsertToolName(name) {
+  return /office[._]insert/i.test(String(name || ''))
+}
+
+function partialOfficeReplaceArgs(raw) {
+  return {
+    path: partialJsonStringField(raw, 'path') || partialJsonStringField(raw, 'relPath'),
+    fileId: partialJsonStringField(raw, 'fileId'),
+    elementId: partialJsonStringField(raw, 'elementId'),
+    newText: partialJsonStringField(raw, 'newText') || partialJsonStringField(raw, 'text'),
+  }
+}
+
+function partialOfficeInsertArgs(raw) {
+  return {
+    path: partialJsonStringField(raw, 'path') || partialJsonStringField(raw, 'relPath'),
+    fileId: partialJsonStringField(raw, 'fileId'),
+    elementId: partialJsonStringField(raw, 'elementId'),
+    text: partialJsonStringField(raw, 'text'),
+  }
+}
+
+/** Office 局部编辑的流式预览：只展示当前目标元素的新文本，文件仍在工具完成后原子保存。 */
+function applyStreamingOfficePreview(fileId, path, elementId, text) {
+  const file = state.filePreview
+  if (!file) return
+  const idMatch = Boolean(fileId && String(file.id || '') === String(fileId))
+  if (!idMatch && !filePreviewMatchesPath(file, path)) return
+  const targetPath = path && filePreviewMatchesPath(file, path) ? path : file.relPath
+  const prefix = elementId ? `编辑 ${elementId}\n` : ''
+  applyStreamingFilePreview(targetPath || file.relPath, `${prefix}${String(text || '')}`)
+}
+
+function filePreviewMatchesPath(file, path) {
+  if (!file) return false
+  const target = String(path || '').trim()
+  if (!target) return false
+  const targetName = baseFileName(target)
+  return Boolean(
+    target === file.relPath ||
+      target === file.name ||
+      targetName === file.name ||
+      targetName === baseFileName(file.relPath || ''),
+  )
+}
+
+function streamingPreviewNode() {
+  const body = $('#file-pane-body')
+  if (!body || body.hidden) return null
+  const existing = body.querySelector('pre.file-text-view')
+  if (existing) return existing
+  // OnlyOffice / PDF / 图片预览时不替换宿主，避免把编辑器或 iframe 拆掉。
+  if (body.querySelector('#onlyoffice-editor, iframe, img')) return null
+  const pre = document.createElement('pre')
+  pre.className = 'file-text-view'
+  body.innerHTML = ''
+  body.appendChild(pre)
+  return pre
+}
+
+/** 把模型生成中的文本写入右侧文本预览；文件本身等 tool 完成后再原子落盘。 */
+function applyStreamingFilePreview(path, text) {
+  const file = state.filePreview
+  if (!file || !filePreviewMatchesPath(file, path)) return
+  const draft = {
+    fileId: file.id,
+    path: String(path || ''),
+    text: String(text || ''),
+    updatedAt: Date.now(),
+    office: isOfficeLike(file),
+  }
+  fileStreamDraft = draft
+  if (draft.office) {
+    const body = $('#file-pane-body')
+    if (!body || body.hidden) return
+    let overlay = body.querySelector('.file-stream-draft')
+    if (!overlay) {
+      overlay = document.createElement('div')
+      overlay.className = 'file-stream-draft'
+      overlay.innerHTML = '<div class="file-stream-draft-head"><span class="file-stream-draft-dot"></span>Agent 正在生成 Office 文档内容 · 完成后由 OnlyOffice 刷新</div><pre></pre>'
+      body.appendChild(overlay)
+    }
+    const pre = overlay.querySelector('pre')
+    if (pre) revealPreviewText(pre, draft.text, body)
+    body.scrollTop = body.scrollHeight
+    return
+  }
+  if (!isTextLike(file)) return
+  const pre = streamingPreviewNode()
+  if (!pre) return
+  const body = $('#file-pane-body')
+  revealPreviewText(pre, draft.text, body)
+  workspacePreviewText = draft.text
+  workspacePreviewTextLoaded = true
+}
+
+/**
+ * 模型工具参数若一次整块到达，直接整段替换会看不到过程；
+ * 这里按字符揭示到完整文本，后续真实增量仍会继续续写。
+ */
+function revealPreviewText(el, text, body) {
+  const full = String(text || '')
+  const isText = el.classList.contains('file-text-view')
+  el.classList.add('is-streaming')
+  if (!full) {
+    el.textContent = isText ? '（空文件）' : ''
+    return
+  }
+  const same = fileStreamReveal && fileStreamReveal.el === el
+  const previousFull = fileStreamReveal?.fullText || ''
+  let shown = 0
+  let startedAt = performance.now()
+  if (same && full.startsWith(previousFull) && previousFull) {
+    shown = fileStreamReveal.shown
+    startedAt = performance.now() - (shown / Math.max(1, full.length)) * fileStreamReveal.duration
+  }
+  if (same) {
+    fileStreamReveal.fullText = full
+  } else {
+    fileStreamReveal = {
+      el,
+      fullText: full,
+      shown,
+      startedAt,
+      duration: Math.min(1600, Math.max(450, full.length * 1.2)),
+      onDone: null,
+    }
+  }
+  el.textContent = full.slice(0, shown)
+  const nearBottom = body ? body.scrollHeight - body.scrollTop - body.clientHeight < 80 : true
+  const tick = () => {
+    const state = fileStreamReveal
+    if (!state || state.el !== el) return
+    const target = state.fullText
+    const elapsed = performance.now() - state.startedAt
+    const count = Math.max(
+      state.shown,
+      Math.min(target.length, Math.floor((target.length * elapsed) / state.duration)),
+    )
+    state.shown = count
+    el.textContent = target.slice(0, count)
+    if (body && nearBottom) body.scrollTop = body.scrollHeight
+    if (count < target.length) {
+      setTimeout(tick, 16)
+      return
+    }
+    fileStreamReveal = null
+    const onDone = state.onDone
+    if (onDone) {
+      clearStreamingPreviewArtifacts()
+      onDone()
+    }
+  }
+  setTimeout(tick, 16)
+}
+
+function clearStreamingPreviewArtifacts() {
+  const body = $('#file-pane-body')
+  if (!body) return
+  body.querySelector('.file-stream-draft')?.remove()
+  body.querySelector('pre.file-text-view.is-streaming')?.classList.remove('is-streaming')
+  fileStreamReveal = null
+}
+
+function finishStreamingFilePreview(onDone) {
+  const draft = fileStreamDraft
+  fileStreamDraft = null
+  if (onDone && fileStreamReveal) {
+    fileStreamReveal.onDone = onDone
+    return
+  }
+  if (!draft && !fileStreamReveal) {
+    onDone?.()
+    return
+  }
+  clearStreamingPreviewArtifacts()
+  onDone?.()
+}
+
+/** 把工作区工具轨迹转成文件操作卡片所需的最小信息，不把原始参数直接铺在对话里。 */
+function fileOperationInfo(trace) {
+  if (!trace || !FILE_OPERATION_TOOLS.has(String(trace.toolId || ''))) return null
+  const kind = OFFICE_OPERATION_KINDS[trace.toolId] || String(trace.toolId).slice('workspace.'.length)
+  const copy = FILE_OPERATION_COPY[kind]
+  if (!copy) return null
+  const args = trace.args && typeof trace.args === 'object' ? trace.args : {}
+  const summary = parseToolSummaryObject(trace) || {}
+  const rawPath = String(args.path || '').trim()
+  const summaryPath = String(summary.path || summary.relPath || '').trim()
+  const targetPath = kind === 'rename'
+    ? String(summary.to || args.newName || rawPath).trim()
+    : (summaryPath || rawPath)
+  const fallbackName = String(summary.fileName || summary.name || '').trim()
+  const name = baseFileName(targetPath) || fallbackName || (kind === 'send' ? '云空间文件' : '文件')
+  // 发送到钉钉的结果里 fileId 是钉钉侧文件 ID，不是云空间 ID；发送卡用 relPath 定位。
+  const fileId = kind === 'send' ? '' : String(summary.fileId || args.fileId || '').trim()
+  const text = kind === 'write'
+    ? String(args.text ?? '')
+    : (kind === 'read' ? String(summary.text ?? '') : (
+      kind === 'edit' ? String(args.newText ?? summary.nextText ?? '') : (
+        kind === 'insert' ? String(args.text ?? (Array.isArray(summary.insertedValues) ? summary.insertedValues.join(' ') : '') ?? '') : ''
+      )
+    ))
+  const previewPath = fileId && state.filePreview && String(state.filePreview.id || '') === fileId
+    ? String(state.filePreview.relPath || '')
+    : ''
+  const edits = kind === 'edit' && Array.isArray(args.edits) ? args.edits : []
+  const changes = kind === 'edit'
+    ? Number(summary.changes ?? summary.replacements ?? edits.length) || 0
+    : 0
+  const created = summary.created === true
+  const from = String(summary.from || rawPath || '').trim()
+  const to = String(summary.to || args.newName || targetPath || '').trim()
+  return {
+    kind,
+    copy,
+    path: targetPath || from || previewPath,
+    name,
+    fileId,
+    text,
+    edits,
+    changes,
+    created,
+    from,
+    to,
+    status: trace.status === 'running' ? 'running' : trace.status === 'error' ? 'error' : 'done',
+    statusLabel: trace.status === 'running'
+      ? copy.running
+      : trace.status === 'error' ? copy.error : copy.done,
+    durationMs: Number(trace.durationMs) || 0,
+    errorText: trace.status === 'error' ? String(trace.summary || '').trim() : '',
+  }
+}
+
+function fileOperationPreviewHtml(op) {
+  if (op.kind === 'rename') {
+    if (!op.from && !op.to) return ''
+    return `<div class="file-op-change">
+      <span class="file-op-change-label">名称变更</span>
+      <span class="file-op-change-value is-old">${esc(op.from || '—')}</span>
+      <span class="file-op-change-arrow">→</span>
+      <span class="file-op-change-value is-new">${esc(op.to || '—')}</span>
+    </div>`
+  }
+  if (op.kind === 'delete') {
+    return `<div class="file-op-note">文件已从云空间列表移除，移到回收目录保留审计。</div>`
+  }
+  if (op.kind === 'edit') {
+    if (op.status === 'running') {
+      return '<div class="file-op-note is-live"><span class="file-op-loading-dot"></span>Agent 正在定位并修改指定片段…</div>'
+    }
+    return `<div class="file-op-note">只修改了 ${op.changes || 0} 处片段，其余内容保持不变。</div>`
+  }
+  if (op.kind === 'insert' || op.kind === 'format' || op.kind === 'comment') {
+    if (op.status === 'running') {
+      return '<div class="file-op-note is-live"><span class="file-op-loading-dot"></span>Agent 正在写入目标元素…</div>'
+    }
+    if (op.status === 'error') return '<div class="file-op-note">没有写入文件，原始内容保持不变。</div>'
+    const doneText = op.kind === 'insert'
+      ? '已在目标位置插入新内容，其他元素未整体重写。'
+      : op.kind === 'format'
+        ? '已按目标元素设置字符格式，其他段落和表格结构未改动。'
+        : '已给目标元素添加批注，原文未修改。'
+    return `<div class="file-op-note">${doneText}</div>`
+  }
+  if (op.kind === 'write' || op.kind === 'read') {
+    const raw = String(op.text || '')
+    if (!raw) {
+      return op.status === 'running'
+        ? '<div class="file-op-note is-live"><span class="file-op-loading-dot"></span>Agent 正在生成内容…</div>'
+        : '<div class="file-op-note">空文件</div>'
+    }
+    const lines = raw.split(/\r?\n/)
+    const shown = lines.slice(0, 14).join('\n')
+    const omitted = lines.length > 14 || raw.length > 1800
+    const size = typeof TextEncoder !== 'undefined' ? new TextEncoder().encode(raw).length : raw.length
+    const officeWarning = op.kind === 'write' && isOfficeFileName(op.name)
+      ? '<div class="file-op-note is-warning">Agent 当前只能写入文本内容；Word / Excel / PPT 的内容级编辑请在右侧用 OnlyOffice 完成。</div>'
+      : ''
+    return `${officeWarning}<div class="file-op-preview">
+      <div class="file-op-preview-head">
+        <span>${op.kind === 'write' ? 'Agent 写入内容' : '读取内容'}</span>
+        <span>${lines.length} 行 · ${esc(fmtSize(size))}${omitted ? ' · 仅显示开头' : ''}</span>
+      </div>
+      <pre>${esc(shown)}${omitted ? '\n…' : ''}</pre>
+    </div>`
+  }
+  return ''
+}
+
+function fileOperationCardHtml(trace) {
+  const op = fileOperationInfo(trace)
+  if (!op) return ''
+  const badge = fileBadgeLabel(op.name)
+  const canOpen = op.status !== 'running' && op.kind !== 'delete' && Boolean(op.fileId || op.path)
+  const duration = op.status === 'done' && op.durationMs > 0 ? ` · ${formatElapsed(op.durationMs)}` : ''
+  const actionText = op.kind === 'write'
+    ? (op.created ? '新建文件' : op.status === 'done' ? '修改文件' : '写入文件')
+    : op.copy.action
+  return `<div class="file-op-card is-${op.status} is-${op.kind}" data-file-op-kind="${op.kind}">
+    <div class="file-op-head">
+      <span class="file-op-badge is-${badge.tone}">${badge.label}</span>
+      <div class="file-op-main">
+        <span class="file-op-kicker">Agent 文件操作</span>
+        <strong>${esc(op.name)}</strong>
+        <span class="file-op-sub">${esc(actionText)}${duration}</span>
+      </div>
+      <span class="file-op-state"><span class="file-op-dot"></span>${esc(op.statusLabel)}</span>
+    </div>
+    ${fileOperationPreviewHtml(op)}
+    <div class="file-op-foot">
+      <span class="file-op-path" title="${esc(op.path || op.name)}">${esc(op.path || op.name)}</span>
+      ${op.status === 'error' ? `<span class="file-op-error">${esc(oneLinePreview(op.errorText, 60))}</span>` : ''}
+      ${canOpen ? `<button class="file-op-open" type="button" data-file-op-open="${esc(op.fileId)}" data-file-op-path="${esc(op.path)}">在右侧预览</button>` : ''}
+    </div>
+  </div>`
+}
+
+function fileOpsPanelHtml(tools) {
+  const cards = (Array.isArray(tools) ? tools : [])
+    .map((trace) => fileOperationCardHtml(trace))
+    .filter(Boolean)
+  if (cards.length === 0) return ''
+  return `<div class="file-op-stack">${cards.slice(-4).join('')}</div>`
+}
+
+async function openFileOperationPreview(button) {
+  if (!button || button.disabled) return
+  let fileId = String(button.dataset.fileOpOpen || '').trim()
+  const path = String(button.dataset.fileOpPath || '').trim()
+  button.disabled = true
+  try {
+    if (!fileId || !state.files.some((file) => file.id === fileId)) await loadWorkspaceFiles()
+    if (fileId && !state.files.some((file) => file.id === fileId)) fileId = ''
+    if (!fileId && path) {
+      const match = state.files.find((file) => file.relPath === path || file.name === path || baseFileName(file.relPath) === path)
+      fileId = match?.id || ''
+    }
+    if (!fileId) {
+      banner('文件列表还没有同步完成，请稍后再试。', 'bad')
+      return
+    }
+    await openWorkspaceFile(fileId)
+  } catch (err) {
+    banner(`打开文件失败：${err.message}`, 'bad')
+  } finally {
+    button.disabled = false
+  }
+}
+
+/**
+ * 插件保存成功后，先把当前云端版本记为水位，再关闭旧编辑器并切回查看态。
+ * 旧编辑器关闭时会再次触发 OnlyOffice 保存回调；refresh-guard 让旧 version 的回调
+ * 被丢弃，避免同一份内容重复写回把 updated_at 再抬一次。
+ */
+function refreshWorkspaceAfterPluginSave(file, data) {
+  void (async () => {
+    try {
+      await api(`/api/workspace/office/${encodeURIComponent(file.id)}/refresh-guard`, {
+        method: 'POST',
+      })
+      await loadWorkspaceFiles()
+      const latest = state.files.find((item) => item.id === file.id)
+      if (!latest) {
+        closeWorkspaceFile()
+        banner('文件已不存在，无法刷新预览', 'bad')
+        return
+      }
+      const updatedAt = Number(data.updatedAt) || latest.updatedAt
+      const size = Number(data.size) || latest.size
+      banner(
+        `已保存《${latest.name}》到云空间（${workspaceFileDate(updatedAt)}，${fmtSize(size)}），已切换到查看态。`,
+      )
+      await openWorkspaceFile(latest.id, { mode: 'view' })
+    } catch (err) {
+      banner(`已保存成功，但刷新预览失败：${err.message}`, 'bad')
+    }
+  })()
+}
+
+function refreshWorkspaceAfterFileOperation(op) {
+  if (!op || !['write', 'edit', 'insert', 'format', 'comment', 'rename', 'delete'].includes(op.kind)) return
+  void (async () => {
+    try {
+      finishStreamingFilePreview()
+      await loadWorkspaceFiles()
+      const activeId = state.filePreview?.id
+      if (op.kind === 'delete' && activeId && activeId === op.fileId) {
+        closeWorkspaceFile()
+        return
+      }
+      if (op.fileId && activeId && activeId === op.fileId) {
+        if (onlyOfficeMode === 'edit') {
+          const latest = state.files.find((file) => file.id === op.fileId)
+          const cloudMeta = latest
+            ? `（${workspaceFileDate(latest.updatedAt)}，${fmtSize(latest.size)}）`
+            : ''
+          showFilePaneSyncNotice(
+            op.fileId,
+            `文档已在云端更新${cloudMeta}。当前编辑器仍显示打开时的版本；未保存的修改不会自动合并。请先保存或撤销，再刷新到云端版本。`,
+          )
+          return
+        }
+        await openWorkspaceFile(op.fileId)
+      }
+    } catch {
+      // 文件列表刷新失败不影响对话继续；下一次手动刷新会重新读取。
+    }
+  })()
+}
+
+function fileActivitySnippet(activity) {
+  if (!activity) return ''
+  if (activity.kind === 'rename') {
+    return `${oneLinePreview(activity.from || '—', 70)} → ${oneLinePreview(activity.to || '—', 70)}`
+  }
+  if (activity.kind === 'delete') return '文件已移入回收目录，列表同步刷新中'
+  if (activity.kind === 'edit' && activity.status !== 'error') {
+    return `已局部修改 ${activity.changes || 0} 处片段，其余内容未变`
+  }
+  if (activity.status === 'error') return oneLinePreview(activity.errorText || '文件操作失败', 180)
+  const text = String(activity.text || '')
+  if (!text) {
+    if (activity.status === 'running') return 'Agent 正在生成文件内容…'
+    if (activity.status === 'done') return '操作已完成'
+    return '等待文件操作'
+  }
+  const lines = text.split(/\r?\n/)
+  const nonEmpty = lines.filter((line) => line.trim())
+  const tail = nonEmpty.slice(-2).join('  /  ') || text
+  return oneLinePreview(tail, 220)
+}
+
+function renderFileDock() {
+  const dock = $('#file-dock')
+  if (!dock) return
+  const activity = state.fileActivity
+  if (
+    !activity ||
+    state.fileDockClosed ||
+    state.fileDockSettled ||
+    state.fileDockPreviewSuppressed
+  ) {
+    dock.hidden = true
+    dock.innerHTML = ''
+    return
+  }
+  const badge = fileBadgeLabel(activity.name)
+  const canOpen = activity.status !== 'running' && activity.kind !== 'delete' && Boolean(activity.fileId || activity.path)
+  const lineCount = String(activity.text || '').split(/\r?\n/).length
+  const size = String(activity.text || '')
+    ? (typeof TextEncoder !== 'undefined' ? new TextEncoder().encode(String(activity.text)).length : String(activity.text).length)
+    : 0
+  const duration = activity.status === 'done' && activity.durationMs > 0 ? ` · ${formatElapsed(activity.durationMs)}` : ''
+  const actionText = activity.kind === 'write'
+    ? (activity.created ? '新建文件' : activity.status === 'done' ? '修改文件' : '写入文件')
+    : activity.copy?.action || '文件操作'
+  const detail = activity.kind === 'write' || activity.kind === 'read'
+    ? `${lineCount} 行${size ? ` · ${fmtSize(size)}` : ''}${duration}`
+    : activity.kind === 'edit'
+      ? `局部修改 ${activity.changes || 0} 处${duration}`
+      : activity.kind === 'rename'
+        ? `名称变更${duration}`
+        : activity.kind === 'delete'
+          ? '已删除'
+          : `文件发送${duration}`
+  dock.hidden = false
+  dock.className = `file-dock is-${activity.status} is-${activity.kind}`
+  dock.innerHTML = `<div class="file-dock-card" data-file-dock-open role="button" tabindex="0" title="打开文件预览">
+    <span class="file-dock-badge is-${badge.tone}">${badge.label}</span>
+    <div class="file-dock-main">
+      <div class="file-dock-title-row">
+        <strong>${esc(activity.name)}</strong>
+        <span class="file-dock-status"><span class="file-dock-dot"></span>${esc(activity.statusLabel)}</span>
+        <span class="file-dock-step">Agent 文件操作 · 第 ${activity.step || 1} 步</span>
+      </div>
+      <div class="file-dock-sub">${esc(actionText)}${activity.path ? ` · ${esc(activity.path)}` : ''}</div>
+      <div class="file-dock-snippet">${esc(fileActivitySnippet(activity))}</div>
+    </div>
+    <div class="file-dock-actions">
+      <span class="file-dock-detail">${esc(detail)}</span>
+      ${canOpen ? '<button class="file-dock-open" type="button" data-file-dock-open>打开预览</button>' : `<span class="file-dock-wait">${activity.status === 'running' ? '完成后可预览' : ''}</span>`}
+      <button class="file-dock-close" type="button" data-file-dock-close title="关闭文件操作卡片" aria-label="关闭文件操作卡片">×</button>
+    </div>
+    <span class="file-dock-progress"><span></span></span>
+  </div>`
+}
+
+function settleFileDock() {
+  if (!state.fileActivity) return
+  state.fileDockSettled = true
+  renderFileDock()
+}
+
+function suppressFileDockForPreview() {
+  state.fileDockPreviewSuppressed = true
+  renderFileDock()
+}
+
+function restoreFileDockAfterPreview() {
+  if (!state.fileActivity) return
+  state.fileDockPreviewSuppressed = false
+  // 关闭预览时只恢复仍在执行的文件操作卡；已完成的卡片保持收起状态。
+  if (!state.fileDockClosed && state.fileActivity.status === 'running') state.fileDockSettled = false
+  renderFileDock()
+}
+
+function updateFileActivity(trace) {
+  const op = fileOperationInfo(trace)
+  if (!op) return
+  const previous = state.fileActivity
+  const traceId = String(trace?.id || '')
+  const sameTrace = Boolean(previous && traceId && previous.traceId === traceId)
+  const same = previous && (
+    (op.fileId && previous.fileId === op.fileId) ||
+    (op.path && previous.path === op.path) ||
+    (!op.fileId && !op.path && previous.name === op.name)
+  )
+  state.fileActivity = {
+    ...op,
+    name: op.name || previous?.name || '文件',
+    path: op.path || previous?.path || '',
+    traceId,
+    step: sameTrace ? previous.step : same ? Number(previous.step || 1) + 1 : 1,
+    startedAt: same ? previous.startedAt : Date.now(),
+    text: op.kind === 'delete' ? '' : (op.text || (same ? previous.text : '')),
+    updatedAt: Date.now(),
+  }
+  state.fileDockClosed = false
+  state.fileDockSettled = false
+  renderFileDock()
+}
+
+function clearFileActivity() {
+  state.fileActivity = null
+  state.fileDockClosed = false
+  state.fileDockSettled = false
+  state.fileDockPreviewSuppressed = false
+  renderFileDock()
+}
+
+async function openFileDockPreview() {
+  const activity = state.fileActivity
+  if (!activity) return
+  if (activity.status === 'running' && !activity.fileId) {
+    banner('Agent 还在写入文件，完成后就能打开预览', 'warn')
+    return
+  }
+  let fileId = String(activity.fileId || '').trim()
+  const path = String(activity.path || '').trim()
+  try {
+    if (!fileId || !state.files.some((file) => file.id === fileId)) await loadWorkspaceFiles()
+    if (fileId && !state.files.some((file) => file.id === fileId)) fileId = ''
+    if (!fileId && path) {
+      const match = state.files.find((file) => file.relPath === path || file.name === path || baseFileName(file.relPath) === path)
+      fileId = match?.id || ''
+    }
+    if (!fileId) {
+      banner('文件列表还没有同步完成，请稍后再试。', 'bad')
+      return
+    }
+    await openWorkspaceFile(fileId, { split: true })
+  } catch (err) {
+    banner(`打开文件失败：${err.message}`, 'bad')
+  }
+}
+
+document.addEventListener('click', (event) => {
+  if (!(event.target instanceof Element)) return
+  const close = event.target.closest('[data-file-dock-close]')
+  if (close) {
+    event.preventDefault()
+    event.stopPropagation()
+    state.fileDockClosed = true
+    renderFileDock()
+    return
+  }
+  const open = event.target.closest('[data-file-dock-open]')
+  if (!open) return
+  event.preventDefault()
+  event.stopPropagation()
+  void openFileDockPreview()
+})
+
+document.addEventListener('keydown', (event) => {
+  if (event.key !== 'Enter' && event.key !== ' ') return
+  if (!(event.target instanceof HTMLElement)) return
+  const card = event.target.closest('.file-dock-card[data-file-dock-open]')
+  if (!card || event.target.closest('button')) return
+  event.preventDefault()
+  void openFileDockPreview()
+})
+
+document.addEventListener('mouseup', (event) => {
+  if (!(event.target instanceof Element) || !event.target.closest('#file-pane-body')) return
+  // 等浏览器先完成 selection 更新，再显示“引用选中内容”。
+  window.setTimeout(refreshPreviewSelection, 0)
+})
+
+document.addEventListener('keyup', (event) => {
+  if (!(event.target instanceof Element) || !event.target.closest('#file-pane-body')) return
+  window.setTimeout(refreshPreviewSelection, 0)
+})
+
+document.addEventListener('click', (event) => {
+  if (!(event.target instanceof Element)) return
+  const button = event.target.closest('#file-selection-action')
+  if (!button) return
+  event.preventDefault()
+  quotePreviewSelection()
+})
+
 /** 工具调用收成一张可折叠面板：默认只留标题，执行中再加一行当前工具。 */
 function toolPanelHtml(tools, { active = false, expanded = false } = {}) {
   if (!Array.isArray(tools) || tools.length === 0) return ''
@@ -3361,7 +6144,18 @@ function channelTag(channel) {
 }
 
 function clarifyInlineNote() {
-  return `<div class="clarify-inline-note"><span class="clarify-mark" aria-hidden="true">?</span><span>正在通过底部引导面板和 Agent 确认方向，请选择或补充。</span></div>`
+  return `<div class="clarify-inline-note"><span class="clarify-mark" aria-hidden="true">?</span><span>需要先确认方向，请选择或补充。</span></div>`
+}
+
+function historyMetaText(meta) {
+  if (!meta) return ''
+  if (typeof meta === 'string' || typeof meta === 'number') return String(meta)
+  if (typeof meta === 'object') {
+    return [meta.modelName, meta.autoSelected ? '自动选择' : '']
+      .filter(Boolean)
+      .join(' · ')
+  }
+  return ''
 }
 
 function historyAiBubble(text, meta, rich, options = {}) {
@@ -3369,13 +6163,14 @@ function historyAiBubble(text, meta, rich, options = {}) {
   const tools = Array.isArray(rich?.toolCalls) ? rich.toolCalls : []
   const channel = channelTag(rich?.channel)
   const clarify = rich?.clarify && typeof rich.clarify === 'object' ? rich.clarify : null
+  const metaText = historyMetaText(meta)
   const body = clarify && options.pendingClarify
     ? clarifyInlineNote()
-    : `<div class="answer-text">${renderAnswer(text)}</div>`
+    : `<div class="answer-text">${renderAnswer(text, { omitCodeBlocks: writtenFileContentBlocks(tools) })}</div>`
   return `${reasoning ? thinkPanelHtml(reasoning) : ''}
     ${tools.length > 0 ? toolPanelHtml(tools) : ''}
     ${body}
-    ${meta || channel ? `<span class="meta">${channel}${meta ? esc(meta) : ''}</span>` : ''}`
+    ${metaText || channel ? `<span class="meta">${channel}${metaText ? esc(metaText) : ''}</span>` : ''}`
 }
 
 /** AI 没有足够方向时给出的结构化问题 + 可点击方向 + 自定义补充入口。 */
@@ -3412,6 +6207,7 @@ function clarifyPanelHtml(clarify, options = {}) {
         </button>`
       }).join('')}
     </div>
+    <div class="clarify-auto" id="clarify-auto" hidden></div>
     ${
       allowCustom
         ? docked
@@ -3427,9 +6223,9 @@ function clarifyPanelHtml(clarify, options = {}) {
 
 /** 多页澄清的中间消息只作为 Agent 上下文，不进入聊天消息流。 */
 function isHiddenClarifyStep(message) {
-  if (!message?.meta?.clarifyFlowId) return false
-  if (message.role === 'user') return true
-  return message.role === 'assistant' && Boolean(message.meta?.clarify)
+  if (!message?.meta) return false
+  if (message.role === 'user') return Boolean(message.meta.clarifyFlowId)
+  return message.role === 'assistant' && Boolean(message.meta.clarify)
 }
 
 function newClarifyFlowId() {
@@ -3449,7 +6245,10 @@ function ensureClarifyFlow(meta) {
     if (step > state.clarifyFlow.step) state.clarifyFlow.step = step
     return state.clarifyFlow
   }
-  if (state.clarifyFlow?.controller) state.clarifyFlow.controller.abort()
+  if (state.clarifyFlow) {
+    stopClarifyAuto(state.clarifyFlow)
+    if (state.clarifyFlow.controller) state.clarifyFlow.controller.abort()
+  }
   state.clarifyFlow = {
     id: incomingId || newClarifyFlowId(),
     step,
@@ -3459,6 +6258,13 @@ function ensureClarifyFlow(meta) {
     sessionId: state.sessionId,
     modelId: state.selected || null,
     reasoningEffort: state.reasoningEffort || null,
+    turn: null,
+    autoTimer: 0,
+    autoTick: 0,
+    autoDeadline: 0,
+    autoSelectMs: CLARIFY_AUTO_SELECT_MS,
+    autoOptionLabel: '',
+    lastAuto: false,
   }
   return state.clarifyFlow
 }
@@ -3476,62 +6282,113 @@ function trailingPendingClarify(messages) {
   return null
 }
 
-function showClarifyDock(clarify, options = {}) {
+function stopClarifyAuto(flow = state.clarifyFlow) {
+  if (!flow) return
+  if (flow.autoTimer) window.clearTimeout(flow.autoTimer)
+  if (flow.autoTick) window.clearInterval(flow.autoTick)
+  flow.autoTimer = 0
+  flow.autoTick = 0
+  flow.autoDeadline = 0
+  const hint = $('#clarify-auto')
+  if (hint) {
+    hint.hidden = true
+    hint.textContent = ''
+  }
+}
+
+function formatClarifyAutoWait(ms) {
+  const total = Math.max(0, Math.ceil(ms / 1000))
+  const minutes = Math.floor(total / 60)
+  const seconds = total % 60
+  return minutes > 0 ? `${minutes} 分 ${String(seconds).padStart(2, '0')} 秒` : `${seconds} 秒`
+}
+
+function updateClarifyAutoHint(flow = state.clarifyFlow) {
+  const hint = $('#clarify-auto')
+  if (!hint) return
+  if (!flow?.autoDeadline) {
+    hint.hidden = true
+    return
+  }
+  const remaining = Math.max(0, Math.ceil((flow.autoDeadline - Date.now()) / 1000))
+  hint.hidden = false
+  hint.textContent = remaining > 0
+    ? `${formatClarifyAutoWait(flow.autoDeadline - Date.now())}后自动选择：${flow.autoOptionLabel || '第一个方向'}`
+    : '等待超时，正在自动选择…'
+}
+
+/** 用户迟迟不选时，等待一段时间后自动采用第一个方向，避免流程一直悬着。 */
+function startClarifyAutoSelect(flow = state.clarifyFlow) {
+  const clarify = state.pendingClarify
+  if (!flow || !clarify || flow.busy) return
+  const optionsList = Array.isArray(clarify.options) ? clarify.options : []
+  const first = optionsList.map((option) => String(option?.label || '').trim()).find(Boolean)
+  if (!first) return
+  stopClarifyAuto(flow)
+  flow.autoSelectMs = Number(flow.autoSelectMs) > 0 ? flow.autoSelectMs : CLARIFY_AUTO_SELECT_MS
+  flow.autoOptionLabel = first
+  flow.autoDeadline = Date.now() + flow.autoSelectMs
+  flow.autoTimer = window.setTimeout(() => {
+    flow.autoTimer = 0
+    if (state.clarifyFlow !== flow || !state.pendingClarify || flow.busy) return
+    const runtime = runtimeFor(flow.sessionId ?? state.sessionId)
+    if (runtime.sending) {
+      startClarifyAutoSelect(flow)
+      return
+    }
+    stopClarifyAuto(flow)
+    banner(`已等待 ${formatClarifyAutoWait(flow.autoSelectMs)}，自动选择：${first}`)
+    advanceClarifyFlow(first, { auto: true })
+  }, flow.autoSelectMs)
+  flow.autoTick = window.setInterval(() => updateClarifyAutoHint(flow), 1000)
+  updateClarifyAutoHint(flow)
+}
+
+function hideClarifyDockView() {
   const dock = $('#clarify-dock')
   if (!dock) return
+  dock.hidden = true
+  dock.innerHTML = ''
+}
+
+/** 方向选项直接渲染进当前 AI 气泡；底部不再出现独立的引导浮层。 */
+function showClarifyDock(clarify, options = {}) {
   const flow = ensureClarifyFlow(options.flowMeta)
   const step = Number(options.step)
   if (Number.isFinite(step) && step > 0) flow.step = Math.max(flow.step, Math.trunc(step))
   const previous = flow.answers.length
     ? flow.answers[flow.answers.length - 1].answer
     : String(options.previous || '').trim()
-  const html = clarifyPanelHtml(clarify, {
-    docked: true,
-    step: flow.step,
-    previous,
-    exitable: true,
-  })
-  if (!html) return
-  state.pendingClarify = clarify
-  dock.hidden = false
-  dock.innerHTML = html
-  bindClarifyPanel(dock)
+  if (!clarifyPanelHtml(clarify, { docked: false, step: flow.step, previous, exitable: true })) return
+  let turn = flow.turn?.node?.isConnected ? flow.turn : null
+  if (!turn) {
+    turn = createAiTurn({ append: true })
+    flow.turn = turn
+  }
+  hideClarifyDockView()
   const input = $('#input')
-  if (input) input.placeholder = '也可以直接输入你的回答或补充，选择后继续下一步…'
-  scrollThreadToBottomInstant()
+  if (input) input.placeholder = '也可以直接输入你的回答或补充，Enter 发送…'
+  turn.showClarifyPrompt(clarify, { step: flow.step, previous, auto: options.auto })
 }
 
-function showClarifyBusy(flow, answer) {
-  const dock = $('#clarify-dock')
-  if (!dock) return
-  const nextStep = flow.step + 1
-  dock.hidden = false
-  dock.innerHTML = `<div class="clarify-card is-docked is-busy" role="status" aria-live="polite">
-    <div class="clarify-stepline">
-      <span class="clarify-step">第 ${nextStep} 步</span>
-      <span class="clarify-prev">已选：${esc(oneLinePreview(answer, 24))}</span>
-    </div>
-    <div class="clarify-question">正在把这个选择交给 Agent，继续确认…</div>
-    <div class="clarify-progress" aria-hidden="true">
-      <span class="clarify-progress-dot"></span>
-      <span class="clarify-progress-dot"></span>
-      <span class="clarify-progress-dot"></span>
-    </div>
-  </div>`
+function showClarifyBusy(flow, answer, options = {}) {
+  stopClarifyAuto(flow)
+  hideClarifyDockView()
+  const turn = flow.turn?.node?.isConnected ? flow.turn : null
+  if (turn?.waitForReply) {
+    turn.waitForReply(options.auto ? '等待超时，已自动选择，等待回复中…' : '等待回复中…')
+  }
   const input = $('#input')
-  if (input) input.placeholder = '正在继续确认…'
-  scrollThreadToBottomInstant()
+  if (input) input.placeholder = '正在等待回复…'
 }
 
 function clearClarifyDock(options = {}) {
+  stopClarifyAuto(state.clarifyFlow)
+  state.clarifyFlow?.turn?.clearClarifyPrompt?.()
   if (options.abort && state.clarifyFlow?.controller) state.clarifyFlow.controller.abort()
   state.pendingClarify = null
   state.clarifyFlow = null
-  const dock = $('#clarify-dock')
-  if (dock) {
-    dock.hidden = true
-    dock.innerHTML = ''
-  }
+  hideClarifyDockView()
   const input = $('#input')
   if (input) input.placeholder = DEFAULT_INPUT_PLACEHOLDER
 }
@@ -3543,7 +6400,6 @@ function bindClarifyPanel(node) {
     const submit = (value) => {
       const text = String(value || '').trim()
       if (!text) return
-      for (const control of card.querySelectorAll('button, input')) control.disabled = true
       advanceClarifyFlow(text)
     }
     for (const option of card.querySelectorAll('.clarify-option')) {
@@ -3570,27 +6426,29 @@ function bindClarifyPanel(node) {
   }
 }
 
-/** 选择方向或补充内容：先记在当前导引页，再续跑 Agent；不生成普通用户消息。 */
-function advanceClarifyFlow(answer) {
+/** 选择方向或补充内容：隐藏续跑 Agent，不新增用户气泡。 */
+function advanceClarifyFlow(answer, options = {}) {
   const text = String(answer || '').trim()
   const clarify = state.pendingClarify
   if (!text || !clarify) return
   const flow = ensureClarifyFlow()
   if (flow.busy) return
+  stopClarifyAuto(flow)
   flow.sessionId = flow.sessionId || state.sessionId
   flow.modelId = flow.modelId || state.selected || null
   flow.reasoningEffort = flow.reasoningEffort || state.reasoningEffort || null
   flow.answers.push({ question: String(clarify.question || ''), answer: text })
   flow.busy = true
+  flow.lastAuto = options.auto === true
   if (flow.sessionId) {
     markSessionActive(flow.sessionId)
     renderSessions()
   }
-  showClarifyBusy(flow, text)
+  showClarifyBusy(flow, text, options)
   void runClarifyStep(flow, text, clarify)
 }
 
-/** 把一页答案作为隐藏续跑发给 Agent，下一页仍回到同一个底部导引面板。 */
+/** 把一页答案作为隐藏续跑发给 Agent，下一页仍回到同一个 AI 气泡内的引导区。 */
 async function runClarifyStep(flow, answer, answeredClarify) {
   const runtime = runtimeFor(flow.sessionId ?? state.sessionId)
   if (runtime.sending) return
@@ -3598,10 +6456,30 @@ async function runClarifyStep(flow, answer, answeredClarify) {
   flow.controller = controller
   runtime.controller = controller
   runtime.sending = true
+  renderSessions()
   renderQueueState()
   updateSendState()
   const targetSessionId = flow.sessionId ?? state.sessionId
   const nextStep = flow.step + 1
+  const startedAt = Date.now()
+  const selectionAt = new Date(startedAt).toISOString()
+  let turn = null
+  if (targetSessionId === state.sessionId || targetSessionId === null) {
+    if (flow.turn?.node?.isConnected) {
+      turn = flow.turn
+      turn.reset({
+        createdAt: selectionAt,
+        waitingText: flow.lastAuto ? '等待超时，已自动选择，等待回复中…' : '等待回复中…',
+      })
+    } else {
+      turn = createAiTurn({ append: true, createdAt: selectionAt })
+      flow.turn = turn
+      turn.waitForReply(flow.lastAuto ? '等待超时，已自动选择，等待回复中…' : '等待回复中…')
+    }
+    runtime.turn = turn
+    scrollThreadToBottomInstant()
+  }
+  const turnStartedLive = Boolean(turn)
   const buffered = { reasoning: '', content: '', tools: [], toolResults: [], done: null, clarify: null, messageId: '' }
   let streamError = null
   let sawDone = false
@@ -3616,12 +6494,27 @@ async function runClarifyStep(flow, answer, answeredClarify) {
         spaceKind: state.spaceKind,
         clarifyFlowId: flow.id,
         clarifyStep: nextStep,
+        activeFile: activePreviewFilePayload(),
       },
       (event, data) => {
         if (event === 'meta') {
           messageId = String(data.messageId || '')
-          if (messageId) state.localLiveMessageIds.add(messageId)
+          if (messageId) {
+            state.localLiveMessageIds.add(messageId)
+            state.historyMessageIds.add(messageId)
+            if (turn) {
+              turn.node.dataset.messageId = messageId
+              state.liveTurns.set(messageId, {
+                turn,
+                sessionId: data.sessionId || runtime.sessionId,
+                messageId,
+                hydrated: true,
+              })
+              refreshMessageActions(turn.node)
+            }
+          }
           runtime.runId = data.runId || runtime.runId
+          if (data.runId) beginParentAgentTurn(data.runId)
           runtime.messageId = messageId
           if (data.sessionId) {
             migrateRuntime(runtime, data.sessionId)
@@ -3636,12 +6529,18 @@ async function runClarifyStep(flow, answer, answeredClarify) {
           }
         } else if (event === 'reasoning') {
           buffered.reasoning += String(data.text || '')
+          if (turn) turn.reasoning(String(data.text || ''))
         } else if (event === 'delta') {
           buffered.content += String(data.text || '')
+          if (turn) turn.content(String(data.text || ''))
         } else if (event === 'tool') {
           buffered.tools.push(data)
+          if (turn) turn.tool(data)
         } else if (event === 'tool_result') {
           buffered.toolResults.push(data)
+          if (turn) turn.toolResult(data)
+        } else if (event === 'agent') {
+          updateAgentEvent(data)
         } else if (event === 'clarify') {
           buffered.clarify = data.clarify || buffered.clarify
         } else if (event === 'done') {
@@ -3668,12 +6567,36 @@ async function runClarifyStep(flow, answer, answeredClarify) {
     if (streamError) throw streamError
     if (!sawDone) throw new Error('回答流意外中断，请重试')
 
+    const userMessageId = String(buffered.done?.userMessageId || '')
+    if (userMessageId) state.historyMessageIds.add(userMessageId)
+
     if (buffered.clarify) {
       flow.busy = false
       flow.step = nextStep
       state.pendingClarify = buffered.clarify
       state.clarifyFlow = flow
-      showClarifyDock(buffered.clarify, { step: nextStep })
+      if (turn) {
+        const doneData = buffered.done || { text: buffered.content }
+        const questionText = String(
+          doneData.text || buffered.clarify.question || buffered.content || '',
+        )
+        if (messageId) {
+          turn.node.dataset.messageId = messageId
+          turn.node.chatMessage = {
+            id: messageId,
+            role: 'assistant',
+            text: questionText,
+            createdAt: doneData.createdAt || new Date().toISOString(),
+          }
+          state.historyMessageIds.add(messageId)
+          setMessageTime(turn.node, doneData.createdAt)
+          refreshMessageActions(turn.node)
+        }
+        turn.finish({ ...doneData, text: questionText, clarify: null })
+        if (messageId) state.liveTurns.delete(messageId)
+      }
+      showClarifyDock(buffered.clarify, { step: nextStep, auto: true })
+      loadSessions()
       return
     }
 
@@ -3685,11 +6608,28 @@ async function runClarifyStep(flow, answer, answeredClarify) {
     state.clarifyFlow = null
     state.pendingClarify = null
     clearClarifyDock()
-    const turn = createAiTurn({ append: runtime.sessionId === state.sessionId })
-    if (buffered.reasoning.trim()) turn.reasoning(buffered.reasoning)
-    for (const event of buffered.tools) turn.tool(event)
-    for (const event of buffered.toolResults) turn.toolResult(event)
-    turn.finish(buffered.done || { text: buffered.content })
+    if (!turn && runtime.sessionId === state.sessionId) {
+      turn = createAiTurn({ append: true, createdAt: selectionAt })
+      runtime.turn = turn
+    }
+    if (turn && messageId) {
+      turn.node.dataset.messageId = messageId
+      turn.node.chatMessage = {
+        id: messageId,
+        role: 'assistant',
+        text: String(buffered.done?.text || buffered.content || ''),
+        createdAt: buffered.done?.createdAt || new Date().toISOString(),
+      }
+      setMessageTime(turn.node, buffered.done?.createdAt)
+      refreshMessageActions(turn.node)
+    }
+    if (turn && !turnStartedLive) {
+      if (buffered.reasoning.trim()) turn.reasoning(buffered.reasoning)
+      for (const event of buffered.tools) turn.tool(event)
+      for (const event of buffered.toolResults) turn.toolResult(event)
+    }
+    if (turn) turn.finish(buffered.done || { text: buffered.content })
+    if (messageId) state.liveTurns.delete(messageId)
     if (messageId) {
       state.historyMessageIds.add(messageId)
       state.localLiveMessageIds.delete(messageId)
@@ -3699,6 +6639,10 @@ async function runClarifyStep(flow, answer, answeredClarify) {
     updateSendState()
   } catch (err) {
     const aborted = controller.signal.aborted
+    if (turn) {
+      if (aborted) turn.stop()
+      else turn.fail(`引导续跑失败：${err.message}`)
+    }
     if (state.clarifyFlow === flow) {
       flow.busy = false
       flow.controller = null
@@ -3714,7 +6658,14 @@ async function runClarifyStep(flow, answer, answeredClarify) {
   } finally {
     runtime.sending = false
     runtime.controller = null
+    if (runtime.turn === turn) runtime.turn = null
+    if (messageId) {
+      const live = state.liveTurns.get(messageId)
+      if (live?.turn === turn) state.liveTurns.delete(messageId)
+    }
+    if (messageId && runtime.messageId === messageId) runtime.messageId = null
     if (messageId) state.localLiveMessageIds.delete(messageId)
+    renderSessions()
     updateSendState()
     renderQueueState()
     if (runtime.queue.length > 0) {
@@ -3742,19 +6693,111 @@ function myDisplayName() {
   return String(state.me?.person?.name || $('#user-name')?.textContent || '我').trim() || '我'
 }
 
+function formatMessageStamp(value) {
+  const date = value ? new Date(value) : new Date()
+  if (Number.isNaN(date.getTime())) return null
+  const now = new Date()
+  const pad = (number) => String(number).padStart(2, '0')
+  const hhmm = `${pad(date.getHours())}:${pad(date.getMinutes())}`
+  const isSameDay = (left, right) =>
+    left.getFullYear() === right.getFullYear() &&
+    left.getMonth() === right.getMonth() &&
+    left.getDate() === right.getDate()
+  const yesterday = new Date(now)
+  yesterday.setDate(now.getDate() - 1)
+  let short = hhmm
+  if (!isSameDay(date, now)) {
+    short = isSameDay(date, yesterday)
+      ? `昨天 ${hhmm}`
+      : date.getFullYear() === now.getFullYear()
+        ? `${date.getMonth() + 1}月${date.getDate()}日 ${hhmm}`
+        : `${date.getFullYear()}年${date.getMonth() + 1}月${date.getDate()}日 ${hhmm}`
+  }
+  const full = `${date.getFullYear()}年${date.getMonth() + 1}月${date.getDate()}日 ${hhmm}`
+  return { iso: date.toISOString(), short, full }
+}
+
+function setMessageTime(node, value) {
+  const time = node?.querySelector('.msg-time')
+  const stamp = formatMessageStamp(value)
+  if (!time || !stamp) return
+  time.dateTime = stamp.iso
+  time.title = stamp.full
+  time.textContent = stamp.short
+}
+
+const MESSAGE_ACTION_ICONS = {
+  edit: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.5 19.5h4L19 9a2.2 2.2 0 0 0-3.1-3.1L5.5 16.4v3.1Z" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="m13.5 6.5 3.1 3.1" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>',
+  recall:
+    '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 7 5 11l4 4" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M5 11h8.2A5.8 5.8 0 0 1 19 16.8" fill="none" stroke="currentColor" stroke-width="1.7"/></svg>',
+  delete:
+    '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M9 7V5h6v2M8 7l1 12h6l1-12M10 10v6M14 10v6" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>',
+}
+
+function messageFooterMarkup(role) {
+  const actions =
+    role === 'me'
+      ? `<button type="button" class="msg-action" data-message-act="edit" title="编辑后重发" aria-label="编辑后重发">${MESSAGE_ACTION_ICONS.edit}</button>
+         <button type="button" class="msg-action" data-message-act="recall" title="撤回" aria-label="撤回">${MESSAGE_ACTION_ICONS.recall}</button>
+         <button type="button" class="msg-action is-danger" data-message-act="delete" title="删除" aria-label="删除">${MESSAGE_ACTION_ICONS.delete}</button>`
+      : `<button type="button" class="msg-action is-danger" data-message-act="delete" title="删除回答" aria-label="删除回答">${MESSAGE_ACTION_ICONS.delete}</button>`
+  const actionsBlock = `<div class="msg-actions" role="group" aria-label="消息操作" hidden>${actions}</div>`
+  const time = '<time class="msg-time"></time>'
+  const blocks =
+    role === 'me'
+      ? `${actionsBlock}${time}`
+      : `${time}${actionsBlock}`
+  return `<div class="msg-footer">
+    ${blocks}
+  </div>`
+}
+
+function refreshMessageActions(node) {
+  const actions = node?.querySelector('.msg-actions')
+  if (!actions) return
+  actions.hidden = !node.dataset.messageId
+}
+
+function sessionReplyBusy() {
+  const runtime = currentRuntime()
+  if (runtime?.sending) return true
+  if (
+    Array.from(state.liveTurns.values()).some((entry) => entry.sessionId === state.sessionId)
+  ) {
+    return true
+  }
+  return Array.from(state.activeRunSnapshots.values()).some(
+    (run) => run.sessionId === state.sessionId && run.status === 'running',
+  )
+}
+
+function syncMessageActionAvailability() {
+  const thread = $('#thread')
+  if (thread) thread.dataset.replyBusy = sessionReplyBusy() ? 'true' : 'false'
+}
+
 function appendMessage(role, text, meta, attachments, rich, options = {}) {
   setEmptyVisible(false)
   const node = document.createElement('div')
   node.className = `msg ${role === 'me' ? 'me' : 'ai'}`
-  if (options.messageId) node.dataset.messageId = String(options.messageId)
+  if (options.messageId) {
+    node.dataset.messageId = String(options.messageId)
+    node.chatMessage = {
+      id: String(options.messageId),
+      role: role === 'me' ? 'user' : 'assistant',
+      text: String(text || ''),
+      createdAt: options.createdAt || new Date().toISOString(),
+    }
+  }
   const files = attachments && attachments.length ? `<div class="bubble-files">${attachmentChips(attachments)}</div>` : ''
   const meName = myDisplayName()
   const channel = channelTag(options.channel)
+  const footer = messageFooterMarkup(role === 'me' ? 'me' : 'ai')
   node.innerHTML =
     role === 'me'
-      ? `<div class="bubble">${esc(text)}${files}</div>
+      ? `<div class="msg-body"><div class="bubble">${esc(text)}${files}</div>${footer}</div>
         <div class="who-me"><span class="who-name">${esc(meName)}</span>${channel}${avatarMarkup(meName, meAvatarUrl(), 'who-badge me')}</div>`
-      : `${aiWhoMarkup()}<div class="bubble ai-turn">${historyAiBubble(text, meta, rich || {}, options)}</div>`
+      : `${aiWhoMarkup()}<div class="msg-body"><div class="bubble ai-turn">${historyAiBubble(text, meta, rich || {}, options)}</div>${footer}</div>`
   const thread = $('#thread')
   if (options.prepend) {
     const firstMessage = thread.querySelector('.msg')
@@ -3762,8 +6805,13 @@ function appendMessage(role, text, meta, attachments, rich, options = {}) {
   } else {
     thread.appendChild(node)
   }
+  setMessageTime(node, options.createdAt)
+  refreshMessageActions(node)
   bindToolToggles(node)
-  if (options.scroll !== false) node.scrollIntoView({ block: 'end', behavior: 'smooth' })
+  if (options.scroll !== false) {
+    if (threadScrollPinned) node.scrollIntoView({ block: 'end', behavior: 'smooth' })
+    else markThreadNewContent()
+  }
   queueScrollBottomButtonUpdate()
   return node
 }
@@ -3774,7 +6822,7 @@ function createAiTurn(options = {}) {
   if (append) setEmptyVisible(false)
   const node = document.createElement('div')
   node.className = 'msg ai'
-  node.innerHTML = `${aiWhoMarkup()}<div class="bubble ai-turn">
+  node.innerHTML = `${aiWhoMarkup()}<div class="msg-body"><div class="bubble ai-turn">
     <div class="think-panel is-collapsed" hidden>
       <button class="think-head" type="button" aria-expanded="false">
         <span class="think-icon">✦</span><span class="think-title">正在思考…</span><span class="think-chevron">⌄</span>
@@ -3783,10 +6831,14 @@ function createAiTurn(options = {}) {
       <div class="think-body"></div>
     </div>
     <div class="tool-slot" hidden></div>
-    <div class="ai-status"><span class="ai-status-dot"></span><span class="ai-status-text">正在思考…</span></div>
+    <div class="ai-status"><span class="ai-status-dot"></span><span class="ai-status-text">正在思考中…</span></div>
+    <div class="ai-waiting" hidden><span class="ai-waiting-dot"></span><span class="ai-waiting-text">等待回复中…</span></div>
+    <div class="clarify-slot" hidden></div>
     <div class="answer-text"></div>
     <span class="meta" hidden></span>
-  </div>`
+  </div>${messageFooterMarkup('ai')}</div>`
+  setMessageTime(node, options.createdAt || Date.now())
+  refreshMessageActions(node)
   if (append) {
     $('#thread').appendChild(node)
     bindToolToggles(node)
@@ -3801,28 +6853,47 @@ function createAiTurn(options = {}) {
   const statusText = node.querySelector('.ai-status-text')
   const answer = node.querySelector('.answer-text')
   const metaLine = node.querySelector('.meta')
-  const startedAt = Date.now()
+  const clarifySlot = node.querySelector('.clarify-slot')
+  const waiting = node.querySelector('.ai-waiting')
+  const waitingText = node.querySelector('.ai-waiting-text')
+  let startedAt = Date.now()
   let firstAnswerAt = 0
   let rawAnswer = ''
   let answerRenderQueued = false
   let scrollQueued = false
+  let renderGeneration = 0
   const toolTraces = []
+  /** 当前回合按 tool_call index 累积的参数；只用于右侧预览，不写入工具轨迹。 */
+  const streamToolDrafts = new Map()
 
   const scroll = () => {
     // 后台会话的节点不在当前消息流里，不能因为它的增量把当前页面滚到底部。
     if (!node.isConnected) return
+    if (!threadScrollPinned) {
+      markThreadNewContent()
+      return
+    }
     if (scrollQueued) return
     scrollQueued = true
     requestAnimationFrame(() => {
       scrollQueued = false
+      // 用户可能在上滚已经打断了上一帧的跟随；这一帧也要重新确认。
+      if (!threadScrollPinned) {
+        markThreadNewContent()
+        return
+      }
       scrollThreadToBottomInstant()
     })
   }
   // 最后一条内容常常在 end 事件之后才完成排版，补一帧确保工具面板不被输入区遮住。
   const finalScroll = () => {
+    if (!threadScrollPinned) {
+      markThreadNewContent()
+      return
+    }
     scroll()
     setTimeout(() => {
-      if (node.isConnected) scrollThreadToBottomInstant()
+      if (node.isConnected && threadScrollPinned) scrollThreadToBottomInstant()
     }, 120)
   }
   const setStatus = (text) => {
@@ -3856,35 +6927,157 @@ function createAiTurn(options = {}) {
     bindToolToggles(node)
     scroll()
   }
+  /**
+   * 实时事件有可能丢失（例如页面刚从后台恢复、SSE 重连或工具事件先于气泡创建）。
+   * done 事件带着完整的 reasoning / toolCalls 快照，这里按快照补齐并合并，保证
+   * 用户仍能看到“已深度思考”和可展开的工具调用记录。
+   */
+  const mergeDoneDetails = (data) => {
+    const doneReasoning = String(data?.reasoning || '').trim()
+    if (doneReasoning && think.hidden) {
+      think.hidden = false
+      think.classList.add('is-active')
+      thinkBody.textContent = doneReasoning
+      thinkTitle.textContent = '正在思考中…'
+    }
+    const calls = Array.isArray(data?.toolCalls) ? data.toolCalls : []
+    for (const item of calls) {
+      const id = String(item?.id || '').trim()
+      if (!id) continue
+      const trace = {
+        id,
+        name: item.name || '工具调用',
+        toolId: item.toolId || '',
+        args: item.args ?? {},
+        status: item.status === 'error' ? 'error' : 'done',
+        summary: item.summary || '',
+        durationMs: Number(item.durationMs) || 0,
+      }
+      const existing = toolTraces.find((entry) => entry.id === id)
+      if (existing) {
+        existing.name = trace.name || existing.name
+        existing.toolId = trace.toolId || existing.toolId
+        existing.status = trace.status
+        existing.summary = trace.summary || existing.summary
+        existing.durationMs = trace.durationMs || existing.durationMs
+      } else {
+        toolTraces.push(trace)
+      }
+    }
+    if (toolTraces.length > 0 && toolPanel.hidden) {
+      renderToolPanel(toolTraces.some((item) => item.status === 'running'))
+    }
+    const lastFileTrace = [...toolTraces].reverse().find((entry) => FILE_OPERATION_TOOLS.has(entry.toolId))
+    if (lastFileTrace) updateFileActivity(lastFileTrace)
+  }
   // 流式阶段也按 Markdown 渲染；每帧最多重排一次，避免逐 token 抖动。
   const renderStreamingAnswer = () => {
     if (answerRenderQueued) return
     answerRenderQueued = true
+    const generation = renderGeneration
     requestAnimationFrame(() => {
       answerRenderQueued = false
-      answer.innerHTML = renderAnswer(rawAnswer)
+      if (generation !== renderGeneration) return
+      answer.innerHTML = renderAnswer(rawAnswer, { omitCodeBlocks: writtenFileContentBlocks(toolTraces) })
       scroll()
     })
   }
-  const showClarify = (clarify) => {
-    if (!clarifyPanelHtml(clarify, { docked: true })) return
+  let turn = null
+  const hideWaiting = () => {
+    waiting.hidden = true
+  }
+  const showWaiting = (text = '等待回复中…') => {
+    clarifySlot.hidden = true
+    clarifySlot.innerHTML = ''
+    answer.hidden = true
+    setStatus('正在思考中…')
+    waiting.hidden = false
+    waitingText.textContent = text
+    scroll()
+  }
+  const showClarifyPrompt = (clarify, options = {}) => {
+    const flow = state.clarifyFlow || ensureClarifyFlow()
+    flow.turn = turn
+    const step = Number.isFinite(Number(options.step)) && Number(options.step) > 0
+      ? Math.trunc(Number(options.step))
+      : Number(flow?.step) || 1
+    const previous = String(options.previous || '').trim()
+    const content = clarifyPanelHtml(clarify, {
+      docked: false,
+      step,
+      previous,
+      exitable: true,
+    })
+    if (!content) return
     setStatus('')
+    hideWaiting()
     collapseThink(true)
     if (toolTraces.length > 0) {
       toolPanel.innerHTML = toolPanelHtml(toolTraces, { active: false, expanded: false })
       toolPanel.hidden = false
       bindToolToggles(node)
     }
-    answer.hidden = false
-    answer.classList.add('is-clarify-note')
-    answer.innerHTML = clarifyInlineNote()
     rawAnswer = ''
-    showClarifyDock(clarify)
+    answer.innerHTML = ''
+    answer.hidden = true
+    answer.classList.remove('is-clarify-note', 'is-error')
+    clarifySlot.innerHTML = content
+    clarifySlot.hidden = false
+    bindClarifyPanel(clarifySlot)
+    state.pendingClarify = clarify
+    if (state.clarifyFlow) state.clarifyFlow.turn = turn
+    if (options.auto) startClarifyAutoSelect(state.clarifyFlow)
     finalScroll()
   }
 
-  return {
+  turn = {
     node,
+    /** 在当前气泡内渲染方向选项，不再使用底部浮层。 */
+    showClarifyPrompt(clarify, options = {}) {
+      showClarifyPrompt(clarify, options)
+      return this
+    },
+    /** 选项已提交后，在当前气泡显示“正在思考中 / 等待回复中”。 */
+    waitForReply(text = '等待回复中…') {
+      showWaiting(text)
+      return this
+    },
+    clearClarifyPrompt() {
+      clarifySlot.hidden = true
+      clarifySlot.innerHTML = ''
+      return this
+    },
+    /** 引导续跑时复用同一条 AI 气泡，清空上一问的内容但保留节点位置。 */
+    reset(options = {}) {
+      renderGeneration += 1
+      startedAt = Date.now()
+      firstAnswerAt = 0
+      rawAnswer = ''
+      answer.innerHTML = ''
+      answer.hidden = true
+      answer.classList.remove('is-clarify-note', 'is-error')
+      think.hidden = true
+      think.classList.remove('is-active')
+      think.classList.add('is-collapsed')
+      thinkTitle.textContent = '正在思考中…'
+      thinkPeek.hidden = true
+      thinkBody.textContent = ''
+      toolTraces.length = 0
+      streamToolDrafts.clear()
+      finishStreamingFilePreview()
+      toolPanel.innerHTML = ''
+      toolPanel.hidden = true
+      clarifySlot.innerHTML = ''
+      clarifySlot.hidden = true
+      metaLine.hidden = true
+      metaLine.textContent = ''
+      showWaiting(options.waitingText || '等待回复中…')
+      delete node.dataset.messageId
+      node.chatMessage = null
+      setMessageTime(node, options.createdAt || Date.now())
+      refreshMessageActions(node)
+      scrollThreadToBottomInstant()
+    },
     appendToThread() {
       if (node.isConnected) return
       setEmptyVisible(false)
@@ -3915,7 +7108,7 @@ function createAiTurn(options = {}) {
       think.hidden = false
       think.classList.add('is-active')
       thinkBody.textContent += text
-      thinkTitle.textContent = '正在思考…'
+      thinkTitle.textContent = '正在思考中…'
       setStatus('')
       if (think.classList.contains('is-collapsed')) {
         const peek = oneLinePreview(thinkBody.textContent)
@@ -3929,6 +7122,9 @@ function createAiTurn(options = {}) {
       if (!text) return
       if (!firstAnswerAt) firstAnswerAt = Date.now()
       if (!rawAnswer) setStatus('')
+      hideWaiting()
+      clarifySlot.hidden = true
+      clarifySlot.innerHTML = ''
       collapseThink(true)
       answer.hidden = false
       answer.classList.remove('is-clarify-note')
@@ -3936,9 +7132,56 @@ function createAiTurn(options = {}) {
       renderStreamingAnswer()
     },
     tool(event) {
-      toolTraces.push({ id: event.id, name: event.name, toolId: event.toolId, args: event.args, status: 'running', summary: '', durationMs: 0 })
+      const trace = { id: event.id, name: event.name, toolId: event.toolId, args: event.args, status: 'running', summary: '', durationMs: 0 }
+      toolTraces.push(trace)
       setStatus('')
+      updateFileActivity(trace)
+      const op = fileOperationInfo(trace)
+      if (op) {
+        if (trace.toolId === 'office.replace' || trace.toolId === 'office.insert') {
+          applyStreamingOfficePreview(trace.args?.fileId, op.path, trace.args?.elementId, op.text)
+        } else {
+          applyStreamingFilePreview(op.path, op.text)
+        }
+      }
       renderToolPanel(true)
+    },
+    /** 模型生成 workspace.write 参数时，同步更新右侧草稿和吊顶卡。 */
+    toolDelta(event) {
+      const index = Number(event?.index)
+      if (!Number.isFinite(index)) return
+      const draft = streamToolDrafts.get(index) || { id: '', name: '', raw: '' }
+      if (event.name) draft.name = String(event.name)
+      if (event.id) draft.id = String(event.id)
+      const argumentsDelta = event.argsDelta || event.argumentsDelta
+      if (argumentsDelta) draft.raw += String(argumentsDelta)
+      streamToolDrafts.set(index, draft)
+      if (isOfficeReplaceToolName(draft.name)) {
+        const args = partialOfficeReplaceArgs(draft.raw)
+        if (args.newText) applyStreamingOfficePreview(args.fileId, args.path, args.elementId, args.newText)
+        return
+      }
+      if (isOfficeInsertToolName(draft.name)) {
+        const args = partialOfficeInsertArgs(draft.raw)
+        if (args.text) applyStreamingOfficePreview(args.fileId, args.path, args.elementId, args.text)
+        return
+      }
+      if (!isWorkspaceWriteToolName(draft.name)) return
+      const args = partialWorkspaceWriteArgs(draft.raw)
+      if (!args.path && !args.text) return
+      applyStreamingFilePreview(args.path, args.text)
+      // 有 call id 才更新吊顶卡：tool 事件到达时按同一个 id 合并，避免多算一步。
+      if (draft.id) {
+        updateFileActivity({
+          id: draft.id,
+          name: draft.name,
+          toolId: 'workspace.write',
+          args: { path: args.path, text: args.text },
+          status: 'running',
+          summary: '',
+          durationMs: 0,
+        })
+      }
     },
     toolResult(event) {
       const trace = toolTraces.find((item) => item.id === event.id)
@@ -3947,13 +7190,28 @@ function createAiTurn(options = {}) {
       trace.summary = event.summary
       trace.durationMs = event.durationMs
       setStatus('')
+      updateFileActivity(trace)
       renderToolPanel(toolTraces.some((item) => item.status === 'running'))
+      // 最后一个工具完成后收起吊顶卡；最终回答仍会保留在消息里。
+      if (trace.status === 'done' && !toolTraces.some((item) => item.status === 'running')) {
+        settleFileDock()
+      }
+      const op = fileOperationInfo(trace)
+      if (op && op.status === 'done') {
+        // 等右侧草稿把最后一段揭示完，再刷新真实文件，避免预览在收尾时跳一下。
+        finishStreamingFilePreview(() => refreshWorkspaceAfterFileOperation(op))
+      } else if (op) {
+        finishStreamingFilePreview()
+      }
     },
     clarify(clarify) {
-      showClarify(clarify)
+      showClarifyPrompt(clarify)
     },
     finish(data) {
       setStatus('')
+      if (data?.createdAt) setMessageTime(node, data.createdAt)
+      refreshMessageActions(node)
+      mergeDoneDetails(data)
       collapseThink(true)
       if (toolTraces.length > 0) {
         const current = toolPanel.querySelector('.tool-panel')
@@ -3963,13 +7221,17 @@ function createAiTurn(options = {}) {
         bindToolToggles(node)
       }
       if (data?.clarify) {
-        showClarify(data.clarify)
+        if (state.clarifyFlow) state.clarifyFlow.turn = turn
+        showClarifyPrompt(data.clarify)
       } else {
+        hideWaiting()
+        clarifySlot.hidden = true
+        clarifySlot.innerHTML = ''
         const finalText = String(data?.text || '').trim()
         if (finalText) rawAnswer = finalText
         answer.hidden = false
         answer.classList.remove('is-clarify-note')
-        if (rawAnswer) answer.innerHTML = renderAnswer(rawAnswer)
+        if (rawAnswer) answer.innerHTML = renderAnswer(rawAnswer, { omitCodeBlocks: writtenFileContentBlocks(toolTraces) })
         else if (!answer.textContent) answer.textContent = '（没有返回内容）'
       }
       const citations = data.citations && data.citations.length ? ` · 引用 ${data.citations.length} 条` : ''
@@ -3982,9 +7244,14 @@ function createAiTurn(options = {}) {
       }
       if (data.fallbackFromModelId) void refreshModelCatalog()
       finalScroll()
+      if (node.isConnected) settleFileDock()
+      if (data?.clarify) startClarifyAutoSelect(state.clarifyFlow)
     },
     fail(message, meta) {
       setStatus('')
+      hideWaiting()
+      clarifySlot.hidden = true
+      clarifySlot.innerHTML = ''
       collapseThink(true)
       answer.hidden = false
       answer.classList.remove('is-clarify-note')
@@ -3994,19 +7261,25 @@ function createAiTurn(options = {}) {
         metaLine.hidden = false
         metaLine.textContent = meta
       }
+      if (node.isConnected) settleFileDock()
       scroll()
     },
     stop() {
       setStatus('')
+      hideWaiting()
+      clarifySlot.hidden = true
+      clarifySlot.innerHTML = ''
       collapseThink(true)
       answer.hidden = false
       answer.classList.remove('is-clarify-note')
       if (!rawAnswer) answer.textContent = '已停止生成'
       metaLine.hidden = false
       metaLine.textContent = '已停止生成'
+      if (node.isConnected) settleFileDock()
       scroll()
     },
   }
+  return turn
 }
 
 function appendTyping() {
@@ -4025,7 +7298,6 @@ function renderDenied(err) {
     <span class="mono">${esc(err.code || '')}${err.traceId ? ` · traceId ${esc(err.traceId)}` : ''}</span>
     <span class="mono">换一个账号登录，或让管理员在控制台里给你的角色授这个权限。</span>
   </div>`
-  $('#composer-foot').textContent = '当前账号不能对话'
   $('#model-chip').disabled = true
   $('#send').disabled = true
   const input = $('#input')
@@ -4151,20 +7423,58 @@ async function addFiles(fileList) {
 /* ---------------- 发送 ---------------- */
 
 function updateSendState() {
-  const text = $('#input').value.trim()
+  const input = $('#input')
+  const sendButton = $('#send')
+  if (!input || !sendButton) return
+  const text = input.value.trim()
   const clarifyBusy = Boolean(state.clarifyFlow?.busy)
-  $('#send').disabled =
-    clarifyBusy || state.models.length === 0 || (!text && state.attachments.length === 0)
+  const runtime = currentRuntime()
+  const streaming = Boolean(runtime.sending)
+  const hasContent = Boolean(text || state.attachments.length > 0)
+  const queueSend = $('#queue-send')
+
+  // 回复中做两个按钮的互换：右侧主按钮变暂停，左侧队列发送按钮出现。
+  // 输入框保持可编辑，Enter 仍按 send() 走排队发送。
+  if (streaming) {
+    if (queueSend) {
+      queueSend.hidden = false
+      queueSend.disabled = clarifyBusy || state.models.length === 0 || !hasContent
+    }
+    if (sendButton.dataset.mode !== 'pause') {
+      sendButton.dataset.mode = 'pause'
+      sendButton.classList.add('is-stop')
+      sendButton.title = '暂停当前回复'
+      sendButton.setAttribute('aria-label', '暂停当前回复')
+      sendButton.innerHTML =
+        '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="5" width="3.6" height="14" rx="1.2" fill="currentColor"/><rect x="13.4" y="5" width="3.6" height="14" rx="1.2" fill="currentColor"/></svg>'
+    }
+    sendButton.disabled = false
+    syncMessageActionAvailability()
+    return
+  }
+
+  if (queueSend) queueSend.hidden = true
+  if (sendButton.dataset.mode !== 'send') {
+    sendButton.dataset.mode = 'send'
+    sendButton.classList.remove('is-stop')
+    sendButton.title = '发送'
+    sendButton.setAttribute('aria-label', '发送')
+    sendButton.innerHTML =
+      '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 11.5 20 4l-7.4 16-2.1-6.3-6.5-2.2Z" fill="none" stroke="currentColor" stroke-width="1.7"/></svg>'
+  }
+  sendButton.disabled = clarifyBusy || state.models.length === 0 || !hasContent
+  syncMessageActionAvailability()
 }
 
 /** 只在真的出现排队消息时提示；只有一条正在回复的消息时不占输入区。 */
 function renderQueueState() {
+  // 会话切换后主按钮必须跟着当前会话的 sending 状态走：
+  // A 会话回复中切到 B，B 的按钮应恢复发送；切回 A 再变回暂停。
+  updateSendState()
   const bar = $('#queue-bar')
   if (!bar) return
   const runtime = currentRuntime()
   const queued = runtime.queue.length
-  const stopReply = $('#stop-reply')
-  if (stopReply) stopReply.hidden = !runtime.sending || queued > 0
   bar.hidden = queued === 0
   if (bar.hidden) return
   const text = runtime.sending
@@ -4209,6 +7519,10 @@ async function streamChat(payload, onEvent, signal) {
   })
   if (!response.ok) {
     const body = await response.json().catch(() => null)
+    if (response.status === 401) {
+      redirectToLogin()
+      return waitForLoginRedirect()
+    }
     const err = new Error(body?.error?.message || body?.message || `HTTP ${response.status}`)
     err.code = body?.error?.code || body?.code
     err.traceId = body?.error?.traceId || body?.traceId
@@ -4285,6 +7599,31 @@ async function send() {
   }
   // 只要用户真正发了消息（包括带附件），底部澄清就完成使命。
   clearClarifyDock()
+
+  // 编辑后重发：先回退到被编辑消息之前，再按正常发送走一遍，
+  // 避免旧提问和旧回答继续留在模型上下文里。
+  if (state.messageEdit) {
+    const edit = state.messageEdit
+    if (state.sessionId !== edit.sessionId) {
+      cancelMessageEdit({ clearInput: true, silent: true })
+      banner('会话已切换，编辑已取消', 'warn')
+      return
+    }
+    if (sessionReplyBusy()) {
+      banner('回复结束后再发送编辑后的消息', 'warn')
+      return
+    }
+    try {
+      const result = await deleteMessageApi(edit.id, 'after')
+      removeDeletedMessageNodes(result.deletedIds)
+      state.messageEdit = null
+      renderMessageEditBar()
+    } catch (err) {
+      banner(`替换原消息失败：${err.message}`, 'bad')
+      return
+    }
+  }
+
   if (state.sessionId) {
     markSessionActive(state.sessionId)
     renderSessions()
@@ -4307,6 +7646,7 @@ async function send() {
     attachmentMeta,
     sessionId: state.sessionId,
     runtimeKey: runtime.key,
+    createdAt: Date.now(),
     node: null,
   }
 
@@ -4326,7 +7666,7 @@ async function send() {
   runtime.queue.push(item)
   input.value = ''
   input.style.height = '44px'
-  item.node = appendMessage('me', text, undefined, attachmentMeta)
+  item.node = appendMessage('me', text, undefined, attachmentMeta, undefined, { createdAt: item.createdAt })
   scrollThreadToBottomInstant()
 
   state.attachments = []
@@ -4349,6 +7689,7 @@ async function drainQueue(runtime = currentRuntime()) {
   }
 
   runtime.sending = true
+  renderSessions()
   const controller = new AbortController()
   runtime.controller = controller
   runtime.runId = null
@@ -4380,6 +7721,8 @@ async function drainQueue(runtime = currentRuntime()) {
         attachments,
         sessionId: item.sessionId,
         spaceKind: state.spaceKind,
+        // 右侧正在预览的文件：让模型知道「这个文件」指谁；面板没开就不传。
+        activeFile: activePreviewFilePayload(),
       },
       (event, data) => {
         const isCurrentRun = runtime.sessionId ? runtime.sessionId === state.sessionId : state.sessionId === null
@@ -4387,6 +7730,19 @@ async function drainQueue(runtime = currentRuntime()) {
           messageId = String(data.messageId || '')
           runtime.messageId = messageId
           runtime.runId = data.runId || null
+          if (data.runId) beginParentAgentTurn(data.runId)
+          const userMessageId = String(data.userMessageId || '')
+          if (userMessageId && item.node) {
+            item.node.dataset.messageId = userMessageId
+            item.node.chatMessage = {
+              id: userMessageId,
+              role: 'user',
+              text: item.text,
+              createdAt: new Date(item.createdAt).toISOString(),
+            }
+            refreshMessageActions(item.node)
+            state.historyMessageIds.add(userMessageId)
+          }
           if (messageId) {
             state.localLiveMessageIds.add(messageId)
             // EventSource 可能先于 meta 到达并已经建好实时节点；复用它，
@@ -4415,6 +7771,10 @@ async function drainQueue(runtime = currentRuntime()) {
             for (const queued of runtime.queue) {
               if (!queued.sessionId) queued.sessionId = data.sessionId
             }
+            if (!state.sessions.some((session) => session.id === data.sessionId)) {
+              // 新会话第一次回复时还没进左侧列表，先拉一次，运行中的绿点才有落点。
+              void loadSessions()
+            }
             if (state.sessionId === null || state.sessionId === data.sessionId) {
               state.sessionId = data.sessionId
               persistChatLocation()
@@ -4432,22 +7792,22 @@ async function drainQueue(runtime = currentRuntime()) {
           event === 'reasoning' ||
           event === 'delta' ||
           event === 'tool' ||
+          event === 'tool_delta' ||
           event === 'tool_result'
         ) {
           /**
-           * 实时正文和工具轨迹优先由 EventSource 渲染：POST 流和广播流内容相同，
-           * 两处都画会重复；只靠 POST 又会在连接卡住时一直停在“正在思考…”。
-           * EventSource 尚未连上时退回 POST 流；连上后只接收后续增量，不会重复。
-           * POST 仍负责 meta / done / error，EventSource 断开时最终答案由 done 收尾。
+           * POST 流负责本次发送的实时渲染。EventSource 在 setupChatEvents
+           * 里会跳过当前会话正在 POST 的同一轮，避免重复；这里不能再因为
+           * EventSource 已连接就不画，否则两处互相让路，气泡会一直停在
+           * “正在思考中…”，刷新后才从历史消息恢复。
            */
-          const liveEventsReady =
-            typeof EventSource !== 'undefined' && state.liveEventSource?.readyState === EventSource.OPEN
-          if (!liveEventsReady) {
-            if (event === 'reasoning') turn.reasoning(data.text)
-            else if (event === 'delta') turn.content(data.text)
-            else if (event === 'tool') turn.tool(data)
-            else turn.toolResult(data)
-          }
+          if (event === 'reasoning') turn.reasoning(data.text)
+          else if (event === 'delta') turn.content(data.text)
+          else if (event === 'tool') turn.tool(data)
+          else if (event === 'tool_delta') turn.toolDelta(data)
+          else turn.toolResult(data)
+        } else if (event === 'agent') {
+          updateAgentEvent(data)
         } else if (event === 'clarify') {
           turn.clarify(data.clarify)
         } else if (event === 'done') {
@@ -4469,6 +7829,17 @@ async function drainQueue(runtime = currentRuntime()) {
             state.activeRunSnapshots.delete(id)
             state.localLiveMessageIds.delete(id)
             state.liveTurns.delete(id)
+            if (turn.node) {
+              turn.node.dataset.messageId = id
+              turn.node.chatMessage = {
+                id,
+                role: 'assistant',
+                text: String(data.text || ''),
+                createdAt: data.createdAt || new Date().toISOString(),
+              }
+              setMessageTime(turn.node, data.createdAt)
+              refreshMessageActions(turn.node)
+            }
           }
           if (data.sessionId) {
             migrateRuntime(runtime, data.sessionId)
@@ -4478,6 +7849,7 @@ async function drainQueue(runtime = currentRuntime()) {
             }
           }
           turn.finish(data)
+          syncMessageActionAvailability()
           if (isCurrentRun || runtime.sessionId === state.sessionId) {
             notifySessionRead(runtime.sessionId)
           }
@@ -4511,6 +7883,7 @@ async function drainQueue(runtime = currentRuntime()) {
     runtime.runId = null
     if (runtime.turn === turn) runtime.turn = null
     if (messageId) state.localLiveMessageIds.delete(messageId)
+    renderSessions()
     updateSendState()
     renderQueueState()
     if (runtime.queue.length > 0) {
@@ -4953,6 +8326,392 @@ async function setupLoginSso() {
   })
 }
 
+function setSidebarCollapsed(collapsed, options = {}) {
+  const isCollapsed = Boolean(collapsed)
+  document.body.classList.toggle('is-side-collapsed', isCollapsed)
+  const button = $('#side-toggle')
+  if (button) {
+    button.setAttribute('aria-expanded', String(!isCollapsed))
+    button.setAttribute('aria-label', isCollapsed ? '展开侧边栏' : '收起侧边栏')
+    button.title = isCollapsed ? '展开侧边栏' : '收起侧边栏'
+  }
+  if (options.persist !== false) {
+    try {
+      localStorage.setItem(SIDEBAR_COLLAPSED_KEY, isCollapsed ? '1' : '0')
+    } catch {
+      /* 本地存储不可用时只影响记忆，不影响折叠 */
+    }
+  }
+  syncSideSectionSplit()
+}
+
+function initSidebarToggle() {
+  let collapsed = false
+  try {
+    collapsed = localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === '1'
+  } catch {
+    collapsed = false
+  }
+  setSidebarCollapsed(collapsed, { persist: false })
+  const button = $('#side-toggle')
+  if (!button || button.dataset.bound === '1') return
+  button.dataset.bound = '1'
+  button.addEventListener('click', () => {
+    setSidebarCollapsed(!document.body.classList.contains('is-side-collapsed'))
+  })
+}
+
+function readSideSectionRatio() {
+  try {
+    const saved = Number(localStorage.getItem(SIDE_SECTION_RATIO_KEY))
+    if (Number.isFinite(saved) && saved >= 0.2 && saved <= 0.8) return saved
+  } catch {
+    /* 本地存储不可用时使用默认比例 */
+  }
+  return 0.5
+}
+
+function applySideSectionRatio(ratio, options = {}) {
+  const side = $('#chat-side')
+  if (!side) return
+  const value = Math.max(0.2, Math.min(0.8, Number(ratio) || 0.5))
+  side.style.setProperty('--side-sessions-grow', String(value))
+  side.style.setProperty('--side-files-grow', String(1 - value))
+  const resizer = $('#side-split-resizer')
+  if (resizer) resizer.setAttribute('aria-valuenow', String(Math.round(value * 100)))
+  if (options.persist !== false) {
+    try {
+      localStorage.setItem(SIDE_SECTION_RATIO_KEY, String(value))
+    } catch {
+      /* 本地存储不可用时只影响记忆，不影响本次拖动 */
+    }
+  }
+}
+
+function syncSideSectionSplit() {
+  const side = $('#chat-side')
+  const sessions = $('#side-sessions')
+  const files = $('#side-files')
+  const resizer = $('#side-split-resizer')
+  if (!side || !sessions || !files || !resizer) return
+  const show = !side.hidden && !sessions.hidden && !files.hidden && !document.body.classList.contains('is-side-collapsed')
+  side.classList.toggle('is-side-sections-resizable', show)
+  resizer.hidden = !show
+  if (show) applySideSectionRatio(readSideSectionRatio(), { persist: false })
+}
+
+function bindSideSectionResizer() {
+  const resizer = $('#side-split-resizer')
+  if (!resizer || resizer.dataset.bound === '1') return
+  resizer.dataset.bound = '1'
+  let drag = null
+
+  const finishDrag = (pointerId) => {
+    if (!drag || (pointerId != null && pointerId !== drag.pointerId)) return
+    const ratio = Number.parseFloat(
+      $('#chat-side')?.style.getPropertyValue('--side-sessions-grow') || '0.5',
+    )
+    if (Number.isFinite(ratio)) applySideSectionRatio(ratio)
+    drag = null
+    document.body.classList.remove('is-resizing-side')
+  }
+
+  resizer.addEventListener('pointerdown', (event) => {
+    if (resizer.hidden || document.body.classList.contains('is-side-collapsed')) return
+    if (event.pointerType === 'mouse' && event.button !== 0) return
+    const sessions = $('#side-sessions')
+    const files = $('#side-files')
+    if (!sessions || !files) return
+    const sessionsHeight = sessions.getBoundingClientRect().height
+    const filesHeight = files.getBoundingClientRect().height
+    const total = sessionsHeight + filesHeight
+    if (total <= 0) return
+    drag = {
+      pointerId: event.pointerId,
+      startY: event.clientY,
+      startSessions: sessionsHeight,
+      total,
+    }
+    resizer.setPointerCapture?.(event.pointerId)
+    document.body.classList.add('is-resizing-side')
+    event.preventDefault()
+  })
+
+  resizer.addEventListener('pointermove', (event) => {
+    if (!drag || event.pointerId !== drag.pointerId) return
+    const minHeight = Math.min(96, drag.total * 0.2)
+    const nextSessions = Math.max(
+      minHeight,
+      Math.min(drag.total - minHeight, drag.startSessions + event.clientY - drag.startY),
+    )
+    applySideSectionRatio(nextSessions / drag.total, { persist: false })
+    event.preventDefault()
+  })
+
+  resizer.addEventListener('pointerup', (event) => finishDrag(event.pointerId))
+  resizer.addEventListener('pointercancel', (event) => finishDrag(event.pointerId))
+  resizer.addEventListener('lostpointercapture', (event) => finishDrag(event.pointerId))
+
+  resizer.addEventListener('keydown', (event) => {
+    if (resizer.hidden || document.body.classList.contains('is-side-collapsed')) return
+    let next = readSideSectionRatio()
+    if (event.key === 'ArrowUp') next -= 0.02
+    else if (event.key === 'ArrowDown') next += 0.02
+    else if (event.key === 'Home') next = 0.2
+    else if (event.key === 'End') next = 0.8
+    else return
+    event.preventDefault()
+    applySideSectionRatio(next)
+  })
+}
+
+function fileSplitContentWidth(main) {
+  const rect = main.getBoundingClientRect()
+  const styles = getComputedStyle(main)
+  const padLeft = Number.parseFloat(styles.paddingLeft) || 0
+  const padRight = Number.parseFloat(styles.paddingRight) || 0
+  return {
+    rect,
+    padLeft,
+    contentWidth: Math.max(1, rect.width - padLeft - padRight),
+  }
+}
+
+/** 右栏最小 440（列表 200 + 详情）、对话最小 360；文件模式沿用原来的 284/320。 */
+function splitBounds(teamMode, contentWidth) {
+  const minRail = teamMode ? 440 : 284
+  const minChat = teamMode ? 360 : 320
+  const minRatio = Math.min(0.5, minRail / contentWidth)
+  const maxRatio = Math.max(minRatio, 1 - minChat / contentWidth)
+  return { minRatio, maxRatio }
+}
+
+function applySplitRatio(ratio, options = {}) {
+  const main = $('.chat-main')
+  if (!main) return
+  const teamMode = Boolean(options.team)
+  const varName = teamMode ? '--team-split' : '--file-split'
+  const fallback = teamMode ? 0.56 : 0.5
+  const geometry = fileSplitContentWidth(main)
+  let value = Number(ratio)
+  if (!Number.isFinite(value) || value <= 0) value = fallback
+  if (geometry.contentWidth > 1) {
+    const bounds = splitBounds(teamMode, geometry.contentWidth)
+    value = Math.max(bounds.minRatio, Math.min(bounds.maxRatio, value))
+  }
+  main.style.setProperty(varName, `${(value * 100).toFixed(2)}%`)
+  const resizer = $('#file-split-resizer')
+  if (resizer) resizer.setAttribute('aria-valuenow', String(Math.round(value * 100)))
+  if (options.persist !== false) {
+    try {
+      localStorage.setItem(teamMode ? TEAM_SPLIT_RATIO_KEY : FILE_SPLIT_RATIO_KEY, String(value))
+    } catch {
+      /* 忽略本地存储失败 */
+    }
+  }
+}
+
+function applyFileSplitRatio(ratio, options = {}) {
+  applySplitRatio(ratio, { ...options, team: false })
+}
+
+function applyTeamSplitRatio(ratio, options = {}) {
+  applySplitRatio(ratio, { ...options, team: true })
+}
+
+function restoreFileSplitRatio() {
+  let ratio = 0.5
+  try {
+    const saved = Number(localStorage.getItem(FILE_SPLIT_RATIO_KEY))
+    if (Number.isFinite(saved) && saved >= 0.2 && saved <= 0.8) ratio = saved
+  } catch {
+    ratio = 0.5
+  }
+  applyFileSplitRatio(ratio, { persist: false })
+}
+
+/** 团队栏宽度也记住：默认对话 56% / 团队 44% */
+function restoreTeamSplitRatio() {
+  let ratio = 0.56
+  try {
+    const saved = Number(localStorage.getItem(TEAM_SPLIT_RATIO_KEY))
+    if (Number.isFinite(saved) && saved >= 0.25 && saved <= 0.75) ratio = saved
+  } catch {
+    ratio = 0.56
+  }
+  applyTeamSplitRatio(ratio, { persist: false })
+}
+
+/** 团队栏内部的列表/预览分界线：像左侧对话/文件一样可拖，宽度记在本地。 */
+function applyTeamListWidth(width, options = {}) {
+  const split = $('#team-split')
+  if (!split) return
+  const total = split.getBoundingClientRect().width || 0
+  const min = 128
+  const max = total > 1 ? Math.max(min, total - 260) : 480
+  let value = Number(width)
+  if (!Number.isFinite(value) || value <= 0) value = 196
+  value = Math.round(Math.max(min, Math.min(max, value)))
+  split.style.setProperty('--team-list-width', `${value}px`)
+  const resizer = $('#team-list-resizer')
+  if (resizer) {
+    resizer.setAttribute('aria-valuenow', String(value))
+    resizer.setAttribute('aria-valuemin', String(min))
+    resizer.setAttribute('aria-valuemax', String(Math.round(max)))
+  }
+  if (options.persist !== false) {
+    try {
+      localStorage.setItem(TEAM_LIST_WIDTH_KEY, String(value))
+    } catch {
+      /* 忽略本地存储失败 */
+    }
+  }
+}
+
+function restoreTeamListWidth() {
+  let width = 196
+  try {
+    const saved = Number(localStorage.getItem(TEAM_LIST_WIDTH_KEY))
+    if (Number.isFinite(saved) && saved >= 120 && saved <= 480) width = saved
+  } catch {
+    width = 196
+  }
+  applyTeamListWidth(width, { persist: false })
+}
+
+function bindTeamListResizer() {
+  const resizer = $('#team-list-resizer')
+  if (!resizer || resizer.dataset.bound === '1') return
+  resizer.dataset.bound = '1'
+  let drag = null
+
+  const finish = (pointerId) => {
+    if (!drag || (pointerId != null && pointerId !== drag.pointerId)) return
+    applyTeamListWidth(drag.lastWidth)
+    drag = null
+    document.body.classList.remove('is-resizing-team-list')
+  }
+
+  resizer.addEventListener('pointerdown', (event) => {
+    if (event.pointerType === 'mouse' && event.button !== 0) return
+    const list = $('#team-list')
+    if (!list) return
+    drag = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startWidth: list.getBoundingClientRect().width,
+      lastWidth: list.getBoundingClientRect().width,
+    }
+    resizer.setPointerCapture?.(event.pointerId)
+    document.body.classList.add('is-resizing-team-list')
+    event.preventDefault()
+  })
+
+  resizer.addEventListener('pointermove', (event) => {
+    if (!drag || event.pointerId !== drag.pointerId) return
+    drag.lastWidth = drag.startWidth + event.clientX - drag.startX
+    applyTeamListWidth(drag.lastWidth, { persist: false })
+    event.preventDefault()
+  })
+
+  resizer.addEventListener('pointerup', (event) => finish(event.pointerId))
+  resizer.addEventListener('pointercancel', (event) => finish(event.pointerId))
+  resizer.addEventListener('lostpointercapture', (event) => finish(event.pointerId))
+
+  resizer.addEventListener('keydown', (event) => {
+    const list = $('#team-list')
+    if (!list) return
+    const step = event.shiftKey ? 32 : 12
+    let next = list.getBoundingClientRect().width
+    if (event.key === 'ArrowLeft') next -= step
+    else if (event.key === 'ArrowRight') next += step
+    else if (event.key === 'Home') next = 128
+    else if (event.key === 'End') next = 420
+    else return
+    event.preventDefault()
+    applyTeamListWidth(next)
+  })
+
+  window.addEventListener('resize', () => {
+    const list = $('#team-list')
+    if (list) applyTeamListWidth(list.getBoundingClientRect().width, { persist: false })
+  })
+}
+
+/** 当前分栏是不是团队模式（团队独占或团队+文件并排） */
+function isTeamSplitMode(main) {
+  return Boolean(main?.classList.contains('is-team-only') || main?.classList.contains('is-team-file'))
+}
+
+function bindFileSplitResizer() {
+  const resizer = $('#file-split-resizer')
+  if (!resizer || resizer.dataset.bound === '1') return
+  resizer.dataset.bound = '1'
+  let drag = null
+
+  const finishDrag = (pointerId) => {
+    if (!drag || (pointerId != null && pointerId !== drag.pointerId)) return
+    const main = $('.chat-main')
+    const varName = drag.team ? '--team-split' : '--file-split'
+    const ratio = Number.parseFloat(main?.style.getPropertyValue(varName) || '') / 100
+    if (Number.isFinite(ratio)) applySplitRatio(ratio, { team: drag.team })
+    drag = null
+    document.body.classList.remove('is-resizing-split')
+  }
+
+  resizer.addEventListener('pointerdown', (event) => {
+    const main = $('.chat-main')
+    if (!main?.classList.contains('is-workbench-open')) return
+    if (event.pointerType === 'mouse' && event.button !== 0) return
+    const geometry = fileSplitContentWidth(main)
+    drag = { pointerId: event.pointerId, ...geometry, team: isTeamSplitMode(main) }
+    resizer.setPointerCapture?.(event.pointerId)
+    document.body.classList.add('is-resizing-split')
+    event.preventDefault()
+  })
+
+  resizer.addEventListener('pointermove', (event) => {
+    if (!drag || event.pointerId !== drag.pointerId) return
+    const x = event.clientX - drag.rect.left - drag.padLeft
+    const bounds = splitBounds(drag.team, drag.contentWidth)
+    const ratio = Math.max(bounds.minRatio, Math.min(bounds.maxRatio, x / drag.contentWidth))
+    applySplitRatio(ratio, { team: drag.team, persist: false })
+    event.preventDefault()
+  })
+
+  resizer.addEventListener('pointerup', (event) => finishDrag(event.pointerId))
+  resizer.addEventListener('pointercancel', (event) => finishDrag(event.pointerId))
+  resizer.addEventListener('lostpointercapture', (event) => finishDrag(event.pointerId))
+
+  resizer.addEventListener('keydown', (event) => {
+    const main = $('.chat-main')
+    if (!main?.classList.contains('is-workbench-open')) return
+    const team = isTeamSplitMode(main)
+    const varName = team ? '--team-split' : '--file-split'
+    const current = Number.parseFloat(main.style.getPropertyValue(varName) || '') / 100
+    let next = Number.isFinite(current) && current > 0 ? current : (team ? 0.56 : 0.5)
+    if (event.key === 'ArrowLeft') next -= 0.02
+    else if (event.key === 'ArrowRight') next += 0.02
+    else if (event.key === 'Home') next = team ? 0.36 : 0.3
+    else if (event.key === 'End') next = team ? 0.7 : 0.7
+    else return
+    event.preventDefault()
+    applySplitRatio(next, { team })
+  })
+
+  // 窗口变窄时按新宽度重新夹一次，避免对话区被压没
+  window.addEventListener('resize', () => {
+    const main = $('.chat-main')
+    if (!main?.classList.contains('is-workbench-open')) return
+    const team = isTeamSplitMode(main)
+    const varName = team ? '--team-split' : '--file-split'
+    const current = Number.parseFloat(main.style.getPropertyValue(varName) || '') / 100
+    if (Number.isFinite(current) && current > 0) {
+      applySplitRatio(current, { team, persist: false })
+    }
+  })
+}
+
 async function boot() {
   const as = currentAs()
   $('#login-form').addEventListener('submit', doLogin)
@@ -4962,9 +8721,17 @@ async function boot() {
   for (const button of $('#mode-switch').querySelectorAll('[data-mode]')) {
     button.addEventListener('click', () => setChatMode(button.dataset.mode))
   }
+  initSidebarToggle()
+  bindFileSplitResizer()
+  restoreTeamSplitRatio()
+  bindTeamListResizer()
+  restoreTeamListWidth()
+  bindSideSectionResizer()
   bindWorkspaceFilePane()
+  bindWorkbenchTabs()
   bindSpacePicker()
   setChatMode('chat')
+  syncSideSectionSplit()
 
   let hasSession = false
   try {
@@ -5061,9 +8828,34 @@ async function boot() {
   $('#thread').addEventListener('scroll', onThreadScroll, { passive: true })
   $('#scroll-bottom').addEventListener('click', scrollThreadToBottomSmooth)
   window.addEventListener('resize', queueScrollBottomButtonUpdate)
-  $('#send').addEventListener('click', send)
+
+  // 用户一上滚就立即解除贴底，不等 scroll 事件，避免流式增量抢先滚回底部。
+  const threadEl = $('#thread')
+  threadEl.addEventListener('wheel', (event) => {
+    if (event.deltaY < 0) unpinThreadFromBottom()
+  }, { passive: true })
+  let touchStartY = 0
+  threadEl.addEventListener('touchstart', (event) => {
+    touchStartY = event.touches[0]?.clientY || 0
+  }, { passive: true })
+  threadEl.addEventListener('touchmove', (event) => {
+    const y = event.touches[0]?.clientY || 0
+    if (touchStartY && y - touchStartY > 6) unpinThreadFromBottom()
+  }, { passive: true })
+  document.addEventListener('keydown', (event) => {
+    const target = event.target
+    if (target instanceof Element && target.closest('input, textarea, select, [contenteditable="true"]')) return
+    if (event.key === 'PageUp' || event.key === 'Home' || event.key === 'ArrowUp') {
+      unpinThreadFromBottom()
+    }
+  })
+  $('#send').addEventListener('click', () => {
+    // 回复中主按钮是暂停；不在回复时才是发送。
+    if (currentRuntime().sending) stopCurrentReply()
+    else send()
+  })
   $('#queue-stop').addEventListener('click', stopCurrentReply)
-  $('#stop-reply').addEventListener('click', stopCurrentReply)
+  $('#queue-send').addEventListener('click', () => send())
   $('#input').addEventListener('keydown', (event) => {
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault()
@@ -5206,17 +8998,44 @@ async function boot() {
     else if (action.dataset.fileAct === 'delete') deleteWorkspaceFile(file)
     else if (action.dataset.fileAct === 'send-dingtalk') sendWorkspaceFileToDingTalk(file)
     else if (action.dataset.fileAct === 'download') {
-      const link = document.createElement('a')
-      link.href = workspaceFileUrl(file)
-      link.download = file.name
-      document.body.appendChild(link)
-      link.click()
-      link.remove()
+      downloadWorkspaceFile(file).catch((err) => banner(err.message, 'bad'))
     }
   })
+  $('#message-menu').addEventListener('click', (event) => {
+    const action = event.target.closest('[data-message-act]')
+    if (!action || action.disabled) return
+    const id = $('#message-menu').dataset.message
+    const node = Array.from($('#thread').querySelectorAll('.msg[data-message-id]')).find(
+      (item) => item.dataset.messageId === id,
+    )
+    const message = node?.chatMessage || null
+    hideMessageMenu()
+    if (!message) return
+    handleMessageAction(action.dataset.messageAct, message)
+  })
+  $('#message-edit-cancel').addEventListener('click', () => cancelMessageEdit({ clearInput: true }))
+  $('#thread').addEventListener('click', (event) => {
+    const action = event.target.closest('.msg-actions [data-message-act]')
+    if (!action || action.disabled) return
+    const node = action.closest('.msg')
+    const message = node?.chatMessage || null
+    if (!message) return
+    event.preventDefault()
+    event.stopPropagation()
+    hideMessageMenu()
+    handleMessageAction(action.dataset.messageAct, message)
+  })
+  $('#thread').addEventListener('contextmenu', (event) => {
+    const node = event.target.closest('.msg')
+    if (!node || !node.dataset.messageId) return
+    event.preventDefault()
+    showMessageMenu(node, event.clientX, event.clientY)
+  })
+  $('#thread').addEventListener('scroll', hideMessageMenu, { passive: true })
   document.addEventListener('click', (event) => {
     if (!event.target.closest('#session-menu') && !event.target.closest('.side-session-more')) hideSessionMenu()
     if (!event.target.closest('#file-menu') && !event.target.closest('.side-file-more')) hideFileMenu()
+    if (!event.target.closest('#message-menu')) hideMessageMenu()
   })
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape') {
@@ -5224,6 +9043,7 @@ async function boot() {
       hideFileMenu()
       hideSpaceMenu()
       hideQuota()
+      hideMessageMenu()
     }
   })
   window.addEventListener('resize', () => {
@@ -5231,6 +9051,7 @@ async function boot() {
     hideFileMenu()
     hideSpaceMenu()
     hideQuota()
+    hideMessageMenu()
   })
 
   // 个人工作区
@@ -5252,4 +9073,5 @@ async function boot() {
 
 bindSettings()
 bindHintTips($('#workspace-pane'))
+bindWorkspaceKindSwitch()
 boot()

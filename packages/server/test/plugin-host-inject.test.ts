@@ -16,6 +16,7 @@ function instance(): HostInstance {
     routes: new Map(),
     upgrades: new Map(),
     logs: [],
+    hostGaps: [],
     disposers: [],
     root: null,
     fiber: null,
@@ -55,6 +56,67 @@ describe('插件 host 内置服务注入', () => {
     expect((ctx.connection as { admit: () => unknown }).admit()).toBeUndefined()
     db.close()
   })
+
+  it('webServer 未实现的 upgrade/fallback/tapIndex 登记为 host gap，正常路由仍可用', async () => {
+    const db = openDatabase({ path: ':memory:' })
+    const host = instance()
+    const ctx = makeContext(db, host, { dbPath: ':memory:', companyId: 'c1' })
+    const inject = ctx.inject as (
+      keys: string[],
+      callback: (child: any) => unknown,
+    ) => Promise<unknown>
+
+    await inject(['webServer'], (child: any) => {
+      expect(child.webServer.supportsUpgrade).toBe(false)
+      expect(child.webServer.supportsFallback).toBe(false)
+      expect(child.webServer.supportsTapIndex).toBe(false)
+      child.webServer.registerUpgrade({ path: '/ws/probe', handler: () => undefined })
+      child.webServer.registerFallback({ path: '/fallback/probe', handler: () => undefined })
+      child.webServer.tapIndex(() => undefined)
+      child.webServer.register({
+        path: '/api/probe-gap',
+        methods: ['GET'],
+        fetch: async () => Response.json({ ok: true }),
+      })
+    })
+
+    expect(host.upgrades.has('/ws/probe')).toBe(true)
+    expect(host.routes.has('/api/probe-gap')).toBe(true)
+    expect(host.hostGaps.map((gap) => gap.code)).toEqual(
+      expect.arrayContaining([
+        'webServer.upgrade:/ws/probe',
+        'webServer.fallback:/fallback/probe',
+        'webServer.tapIndex',
+      ]),
+    )
+    db.close()
+  })
+
+  it('available:false 的写入调用立即失败，并登记为 host gap', async () => {
+    const db = openDatabase({ path: ':memory:' })
+    const host = instance()
+    const ctx = makeContext(db, host, { dbPath: ':memory:', companyId: 'c1' })
+    const inject = ctx.inject as (
+      keys: string[],
+      callback: (child: any) => unknown,
+    ) => Promise<unknown>
+
+    await inject(['speechToText', 'pluginManager', 'agents'], async (child: any) => {
+      await expect(child.speechToText.transcribe()).rejects.toThrow(/语音转写/)
+      await expect(child.pluginManager.enable()).rejects.toThrow(/pluginManager.enable/)
+      await expect(child.agents.create()).rejects.toThrow(/agents.create/)
+    })
+
+    expect(host.hostGaps.map((gap) => gap.code)).toEqual(
+      expect.arrayContaining([
+        'speechToText.unavailable',
+        'pluginManager.enable-unavailable',
+        'agents.create-unavailable',
+      ]),
+    )
+    db.close()
+  })
+
 
   it('ctx.systemPrompt.patch 赋值会进入插件系统提示，而不是静默丢失', async () => {
     const db = openDatabase({ path: ':memory:' })

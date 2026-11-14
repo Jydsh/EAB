@@ -168,9 +168,6 @@ export function setPluginRoot(path: string): void {
   pluginRootPath = path
 }
 
-function trashDir(): string {
-  return join(pluginRootPath, '.trash')
-}
 const KNOWN_SCOPES = new Set<string>(Object.values(SC))
 const ID_PATTERN = /^[a-z][a-z0-9-]{1,40}$/
 
@@ -1058,17 +1055,14 @@ export function uninstallUserPlugin(
     dataRoot = pluginDataRoot(dataOptions, companyId, userScope(userId))
     rmSync(dataRoot, { recursive: true, force: true })
   }
-  let trashPath: string | null = null
   const stillUsedByCompany = activeCompanyOwners(db, pluginId) > 0
   const stillUsedByUser = activeUserOwners(db, pluginId) > 0
-  // 最后一个归属人卸载后，包目录也要移走；否则会以“未认领插件”重新出现在别人列表里。
+  // 最后一个归属人卸载后，包目录直接删除；不保留回收站副本。
   if (!stillUsedByCompany && !stillUsedByUser) {
     const dir = join(pluginRootPath, pluginId)
     if (existsSync(dir)) {
       const { record } = parseManifest(dir, pluginId)
-      mkdirSync(trashDir(), { recursive: true })
-      trashPath = join(trashDir(), `${pluginId}-${Date.now()}`)
-      renameSync(dir, trashPath)
+      rmSync(dir, { recursive: true, force: true })
       const existing = installRecordOf(db, pluginId)
       db.prepare(
         `INSERT INTO plugin_installs
@@ -1094,14 +1088,14 @@ export function uninstallUserPlugin(
     companyId,
     event: 'uninstall',
     actorId: userId,
-    detail: JSON.stringify({ scope: 'user', userId, trashPath, dataRoot }),
+    detail: JSON.stringify({ scope: 'user', userId, dataRoot }),
   })
   return { pluginId, removed: true, dataRoot }
 }
 
 /* ---------------- 生命周期：安装 / 更新 / 卸载 / 事件 ---------------- */
 
-const COPY_SKIP = new Set(['node_modules', '.git', '.tmp', '.trash', '.staging'])
+const COPY_SKIP = new Set(['node_modules', '.git', '.tmp', '.staging'])
 
 /** 把 package.json 的 files 白名单展开成相对文件列表（目录递归，跳过 node_modules 等） */
 function collectSelectedFiles(dir: string, entries: readonly string[]): string[] {
@@ -1292,7 +1286,6 @@ export interface InstallPluginResult {
   readonly plugin: PluginRecord
   readonly replaced: boolean
   readonly sourcePath: string
-  readonly trashPath: string | null
 }
 
 function randomSuffix(): string {
@@ -1349,7 +1342,7 @@ function preparePackage(source: string, logicalId: string): PluginRecord {
   return record
 }
 
-/** 已校验过的来源目录 → plugins/<id>；先暂存、二次校验、旧目录进 .trash、再登记审计 */
+/** 已校验过的来源目录 → plugins/<id>；先暂存、二次校验、旧目录临时备份、成功即删备份 */
 function commitPluginPackage(
   db: Db,
   source: string,
@@ -1360,7 +1353,7 @@ function commitPluginPackage(
   mkdirSync(pluginRootPath, { recursive: true })
   const staging = join(pluginRootPath, `.staging-${dirName}-${Date.now()}-${randomSuffix()}`)
   const dest = join(pluginRootPath, dirName)
-  let trashPath: string | null = null
+  let backupPath: string | null = null
   const installSource = options.source ?? 'local-dir'
   const sourceRef = options.sourceRef ?? source
 
@@ -1423,9 +1416,9 @@ function commitPluginPackage(
           throw new EabError(EC.VALIDATION, `插件 ${dirName} 目录已存在；替换为 ${staged.version} 请显式确认覆盖`)
         }
         if (!reuseSharedForSameVersion) {
-          mkdirSync(trashDir(), { recursive: true })
-          trashPath = join(trashDir(), `${dirName}-${Date.now()}`)
-          renameSync(dest, trashPath)
+          // 旧目录只在替换过程中临时保留，用于失败回滚；安装成功后立即删除，不进入回收站。
+          backupPath = join(pluginRootPath, `.backup-${dirName}-${Date.now()}-${randomSuffix()}`)
+          renameSync(dest, backupPath)
           renameSync(staging, dest)
           replaced = true
           installedRecord = null
@@ -1533,16 +1526,17 @@ function commitPluginPackage(
       })
     }
     if (existsSync(staging)) rmSync(staging, { recursive: true, force: true })
+    // 安装已成功：临时备份的旧版本不再需要，直接删除。
+    if (backupPath && existsSync(backupPath)) rmSync(backupPath, { recursive: true, force: true })
     return {
       plugin: { ...(installedRecord ?? staged), enabled: true, install },
       replaced,
       sourcePath: sourceRef,
-      trashPath,
     }
   } catch (err) {
     rmSync(staging, { recursive: true, force: true })
-    if (trashPath && existsSync(trashPath) && !existsSync(dest)) {
-      renameSync(trashPath, dest)
+    if (backupPath && existsSync(backupPath) && !existsSync(dest)) {
+      renameSync(backupPath, dest)
     }
     throw err
   }
@@ -1936,12 +1930,11 @@ export async function installPluginFromGithub(
 
 export interface UninstallPluginResult {
   readonly pluginId: string
-  readonly trashPath: string | null
   readonly version: string
   readonly shared: boolean
 }
 
-/** 卸载当前公司的安装；只有最后一家公司卸载时才把共享目录移到 plugins/.trash */
+/** 卸载当前公司的安装；最后一家公司卸载时直接删除共享目录，不保留回收站副本 */
 export function uninstallPluginPackage(db: Db, pluginId: string, actorId: string, companyId: string): UninstallPluginResult {
   if (!ID_PATTERN.test(pluginId)) throw new EabError(EC.VALIDATION, `插件 id 不合法：${pluginId}`)
   const ownRecord = companyInstallOf(db, companyId, pluginId)
@@ -1987,12 +1980,9 @@ export function uninstallPluginPackage(db: Db, pluginId: string, actorId: string
   const ownersAfter = activeCompanyOwners(db, pluginId)
   const personalOwners = activeUserOwners(db, pluginId)
   const shared = ownersAfter > 0
-  let trashPath: string | null = null
-  // 还有公司或员工在用这个包时，不能把目录移走；公司卸载只解除公司归属。
+  // 还有公司或员工在用这个包时，不能删目录；公司卸载只解除公司归属。
   if (!shared && personalOwners === 0) {
-    mkdirSync(trashDir(), { recursive: true })
-    trashPath = join(trashDir(), `${pluginId}-${Date.now()}`)
-    renameSync(dir, trashPath)
+    rmSync(dir, { recursive: true, force: true })
     const existing = installRecordOf(db, pluginId)
     db.prepare(
       `INSERT INTO plugin_installs
@@ -2018,10 +2008,10 @@ export function uninstallPluginPackage(db: Db, pluginId: string, actorId: string
     companyId,
     event: 'uninstall',
     actorId,
-    detail: JSON.stringify({ trashPath, version: record.version, shared, personalOwners }),
+    detail: JSON.stringify({ version: record.version, shared, personalOwners }),
   })
 
-  return { pluginId, trashPath, version: record.version, shared }
+  return { pluginId, version: record.version, shared }
 }
 
 export function recordPluginEvent(

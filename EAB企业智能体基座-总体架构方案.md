@@ -1,6 +1,6 @@
 # EAB 企业智能体基座 — 总体架构方案与需求规格
 
-> **版本**：v2026.11.11（日期版本号，与根 `package.json` 的 `version` 一致）
+> **版本**：v2026.11.14（日期版本号，与根 `package.json` 的 `version` 一致）
 > **项目代号**：EAB（Enterprise Agent Base）
 > **文档性质**：架构决策 + 需求规格 + 工程规范，是开发的**唯一上游依据**。代码实现与本文件冲突时，以本文件为准；本文件有错时，先改本文件再改代码。
 > **本次修订**：2026-11-07，在第一版架构草稿基础上补齐「架构再设计分析与决策记录（ADR）」「需求规格说明书（FR/NFR/用例/验收）」「领域模型与数据字典」「接口契约」「工程结构与任务分解」。
@@ -1982,7 +1982,6 @@ plugins/
 ├── eab-plugin-oncall/           # 一个插件 = 一个目录，目录名必须等于清单 id
 │   ├── plugin.json
 │   └── page.html                # pages[].file 指向的文件，不许 ../ 或反斜杠逃逸
-└── .trash/                      # 卸载不删除：移到这里，可人工恢复
 ```
 
 `plugin.json` 的完整字段（除 `id` / `name` / `version` / `pages` 外都可选）：
@@ -2020,7 +2019,7 @@ plugins/
 | `installed` | 控制台「安装插件…」成功 | `plugin_company_installs`（本公司）+ `plugin_installs`（服务器制品）+ 磁盘 | 已安装（仅本公司可见） |
 | `enabled` / `disabled` | 控制台「启用（本司）/ 停用（本司）」 | `plugin_states(company_id, plugin_id)` | 已安装 · 本司启用 / 停用 |
 | `invalid` | 清单校验失败 | 磁盘 + 无有效记录 | 清单不合法 + 原因 |
-| `uninstalled` | 控制台「卸载…」 | 解除当前公司的 `plugin_company_installs`；`plugin_states` 只清当前公司；目录只在**最后一家公司卸载时**移到 `plugins/.trash/` | 当前公司列表消失；其他公司不受影响，审计里留痕 |
+| `uninstalled` | 控制台「卸载…」 | 解除当前公司的 `plugin_company_installs`；`plugin_states` 只清当前公司；目录只在**最后一家公司/员工卸载时**直接删除，不保留回收站 | 当前公司列表消失；其他公司不受影响，审计里留痕 |
 
 **别家公司已安装的插件不会进入当前公司的列表**：`loadPlugins(db, companyId)` 先按 `plugin_company_installs` 过滤，再叠加本公司的 `plugin_states`；同一份代码目录可以被多家公司共用，但安装归属、启停、卸载和生命周期记录各自独立。
 
@@ -2039,7 +2038,7 @@ plugins/
 
 `source` 取值：`local-dir` / `npm` / `github`（磁盘发现为 `disk`）。`sourceRef` 形如 `npm:eab-plugin-x@1.2.0?registry=https%3A%2F%2Fregistry.npmmirror.com`、`github:owner/repo#main?dir=packages/plugin`。**npm 与 GitHub 只取包内容，不执行 `npm install`、`prepare`、仓库脚本或源码构建。**
 
-卸载动作（`uninstallPluginPackage`）：校验 id → 校验当前公司是否安装（别家公司安装时拒绝）→ 只清当前公司的 `plugin_states` → 当前公司的 `plugin_company_installs.removed_at` 记时间 → 写 `uninstall` 事件 → **没有其他公司还在使用时**才把目录移到 `.trash/` 并把 `plugin_installs.removed_at` 记时间。**不物理删除**，运维可以手工捞回。
+卸载动作（`uninstallPluginPackage`）：校验 id → 校验当前公司是否安装（别家公司安装时拒绝）→ 只清当前公司的 `plugin_states` → 当前公司的 `plugin_company_installs.removed_at` 记时间 → 写 `uninstall` 事件 → **没有其他公司/员工还在使用时**直接删除目录并把 `plugin_installs.removed_at` 记时间。不保留回收站副本。
 
 #### 12.9.3 数据表（迁移 `0007_plugin_lifecycle.sql` + `0017_plugin_company_install.sql`）
 
@@ -2061,7 +2060,7 @@ plugins/
 | GET | `/plugins/assets/:id/:file` | 有 `plugin:list` | 插件页面资源；未启用 / 越界 / 不存在都 404 |
 | GET | `/api/console/plugins` | 仅控制台会话（`x-eab-console: 1` + 登录） | 插件管理器：本公司已安装清单 + 可安装/可更新条目 + 最近事件（含本公司与平台事件）+ 安装根目录/上限；返回 `companyId` |
 | POST | `/api/console/plugins/install` | 仅控制台会话 | `{ source:'local-dir'\|'npm'\|'github', sourcePath?, packageName?, version?, registry?, repo?, ref?, subdir?, overwrite?, enable? }`；安装登记到当前公司；三源共用暂存校验、落库与审计 |
-| POST | `/api/console/plugins/:id/uninstall` | 仅控制台会话 | 只解除当前公司的安装与启停；还有别家公司使用则保留共享目录，最后一家才移到 `.trash`、记审计 |
+| POST | `/api/console/plugins/:id/uninstall` | 仅控制台会话 | 只解除当前公司的安装与启停；还有别家公司/员工使用则保留共享目录，最后一个归属人卸载时直接删除并记审计 |
 | GET | `/api/console/plugins/events` | 仅控制台会话 | 生命周期流水（默认 30 条，最多 100） |
 
 控制台接口都先过 `isConsoleRequest`（必须带 `x-eab-console: 1` 且会话有效），**组织成员即使有插件权限也进不来**；员工侧 `/api/plugins` 永远看不到服务器路径与安装来源。
@@ -2103,7 +2102,7 @@ plugins/
 - 生命周期记录表：时间 / 插件 / 动作 / 操作人 / 公司 / 详情；
 - 左侧子导航：已安装列表、插件源列表、生命周期说明；安装来源与服务器路径**只在控制台出现**。
 
-随仓库带演示插件 `plugins/eab-plugin-oncall`（值班表）：声明 `org:member:read`，页面通过 `/api/org/members` 取组织成员、按部门排 7 天班——证明插件真能读基座数据，而不是空壳卡片。如果它已被卸载，目录在 `plugins/.trash/` 下，可用安装弹窗的「本地目录」重新装回。
+随仓库带演示插件 `plugins/eab-plugin-oncall`（值班表）：声明 `org:member:read`，页面通过 `/api/org/members` 取组织成员、按部门排 7 天班——证明插件真能读基座数据，而不是空壳卡片。如果它已被卸载，目录会被直接删除，需要时用安装弹窗的「本地目录」重新装回。
 
 #### 12.9.7 明确没做的（防止被当成已有）
 
@@ -3343,7 +3342,8 @@ eab/
 │       ├── src/routes/{system,org,org-sync,channel,kb,chat,plugins,console}.ts
 │       └── public/{index.html,app.css,app.js}  # 无构建步骤；管理控制台入口 http://127.0.0.1:8788/admin
 │       └── public/{chat.html,chat.css,chat.js}   # 员工工作台 http://127.0.0.1:8787/chat（12.7）；admin-gate.html 是管理员账号密码登录页（12.8）
-├── plugins/catalog.json                        # 本地插件源：版本 / 来源路径 / 标签（12.9.5）\n├── plugins/eab-plugin-oncall/                  # 演示插件：值班表（plugin.json + page.html，12.9）\n├── plugins/.trash/                             # 卸载的插件移到这里，不物理删除
+├── plugins/catalog.json                        # 本地插件源：版本 / 来源路径 / 标签（12.9.5）
+├── plugins/eab-plugin-oncall/                  # 演示插件：值班表（plugin.json + page.html，12.9）
 ├── demo/kb-visibility.ts                       # 4 人 × 5 库的可视化验算脚本
 ├── scripts/smoke-http.mjs                      # 50 条 HTTP 断言
 └── .eab-dev/                                   # 本地演示库 + admin-credentials.txt（已 gitignore）

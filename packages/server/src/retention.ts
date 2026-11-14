@@ -10,6 +10,7 @@
  * 清理是可重复执行的幂等操作：按时间阈值删除，重复跑只会删到同样的边界。
  */
 import type { AuditPruneResult, Db } from '@eab/storage'
+import { runAsLeader } from './backends/coordination.js'
 import { pruneAuditLogs, withTransaction } from '@eab/storage'
 
 export interface RetentionStats {
@@ -21,6 +22,8 @@ export interface RetentionResult {
   days: number
   /** 早于这个时间点的日志会被清理 */
   cutoff: string | null
+  /** 生效的 Agent 轨迹保留天数；0 表示永久保留 */
+  agentDays: number
   deleted: RetentionStats
   /** 实际删掉的记录总数（包含审计） */
   total: number
@@ -35,7 +38,7 @@ function deleteOlder(db: Db, table: string, column: string, cutoff: number, extr
   return Number(result.changes ?? 0)
 }
 
-export function runRetention(db: Db, days: number, auditDays = 0): RetentionResult {
+export function runRetention(db: Db, days: number, auditDays = 0, agentDays = 0): RetentionResult {
   const logDays = Number.isFinite(days) && days > 0 ? Math.trunc(days) : 0
   const deleted: RetentionStats = {}
   let cutoff: string | null = null
@@ -63,6 +66,39 @@ export function runRetention(db: Db, days: number, auditDays = 0): RetentionResu
     })
   }
 
+  const agentLogDays = Number.isFinite(agentDays) && agentDays > 0 ? Math.trunc(agentDays) : 0
+  if (agentLogDays > 0) {
+    const agentCutoffMs = Date.now() - agentLogDays * 86_400_000
+    withTransaction(db, () => {
+      // 只删「已经结束」的 run：running / suspended 是活任务或等后台结果的挂起任务，不能动。
+      deleted['agentSteps'] = Number(
+        (
+          db
+            .prepare(
+              `DELETE FROM agent_steps
+                WHERE run_id IN (
+                  SELECT id FROM agent_runs
+                   WHERE status IN ('succeeded', 'failed', 'cancelled')
+                     AND COALESCE(ended_at, started_at) < ?
+                )`,
+            )
+            .run(agentCutoffMs) as { changes?: number }
+        ).changes ?? 0,
+      )
+      deleted['agentRuns'] = Number(
+        (
+          db
+            .prepare(
+              `DELETE FROM agent_runs
+                WHERE status IN ('succeeded', 'failed', 'cancelled')
+                  AND COALESCE(ended_at, started_at) < ?`,
+            )
+            .run(agentCutoffMs) as { changes?: number }
+        ).changes ?? 0,
+      )
+    })
+  }
+
   const audit = pruneAuditLogs(db, auditDays)
   if (audit.deleted > 0) deleted['auditLogs'] = audit.deleted
 
@@ -70,9 +106,10 @@ export function runRetention(db: Db, days: number, auditDays = 0): RetentionResu
   return {
     days: logDays,
     cutoff,
+    agentDays: agentLogDays,
     deleted,
     total,
-    skipped: logDays === 0 && audit.skipped,
+    skipped: logDays === 0 && agentLogDays === 0 && audit.skipped,
     audit,
   }
 }
@@ -86,14 +123,17 @@ export function startRetention(
   readDays: () => number,
   onDone?: (result: RetentionResult) => void,
   readAuditDays?: () => number,
+  readAgentDays?: () => number,
 ): () => void {
   const tick = () => {
-    try {
-      const result = runRetention(db, readDays(), readAuditDays?.() ?? 0)
-      if (!result.skipped) onDone?.(result)
-    } catch (err) {
-      console.warn(`[eab] 保留清理失败：${(err as Error).message}`)
-    }
+    void runAsLeader('retention', 10 * 60_000, () => {
+      try {
+        const result = runRetention(db, readDays(), readAuditDays?.() ?? 0, readAgentDays?.() ?? 0)
+        if (!result.skipped) onDone?.(result)
+      } catch (err) {
+        console.warn(`[eab] 保留清理失败：${(err as Error).message}`)
+      }
+    })
   }
   const first = setTimeout(tick, 30_000)
   const timer = setInterval(tick, 6 * 60 * 60 * 1000)

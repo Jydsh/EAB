@@ -2,8 +2,9 @@
  * 记忆分层（CHAT-09）：session / user / dept / company 四层，写入先落"待确认"。
  *
  * 规则：
- * - 只有用户本人确认过的记忆才会进入对话上下文，模型不能静默写长期记忆；
- * - dept / company 层需要 memory:admin，普通成员只能写自己的 user 层；
+ * - 只有确认过的记忆才会进入对话上下文，模型不能静默写长期记忆；
+ * - 成员可通过 memory.propose 提交公司级团队学习候选，但必须管理员确认后才会生效；
+ * - dept / company 层直接写入需要 memory:admin，普通成员只能写自己的 user 层；
  * - 查询永远按当前身份过滤，不返回别人私有的记忆。
  */
 import type { FastifyInstance } from 'fastify'
@@ -24,6 +25,9 @@ export function registerMemoryRoutes(app: FastifyInstance, deps: ServerDeps): vo
         details: { requiredScope: SC.MEMORY_READ },
       })
     }
+    const canAdmin = scopeAllows(actor.subject.scopes, SC.MEMORY_ADMIN)
+    // 普通成员只能看到“自己的待确认记忆 + 已确认的团队记忆”；管理员额外看到待审核的团队候选。
+    const visibility = canAdmin ? '' : `AND (confirmed = 1 OR (scope_type = 'user' AND scope_id = ?))`
     const rows = deps.db
       .prepare(
         `SELECT id, scope_type, scope_id, content, confirmed, created_at
@@ -32,9 +36,16 @@ export function registerMemoryRoutes(app: FastifyInstance, deps: ServerDeps): vo
             AND ((scope_type = 'user' AND scope_id = ?)
               OR (scope_type = 'dept' AND scope_id = ?)
               OR (scope_type = 'company' AND scope_id = ?))
+            ${visibility}
           ORDER BY created_at DESC LIMIT 100`,
       )
-      .all(actor.subject.companyId, actor.person.id, actor.subject.deptId, actor.subject.companyId) as unknown as Array<{
+      .all(
+        actor.subject.companyId,
+        actor.person.id,
+        actor.subject.deptId,
+        actor.subject.companyId,
+        ...(canAdmin ? [] : [actor.person.id]),
+      ) as unknown as Array<{
       id: string
       scope_type: string
       scope_id: string
@@ -102,10 +113,13 @@ export function registerMemoryRoutes(app: FastifyInstance, deps: ServerDeps): vo
       throw new EabError(EC.FORBIDDEN, '当前身份缺少权限：写入记忆（memory:write）')
     }
     const row = deps.db
-      .prepare('SELECT id, user_id FROM memories WHERE id = ? AND company_id = ? AND deleted_at IS NULL')
-      .get(req.params.id, actor.subject.companyId) as { id: string; user_id: string | null } | undefined
+      .prepare('SELECT id, scope_type, user_id FROM memories WHERE id = ? AND company_id = ? AND deleted_at IS NULL')
+      .get(req.params.id, actor.subject.companyId) as { id: string; scope_type: string; user_id: string | null } | undefined
     if (!row) throw new EabError(EC.NOT_FOUND, '记忆不存在')
-    if (row.user_id !== null && row.user_id !== actor.person.id && !scopeAllows(actor.subject.scopes, SC.MEMORY_ADMIN)) {
+    if (row.scope_type !== 'user' && !scopeAllows(actor.subject.scopes, SC.MEMORY_ADMIN)) {
+      throw new EabError(EC.FORBIDDEN, '团队记忆需要管理员确认')
+    }
+    if (row.scope_type === 'user' && row.user_id !== null && row.user_id !== actor.person.id && !scopeAllows(actor.subject.scopes, SC.MEMORY_ADMIN)) {
       throw new EabError(EC.FORBIDDEN, '只能确认自己的记忆')
     }
     deps.db.prepare('UPDATE memories SET confirmed = 1 WHERE id = ?').run(req.params.id)
@@ -118,10 +132,13 @@ export function registerMemoryRoutes(app: FastifyInstance, deps: ServerDeps): vo
       throw new EabError(EC.FORBIDDEN, '当前身份缺少权限：写入记忆（memory:write）')
     }
     const row = deps.db
-      .prepare('SELECT id, user_id FROM memories WHERE id = ? AND company_id = ? AND deleted_at IS NULL')
-      .get(req.params.id, actor.subject.companyId) as { id: string; user_id: string | null } | undefined
+      .prepare('SELECT id, scope_type, user_id FROM memories WHERE id = ? AND company_id = ? AND deleted_at IS NULL')
+      .get(req.params.id, actor.subject.companyId) as { id: string; scope_type: string; user_id: string | null } | undefined
     if (!row) throw new EabError(EC.NOT_FOUND, '记忆不存在')
-    if (row.user_id !== null && row.user_id !== actor.person.id && !scopeAllows(actor.subject.scopes, SC.MEMORY_ADMIN)) {
+    if (row.scope_type !== 'user' && !scopeAllows(actor.subject.scopes, SC.MEMORY_ADMIN)) {
+      throw new EabError(EC.FORBIDDEN, '团队记忆需要管理员删除')
+    }
+    if (row.scope_type === 'user' && row.user_id !== null && row.user_id !== actor.person.id && !scopeAllows(actor.subject.scopes, SC.MEMORY_ADMIN)) {
       throw new EabError(EC.FORBIDDEN, '只能删除自己的记忆')
     }
     deps.db.prepare('UPDATE memories SET deleted_at = ? WHERE id = ?').run(Date.now(), req.params.id)

@@ -5,13 +5,14 @@
  * 这些接口与页面一一对应，不靠脚本造数据。
  */
 import type { FastifyInstance, FastifyRequest } from 'fastify'
-import { mkdirSync, existsSync, statSync, readdirSync, unlinkSync } from 'node:fs'
+import { mkdirSync, existsSync, statSync, readdirSync, readFileSync, unlinkSync, rmSync } from 'node:fs'
 import { spawn } from 'node:child_process'
 import { basename, dirname, join, resolve as resolvePath } from 'node:path'
 import QRCode from 'qrcode'
 import { EC, EabError, isKnownScope, normalizeMobile, ulid } from '@eab/domain'
 import { BUILTIN_ROLES } from '@eab/authz'
 import { appendAudit, verifyAuditChain } from '@eab/storage'
+import { SqliteAuditReadSource } from '../backends/audit-read.js'
 import {
   applyOrgSync,
   fetchChannelOrg,
@@ -29,6 +30,8 @@ import { revokeAllSessions } from '../employee-session.js'
 import { resolveSecret, storeSecret } from '../secrets.js'
 import { companyAssistantView, resolveAssistantDataDir, saveCompanyAssistant } from '../company-assistant.js'
 import { refreshDingTalkStream } from '../dingtalk-bot.js'
+import { createRuntimeBackup } from '../runtime-backup.js'
+import { recordSkillApprovalDecision } from '../skills.js'
 
 function requireConsole(req: FastifyRequest, deps: ServerDeps): void {
   if (!isConsoleRequest(req, deps.config)) {
@@ -79,16 +82,40 @@ function backupDir(deps: ServerDeps): string {
   return deps.config.backupsDir ?? resolvePath(deps.config.dbPath, '..', 'backups')
 }
 
-/** 备份操作只接受备份目录下的文件名，避免把任意路径带进删除或打开动作。 */
-function resolveBackupFile(deps: ServerDeps, rawName: unknown): { dir: string; file: string; size: number } {
+/** 运行数据备份目录只在 manifest 存在时才算完成；列表统一读 manifest 里的 size。 */
+function runtimeBackupManifest(file: string): { size: number } | null {
+  const manifest = join(file, 'manifest.json')
+  if (!existsSync(manifest)) return null
+  try {
+    const raw = JSON.parse(readFileSync(manifest, 'utf8')) as { format?: string; size?: unknown }
+    if (raw.format !== 'eab-runtime-backup-v1') return null
+    return { size: Number(raw.size) || 0 }
+  } catch {
+    return null
+  }
+}
+
+/** 备份操作只接受备份目录下的文件名/运行数据快照目录，避免把任意路径带进删除或打开动作。 */
+function resolveBackupFile(
+  deps: ServerDeps,
+  rawName: unknown,
+): { dir: string; file: string; size: number; kind: 'database' | 'runtime' } {
   const name = String(rawName ?? '')
-  if (!name || name !== basename(name) || !name.endsWith('.db')) {
+  if (!name || name !== basename(name) || name.includes('..')) {
     throw new EabError(EC.VALIDATION, '备份文件名不合法')
   }
   const dir = backupDir(deps)
   const file = join(dir, name)
-  if (!existsSync(file) || !statSync(file).isFile()) throw new EabError(EC.NOT_FOUND, '备份不存在')
-  return { dir, file, size: statSync(file).size }
+  if (!existsSync(file)) throw new EabError(EC.NOT_FOUND, '备份不存在')
+  const stat = statSync(file)
+  if (name.endsWith('.db') && stat.isFile()) return { dir, file, size: stat.size, kind: 'database' }
+  if (name.startsWith('eab-runtime-') && stat.isDirectory()) {
+    // 只有带 manifest 的目录才是完整快照；复制到一半的目录不暴露给列表/删除。
+    const manifest = runtimeBackupManifest(file)
+    if (!manifest) throw new EabError(EC.NOT_FOUND, '备份尚未完成')
+    return { dir, file, size: manifest.size, kind: 'runtime' }
+  }
+  throw new EabError(EC.VALIDATION, '备份类型不合法')
 }
 
 function text(value: unknown, field: string, max = 200): string {
@@ -491,6 +518,19 @@ export async function createDingTalkCompany(
 }
 
 export function registerAdminRoutes(app: FastifyInstance, deps: ServerDeps): void {
+  type RuntimeBackupJob = {
+    id: string
+    status: 'running' | 'done' | 'failed'
+    startedAt: string
+    finishedAt?: string
+    dir?: string
+    size?: number
+    manifest?: unknown
+    error?: string
+  }
+  // 运行数据备份可能达到数百 MB；不能占住 HTTP 请求，改为后台任务 + 轮询。
+  const runtimeBackupJobs = new Map<string, RuntimeBackupJob>()
+
   /* ---------------- 部门 ---------------- */
 
   app.post<{ Body: { name?: string; parentId?: string; managerUserId?: string } }>(
@@ -1776,44 +1816,26 @@ export function registerAdminRoutes(app: FastifyInstance, deps: ServerDeps): voi
   }>('/api/console/audit', async (req) => {
     requireConsole(req, deps)
     const companyId = companyOf(req, deps)
-    const where: string[] = ['company_id = ?']
-    const args: Array<string | number> = [companyId]
-    if (req.query.action) {
-      where.push('action LIKE ?')
-      args.push(`%${req.query.action}%`)
-    }
-    if (req.query.actor) {
-      where.push('actor_user_id = ?')
-      args.push(req.query.actor)
-    }
-    if (req.query.result) {
-      where.push('result = ?')
-      args.push(req.query.result)
-    }
-    if (req.query.from) {
-      where.push('created_at >= ?')
-      args.push(Date.parse(req.query.from))
-    }
-    if (req.query.to) {
-      where.push('created_at <= ?')
-      args.push(Date.parse(req.query.to))
-    }
     const limit = Math.min(Math.max(Number(req.query.limit ?? 50), 1), 500)
     const offset = Math.max(Number(req.query.offset ?? 0), 0)
-    const total = Number(
-      (deps.db.prepare(`SELECT COUNT(*) AS n FROM audit_logs WHERE ${where.join(' AND ')}`).get(...args) as { n: number }).n,
-    )
-    const rows = deps.db
-      .prepare(
-        `SELECT id, seq, actor_user_id, action, resource_type, resource_id, result, detail_json, trace_id, ip, channel, hash, created_at
-           FROM audit_logs WHERE ${where.join(' AND ')} ORDER BY seq DESC LIMIT ? OFFSET ?`,
-      )
-      .all(...args, limit, offset) as unknown as Array<Record<string, unknown>>
-    return ok({
-      total,
+    const reader = deps.backends?.auditRead ?? new SqliteAuditReadSource(deps.db)
+    const page = await reader.list({
+      companyId,
+      action: req.query.action || undefined,
+      actor: req.query.actor || undefined,
+      result: req.query.result || undefined,
+      from: req.query.from ? Date.parse(req.query.from) : undefined,
+      to: req.query.to ? Date.parse(req.query.to) : undefined,
       limit,
       offset,
-      items: rows.map((row) => ({
+    })
+    return ok({
+      total: page.total,
+      limit,
+      offset,
+      source: page.source,
+      ...(page.fallbackReason ? { fallbackReason: page.fallbackReason } : {}),
+      items: page.rows.map((row) => ({
         id: row.id,
         seq: row.seq,
         actorUserId: row.actor_user_id,
@@ -1821,7 +1843,11 @@ export function registerAdminRoutes(app: FastifyInstance, deps: ServerDeps): voi
         resourceType: row.resource_type,
         resourceId: row.resource_id,
         result: row.result,
-        detail: row.detail_json ? JSON.parse(String(row.detail_json)) : null,
+        detail: row.detail_json
+          ? typeof row.detail_json === 'string'
+            ? JSON.parse(row.detail_json)
+            : row.detail_json
+          : null,
         traceId: row.trace_id,
         ip: row.ip,
         channel: row.channel,
@@ -1834,13 +1860,15 @@ export function registerAdminRoutes(app: FastifyInstance, deps: ServerDeps): voi
   app.get<{ Querystring: { format?: string } }>('/api/console/audit/export', async (req, reply) => {
     requireConsole(req, deps)
     const companyId = companyOf(req, deps)
-    const rows = deps.db
-      .prepare(
-        `SELECT seq, actor_user_id, action, resource_type, resource_id, result, trace_id, ip, channel, hash, created_at
-           FROM audit_logs WHERE company_id = ? ORDER BY seq ASC LIMIT 100000`,
-      )
-      .all(companyId) as unknown as Array<Record<string, unknown>>
-    audit(deps, req, companyId, 'audit.export', 'audit_log', null, { count: rows.length, format: req.query.format ?? 'csv' })
+    const reader = deps.backends?.auditRead ?? new SqliteAuditReadSource(deps.db)
+    const exported = await reader.export(companyId)
+    const rows = exported.rows as Array<Record<string, unknown>>
+    audit(deps, req, companyId, 'audit.export', 'audit_log', null, {
+      count: rows.length,
+      format: req.query.format ?? 'csv',
+      source: exported.source,
+      ...(exported.fallbackReason ? { fallbackReason: exported.fallbackReason } : {}),
+    })
     if (req.query.format === 'json') {
       reply.type('application/json; charset=utf-8')
       reply.header('content-disposition', 'attachment; filename="audit.json"')
@@ -1941,17 +1969,37 @@ export function registerAdminRoutes(app: FastifyInstance, deps: ServerDeps): voi
     async (req) => {
       requireConsole(req, deps)
       const companyId = companyOf(req, deps)
-      const decision = String(req.body?.decision ?? '')
-      if (!['approved', 'rejected'].includes(decision)) throw new EabError(EC.VALIDATION, 'decision 只能是 approved / rejected')
+      const decisionRaw = String(req.body?.decision ?? '')
+      if (!['approved', 'rejected'].includes(decisionRaw)) throw new EabError(EC.VALIDATION, 'decision 只能是 approved / rejected')
+      const decision = decisionRaw as 'approved' | 'rejected'
       const row = deps.db
-        .prepare('SELECT id, status FROM approvals WHERE id = ? AND company_id = ?')
-        .get(req.params.id, companyId) as { id: string; status: string } | undefined
+        .prepare('SELECT id, status, action, requester_user_id, payload_json FROM approvals WHERE id = ? AND company_id = ?')
+        .get(req.params.id, companyId) as
+        | { id: string; status: string; action: string; requester_user_id: string; payload_json: string | null }
+        | undefined
       if (!row) throw new EabError(EC.NOT_FOUND, '审批不存在')
       if (row.status !== 'pending') throw new EabError(EC.CONFLICT, `审批已是 ${row.status}`)
       deps.db
         .prepare('UPDATE approvals SET status = ?, decided_by = ?, decided_at = ?, reason = COALESCE(?, reason) WHERE id = ?')
         .run(decision, 'console-operator', Date.now(), optionalText(req.body?.reason, 200), row.id)
       audit(deps, req, companyId, `approval.${decision}`, 'approval', row.id, { decision })
+      let payload: { toolId?: string; skillId?: string } | null = null
+      try {
+        payload = row.payload_json ? (JSON.parse(row.payload_json) as { toolId?: string; skillId?: string }) : null
+      } catch {
+        payload = null
+      }
+      recordSkillApprovalDecision(deps.db, {
+        companyId,
+        requesterUserId: row.requester_user_id,
+        action: row.action,
+        decision,
+        actorId: 'console-operator',
+        approvalId: row.id,
+        toolId: payload?.toolId,
+        skillId: payload?.skillId,
+        reason: optionalText(req.body?.reason, 200),
+      })
       return ok({ id: row.id, status: decision })
     },
   )
@@ -1971,16 +2019,79 @@ export function registerAdminRoutes(app: FastifyInstance, deps: ServerDeps): voi
     return ok({ file, size, createdAt: new Date().toISOString() })
   })
 
+  app.post('/api/console/backups/runtime', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const running = [...runtimeBackupJobs.values()].find((job) => job.status === 'running')
+    if (running) return ok({ jobId: running.id, status: running.status, startedAt: running.startedAt })
+    const job: RuntimeBackupJob = {
+      id: `bk_${ulid()}`,
+      status: 'running',
+      startedAt: new Date().toISOString(),
+    }
+    runtimeBackupJobs.set(job.id, job)
+    void (async () => {
+      try {
+        const result = await createRuntimeBackup(deps)
+        Object.assign(job, {
+          status: 'done',
+          finishedAt: new Date().toISOString(),
+          dir: result.dir,
+          size: result.size,
+          manifest: result.manifest,
+        })
+        audit(deps, req, companyId, 'ops.backup.runtime.create', 'runtime-backup', result.dir, {
+          size: result.size,
+          includes: result.manifest.includes,
+          excludes: result.manifest.excludes,
+        })
+      } catch (error) {
+        job.status = 'failed'
+        job.finishedAt = new Date().toISOString()
+        job.error = error instanceof Error ? error.message : String(error)
+      }
+    })()
+    return ok({ jobId: job.id, status: job.status, startedAt: job.startedAt })
+  })
+
+  app.get<{ Params: { id: string } }>('/api/console/backup-jobs/:id', async (req) => {
+    requireConsole(req, deps)
+    const job = runtimeBackupJobs.get(req.params.id)
+    if (!job) throw new EabError(EC.NOT_FOUND, '备份任务不存在')
+    return ok(job)
+  })
+
   app.get('/api/console/backups', async (req) => {
     requireConsole(req, deps)
     const dir = backupDir(deps)
     if (!existsSync(dir)) return ok({ items: [] })
-    const items = readdirSync(dir)
-      .filter((name) => name.endsWith('.db'))
-      .map((name) => {
-        const file = join(dir, name)
-        return { file, name, size: statSync(file).size, createdAt: statSync(file).mtime.toISOString() }
+    const items = readdirSync(dir, { withFileTypes: true })
+      .map((entry) => {
+        const file = join(dir, entry.name)
+        const stat = statSync(file)
+        if (entry.name.endsWith('.db') && stat.isFile()) {
+          return {
+            kind: 'database' as const,
+            file,
+            name: entry.name,
+            size: stat.size,
+            createdAt: stat.mtime.toISOString(),
+          }
+        }
+        if (entry.name.startsWith('eab-runtime-') && stat.isDirectory()) {
+          const manifest = runtimeBackupManifest(file)
+          if (!manifest) return null
+          return {
+            kind: 'runtime' as const,
+            file,
+            name: entry.name,
+            size: manifest.size,
+            createdAt: stat.mtime.toISOString(),
+          }
+        }
+        return null
       })
+      .filter((item): item is NonNullable<typeof item> => Boolean(item))
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
     return ok({ items })
   })
@@ -1988,7 +2099,7 @@ export function registerAdminRoutes(app: FastifyInstance, deps: ServerDeps): voi
   app.post<{ Params: { name: string } }>('/api/console/backups/:name/reveal', async (req) => {
     requireConsole(req, deps)
     const companyId = companyOf(req, deps)
-    const { dir, file } = resolveBackupFile(deps, req.params.name)
+    const { dir, file, kind } = resolveBackupFile(deps, req.params.name)
     let opened = false
     try {
       const command = process.platform === 'win32' ? 'explorer.exe' : process.platform === 'darwin' ? 'open' : 'xdg-open'
@@ -2006,16 +2117,17 @@ export function registerAdminRoutes(app: FastifyInstance, deps: ServerDeps): voi
     } catch {
       opened = false
     }
-    audit(deps, req, companyId, 'ops.backup.reveal', 'database', file, { dir, opened })
+    audit(deps, req, companyId, 'ops.backup.reveal', kind, file, { dir, opened })
     return ok({ file, opened })
   })
 
   app.delete<{ Params: { name: string } }>('/api/console/backups/:name', async (req) => {
     requireConsole(req, deps)
     const companyId = companyOf(req, deps)
-    const { file, size } = resolveBackupFile(deps, req.params.name)
-    unlinkSync(file)
-    audit(deps, req, companyId, 'ops.backup.delete', 'database', file, { size })
+    const { file, size, kind } = resolveBackupFile(deps, req.params.name)
+    if (kind === 'runtime') rmSync(file, { recursive: true, force: true })
+    else unlinkSync(file)
+    audit(deps, req, companyId, 'ops.backup.delete', kind, file, { size })
     return ok({ deleted: true, file })
   })
 }

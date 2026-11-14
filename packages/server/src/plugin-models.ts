@@ -812,10 +812,21 @@ export async function callPluginModel(
       } else if (type === 'tool-call-delta') {
         const index = Number(chunk.index ?? 0)
         const current = toolCalls.get(index) ?? { id: '', name: '', arguments: '' }
+        const argumentsDelta = String(chunk.argumentsDelta ?? '')
         if (chunk.id) current.id = String(chunk.id)
         if (chunk.name) current.name = String(chunk.name)
-        if (chunk.argumentsDelta) current.arguments += String(chunk.argumentsDelta)
+        if (argumentsDelta) current.arguments += argumentsDelta
         toolCalls.set(index, current)
+        // 和内置模型路径保持一致：把工具参数增量交给上层做写入预览。
+        if (chunk.id || chunk.name || argumentsDelta) {
+          options.onEvent?.({
+            type: 'tool_delta',
+            index,
+            ...(current.id ? { id: current.id } : {}),
+            ...(current.name ? { name: current.name } : {}),
+            ...(argumentsDelta ? { argumentsDelta } : {}),
+          })
+        }
       } else if (type === 'block-end') {
         const block = asRecord(chunk.block)
         if (String(block.type ?? '') === 'tool-call') {

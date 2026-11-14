@@ -77,6 +77,7 @@ describe('DSH session projection', () => {
           summary: '{"total":3}',
           durationMs: 12,
         }],
+        timing: { ttftMs: 25, genMs: 40, wallMs: 100 },
       }),
       1001,
     )
@@ -105,6 +106,8 @@ describe('DSH session projection', () => {
     expect(state.current.total).toBe(state.sums.user + state.sums.assistant + state.sums.tool)
     expect(state.timing.toolCalls).toBe(1)
     expect(state.timing.calls).toBe(1)
+    expect(state.timing.ttftMs).toBe(25)
+    expect(state.timing.genMs).toBe(40)
     expect(state.timing.tools.query_records).toEqual({ calls: 1, ms: 12 })
     expect(state.cost.eab.estimated.peak.uncached).toBeGreaterThan(0)
     expect(state.cost.eab.estimated.peak.output).toBeGreaterThan(0)
@@ -115,6 +118,16 @@ describe('DSH session projection', () => {
       0,
     )
     expect(activityTokens).toBeGreaterThan(state.sums.assistant + state.sums.tool)
+    const activityToolsMs = Object.values(activity.days).reduce(
+      (sum: number, day: any) => sum + Number(day.toolsMs || 0),
+      0,
+    )
+    const activityWallMs = Object.values(activity.days).reduce(
+      (sum: number, day: any) => sum + Number(day.wallMs || 0),
+      0,
+    )
+    expect(activityToolsMs).toBe(12)
+    expect(activityWallMs).toBeGreaterThan(0)
   })
 
   it('keeps the official empty contextTimeline shape when there are no events', () => {

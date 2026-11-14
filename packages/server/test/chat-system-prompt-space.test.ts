@@ -60,4 +60,26 @@ describe('对话系统提示的文件空间边界', () => {
     expect(text).toContain('云空间（可直接使用）')
     expect(text).not.toContain('本地空间（必须选择）')
   })
+
+  it('右侧预览文件会带进本轮提示，并禁止反问是哪个文件', () => {
+    const text = buildSystemPrompt({
+      actor,
+      chatTools: cloudTools,
+      memories: [],
+      hits: [],
+      hasAttachments: false,
+      spaceKind: 'cloud',
+      spaceLabel: '云空间',
+      activeFile: { fileId: 'file_q1', name: '季度复盘.docx', relPath: '文档/季度复盘.docx' },
+    })
+    expect(text).toContain('用户此刻在右侧预览《季度复盘.docx》')
+    expect(text).toContain('fileId=file_q1')
+    expect(text).toContain('云空间路径 文档/季度复盘.docx')
+    expect(text).toContain('不要反问「是哪个文件」')
+    expect(text).toContain('以用户说的为准')
+  })
+
+  it('没有预览文件时不出现这段上下文', () => {
+    expect(prompt('cloud', '云空间')).not.toContain('用户此刻在右侧预览')
+  })
 })

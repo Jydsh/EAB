@@ -24,7 +24,7 @@ import {
   bumpUsage,
   ensureChannelSession,
   historyOf,
-  loadModelCatalog,
+  loadModelCatalogCached,
   releaseTurn,
   retrieveKb,
   runAgentTurn,
@@ -34,6 +34,7 @@ import {
 import { assertChatQuota } from './quota.js'
 import { planChannelModelCommand } from './channel-model-command.js'
 import { publishChatEvent } from './chat-events.js'
+import { acquireLeaderHold, claimOnce, type LeaderHold } from './backends/coordination.js'
 import { pluginPromptTexts } from './plugin-tools.js'
 import { toolSpecsForAgent } from './routes/tools.js'
 
@@ -290,6 +291,29 @@ function feishuConfig(db: Db, companyId: string): FeishuChannelRow | undefined {
 
 let refreshPromise: Promise<void> | null = null
 
+/**
+ * 飞书长连接同样只能有一个实例持有：多实例各连一份会重复收到事件、重复回复。
+ * Redis 在线时用租约选定实例，其余待命；没接 Redis 时恒为本实例持有。
+ */
+let streamLeader: LeaderHold | null = null
+let streamLeaderKey = ''
+
+async function ensureStreamLeadership(appId: string): Promise<boolean> {
+  const key = `feishu-stream:${appId}`
+  if (streamLeader && streamLeaderKey === key && streamLeader.isHeld()) return true
+  streamLeader?.release()
+  streamLeader = null
+  streamLeaderKey = key
+  streamLeader = await acquireLeaderHold(key, { ttlMs: 90_000 })
+  return Boolean(streamLeader?.isHeld())
+}
+
+function releaseStreamLeadership(): void {
+  streamLeader?.release()
+  streamLeader = null
+  streamLeaderKey = ''
+}
+
 /** 启动/重建飞书长连接。绑定换应用后调用它即可切换凭证，不必重启整个服务。 */
 export function refreshFeishuStream(deps: ServerDeps): Promise<void> {
   if (refreshPromise) return refreshPromise
@@ -304,6 +328,7 @@ async function doRefreshFeishuStream(deps: ServerDeps): Promise<void> {
   streamState.lastAttemptAt = Date.now()
   if (!cfg?.app_id || !cfg.secret_ref || cfg.status !== 'bound') {
     stopFeishuStream()
+    releaseStreamLeadership()
     streamState.error = '飞书渠道未满足长连接启动条件（需已绑定且填写 App ID/App Secret）'
     return
   }
@@ -312,6 +337,13 @@ async function doRefreshFeishuStream(deps: ServerDeps): Promise<void> {
     stopFeishuStream()
     streamState.error = `飞书渠道密钥缺失：${cfg.secret_ref} 未配置，请重新保存 App Secret`
     console.warn(`[eab] 飞书长连接未启动：${streamState.error}`)
+    return
+  }
+
+  // 多实例部署时只让一个实例持有长连接，避免同一条事件被两个实例各处理一次。
+  if (!(await ensureStreamLeadership(cfg.app_id))) {
+    if (streamState.client) stopFeishuStream()
+    streamState.error = '飞书长连接正由另一实例持有，本实例待命（Redis 领导权）'
     return
   }
 
@@ -470,6 +502,12 @@ export async function handleFeishuEvent(
     createHash('sha256').update(JSON.stringify(body)).digest('hex').slice(0, 32)
 
   if (!opts.eventRecorded) {
+    // Redis 原子预去重：同一条飞书事件被多个实例同时收到时只放一个进去；
+    // 缓存层不可用时返回 true，下面的 DB 查询/插入继续兜底。
+    const firstSeen = await claimOnce(`feishu:event:${deps.companyId}:${eventKey}`, 300)
+    if (!firstSeen) {
+      return { handled: false, text: null, sessionId: null, reason: 'duplicate' }
+    }
     const existing = deps.db
       .prepare('SELECT id FROM channel_events WHERE provider = ? AND event_key = ?')
       .get('feishu', eventKey) as { id: string } | undefined
@@ -532,7 +570,7 @@ export async function handleFeishuEvent(
       return finish(deps, eventKey, { handled: true, text, sessionId: null, reason: 'identity-unbound' })
     }
 
-    const catalog = loadModelCatalog(
+    const catalog = await loadModelCatalogCached(
       deps.db,
       actor.subject.companyId,
       deps.config.devAuth,

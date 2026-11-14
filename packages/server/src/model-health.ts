@@ -15,6 +15,8 @@ import {
   listAllPluginModels,
   type PluginModelDefinition,
 } from './plugin-models.js'
+import { runAsLeader } from './backends/coordination.js'
+import { hotGet, hotSet } from './hot-cache.js'
 import type { ChatMessage } from './llm.js'
 
 interface ModelHealthEntry {
@@ -48,6 +50,65 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
+/**
+ * 健康结论的跨实例共享。
+ *
+ * 定时探测是领导权任务：只有 leader 真正打上游，其它实例自己永远拿不到探测结果。
+ * 于是 leader 把「公司 → 模型 → 健康」快照写进共享缓存（TTL 120 秒），
+ * 其它实例在组装模型目录前先合并一次；没配 Redis 时读写的是本进程 Map，
+ * 行为与升级前完全一致。写操作合并成 200ms 一次的批量写，避免探测批次里每个模型写一次。
+ */
+const HEALTH_SHARED_TTL_SEC = 120
+const HEALTH_PUSH_DEBOUNCE_MS = 200
+const pendingPush = new Set<string>()
+let pushTimer: ReturnType<typeof setTimeout> | null = null
+
+function healthSharedKey(companyId: string): string {
+  return `model-health:${companyId}`
+}
+
+function serializeHealth(companyId: string): Record<string, ModelHealthEntry> {
+  const out: Record<string, ModelHealthEntry> = {}
+  for (const [modelId, entry] of companyHealth(companyId)) out[modelId] = entry
+  return out
+}
+
+function scheduleHealthPush(companyId: string): void {
+  pendingPush.add(companyId)
+  if (pushTimer) return
+  pushTimer = setTimeout(() => {
+    pushTimer = null
+    const companies = [...pendingPush]
+    pendingPush.clear()
+    for (const id of companies) {
+      void hotSet(healthSharedKey(id), serializeHealth(id), HEALTH_SHARED_TTL_SEC)
+    }
+  }, HEALTH_PUSH_DEBOUNCE_MS)
+  pushTimer.unref?.()
+}
+
+/**
+ * 把共享健康快照合并进本进程：同一条模型以 checkedAt 较新者为准，
+ * 本进程更新（例如刚真实调用成功）不会被旧快照覆盖。
+ */
+export async function hydrateModelHealth(companyId: string): Promise<void> {
+  const shared = await hotGet<Record<string, ModelHealthEntry>>(healthSharedKey(companyId))
+  if (!shared || typeof shared !== 'object') return
+  const rows = companyHealth(companyId)
+  for (const [modelId, entry] of Object.entries(shared)) {
+    if (!entry || typeof entry !== 'object') continue
+    const current = rows.get(modelId)
+    const incomingCheckedAt = Number(entry.checkedAt) || 0
+    if (current && current.checkedAt > incomingCheckedAt) continue
+    rows.set(String(modelId), {
+      healthy: entry.healthy === true,
+      checkedAt: incomingCheckedAt,
+      failures: Number(entry.failures) || 0,
+      lastError: String(entry.lastError ?? '').slice(0, 300),
+    })
+  }
+}
+
 /** 成功调用或成功探测：恢复为可用。 */
 export function markModelHealthy(companyId: string, modelId: string): void {
   const rows = companyHealth(companyId)
@@ -58,6 +119,7 @@ export function markModelHealthy(companyId: string, modelId: string): void {
     failures: previous?.failures ?? 0,
     lastError: '',
   })
+  scheduleHealthPush(companyId)
 }
 
 /** 失败调用或失败探测：标记不可用，供对话候选过滤。 */
@@ -71,6 +133,7 @@ export function markModelUnhealthy(companyId: string, modelId: string, reason: s
     lastError: reason.slice(0, 300),
   })
   if (preferredByCompany.get(companyId) === modelId) preferredByCompany.delete(companyId)
+  scheduleHealthPush(companyId)
 }
 
 /**
@@ -124,6 +187,7 @@ export function forgetModelHealth(companyId: string, modelIds: readonly string[]
     rows.delete(String(modelId))
     if (preferredByCompany.get(companyId) === modelId) preferredByCompany.delete(companyId)
   }
+  scheduleHealthPush(companyId)
 }
 
 export function isModelHealthKnown(companyId: string, modelId: string): boolean {
@@ -299,7 +363,9 @@ export function startModelHealthMonitor(
     }
     running = true
     try {
-      const result = await probeModels(companyId, models, timeoutMs, 3)
+      const lead = await runAsLeader('model-probe', 5 * 60_000, () => probeModels(companyId, models, timeoutMs, 3))
+      if (!lead.ran || !lead.value) return
+      const result = lead.value
       if (result.failed.length > 0) {
         console.warn(
           `[eab] 模型健康检查：${result.failed.length}/${result.checked} 个插件模型暂时不可用：` +

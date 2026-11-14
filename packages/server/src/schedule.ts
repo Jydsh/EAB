@@ -20,6 +20,7 @@
 import { randomUUID } from 'node:crypto'
 import type { Db } from '@eab/storage'
 import { EC, EabError, SC } from '@eab/domain'
+import { runAsLeader } from './backends/coordination.js'
 import type { ServerDeps } from './deps.js'
 import { actorFor, findActivePerson, type RequestActor } from './session.js'
 import { resolveModelForPurpose } from './model-registry.js'
@@ -650,7 +651,7 @@ async function runSchedule(deps: ServerDeps, row: ScheduleRow, runId: string): P
   // 动态导入避免 schedule -> chat -> tools -> schedule 的静态循环。
   const chat = await import('./routes/chat.js')
   const { toolSpecsForAgent } = await import('./routes/tools.js')
-  const catalog = chat.loadModelCatalog(deps.db, row.company_id, deps.config.devAuth, row.user_id)
+  const catalog = await chat.loadModelCatalogCached(deps.db, row.company_id, deps.config.devAuth, row.user_id)
   const visible = chat.visibleModelsFor(catalog, [...actor.subject.roles], row.company_id)
   const routed = resolveModelForPurpose(deps.db, row.company_id, 'chat.default')
   const model = (routed && visible.find((item) => item.id === routed.id)) ?? visible[0]
@@ -992,15 +993,17 @@ export function startScheduleWorker(deps: ServerDeps): () => void {
     if (running) return
     running = true
     try {
-      const due = deps.db
-        .prepare(
-          `SELECT * FROM user_schedules
-            WHERE status = 'active' AND next_run_at <= ?
-            ORDER BY CASE WHEN mode = 'once' THEN 0 ELSE 1 END, next_run_at ASC
-            LIMIT 5`,
-        )
-        .all(Date.now()) as unknown as ScheduleRow[]
-      for (const row of due) await executeDueSchedule(deps, row)
+      await runAsLeader('schedule-worker', 2 * 60_000, async () => {
+        const due = deps.db
+          .prepare(
+            `SELECT * FROM user_schedules
+              WHERE status = 'active' AND next_run_at <= ?
+              ORDER BY CASE WHEN mode = 'once' THEN 0 ELSE 1 END, next_run_at ASC
+              LIMIT 5`,
+          )
+          .all(Date.now()) as unknown as ScheduleRow[]
+        for (const row of due) await executeDueSchedule(deps, row)
+      })
     } catch (error) {
       console.warn('[eab] 定时任务调度失败：', (error as Error).message)
     } finally {

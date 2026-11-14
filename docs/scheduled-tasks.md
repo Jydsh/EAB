@@ -1,7 +1,8 @@
 # 用户自建定时任务（Schedule）— 按 DSH 定位重做
 
 > 状态：重构中（2026-11-09）。事件日志、DSH canonical 选择器、delete 语义、错误码闭集已落盘；
-> 任务中心 / 批量合并 / 无人值守审批仍是后续阶段。
+> 控制台任务中心（列表 / 详情 / 事件时间线 / 暂停恢复取消）已于 2026-11-13 落地；
+> 批量合并 / 无人值守审批仍是后续阶段。
 > 相关代码：`packages/server/src/schedule.ts`、`routes/schedules.ts`、`routes/tools.ts`、
 > 迁移 `0031_schedules.sql` + `0032_schedule_events.sql`。
 
@@ -150,6 +151,16 @@ HTTP（员工端）：
 
 权限：`schedule:read` / `schedule:write`；只能操作当前员工自己的任务；每员工最多 50 个进行中任务。
 
+HTTP（控制台任务中心，要求 `x-eab-console: 1`；按当前控制台公司隔离）：
+
+- `GET /api/console/schedules?status=all|active|paused|running|done|error|cancelled&limit=1..200`
+  → `{ items, counts, total, status }`；列表带最近一次 run，按“运行中 > 待触发 > 暂停 > 失败 > 完成 > 取消”排序
+- `GET /api/console/schedules/:id` → 任务字段 + `runs`（最近 50 条）+ `events`（最近 100 条）
+- `POST /api/console/schedules/:id/pause|resume|cancel`
+  → 事务内更新投影并追加 `pause` / `resume` / `delete` 事件；`running` 状态一律拒绝；更新按原状态做条件更新，若调度器在读取后改变状态则回滚并返回 409，避免与调度器抢占
+
+页面入口：控制台“运营与审计 > 任务中心”。列表支持状态分段筛选与暂停/恢复/取消；点任务标题或“详情”查看最近执行和 append-only 事件时间线。操作写审计，`actorUserId=console-operator`。
+
 ## 7. 当前边界与后续
 
 已落地：
@@ -159,20 +170,21 @@ HTTP（员工端）：
 - 错误码闭集；
 - `schedule.delete` 语义；
 - 重启恢复不重放；
-- 钉钉主动推送 + 网页 SSE。
+- 钉钉主动推送 + 网页 SSE；
+- 控制台任务中心：公司级列表、状态筛选、单任务详情、最近执行、事件时间线、暂停/恢复/取消（2026-11-13）。
 
 未落地（按优先级）：
 
-1. **任务中心 UI**：列表/暂停/恢复/删除/最近一次结果/事件时间线；
-2. **批量合并**：同一 tick 内同一会话的多条到期提醒合成一条 framing，减少刷屏；
-3. **无人值守审批 fail-closed**：定时任务遇到 `dangerous` 工具直接失败并写 `approval_required`；
-4. **投递补偿**：模型成功但钉钉失败时，只重投递，不重跑模型；
-5. **有效期 / 频控 / 多实例抢占**：`expiresAt`、每任务最小间隔、DB 条件更新抢占；
-6. **会话事件流统一**：把 `schedule_events` 的写法推广到 `session_events`，让 Trajectory 直接读。
+1. **批量合并**：同一 tick 内同一会话的多条到期提醒合成一条 framing，减少刷屏；
+2. **无人值守审批 fail-closed**：定时任务遇到 `dangerous` 工具直接失败并写 `approval_required`；
+3. **投递补偿**：模型成功但钉钉失败时，只重投递，不重跑模型；
+4. **有效期 / 频控 / 多实例抢占**：`expiresAt`、每任务最小间隔、DB 条件更新抢占；
+5. **会话事件流统一**：把 `schedule_events` 的写法推广到 `session_events`，让 Trajectory 直接读。
 
 ## 8. 验收口径
 
 - `pnpm typecheck` 0；
 - `pnpm exec vitest run packages/server/test/schedule.test.ts --pool=forks` 全过；
+- 任务中心：`pnpm test -- console-schedules` 5/5；控制台“运营与审计 > 任务中心”能看到列表、状态计数、最近执行与事件时间线，暂停/恢复/取消后状态与事件同步更新；
 - 真机：网页/钉钉各建一条 `after_seconds` 任务，到点在原会话看到「定时提醒」+ 回答，钉钉单聊收到同一条结果；
 - 查库：`user_schedules.status`、`schedule_runs`、`schedule_events` 三者能对上；同一 occurrence 不出现两条 run。

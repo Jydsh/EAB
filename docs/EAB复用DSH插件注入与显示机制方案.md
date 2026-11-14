@@ -368,7 +368,7 @@ EAB 8787 员工端 / 8788 控制台（同一个 EAB 进程）
   - `plugins.detail.actions` 出现；
   - `ctx.layout.selectPanel` 能切到面板。
 - `dsh-context`：
-  - `conversation.view` 页签出现；
+  - `conversation.view` 页签出现，并渲染当前会话投影（2026-11-13 已通过：57 条用户消息、47 步、29 次工具调用；页面无异常）；
   - `conversation.chat.assistant-actions` 出现；
   - `conversation.input.overlay` 出现；
   - `plugins.bundle.config` 卡片出现；
@@ -389,6 +389,16 @@ EAB 8787 员工端 / 8788 控制台（同一个 EAB 进程）
 - 8787/8788 正常；
 - 插件宿主失败不阻塞主服务（保持现有行为）。
 
+### 10.4 插件页首屏与内核预热
+
+- `plugin-kernel.html` 的共享内核资源（`primitives.js` / `primitives.css` / `cordis` / `slots` / `renderer` / React UMD）在 head 中用 `modulepreload` / `preload` 并发拉起，boot 内的三个模块 `Promise.all` 并行 import，不再串行等待。
+- 去掉固定 500ms 等待，改为轮询插件注册的 slot（`main` / `settings.section` / `conversation.view` 等），首个 slot 出现即挂载，最多兜底 500ms。
+- 控制台插件工作台加载成功后，用隐藏的 `plugin-kernel.html?warm=1` 预热共享内核；预热页只执行 Cordis / slots / primitives / renderer，不执行任何插件 client bundle，避免一次性启动所有插件。`warm=1` 完成后通过 `parent.postMessage({ type: 'eab-plugin-kernel-warm', ready: true })` 让父页清理隐藏 iframe。
+- 同时按插件版本 + 校验和预取已启用 DSH 插件的 `lib/client.js`；插件代码仍在用户点击时按 iframe 隔离启动。预热 iframe 每次页面会话只创建一次，插件列表后续刷新时只补拉新增或升级过的 bundle，不重复请求同一 URL。
+- 内核 vendor 与插件静态代码资源使用 `private, max-age=3600, must-revalidate`；插件代码 URL 带 `v=<version>&h=<checksum>` 作为失效键，同版本覆盖重装也能失效；插件入口 HTML 仍为 `no-store`。
+- 插件页首屏状态现在按阶段显示“正在加载共享内核 → 正在加载插件代码 → 正在渲染页面 → 内核已就绪”，启动失败时错误区带插件 id 和入口路径，并提示可点“重新加载”重试。
+- 2026-11-13 加入校验和缓存键后实测：控制台 `dsh-context` 首次页面耗时约 157ms，`dsh-cy-api` 约 93ms，`dsh-ding-card` 约 199ms；三页均 `内核已就绪`、无 `#pk-error`。`dsh-context` 仍读到 9 个会话、926.3k Token、133 轮次。四个插件 bundle 的预取资源 `transferSize` 均为 0，命中 HTTP 缓存。
+
 ---
 
 ## 11. 缺陷与影响
@@ -408,14 +418,14 @@ EAB 8787 员工端 / 8788 控制台（同一个 EAB 进程）
 ### 11.3 Slot 契约债
 
 - EAB 必须持续维护 slot 声明表；每接一个新插件，可能要多声明一个 slot。
-- 未声明 slot 现在是静默等待，必须加诊断，否则又会回到“页面空白但没人知道为什么”。
+- 未声明 slot 现在是静默等待，必须加诊断，否则又会回到“页面空白但没人知道为什么”。`plugin-kernel.html` 已包住插件自己的 `ctx.slots.register`：缺声明、重复声明、缺 `select` 的抛错会在页面顶部显示“插件使用了 EAB 尚未声明的 slot”，状态改为“内核已就绪 · N 个 slot 未声明”，并保留官方 SlotCore 的抛错，不把契约错误吞掉。
 - EAB 页面壳可以不是 DSH 三列布局，但 slot 名要对齐；视觉可以 EAB 化，注册契约不能改。
 
 ### 11.4 Host 服务债
 
 - 每接一个新插件，可能要多补一个服务或一个方法。
 - `available:false` 的服务不能无限等；要有 fail-fast 和插件页提示。
-- `webServer` 的 `upgrade/fallback/tapIndex` 是硬缺口，`dsh-cy-api` 这类网关插件会直接受影响。
+- `webServer` 的 `upgrade/fallback/tapIndex` 仍未真正实现，但不再静默：`supportsUpgrade/supportsFallback/supportsTapIndex=false`，插件注册时写入实例 `hostGaps`，控制台插件状态显示“启用 · 能力缺口”，`/api/console/plugins` 的 `hosts[].hostGaps` 可读到具体路径。`available:false` 的 `speechToText / agents / pluginManager / attachments` 读方法会登记缺口，创建/写入类方法直接抛出带 `code` 的错误；`approval / userQuestions` 返回明确 failure。新增 `plugin-host-inject.test.ts` 覆盖 upgrade/fallback/tapIndex 与 `available:false` 写入失败。
 
 ### 11.5 安全
 
@@ -431,12 +441,12 @@ EAB 8787 员工端 / 8788 控制台（同一个 EAB 进程）
 
 - 每个插件页启动时加载当前 scope 的 client roster；插件多时首屏会变慢。
 - 官方模块系统是懒加载，bundle 只在首次使用时 materialize；可以接受。
-- 需要缓存 `/plugins` bundle 和 boot 图，但版本/实例变化要失效。
+- 需要缓存 `/plugins` bundle 和 boot 图，版本/实例变化要失效；当前插件代码缓存键已带 `v=<version>&h=<checksum>`，同版本覆盖重装也会重新取。
 
 ### 11.7 备份/更新
 
-- SQLite 备份只覆盖 EAB 主库；插件数据根、client bundle、设置不在备份里。需要扩展备份或明确文档。
-- `scripts/eab-update.mjs` 的 `CODE_PATHS` 目前没有 `packages/dsh-bridge`；新增包必须补，否则更新后代码缺文件。
+- SQLite 备份只覆盖 EAB 主库；已新增「运行数据备份」：`eab backup --full` 或 `POST /api/console/backups/runtime` 生成 `eab-runtime-*` 目录，包含 `eab.db`、`plugins/`、`dsh-home/`、`dsh/`、`workspaces/`、`company-assets/`、`console-settings.json`，并写 `manifest.json`。备份在后台异步生成，页面轮询 `/api/console/backup-jobs/:id`；列表只展示带 manifest 的完整快照。`secrets.json` / `admin-credentials.txt` 明确排除，恢复后需重新确认密钥。`eab restore <目录> --yes` 会先停服务、把当前运行目录改名到 `restore-safety-*`，再按 manifest 回填；已在独立 `EAB_HOME` 沙箱验证运行数据恢复和数据库恢复，真实运行目录尚未执行恢复。
+- `scripts/eab-update.mjs` 的 `CODE_PATHS` 已从逐个子包改为整个 `packages/`，新增包不会再漏拷；`scripts/`、锁文件和 tsconfig 仍在更新范围。
 - Node 版本：EAB `>=22.5.0`，部分 DSH 插件要求 `^22.19.0`；当前 `v22.23.2` 满足，但要在文档里写清楚。
 
 ### 11.8 多实例与 env
@@ -603,8 +613,9 @@ EAB chat 写入 chat_messages（事务提交）
 - 用真实库会话 `chat_f2957cfe-a547-4acc-8e87-2c17a8db7f1e` 验证：137 个事件、106 个 surface、37 个 requests，`sums={user:318,assistant:28640,tool:6731}`；再通过 `dsh-context` 的 `/api/dsh-context/detail` 返回 37 个 requests、106 个 nodes，`head.toolCalls=23`、`humanInputs=50`、`answers=41`；
 - `@deepseek-ai/dsh-client-ui-primitives` 已通过临时 esbuild 工程打成浏览器 ESM + CSS，落到 `packages/server/public/vendor/dsh-kernel/primitives.js`（约 4.28 MB）和 `primitives.css`（约 1.52 MB）；同时补了 `react-esm.js`、`react-dom-esm.js`、`react-jsx-runtime.js`，`plugin-kernel.html` 的 importmap 已映射 `react`、`react-dom`、`react/jsx-runtime`、primitives；
 - `plugin-kernel.html` 的 locale facade 已兼容官方多语言字典 `{ de, en, ja, zh }`，`register(ns, { zh, en, ... })` 会按当前语言取词条，仍支持 `{name}` 插值；
-- `dsh-context` 的 `main` / `sidebar.panellist` 已能在正式插件页完整渲染中文“上下文洞察”页；`overview` 从 404 变为 200，页面读到 9 个会话、Token 762.9k、轮次 107、近 7 天用量图表、Token 统计和耗时统计；
-- 概览的“工具调用 / 工具执行 / 活跃时长 / 模型调用”已从 0 补齐为真实值：`summary.timing.toolCalls=59`、`toolsMs=5267`（约 5.3s）、`wallMs=1102075`（约 18m22s）、`calls=86`；`toolsMs` 使用 `meta_json.toolCalls[].durationMs`，`foldContextTiming` 还把 `tool/call`/`tool/result` 按 `callId` 聚合成每个工具名的 `calls/ms`；
+- `dsh-context` 的 `main` / `sidebar.panellist` 已能在正式插件页完整渲染中文“上下文洞察”页；`overview` 从 404 变为 200，页面读到 9 个会话、Token 812.3k、轮次 112、近 7 天用量图表、Token 统计和耗时统计；
+- 概览的“工具调用 / 工具执行 / 活跃时长 / 模型调用”已从 0 补齐为真实值：`summary.timing.toolCalls=61`、`toolsMs≈5274`（约 5.3s）、`wallMs≈1173000`（约 19m33s）、`calls=89`；`toolsMs` 使用 `meta_json.toolCalls[].durationMs`，`foldContextTiming` 还把 `tool/call`/`tool/result` 按 `callId` 聚合成每个工具名的 `calls/ms`；
+- 助手消息的 `meta_json.timing` 已开始记录 `ttftMs / genMs / wallMs`：`routes/chat.ts` 用可注入时钟的 `createTurnTimingTracker`，在流式 `reasoning/content` 首次到达时记首字，按 `tool`/`tool_result`/`clarify` 切分生成窗口，累加模型生成时间；`messageEvents` 把这份 timing 带入 `assistant/message`，`foldContextTiming` 汇总到 timeline。旧消息没有这份字段，仍按 0 处理；
 - `contextTimeline` 新增 `counts.turns`（`Ko` 读的是 `counts.turns`，不是 `turns`）和 `timing` 形状；空 timeline 也返回零值 `timing`；`sessionProjectionCache.cachedSnapshot/coldSnapshot` 与 `sessionProjections.snapshot` 同时返回 `contextTimeline + contextActivity`；
 - `sessionQuery.listSessions`、`sessionProjectionCache.cachedSnapshot/coldSnapshot` 已补齐；`cachedSnapshot` 按 `chat_session_events` 现场折叠 `contextTimeline` 和 `contextActivity`，`sessionProjections.snapshot` 供 overview 的 live 会话路径读取，详情页仍走 `stateOf`；
 
@@ -675,8 +686,18 @@ EAB chat 写入 chat_messages（事务提交）
 ### 17.4 仍需继续做的部分
 
 - `settings.section` 现在通过页面顶部“页面 / 设置”切换：有 `main` 时默认显示页面，点设置切到 `settings.section`；没有 `main` 时自动回退到 `settings.section` 或 `plugins.bundle.config`。
+- `conversation.view` 已在插件页接入：`Root` 检测 `registry.entries('conversation.view')` 且存在当前会话时，显示“会话上下文”页签；渲染时把 `sessionId`（URL 的 `session` 参数或 localStorage 当前会话）作为 owner props 传给插件组件。`dsh-context` 的上下文统计、Token、趋势和 Context Browser 已读到真实会话投影（57 条用户消息、47 步、29 次工具调用），不再全 0。
 - `sessions / sessionQuery / sessionProjections` 的 host 投影已经接真实 `chat_messages`；页面内核目前只注入 `sessions` 的当前会话入口，还没有把 `sessionQuery` 的完整事件流暴露给前端插件，避免同源插件直接读全量消息。
-- `dsh-context` 正式页已跑通：primitives 及其必要依赖已 vendor，页面显示 9 个会话、Token `762.9k`、轮次 `107`、近 7 天柱状图、Token 统计和耗时统计；`detail head` 对真实会话返回 `toolCalls:23`、`humanInputs:50`、`answers:41`；overview 的“工具调用 59 / 工具执行 5.3s / 活跃时长 18m22s / 模型调用 86”已来自 `summary.timing`，由 `chat_messages.meta_json.toolCalls[].durationMs` 与事件时间跨度折叠。`ttftMs/genMs` 仍为 0，因为 EAB 当前没有真实生成延迟字段，页面“模型等待/模型生成”显示 0.0%；`dsh-cy-api` 个人页在 primitives/importmap 接入后尚未回归，`dsh-ding-card` 公司页已回归。
+- `dsh-context` 正式页已跑通：primitives 及其必要依赖已 vendor，页面显示 9 个会话、Token `812.3k`、轮次 `112`、近 7 天柱状图、Token 统计和耗时统计；`detail head` 对真实会话返回 `toolCalls:23`、`humanInputs:50`、`answers:41`；overview 的“工具调用 61 / 工具执行 5.3s / 活跃时长 19m33s / 模型调用 89”已来自 `summary.timing`，由 `chat_messages.meta_json.toolCalls[].durationMs` 与事件时间跨度折叠。
+- “模型等待 / 模型生成”已完成真实链路验证：`EAB_DEV_AUTH=1` 下发送一条真实对话，助手消息落库 `meta_json.timing={ttftMs:17692,genMs:1109,wallMs:18850}`；`chatSessionEvents` + `foldContextTimeline` 读回同一组值；清理测试会话后，页面仍基于真实消息显示“模型等待 1.1% / 13.0s / 89次”“模型生成 2.3% / 26.5s”，截图保存在 `.eab-dev/tmp/dsh-context-page.png`。历史消息没有 timing 仍按 0 处理。
+- 为跑通开发预览，`dev-seed.ensureModelCatalog` 增加了“公司不存在则跳过”的保护：演示目录包含 `c1/c2`，但真实库只启用 `c1` 时原逻辑会向不存在的 `c2` 插 `model_providers` 并触发 FK。
+- `dsh-cy-api` 个人页已回归：`installScope=user`、host `loaded=true`、3 个工具；页面“API 转 DSH / v2026.11.12 / 全局页面 / 已配置”完整渲染，`/gateway/dsh-cy-api/api/connection` 返回 200。此前页面 404 的根因是 `plugin-kernel.html` 的网关转发没有把 URL 里的 `as=<userId>` 带给 `/api/my/plugins/:id/gateway/*`，被后端判成“未安装”；已在 `mapPluginUrl` 中为 user scope 补 `as`。两个个人账号的存储目录分别落在各自 `dsh-home/scopes/users/...` 下。
+- `dsh-ding-card` 公司页已回归；primitives/importmap 接入后公司页与个人页均可用。
+- 管理后台与员工对话页的 401 已统一改为“直接跳登录页”：`app.js` 的 `parseResponse` 在 401 时 `location.replace('/admin' + location.search)`，`chat.js` 的 `api` 与 `streamChat` 在 401 时跳 `/chat?login=1`（保留 company、去掉失效 as），并通过永不结束的 Promise 阻止调用方继续渲染错误提示。实测控制台 Cookie 清空后点击导航会落到管理员登录门，员工页无效 `as` 会落到 `/chat?login=1`，均无“需要登录”提示。
+- 非 `api()` 路径也已接入同样的 401 跳转：控制台导出 `downloadConsoleFile`、对话页文件读取/下载、插件页 `RPC`/网关 `fetch`/`XHR`，以及 client bundle 的脚本预探测；插件 iframe 会把最外层页面带回 `/chat?login=1` 或 `/admin`。
+- 已新增 `pnpm test:auth-redirect`（`scripts/auth-redirect.e2e.mjs`）固化上述行为：覆盖控制台有效会话、导航 401、导出 401、员工 API 401、个人插件 iframe 401；默认连接 9335 的独立测试 Chrome，没有则自动启动 headless Chrome，控制台凭据读 `.eab-dev/admin-credentials.txt` 或 `EAB_ADMIN_USER/EAB_ADMIN_PASSWORD`。前置要求 `pnpm dev` 已运行。
+- 插件宿主已补 `sessionPersistence.stat/open`：`dsh-context` 的 projection backfill 通过 `open(id, 'read')` 读取 `chat_messages` 映射出的 DSH 事件，再写回 `sessionProjectionCache.coldSnapshot`。补上该服务后，`dsh-context v0.84.0` 页面不再卡在“投影补算中…”，9 个会话投影完成；耗时统计实测为活跃 19m59s、模型等待 25.8s（90 次）、模型生成 37.4s、工具执行 5.3s（62 次）。顶部 KPI 读取 `contextActivity.days` 的 `toolsMs/wallMs`，已在 `foldContextActivity` 为每日桶补上这两个字段，避免概览顶部继续显示 `—`。
 - 不是所有 DSH 插件都能“无条件全能力可用”：桌面专属（原生目录选择、打开本地应用、Office 转 PDF、subprocess、workspace、终端）仍不保证；host-only 插件可能只有能力注册、没有页面；深度写 DSH Agent/session 的插件只能只读兼容。
-- `plugin-kernel.html` 目前没有专门的鉴权入口校验，沿用现有员工/控制台 Cookie 和插件网关鉴权；正式发布前应加一条“直接打开插件页也要先过当前 scope 会话”的检查。
+- 插件宿主的依赖预装已改为“按插件目录并发、单插件预算内失败即降级”：`runNpmInstall` 支持 `AbortSignal`，默认单轮 60 秒、单插件 90 秒预算，可用 `EAB_PLUGIN_INSTALL_TIMEOUT_MS` / `EAB_PLUGIN_INSTALL_BUDGET_MS` 覆盖；`reloadPluginHosts` 先创建全部实例，再并发预装，最后串行启动 host。某个插件装不上时只在该实例上写 `依赖安装失败：...`，后面的插件继续启动。新增 `plugin-dependency-isolation.test.ts`，验证失败只返回错误 Map、不抛断批量预装。
+- `plugin-kernel.html` 已补入口校验：`scope=user` 必须带有效员工 Cookie，且 `as` 不能与当前登录身份不一致；未登录跳 `/chat?company=...&login=1`。控制台 scope 必须带有效 `eab_console_sid`，否则落到 `admin-gate.html`。查询里的 `company` 与当前实例不一致直接 403。有效员工本人页、错误 `as` 403、无会话跳登录、控制台无会话进登录门均已实测；`pnpm test:auth-redirect` 8 项仍全绿。
 

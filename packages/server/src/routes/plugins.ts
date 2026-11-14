@@ -16,7 +16,7 @@ import { hasConsoleSession, isConsoleRequest } from '../console-auth.js'
 import type { ServerDeps } from '../deps.js'
 import { ok, requireScope } from '../http.js'
 import { dispatchPluginRpc, dispatchPluginWeb, listPluginHostStatuses, pluginHostStatus, refreshPluginHosts } from '../plugin-host.js'
-import { pluginToolCatalogFor } from '../plugin-tools.js'
+import { invalidatePluginToolSpecsEverywhere, pluginToolCatalogFor } from '../plugin-tools.js'
 import { userScope } from '../plugin-scope.js'
 import {
   installPluginFromGithub,
@@ -54,6 +54,12 @@ const ASSET_TYPES: Record<string, string> = {
   '.txt': 'text/plain; charset=utf-8',
   '.md': 'text/plain; charset=utf-8',
 }
+
+/** 插件代码/图片/字体是静态资源；入口 HTML 不在此列，仍保持 no-store。 */
+const CACHEABLE_ASSET_EXTENSIONS = new Set([
+  '.js', '.mjs', '.css', '.json', '.svg', '.png', '.jpg', '.jpeg', '.gif', '.webp',
+  '.woff', '.woff2', '.ttf', '.otf',
+])
 
 /**
  * DSH 插件页需要当前的会话身份：dsh-context 等插件直接读取
@@ -260,6 +266,12 @@ export function registerPluginRoutes(app: FastifyInstance, deps: ServerDeps): vo
     )
     return ok({
       companyId: subject.companyId,
+      permissions: {
+        install: subject.scopes.has(SC.PLUGIN_INSTALL),
+        uninstall: subject.scopes.has(SC.PLUGIN_UNINSTALL),
+        configure: subject.scopes.has(SC.PLUGIN_CONFIGURE),
+        invokeTools: subject.scopes.has(SC.AGENT_TOOL_INVOKE),
+      },
       plugins: plugins.map((plugin) =>
         serializePersonalPlugin(plugin, toolsByPlugin.get(plugin.id) ?? [], hosts.get(plugin.id) ?? null),
       ),
@@ -268,7 +280,7 @@ export function registerPluginRoutes(app: FastifyInstance, deps: ServerDeps): vo
         enabled: plugins.filter((plugin) => plugin.enabled).length,
         tools: tools.length,
       },
-      hint: '这里只显示你本人安装的插件；公司级插件不会出现在个人工作台。插件工具在启用后自动注册给对话模型。',
+      hint: '这里只显示你本人安装的插件；公司级插件不会出现在个人工作台。个人插件的安装、启停、卸载分别受当前角色是否具备相应插件权限控制；插件工具还要同时满足 agent:tool:invoke 与工具角色白名单。',
     })
   })
 
@@ -381,7 +393,7 @@ export function registerPluginRoutes(app: FastifyInstance, deps: ServerDeps): vo
     }
   }>('/api/my/plugins/install', { bodyLimit: 256 * 1024 * 1024 }, async (req) => {
     const { subject } = resolveActor(deps.db, deps.config, req)
-    requireScope(subject, SC.PLUGIN_LIST)
+    requireScope(subject, SC.PLUGIN_INSTALL)
 
     const source = typeof req.body?.source === 'string' ? req.body.source : 'browser-dir'
     const overwrite = req.body?.overwrite === true
@@ -439,6 +451,7 @@ export function registerPluginRoutes(app: FastifyInstance, deps: ServerDeps): vo
     const plugin = plugins.find((item) => item.id === result.plugin.id)
     // 个人安装也可能让这个插件的 host 第一次启动；工具要立即可用
     await refreshPluginHosts(deps.db, dshOptions(deps))
+    await invalidatePluginToolSpecsEverywhere()
     return ok({
       plugin: plugin ? serializePlugin(plugin, false) : serializePlugin(result.plugin, false),
       replaced: result.replaced,
@@ -450,23 +463,25 @@ export function registerPluginRoutes(app: FastifyInstance, deps: ServerDeps): vo
     '/api/my/plugins/:id/state',
     async (req) => {
       const { subject } = resolveActor(deps.db, deps.config, req)
-      requireScope(subject, SC.PLUGIN_LIST)
+      requireScope(subject, SC.PLUGIN_CONFIGURE)
       const enabled = req.body?.enabled !== false
       setUserPluginEnabled(deps.db, subject.companyId, subject.userId, req.params.id, enabled)
       await refreshPluginHosts(deps.db, dshOptions(deps))
+      await invalidatePluginToolSpecsEverywhere()
       return ok({ id: req.params.id, enabled })
     },
   )
 
   app.post<{ Params: { id: string } }>('/api/my/plugins/:id/uninstall', async (req) => {
     const { subject } = resolveActor(deps.db, deps.config, req)
-    requireScope(subject, SC.PLUGIN_LIST)
+    requireScope(subject, SC.PLUGIN_UNINSTALL)
     const result = uninstallUserPlugin(deps.db, subject.companyId, subject.userId, req.params.id, {
       dbPath: deps.config.dbPath,
       dataDir: deps.config.dataDir,
       dshHomeDir: deps.config.dshHomeDir,
     })
     await refreshPluginHosts(deps.db, dshOptions(deps))
+    await invalidatePluginToolSpecsEverywhere()
     return ok(result)
   })
 
@@ -484,6 +499,7 @@ export function registerPluginRoutes(app: FastifyInstance, deps: ServerDeps): vo
       const enabled = req.body?.enabled !== false
       setPluginEnabled(deps.db, subject.companyId, plugin.id, enabled, subject.userId)
       await refreshPluginHosts(deps.db, dshOptions(deps))
+      await invalidatePluginToolSpecsEverywhere()
       return ok({ id: plugin.id, enabled })
     },
   )
@@ -533,7 +549,7 @@ export function registerPluginRoutes(app: FastifyInstance, deps: ServerDeps): vo
           { id: 'github', label: 'GitHub', hint: '按仓库 + 分支/标签下载 codeload tarball' },
         ],
         registries: PLUGIN_REGISTRIES,
-        note: '安装登记按公司隔离：哪家公司安装、启停、卸载都各自记账；插件代码目录在服务器上共享，最后一家公司卸载时才移入 plugins/.trash。支持两种清单：EAB 原生 plugin.json，以及 DSH 插件（package.json 的 dsh 段：bundle.patch / client.inject / compatibility）。DSH 包会按 files 白名单复制，避开 test / .tmp / tgz 残留；host 入口（main）由 EAB 的 DSH 兼容宿主执行，client 入口（exports["./client"]）由控制台的 DSH 运行时渲染。npm 与 GitHub 只取包内容，不执行 npm install、生命周期脚本或仓库脚本。',
+        note: '安装登记按公司隔离：哪家公司安装、启停、卸载都各自记账；插件代码目录在服务器上共享，最后一个归属人卸载时直接删除，不保留回收站。支持两种清单：EAB 原生 plugin.json，以及 DSH 插件（package.json 的 dsh 段：bundle.patch / client.inject / compatibility）。DSH 包会按 files 白名单复制，避开 test / .tmp / tgz 残留；host 入口（main）由 EAB 的 DSH 兼容宿主执行，client 入口（exports["./client"]）由控制台的 DSH 运行时渲染。npm 与 GitHub 只取包内容，不执行 npm install、生命周期脚本或仓库脚本。',
       },
     })
   })
@@ -613,11 +629,11 @@ export function registerPluginRoutes(app: FastifyInstance, deps: ServerDeps): vo
     }
     // DSH 插件的 host 侧要跟着安装结果重新加载，插件页立刻能打开自己的 RPC 通道
     await refreshPluginHosts(deps.db, dshOptions(deps))
+    await invalidatePluginToolSpecsEverywhere()
     return ok({
       plugin: serializePlugin(result.plugin, false),
       replaced: result.replaced,
       sourcePath: result.sourcePath,
-      trashPath: result.trashPath,
     })
   })
 
@@ -626,6 +642,7 @@ export function registerPluginRoutes(app: FastifyInstance, deps: ServerDeps): vo
     const { subject } = resolveActor(deps.db, deps.config, req)
     const result = uninstallPluginPackage(deps.db, req.params.id, subject.userId, subject.companyId)
     await refreshPluginHosts(deps.db, dshOptions(deps))
+    await invalidatePluginToolSpecsEverywhere()
     return ok(result)
   })
 
@@ -766,7 +783,14 @@ export function registerPluginRoutes(app: FastifyInstance, deps: ServerDeps): vo
       if (!asset) throw new EabError(EC.NOT_FOUND, '插件资源不存在或插件未启用')
 
       const type = ASSET_TYPES[extname(asset)] ?? 'application/octet-stream'
-      reply.type(type).header('cache-control', 'no-store')
+      // 插件 client bundle / 图片 / 字体是静态代码，不是页面入口；每次都 no-store
+      // 会让每个插件页重复下载同一份 client.js。插件入口 HTML 仍保持 no-store，
+      // 代码资源按插件版本 + 校验和 URL（plugin-kernel 里带 v= / h=）失效，缓存 1 小时。
+      const assetExt = extname(asset).toLowerCase()
+      reply.type(type).header(
+        'cache-control',
+        CACHEABLE_ASSET_EXTENSIONS.has(assetExt) ? 'private, max-age=3600, must-revalidate' : 'no-store',
+      )
       return reply.send(readFileSync(asset))
     },
   )

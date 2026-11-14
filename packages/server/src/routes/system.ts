@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify'
 import { EC, EabError, resolveVisibleCollections, SC, scopeAllows } from '@eab/domain'
 import { loadKbCollectionAcls, sqliteBusyStats } from '@eab/storage'
 import type { ServerDeps } from '../deps.js'
+import { coordinationBackendStatus } from '../backends/coordination.js'
 import { ensureDingTalkUserAvatar } from '../dingtalk-avatar.js'
 import {
   companyAssistantView,
@@ -9,9 +10,12 @@ import {
   resolveAssistantDataDir,
 } from '../company-assistant.js'
 import { isConsoleRequest, hasConsoleSession } from '../console-auth.js'
-import { pluginToolSemaphore } from '../plugin-tools.js'
-import { toolConcurrencyStats } from './tools.js'
+import { pluginToolSemaphore, sharedPluginCapacityStats } from '../plugin-tools.js'
+import { sharedToolCapacityStats, toolConcurrencyStats } from './tools.js'
 import { activeAgentRunCount, cancelAgentRunTree, listAgentRuns } from '../agent-runtime.js'
+import { toolDurationStats } from '../tool-metrics.js'
+import { toolInflightCount, toolInflightSnapshot } from '../tool-inflight.js'
+import { requestCancelAgentRun } from '../realtime-control.js'
 import { capabilityList, ok, readVersion } from '../http.js'
 import { actorFor, listPersonas, resolveActor, roleCodesOf } from '../session.js'
 
@@ -48,8 +52,29 @@ export function registerSystemRoutes(app: FastifyInstance, deps: ServerDeps): vo
       allowRemoteConsole: deps.config.allowRemoteConsole,
       companyId: deps.companyId,
       singleCompany: true,
+      backends: deps.backends?.statuses().map((item) => ({ id: item.id, state: item.state })) ?? [],
     }),
   )
+
+  /**
+   * 控制台「系统 > 数据与运维」用：只回能力与健康状态，不回连接串/账号密码。
+   * 未接入 PostgreSQL/Redis 时也会返回 disabled/ready 的内置实现，方便部署时确认组合。
+   */
+  app.get('/api/console/backends', async (req) => {
+    if (!isConsoleRequest(req, deps.config)) {
+      throw new EabError(EC.FORBIDDEN, '需要控制台登录后再查看后端状态')
+    }
+    return ok({
+      backends: [...(deps.backends?.statuses() ?? []), coordinationBackendStatus()],
+      config: {
+        cache: deps.config.cacheBackend,
+        postgres: deps.config.postgresBackend,
+        auditRead: deps.config.auditRead,
+        chatRead: deps.config.chatRead,
+        strict: deps.config.backendsStrict,
+      },
+    })
+  })
 
   app.get('/healthz', async () => ok({ status: 'ok', version: readVersion() }))
 
@@ -158,6 +183,9 @@ export function registerSystemRoutes(app: FastifyInstance, deps: ServerDeps): vo
     const chat = deps.chatCapacity?.stats()
     const tools = toolConcurrencyStats()
     const plugins = pluginToolSemaphore.stats()
+    // 共享名额（Redis）在线时，并发数回读全局值；否则仍显示本实例统计。
+    const sharedTools = await sharedToolCapacityStats()
+    const sharedPlugins = await sharedPluginCapacityStats()
     return ok({
       updatedAt: new Date().toISOString(),
       chat: {
@@ -178,6 +206,9 @@ export function registerSystemRoutes(app: FastifyInstance, deps: ServerDeps): vo
       },
       tools: {
         ...tools,
+        active: sharedTools ? sharedTools.total : tools.active,
+        keys: sharedTools ? sharedTools.keys : tools.keys,
+        shared: sharedTools !== null,
         limits: {
           maxConcurrent: deps.config.toolMaxConcurrent ?? 8,
           queueLimit: deps.config.toolQueueLimit ?? 200,
@@ -186,13 +217,33 @@ export function registerSystemRoutes(app: FastifyInstance, deps: ServerDeps): vo
       },
       plugins: {
         ...plugins,
+        active: sharedPlugins ? sharedPlugins.total : plugins.active,
+        keys: sharedPlugins ? sharedPlugins.keys : plugins.keys,
+        shared: sharedPlugins !== null,
         limits: {
           maxConcurrent: deps.config.pluginToolMaxConcurrent ?? 4,
           timeoutMs: deps.config.pluginToolTimeoutMs ?? 60_000,
         },
       },
       sqlite: { busyTotal: sqliteBusyStats().count },
+      inflight: toolInflightSnapshot(10),
+      inflightTotal: toolInflightCount(),
     })
+  })
+
+  app.get('/api/console/tool-metrics', async (req) => {
+    if (!isConsoleRequest(req, deps.config)) {
+      throw new EabError(EC.FORBIDDEN, '需要控制台登录后再查看工具耗时')
+    }
+    const query = req.query as { days?: string; limit?: string } | undefined
+    const days = Number(query?.days ?? 7)
+    const limit = Number(query?.limit ?? 10)
+    return ok(
+      toolDurationStats(deps.db, {
+        days: Number.isFinite(days) ? days : 7,
+        limit: Number.isFinite(limit) ? limit : 10,
+      }),
+    )
   })
 
   app.get('/api/console/agent-runs', async (req) => {
@@ -216,8 +267,11 @@ export function registerSystemRoutes(app: FastifyInstance, deps: ServerDeps): vo
     }
     const id = (req.params as { id?: string } | undefined)?.id ?? ''
     if (!id) throw new EabError(EC.VALIDATION, '缺少运行 id')
-    const cancelled = cancelAgentRunTree(deps.db, id, '控制台取消了任务')
-    return ok({ cancelled, count: cancelled.length })
+    const reason = '控制台取消了任务'
+    const cancelled = cancelAgentRunTree(deps.db, id, reason)
+    // 本进程没有这棵树（跑在另一台实例上）时，广播出去让持有它的实例真正 abort。
+    const forwarded = cancelled.length === 0 ? requestCancelAgentRun(id, reason) : false
+    return ok({ cancelled, count: cancelled.length, forwarded })
   })
 
   app.get('/api/me', async (req) => {

@@ -417,6 +417,10 @@ export function ensureModelCatalog(db: Db): boolean {
     { id: C2, name: C2_NAME },
   ]
   for (const company of companies) {
+    // 演示目录里包含第二家公司，但真实库可能只启用了一家公司；
+    // 外键要求 provider 所属公司必须存在，缺失时不要硬插。
+    const companyExists = db.prepare('SELECT 1 FROM companies WHERE id = ?').get(company.id)
+    if (!companyExists) continue
     const existing = db.prepare('SELECT COUNT(*) AS n FROM models WHERE company_id = ?').get(company.id) as { n: number }
     if (Number(existing.n) > 0) continue
     const providerId = `prov_${company.id}_demo`

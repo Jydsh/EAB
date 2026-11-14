@@ -4,8 +4,8 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>EAB 工作台</title>
-    <link rel="stylesheet" href="/app.css?v=20261112e" />
-    <link rel="stylesheet" href="/chat.css?v=20261112e" />
+    <link rel="stylesheet" href="/app.css?v=20261113u" />
+    <link rel="stylesheet" href="/chat.css?v=20261113v" />
   </head>
   <body class="chat-body">
     <!-- 左侧：账号与可用模型。桌面网页对话产品的常规布局，右侧只放对话。 -->
@@ -34,6 +34,20 @@
         </div>
         <div class="side-sessions" id="session-list"></div>
       </div>
+
+      <div
+        class="side-split-resizer"
+        id="side-split-resizer"
+        role="separator"
+        aria-orientation="horizontal"
+        aria-label="调整对话和云空间高度"
+        aria-valuemin="20"
+        aria-valuemax="80"
+        aria-valuenow="50"
+        title="拖动调整对话和云空间高度"
+        tabindex="0"
+        hidden
+      ></div>
 
       <div class="side-section" id="side-files" hidden>
         <div class="side-section-title side-section-title-row">
@@ -66,9 +80,18 @@
 
     <div class="chat-stage" id="chat-stage">
       <header class="chat-head">
-        <div class="chat-mode-switch" id="mode-switch" role="tablist" aria-label="页面切换">
-          <button class="chat-mode-btn is-active" type="button" data-mode="chat" role="tab" aria-selected="true">对话</button>
-          <button class="chat-mode-btn" type="button" data-mode="workspace" role="tab" aria-selected="false">工作台</button>
+        <div class="chat-head-left">
+          <button class="chat-side-toggle" id="side-toggle" type="button" aria-expanded="true" aria-label="收起侧边栏" title="收起侧边栏">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <rect x="3" y="4" width="18" height="16" rx="3" />
+              <path d="M8.2 4v16" />
+              <path class="side-toggle-arrow" d="M13.2 9.2l-2.8 2.8 2.8 2.8" />
+            </svg>
+          </button>
+          <div class="chat-mode-switch" id="mode-switch" role="tablist" aria-label="页面切换">
+            <button class="chat-mode-btn is-active" type="button" data-mode="chat" role="tab" aria-selected="true">对话</button>
+            <button class="chat-mode-btn" type="button" data-mode="workspace" role="tab" aria-selected="false">工作台</button>
+          </div>
         </div>
         <div class="chat-head-title" id="chat-title">新对话</div>
         <div class="chat-head-right">
@@ -76,6 +99,8 @@
           <button class="btn ghost sm" id="login-btn" type="button" hidden>登录</button>
         </div>
       </header>
+
+      <section class="file-dock" id="file-dock" aria-label="Agent 文件操作" hidden></section>
 
       <main class="chat-main">
         <section class="chat-thread" id="thread">
@@ -87,7 +112,39 @@
           </div>
         </section>
 
-        <section class="file-pane" id="file-pane" hidden>
+        <div class="file-split-resizer" id="file-split-resizer" role="separator" aria-orientation="vertical" aria-label="拖动调整对话与右侧栏的宽度" tabindex="0" hidden></div>
+
+        <div class="workbench-rail" id="workbench-rail" hidden>
+          <div class="workbench-tabs" id="workbench-tabs" role="tablist" aria-label="右侧工作台">
+            <button class="workbench-tab is-active" type="button" role="tab" data-workbench-tab="team" aria-selected="true">
+              Agent 团队 <span class="workbench-tab-count" id="workbench-team-count" hidden>0</span>
+            </button>
+            <button class="workbench-tab" type="button" role="tab" data-workbench-tab="file" aria-selected="false">文件预览</button>
+            <button class="workbench-tab workbench-split-btn" type="button" id="workbench-split" title="团队与文件并排显示" aria-pressed="false">并排</button>
+          </div>
+
+          <div class="workbench-body" id="workbench-body">
+            <section class="team-pane" id="team-pane" hidden aria-label="Agent 团队">
+              <div class="team-head">
+                <div class="team-head-main">
+                  <span class="team-kicker">AGENT TEAM</span>
+                  <strong id="team-manager-name">父 Agent · 当前对话</strong>
+                  <p class="team-sub" id="team-manager-sub">父 Agent 在右侧派发和回复，子 Agent 在左侧汇报；需要你拍板时由父 Agent 来问，再把结论回给子 Agent。</p>
+                </div>
+                <span class="team-summary" id="team-summary">等待派发</span>
+              </div>
+              <div class="team-split" id="team-split">
+                <div class="team-list" id="team-list" role="list" aria-label="子 Agent 列表"></div>
+                <div class="team-list-resizer" id="team-list-resizer" role="separator" aria-orientation="vertical" aria-label="拖动调整子 Agent 列表与预览宽度" title="拖动调整列表与预览宽度" tabindex="0"></div>
+                <div class="team-detail" id="team-detail" role="region" aria-label="选中子 Agent 的工作详情" aria-live="polite"></div>
+              </div>
+              <div class="team-empty" id="team-empty">
+                <span class="team-empty-title">还没有子 Agent</span>
+                <p>当任务可以拆开并行做（同时查几份资料、分别改几个文件、多模型各出一版），父 Agent 会在这里注册子 Agent，每个子 Agent 有一个独立的对话窗口。</p>
+              </div>
+            </section>
+
+          <section class="file-pane" id="file-pane" hidden>
           <div class="file-pane-head">
             <div class="file-pane-head-main">
               <span class="file-pane-kicker" id="file-pane-kicker">云空间</span>
@@ -96,6 +153,10 @@
             </div>
             <div class="file-pane-actions">
               <button class="btn ghost sm" id="file-pane-download" type="button">下载</button>
+              <button class="btn ghost sm file-pane-fullscreen" id="file-pane-fullscreen" type="button" title="全屏预览" aria-label="全屏预览" aria-pressed="false">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M21 16v5h-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+                <span id="file-pane-fullscreen-label">全屏</span>
+              </button>
               <button class="btn ghost sm" id="file-pane-send-dingtalk" type="button">发送到钉钉</button>
               <button class="btn ghost sm" id="file-pane-rename" type="button" hidden>重命名</button>
               <button class="btn ghost sm" id="file-pane-edit" type="button" hidden>编辑</button>
@@ -103,7 +164,12 @@
               <button class="icon-btn file-pane-x" id="file-pane-close" type="button" title="关闭文件" aria-label="关闭文件">×</button>
             </div>
           </div>
+          <div class="file-pane-sync-notice" id="file-pane-sync-notice" hidden>
+            <span id="file-pane-sync-text"></span>
+            <button class="btn ghost sm" id="file-pane-refresh" type="button">刷新到云端版本</button>
+          </div>
           <div class="file-pane-body" id="file-pane-body"></div>
+          <button class="file-selection-action" id="file-selection-action" type="button" hidden>引用选中内容并修改</button>
           <div class="file-pane-editor" id="file-pane-editor" hidden>
             <textarea id="file-pane-text" spellcheck="false" aria-label="编辑文件内容"></textarea>
             <div class="file-pane-editor-actions">
@@ -113,14 +179,22 @@
             </div>
           </div>
         </section>
+          </div>
+        </div>
 
         <section class="workspace-pane" id="workspace-pane" hidden>
           <div class="workspace-head">
-            <div>
-              <span class="workspace-eyebrow">PERSONAL PLUGIN WORKSPACE</span>
-              <h2>我的工作台</h2>
+            <div class="workspace-head-main">
+              <div>
+                <span class="workspace-eyebrow" id="workspace-eyebrow">PERSONAL PLUGIN WORKSPACE</span>
+                <h2 id="workspace-title">我的工作台</h2>
+              </div>
+              <div class="chat-mode-switch" id="workspace-kind-switch" role="tablist" aria-label="工作台类型">
+                <button class="chat-mode-btn is-active" type="button" data-workspace-kind="plugins" role="tab" aria-selected="true">插件</button>
+                <button class="chat-mode-btn" type="button" data-workspace-kind="skills" role="tab" aria-selected="false">技能</button>
+              </div>
             </div>
-            <span class="workspace-scope-badge hint-badge" data-tip="只显示你自己安装的插件。启停、卸载、查看详情和打开插件页面都只影响你本人，不会碰公司和别人的安装。" tabindex="0" aria-label="个人工作台插件范围说明">仅本人可见</span>
+            <span class="workspace-scope-badge hint-badge" id="workspace-scope-badge" data-tip="只显示你自己安装的插件。启停、卸载、查看详情和打开插件页面都只影响你本人，不会碰公司和别人的安装。" tabindex="0" aria-label="个人工作台插件范围说明">仅本人可见</span>
           </div>
           <div class="workspace-shell">
             <aside class="ws-plugin-rail" id="my-plugin-rail" aria-label="个人插件列表">
@@ -137,11 +211,15 @@
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </button>
           <div class="attach-strip" id="attach-strip" hidden></div>
-          <div class="clarify-dock" id="clarify-dock" hidden></div>
           <div class="queue-bar" id="queue-bar" hidden>
             <span class="queue-dot" aria-hidden="true"></span>
             <span id="queue-text">正在回复，你的新消息会按顺序排队</span>
             <button class="queue-stop" id="queue-stop" type="button">停止当前回复</button>
+          </div>
+          <div class="message-edit-bar" id="message-edit-bar" hidden>
+            <span class="message-edit-dot" aria-hidden="true"></span>
+            <span id="message-edit-text">正在编辑这条消息，发送后将替换原消息</span>
+            <button class="message-edit-cancel" id="message-edit-cancel" type="button">取消</button>
           </div>
           <div class="composer-box" id="composer-box">
             <textarea
@@ -157,8 +235,8 @@
                 <button class="icon-btn" id="pick-file" type="button" title="上传文件" aria-label="上传文件">
                   <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-5-5Z" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M14 3v5h5" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>
                 </button>
-                <button class="icon-btn stop-reply" id="stop-reply" type="button" title="停止当前回复" aria-label="停止当前回复" hidden>
-                  <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="8" height="8" rx="1.4" fill="currentColor"/></svg>
+                <button class="icon-btn queue-send" id="queue-send" type="button" title="发送并排队" aria-label="发送并排队" hidden>
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 11.5 20 4l-7.4 16-2.1-6.3-6.5-2.2Z" fill="none" stroke="currentColor" stroke-width="1.7"/></svg>
                 </button>
                 <button class="space-chip" id="space-chip" type="button" aria-haspopup="listbox" aria-expanded="false">
                   <span class="space-dot"></span>
@@ -186,7 +264,6 @@
               </button>
             </div>
           </div>
-          <div class="composer-foot muted" id="composer-foot">回答由所选模型生成；输入 /model 可按对话切换模型；模型开放思考选项时，可用「思考」气泡切换档位；支持 Ctrl+V 粘贴截图/图片，附件随消息提交，不会公网分享</div>
         </footer>
       </main>
 
@@ -263,6 +340,7 @@
     <input type="file" id="file-any" multiple hidden />
     <div class="session-menu" id="session-menu" hidden></div>
     <div class="session-menu" id="file-menu" hidden></div>
+    <div class="session-menu" id="message-menu" hidden></div>
 
     <!-- 未登录：只显示登录，不展示任何组织/成员信息 -->
     <div class="login-gate" id="login-gate" hidden>
@@ -351,6 +429,6 @@
         if (gate) gate.hidden = false
       }
     </script>
-    <script src="/chat.js?v=20261112e"></script>
+    <script src="/chat.js?v=20261113y"></script>
   </body>
 </html>

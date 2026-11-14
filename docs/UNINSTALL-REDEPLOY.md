@@ -66,10 +66,10 @@ npm install -g pnpm@12
 
 ### 3.2 解压源码包
 
-从 [Releases](https://github.com/Jydsh/EAB/releases) 下载当前版本的源码包，例如 `EAB-2026.11.11.zip`，解压到一个固定目录：
+从 [Releases](https://github.com/Jydsh/EAB/releases) 下载当前版本的源码包，例如 `EAB-2026.11.14.zip`，解压到一个固定目录：
 
 ```powershell
-Expand-Archive -LiteralPath 'D:\EAB-2026.11.11.zip' -DestinationPath 'D:\EAB' -Force
+Expand-Archive -LiteralPath 'D:\EAB-2026.11.14.zip' -DestinationPath 'D:\EAB' -Force
 Set-Location 'D:\EAB'
 pnpm install
 ```

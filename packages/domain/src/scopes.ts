@@ -27,6 +27,14 @@ export const SC = {
   PLUGIN_CONFIGURE: 'plugin:configure',
   PLUGIN_APPROVE: 'plugin:approve',
 
+  // 技能：与插件同级，但技能只加载说明与声明式工具，不执行任意脚本
+  SKILL_LIST: 'skill:list',
+  SKILL_USE: 'skill:use',
+  SKILL_INSTALL: 'skill:install',
+  SKILL_CONFIGURE: 'skill:configure',
+  SKILL_UNINSTALL: 'skill:uninstall',
+  SKILL_APPROVE: 'skill:approve',
+
   // 知识库
   KB_READ: 'kb:read',
   KB_WRITE: 'kb:write',
@@ -119,6 +127,18 @@ export const SCOPE_REGISTRY: Record<Scope, ScopeMeta> = {
   [SC.PLUGIN_UNINSTALL]: { group: '插件', label: '卸载插件', dangerous: true },
   [SC.PLUGIN_CONFIGURE]: { group: '插件', label: '配置插件' },
   [SC.PLUGIN_APPROVE]: { group: '插件', label: '审批插件', implies: [SC.PLUGIN_LIST], dangerous: true },
+
+  [SC.SKILL_LIST]: { group: '技能', label: '查看技能' },
+  [SC.SKILL_USE]: { group: '技能', label: '使用技能', implies: [SC.SKILL_LIST] },
+  [SC.SKILL_INSTALL]: { group: '技能', label: '安装技能', dangerous: true },
+  [SC.SKILL_UNINSTALL]: { group: '技能', label: '卸载技能', dangerous: true },
+  [SC.SKILL_CONFIGURE]: { group: '技能', label: '启停技能' },
+  [SC.SKILL_APPROVE]: {
+    group: '技能',
+    label: '审批技能',
+    implies: [SC.SKILL_LIST, SC.SKILL_CONFIGURE],
+    dangerous: true,
+  },
 
   [SC.KB_READ]: { group: '知识库', label: '检索知识库' },
   [SC.KB_WRITE]: { group: '知识库', label: '入库文档', implies: [SC.KB_READ] },

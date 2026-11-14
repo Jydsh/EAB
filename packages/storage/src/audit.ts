@@ -36,6 +36,36 @@ export interface AuditRecord {
   readonly hash: string
 }
 
+/**
+ * 可选审计镜像（例如 PostgreSQL 旁路）。
+ * 主路径仍写 SQLite；镜像只入队，失败不能反向影响主审计。
+ */
+export interface AuditMirrorRecord extends AuditRecord {
+  readonly companyId: string
+  readonly actorUserId: string | null
+  readonly action: string
+  readonly resourceType: string | null
+  readonly resourceId: string | null
+  readonly resourceScope: string | null
+  readonly result: string
+  readonly detailJson: string | null
+  readonly traceId: string | null
+  readonly ip: string | null
+  readonly channel: string | null
+  readonly prevHash: string
+  readonly createdAt: number
+}
+
+export interface AuditMirror {
+  append(record: AuditMirrorRecord): void
+}
+
+let auditMirror: AuditMirror | null = null
+
+export function setAuditMirror(mirror: AuditMirror | null): void {
+  auditMirror = mirror
+}
+
 interface AuditRow {
   id: string
   seq: number
@@ -186,6 +216,29 @@ export function appendAudit(db: Db, entry: AuditEntry, now: number = Date.now())
     hash,
     payload.createdAt,
   )
+
+  try {
+    auditMirror?.append({
+      id,
+      seq,
+      companyId: payload.companyId,
+      actorUserId: payload.actorUserId,
+      action: payload.action,
+      resourceType: payload.resourceType,
+      resourceId: payload.resourceId,
+      resourceScope: payload.resourceScope,
+      result: payload.result,
+      detailJson: payload.detailJson,
+      traceId: payload.traceId,
+      ip: payload.ip,
+      channel: payload.channel,
+      prevHash,
+      hash,
+      createdAt: payload.createdAt,
+    })
+  } catch {
+    // 镜像失败不能影响已提交的 SQLite 审计主路径。
+  }
 
   return { id, seq, hash }
 }

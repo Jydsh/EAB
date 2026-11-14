@@ -25,7 +25,7 @@ EAB 已经具备 DSH 的**基座骨架**：多租户、角色/scope、对话、�
 2. **Agent teams / subagents**（父 Agent 派生子 Agent，结果可追溯）；
 3. **无人值守的审批 fail-closed**（定时/后台任务遇到高危动作不能默认放行）；
 4. **沙箱（sandboxes）**（工具执行边界，当前工具是白名单但不是隔离沙箱）；
-5. **调度器的生产化增强**（本轮已补基础版，但缺任务中心 UI、cron、配额、只重投递的补偿）。
+5. **调度器的生产化增强**（本轮已补基础版，任务中心已于 2026-11-13 落地；仍缺 cron、配额、只重投递的补偿）。
 
 其中 1 是**最高优先级**：没有事件日志，fork/resume/replay、Agent teams、审批追踪都只能靠散落的表，后续每加一个能力都要再补一次。
 
@@ -37,7 +37,7 @@ EAB 已经具备 DSH 的**基座骨架**：多租户、角色/scope、对话、�
 | Agent teams / Subagents | 官方插件家族有 Agent teams、Subagents；父 Agent 派生、并行、汇总 | 单 Agent 循环；`runAgentTurn` 只能顺序调工具；无子 Agent 生命周期、无父子 trace | **大**：复杂任务只能靠一次对话硬扛 | **P0** |
 | 无人值守审批 | Auto approval review；后台任务 fail-closed | 有 `approvals` 表 + 高危工具审批（HTTP 入口），但 Agent 工具只暴露 `!dangerous`；定时任务没有审批门 | 中：后台任务一旦放开高危工具，缺 fail-closed | **P0（与调度联动）** |
 | 沙箱 / 执行隔离 | Sandboxes 是 DSH 能力面的一层；工具/终端在隔离环境跑 | 工具是代码白名单；本地空间直接读写用户目录；没有进程/文件/网络隔离 | 大：当前定位是单公司本地部署，风险可控但边界弱 | **P1** |
-| 调度 / 定时任务 | 官方 `dsh-schedule`：`after_seconds` / `at` / `every_seconds(>=300)`，session-scoped；社区插件补 cron、有效期、并发上限、IM 通知 | **本轮已重构**：事件日志 + 投影、canonical 选择器、delete 语义、错误码闭集、latest-only、钉钉/网页回推 | 还缺：任务中心 UI、批量合并 framing、unattended 审批、投递补偿、有效期、多实例抢占 | **P1（底座已就绪）** |
+| 调度 / 定时任务 | 官方 `dsh-schedule`：`after_seconds` / `at` / `every_seconds(>=300)`，session-scoped；社区插件补 cron、有效期、并发上限、IM 通知 | **本轮已重构**：事件日志 + 投影、canonical 选择器、delete 语义、错误码闭集、latest-only、钉钉/网页回推、控制台任务中心 | 还缺：批量合并 framing、unattended 审批、投递补偿、有效期、多实例抢占 | **P1（底座已就绪）** |
 | 插件 / Skill 统一热插拔 | models、tools、skills、sessions、sandboxes、storage、loops、scheduling、UI 皆插件；插件可热加载 | 有 DSH 插件宿主（host + client bundle + iframe + RPC），但内置功能不是插件；Skill 是文件目录约定，不是统一运行时 | 中：生态兼容有，但「一切皆插件」的运行时没有 | **P1** |
 | 运行模式 | Standard / Code(PTC) / Minimal / Creator | 只有标准对话；无代码执行模式、无最小模式、无创作模式 | 中：影响特定任务形态，不影响基座 | **P2** |
 | 终端 / Terminal | 官方插件家族有 Terminal；命令执行作为工具 | 无终端工具；本地空间只能读写文件，不能执行命令 | 中：与本地空间安全边界一起设计 | **P2** |
@@ -52,7 +52,7 @@ EAB 已经具备 DSH 的**基座骨架**：多租户、角色/scope、对话、�
 1. **统一 session_events + Trajectory**：当前只有 `schedule_events` 一个域试点，消息/工具/审批/子 Agent 还没进同一事件流；没有 fork/replay/search-by-event。
 2. **Subagents / Agent teams**：无子 Agent 生命周期、父子 trace、超时取消、scope 收敛；复杂任务只能单 Agent 顺序跑。
 3. **无人值守审批 fail-closed**：后台/定时任务遇到 `dangerous` 工具没有 `approval_required` 终态。
-4. **任务中心 UI**：没有列表/时间线/最近结果页面，用户只能对话或直接打 HTTP。
+4. ~~**任务中心 UI**：没有列表/时间线/最近结果页面，用户只能对话或直接打 HTTP。~~ 已完成（2026-11-13）：控制台“运营与审计 > 任务中心”，公司级列表/详情/事件时间线/暂停恢复取消，直接读 `schedule_events`。
 5. **调度批量合并**：同一 tick 的多条到期提醒仍是各自一轮；DSH 的 batch framing 未做。
 6. **投递补偿**：模型成功、钉钉失败时没有“只重投递”的补偿；重试会重跑模型。
 7. **有效期与多实例抢占**：无 `expiresAt`；`running` 抢占是进程内锁，不是 DB 条件更新，多实例会打架。
@@ -117,7 +117,7 @@ EAB 已有 `approvals` 表和高危工具的 HTTP 审批门（`POST /api/tools/:
 | 错误 | 10 项闭集 | 各自定义 | 同一套 `ScheduleErrorCode` |
 | 结果 | followup 新 turn | 执行结论 + 通知失败标注 | 带 `【定时提醒】` 信封的新 turn + 结果落库 + 钉钉投递事件 |
 
-结论：**事件日志与语义已对齐，生产化还差任务中心、批量合并、unattended 审批、投递补偿、多实例抢占**。
+结论：**事件日志与语义已对齐，任务中心已落地；生产化还差批量合并、unattended 审批、投递补偿、多实例抢占**。
 
 ## 建议路线图
 
@@ -126,11 +126,11 @@ EAB 已有 `approvals` 表和高危工具的 HTTP 审批门（`POST /api/tools/:
 1. **`session_events` 事件流 + 双写**：把 `schedule_events` 的写法推广到消息/工具开始/工具结束/定时/审批；`chat_messages` 继续做读模型。没有它，Trajectory / fork / replay 都做不实。
 2. **`subagent.run` 单层子 Agent 工具 + 父子 trace**：同步、带超时、scope 白名单；先不做并行团队。
 3. **定时任务 `unattended` 审批 fail-closed**：遇到 `dangerous` 工具直接失败并写 `approval_required`。
-4. **任务中心页面**：列表/暂停/恢复/删除/最近结果/事件时间线；数据直接读 `schedule_events`，不再拼日志。
+4. ~~**任务中心页面**：列表/暂停/恢复/删除/最近结果/事件时间线；数据直接读 `schedule_events`，不再拼日志。~~ 已完成（2026-11-13）。
 
 ### P1（生产化）
 
-5. 调度器收尾：同 tick 批量合并、只重投递补偿、`expiresAt`、多实例条件抢占、任务中心时间线；
+5. 调度器收尾：同 tick 批量合并、只重投递补偿、`expiresAt`、多实例条件抢占（任务中心时间线已落地）；
 6. 沙箱边界：终端/代码执行前先做隔离，至少做到只读挂载 + 超时 + 输出上限；
 7. 一次任务完整轨迹视图（直接读 `session_events`，不再拼日志）；
 8. 插件运行时统一：内置能力逐步插件化，Skill 纳入统一清单。

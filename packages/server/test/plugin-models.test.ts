@@ -55,7 +55,13 @@ describe('插件 LLM adapter 注册表', () => {
       COMPANY,
       'plugin:demo-route:demo%2Fmodel',
       [{ role: 'user', content: '嗨' }],
-      { onEvent: (event) => events.push(`${event.type}:${event.text}`) },
+      {
+        onEvent: (event) => {
+          if (event.type === 'reasoning' || event.type === 'content') {
+            events.push(`${event.type}:${event.text}`)
+          }
+        },
+      },
     )
     expect(result?.text).toBe('你好')
     expect(result?.promptTokens).toBe(3)

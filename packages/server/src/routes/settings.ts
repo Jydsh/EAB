@@ -259,6 +259,7 @@ export function registerSettingsRoutes(app: FastifyInstance, deps: ServerDeps): 
       storage: storageView(deps, settings),
       retentionDays: settings.logRetentionDays,
       auditRetentionDays: settings.auditRetentionDays,
+      agentRetentionDays: settings.agentRetentionDays,
       lastCleanupAt: settings.lastCleanupAt,
       lastCleanupStats: settings.lastCleanupStats,
       network: {
@@ -282,41 +283,60 @@ export function registerSettingsRoutes(app: FastifyInstance, deps: ServerDeps): 
         pluginEvents: count(deps.db, 'SELECT COUNT(*) AS n FROM plugin_events'),
         onboardAttempts: count(deps.db, 'SELECT COUNT(*) AS n FROM dingtalk_onboard_attempts'),
         auditLogs: count(deps.db, 'SELECT COUNT(*) AS n FROM audit_logs'),
+        agentRuns: count(deps.db, 'SELECT COUNT(*) AS n FROM agent_runs'),
+        agentSteps: count(deps.db, 'SELECT COUNT(*) AS n FROM agent_steps'),
       },
     })
   })
 
-  app.put<{ Body: { days?: number; auditDays?: number } }>('/api/console/settings/retention', async (req) => {
-    requireConsole(req, deps)
-    const current = readConsoleSettings()
-    const days = req.body?.days === undefined ? current.logRetentionDays : Number(req.body?.days)
-    const auditDays =
-      req.body?.auditDays === undefined ? current.auditRetentionDays : Number(req.body?.auditDays)
-    for (const [label, value] of [
-      ['日志保留天数', days],
-      ['审计保留天数', auditDays],
-    ] as const) {
-      if (!Number.isInteger(value) || value < 0 || (value > 0 && value < 7) || value > 3650) {
-        throw new EabError(EC.VALIDATION, `${label}只能是 0（永久保留）或 7–3650 天`)
+  app.put<{ Body: { days?: number; auditDays?: number; agentDays?: number } }>(
+    '/api/console/settings/retention',
+    async (req) => {
+      requireConsole(req, deps)
+      const current = readConsoleSettings()
+      const days = req.body?.days === undefined ? current.logRetentionDays : Number(req.body?.days)
+      const auditDays =
+        req.body?.auditDays === undefined ? current.auditRetentionDays : Number(req.body?.auditDays)
+      const agentDays =
+        req.body?.agentDays === undefined ? current.agentRetentionDays : Number(req.body?.agentDays)
+      for (const [label, value] of [
+        ['日志保留天数', days],
+        ['审计保留天数', auditDays],
+        ['Agent 轨迹保留天数', agentDays],
+      ] as const) {
+        if (!Number.isInteger(value) || value < 0 || (value > 0 && value < 7) || value > 3650) {
+          throw new EabError(EC.VALIDATION, `${label}只能是 0（永久保留）或 7–3650 天`)
+        }
       }
-    }
-    const settings = writeConsoleSettings({ logRetentionDays: days, auditRetentionDays: auditDays })
-    audit(deps, req, 'ops.settings.retention', { days, auditDays })
-    return ok({
-      retentionDays: settings.logRetentionDays,
-      auditRetentionDays: settings.auditRetentionDays,
-      applied: true,
-    })
-  })
+      const settings = writeConsoleSettings({
+        logRetentionDays: days,
+        auditRetentionDays: auditDays,
+        agentRetentionDays: agentDays,
+      })
+      audit(deps, req, 'ops.settings.retention', { days, auditDays, agentDays })
+      return ok({
+        retentionDays: settings.logRetentionDays,
+        auditRetentionDays: settings.auditRetentionDays,
+        agentRetentionDays: settings.agentRetentionDays,
+        applied: true,
+      })
+    },
+  )
 
   app.post('/api/console/settings/retention/run', async (req) => {
     requireConsole(req, deps)
     const settings = readConsoleSettings()
-    const result = runRetention(deps.db, settings.logRetentionDays, settings.auditRetentionDays)
+    const result = runRetention(
+      deps.db,
+      settings.logRetentionDays,
+      settings.auditRetentionDays,
+      settings.agentRetentionDays,
+    )
     writeConsoleSettings({ lastCleanupAt: new Date().toISOString(), lastCleanupStats: result.deleted })
     audit(deps, req, 'ops.settings.retention.run', {
       days: result.days,
       auditDays: result.audit.days,
+      agentDays: result.agentDays,
       deleted: result.deleted,
     })
     return ok(result)

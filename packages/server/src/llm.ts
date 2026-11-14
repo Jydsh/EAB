@@ -127,7 +127,20 @@ export interface CallResult {
   readonly completionTokens: number
 }
 
-export type ModelStreamEvent = { type: 'reasoning'; text: string } | { type: 'content'; text: string }
+export type ModelStreamEvent =
+  | { type: 'reasoning'; text: string }
+  | { type: 'content'; text: string }
+  /**
+   * 工具调用参数增量：模型生成 workspace.write 的 text 时就推给前端，
+   * 右侧预览可以先显示草稿；真正落盘仍等完整参数到达后执行一次。
+   */
+  | {
+      type: 'tool_delta'
+      index: number
+      id?: string
+      name?: string
+      argumentsDelta?: string
+    }
 
 export type ToolChoice =
   | 'auto'
@@ -546,10 +559,22 @@ async function callOpenAiStream(
     for (const part of delta.tool_calls ?? []) {
       const index = Number(part.index ?? 0)
       const current = toolCalls.get(index) ?? { id: '', type: 'function' as const, name: '', arguments: '' }
+      const argumentsDelta = String(part.function?.arguments ?? '')
       if (part.id) current.id = part.id
       if (part.function?.name) current.name += part.function.name
-      if (part.function?.arguments) current.arguments += part.function.arguments
+      if (argumentsDelta) current.arguments += argumentsDelta
       toolCalls.set(index, current)
+      // 工具参数分片也实时交给调用方：网页端靠它做文件写入预览。
+      // 注意只推增量，完整参数仍以最终 toolCalls 为准。
+      if (part.id || part.function?.name || argumentsDelta) {
+        options.onEvent?.({
+          type: 'tool_delta',
+          index,
+          ...(current.id ? { id: current.id } : {}),
+          ...(current.name ? { name: current.name } : {}),
+          ...(argumentsDelta ? { argumentsDelta } : {}),
+        })
+      }
     }
   }
 
@@ -934,4 +959,139 @@ export async function testProviderModel(  db: Db,
   modelId: string,
 ): Promise<CallResult | null> {
   return callModel(db, dbPath, companyId, modelId, [{ role: 'user', content: '只回复 OK 两个字母。' }], 16)
+}
+
+export interface TranscriptionResult {
+  readonly text: string
+  readonly modelKey: string
+}
+
+/**
+ * 语音转写（用途路由 `asr.default` 的运行时实现）。
+ *
+ * 兼容 OpenAI 协议：POST /audio/transcriptions（multipart）。
+ * Azure OpenAI 走 deployments 路径；Anthropic / Gemini 没有标准转写接口，直接给可执行提示。
+ */
+export async function callTranscription(
+  db: Db,
+  dbPath: string,
+  companyId: string,
+  modelId: string,
+  audio: { readonly buffer: Uint8Array; readonly mime: string; readonly fileName?: string },
+): Promise<TranscriptionResult> {
+  if (!audio.buffer || audio.buffer.byteLength === 0) {
+    throw new EabError(EC.VALIDATION, '转写缺少音频内容')
+  }
+  const provider = providerOf(db, companyId, modelId)
+  if (provider.kind === 'demo') {
+    throw new EabError(EC.VALIDATION, '演示模型不提供语音转写能力', {
+      hint: '请接入 Whisper、FunASR、Paraformer 或 SenseVoice 这类提供 /audio/transcriptions 的端点',
+    })
+  }
+  if (provider.kind === 'anthropic' || provider.kind === 'gemini') {
+    throw new EabError(EC.VALIDATION, `供应商「${provider.name}」没有标准的语音转写接口`, {
+      hint: '请选择 OpenAI 兼容的转写端点，或把 Base URL 指向自建 whisper / funasr 服务',
+    })
+  }
+  const base = provider.base_url || DEFAULT_BASE[provider.kind] || ''
+  if (!base) throw new EabError(EC.VALIDATION, `供应商「${provider.name}」还没有填写端点`)
+  const key = apiKeyOf(provider, dbPath)
+  const url =
+    provider.kind === 'azure_openai'
+      ? `${trimBase(base)}/openai/deployments/${encodeURIComponent(provider.modelKey)}/audio/transcriptions?api-version=2024-02-01`
+      : /\/audio\/transcriptions$/i.test(base)
+        ? trimBase(base)
+        : `${trimBase(base)}/audio/transcriptions`
+
+  const form = new FormData()
+  form.append('model', provider.modelKey)
+  form.append('file', new Blob([audio.buffer], { type: audio.mime }), audio.fileName || 'audio.webm')
+  form.append('response_format', 'json')
+  const headers: Record<string, string> = { accept: 'application/json' }
+  if (key) {
+    if (provider.kind === 'azure_openai') headers['api-key'] = key
+    else headers.authorization = `Bearer ${key}`
+  }
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers,
+    body: form,
+    signal: AbortSignal.timeout(60_000),
+  })
+  if (!res.ok) throw new EabError(EC.VALIDATION, `语音转写失败：${await readError(res)}`)
+  let payload: unknown = null
+  try {
+    payload = await res.json()
+  } catch {
+    payload = null
+  }
+  const text =
+    payload && typeof payload === 'object' ? String((payload as { text?: unknown }).text ?? '').trim() : ''
+  if (!text) throw new EabError(EC.VALIDATION, '语音转写返回空文本', { hint: '检查转写端点是否支持 multipart 上传与 response_format=json' })
+  return { text, modelKey: provider.modelKey }
+}
+
+export interface SpeechResult {
+  readonly audio: Uint8Array
+  readonly mime: string
+  readonly modelKey: string
+}
+
+/**
+ * 语音合成（用途路由 `tts.default` 的运行时实现）。
+ * 兼容 OpenAI 协议 POST /audio/speech；Azure 走 deployments 路径；不支持时给出提示。
+ */
+export async function callSpeech(
+  db: Db,
+  dbPath: string,
+  companyId: string,
+  modelId: string,
+  text: string,
+  options: { voice?: string; format?: 'mp3' | 'wav' | 'opus' } = {},
+): Promise<SpeechResult> {
+  const input = text.trim()
+  if (!input) throw new EabError(EC.VALIDATION, '合成缺少文本')
+  const provider = providerOf(db, companyId, modelId)
+  if (provider.kind === 'demo') {
+    throw new EabError(EC.VALIDATION, '演示模型不提供语音合成能力', {
+      hint: '请接入 CosyVoice、ChatTTS、F5-TTS 或任意提供 /audio/speech 的端点',
+    })
+  }
+  if (provider.kind === 'anthropic' || provider.kind === 'gemini') {
+    throw new EabError(EC.VALIDATION, `供应商「${provider.name}」没有标准的语音合成接口`, {
+      hint: '请选择 OpenAI 兼容的 /audio/speech 端点',
+    })
+  }
+  const base = provider.base_url || DEFAULT_BASE[provider.kind] || ''
+  if (!base) throw new EabError(EC.VALIDATION, `供应商「${provider.name}」还没有填写端点`)
+  const key = apiKeyOf(provider, dbPath)
+  const format = options.format ?? 'mp3'
+  const url =
+    provider.kind === 'azure_openai'
+      ? `${trimBase(base)}/openai/deployments/${encodeURIComponent(provider.modelKey)}/audio/speech?api-version=2024-02-01`
+      : /\/audio\/speech$/i.test(base)
+        ? trimBase(base)
+        : `${trimBase(base)}/audio/speech`
+  const headers: Record<string, string> = { 'content-type': 'application/json', accept: 'audio/*' }
+  if (key) {
+    if (provider.kind === 'azure_openai') headers['api-key'] = key
+    else headers.authorization = `Bearer ${key}`
+  }
+  const res = await fetch(url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      model: provider.modelKey,
+      input: input.slice(0, 1_200),
+      voice: options.voice || 'alloy',
+      response_format: format,
+    }),
+    signal: AbortSignal.timeout(60_000),
+  })
+  if (!res.ok) throw new EabError(EC.VALIDATION, `语音合成失败：${await readError(res)}`)
+  const bytes = new Uint8Array(await res.arrayBuffer())
+  if (bytes.byteLength === 0) throw new EabError(EC.VALIDATION, '语音合成返回空音频')
+  const mime = res.headers.get('content-type') || (format === 'wav' ? 'audio/wav' : format === 'opus' ? 'audio/ogg' : 'audio/mpeg')
+  return { audio: bytes, mime, modelKey: provider.modelKey }
 }

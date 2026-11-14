@@ -6,7 +6,7 @@
  * 不在本地执行任意脚本；工具白名单是代码常量，插件想加工具必须走插件清单。
  */
 import type { FastifyInstance, FastifyRequest } from 'fastify'
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { basename, dirname } from 'node:path'
 import { EC, EabError, SC, ulid, type Scope } from '@eab/domain'
 import { appendAudit } from '@eab/storage'
@@ -19,6 +19,8 @@ import { ok, requireScope } from '../http.js'
 import { resolveActor, type RequestActor } from '../session.js'
 import { hashPassword } from '../password.js'
 import { KeyedMutex, KeyedSemaphore, LockAbortedError, LockTimeoutError, SemaphoreQueueFullError, SemaphoreTimeoutError } from '../concurrency.js'
+import { acquireCoordinationSlot, coordinationStatus, readCapacityCount } from '../backends/coordination.js'
+import { beginToolInflight } from '../tool-inflight.js'
 import {
   beginToolOperation,
   completeToolOperation,
@@ -26,7 +28,12 @@ import {
   resolveToolOperationKey,
 } from '../tool-idempotency.js'
 import { retrieveExternalKb } from '../kb-external.js'
-import { executePluginTool, pluginToolCatalogFor, pluginToolSpecsFor, resolvePluginToolForActor } from '../plugin-tools.js'
+import { executePluginTool, pluginToolCatalogFor, pluginToolSpecsFor, prefersPersonalPluginTools, resolvePluginToolByCatalogId } from '../plugin-tools.js'
+import {
+  readToolRoleAccessMap,
+  toolAllowedForActor,
+  toolAllowedForRoles,
+} from '../tool-role-access.js'
 import type { ActiveSpace } from '../space.js'
 import {
   resolveUserWorkspaceQuota,
@@ -40,8 +47,53 @@ import {
   markRobotUserFileSendFailed,
   markRobotUserFileSendSent,
 } from '../dingtalk-file-echo.js'
-import { deleteUserWorkspaceFile, readUserWorkspaceFile, renameUserWorkspaceFile, userScopeDir } from './workspace.js'
+import {
+  applyWorkspaceTextEdits,
+  deleteUserWorkspaceFile,
+  isTextEditableFile,
+  readUserWorkspaceFile,
+  renameUserWorkspaceFile,
+  editUserWorkspaceFile,
+  userScopeDir,
+  type WorkspaceTextEdit,
+} from './workspace.js'
 import { createSchedule, deleteSchedule, listSchedules } from '../schedule.js'
+import {
+  addDocxComment,
+  addXlsxCellComment,
+  appendXlsxSheet,
+  applyDocxRevisions,
+  deleteDocxComment,
+  deleteDocxTable,
+  deleteXlsxCellComment,
+  deleteXlsxSheet,
+  findInOutline,
+  findInPptx,
+  findInXlsx,
+  formatDocxText,
+  formatXlsxCell,
+  formatXlsxDimension,
+  insertDocxTable,
+  insertDocxText,
+  insertXlsxColumn,
+  insertXlsxRow,
+  mergeDocxTableCells,
+  readDocxComments,
+  readDocxOutline,
+  readDocxRange,
+  readDocxRevisions,
+  readDocxTrackChanges,
+  readPptxOutline,
+  readXlsxComments,
+  readXlsxOutline,
+  replyDocxComment,
+  replaceDocxText,
+  replacePptxText,
+  replaceXlsxCellText,
+  resolveDocxComment,
+  setDocxTrackChanges,
+  splitDocxTableMergedCells,
+} from '../office-content.js'
 
 export interface ToolDef {
   id: string
@@ -49,7 +101,7 @@ export interface ToolDef {
   description: string
   scope: Scope
   dangerous: boolean
-  input: Record<string, { type: string; description: string; required?: boolean }>
+  input: Record<string, Omit<ToolParameterSchema, 'required'> & { required?: boolean }>
   /** 并发属性：read 只读；write 按资源键互斥；exclusive 全局/公司级互斥。默认 read */
   concurrency?: 'read' | 'write' | 'exclusive'
   /** 互斥资源键；返回 null 表示该次调用不需要加锁 */
@@ -74,6 +126,11 @@ export interface ToolExecutionContext {
   turnId?: string
   /** 调用方显式提供的幂等键，优先于 turnId */
   idempotencyKey?: string
+  /**
+   * 右侧预览/编辑中的文件。模型漏传 fileId、path 时用它兜底，
+   * 避免「明明开着文件还要反问是哪个文件」。
+   */
+  activeFile?: { id: string; relPath?: string }
 }
 
 /**
@@ -126,6 +183,30 @@ export function recordToolRun(toolId: string, durationMs: number, status: 'ok' |
   item.maxDurationMs = Math.max(item.maxDurationMs, durationMs)
   item.lockWaitMs += Math.max(0, lockWaitMs)
   toolMetrics.set(toolId, item)
+}
+
+/**
+ * 共享模式下把工具并发数从 Redis 读回来。
+ *
+ * 升级前控制台看到的是「本实例」的并发；多个实例各持一份，数字对不上实际负载。
+ * 共享名额在 Redis 里是全局计数，这里按当前注册的工具逐个读回，让面板显示全局值。
+ * 未接 Redis 时返回 null，调用方继续使用本实例统计。
+ */
+export async function sharedToolCapacityStats(): Promise<{
+  total: number
+  keys: Array<{ key: string; active: number; queued: number }>
+} | null> {
+  if (!coordinationStatus().shared) return null
+  const keys = TOOLS.map((tool) => `tool:${tool.id}`)
+  const counts = await Promise.all(keys.map((key) => readCapacityCount(key)))
+  if (counts.every((count) => count === null)) return null
+  const entries = keys
+    .map((key, index) => ({ key, active: counts[index] ?? 0, queued: 0 }))
+    .filter((item) => item.active > 0)
+  return {
+    total: entries.reduce((sum, item) => sum + item.active, 0),
+    keys: entries,
+  }
 }
 
 export function toolConcurrencyStats(): {
@@ -245,7 +326,7 @@ export const TOOLS: readonly ToolDef[] = [
     id: 'agent.spawn',
     name: '并行子 Agent',
     description:
-      '把一个复杂任务拆成多个互不依赖的子任务，并行交给多个子 Agent 执行。适合“同时查三份资料”“分别分析几个文件”“多模型各给一版方案”这类可以并行的任务。每个子 Agent 有独立运行记录和会话锁；一个子任务失败不会取消其他子任务。tasks 必须是 JSON 数组字符串，每项形如 {"title":"资料A","prompt":"完整子任务指令","modelId":"可选模型 id","retries":1}。不要让子任务互相依赖，不要用子 Agent 代替普通的一次工具调用。',
+      '把一个复杂任务拆成多个互不依赖的子任务，并行交给多个子 Agent 执行。适合“同时查三份资料”“分别分析几个文件”“多模型各给一版方案”这类可以并行的任务。每个子 Agent 有独立运行记录和会话锁；一个子任务失败不会取消其他子任务。tasks 必须是 JSON 数组字符串，每项形如 {"key":"research-a","title":"资料A","prompt":"完整子任务指令","modelId":"可选模型 id","retries":1}。key 是团队内的稳定标识（建议英文短名），后续可用 agent_task 凭 key 继续给它派活，复用同一个子 Agent 窗口与会话；子 Agent 完成一次任务后若没有新任务，会在空闲一段时间后自动注销，需要再工作时重新 agent_spawn。不要让子任务互相依赖，不要用子 Agent 代替普通的一次工具调用。',
     scope: SC.AGENT_TOOL_INVOKE,
     dangerous: false,
     concurrency: 'read',
@@ -255,6 +336,32 @@ export const TOOLS: readonly ToolDef[] = [
         description: 'JSON 数组字符串；每项必须包含 prompt，可选 title、modelId、retries',
         required: true,
       },
+    },
+  },
+  {
+    id: 'agent.task',
+    name: '继续派活给子 Agent',
+    description:
+      '给团队里已经存在的子 Agent 继续派一个新任务，复用同一个子 Agent 会话与同一个可视窗口，不需要重新创建。仅在本轮已经用 agent_spawn 创建过子 Agent 后可用；agent 必须填 agent.spawn 返回或此前事件里给出的 key。子 Agent 完成任务后如果没有再派新任务，会在空闲一段时间后自动注销，那时必须重新 agent_spawn。',
+    scope: SC.AGENT_TOOL_INVOKE,
+    dangerous: false,
+    concurrency: 'read',
+    input: {
+      agent: { type: 'string', description: '目标子 Agent 的团队 key', required: true },
+      prompt: { type: 'string', description: '这次要它做的完整任务指令', required: true },
+    },
+  },
+  {
+    id: 'agent.ask_parent',
+    name: '向父 Agent 提问',
+    description:
+      '只有子 Agent 可用。执行中发现缺少关键信息、需要用户授权或要父 Agent 做决策时，调用它把问题交给父 Agent。本轮会暂停并返回“等待父 Agent”；父 Agent 可以直接回答，也可以先向用户确认，然后用 agent_task 把答复发回来，你会在同一个会话里继续。不要用它代替普通工具调用，也不要在能自行判断时反复提问。',
+    scope: SC.AGENT_TOOL_INVOKE,
+    dangerous: false,
+    concurrency: 'read',
+    input: {
+      question: { type: 'string', description: '要父 Agent 回答或向用户确认的问题', required: true },
+      context: { type: 'string', description: '可选：为什么需要这个信息、你已经做到哪一步' },
     },
   },
   {
@@ -349,6 +456,21 @@ export const TOOLS: readonly ToolDef[] = [
     input: { query: { type: 'string', description: '要检索的问题或关键词', required: true } },
   },
   {
+    id: 'memory.propose',
+    name: '提交团队学习',
+    description:
+      '成员在对话里明确说“以后都这样/让团队也按这个规则/把这条经验分享给大家/记住这个规范”时，把可复用的规则提炼成一条不超过 1000 字的团队记忆候选，提交给管理员审核。审核通过后会自动进入全公司所有成员的对话上下文，实现跨成员学习扩散。只提交提炼后的规则，不要提交原始聊天、密码、手机号、身份证号、客户隐私或一次性任务内容。',
+    scope: SC.MEMORY_WRITE,
+    dangerous: false,
+    input: {
+      content: {
+        type: 'string',
+        description: '提炼后的可复用规则或经验，一句话到一小段，最多 1000 字',
+        required: true,
+      },
+    },
+  },
+  {
     id: 'workspace.list',
     name: '列出我的文件',
     description: '列出个人工作区里未删除的文件',
@@ -368,7 +490,8 @@ export const TOOLS: readonly ToolDef[] = [
   {
     id: 'workspace.write',
     name: '写入工作区文件',
-    description: '把一段文本写成个人工作区里的文件（同名覆盖）',
+    description:
+      '把一段文本写成个人工作区里的文件（同名覆盖）。如果文件已存在且只需要改其中某几段、某几个字段，优先调用 workspace.edit，不要整篇重写；只有新建文件或确实要整篇替换时才用本工具。成功后只说明文件名和结果，不要重复粘贴文件正文，界面会展示文件内容预览。',
     scope: SC.WORKSPACE_WRITE,
     dangerous: false,
     concurrency: 'write',
@@ -379,6 +502,39 @@ export const TOOLS: readonly ToolDef[] = [
     },
   },
   {
+    id: 'workspace.edit',
+    name: '局部修改工作区文件',
+    description:
+      '只修改文件中指定的片段，不整篇覆盖。适用场景：方案只需更新其中一段、表格只需改几个字段、说明文档只替换某一节。先用 workspace.read 读取原文，把要改的原文精确复制到 find，把新内容放到 replace；一次可传多个 edits，按顺序执行，任何一条找不到原文都会整体失败且不写盘。支持 txt/md/csv/json/代码等文本文件。Word .docx、Excel .xlsx/.xlsm、PowerPoint .pptx 请改用 office.find 定位、office.replace 局部替换；不要用 workspace.edit 改 Office 文件。成功后只说明文件名和改动条数，不要重复粘贴文件正文。',
+    scope: SC.WORKSPACE_WRITE,
+    dangerous: false,
+    concurrency: 'write',
+    lockKey: (deps, actor, args) => workspaceFileLockKey(deps, actor, args),
+    input: {
+      path: { type: 'string', description: '相对路径，例如 docs/方案.md', required: true },
+      edits: {
+        type: 'array',
+        description: '局部替换列表；每项 find 必须与原文完全一致，replace 为新内容',
+        required: true,
+        minItems: 1,
+        maxItems: 50,
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            find: { type: 'string', description: '要替换的原文片段（区分大小写和空白）' },
+            replace: { type: 'string', description: '替换后的新内容，可为空字符串表示删除' },
+            occurrence: {
+              type: 'integer',
+              description: '可选：只替换第几个匹配（从 1 开始）；不传则替换全部匹配',
+            },
+          },
+          required: ['find', 'replace'],
+        },
+      },
+    },
+  },
+  {
     id: 'workspace.read',
     name: '读取工作区文件',
     description: '读取云空间里一个文本文件的正文（最大 5 MB）',
@@ -386,6 +542,169 @@ export const TOOLS: readonly ToolDef[] = [
     dangerous: false,
     input: {
       path: { type: 'string', description: '相对路径，例如 notes/todo.md', required: true },
+    },
+  },
+  {
+    id: 'office.read_outline',
+    name: '读取 Office 文档结构',
+    description:
+      '读取 docx 的段落、标题和表格结构，读取 xlsx/xlsm 的工作表、行列和单元格文本，或读取 pptx 的幻灯片段落文本，返回稳定 ID、公式标记和预览。只读，不需要打开 OnlyOffice，也不会修改文件。先确认 fileId 或相对路径。pptx 段落 ID 为 sN-pM，可用 office.find/office.replace 做文本级局部替换。',
+    scope: SC.AGENT_TOOL_INVOKE,
+    dangerous: false,
+    input: {
+      fileId: { type: 'string', description: '云空间文件 id；和 path 二选一' },
+      path: { type: 'string', description: '云空间相对路径；和 fileId 二选一' },
+      maxElements: { type: 'number', description: '最多返回多少个顶层元素，默认 200，范围 1-500' },
+    },
+  },
+  {
+    id: 'office.read_range',
+    name: '读取 Office 文档范围',
+    description:
+      '读取 docx 指定范围的完整文本、run 级格式摘要和表格结构，不截断、不改文件。elementId 支持 pN 段落、tN 整张表、tN-rN 表格行、tN-cN 表格列、tN-rN-cN 表格单元格；start/end 是目标段落或单元格完整文本内的字符偏移，只对 pN 和 tN-rN-cN 有效。返回 text、start/end、totalLength、runs（每段文本的 bold/italic/underline/color/fontSize/fontFamily/style）和表格行列数据。xlsx/pptx 暂未覆盖，会明确报错。只读，不打开 OnlyOffice。',
+    scope: SC.AGENT_TOOL_INVOKE,
+    dangerous: false,
+    input: {
+      fileId: { type: 'string', description: '云空间文件 id；和 path 二选一' },
+      path: { type: 'string', description: '云空间相对路径；和 fileId 二选一' },
+      elementId: { type: 'string', description: 'docx 的 pN、tN、tN-rN、tN-cN 或 tN-rN-cN', required: true },
+      start: { type: 'number', description: '目标段落/单元格完整文本内的起始字符偏移，默认 0' },
+      end: { type: 'number', description: '目标段落/单元格完整文本内的结束字符偏移，默认文本长度' },
+    },
+  },
+  {
+    id: 'office.find',
+    name: '在 Office 文档中查找文本',
+    description:
+      '在 docx 段落/表格单元格、xlsx/xlsm 单元格或 pptx 幻灯片段落中按文本或正则查找，返回元素 ID（docx 段落 pN、表格单元格 tN-rN-cN，xlsx 单元格 sN-rN-cN，pptx 段落 sN-pM）、工作表/幻灯片/地址、公式标记、命中位置和上下文，供后续定位/修改使用。只读。',
+    scope: SC.AGENT_TOOL_INVOKE,
+    dangerous: false,
+    input: {
+      query: { type: 'string', description: '要查找的文本或正则表达式', required: true },
+      fileId: { type: 'string', description: '云空间文件 id；和 path 二选一' },
+      path: { type: 'string', description: '云空间相对路径；和 fileId 二选一' },
+      regex: { type: 'boolean', description: '是否把 query 当正则，默认 false' },
+      limit: { type: 'number', description: '最多返回多少条命中，默认 20，范围 1-100' },
+    },
+  },
+  {
+    id: 'office.revisions',
+    name: '读取或处理 Word 修订',
+    description:
+      '读取 docx 修订，或设置修订开关、接受/拒绝修订。action=read（默认）返回插入/删除数量、作者、日期、文本范围和段落/单元格 ID；action=enable/disable 改 settings.xml 的 w:trackChanges；action=accept/reject 处理 w:ins/w:del 并原子保存。只识别 w:ins / w:del（含 w:delText），移动和格式修订仍需人工在编辑器处理。接受/拒绝时传 revisionId，或 all=true 处理全部。',
+    scope: SC.AGENT_TOOL_INVOKE,
+    dangerous: false,
+    input: {
+      fileId: { type: 'string', description: '云空间文件 id；和 path 二选一' },
+      path: { type: 'string', description: '云空间相对路径；和 fileId 二选一' },
+      action: {
+        type: 'string',
+        description: 'read（默认）、enable、disable、accept 或 reject',
+      },
+      revisionId: { type: 'string', description: 'accept/reject 指定的修订 id；与 all 二选一' },
+      all: { type: 'boolean', description: 'accept/reject 是否处理全部修订；与 revisionId 二选一' },
+      maxRevisions: { type: 'number', description: 'read 时最多返回多少条修订，默认 200，范围 1-500' },
+    },
+  },
+  {
+    id: 'office.replace',
+    name: '局部替换 Office 文档文本',
+    description:
+      '只替换 docx 指定段落/表格单元格、xlsx/xlsm 指定单元格中的文本，或 pptx 指定幻灯片段落中的文本，不整篇/整表重写，其他内容、样式和结构保持不变。先用 office.find 拿到 docx 的 pN / tN-rN-cN、xlsx 的 sN-rN-cN 或 pptx 的 sN-pM，再把原文精确放到 oldText；省略 oldText 表示替换该元素可见文本。xlsx 空单元格可直接用 sN-rN-cN 写入整格；数字单元格可改成数字或文本；公式单元格只能改成以 = 开头的新公式，不能静默改成静态值。已有缺失行会按行号插入，保持工作表行顺序。pptx 段落跨多个文本 run 时，新文本沿用第一个 run 的格式，其余 run 清空；不支持段落内换行。命中多处时必须指定 occurrence（1 起，0 仅 xlsx 支持）。写入后会自动保存并记录 workspace.file.agent_edit 审计。支持 docx、xlsx、xlsm、pptx。',
+    scope: SC.AGENT_TOOL_INVOKE,
+    dangerous: false,
+    concurrency: 'write',
+    lockKey: (deps, actor, args) => workspaceFileLockKey(deps, actor, args),
+    input: {
+      elementId: { type: 'string', description: 'office.read_outline / office.find 返回的 pN、tN-rN-cN（docx）、sN-rN-cN（xlsx）或 sN-pM（pptx）；xlsx 空单元格也可直接按该格式指定', required: true },
+      fileId: { type: 'string', description: '云空间文件 id；和 path 二选一' },
+      path: { type: 'string', description: '云空间相对路径；和 fileId 二选一' },
+      oldText: { type: 'string', description: '要替换的原文；省略时替换该元素整段可见文本' },
+      newText: { type: 'string', description: '替换后的新文本；空字符串表示删除', required: true },
+      occurrence: { type: 'number', description: '第几次命中，1 起；0 表示全部（仅 xlsx）；默认 1' },
+      trackChanges: { type: 'boolean', description: 'docx 专用：true 时把旧文本写入 w:del、新文本写入 w:ins，保留修订标记；目标已有修订时先接受或拒绝' },
+      author: { type: 'string', description: 'docx 修订作者，默认 EAB Agent' },
+    },
+  },
+  {
+    id: 'office.insert',
+    name: '插入/删除/合并/拆分 Office 表格结构',
+    description:
+      '编辑 docx 表格结构：action=insert 在指定段落或表格行/列前后插入内容；action=delete 删除 docx 表格行/列；action=merge 合并一个矩形单元格区域；action=split 拆分整张表的合并单元格。先用 office.read_outline / office.find 拿到 pN、tN、tN-rN-cN、tN-rN、tN-cN。删除行会保留并重接纵向合并；删除列按表格网格缩减或移除覆盖该列的单元格，横向合并单元格会减少 gridSpan。插入列、插入含纵向合并的行和合并区域前，若表格仍有合并单元格，先用 action=split 归一化。docx 表格行用制表符分隔多列，列用换行分隔各行值。xlsx 支持插入行/列、用 elementId=workbook 追加工作表、用 elementId=sN 删除工作表；插入行/列会同步移动引用，跨表公式、命名区域、图表或数据透视表引用目标工作表时拒绝删除。删除工作表时会清理它独占的批注、VML、绘图、表格等关联部件，仍被其他工作表引用的部件保留。写入后自动保存并记录 workspace.file.agent_edit 审计；pptx 结构变更暂不支持。',
+    scope: SC.AGENT_TOOL_INVOKE,
+    dangerous: false,
+    concurrency: 'write',
+    lockKey: (deps, actor, args) => workspaceFileLockKey(deps, actor, args),
+    input: {
+      elementId: { type: 'string', description: 'insert/delete/split 的 docx 段落 pN、表格 tN、表格单元格 tN-rN-cN、表格行 tN-rN、表格列 tN-cN；action=merge 时传合并范围 tN-rA-cA:tN-rB-cB；xlsx 行 sN-rN / 列 sN-cN（也可传该行任意单元格 sN-rN-cN）；xlsx 追加工作表用 workbook，删除工作表用 sN', required: true },
+      fileId: { type: 'string', description: '云空间文件 id；和 path 二选一' },
+      path: { type: 'string', description: '云空间相对路径；和 fileId 二选一' },
+      action: { type: 'string', description: 'insert（默认）、delete、merge 或 split；split 用 elementId=tN 拆分整张表的合并单元格，merge 用 elementId=tN-rA-cA:tN-rB-cB 合并矩形区域；xlsx 删除工作表用 action=delete + elementId=sN' },
+      text: { type: 'string', description: 'action=insert 时必填：docx 新段落文本，可包含换行和制表符；docx 表格行用制表符分隔多列、表格列用换行分隔各行值；xlsx 行用制表符分隔多列，列用换行分隔各行值，空字符串表示空行/空列；xlsx 追加工作表时为新工作表名称' },
+      position: { type: 'string', description: 'action=insert 时的 before 或 after，默认 after' },
+    },
+  },
+  {
+    id: 'office.format',
+    name: '设置 Office 文档格式',
+    description:
+      '只对 docx 指定段落/表格单元格，或 xlsx/xlsm 指定单元格、整列/整行设置格式，不改动其他内容、文本和结构。先用 office.find 或 office.read_outline 拿到 pN / tN-rN-cN / sN-rN-cN。支持加粗、斜体、下划线、字体颜色、字号、字体族和数字格式；docx 段落另支持对齐、行距、段前段后间距；xlsx 另支持单元格填充色、列宽和行高（elementId 用 sN-cN / sN-rN，可带范围 sN-c2:c4、sN-r2:r4）。传 false 或 none 可清除对应格式。写入后自动保存并记录 workspace.file.agent_edit 审计。pptx 暂不支持。',
+    scope: SC.AGENT_TOOL_INVOKE,
+    dangerous: false,
+    concurrency: 'write',
+    lockKey: (deps, actor, args) => workspaceFileLockKey(deps, actor, args),
+    input: {
+      elementId: { type: 'string', description: 'office.read_outline / office.find 返回的 pN、tN-rN-cN；xlsx 单元格 sN-rN-cN，列宽 sN-cN 或 sN-c2:c4，行高 sN-rN 或 sN-r2:r4', required: true },
+      fileId: { type: 'string', description: '云空间文件 id；和 path 二选一' },
+      path: { type: 'string', description: '云空间相对路径；和 fileId 二选一' },
+      bold: { type: 'boolean', description: '是否加粗；false 表示清除' },
+      italic: { type: 'boolean', description: '是否斜体；false 表示清除' },
+      underline: { type: 'string', description: 'true/false，或 single/double/dotted/wave 等下划线样式；false 表示清除' },
+      color: { type: 'string', description: '字体颜色，6 位十六进制，例如 FF0000；none 表示清除' },
+      highlight: { type: 'string', description: 'docx 高亮色：yellow/green/cyan/magenta/blue/red 等；none 表示清除' },
+      fill: { type: 'string', description: 'xlsx 单元格填充色，6 位十六进制，例如 FFF2CC；none 表示清除' },
+      fontSize: { type: 'number', description: '字号（磅），例如 14' },
+      fontFamily: { type: 'string', description: 'docx 字体族，例如 宋体、黑体、Arial' },
+      align: { type: 'string', description: 'docx 段落对齐：left / center / right / justify' },
+      lineSpacing: { type: 'number', description: 'docx 行距倍数，1 到 3，例如 1.5' },
+      spaceBefore: { type: 'number', description: 'docx 段前间距（磅），例如 6' },
+      spaceAfter: { type: 'number', description: 'docx 段后间距（磅），例如 6' },
+      numberFormat: { type: 'string', description: 'xlsx 数字格式，例如 0.00%、#,##0、yyyy-mm-dd，或 builtin:14' },
+      columnWidth: { type: 'number', description: 'xlsx 列宽（字符数，0 到 255），elementId 用 sN-cN 或 sN-c2:c4；列号范围 1-16384' },
+      rowHeight: { type: 'number', description: 'xlsx 行高（磅，0 到 409），elementId 用 sN-rN 或 sN-r2:r4；行号范围 1-1048576，单次最多 20000 行' },
+    },
+  },
+  {
+    id: 'office.comment',
+    name: '管理文档批注',
+    description:
+      '管理 docx/xlsx 批注。docx：action=add（默认）给 pN 段落或 tN-rN-cN 单元格加批注，可用 oldText/occurrence 或 start/end 把范围收窄到短语；action=list 列出批注、回复数、是否解决；action=reply 回复指定批注；action=resolve 解决/重新打开；action=delete 删除批注及其回复和锚点。xlsx：action=add 给 sN-rN-cN 单元格加批注，action=list 列出单元格批注，action=delete 按 elementId 或 commentId 删除；xlsx 单元格批注是扁平批注，不支持 reply/resolve，也不支持 oldText/start/end。自动创建 comments/VML、关系项和内容类型，写入后原子保存并记录审计。pptx 暂不支持。',
+    scope: SC.AGENT_TOOL_INVOKE,
+    dangerous: false,
+    concurrency: 'write',
+    lockKey: (deps, actor, args) => workspaceFileLockKey(deps, actor, args),
+    input: {
+      action: {
+        type: 'string',
+        description: 'add（默认）、list、reply、resolve 或 delete；xlsx 只支持 add、list、delete',
+      },
+      elementId: {
+        type: 'string',
+        description: 'add 时的 pN、tN-rN-cN 或 xlsx 的 sN-rN-cN；xlsx delete 也可用 elementId 指定单元格',
+      },
+      commentId: {
+        type: 'number',
+        description: 'docx reply/resolve/delete 的批注 id；xlsx list 返回的序号，可用于 delete；list 时返回全部',
+      },
+      fileId: { type: 'string', description: '云空间文件 id；和 path 二选一' },
+      path: { type: 'string', description: '云空间相对路径；和 fileId 二选一' },
+      text: { type: 'string', description: 'add/reply 的批注正文' },
+      author: { type: 'string', description: '批注作者，默认 EAB Agent' },
+      oldText: { type: 'string', description: 'docx add 时锚定短语；和 start/end 二选一；xlsx 不支持' },
+      occurrence: { type: 'number', description: 'docx oldText 命中多次时的序号，1 起' },
+      start: { type: 'number', description: 'docx add 时的起始字符偏移；和 oldText 二选一；xlsx 不支持' },
+      end: { type: 'number', description: 'docx add 时的结束字符偏移；和 oldText 二选一；xlsx 不支持' },
+      resolved: { type: 'boolean', description: 'docx resolve 时 true 标记解决，false 重新打开，默认 true；xlsx 不支持' },
     },
   },
   {
@@ -742,11 +1061,23 @@ export const AGENT_CORE_TOOL_IDS: readonly string[] = [
   'tool.search',
   'time.now',
   'agent.spawn',
+  'agent.task',
+  'agent.ask_parent',
   'org.directory',
   'kb.search',
   'schedule.create',
   'workspace.list',
   'workspace.read',
+  'workspace.edit',
+  'office.read_outline',
+  'office.read_range',
+  'office.find',
+  'office.revisions',
+  'office.replace',
+  'office.insert',
+  'office.format',
+  'office.comment',
+  'memory.propose',
 ]
 
 export interface ToolSearchHit {
@@ -793,10 +1124,20 @@ const TOOL_SEARCH_ALIASES: Record<string, string> = {
   'org.directory': '通讯录 组织架构 部门 组长 上级 同事 成员 查找人 org directory',
   'org.search': '找人 搜索成员 姓名 工号 岗位 search member',
   'kb.search': '知识库 文档 资料 检索 搜索 制度 流程 kb rag search',
+  'memory.propose': '团队学习 共享记忆 记住 规范 以后都这样 扩散 经验 沉淀 team memory learn share',
   'workspace.list': '文件 列表 我的文件 云空间 workspace file list',
   'workspace.capacity': '容量 空间 剩余 配额 满了吗 capacity quota space',
-  'workspace.write': '写文件 保存 新建文件 文本 write file save',
+  'workspace.write': '写文件 保存 新建文件 文本 整篇 write file save',
+  'workspace.edit': '局部修改 局部编辑 只改一段 改字段 替换片段 修订 patch edit replace',
   'workspace.read': '读文件 查看文件 打开文件 内容 read file',
+  'office.read_outline': '读取文档结构 文档大纲 段落 表格 单元格 工作表 幻灯片 docx xlsx Excel pptx PowerPoint Office 文档结构 read outline document structure paragraph table sheet slide',
+  'office.read_range': '读取文档范围 读全文 读段落全文 读表格 读单元格 读整行 读整列 文本区间 格式摘要 range read full text paragraph table cell row column runs font format docx',
+  'office.find': '文档查找 在文档中找 定位文本 查找段落 查找单元格 查找幻灯片 xlsx pptx Excel PowerPoint find document search cell slide',
+  'office.revisions': '读取修订 查看修订 修订记录 插入删除 作者 接受修订 拒绝修订 开启修订 关闭修订 track changes revision accept reject w:ins w:del docx',
+  'office.replace': '替换文档文本 改段落 改单元格 修改word 修改Excel 修改PPT xlsx xlsm pptx replace office text update cell formula slide paragraph',
+  'office.insert': '插入段落 新增段落 插入整行 插入整列 删除整行 删除整列 合并单元格 拆分单元格 删除表格行 删除表格列 xlsx Excel insert delete merge split paragraph row column office',
+  'office.format': '设置格式 加粗 斜体 下划线 字体颜色 高亮 填充 数字格式 字号 format bold italic underline color highlight fill numberFormat number format font size xlsx',
+  'office.comment': '加批注 批注 评论 单元格批注 工作表批注 Excel批注 回复批注 解决批注 删除批注 批注列表 短语批注 comment annotation note list reply resolve delete xlsx Excel cell comment',
   'workspace.send_dingtalk': '发送文件 发文件 发给我 钉钉 send file dingtalk attachment',
   'workspace.rename': '重命名 改名 文件名 rename file',
   'workspace.delete': '删除文件 删掉 清理文件 delete file remove',
@@ -817,7 +1158,7 @@ export function searchToolCatalog(
   const clean = query.trim()
   if (!clean) throw new EabError(EC.VALIDATION, 'query 不能为空')
   const capped = Math.min(12, Math.max(1, Number.isFinite(limit) ? Math.floor(limit) : 8))
-  const specs = toolSpecsForActor(db, actor, space)
+  const specs = toolSpecsForActor(db, actor, space, clean)
   const builtinByFunction = new Map(TOOLS.map((tool) => [toolFunctionName(tool.id), tool]))
   const terms = toolSearchTerms(clean)
   const hits: ToolSearchHit[] = []
@@ -878,7 +1219,7 @@ export function toolSpecsForAgent(
   query = '',
 ): ChatToolSpec[] {
   const coreNames = new Set(AGENT_CORE_TOOL_IDS.map(toolFunctionName))
-  const specs = toolSpecsForActor(db, actor, space)
+  const specs = toolSpecsForActor(db, actor, space, query)
   /**
    * 通讯录是核心工具，但只在问题确实在问人/部门/上下级时下发。
    * 业务数据问题（录入了几条检查整治、台账、统计）里常出现“东环线/工区/站点”
@@ -903,7 +1244,7 @@ export function toolSpecsForAgent(
    * 因此把当前员工已启用插件的工具直接随首轮工具下发；内置工具仍按需加载。
    */
   const pluginNames = new Set(
-    pluginToolSpecsFor(db, actor).map((spec) => {
+    pluginToolSpecsFor(db, actor, { preferPersonal: prefersPersonalPluginTools(query) }).map((spec) => {
       const fn = spec.function as { name?: unknown } | undefined
       return String(fn?.name ?? '')
     }),
@@ -913,8 +1254,76 @@ export function toolSpecsForAgent(
 
 /** 云空间是唯一可用的文件空间；none 不暴露文件工具。 */
 function toolAllowedInSpace(toolId: string, space: ActiveSpace): boolean {
-  if (toolId.startsWith('workspace.')) return space.kind === 'cloud'
+  if (toolId.startsWith('workspace.') || toolId.startsWith('office.')) return space.kind === 'cloud'
   return true
+}
+
+interface OfficeFileRef {
+  fileId: string
+  name: string
+  relPath: string
+  version: string
+  buffer: Buffer
+}
+
+/** xlsx 与 xlsm 共用 OOXML 内容层；xlsm 只多一个 vbaProject 部件，局部改 XML 不会丢宏。 */
+function isXlsxFileName(name: string): boolean {
+  return /\.(xlsx|xlsm)$/i.test(name)
+}
+
+function isPptxFileName(name: string): boolean {
+  return /\.pptx$/i.test(name)
+}
+
+/** 解析 office 工具的 fileId/path 参数；docx 与 xlsx 共用这段定位逻辑。 */
+function resolveOfficeFile(
+  deps: ServerDeps,
+  actor: RequestActor,
+  args: Record<string, unknown>,
+): OfficeFileRef {
+  const fileIdArg = String(args.fileId ?? '').trim()
+  const pathArg = String(args.path ?? '').trim()
+  let row: { id: string; name: string; rel_path: string; updated_at: string } | undefined
+  if (fileIdArg) {
+    row = deps.db
+      .prepare(
+        `SELECT id, name, rel_path, updated_at FROM workspace_files
+          WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
+      )
+      .get(fileIdArg, actor.subject.companyId) as typeof row
+  } else if (pathArg) {
+    row = deps.db
+      .prepare(
+        `SELECT id, name, rel_path, updated_at FROM workspace_files
+          WHERE company_id = ? AND owner_user_id = ? AND deleted_at IS NULL
+            AND (rel_path = ? OR name = ?)
+          ORDER BY updated_at DESC LIMIT 1`,
+      )
+      .get(actor.subject.companyId, actor.subject.userId, pathArg, pathArg) as typeof row
+  } else {
+    throw new EabError(EC.VALIDATION, 'fileId 和 path 至少提供一个')
+  }
+  if (!row) throw new EabError(EC.NOT_FOUND, '云空间里没有找到该文件')
+  const file = readUserWorkspaceFile(deps, actor, row.id)
+  return {
+    fileId: file.id,
+    name: file.name,
+    relPath: file.relPath,
+    version: row.updated_at,
+    buffer: file.buffer,
+  }
+}
+
+function resolveOfficeDocx(
+  deps: ServerDeps,
+  actor: RequestActor,
+  args: Record<string, unknown>,
+): OfficeFileRef {
+  const file = resolveOfficeFile(deps, actor, args)
+  if (!/\.docx$/i.test(file.name)) {
+    throw new EabError(EC.VALIDATION, `${file.name} 不是 docx；xlsx/xlsm/pptx 请用 office.find/office.replace 做局部替换`)
+  }
+  return file
 }
 
 /** 取当前对话对应的钉钉机器人单聊 openConversationId；网页会话或旧会话可能为空。 */
@@ -936,10 +1345,17 @@ function openConversationIdForTool(
 }
 
 /** 给对话模型用的工具声明：内置工具 + 当前员工已安装且启用插件的工具。 */
-export function toolSpecsForActor(db: Db, actor: Actor, space: ActiveSpace = { kind: 'cloud' }): ChatToolSpec[] {
+export function toolSpecsForActor(
+  db: Db,
+  actor: Actor,
+  space: ActiveSpace = { kind: 'cloud' },
+  query = '',
+): ChatToolSpec[] {
+  const roleAccess = readToolRoleAccessMap(db, actor.subject.companyId)
   const builtin: ChatToolSpec[] = TOOLS.filter(
     (tool) =>
       !tool.dangerous &&
+      toolAllowedForRoles(roleAccess.get(tool.id), actor.subject.roles ?? []) &&
       actor.subject.scopes.has(tool.scope) &&
       toolAllowedInSpace(tool.id, space),
   ).map((tool): ChatToolSpec => ({
@@ -950,7 +1366,10 @@ export function toolSpecsForActor(db: Db, actor: Actor, space: ActiveSpace = { k
       parameters: {
         type: 'object',
         properties: Object.fromEntries(
-          Object.entries(tool.input).map(([key, value]) => [key, { type: value.type, description: value.description }]),
+          Object.entries(tool.input).map(([key, value]) => {
+            const { required: _required, ...schema } = value
+            return [key, schema]
+          }),
         ),
         required: Object.entries(tool.input)
           .filter(([, value]) => value.required)
@@ -960,7 +1379,9 @@ export function toolSpecsForActor(db: Db, actor: Actor, space: ActiveSpace = { k
     },
   }))
   const builtinNames = new Set(builtin.map((tool) => tool.function.name))
-  const pluginSpecs = pluginToolSpecsFor(db, actor)
+  const pluginSpecs = pluginToolSpecsFor(db, actor, {
+    preferPersonal: prefersPersonalPluginTools(query),
+  })
     .map((spec) => spec as unknown as ChatToolSpec)
     // 插件工具不能覆盖 EAB 内置工具的同名 function
     .filter((spec) => !builtinNames.has(spec.function.name))
@@ -968,16 +1389,47 @@ export function toolSpecsForActor(db: Db, actor: Actor, space: ActiveSpace = { k
 }
 
 /** 执行一个工具。鉴权在本函数内再做一次，调用方仍需自己处理高危审批。 */
+/**
+ * 工具参数兜底：模型漏传 fileId / path 时，回落到右侧预览文件。
+ * 规则刻意保守：
+ * - 只在「fileId 和 path 都没给」时才补，绝不覆盖模型自己写的值；
+ * - office_* 补 fileId；workspace.read 补相对路径；
+ * - 其它工具一律不动，避免张冠李戴。
+ */
+export function withActiveFileDefaults(
+  toolId: string,
+  args: Record<string, unknown>,
+  activeFile?: { id: string; relPath?: string },
+): Record<string, unknown> {
+  if (!activeFile?.id) return args
+  const hasFileId = typeof args.fileId === 'string' && args.fileId.trim() !== ''
+  const hasPath = typeof args.path === 'string' && args.path.trim() !== ''
+  if (toolId.startsWith('office.')) {
+    return hasFileId || hasPath ? args : { ...args, fileId: activeFile.id }
+  }
+  if (toolId === 'workspace.read' && !hasPath && activeFile.relPath) {
+    return { ...args, path: activeFile.relPath }
+  }
+  return args
+}
+
 export async function executeTool(
   deps: ServerDeps,
   actor: Actor,
   toolId: string,
-  args: Record<string, unknown>,
+  rawArgs: Record<string, unknown>,
   space: ActiveSpace = { kind: 'cloud' },
   context: ToolExecutionContext = {},
 ): Promise<unknown> {
   const tool = TOOLS.find((item) => item.id === toolId)
   if (!tool) throw new EabError(EC.NOT_FOUND, `工具不存在: ${toolId}`)
+  const args = withActiveFileDefaults(tool.id, rawArgs, context.activeFile)
+  if (!toolAllowedForActor(deps.db, actor, tool.id)) {
+    throw new EabError(EC.FORBIDDEN, `当前角色不可使用工具「${tool.name}」`, {
+      details: { toolId: tool.id, roles: actor.subject.roles ?? [] },
+      hint: '请管理员在控制台「工具」页调整该工具的可用角色',
+    })
+  }
   requireScope(actor.subject, tool.scope)
   if (!toolAllowedInSpace(tool.id, space)) {
     throw new EabError(EC.FORBIDDEN, `工具 ${tool.id} 不属于当前文件空间`)
@@ -986,12 +1438,19 @@ export async function executeTool(
   const startedAt = Date.now()
   let toolRelease: (() => void) | null = null
   try {
-    toolRelease = await toolSemaphore.acquire(tool.id, {
+    const lease = await acquireCoordinationSlot(`tool:${tool.id}`, {
       limit: toolConcurrencyLimit(tool, deps),
+      ttlSec: 300,
+      waitMs: deps.config.toolTimeoutMs ?? 30_000,
       queueLimit: deps.config.toolQueueLimit ?? 200,
-      timeoutMs: deps.config.toolTimeoutMs ?? 30_000,
       signal: context.signal,
     })
+    // 从占到名额开始登记「正在执行」，随 release 一起注销（释放点只有一个，不会漏）。
+    const inflight = beginToolInflight({ toolId: tool.id, channel: context.channel ?? null })
+    toolRelease = () => {
+      inflight.end()
+      lease.release()
+    }
   } catch (error) {
     recordToolRun(tool.id, Date.now() - startedAt, 'failed', 0)
     if (error instanceof SemaphoreTimeoutError) {
@@ -1087,6 +1546,8 @@ export async function executeTool(
     switch (tool.id) {
     case 'agent.spawn':
       throw new EabError(EC.VALIDATION, 'agent.spawn 只能由对话 Agent 调度器执行')
+    case 'agent.task':
+      throw new EabError(EC.VALIDATION, 'agent.task 只能由对话 Agent 调度器执行')
     case 'tool.search':
       result = searchToolCatalog(deps.db, actor, space, String(args.query ?? ''), args.limit === undefined ? 8 : Number(args.limit))
       break
@@ -1195,6 +1656,1210 @@ export async function executeTool(
         throw new EabError(EC.VALIDATION, '文件超过 5 MB，请下载后查看')
       }
       result = { path, size: content.byteLength, text: content.toString('utf8'), truncated: false }
+      break
+    }
+    case 'office.read_outline': {
+      const file = resolveOfficeFile(deps, actor, args)
+      const operationId = `op_${ulid()}`
+      if (isXlsxFileName(file.name)) {
+        const maxCells = args.maxElements === undefined ? 200 : Number(args.maxElements)
+        const outline = readXlsxOutline(file.buffer, Number.isFinite(maxCells) ? maxCells : 200)
+        outline.fileName = file.name
+        result = {
+          fileId: file.fileId,
+          name: file.name,
+          relPath: file.relPath,
+          version: file.version,
+          operationId,
+          kind: 'xlsx',
+          sheetCount: outline.sheetCount,
+          sheets: outline.sheets,
+          truncated: outline.truncated,
+          editorSync: false,
+          wrote: false,
+        }
+        break
+      }
+      if (isPptxFileName(file.name)) {
+        const maxElements = args.maxElements === undefined ? 200 : Number(args.maxElements)
+        const outline = readPptxOutline(file.buffer, Number.isFinite(maxElements) ? maxElements : 200)
+        outline.fileName = file.name
+        result = {
+          fileId: file.fileId,
+          name: file.name,
+          relPath: file.relPath,
+          version: file.version,
+          operationId,
+          kind: 'pptx',
+          slideCount: outline.slideCount,
+          slides: outline.slides,
+          truncated: outline.truncated,
+          editorSync: false,
+          wrote: false,
+        }
+        break
+      }
+      const docx = resolveOfficeDocx(deps, actor, args)
+      const maxElements = args.maxElements === undefined ? 200 : Number(args.maxElements)
+      const outline = readDocxOutline(docx.buffer, Number.isFinite(maxElements) ? maxElements : 200)
+      outline.fileName = docx.name
+      result = {
+        fileId: docx.fileId,
+        name: docx.name,
+        relPath: docx.relPath,
+        version: docx.version,
+        operationId,
+        elementCount: outline.elementCount,
+        elements: outline.elements,
+        truncated: outline.truncated,
+        editorSync: false,
+        wrote: false,
+      }
+      break
+    }
+    case 'office.read_range': {
+      const elementId = String(args.elementId ?? '').trim()
+      if (!elementId) throw new EabError(EC.VALIDATION, 'elementId 不能为空')
+      const file = resolveOfficeFile(deps, actor, args)
+      if (isXlsxFileName(file.name)) {
+        throw new EabError(EC.VALIDATION, 'office.read_range 暂只支持 docx；xlsx/xlsm 请先用 office.read_outline 或 office.find', {
+          hint: 'xlsx 单元格读取请用 sN-rN-cN；行列范围目前由 read_outline 的 cells 覆盖。',
+        })
+      }
+      if (isPptxFileName(file.name)) {
+        throw new EabError(EC.VALIDATION, 'office.read_range 暂只支持 docx；pptx 请先用 office.read_outline 或 office.find', {
+          hint: 'pptx 段落读取请用 sN-pM。',
+        })
+      }
+      const docx = resolveOfficeDocx(deps, actor, args)
+      const start = args.start === undefined ? undefined : Number(args.start)
+      const end = args.end === undefined ? undefined : Number(args.end)
+      if (start !== undefined && !Number.isFinite(start)) throw new EabError(EC.VALIDATION, 'start 必须是数字')
+      if (end !== undefined && !Number.isFinite(end)) throw new EabError(EC.VALIDATION, 'end 必须是数字')
+      let range
+      try {
+        range = readDocxRange(docx.buffer, {
+          elementId,
+          ...(start === undefined ? {} : { start }),
+          ...(end === undefined ? {} : { end }),
+        })
+      } catch (error) {
+        throw new EabError(EC.VALIDATION, error instanceof Error ? error.message : String(error), {
+          hint: '先用 office.read_outline 确认 pN、tN、tN-rN、tN-cN 或 tN-rN-cN；start/end 只对 pN 和 tN-rN-cN 有效。',
+        })
+      }
+      result = {
+        fileId: docx.fileId,
+        name: docx.name,
+        relPath: docx.relPath,
+        version: docx.version,
+        operationId: `op_${ulid()}`,
+        ...range,
+        wrote: false,
+        editorSync: false,
+      }
+      break
+    }
+    case 'office.find': {
+      const query = String(args.query ?? '').trim()
+      if (!query) throw new EabError(EC.VALIDATION, 'query 不能为空')
+      const file = resolveOfficeFile(deps, actor, args)
+      const operationId = `op_${ulid()}`
+      if (isXlsxFileName(file.name)) {
+        const limit = args.limit === undefined ? 20 : Number(args.limit)
+        const matches = findInXlsx(file.buffer, query, {
+          regex: args.regex === true,
+          limit: Number.isFinite(limit) ? limit : 20,
+        })
+        result = {
+          fileId: file.fileId,
+          name: file.name,
+          relPath: file.relPath,
+          version: file.version,
+          operationId,
+          kind: 'xlsx',
+          query,
+          regex: args.regex === true,
+          matches,
+          matchCount: matches.length,
+          wrote: false,
+          hint: '调用 office.replace 时请原样传入本结果的 fileId（或同一个 path）和命中的 elementId。',
+        }
+        break
+      }
+      if (isPptxFileName(file.name)) {
+        const limit = args.limit === undefined ? 20 : Number(args.limit)
+        const matches = findInPptx(file.buffer, query, {
+          regex: args.regex === true,
+          limit: Number.isFinite(limit) ? limit : 20,
+        })
+        result = {
+          fileId: file.fileId,
+          name: file.name,
+          relPath: file.relPath,
+          version: file.version,
+          operationId,
+          kind: 'pptx',
+          query,
+          regex: args.regex === true,
+          matches,
+          matchCount: matches.length,
+          wrote: false,
+          hint: '调用 office.replace 时请原样传入本结果的 fileId（或同一个 path）和命中的 elementId（sN-pM）。',
+        }
+        break
+      }
+      const docx = resolveOfficeDocx(deps, actor, args)
+      const outline = readDocxOutline(docx.buffer, 500, { includeTableRows: true })
+      outline.fileName = docx.name
+      const limit = args.limit === undefined ? 20 : Number(args.limit)
+      const matches = findInOutline(outline, query, {
+        regex: args.regex === true,
+        limit: Number.isFinite(limit) ? limit : 20,
+      })
+      result = {
+        fileId: docx.fileId,
+        name: docx.name,
+        relPath: docx.relPath,
+        version: docx.version,
+        operationId,
+        query,
+        regex: args.regex === true,
+        matches,
+        matchCount: matches.length,
+        wrote: false,
+        hint: '调用 office.replace 时请原样传入本结果的 fileId（或同一个 path）和命中的 elementId。',
+      }
+      break
+    }
+    case 'office.revisions': {
+      const action = args.action === undefined ? 'read' : String(args.action)
+      if (!['read', 'enable', 'disable', 'accept', 'reject'].includes(action)) {
+        throw new EabError(EC.VALIDATION, 'action 只能是 read、enable、disable、accept 或 reject')
+      }
+      const file = resolveOfficeFile(deps, actor, args)
+      if (!/\.docx$/i.test(file.name)) {
+        throw new EabError(EC.VALIDATION, 'office.revisions 只支持 docx；xlsx/pptx 暂不支持修订和修订开关')
+      }
+      const operationId = `op_${ulid()}`
+      if (action === 'read') {
+        const maxRevisions = args.maxRevisions === undefined ? 200 : Number(args.maxRevisions)
+        const report = readDocxRevisions(
+          file.buffer,
+          Number.isFinite(maxRevisions) ? maxRevisions : 200,
+        )
+        result = {
+          fileId: file.fileId,
+          name: file.name,
+          relPath: file.relPath,
+          version: file.version,
+          operationId,
+          revisionCount: report.revisionCount,
+          insertions: report.insertions,
+          deletions: report.deletions,
+          authors: report.authors,
+          revisions: report.revisions,
+          truncated: report.truncated,
+          trackChanges: readDocxTrackChanges(file.buffer),
+          wrote: false,
+          hint:
+            report.revisionCount > 0
+              ? '处理修订请用 action=accept/reject，并传 revisionId 或 all=true；接受/拒绝会原子保存。'
+              : '当前文档没有 w:ins/w:del 修订；可用 office.replace 的 trackChanges=true 写入修订。',
+        }
+        break
+      }
+      if (action === 'enable' || action === 'disable') {
+        let edit
+        try {
+          edit = setDocxTrackChanges(file.buffer, action === 'enable')
+        } catch (error) {
+          throw new EabError(EC.VALIDATION, error instanceof Error ? error.message : String(error), {
+            hint: 'docx 需要可写的 word/settings.xml；当前实现会按需创建 settings 部件和关系项。',
+          })
+        }
+        if (!edit.changed) {
+          result = {
+            fileId: file.fileId,
+            name: file.name,
+            relPath: file.relPath,
+            version: file.version,
+            operationId,
+            trackChanges: edit.enabled,
+            changed: false,
+            wrote: false,
+            saved: false,
+            editorSync: false,
+          }
+          break
+        }
+        const saved = editUserWorkspaceFile(deps, actor, file.fileId, edit.buffer, {
+          source: 'office.revisions',
+          operationId,
+          action,
+        })
+        result = {
+          fileId: file.fileId,
+          name: file.name,
+          relPath: file.relPath,
+          version: saved.updatedAt,
+          operationId,
+          trackChanges: edit.enabled,
+          changed: true,
+          wrote: true,
+          saved: true,
+          editorSync: false,
+        }
+        break
+      }
+      const revisionId = args.revisionId === undefined ? undefined : String(args.revisionId).trim()
+      if (!revisionId && args.all !== true) {
+        throw new EabError(EC.VALIDATION, 'accept/reject 需要 revisionId，或 all=true 处理全部修订')
+      }
+      let edit
+      try {
+        edit = applyDocxRevisions(file.buffer, {
+          action: action === 'accept' ? 'accept' : 'reject',
+          ...(revisionId ? { revisionId } : {}),
+          ...(args.all === true ? { all: true } : {}),
+        })
+      } catch (error) {
+        throw new EabError(EC.VALIDATION, error instanceof Error ? error.message : String(error), {
+          hint: '先用 action=read 确认 revision id；移动和格式修订不在当前覆盖范围。',
+        })
+      }
+      if (edit.processed === 0) {
+        result = {
+          fileId: file.fileId,
+          name: file.name,
+          relPath: file.relPath,
+          version: file.version,
+          operationId,
+          action: edit.action,
+          processed: 0,
+          revisionIds: [],
+          remaining: edit.remaining,
+          trackChanges: edit.trackChanges,
+          wrote: false,
+          saved: false,
+          editorSync: false,
+        }
+        break
+      }
+      const saved = editUserWorkspaceFile(deps, actor, file.fileId, edit.buffer, {
+        source: 'office.revisions',
+        operationId,
+        action: edit.action,
+        processed: edit.processed,
+        revisionIds: edit.revisionIds,
+      })
+      result = {
+        fileId: file.fileId,
+        name: file.name,
+        relPath: file.relPath,
+        version: saved.updatedAt,
+        operationId,
+        action: edit.action,
+        processed: edit.processed,
+        revisionIds: edit.revisionIds,
+        remaining: edit.remaining,
+        trackChanges: edit.trackChanges,
+        wrote: true,
+        saved: true,
+        editorSync: false,
+      }
+      break
+    }
+    case 'office.insert': {
+      const elementId = String(args.elementId ?? '').trim()
+      if (!elementId) throw new EabError(EC.VALIDATION, 'elementId 不能为空')
+      const action = args.action === undefined ? 'insert' : String(args.action)
+      if (action !== 'insert' && action !== 'delete' && action !== 'merge' && action !== 'split') {
+        throw new EabError(EC.VALIDATION, 'action 只能是 insert、delete、merge 或 split')
+      }
+      if (action === 'insert' && typeof args.text !== 'string') {
+        throw new EabError(EC.VALIDATION, 'action=insert 时 text 必须是字符串')
+      }
+      const text = typeof args.text === 'string' ? args.text : ''
+      const position = args.position === undefined ? 'after' : String(args.position)
+      if (position !== 'before' && position !== 'after') {
+        throw new EabError(EC.VALIDATION, 'position 只能是 before 或 after')
+      }
+      const file = resolveOfficeFile(deps, actor, args)
+      const operationId = `op_${ulid()}`
+      if (isXlsxFileName(file.name)) {
+        if (action === 'insert' && elementId === 'workbook') {
+          let edit
+          try {
+            edit = appendXlsxSheet(file.buffer, text)
+          } catch (error) {
+            throw new EabError(EC.VALIDATION, error instanceof Error ? error.message : String(error), {
+              hint: '追加工作表用 elementId=workbook，text 传新工作表名称；名称不能超过 31 个字符，不能包含 \\ / ? * [ ] :，也不能与已有工作表重名。',
+            })
+          }
+          const saved = editUserWorkspaceFile(deps, actor, file.fileId, edit.buffer, {
+            source: 'office.insert',
+            operationId,
+            elementId: 'workbook',
+            text,
+          })
+          result = {
+            fileId: file.fileId,
+            name: file.name,
+            relPath: file.relPath,
+            version: saved.updatedAt,
+            operationId,
+            kind: 'xlsx',
+            elementId: 'workbook',
+            structureKind: 'sheet',
+            sheetId: edit.sheetId,
+            sheetName: edit.sheetName,
+            sheetCount: edit.sheetCount,
+            wrote: true,
+            saved: true,
+            editorSync: false,
+          }
+          break
+        }
+        if (action === 'delete' && /^s\d+$/i.test(elementId)) {
+          let edit
+          try {
+            edit = deleteXlsxSheet(file.buffer, elementId)
+          } catch (error) {
+            throw new EabError(EC.VALIDATION, error instanceof Error ? error.message : String(error), {
+              hint: '删除工作表用 action=delete + elementId=sN；至少保留一个工作表。其他工作表公式或命名区域引用目标表时会拒绝删除，请先改引用。',
+            })
+          }
+          const saved = editUserWorkspaceFile(deps, actor, file.fileId, edit.buffer, {
+            source: 'office.insert',
+            operationId,
+            elementId,
+          })
+          result = {
+            fileId: file.fileId,
+            name: file.name,
+            relPath: file.relPath,
+            version: saved.updatedAt,
+            operationId,
+            kind: 'xlsx',
+            elementId,
+            structureKind: 'sheet',
+            deletedSheetId: edit.deletedSheetId,
+            deletedSheetName: edit.deletedSheetName,
+            remainingSheets: edit.remainingSheets,
+            wrote: true,
+            saved: true,
+            editorSync: false,
+          }
+          break
+        }
+        if (action !== 'insert') {
+          throw new EabError(EC.VALIDATION, 'xlsx 结构操作只支持插入/删除工作表、插入行/列；删除行/列、合并和拆分暂只支持 docx')
+        }
+        let edit
+        let editKind: 'row' | 'column'
+        try {
+          if (/^s\d+-c\d+$/i.test(elementId)) {
+            edit = insertXlsxColumn(file.buffer, {
+              elementId,
+              position: position as 'before' | 'after',
+              text,
+            })
+            editKind = 'column'
+          } else {
+            edit = insertXlsxRow(file.buffer, {
+              elementId,
+              position: position as 'before' | 'after',
+              text,
+            })
+            editKind = 'row'
+          }
+        } catch (error) {
+          throw new EabError(EC.VALIDATION, error instanceof Error ? error.message : String(error), {
+            hint: '先用 office.read_outline 确认工作表 sN、目标行号 rN 或列号 cN；行 text 用制表符分隔多列，列 text 用换行分隔各行值。含公式或数据验证的工作表会拒绝结构插入。',
+          })
+        }
+        const saved = editUserWorkspaceFile(deps, actor, file.fileId, edit.buffer, {
+          source: 'office.insert',
+          operationId,
+          elementId: edit.elementId,
+          text,
+        })
+        result = {
+          fileId: file.fileId,
+          name: file.name,
+          relPath: file.relPath,
+          version: saved.updatedAt,
+          operationId,
+          kind: 'xlsx',
+          elementId: edit.elementId,
+          structureKind: editKind,
+          ...(editKind === 'row'
+            ? { insertedRow: (edit as { insertedRow: number }).insertedRow }
+            : { insertedColumn: (edit as { insertedColumn: number }).insertedColumn }),
+          insertedValues: edit.insertedValues,
+          wrote: true,
+          saved: true,
+          editorSync: false,
+        }
+        break
+      }
+      if (isPptxFileName(file.name)) {
+        throw new EabError(EC.VALIDATION, 'pptx 暂不支持结构插入、删除、合并或拆分；请用 office.replace 替换指定段落文本')
+      }
+      const docx = resolveOfficeDocx(deps, actor, args)
+      const tableStructure = /^t\d+-r\d+$/i.test(elementId) || /^t\d+-c\d+$/i.test(elementId)
+      if (action === 'split') {
+        let split
+        try {
+          split = splitDocxTableMergedCells(docx.buffer, { elementId })
+        } catch (error) {
+          throw new EabError(EC.VALIDATION, error instanceof Error ? error.message : String(error), {
+            hint: 'action=split 的 elementId 必须是整张表 tN；拆分后表格每行单元格数等于 gridCol 数。',
+          })
+        }
+        const saved = editUserWorkspaceFile(deps, actor, docx.fileId, split.buffer, {
+          source: 'office.insert',
+          operationId,
+          action,
+          elementId: split.elementId,
+          splitCells: split.splitCells,
+        })
+        result = {
+          fileId: docx.fileId,
+          name: docx.name,
+          relPath: docx.relPath,
+          version: saved.updatedAt,
+          operationId,
+          action,
+          elementId: split.elementId,
+          kind: 'docx',
+          structureKind: split.kind,
+          splitCells: split.splitCells,
+          remainingRows: split.remainingRows,
+          remainingColumns: split.remainingColumns,
+          wrote: true,
+          saved: true,
+          editorSync: false,
+        }
+        break
+      }
+      if (action === 'merge') {
+        let merged
+        try {
+          merged = mergeDocxTableCells(docx.buffer, { range: elementId })
+        } catch (error) {
+          throw new EabError(EC.VALIDATION, error instanceof Error ? error.message : String(error), {
+            hint: 'action=merge 用 elementId=tN-rA-cA:tN-rB-cB；区域必须无合并单元格，且除左上角外不能有文本。',
+          })
+        }
+        const saved = editUserWorkspaceFile(deps, actor, docx.fileId, merged.buffer, {
+          source: 'office.insert',
+          operationId,
+          action,
+          elementId: merged.elementId,
+          mergedRows: merged.mergedRows,
+          mergedColumns: merged.mergedColumns,
+        })
+        result = {
+          fileId: docx.fileId,
+          name: docx.name,
+          relPath: docx.relPath,
+          version: saved.updatedAt,
+          operationId,
+          action,
+          elementId: merged.elementId,
+          kind: 'docx',
+          structureKind: merged.kind,
+          mergedRows: merged.mergedRows,
+          mergedColumns: merged.mergedColumns,
+          remainingRows: merged.remainingRows,
+          remainingColumns: merged.remainingColumns,
+          wrote: true,
+          saved: true,
+          editorSync: false,
+        }
+        break
+      }
+      if (action === 'delete') {
+        if (!tableStructure) {
+          throw new EabError(EC.VALIDATION, 'action=delete 只支持 docx 表格行 tN-rN 或表格列 tN-cN')
+        }
+        let deletion
+        try {
+          deletion = deleteDocxTable(docx.buffer, { elementId })
+        } catch (error) {
+          throw new EabError(EC.VALIDATION, error instanceof Error ? error.message : String(error), {
+            hint: '先用 office.read_outline 确认 tN-rN 或 tN-cN；表格至少保留一行/一列；删除列按 grid 列号计算，含 gridSpan/vMerge 的表会直接缩减或移除对应网格单元格。',
+          })
+        }
+        const saved = editUserWorkspaceFile(deps, actor, docx.fileId, deletion.buffer, {
+          source: 'office.insert',
+          operationId,
+          action,
+          elementId: deletion.elementId,
+        })
+        result = {
+          fileId: docx.fileId,
+          name: docx.name,
+          relPath: docx.relPath,
+          version: saved.updatedAt,
+          operationId,
+          action,
+          elementId: deletion.elementId,
+          kind: 'docx',
+          structureKind: deletion.kind,
+          ...(deletion.kind === 'table_row'
+            ? { deletedRow: deletion.deletedRow }
+            : { deletedColumn: deletion.deletedColumn }),
+          remainingRows: deletion.remainingRows,
+          remainingColumns: deletion.remainingColumns,
+          wrote: true,
+          saved: true,
+          editorSync: false,
+        }
+        break
+      }
+      let edit
+      try {
+        edit = tableStructure
+          ? insertDocxTable(docx.buffer, { elementId, position, text })
+          : insertDocxText(docx.buffer, { elementId, position, text })
+      } catch (error) {
+        throw new EabError(EC.VALIDATION, error instanceof Error ? error.message : String(error), {
+          hint: '先用 office.read_outline 确认 pN、tN、tN-rN-cN、tN-rN 或 tN-cN；行 text 用制表符分隔多列，列 text 用换行分隔各行值；目标行含纵向合并或表格含合并单元格时，请先 action=split。',
+        })
+      }
+      const saved = editUserWorkspaceFile(deps, actor, docx.fileId, edit.buffer, {
+        source: 'office.insert',
+        operationId,
+        elementId: edit.elementId,
+        position: edit.position,
+        text,
+      })
+      result = tableStructure
+        ? {
+            fileId: docx.fileId,
+            name: docx.name,
+            relPath: docx.relPath,
+            version: saved.updatedAt,
+            operationId,
+            elementId: edit.elementId,
+            kind: 'docx',
+            structureKind: (edit as { kind: string }).kind,
+            position: edit.position,
+            insertedValues: (edit as { insertedValues: string[] }).insertedValues,
+            wrote: true,
+            saved: true,
+            editorSync: false,
+          }
+        : {
+            fileId: docx.fileId,
+            name: docx.name,
+            relPath: docx.relPath,
+            version: saved.updatedAt,
+            operationId,
+            elementId: edit.elementId,
+            kind: (edit as { kind: string }).kind,
+            position: edit.position,
+            insertedText: (edit as { insertedText: string }).insertedText,
+            wrote: true,
+            saved: true,
+            editorSync: false,
+          }
+      break
+    }
+    case 'office.format': {
+      const elementId = String(args.elementId ?? '').trim()
+      if (!elementId) throw new EabError(EC.VALIDATION, 'elementId 不能为空')
+      const boolArg = (name: string): boolean | undefined => {
+        const value = args[name]
+        if (value === undefined) return undefined
+        if (typeof value !== 'boolean') throw new EabError(EC.VALIDATION, `${name} 必须是布尔值`)
+        return value
+      }
+      const bold = boolArg('bold')
+      const italic = boolArg('italic')
+      let underline: boolean | string | undefined
+      if (args.underline !== undefined) {
+        if (typeof args.underline === 'boolean') underline = args.underline
+        else if (typeof args.underline === 'string') {
+          const value = args.underline.trim()
+          if (value === 'true' || value === 'false') underline = value === 'true'
+          else underline = value
+        } else throw new EabError(EC.VALIDATION, 'underline 必须是布尔值或下划线样式')
+      }
+      const color = args.color === undefined ? undefined : String(args.color)
+      const highlight = args.highlight === undefined ? undefined : String(args.highlight)
+      const fill = args.fill === undefined ? undefined : String(args.fill)
+      const numberFormat = args.numberFormat === undefined ? undefined : String(args.numberFormat)
+      const fontFamily = args.fontFamily === undefined ? undefined : String(args.fontFamily)
+      const align = args.align === undefined ? undefined : String(args.align)
+      const fontSize = args.fontSize === undefined ? undefined : Number(args.fontSize)
+      if (fontSize !== undefined && !Number.isFinite(fontSize)) {
+        throw new EabError(EC.VALIDATION, 'fontSize 必须是数字')
+      }
+      const numberArg = (name: string): number | undefined => {
+        if (args[name] === undefined) return undefined
+        const value = Number(args[name])
+        if (!Number.isFinite(value)) throw new EabError(EC.VALIDATION, `${name} 必须是数字`)
+        return value
+      }
+      const lineSpacing = numberArg('lineSpacing')
+      const spaceBefore = numberArg('spaceBefore')
+      const spaceAfter = numberArg('spaceAfter')
+      const columnWidth = numberArg('columnWidth')
+      const rowHeight = numberArg('rowHeight')
+      if (
+        bold === undefined &&
+        italic === undefined &&
+        underline === undefined &&
+        color === undefined &&
+        highlight === undefined &&
+        fill === undefined &&
+        numberFormat === undefined &&
+        fontSize === undefined &&
+        fontFamily === undefined &&
+        align === undefined &&
+        lineSpacing === undefined &&
+        spaceBefore === undefined &&
+        spaceAfter === undefined &&
+        columnWidth === undefined &&
+        rowHeight === undefined
+      ) {
+        throw new EabError(EC.VALIDATION, '至少指定一个格式属性：bold、italic、underline、color、highlight、fill、fontSize、fontFamily、numberFormat、align、lineSpacing、spaceBefore、spaceAfter、columnWidth 或 rowHeight')
+      }
+      const file = resolveOfficeFile(deps, actor, args)
+      const operationId = `op_${ulid()}`
+      if (isXlsxFileName(file.name)) {
+        if (highlight !== undefined) {
+          throw new EabError(EC.VALIDATION, 'xlsx 单元格请用 fill 指定填充色，不用 highlight')
+        }
+        if (
+          columnWidth !== undefined ||
+          rowHeight !== undefined ||
+          /^s\d+-[cr]\d+(?::[cr]\d+)?$/i.test(elementId)
+        ) {
+          const hasCellFormat =
+            bold !== undefined ||
+            italic !== undefined ||
+            underline !== undefined ||
+            color !== undefined ||
+            fill !== undefined ||
+            fontSize !== undefined ||
+            numberFormat !== undefined ||
+            fontFamily !== undefined ||
+            align !== undefined ||
+            lineSpacing !== undefined ||
+            spaceBefore !== undefined ||
+            spaceAfter !== undefined
+          if (hasCellFormat) {
+            throw new EabError(EC.VALIDATION, 'xlsx 列宽/行高不能和单元格样式同时设置；请分两次调用')
+          }
+          let edit
+          try {
+            edit = formatXlsxDimension(file.buffer, {
+              elementId,
+              ...(columnWidth === undefined ? {} : { columnWidth }),
+              ...(rowHeight === undefined ? {} : { rowHeight }),
+            })
+          } catch (error) {
+            throw new EabError(EC.VALIDATION, error instanceof Error ? error.message : String(error), {
+              hint: 'xlsx 列宽用 elementId=sN-cN 或 sN-c2:c4 + columnWidth（列号 1-16384）；行高用 elementId=sN-rN 或 sN-r2:r4 + rowHeight（行号 1-1048576，单次最多 20000 行）。',
+            })
+          }
+          const saved = editUserWorkspaceFile(deps, actor, file.fileId, edit.buffer, {
+            source: 'office.format',
+            operationId,
+            elementId: edit.elementId,
+            applied: edit.applied,
+          })
+          result = {
+            fileId: file.fileId,
+            name: file.name,
+            relPath: file.relPath,
+            version: saved.updatedAt,
+            operationId,
+            elementId: edit.elementId,
+            kind: edit.kind,
+            applied: edit.applied,
+            ...(edit.columns === undefined ? {} : { columns: edit.columns }),
+            ...(edit.rows === undefined ? {} : { rows: edit.rows }),
+            wrote: true,
+            saved: true,
+            editorSync: false,
+          }
+          break
+        }
+        if (fontFamily !== undefined || align !== undefined || lineSpacing !== undefined || spaceBefore !== undefined || spaceAfter !== undefined) {
+          throw new EabError(EC.VALIDATION, 'xlsx 暂不支持 fontFamily、align、lineSpacing、spaceBefore、spaceAfter；请改用 bold、italic、underline、color、fill、fontSize 或 numberFormat')
+        }
+        let edit
+        try {
+          edit = formatXlsxCell(file.buffer, {
+            elementId,
+            ...(bold === undefined ? {} : { bold }),
+            ...(italic === undefined ? {} : { italic }),
+            ...(underline === undefined ? {} : { underline }),
+            ...(color === undefined ? {} : { color }),
+            ...(fill === undefined ? {} : { fill }),
+            ...(fontSize === undefined ? {} : { fontSize }),
+            ...(numberFormat === undefined ? {} : { numberFormat }),
+          })
+        } catch (error) {
+          throw new EabError(EC.VALIDATION, error instanceof Error ? error.message : String(error), {
+            hint: 'xlsx 单元格用 sN-rN-cN；空单元格请先用 office.replace 写入内容，再设置格式。',
+          })
+        }
+        const saved = editUserWorkspaceFile(deps, actor, file.fileId, edit.buffer, {
+          source: 'office.format',
+          operationId,
+          elementId: edit.elementId,
+          applied: edit.applied,
+        })
+        result = {
+          fileId: file.fileId,
+          name: file.name,
+          relPath: file.relPath,
+          version: saved.updatedAt,
+          operationId,
+          elementId: edit.elementId,
+          kind: edit.kind,
+          applied: edit.applied,
+          styleIndex: edit.styleIndex,
+          wrote: true,
+          saved: true,
+          editorSync: false,
+        }
+        break
+      }
+      if (!/\.docx$/i.test(file.name)) {
+        throw new EabError(EC.VALIDATION, `${file.name} 不是 docx 或 xlsx/xlsm，暂不支持格式设置`)
+      }
+      if (columnWidth !== undefined || rowHeight !== undefined) {
+        throw new EabError(EC.VALIDATION, 'columnWidth、rowHeight 只适用于 xlsx/xlsm，docx 请使用段落或表格单元格格式')
+      }
+      const docx = file
+      let edit
+      try {
+        edit = formatDocxText(docx.buffer, {
+          elementId,
+          ...(bold === undefined ? {} : { bold }),
+          ...(italic === undefined ? {} : { italic }),
+          ...(underline === undefined ? {} : { underline }),
+          ...(color === undefined ? {} : { color }),
+          ...(highlight === undefined ? {} : { highlight }),
+          ...(fontSize === undefined ? {} : { fontSize }),
+          ...(fontFamily === undefined ? {} : { fontFamily }),
+          ...(align === undefined ? {} : { align }),
+          ...(lineSpacing === undefined ? {} : { lineSpacing }),
+          ...(spaceBefore === undefined ? {} : { spaceBefore }),
+          ...(spaceAfter === undefined ? {} : { spaceAfter }),
+        })
+      } catch (error) {
+        throw new EabError(EC.VALIDATION, error instanceof Error ? error.message : String(error), {
+          hint: '先用 office.find 确认 pN 或 tN-rN-cN；只给目标元素设置格式，不要整篇重排。',
+        })
+      }
+      const saved = editUserWorkspaceFile(deps, actor, docx.fileId, edit.buffer, {
+        source: 'office.format',
+        operationId,
+        elementId: edit.elementId,
+        applied: edit.applied,
+      })
+      result = {
+        fileId: docx.fileId,
+        name: docx.name,
+        relPath: docx.relPath,
+        version: saved.updatedAt,
+        operationId,
+        elementId: edit.elementId,
+        kind: edit.kind,
+        applied: edit.applied,
+        runCount: edit.runCount,
+        wrote: true,
+        saved: true,
+        editorSync: false,
+      }
+      break
+    }
+    case 'office.comment': {
+      const action = args.action === undefined ? 'add' : String(args.action)
+      if (!['add', 'list', 'reply', 'resolve', 'delete'].includes(action)) {
+        throw new EabError(EC.VALIDATION, 'action 只能是 add、list、reply、resolve 或 delete')
+      }
+      const file = resolveOfficeFile(deps, actor, args)
+      if (/\.(xlsx|xlsm)$/i.test(file.name)) {
+        if (action === 'reply' || action === 'resolve') {
+          throw new EabError(EC.VALIDATION, 'xlsx 单元格批注是扁平批注，不支持 reply 或 resolve；请用 add/list/delete')
+        }
+        const operationId = `op_${ulid()}`
+        if (action === 'list') {
+          const comments = readXlsxComments(file.buffer)
+          result = {
+            fileId: file.fileId,
+            name: file.name,
+            relPath: file.relPath,
+            version: file.version,
+            operationId,
+            action: 'list',
+            kind: 'xlsx',
+            total: comments.total,
+            resolved: comments.resolvedCount,
+            unresolved: comments.open,
+            comments: comments.comments,
+            wrote: false,
+            editorSync: false,
+          }
+          break
+        }
+        if (action === 'add') {
+          const elementId = String(args.elementId ?? '').trim()
+          if (!elementId) throw new EabError(EC.VALIDATION, 'xlsx add 时 elementId 不能为空，请传 sN-rN-cN')
+          if (typeof args.text !== 'string' || !args.text.trim()) {
+            throw new EabError(EC.VALIDATION, 'text 不能为空')
+          }
+          if (args.oldText !== undefined || args.start !== undefined || args.end !== undefined || args.occurrence !== undefined) {
+            throw new EabError(EC.VALIDATION, 'xlsx 批注不支持 oldText/start/end/occurrence，请直接给单元格加批注')
+          }
+          const author = args.author === undefined ? undefined : String(args.author).trim()
+          let edit
+          try {
+            edit = addXlsxCellComment(file.buffer, {
+              elementId,
+              text: args.text,
+              ...(author ? { author } : {}),
+            })
+          } catch (error) {
+            throw new EabError(EC.VALIDATION, error instanceof Error ? error.message : String(error), {
+              hint: '先用 office.find 或 office.read_outline 确认 xlsx 的 sN-rN-cN；同一单元格只能有一条批注。',
+            })
+          }
+          const saved = editUserWorkspaceFile(deps, actor, file.fileId, edit.buffer, {
+            source: 'office.comment',
+            operationId,
+            action,
+            elementId: edit.elementId,
+            commentId: edit.commentId,
+            author: edit.author,
+            text: edit.text,
+          })
+          result = {
+            fileId: file.fileId,
+            name: file.name,
+            relPath: file.relPath,
+            version: saved.updatedAt,
+            operationId,
+            action,
+            kind: edit.kind,
+            elementId: edit.elementId,
+            sheetId: edit.sheetId,
+            sheetName: edit.sheetName,
+            cell: edit.cell,
+            commentId: edit.commentId,
+            author: edit.author,
+            wrote: true,
+            saved: true,
+            editorSync: false,
+          }
+          break
+        }
+        const elementIdArg = args.elementId === undefined ? '' : String(args.elementId).trim()
+        const commentIdArg = args.commentId === undefined ? undefined : Number(args.commentId)
+        if (commentIdArg !== undefined && (!Number.isInteger(commentIdArg) || commentIdArg < 1)) {
+          throw new EabError(EC.VALIDATION, 'commentId 必须是正整数')
+        }
+        if (elementIdArg && commentIdArg !== undefined) {
+          throw new EabError(EC.VALIDATION, 'xlsx delete 时 elementId 和 commentId 只能二选一')
+        }
+        if (!elementIdArg && commentIdArg === undefined) {
+          throw new EabError(EC.VALIDATION, 'xlsx delete 需要 elementId 或 commentId')
+        }
+        let edit
+        try {
+          edit = deleteXlsxCellComment(file.buffer, {
+            ...(elementIdArg ? { elementId: elementIdArg } : {}),
+            ...(commentIdArg === undefined ? {} : { commentId: commentIdArg }),
+          })
+        } catch (error) {
+          throw new EabError(EC.VALIDATION, error instanceof Error ? error.message : String(error), {
+            hint: '先用 action=list 确认单元格和 commentId；删除最后一个批注会同时清理 comments、VML 和关系项。',
+          })
+        }
+        const saved = editUserWorkspaceFile(deps, actor, file.fileId, edit.buffer, {
+          source: 'office.comment',
+          operationId,
+          action,
+          elementId: edit.elementId,
+          commentId: edit.commentId,
+          remaining: edit.remaining,
+        })
+        result = {
+          fileId: file.fileId,
+          name: file.name,
+          relPath: file.relPath,
+          version: saved.updatedAt,
+          operationId,
+          action,
+          kind: edit.kind,
+          elementId: edit.elementId,
+          sheetId: edit.sheetId,
+          sheetName: edit.sheetName,
+          cell: edit.cell,
+          commentId: edit.commentId,
+          deleted: edit.deleted,
+          remaining: edit.remaining,
+          wrote: true,
+          saved: true,
+          editorSync: false,
+        }
+        break
+      }
+      const docx = resolveOfficeDocx(deps, actor, args)
+      const operationId = `op_${ulid()}`
+      if (action === 'list') {
+        const comments = readDocxComments(docx.buffer)
+        result = {
+          fileId: docx.fileId,
+          name: docx.name,
+          relPath: docx.relPath,
+          version: docx.version,
+          operationId,
+          action: 'list',
+          total: comments.total,
+          resolved: comments.resolvedCount,
+          unresolved: comments.open,
+          comments: comments.comments,
+          wrote: false,
+          editorSync: false,
+        }
+        break
+      }
+      const commentIdArg = args.commentId === undefined ? undefined : Number(args.commentId)
+      if (action !== 'add' && (commentIdArg === undefined || !Number.isInteger(commentIdArg) || commentIdArg < 1)) {
+        throw new EabError(EC.VALIDATION, 'commentId 必须是正整数')
+      }
+      const commentId = commentIdArg ?? 0
+      const author = args.author === undefined ? undefined : String(args.author).trim()
+      let edit
+      try {
+        if (action === 'add') {
+          const elementId = String(args.elementId ?? '').trim()
+          if (!elementId) throw new EabError(EC.VALIDATION, 'elementId 不能为空')
+          if (typeof args.text !== 'string' || !args.text.trim()) throw new EabError(EC.VALIDATION, 'text 不能为空')
+          const oldText = args.oldText === undefined ? undefined : String(args.oldText)
+          const occurrenceArg = args.occurrence === undefined ? undefined : Number(args.occurrence)
+          if (occurrenceArg !== undefined && (!Number.isInteger(occurrenceArg) || occurrenceArg < 1)) {
+            throw new EabError(EC.VALIDATION, 'occurrence 必须是正整数')
+          }
+          const start = args.start === undefined ? undefined : Number(args.start)
+          const end = args.end === undefined ? undefined : Number(args.end)
+          if (oldText !== undefined && (start !== undefined || end !== undefined)) {
+            throw new EabError(EC.VALIDATION, 'oldText 和 start/end 只能二选一')
+          }
+          edit = addDocxComment(docx.buffer, {
+            elementId,
+            text: args.text,
+            ...(author ? { author } : {}),
+            ...(oldText !== undefined ? { oldText } : {}),
+            ...(occurrenceArg !== undefined ? { occurrence: occurrenceArg } : {}),
+            ...(start === undefined ? {} : { start }),
+            ...(end === undefined ? {} : { end }),
+          })
+          const saved = editUserWorkspaceFile(deps, actor, docx.fileId, edit.buffer, {
+            source: 'office.comment',
+            operationId,
+            action,
+            elementId: edit.elementId,
+            commentId: edit.commentId,
+            author: edit.author,
+            text: edit.text,
+          })
+          result = {
+            fileId: docx.fileId,
+            name: docx.name,
+            relPath: docx.relPath,
+            version: saved.updatedAt,
+            operationId,
+            action,
+            elementId: edit.elementId,
+            kind: edit.kind,
+            commentId: edit.commentId,
+            author: edit.author,
+            ...(edit.start === undefined ? {} : { start: edit.start }),
+            ...(edit.end === undefined ? {} : { end: edit.end }),
+            wrote: true,
+            saved: true,
+            editorSync: false,
+          }
+          break
+        }
+        if (action === 'reply') {
+          if (typeof args.text !== 'string' || !args.text.trim()) throw new EabError(EC.VALIDATION, 'text 不能为空')
+          edit = replyDocxComment(docx.buffer, {
+            commentId,
+            text: args.text,
+            ...(author ? { author } : {}),
+          })
+        } else if (action === 'resolve') {
+          edit = resolveDocxComment(docx.buffer, {
+            commentId,
+            resolved: args.resolved !== false,
+          })
+        } else {
+          edit = deleteDocxComment(docx.buffer, { commentId })
+        }
+      } catch (error) {
+        if (error instanceof EabError) throw error
+        throw new EabError(EC.VALIDATION, error instanceof Error ? error.message : String(error), {
+          hint:
+            action === 'add'
+              ? '先用 office.find 确认 pN 或 tN-rN-cN；批注范围可传 oldText 或 start/end 收窄到短语。'
+              : '先用 action=list 确认 commentId；删除会连同回复和锚点一起移除。',
+        })
+      }
+      const saved = editUserWorkspaceFile(deps, actor, docx.fileId, edit.buffer, {
+        source: 'office.comment',
+        operationId,
+        action: edit.action,
+        commentId: edit.commentId,
+        ...(edit.replyId === undefined ? {} : { replyId: edit.replyId }),
+        ...(edit.deletedIds === undefined ? {} : { deletedIds: edit.deletedIds }),
+      })
+      result = {
+        fileId: docx.fileId,
+        name: docx.name,
+        relPath: docx.relPath,
+        version: saved.updatedAt,
+        operationId,
+        action: edit.action,
+        commentId: edit.commentId,
+        ...(edit.replyId === undefined ? {} : { replyId: edit.replyId }),
+        ...(edit.resolved === undefined ? {} : { resolved: edit.resolved }),
+        ...(edit.deletedIds === undefined ? {} : { deletedIds: edit.deletedIds }),
+        wrote: true,
+        saved: true,
+        editorSync: false,
+      }
+      break
+    }
+    case 'office.replace': {
+      const elementId = String(args.elementId ?? '').trim()
+      if (!elementId) throw new EabError(EC.VALIDATION, 'elementId 不能为空')
+      if (typeof args.newText !== 'string') throw new EabError(EC.VALIDATION, 'newText 必须是字符串')
+      const file = resolveOfficeFile(deps, actor, args)
+      const operationId = `op_${ulid()}`
+      const occurrenceArg = args.occurrence === undefined ? undefined : Number(args.occurrence)
+      const commonOptions = {
+        elementId,
+        ...(typeof args.oldText === 'string' ? { oldText: args.oldText } : {}),
+        newText: args.newText,
+        ...(occurrenceArg === undefined || !Number.isFinite(occurrenceArg) ? {} : { occurrence: occurrenceArg }),
+      }
+      if (isXlsxFileName(file.name)) {
+        let edit
+        try {
+          edit = replaceXlsxCellText(file.buffer, commonOptions)
+        } catch (error) {
+          throw new EabError(EC.VALIDATION, error instanceof Error ? error.message : String(error), {
+            hint: '先用 office.find 确认 xlsx 单元格 ID（sN-rN-cN）、工作表名和原文，再只替换目标单元格；不要整表覆盖。',
+          })
+        }
+        const saved = editUserWorkspaceFile(deps, actor, file.fileId, edit.buffer, {
+          source: 'office.replace',
+          operationId,
+          elementId: edit.elementId,
+          replacements: edit.replacements,
+        })
+        result = {
+          fileId: file.fileId,
+          name: file.name,
+          relPath: file.relPath,
+          version: saved.updatedAt,
+          operationId,
+          kind: 'xlsx',
+          elementId: edit.elementId,
+          cellKind: edit.kind,
+          previousText: edit.previousText,
+          nextText: edit.nextText,
+          replacements: edit.replacements,
+          wrote: true,
+          saved: true,
+          editorSync: false,
+        }
+        break
+      }
+      if (isPptxFileName(file.name)) {
+        if (occurrenceArg === 0) {
+          throw new EabError(EC.VALIDATION, 'pptx 段落替换暂不支持 occurrence=0；请分别指定第几处')
+        }
+        let edit
+        try {
+          edit = replacePptxText(file.buffer, commonOptions)
+        } catch (error) {
+          throw new EabError(EC.VALIDATION, error instanceof Error ? error.message : String(error), {
+            hint: '先用 office.find 确认 pptx 段落 ID（sN-pM）和原文；跨 run 时新文本沿用第一个 run 的格式。',
+          })
+        }
+        const saved = editUserWorkspaceFile(deps, actor, file.fileId, edit.buffer, {
+          source: 'office.replace',
+          operationId,
+          elementId: edit.elementId,
+          replacements: edit.replacements,
+        })
+        result = {
+          fileId: file.fileId,
+          name: file.name,
+          relPath: file.relPath,
+          version: saved.updatedAt,
+          operationId,
+          kind: 'pptx',
+          elementId: edit.elementId,
+          paragraphKind: edit.kind,
+          previousText: edit.previousText,
+          nextText: edit.nextText,
+          replacements: edit.replacements,
+          wrote: true,
+          saved: true,
+          editorSync: false,
+        }
+        break
+      }
+      const docx = resolveOfficeDocx(deps, actor, args)
+      let edit
+      try {
+        edit = replaceDocxText(docx.buffer, {
+          ...commonOptions,
+          ...(args.trackChanges === true ? { trackChanges: true } : {}),
+          ...(typeof args.author === 'string' && args.author.trim() ? { author: args.author.trim() } : {}),
+        })
+      } catch (error) {
+        throw new EabError(EC.VALIDATION, error instanceof Error ? error.message : String(error), {
+          hint: '先用 office.find 确认 elementId 与原文，再只替换目标片段；不要整篇重写。需要保留修订标记时传 trackChanges=true。',
+        })
+      }
+      const saved = editUserWorkspaceFile(deps, actor, docx.fileId, edit.buffer, {
+        source: 'office.replace',
+        operationId,
+        elementId: edit.elementId,
+        replacements: edit.replacements,
+      })
+      result = {
+        fileId: docx.fileId,
+        name: docx.name,
+        relPath: docx.relPath,
+        version: saved.updatedAt,
+        operationId,
+        elementId: edit.elementId,
+        kind: edit.kind,
+        previousText: edit.previousText,
+        nextText: edit.nextText,
+        replacements: edit.replacements,
+        ...(edit.tracked ? { trackChanges: true } : {}),
+        wrote: true,
+        saved: true,
+        editorSync: false,
+      }
       break
     }
     case 'workspace.send_dingtalk': {
@@ -1372,6 +3037,56 @@ export async function executeTool(
       }
       break
     }
+    case 'memory.propose': {
+      const content = String(args.content ?? '').trim()
+      if (!content) throw new EabError(EC.VALIDATION, '团队学习内容不能为空')
+      if (content.length > 1000) throw new EabError(EC.VALIDATION, '单条团队学习最多 1000 字')
+      const duplicate = deps.db
+        .prepare(
+          `SELECT id, confirmed FROM memories
+            WHERE company_id = ? AND scope_type = 'company' AND scope_id = ? AND deleted_at IS NULL AND content = ?
+            LIMIT 1`,
+        )
+        .get(actor.subject.companyId, actor.subject.companyId, content) as { id: string; confirmed: number } | undefined
+      if (duplicate) {
+        result = {
+          id: duplicate.id,
+          scopeType: 'company',
+          confirmed: duplicate.confirmed === 1,
+          status: duplicate.confirmed === 1 ? 'active' : 'pending',
+          duplicate: true,
+          note: duplicate.confirmed === 1 ? '这条团队记忆已经生效' : '这条团队学习已经在待审核队列里，无需重复提交',
+        }
+        break
+      }
+      const id = `mem_${ulid()}`
+      const now = Date.now()
+      deps.db
+        .prepare(
+          `INSERT INTO memories (id, company_id, scope_type, scope_id, user_id, content, confirmed, created_at)
+           VALUES (?, ?, 'company', ?, ?, ?, 0, ?)`,
+        )
+        .run(id, actor.subject.companyId, actor.subject.companyId, actor.person.id, content, now)
+      appendAudit(deps.db, {
+        companyId: actor.subject.companyId,
+        actorUserId: actor.person.id,
+        action: 'memory.propose',
+        resourceType: 'memory',
+        resourceId: id,
+        result: 'success',
+        detail: { scopeType: 'company', length: content.length },
+        ip: null,
+        channel: 'web',
+      })
+      result = {
+        id,
+        scopeType: 'company',
+        confirmed: false,
+        status: 'pending',
+        note: '已提交团队学习候选，待管理员审核通过后对全公司所有智能体生效',
+      }
+      break
+    }
     case 'workspace.write': {
       const path = String(args.path ?? '')
       const text = String(args.text ?? '')
@@ -1387,6 +3102,7 @@ export async function executeTool(
         )
         .get(actor.subject.companyId, actor.subject.userId, path) as { id: string } | undefined
       const size = Buffer.byteLength(text, 'utf8')
+      const fileId = row?.id ?? ulid()
       if (row) {
         deps.db
           .prepare('UPDATE workspace_files SET size = ?, storage_path = ?, updated_at = ? WHERE id = ?')
@@ -1397,11 +3113,85 @@ export async function executeTool(
             `INSERT INTO workspace_files (id, company_id, scope_type, scope_id, owner_user_id, rel_path, name, size, mime, storage_path, created_at, updated_at)
              VALUES (?, ?, 'user', ?, ?, ?, ?, ?, 'text/plain', ?, ?, ?)`,
           )
-          .run(ulid(), actor.subject.companyId, actor.subject.userId, actor.subject.userId, path, basename(path), size, target, Date.now(), Date.now())
+          .run(fileId, actor.subject.companyId, actor.subject.userId, actor.subject.userId, path, basename(path), size, target, Date.now(), Date.now())
       }
-      result = { path, size }
+      result = { fileId, path, size, created: !row }
       break
     }
+    case 'workspace.edit': {
+      const path = String(args.path ?? '')
+      if (!path) throw new EabError(EC.VALIDATION, 'path 不能为空')
+      if (!isTextEditableFile(path)) {
+        throw new EabError(EC.VALIDATION, '该文件类型暂不支持 Agent 文本局部编辑', {
+          hint: 'docx 请先用 office.find 定位段落/单元格，xlsx/xlsm 请先定位单元格，pptx 请先定位段落 sN-pM，再用 office.replace 只替换该元素；workspace.edit 只支持 txt/md/csv/json/代码等文本文件。',
+        })
+      }
+      let rawEdits: unknown = args.edits
+      if (typeof rawEdits === 'string') {
+        try {
+          rawEdits = JSON.parse(rawEdits)
+        } catch {
+          throw new EabError(EC.VALIDATION, 'edits 必须是 JSON 数组')
+        }
+      }
+      if (!Array.isArray(rawEdits) || rawEdits.length === 0) {
+        throw new EabError(EC.VALIDATION, 'edits 不能为空', { hint: '每项至少包含 find 和 replace' })
+      }
+      if (rawEdits.length > 50) throw new EabError(EC.VALIDATION, '一次最多修改 50 处')
+      const edits: WorkspaceTextEdit[] = rawEdits.map((item, index) => {
+        if (!item || typeof item !== 'object') {
+          throw new EabError(EC.VALIDATION, `第 ${index + 1} 项不是有效对象`)
+        }
+        const value = item as Record<string, unknown>
+        const find = String(value.find ?? '')
+        const replace = String(value.replace ?? '')
+        if (!find) throw new EabError(EC.VALIDATION, `第 ${index + 1} 项 find 不能为空`)
+        return {
+          find,
+          replace,
+          ...(value.occurrence === undefined ? {} : { occurrence: Number(value.occurrence) }),
+        }
+      })
+      const root = userScopeDir(deps, actor.subject.companyId, actor.subject.userId)
+      const target = safeJoin(root, path)
+      if (!target) throw new EabError(EC.VALIDATION, '非法路径')
+      if (!existsSync(target)) throw new EabError(EC.NOT_FOUND, '要修改的文件不存在', { hint: '新文件请先用 workspace.write 创建' })
+      const source = readFileSync(target, 'utf8')
+      if (Buffer.byteLength(source, 'utf8') > 5 * 1024 * 1024) {
+        throw new EabError(EC.VALIDATION, '文件超过 5 MB，暂不支持局部编辑')
+      }
+      const applied = applyWorkspaceTextEdits(source, edits)
+      writeFileSync(target, applied.text, 'utf8')
+      const row = deps.db
+        .prepare(
+          `SELECT id FROM workspace_files WHERE company_id = ? AND scope_type = 'user' AND scope_id = ? AND rel_path = ? AND deleted_at IS NULL`,
+        )
+        .get(actor.subject.companyId, actor.subject.userId, path) as { id: string } | undefined
+      const size = Buffer.byteLength(applied.text, 'utf8')
+      const fileId = row?.id ?? ulid()
+      if (row) {
+        deps.db
+          .prepare('UPDATE workspace_files SET size = ?, storage_path = ?, updated_at = ? WHERE id = ?')
+          .run(size, target, Date.now(), row.id)
+      } else {
+        deps.db
+          .prepare(
+            `INSERT INTO workspace_files (id, company_id, scope_type, scope_id, owner_user_id, rel_path, name, size, mime, storage_path, created_at, updated_at)
+             VALUES (?, ?, 'user', ?, ?, ?, ?, ?, 'text/plain', ?, ?, ?)`,
+          )
+          .run(fileId, actor.subject.companyId, actor.subject.userId, actor.subject.userId, path, basename(path), size, target, Date.now(), Date.now())
+      }
+      result = {
+        fileId,
+        path,
+        size,
+        changes: applied.changes,
+        matchedEdits: applied.matchedEdits,
+        edited: true,
+      }
+      break
+    }
+
     case 'admin.password.reset': {
       const userId = String(args.userId ?? '')
       const password = String(args.password ?? '')
@@ -1438,6 +3228,7 @@ export function registerToolRoutes(app: FastifyInstance, deps: ServerDeps): void
     const actor = resolveActor(deps.db, deps.config, req)
     requireEnabled(actor)
     requireScope(actor.subject, SC.AGENT_TOOL_LIST)
+    const roleAccess = readToolRoleAccessMap(deps.db, actor.subject.companyId)
     return ok({
       tools: [
         ...TOOLS.map((tool) => ({
@@ -1445,11 +3236,14 @@ export function registerToolRoutes(app: FastifyInstance, deps: ServerDeps): void
           name: tool.name,
           description: tool.description,
           dangerous: tool.dangerous,
-          available: actor.subject.scopes.has(tool.scope),
+          available:
+            actor.subject.scopes.has(tool.scope) &&
+            toolAllowedForRoles(roleAccess.get(tool.id), actor.subject.roles ?? []),
           input: tool.input,
           source: 'builtin' as const,
         })),
-        ...pluginToolCatalogFor(deps.db, actor).map((tool) => ({
+        // 个人插件工具不进入平台通用工具目录；安装人只在个人工作台看到并调用自己的工具。
+        ...pluginToolCatalogFor(deps.db, actor, { scope: 'company' }).map((tool) => ({
           id: tool.id,
           name: tool.name,
           description: tool.description,
@@ -1473,16 +3267,12 @@ export function registerToolRoutes(app: FastifyInstance, deps: ServerDeps): void
       requireEnabled(actor)
       const args = (req.body?.args ?? {}) as Record<string, unknown>
 
-      // 插件工具：id 形如 plugin:<pluginId>:<toolName>，权限与内置工具一致
+      // 插件工具：id 形如 plugin:<instanceKey>:<toolName>，权限与内置工具一致
       if (req.params.id.startsWith('plugin:')) {
         requireScope(actor.subject, SC.AGENT_TOOL_INVOKE)
-        const rest = req.params.id.slice('plugin:'.length)
-        const colon = rest.indexOf(':')
-        const pluginId = colon >= 0 ? rest.slice(0, colon) : ''
-        const functionName = colon >= 0 ? rest.slice(colon + 1) : ''
-        const pluginTool = pluginId ? resolvePluginToolForActor(deps.db, actor, functionName) : null
-        if (!pluginTool || pluginTool.pluginId !== pluginId) {
-          throw new EabError(EC.NOT_FOUND, `插件工具不存在或当前不可用: ${req.params.id}`)
+        const pluginTool = resolvePluginToolByCatalogId(deps.db, actor, req.params.id)
+        if (!pluginTool) {
+          throw new EabError(EC.NOT_FOUND, `插件工具不存在或当前角色不可用: ${req.params.id}`)
         }
         const sessionId = typeof req.body?.sessionId === 'string' ? req.body.sessionId : ''
         const result = await executePluginTool(
@@ -1497,15 +3287,21 @@ export function registerToolRoutes(app: FastifyInstance, deps: ServerDeps): void
             timeoutMs: deps.config.pluginToolTimeoutMs ?? 60_000,
           },
         )
-        audit(deps, req, `tool.invoke.plugin:${pluginId}:${pluginTool.name}`, {
-          toolId: `plugin:${pluginId}:${pluginTool.name}`,
+        audit(deps, req, `tool.invoke.plugin:${pluginTool.pluginId}:${pluginTool.name}`, {
+          toolId: `plugin:${pluginTool.pluginId}:${pluginTool.name}`,
           args,
         })
-        return ok({ toolId: `plugin:${pluginId}:${pluginTool.name}`, result })
+        return ok({ toolId: req.params.id, result })
       }
 
       const tool = TOOLS.find((item) => item.id === req.params.id)
       if (!tool) throw new EabError(EC.NOT_FOUND, `工具不存在: ${req.params.id}`)
+      if (!toolAllowedForActor(deps.db, actor, tool.id)) {
+        throw new EabError(EC.FORBIDDEN, `当前角色不可使用工具「${tool.name}」`, {
+          details: { toolId: tool.id, roles: actor.subject.roles ?? [] },
+          hint: '请管理员在控制台「工具」页调整该工具的可用角色',
+        })
+      }
       requireScope(actor.subject, tool.scope)
 
       if (tool.dangerous) {

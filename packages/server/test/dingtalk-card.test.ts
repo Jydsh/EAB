@@ -4,6 +4,7 @@ import {
   buildDingTalkA2UICreateMessages,
   buildDingTalkA2UIUpdateMessages,
   dingTalkConversationSummary,
+  DingTalkAICardStream,
   flattenMarkdownTables,
   renderDingTalkProgressCard,
 } from '../src/dingtalk-card.js'
@@ -41,20 +42,48 @@ function answerBlock(messages: string[], index = 0): Record<string, any> | undef
 }
 
 function finalComponentsOf(messages: string[]): Array<Record<string, any>> {
-  return parsed(messages)
-    .filter((message) => message.updateComponents)
-    .at(-1)?.updateComponents.components as Array<Record<string, any>>
+  const byId = new Map<string, Record<string, any>>()
+  for (const message of parsed(messages)) {
+    const list = (message.updateComponents as { components?: Array<Record<string, any>> } | undefined)?.components
+    if (!Array.isArray(list)) continue
+    for (const component of list) {
+      if (component?.id) byId.set(String(component.id), component)
+    }
+  }
+  return [...byId.values()]
 }
 
 describe('钉钉 A2UI 卡片可见性与底色', () => {
   it('把回答正文段标为 artifact，供钉钉生成会话列表正文', () => {
     expect(buildDingTalkA2UIArtifactAnnotations('s')).toEqual(
-      Array.from({ length: 6 }, (_, index) => ({
+      Array.from({ length: 24 }, (_, index) => ({
         surfaceId: 's',
         componentId: `answerText${index}`,
         type: 'artifact',
       })),
     )
+  })
+
+  it('首帧即使还没拿到推理内容，也显示“正在思考中”和一行占位摘要', () => {
+    const data = initialData(
+      buildDingTalkA2UICreateMessages('s', {
+        answer: '',
+        reasoning: '',
+        tools: [],
+        thinkingDone: false,
+      }),
+    )
+    expect(data.ui).toMatchObject({
+      showThinking: true,
+      showThinkingPreview: true,
+      showTools: false,
+    })
+    expect(data.thinking.preview).toBe('正在分析你的问题…')
+    expect(
+      componentsOf(
+        buildDingTalkA2UICreateMessages('s', { answer: '', reasoning: '', tools: [], thinkingDone: false }),
+      ).find((component) => component.id === 'thinkingPanel')?.title,
+    ).toBe('✦ 正在思考中…')
   })
 
   it('思考阶段只显示思考面板，标题下带流式预览，不用“等待工具调用”占位', () => {
@@ -99,20 +128,18 @@ describe('钉钉 A2UI 卡片可见性与底色', () => {
     expect(components.find((component) => component.id === 'thinkingPanel')?.title).toBe('✦ 已深度思考')
   })
 
-  it('真正调用工具后显示工具面板与工具链路预览，结束后只保留工具名和耗时', () => {
+  it('真正调用工具后仍显示“正在思考”标题和思考摘要，工具结束后只保留工具名和耗时', () => {
     const tooling = updatesOfTooling()
     expect(uiValues(tooling)).toMatchObject({
       '/ui/showThinking': true,
-      '/ui/showThinkingPreview': false,
+      '/ui/showThinkingPreview': true,
       '/ui/showTools': true,
       '/ui/showToolsPreview': true,
     })
+    expect(updateValues(tooling)['/thinking/preview']).toContain('查一下')
     expect(updateValues(tooling)['/tools/text']).toContain('org.directory')
     expect(updateValues(tooling)['/tools/text']).toContain('参数：')
     expect(updateValues(tooling)['/tools/preview']).toContain('org.directory')
-    expect(finalComponentsOf(tooling).find((component) => component.id === 'thinkingPanel')?.title).toBe(
-      '✦ 已深度思考',
-    )
 
     const final = buildDingTalkA2UIUpdateMessages(
       's',
@@ -149,7 +176,7 @@ describe('钉钉 A2UI 卡片可见性与底色', () => {
     expect(components.find((component) => component.id === 'toolPanel')?.title).toBe('🛠️ 工具调用记录')
   })
 
-  it('工具详情还没到时也保留已深度思考，并给工具面板补一行工具名', () => {
+  it('工具详情还没到时仍保持正在思考，并给工具面板补一行工具名', () => {
     const tooling = buildDingTalkA2UIUpdateMessages(
       's',
       { answer: '', reasoning: '查一下', tools: ['org.directory'], thinkingDone: false },
@@ -157,12 +184,13 @@ describe('钉钉 A2UI 卡片可见性与底色', () => {
     )
     expect(uiValues(tooling)).toMatchObject({
       '/ui/showThinking': true,
+      '/ui/showThinkingPreview': true,
       '/ui/showTools': true,
       '/ui/showToolsPreview': true,
     })
+    expect(updateValues(tooling)['/thinking/preview']).toContain('查一下')
     expect(updateValues(tooling)['/tools/preview']).toBe('org.directory · 执行中')
-    const components = finalComponentsOf(tooling)
-    expect(components.find((component) => component.id === 'thinkingPanel')?.title).toBe('✦ 已深度思考')
+    expect(updateValues(tooling)['/tools/text']).toContain('org.directory')
   })
 
   it('没有工具调用时完成后不显示工具面板', () => {
@@ -225,21 +253,62 @@ describe('钉钉 A2UI 卡片可见性与底色', () => {
       previous,
     )
     const answer = updateValues(messages)['/answer'] as { blocks: Array<Record<string, any>> }
-    expect(answer.blocks[0]?.text).toBe('你好，世界')
+    expect(answer.blocks[0]?.text).toBe('你好，世界▍')
     expect(Object.keys(updateValues(messages))).toEqual(['/answer'])
     expect(messages.some((message) => 'updateComponents' in JSON.parse(message))).toBe(false)
   })
 
-  it('正文流式时把 14px 原生 loading 图标放在同一行末尾，收口后移除', () => {
+  it('普通业务表保留全部列，不因手机宽度被截成三列', () => {
+    const answer = [
+      '| 检查人 | 站名 | 位置 | 问题 | 类别 | 处理人 |',
+      '|---|---|---|---|---|---|',
+      '| 邓骏 | 银花 | 信息机房·照明 | 平板灯故障 | 功能异常 | 李杰 |',
+    ].join('\n')
+    const messages = buildDingTalkA2UIUpdateMessages(
+      's',
+      { answer, reasoning: '', tools: [], thinkingDone: true },
+      false,
+    )
+    const blocks = (updateValues(messages)['/answer'] as { blocks: Array<Record<string, any>> }).blocks
+    expect(blocks[0]?.table?.meta?.map((column: any) => column.colName)).toEqual([
+      '检查人',
+      '站名',
+      '位置',
+      '问题',
+      '类别',
+      '处理人',
+    ])
+  })
+
+  it('多部门多表回答不会被块上限降级成纯文本', () => {
+    const answer = Array.from({ length: 9 }, (_, index) =>
+      [
+        `## 第 ${index + 1} 组`,
+        '',
+        '| 检查人 | 站名 |',
+        '|---|---|',
+        '| 张三 | 银花 |',
+      ].join('\n'),
+    ).join('\n\n')
+    const messages = buildDingTalkA2UIUpdateMessages(
+      's',
+      { answer, reasoning: '', tools: [], thinkingDone: true },
+      false,
+    )
+    const blocks = (updateValues(messages)['/answer'] as { blocks: Array<Record<string, any>> }).blocks
+    const tables = blocks.filter((block) => block.table?.meta?.length > 0)
+    expect(tables).toHaveLength(9)
+    expect(tables.at(-1)?.table?.meta?.map((column: any) => column.colName)).toEqual(['检查人', '站名'])
+  })
+
+  it('正文流式时把光标拼在最后一段正文里，不再追加 loading GIF 组件', () => {
     const streaming = buildDingTalkA2UIUpdateMessages(
       's',
       { answer: '答案', reasoning: '', tools: [], thinkingDone: true },
       true,
     )
-    expect(answerBlock(streaming)?.text).toBe('答案')
-    expect(uiValues(streaming)).toMatchObject({
-      '/ui/showAnswerSpinner': true,
-    })
+    expect(answerBlock(streaming)?.text).toBe('答案▍')
+    expect(uiValues(streaming)).not.toHaveProperty('/ui/showAnswerSpinner')
 
     const final = buildDingTalkA2UIUpdateMessages(
       's',
@@ -247,9 +316,6 @@ describe('钉钉 A2UI 卡片可见性与底色', () => {
       false,
     )
     expect(answerBlock(final)?.text).toBe('答案')
-    expect(uiValues(final)).toMatchObject({
-      '/ui/showAnswerSpinner': false,
-    })
   })
 
   it('正文为空时不注入任何占位内容', () => {
@@ -283,6 +349,7 @@ describe('钉钉 A2UI 卡片可见性与底色', () => {
     expect(root).toMatchObject({ component: 'Card', backgroundColorToken: 'common_bg_color' })
     expect(root.child).toBe('rootColumn')
     expect(thinking.defaultExpanded).toBe(false)
+    expect(thinking.title).toBe('✦ 正在思考中…')
     expect(tool.defaultExpanded).toBe(false)
     expect(preview).toMatchObject({
       component: 'Text',
@@ -290,21 +357,17 @@ describe('钉钉 A2UI 卡片可见性与底色', () => {
       maxLine: 1,
       visible: { path: '/ui/showThinkingPreview' },
     })
-    expect(components.find((component) => component.id === 'answerSpinner')).toMatchObject({
-      component: 'Text',
-      icon: { url: 'https://aka.doubaocdn.com/s/8Q14U759NP' },
-      visible: { path: '/ui/showAnswerSpinner' },
-    })
+    expect(components.find((component) => component.id === 'answerSpinner')).toBeUndefined()
     expect(components.find((component) => component.id === 'answerRow')).toMatchObject({
       component: 'Row',
       align: 'end',
-      children: ['answerBlocks', 'answerSpinner'],
+      children: ['answerBlocks'],
     })
   })
 
-  it('旧模板卡显示流式预览，工具链路不会退回“思考中”', () => {
+  it('旧模板卡显示流式预览，工具执行期间不退回“已深度思考”', () => {
     expect(renderDingTalkProgressCard({ answer: '', reasoning: '', tool: '', thinkingDone: false })).toBe(
-      '**✦ 正在思考…**',
+      '**✦ 正在思考中…**\n\n> 正在分析你的问题…',
     )
     const thinking = renderDingTalkProgressCard({
       answer: '',
@@ -312,22 +375,33 @@ describe('钉钉 A2UI 卡片可见性与底色', () => {
       tool: '',
       thinkingDone: false,
     })
-    expect(thinking).toContain('**✦ 正在思考…**')
+    expect(thinking).toContain('**✦ 正在思考中…**')
     expect(thinking).toContain('> 先确认用户身份')
     expect(
       renderDingTalkProgressCard({ answer: '', reasoning: '想过一下', tool: '', thinkingDone: true }),
     ).toBe('**✦ 已深度思考**')
     const tooling = renderDingTalkProgressCard({
       answer: '',
+      reasoning: '先查部门',
+      tool: '',
+      tools: ['org.directory'],
+      thinkingDone: false,
+    })
+    expect(tooling).toContain('**✦ 正在思考中…**')
+    expect(tooling).toContain('> 先查部门')
+    expect(tooling).toContain('**🛠️ 工具调用中…**')
+    expect(tooling).toContain('org.directory')
+    const done = renderDingTalkProgressCard({
+      answer: '',
       reasoning: '',
       tool: '',
       tools: ['org.directory'],
       thinkingDone: true,
     })
-    expect(tooling).toContain('**✦ 已深度思考**')
-    expect(tooling).toContain('**🛠️ 工具调用中…**')
-    expect(tooling).toContain('org.directory')
-    expect(tooling).not.toContain('正在思考')
+    expect(done).toContain('**✦ 已深度思考**')
+    expect(done).toContain('**🛠️ 工具调用中…**')
+    expect(done).toContain('org.directory')
+    expect(done).not.toContain('正在思考')
   })
 
   it('宽表格拆成竖排列表，手机端不再把更新时间列裁掉', () => {
@@ -410,6 +484,233 @@ describe('钉钉 A2UI 卡片可见性与底色', () => {
     expect(dingTalkConversationSummary('')).toBe('EAB 企业智能助手')
     expect(dingTalkConversationSummary('一'.repeat(80)).endsWith('…')).toBe(true)
   })
+
+  it('澄清请求生成整行可点击选项，卡片带回 sessionId 和选项标识', () => {
+    const messages = buildDingTalkA2UIUpdateMessages(
+      's',
+      {
+        answer: '你想先做哪件事？\n\n也可以直接回复你自己的方向。',
+        reasoning: '',
+        tools: [],
+        thinkingDone: true,
+        clarify: {
+          sessionId: 'chat_test',
+          question: '你想先做哪件事？',
+          allowCustom: true,
+          options: [
+            { id: 'option-1', label: '查公司部门', description: '按组织架构查' },
+            { id: 'option-2', label: '查检查整治', description: '看近期台账' },
+          ],
+        },
+      },
+      false,
+    )
+    expect(updateValues(messages)['/clarify']).toMatchObject({
+      sessionId: 'chat_test',
+      badge: '需要你确认方向',
+      hint: '**请选择一个方向继续**，也可以直接回复你自己的方向',
+      options: [
+        { id: 'option-1', label: '查公司部门', description: '按组织架构查' },
+        { id: 'option-2', label: '查检查整治', description: '看近期台账' },
+      ],
+    })
+    expect(uiValues(messages)).toMatchObject({
+      '/ui/showClarify': true,
+      '/ui/showClarifyOption0': true,
+      '/ui/showClarifyOption1': true,
+      '/ui/showClarifyOption2': false,
+      '/ui/showClarifyDesc0': true,
+    })
+    const components = finalComponentsOf(messages)
+    expect(components.find((component) => component.id === 'clarifyBadge')).toMatchObject({
+      component: 'Tag',
+      text: { path: '/clarify/badge' },
+      theme: 'warning',
+    })
+    expect(components.find((component) => component.id === 'clarifyHint')).toMatchObject({
+      component: 'Markdown',
+      content: { path: '/clarify/hint' },
+    })
+    const option = components.find((component) => component.id === 'clarifyOptionCard0')
+    expect(option).toMatchObject({
+      component: 'Row',
+      padding: 12,
+      cornerRadius: 12,
+      backgroundColor: '#141F7A4D',
+      borderWidth: 1,
+      visible: { path: '/ui/showClarifyOption0' },
+      action: {
+        event: {
+          name: 'eab_clarify_select',
+          context: {
+            action: 'clarify_select',
+            sessionId: 'chat_test',
+            optionId: 'option-1',
+            optionLabel: '查公司部门',
+          },
+        },
+      },
+    })
+    expect(components.find((component) => component.id === 'clarifyOptionCard1')).toMatchObject({
+      backgroundColor: '#0A1F7A4D',
+      action: { event: { context: { optionId: 'option-2', optionLabel: '查检查整治' } } },
+    })
+    expect(components.find((component) => component.id === 'clarifyOptionLabel0')).toMatchObject({
+      component: 'Text',
+      text: { path: '/clarify/options/0/label' },
+    })
+    expect(components.find((component) => component.id === 'clarifyOptionDesc0')).toMatchObject({
+      component: 'Text',
+      variant: 'caption',
+      text: { path: '/clarify/options/0/description' },
+    })
+    expect(components.find((component) => component.id === 'clarifyOptionArrow0')).toMatchObject({
+      component: 'Text',
+      text: '›',
+    })
+  })
+
+  it('带澄清选项的卡片收口后仍保持 PROCESSING，下一次点击才能续用同一张卡', async () => {
+    const requests: Array<{ url: string; body: Record<string, any> }> = []
+    const realFetch = globalThis.fetch
+    globalThis.fetch = (async (input: any, init?: RequestInit) => {
+      const url = String(input)
+      const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, any>
+      requests.push({ url, body })
+      const response = url.includes('/v1.0/oauth2/accessToken')
+        ? { accessToken: 'test-token', expireIn: 7200 }
+        : { success: true }
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify(response),
+      } as Response
+    }) as typeof fetch
+
+    try {
+      const card = new DingTalkAICardStream('clarify-finish-app', 'secret', 'user-1', 'robot-1')
+      expect(
+        await card.start(
+          { answer: '', reasoning: '正在分析…', tools: [], thinkingDone: false },
+          'EAB 企业智能助手',
+        ),
+      ).toBe(true)
+      requests.length = 0
+      const ok = await card.finish(
+        {
+          answer: '你想先做哪件事？',
+          reasoning: '分析完成',
+          tools: [],
+          thinkingDone: true,
+          clarify: {
+            sessionId: 'chat_test',
+            question: '你想先做哪件事？',
+            allowCustom: true,
+            options: [{ id: 'option-1', label: '查公司部门', description: '按组织架构查' }],
+            flowId: 'cf_test',
+            step: 1,
+            messageId: 'msg_assistant',
+          },
+        },
+        '你想先做哪件事？',
+      )
+      expect(ok).toBe(true)
+      const update = requests.filter((request) => request.url.endsWith('/v1.0/card/ai/instances/update')).at(-1)
+      expect(update?.body.flowStatus).toBe('PROCESSING')
+      expect(update?.body.flowStatus).not.toBe('FINISH')
+      expect(
+        requests.some(
+          (request) =>
+            request.url.endsWith('/v1.0/card/ai/instances/update') &&
+            ['FINISH', 'FINISHED', 'COMPLETED', 'DONE'].includes(String(request.body.flowStatus)),
+        ),
+      ).toBe(false)
+    } finally {
+      globalThis.fetch = realFetch
+    }
+  })
+
+  it('澄清卡片组件树每个子节点只有一个父节点，避免 A2UI 结构校验失败', () => {
+    const state = {
+      answer: '你想先做哪件事？',
+      reasoning: '',
+      tools: [],
+      thinkingDone: true,
+      clarify: {
+        sessionId: 'chat_test',
+        question: '你想先做哪件事？',
+        allowCustom: true,
+        options: [
+          { id: 'option-1', label: '查公司部门', description: '按组织架构查' },
+          { id: 'option-2', label: '查检查整治', description: '看近期台账' },
+        ],
+      },
+    }
+    const messages = [
+      ...buildDingTalkA2UICreateMessages('s', state),
+      ...buildDingTalkA2UIUpdateMessages('s', state, false),
+    ]
+    const components = finalComponentsOf(messages)
+    const ids = new Set(components.map((component) => String(component.id)))
+    const parentCount = new Map<string, number>()
+    for (const component of components) {
+      const children = [
+        ...(Array.isArray(component.children) ? component.children : []),
+        ...(component.child ? [component.child] : []),
+      ]
+      for (const child of children) {
+        expect(ids.has(String(child)), `${component.id} 引用了不存在的子节点 ${child}`).toBe(true)
+        parentCount.set(String(child), (parentCount.get(String(child)) ?? 0) + 1)
+      }
+    }
+    for (const [id, count] of parentCount) {
+      expect(count, `${id} 被多个父节点引用`).toBe(1)
+    }
+  })
+
+  it('点击澄清选项后复用原卡片 outTrackId 更新，不创建第二条卡片', async () => {
+    const requests: Array<{ url: string; body: Record<string, any> }> = []
+    const realFetch = globalThis.fetch
+    globalThis.fetch = (async (input: any, init?: RequestInit) => {
+      const url = String(input)
+      const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, any>
+      requests.push({ url, body })
+      const response = url.includes('/v1.0/oauth2/accessToken')
+        ? { accessToken: 'test-token', expireIn: 7200 }
+        : { success: true }
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify(response),
+      } as Response
+    }) as typeof fetch
+
+    try {
+      const card = new DingTalkAICardStream('resume-test-app', 'secret', 'user-1', 'robot-1')
+      const ok = await card.resume('eab_a2ui_existing', {
+        answer: '',
+        reasoning: '已收到你的选择，正在继续…',
+        tools: [],
+        thinkingDone: false,
+      })
+      expect(ok).toBe(true)
+
+      const update = requests.find((request) => request.url.endsWith('/v1.0/card/ai/instances/update'))
+      expect(update).toBeTruthy()
+      expect(update?.body.outTrackId).toBe('eab_a2ui_existing')
+      expect(update?.body.flowStatus).toBe('PROCESSING')
+      const messages = parsed(update?.body.a2uiMessages ?? [])
+      expect(messages.some((message) => message.updateDataModel?.path === '/clarify')).toBe(true)
+      expect(
+        messages
+          .filter((message) => message.updateDataModel?.path === '/ui')
+          .at(-1)?.updateDataModel?.value,
+      ).toMatchObject({ showClarify: false })
+      expect(requests.some((request) => request.url.includes('createAndDeliver'))).toBe(false)
+    } finally {
+      globalThis.fetch = realFetch
+    }
+  })
 })
 
 function updatesOfTooling(): string[] {
@@ -419,7 +720,7 @@ function updatesOfTooling(): string[] {
       answer: '',
       reasoning: '查一下',
       tools: ['org.directory'],
-      thinkingDone: true,
+      thinkingDone: false,
       toolDetails: [
         {
           id: '1-1',

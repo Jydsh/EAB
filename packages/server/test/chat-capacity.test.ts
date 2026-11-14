@@ -1,5 +1,7 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, afterEach } from 'vitest'
 import { createChatCapacity } from '../src/chat-capacity.js'
+import { MemoryCache } from '../src/backends/cache.js'
+import { setBackendRuntimeForTest } from '../src/backends/runtime.js'
 
 describe('网页对话并发闸门', () => {
   it('满员时按顺序排队，排队满后拒绝新请求', async () => {
@@ -137,5 +139,83 @@ describe('网页对话并发闸门', () => {
     expect(sameCompanyDone).toBe(true)
     sameCompanySlot.release()
     otherCompany.release()
+  })
+})
+
+describe('接入共享缓存后的并发闸门', () => {
+  afterEach(() => setBackendRuntimeForTest(undefined))
+
+  function sharedOptions() {
+    return {
+      maxConcurrent: 1,
+      queueLimit: 5,
+      queueTimeoutMs: 800,
+      maxInFlightPerUser: 2,
+      messagesPerMinute: 100,
+    }
+  }
+
+  it('两个实例共享同一份全局名额：一边占满，另一边必须等', async () => {
+    setBackendRuntimeForTest({ cache: new MemoryCache(10_000) } as never)
+    const a = createChatCapacity(sharedOptions())
+    const b = createChatCapacity(sharedOptions())
+
+    const slotA = await a.acquire('u1')
+    let grantedB = false
+    const pendingB = b.acquire('u2').then((slot) => {
+      grantedB = true
+      return slot
+    })
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    expect(grantedB).toBe(false)
+
+    slotA.release()
+    const slotB = await pendingB
+    expect(grantedB).toBe(true)
+    slotB.release()
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(a.stats().active).toBe(0)
+    expect(b.stats().active).toBe(0)
+  })
+
+  it('同一模型的名额也跨实例共享', async () => {
+    setBackendRuntimeForTest({ cache: new MemoryCache(10_000) } as never)
+    const options = { ...sharedOptions(), maxConcurrent: 5, modelMaxConcurrent: 1 }
+    const a = createChatCapacity(options)
+    const b = createChatCapacity(options)
+
+    const first = await a.acquire('u1', { companyId: 'c1', modelId: 'm1' })
+    let otherModelDone = false
+    const otherModel = b.acquire('u2', { companyId: 'c1', modelId: 'm1' }).then((slot) => {
+      otherModelDone = true
+      return slot
+    })
+    const different = await b.acquire('u3', { companyId: 'c1', modelId: 'm2' })
+    expect(otherModelDone).toBe(false)
+
+    first.release()
+    const slot = await otherModel
+    expect(otherModelDone).toBe(true)
+    slot.release()
+    different.release()
+  })
+
+  it('共享层报错时退回本地实现，不拒绝用户', async () => {
+    const broken = {
+      id: 'redis',
+      status: () => ({ state: 'ready' }),
+      adjust: () => Promise.reject(new Error('redis down')),
+      incr: () => Promise.reject(new Error('redis down')),
+      get: () => Promise.reject(new Error('redis down')),
+      set: () => Promise.reject(new Error('redis down')),
+      del: () => Promise.resolve(0),
+      close: () => Promise.resolve(),
+    }
+    setBackendRuntimeForTest({ cache: broken } as never)
+    const capacity = createChatCapacity({ ...sharedOptions(), maxConcurrent: 5, messagesPerMinute: 100 })
+    // 频控读取失败会退回内存计数，名额预留失败会退回本地闸门
+    const slot = await capacity.acquire('u1')
+    expect(slot).toBeTruthy()
+    slot.release()
   })
 })

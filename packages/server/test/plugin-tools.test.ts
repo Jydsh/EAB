@@ -6,10 +6,11 @@ import {
   clearPluginContributions,
   pluginToolCatalogFor,
   pluginToolSpecsFor,
+  prefersPersonalPluginTools,
   registerPluginTool,
   resolvePluginToolForActor,
 } from '../src/plugin-tools.js'
-import { toolSpecsForActor, toolSpecsForAgent } from '../src/routes/tools.js'
+import { toolSpecsForActor, toolSpecsForAgent, searchToolCatalog } from '../src/routes/tools.js'
 
 const dbs: Array<{ close: () => void }> = []
 const registeredKeys: string[] = []
@@ -51,10 +52,11 @@ function registerDemo(
   pluginId: string,
   scope: PluginScope,
   name = 'demo_tool',
+  description = 'demo',
 ) {
   const instanceKey = pluginInstanceKey(companyId, pluginId, scope)
   const result = registerPluginTool(instanceKey, companyId, pluginId, scope, name, {
-    description: 'demo',
+    description,
     parameters: { type: 'object', properties: {}, required: [] },
     execute: () => ({ ok: true }),
   })
@@ -209,5 +211,69 @@ describe('插件工具按安装/启用状态过滤', () => {
       { kind: 'cloud' },
     ).map((spec) => spec.function.name)
     expect(withWorkspaceWrite).toContain('workspace_write')
+  })
+
+  it('公司和个人实例同名工具时，默认公司优先；用户明确要求个人时切到个人', () => {
+    const db = memoryDb()
+    db.prepare(
+      'INSERT INTO plugin_company_installs (company_id, plugin_id, installed_by, installed_at, updated_at, removed_at) VALUES (?, ?, ?, ?, ?, NULL)',
+    ).run('c1', 'p_tools_test', 'admin', 1, 1)
+    db.prepare(
+      'INSERT INTO plugin_user_installs (company_id, user_id, plugin_id, enabled, installed_at, updated_at, removed_at) VALUES (?, ?, ?, 1, ?, ?, NULL)',
+    ).run('c1', 'u1', 'p_tools_test', 4, 4)
+    registerDemo('c1', 'p_tools_test', companyScope(), 'shared_tool', 'company version')
+    registerDemo('c1', 'p_tools_test', userScope('u1'), 'shared_tool', 'personal version')
+
+    // 普通对话：无论函数声明还是执行解析，都落到公司实例。
+    const defaultSpecs = pluginToolSpecsFor(db, actor())
+    expect(defaultSpecs).toHaveLength(1)
+    expect((defaultSpecs[0]?.function as { description?: string }).description).toBe('company version')
+    expect(resolvePluginToolForActor(db, actor(), 'shared_tool')?.description).toBe('company version')
+    expect(
+      toolSpecsForActor(db, actor() as any, { kind: 'cloud' }, '帮我查一下数据').find(
+        (spec) => spec.function.name === 'shared_tool',
+      )?.function.description,
+    ).toBe('company version')
+
+    // 用户明确说用个人插件：声明和执行都落到个人实例。
+    const personalSpecs = pluginToolSpecsFor(db, actor(), { preferPersonal: true })
+    expect(personalSpecs).toHaveLength(1)
+    expect((personalSpecs[0]?.function as { description?: string }).description).toBe('personal version')
+    expect(resolvePluginToolForActor(db, actor(), 'shared_tool', { preferPersonal: true })?.description).toBe(
+      'personal version',
+    )
+    expect(
+      toolSpecsForActor(db, actor() as any, { kind: 'cloud' }, '这次请用个人插件查数据').find(
+        (spec) => spec.function.name === 'shared_tool',
+      )?.function.description,
+    ).toBe('personal version')
+
+    // 工具搜索也要遵循同一优先级：普通搜索公司，明确说个人时个人。
+    expect(
+      searchToolCatalog(db, actor() as any, { kind: 'cloud' }, 'shared_tool 帮我查数据', 8).tools.find(
+        (tool) => tool.functionName === 'shared_tool',
+      )?.description,
+    ).toBe('company version')
+    expect(
+      searchToolCatalog(db, actor() as any, { kind: 'cloud' }, 'shared_tool 请用个人插件', 8).tools.find(
+        (tool) => tool.functionName === 'shared_tool',
+      )?.description,
+    ).toBe('personal version')
+
+    // 普通提及两个级别、但没有明确使用动作，不应误判为个人插件。
+    expect(prefersPersonalPluginTools('公司和个人插件都有同名工具吗')).toBe(false)
+    expect(prefersPersonalPluginTools('不要用个人插件，用公司的')).toBe(false)
+    expect(prefersPersonalPluginTools('用公司插件还是个人插件')).toBe(false)
+    expect(prefersPersonalPluginTools('公司插件还是个人插件，哪个优先')).toBe(false)
+    expect(prefersPersonalPluginTools('请用个人插件执行')).toBe(true)
+    expect(prefersPersonalPluginTools('切换到个人安装')).toBe(true)
+
+    // 公司实例不可用时，自动降级到同一工具的个人实例。
+    db.prepare('INSERT INTO plugin_states (company_id, plugin_id, enabled, updated_by, updated_at) VALUES (?, ?, 0, ?, ?)')
+      .run('c1', 'p_tools_test', 'admin', 2)
+    expect((pluginToolSpecsFor(db, actor())[0]?.function as { description?: string }).description).toBe(
+      'personal version',
+    )
+    expect(resolvePluginToolForActor(db, actor(), 'shared_tool')?.description).toBe('personal version')
   })
 })

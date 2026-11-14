@@ -21,12 +21,8 @@ const DEV_DIR = process.env.EAB_HOME ? resolve(process.env.EAB_HOME) : join(ROOT
 const LOG_DIR = join(DEV_DIR, 'updates')
 const LOG_FILE = join(LOG_DIR, 'last-update.log')
 const CODE_PATHS = [
-  'packages/domain',
-  'packages/authz',
-  'packages/storage',
-  'packages/workspace',
-  'packages/channel',
-  'packages/server',
+  // 整包替换，避免新增 packages/* 目录后更新器漏拷代码。
+  'packages',
   'scripts',
   'package.json',
   'pnpm-lock.yaml',
@@ -215,10 +211,10 @@ async function main() {
     if (restart) {
       log('等待旧服务退出')
       const free = await waitPortFree(8787)
-      if (!free) log('端口 8787 仍被占用，跳过自动重启；请手动执行 eab server')
+      if (!free) log('端口 8787 仍被占用，跳过自动重启；请手动执行 eab start')
       else {
         startServer(root)
-        log('已发出重启命令：eab server --background')
+        log('已发出重启命令：eab start --background')
       }
     }
     log(`更新完成：v${version}`)

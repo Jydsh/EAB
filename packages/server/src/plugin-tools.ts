@@ -12,13 +12,24 @@
 import type { Db } from '@eab/storage'
 import { EC, EabError, SC } from '@eab/domain'
 import { KeyedSemaphore, LockAbortedError, SemaphoreQueueFullError, SemaphoreTimeoutError } from './concurrency.js'
+import { acquireCoordinationSlot, coordinationStatus, readCapacityCount } from './backends/coordination.js'
+import { getBackendRuntime } from './backends/runtime.js'
+import { beginToolInflight } from './tool-inflight.js'
 import { listActorPluginInstances, pluginInstanceKey, type PluginScope } from './plugin-scope.js'
+import {
+  pluginToolAccessId,
+  readToolRoleAccessMap,
+  toolAllowedForRoles,
+  toolRoleAccessReady,
+} from './tool-role-access.js'
 
 export interface PluginToolActor {
   readonly subject: {
     readonly companyId: string
     readonly userId: string
     readonly scopes: ReadonlySet<string>
+    /** 当前角色代码；用于工具级角色白名单，缺省视为没有角色。 */
+    readonly roles?: readonly string[]
   }
 }
 
@@ -131,12 +142,14 @@ export function registerPluginTool(
   }
   list.set(name, registration)
   toolsByInstance.set(instanceKey, list)
+  clearPluginToolSpecsCache()
   return {
     ok: true,
     name,
     dispose: () => {
       list.delete(name)
       if (list.size === 0) toolsByInstance.delete(instanceKey)
+      clearPluginToolSpecsCache()
     },
   }
 }
@@ -147,6 +160,7 @@ export function unregisterPluginTool(instanceKey: string, name: unknown): void {
   if (!list) return
   list.delete(toolName)
   if (list.size === 0) toolsByInstance.delete(instanceKey)
+  clearPluginToolSpecsCache()
 }
 
 /** 注册插件对系统提示的贡献（如「什么时候该发钉钉卡片」） */
@@ -169,19 +183,51 @@ export function registerPluginPrompt(instanceKey: string, entry: unknown): void 
 export function clearPluginContributions(instanceKey: string): void {
   toolsByInstance.delete(instanceKey)
   promptsByInstance.delete(instanceKey)
+  clearPluginToolSpecsCache()
+}
+
+/**
+ * 用户本轮是否明确要求使用个人插件。
+ *
+ * 只认“动作 + 个人插件/个人安装/个人版”这类明确指令，避免把
+ * “公司和个人插件都有同名工具吗”这种普通提及误判成使用个人插件。
+ */
+export function prefersPersonalPluginTools(text: string): boolean {
+  const compact = String(text || '').replace(/\s+/g, ' ').trim()
+  if (!compact) return false
+  // “不要用个人插件”“别走个人安装”是否定意图，不能因为出现“用 + 个人插件”就误切。
+  if (/(?:不要|别|不用|不使用|无需|没必要)[^。！？\n]{0,8}(?:个人|我的|我自己)[^。！？\n]{0,8}(?:插件|工具|安装|版本)/.test(compact)) {
+    return false
+  }
+  // “用公司插件还是个人插件”属于二选一提问，没有明确选择，不能按个人模式执行。
+  if (
+    /(?:公司|企业|团队)[^。！？\n]{0,10}(?:还是|或者|或)[^。！？\n]{0,10}(?:个人|我的|我自己)/.test(compact)
+    || /(?:个人|我的|我自己)[^。！？\n]{0,10}(?:还是|或者|或)[^。！？\n]{0,10}(?:公司|企业|团队)/.test(compact)
+  ) {
+    return false
+  }
+  return (
+    /(?:用|使用|调用|走|选择|切换(?:到|成)?|优先|改成|换成)[^。！？\n]{0,12}(?:个人|我的|我自己)[^。！？\n]{0,8}(?:插件|工具|安装|版本)/.test(compact)
+    || /(?:个人|我的|我自己)[^。！？\n]{0,8}(?:插件|工具|安装|版本)[^。！？\n]{0,10}(?:优先|执行|处理|调用|来|试试|吧)/.test(compact)
+  )
 }
 
 /**
  * 当前公司/当前员工真正可用的插件实例：
  * 公司级安装且未被公司级状态停用；或个人级安装且启用。
- * 个人实例排在前面：同名插件同时存在公司/个人安装时，个人配置和数据优先。
+ * 默认公司实例排在前面：同名插件同时存在公司/个人安装时，公司工具优先；
+ * 只有本轮用户明确要求个人插件时，才把个人实例提前。
  */
-function actorInstanceKeys(db: Db, actor: Pick<PluginToolActor, 'subject'>): string[] {
+function actorInstanceKeys(
+  db: Db,
+  actor: Pick<PluginToolActor, 'subject'>,
+  preferPersonal = false,
+): string[] {
   const rows = listActorPluginInstances(db, actor.subject.companyId, actor.subject.userId)
     .sort((a, b) => {
       const aUser = a.scope.kind === 'user' ? 0 : 1
       const bUser = b.scope.kind === 'user' ? 0 : 1
-      if (aUser !== bUser) return aUser - bUser
+      if (aUser !== bUser) return preferPersonal ? aUser - bUser : bUser - aUser
       return a.pluginId.localeCompare(b.pluginId)
     })
   return rows.map((row) => pluginInstanceKey(row.companyId, row.pluginId, row.scope))
@@ -196,20 +242,113 @@ export function enabledPluginIds(db: Db, actor: Pick<PluginToolActor, 'subject'>
   return ids
 }
 
-export function pluginToolSpecsFor(db: Db, actor: PluginToolActor): Array<Record<string, unknown>> {
+/** 角色表就绪后，个人插件工具默认拒绝；公司插件工具沿用历史默认。 */
+function pluginToolDefaultAllow(db: Db, tool: PluginToolRegistration): boolean {
+  if (tool.scope.kind === 'company') return true
+  return !toolRoleAccessReady(db)
+}
+
+/** 个人插件工具只归安装人本人：别人看不到，本人也不该再走角色授权。 */
+function personalToolOwnedBy(
+  tool: PluginToolRegistration,
+  actor: Pick<PluginToolActor, 'subject'>,
+): boolean {
+  return tool.scope.kind === 'user' && tool.scope.userId === actor.subject.userId
+}
+
+/**
+ * 插件工具对当前账号是否可用。
+ * 个人工具：归属人自己就直接可用，不需要管理员按角色授权；
+ * 公司工具：仍按控制台配置的角色白名单决定。
+ */
+function toolUsableForActor(
+  db: Db,
+  tool: PluginToolRegistration,
+  actor: PluginToolActor,
+  roleAccess: ReturnType<typeof readToolRoleAccessMap>,
+): boolean {
+  if (personalToolOwnedBy(tool, actor)) return true
+  return toolAllowedForRoles(
+    roleAccess.get(pluginToolAccessId(tool.pluginId, tool.name)),
+    actor.subject.roles ?? [],
+    pluginToolDefaultAllow(db, tool),
+  )
+}
+
+/** 插件工具 schema 的进程内短缓存。
+ *
+ * 为什么不做 Redis 共享：`toolsByInstance` 是每个进程自己加载的插件注册表，
+ * 把 A 实例的 schema 共享给没加载该插件的 B 实例，会让模型看到本机不存在的工具。
+ * 所以缓存只在进程内，靠「5 秒 TTL + 安装/启停/授权时 Pub/Sub 广播清空」保持一致。
+ */
+const SPECS_CACHE_TTL_MS =
+  process.env.NODE_ENV === 'test' || process.env.VITEST ? 0 : 5_000
+const PLUGIN_TOOLS_CACHE_CHANNEL = 'plugin-tools'
+const specsCache = new Map<string, { at: number; value: Array<Record<string, unknown>> }>()
+
+function specsCacheKey(actor: PluginToolActor, options: { preferPersonal?: boolean }): string {
+  const roles = [...(actor.subject.roles ?? [])].sort().join(',')
+  const scopes = [...actor.subject.scopes].sort().join(',')
+  return `${actor.subject.companyId}\u0000${actor.subject.userId}\u0000${options.preferPersonal ? 1 : 0}\u0000${roles}\u0000${scopes}`
+}
+
+/** 本进程立即清空；注册/卸载插件工具时调用，避免新工具要等 TTL 才出现。 */
+export function clearPluginToolSpecsCache(): void {
+  specsCache.clear()
+}
+
+/** 清本进程并通知其它实例；安装、启停、卸载、工具角色授权变更后调用。 */
+export async function invalidatePluginToolSpecsEverywhere(): Promise<void> {
+  clearPluginToolSpecsCache()
+  const pubsub = getBackendRuntime()?.pubsub
+  if (!pubsub) return
+  try {
+    await pubsub.publish(PLUGIN_TOOLS_CACHE_CHANNEL, 'invalidate')
+  } catch {
+    // 广播失败最多让其它实例多等 5 秒 TTL，不影响业务
+  }
+}
+
+/** 启动时订阅一次；没接 Redis 时什么都不做，纯单实例用本地 TTL 即可。 */
+export async function startPluginToolSpecsCacheInvalidation(): Promise<void> {
+  const pubsub = getBackendRuntime()?.pubsub
+  if (!pubsub) return
+  try {
+    // Redis 订阅连接偶发卡住时不阻塞主服务启动；订阅成功后再补上即可，5 秒 TTL 仍兜底。
+    await Promise.race([
+      pubsub.subscribe(PLUGIN_TOOLS_CACHE_CHANNEL, () => clearPluginToolSpecsCache()),
+      new Promise<void>((resolve) => setTimeout(resolve, 2000)),
+    ])
+  } catch {
+    // 订阅失败只影响跨实例即时性，5 秒 TTL 仍会兜底
+  }
+}
+
+export function pluginToolSpecsFor(
+  db: Db,
+  actor: PluginToolActor,
+  options: { preferPersonal?: boolean } = {},
+): Array<Record<string, unknown>> {
   // 可见性策略：
-  // - 个人实例只属于安装人：actorInstanceKeys 只并入当前 userId 的个人实例；
-  // - 公司实例属于当前公司，但仍要求角色具备 `agent:tool:invoke`；
-  // - 内置工具的可见性由 routes/tools.ts 按各工具自己的 scope 逐项判断。
+  // - 个人实例只属于安装人：actorInstanceKeys 只并入当前 userId 的个人实例，
+  //   本人调用自己的工具不需要角色授权；
+  // - 公司实例属于当前公司，且要求角色具备 `agent:tool:invoke`，再按控制台角色白名单判定。
   if (!actor.subject.scopes.has(SC.AGENT_TOOL_INVOKE)) return []
+  const cacheKey = SPECS_CACHE_TTL_MS > 0 ? specsCacheKey(actor, options) : ''
+  if (cacheKey) {
+    const hit = specsCache.get(cacheKey)
+    if (hit && Date.now() - hit.at < SPECS_CACHE_TTL_MS) return hit.value
+  }
+  const roleAccess = readToolRoleAccessMap(db, actor.subject.companyId)
   const specs: Array<Record<string, unknown>> = []
   const seen = new Set<string>()
-  for (const instanceKey of actorInstanceKeys(db, actor)) {
+  for (const instanceKey of actorInstanceKeys(db, actor, options.preferPersonal === true)) {
     const tools = toolsByInstance.get(instanceKey)
     if (!tools) continue
     for (const tool of tools.values()) {
-      // 公司和个人实例可能暴露同名工具；function 名不能重复，个人实例先入列。
+      // 公司和个人实例可能暴露同名工具；function 名不能重复，默认公司实例先入列。
       if (seen.has(tool.name)) continue
+      if (!toolUsableForActor(db, tool, actor, roleAccess)) continue
       seen.add(tool.name)
       specs.push({
         type: 'function',
@@ -221,17 +360,57 @@ export function pluginToolSpecsFor(db: Db, actor: PluginToolActor): Array<Record
       })
     }
   }
+  if (cacheKey) {
+    // 防止长期运行的不同用户把缓存撑大：超过 1000 条时清掉过期项。
+    if (specsCache.size > 1_000) {
+      const now = Date.now()
+      for (const [key, entry] of specsCache) {
+        if (now - entry.at >= SPECS_CACHE_TTL_MS) specsCache.delete(key)
+      }
+    }
+    specsCache.set(cacheKey, { at: Date.now(), value: specs })
+  }
   return specs
 }
 
-/** 按模型给出的 function 名找当前员工可用的插件工具；优先本人实例，再公司实例 */
+/** 按模型给出的 function 名找当前员工可用的插件工具；默认公司实例优先 */
 export function resolvePluginToolForActor(
-  db: Db, actor: PluginToolActor, functionName: string,
+  db: Db,
+  actor: PluginToolActor,
+  functionName: string,
+  options: { preferPersonal?: boolean } = {},
 ): PluginToolRegistration | null {
   if (!actor.subject.scopes.has(SC.AGENT_TOOL_INVOKE)) return null
-  for (const instanceKey of actorInstanceKeys(db, actor)) {
+  const roleAccess = readToolRoleAccessMap(db, actor.subject.companyId)
+  for (const instanceKey of actorInstanceKeys(db, actor, options.preferPersonal === true)) {
     const tool = toolsByInstance.get(instanceKey)?.get(functionName)
-    if (tool) return tool
+    if (tool && toolUsableForActor(db, tool, actor, roleAccess)) {
+      return tool
+    }
+  }
+  return null
+}
+
+/**
+ * 按控制台目录 id 解析插件工具。
+ *
+ * 目录 id 形如 `plugin:<instanceKey>:<toolName>`，instanceKey 自身可能含冒号；
+ * 不能像旧实现那样按第一个冒号拆成 pluginId + functionName。
+ * 这里直接遍历当前员工可用实例，按完整目录 id 匹配，避免拆错和跨实例串工具。
+ */
+export function resolvePluginToolByCatalogId(
+  db: Db, actor: PluginToolActor, catalogId: string,
+): PluginToolRegistration | null {
+  if (!actor.subject.scopes.has(SC.AGENT_TOOL_INVOKE)) return null
+  const roleAccess = readToolRoleAccessMap(db, actor.subject.companyId)
+  for (const instanceKey of actorInstanceKeys(db, actor)) {
+    const tools = toolsByInstance.get(instanceKey)
+    if (!tools) continue
+    for (const tool of tools.values()) {
+      if (`plugin:${instanceKey}:${tool.name}` !== catalogId) continue
+      if (!toolUsableForActor(db, tool, actor, roleAccess)) continue
+      return tool
+    }
   }
   return null
 }
@@ -246,12 +425,21 @@ export async function executePluginTool(
   const timeoutMs = Math.max(1, options.timeoutMs ?? 60_000)
   let release: (() => void) | null = null
   try {
-    release = await pluginToolSemaphore.acquire(tool.instanceKey, {
+    const lease = await acquireCoordinationSlot(`plugin:tool:${tool.instanceKey}`, {
       limit: maxConcurrent,
+      ttlSec: 300,
+      waitMs: 30_000,
       queueLimit: 50,
-      timeoutMs: 30_000,
       signal: options.signal,
     })
+    const inflight = beginToolInflight({
+      toolId: `plugin:${tool.instanceKey.split(':').slice(-2).join(':')}`,
+      channel: null,
+    })
+    release = () => {
+      inflight.end()
+      lease.release()
+    }
   } catch (error) {
     if (error instanceof SemaphoreTimeoutError || error instanceof SemaphoreQueueFullError) {
       throw new EabError(EC.RATE_LIMITED, '插件工具并发已满，请稍后重试', {
@@ -302,16 +490,31 @@ export function pluginPromptTexts(db: Db, actor: PluginToolActor): string[] {
   return entries.sort((a, b) => a.order - b.order || a.name.localeCompare(b.name)).map((entry) => entry.text)
 }
 
+/** 控制台配置插件工具角色时，需要看到本公司的全部插件工具，而不只是控制台操作者本人安装的实例。 */
+function companyInstanceKeys(companyId: string): string[] {
+  const keys: string[] = []
+  for (const [instanceKey, tools] of toolsByInstance) {
+    for (const tool of tools.values()) {
+      if (tool.companyId === companyId) {
+        keys.push(instanceKey)
+        break
+      }
+    }
+  }
+  return keys.sort((a, b) => a.localeCompare(b))
+}
+
 /** 控制台「工具」页可展示的插件工具清单；可按实例类型只看个人或公司 */
 export function pluginToolCatalogFor(
   db: Db,
   actor: PluginToolActor,
-  options: { scope?: 'company' | 'user' } = {},
+  options: { scope?: 'company' | 'user'; allCompanyInstances?: boolean } = {},
 ): Array<{
   id: string
   pluginId: string
   name: string
   description: string
+  personal: boolean
   available: boolean
   input: Record<string, unknown>
 }> {
@@ -320,23 +523,56 @@ export function pluginToolCatalogFor(
     pluginId: string
     name: string
     description: string
+    personal: boolean
     available: boolean
     input: Record<string, unknown>
   }> = []
-  for (const instanceKey of actorInstanceKeys(db, actor)) {
+  const roleAccess = readToolRoleAccessMap(db, actor.subject.companyId)
+  const instanceKeys = options.allCompanyInstances
+    ? companyInstanceKeys(actor.subject.companyId)
+    : actorInstanceKeys(db, actor)
+  for (const instanceKey of instanceKeys) {
     const tools = toolsByInstance.get(instanceKey)
     if (!tools) continue
     for (const tool of tools.values()) {
       if (options.scope && tool.scope.kind !== options.scope) continue
+      // 个人插件工具只属于安装人本人：除他本人外，任何人的目录里都不出现（管理员后台也不展示）。
+      if (tool.scope.kind === 'user' && tool.scope.userId !== actor.subject.userId) continue
       rows.push({
         id: `plugin:${tool.instanceKey}:${tool.name}`,
         pluginId: tool.pluginId,
         name: tool.name,
         description: tool.description,
-        available: actor.subject.scopes.has(SC.AGENT_TOOL_INVOKE),
+        personal: tool.scope.kind === 'user',
+        available:
+          (tool.scope.kind === 'company' || tool.scope.userId === actor.subject.userId) &&
+          actor.subject.scopes.has(SC.AGENT_TOOL_INVOKE) &&
+          toolUsableForActor(db, tool, actor, roleAccess),
         input: tool.parameters,
       })
     }
   }
   return rows
+}
+
+/**
+ * 共享模式下把插件工具并发数从 Redis 读回来（与工具那边同理）。
+ * 未接 Redis 时返回 null，控制台继续显示本实例统计。
+ */
+export async function sharedPluginCapacityStats(): Promise<{
+  total: number
+  keys: Array<{ key: string; active: number; queued: number }>
+} | null> {
+  if (!coordinationStatus().shared) return null
+  const keys = [...toolsByInstance.keys()].map((instanceKey) => `plugin:tool:${instanceKey}`)
+  if (keys.length === 0) return { total: 0, keys: [] }
+  const counts = await Promise.all(keys.map((key) => readCapacityCount(key)))
+  if (counts.every((count) => count === null)) return null
+  const entries = keys
+    .map((key, index) => ({ key, active: counts[index] ?? 0, queued: 0 }))
+    .filter((item) => item.active > 0)
+  return {
+    total: entries.reduce((sum, item) => sum + item.active, 0),
+    keys: entries,
+  }
 }

@@ -11,6 +11,7 @@
  * 任何一步失败都只返回 false，由调用方回退到普通文字消息或 A2UI 卡，保证机器人仍可用。
  */
 import { randomUUID } from 'node:crypto'
+import { getBackendRuntime } from './backends/runtime.js'
 
 const DINGTALK_API = 'https://api.dingtalk.com'
 const AI_CARD_TEMPLATE_ID = '02fcf2f4-5e02-4a85-b672-46d1f715543e.schema'
@@ -40,6 +41,7 @@ const TOKEN_REFRESH_MARGIN_MS = 5 * 60_000
 
 const tokenCache = new Map<string, { token: string; expiresAt: number }>()
 const tokenRequests = new Map<string, Promise<string>>()
+const SHARED_TOKEN_KEY_PREFIX = 'dingtalk:access-token:'
 
 class DingTalkHttpError extends Error {
   constructor(
@@ -98,6 +100,20 @@ async function requestJson(
 export async function dingTalkAccessToken(appId: string, appSecret: string): Promise<string> {
   const cached = tokenCache.get(appId)
   if (cached && cached.expiresAt > Date.now()) return cached.token
+
+  const shared = getBackendRuntime()?.cache
+  if (shared) {
+    try {
+      const remote = await shared.get<{ token: string; expiresAt: number }>(`${SHARED_TOKEN_KEY_PREFIX}${appId}`)
+      if (remote && remote.expiresAt > Date.now()) {
+        tokenCache.set(appId, remote)
+        return remote.token
+      }
+    } catch {
+      // 缓存读失败不影响拿新 token
+    }
+  }
+
   const inFlight = tokenRequests.get(appId)
   if (inFlight) return inFlight
 
@@ -109,10 +125,19 @@ export async function dingTalkAccessToken(appId: string, appSecret: string): Pro
     if (!token) throw new Error('钉钉没有返回 accessToken')
     const expireIn = Number(body.expireIn ?? body.expiresIn)
     const expiresInMs = Number.isFinite(expireIn) && expireIn > 0 ? expireIn * 1000 : 7_200_000
-    tokenCache.set(appId, {
+    const record = {
       token,
       expiresAt: Date.now() + Math.max(60_000, expiresInMs - TOKEN_REFRESH_MARGIN_MS),
-    })
+    }
+    tokenCache.set(appId, record)
+    if (shared) {
+      const ttl = Math.max(1, Math.floor((record.expiresAt - Date.now()) / 1000))
+      try {
+        await shared.set(`${SHARED_TOKEN_KEY_PREFIX}${appId}`, record, ttl)
+      } catch {
+        // 缓存写失败不影响本轮回复
+      }
+    }
     return token
   })()
   tokenRequests.set(appId, request)
@@ -273,7 +298,7 @@ export interface DingTalkCardProgress {
 
 function previewLine(text: string, maxLength = 120): string {
   const normalized = text.replace(/\s+/g, ' ').trim()
-  if (!normalized || normalized === '正在分析你的问题…') return ''
+  if (!normalized) return ''
   return normalized.length > maxLength ? `…${normalized.slice(-maxLength)}` : normalized
 }
 
@@ -317,13 +342,16 @@ function richToolsPreview(details: DingTalkToolRecord[], tools: string[]): strin
   return last ? `${last} · 执行中` : ''
 }
 
-/** 工具一出现就说明思考阶段已经结束，标题不能继续停在“正在思考”。 */
 function richHasTools(state: DingTalkRichCardState): boolean {
   return (state.tools ?? []).length > 0 || (state.toolDetails ?? []).length > 0
 }
 
+/**
+ * “思考结束”只由正文开始或收口决定，不能因为出现工具就提前切成“已深度思考”。
+ * 工具执行期间仍要显示“正在思考中”标题和下方一行推理摘要。
+ */
 function richThinkingDone(state: DingTalkRichCardState): boolean {
-  return Boolean(state.thinkingDone) || richHasTools(state)
+  return Boolean(state.thinkingDone)
 }
 
 /**
@@ -346,16 +374,15 @@ export function dingTalkConversationSummary(text: string): string {
 
 export function renderDingTalkProgressCard(progress: DingTalkCardProgress): string {
   // 旧模板卡只能显示一段 msgContent，不能做真正的折叠。
-  // 思考结束或工具出现后，思考标题固定为“已深度思考”，不再被工具行覆盖。
+  // 思考标题只在正文开始/收口后切“已深度思考”；工具执行期间仍保持“正在思考中”。
   const blocks: string[] = []
   const usedTools = progress.tools ?? []
   const detailNames = (progress.toolDetails ?? []).map((tool) => tool.name).filter(Boolean)
   const toolNames = usedTools.length > 0 ? usedTools : detailNames
-  const toolActive = Boolean(progress.tool) || toolNames.length > 0
-  const thinkingDone = Boolean(progress.thinkingDone) || toolActive
-  blocks.push(thinkingDone ? '**✦ 已深度思考**' : '**✦ 正在思考…**')
+  const thinkingDone = Boolean(progress.thinkingDone)
+  blocks.push(thinkingDone ? '**✦ 已深度思考**' : '**✦ 正在思考中…**')
   if (!thinkingDone) {
-    const preview = previewLine(progress.reasoning, 90)
+    const preview = previewLine(progress.reasoning || '正在分析你的问题…', 90)
     if (preview) blocks.push(`> ${preview}`)
   }
   if (progress.tool) blocks.push(`**🛠️ 工具调用中…**\n_${progress.tool}_`)
@@ -641,11 +668,39 @@ const A2UI_STATUS = {
 } as const
 
 /**
- * A2UI 的 Markdown 没有原生流式光标，所以把钉钉客户端自带的 loading 素材
- * （安装目录 image_resource/taiji_loading.gif）缩到 14px，作为 Text 的前置图标
- * 放在正文同一个 Row 的末尾。14px 与正文行高一致，不再单独占一行。
+ * 澄清按钮的卡片归属。按钮事件里的 context 可能因客户端实现差异丢失，
+ * 回调时用 outTrackId 反查会话和选项作为兜底；只保留最近少量卡片。
  */
-const A2UI_ANSWER_SPINNER_URL = 'https://aka.doubaocdn.com/s/8Q14U759NP'
+const clarifyCardStates = new Map<string, DingTalkClarifyState>()
+
+function rememberClarifyCard(outTrackId: string, clarify: DingTalkClarifyState | null | undefined): void {
+  if (!outTrackId || !clarify) return
+  clarifyCardStates.set(outTrackId, {
+    sessionId: String(clarify.sessionId ?? ''),
+    question: String(clarify.question ?? ''),
+    options: (clarify.options ?? []).slice(0, 4).map((option) => ({ ...option })),
+    allowCustom: Boolean(clarify.allowCustom),
+    flowId: String(clarify.flowId ?? ''),
+    step: Number(clarify.step ?? 1) || 1,
+    messageId: String(clarify.messageId ?? ''),
+  })
+  while (clarifyCardStates.size > 200) {
+    const oldest = clarifyCardStates.keys().next().value
+    if (!oldest) break
+    clarifyCardStates.delete(oldest)
+  }
+}
+
+export function dingTalkClarifyCardState(outTrackId: string): DingTalkClarifyState | null {
+  const state = clarifyCardStates.get(outTrackId)
+  return state ? { ...state, options: state.options.map((option) => ({ ...option })) } : null
+}
+
+/**
+ * A2UI 的 Markdown 没有原生流式光标。这里不再使用客户端自带的 loading GIF，
+ * 改为在最新正文末尾追加一个静态细光标，随流式内容一起移动，也不单独占一行。
+ */
+const A2UI_STREAM_CURSOR = '▍'
 
 export interface DingTalkCardAttachment {
   fileName: string
@@ -656,6 +711,26 @@ export interface DingTalkCardAttachment {
   description?: string
 }
 
+export interface DingTalkClarifyOption {
+  id: string
+  label: string
+  description?: string
+}
+
+/** 卡片底部的可点击澄清选项；sessionId 只用于回调校验，不展示在界面上。 */
+export interface DingTalkClarifyState {
+  sessionId: string
+  question: string
+  options: DingTalkClarifyOption[]
+  allowCustom?: boolean
+  /** 同一个 AI 消息/卡片的续跑标识；网页据此隐藏“我选择了…”的中间用户消息。 */
+  flowId?: string
+  /** 当前澄清页序号，从 1 开始；按钮回调按页做幂等，避免同一张卡只能点一次。 */
+  step?: number
+  /** 触发这次澄清的 assistant 消息 ID；回调续跑时直接更新这条消息，而不是新插一条。 */
+  messageId?: string
+}
+
 export interface DingTalkRichCardState {
   answer: string
   reasoning: string
@@ -664,6 +739,8 @@ export interface DingTalkRichCardState {
   toolDetails?: DingTalkToolRecord[]
   /** 钉盘落盘后由 File 组件展示；最多三个，避免卡片过重。 */
   attachments?: DingTalkCardAttachment[]
+  /** 收口时若有澄清请求，卡片底部渲染 2–4 个可点击方向。 */
+  clarify?: DingTalkClarifyState | null
 }
 
 function cloneRichState(state: DingTalkRichCardState): DingTalkRichCardState {
@@ -679,11 +756,27 @@ function cloneRichState(state: DingTalkRichCardState): DingTalkRichCardState {
       durationMs: tool.durationMs ?? 0,
     })),
     attachments: (state.attachments ?? []).slice(0, 3).map((attachment) => ({ ...attachment })),
+    clarify: state.clarify
+      ? {
+          sessionId: String(state.clarify.sessionId ?? ''),
+          question: String(state.clarify.question ?? ''),
+          options: (state.clarify.options ?? []).slice(0, 4).map((option) => ({
+            id: String(option.id ?? ''),
+            label: String(option.label ?? ''),
+            description: String(option.description ?? ''),
+          })),
+          allowCustom: Boolean(state.clarify.allowCustom),
+        }
+      : null,
   }
 }
 
 function richTextLength(state: DingTalkRichCardState): number {
-  return String(state.answer ?? '').length + String(state.reasoning ?? '').length
+  return (
+    String(state.answer ?? '').length +
+    String(state.reasoning ?? '').length +
+    (state.clarify ? String(state.clarify.question ?? '').length : 0)
+  )
 }
 
 function richStateChanged(current: DingTalkRichCardState, previous: DingTalkRichCardState): boolean {
@@ -693,7 +786,8 @@ function richStateChanged(current: DingTalkRichCardState, previous: DingTalkRich
     Boolean(current.thinkingDone) !== Boolean(previous.thinkingDone) ||
     (current.tools ?? []).length !== (previous.tools ?? []).length ||
     JSON.stringify(current.toolDetails ?? []) !== JSON.stringify(previous.toolDetails ?? []) ||
-    JSON.stringify(current.attachments ?? []) !== JSON.stringify(previous.attachments ?? [])
+    JSON.stringify(current.attachments ?? []) !== JSON.stringify(previous.attachments ?? []) ||
+    JSON.stringify(current.clarify ?? null) !== JSON.stringify(previous.clarify ?? null)
   )
 }
 
@@ -701,7 +795,8 @@ function richStructureChanged(current: DingTalkRichCardState, previous: DingTalk
   return (
     Boolean(current.thinkingDone) !== Boolean(previous.thinkingDone) ||
     (current.tools ?? []).length !== (previous.tools ?? []).length ||
-    JSON.stringify(current.toolDetails ?? []) !== JSON.stringify(previous.toolDetails ?? [])
+    JSON.stringify(current.toolDetails ?? []) !== JSON.stringify(previous.toolDetails ?? []) ||
+    Boolean(current.clarify) !== Boolean(previous.clarify)
   )
 }
 
@@ -725,17 +820,35 @@ interface DingTalkRichCardData {
     mimeType: string
     description: string
   }>
+  clarify: {
+    sessionId: string
+    badge: string
+    hint: string
+    options: Array<{
+      id: string
+      label: string
+      description: string
+    }>
+  }
   thinkingDone: boolean
   ui: {
     showThinking: boolean
     showThinkingPreview: boolean
     showTools: boolean
     showToolsPreview: boolean
-    showAnswerSpinner: boolean
     showAttachments: boolean
     showAttachment0: boolean
     showAttachment1: boolean
     showAttachment2: boolean
+    showClarify: boolean
+    showClarifyOption0: boolean
+    showClarifyOption1: boolean
+    showClarifyOption2: boolean
+    showClarifyOption3: boolean
+    showClarifyDesc0: boolean
+    showClarifyDesc1: boolean
+    showClarifyDesc2: boolean
+    showClarifyDesc3: boolean
     [key: `showAnswerUnit${number}`]: boolean
     [key: `showAnswerText${number}`]: boolean
     [key: `showAnswerTable${number}`]: boolean
@@ -752,8 +865,11 @@ interface DingTalkAnswerBlock {
   table: DingTalkAnswerTable
 }
 
-/** A2UI 组件树里预留的正文块数；绝大多数回答只有“正文 + 表格 + 收尾”三块。 */
-const MAX_ANSWER_BLOCKS = 6
+/**
+ * A2UI 组件树里预留的正文块数。真实业务回答经常有“总览 + 多部门明细 + 收尾”
+ * 多张表，6 块会把后面的表降级成纯文本；这里留足 24 块，覆盖 9 张表左右的回答。
+ */
+const MAX_ANSWER_BLOCKS = 24
 
 function plainTableCell(value: string): string {
   return String(value ?? '')
@@ -781,7 +897,12 @@ function compactAnswerTable(table: DingTalkAnswerTable): DingTalkAnswerTable {
   const indexColumn = labels.findIndex((label) => /^(#|序号|no\.?)$/i.test(label.trim()))
   const nameColumn = labels.findIndex((label) => /文件名|文件名称|名称|filename|name/i.test(label))
   const pathColumn = labels.findIndex((label) => /路径|目录|path/i.test(label))
-  if (indexColumn < 0 && nameColumn < 0 && table.meta.length <= 3) {
+  // 只有“文件清单”才需要合并名称/路径并压到 3 列；普通业务表必须保留全部列，
+  // 交给 Table 的横向滚动显示，否则桌面端会像手机一样只剩前 3 列。
+  const isFileTable =
+    labels.some((label) => /文件名|文件名称|filename/i.test(label)) ||
+    (nameColumn >= 0 && pathColumn >= 0)
+  if (!isFileTable || table.meta.length <= 3) {
     return table
   }
 
@@ -935,8 +1056,24 @@ function richCardData(
   const details = state.toolDetails ?? []
   const hasTools = richHasTools(state)
   const thinkingDone = richThinkingDone(state)
-  const answer = state.answer.trim()
-  const answerBlocks = parseAnswerBlocks(answer)
+  const thinkingPreviewText = reasoning || (active && !thinkingDone ? '正在分析你的问题…' : '')
+  const answerText = state.answer.trim()
+  const answerBlocks = parseAnswerBlocks(answerText)
+  if (active && answerText && !state.clarify) {
+    // 光标拼在“最后一个非空正文块”的末尾，和流式文字保持同一行；
+    // 如果回答以表格结尾，就在表格后补一个小光标块，绝不另外挂 loading 图标。
+    for (let index = answerBlocks.length - 1; index >= 0; index -= 1) {
+      const block = answerBlocks[index]
+      if (block.table.meta.length > 0) {
+        if (index + 1 < answerBlocks.length) answerBlocks[index + 1].text = A2UI_STREAM_CURSOR
+        break
+      }
+      if (block.text.trim()) {
+        block.text = `${block.text}${A2UI_STREAM_CURSOR}`
+        break
+      }
+    }
+  }
   const attachments = (state.attachments ?? []).slice(0, 3).map((attachment) => ({
     fileName: String(attachment.fileName ?? ''),
     url: String(attachment.url ?? ''),
@@ -945,6 +1082,16 @@ function richCardData(
     mimeType: String(attachment.mimeType ?? ''),
     description: String(attachment.description ?? '钉盘在线预览'),
   }))
+  const clarifyOptions = (state.clarify?.options ?? []).slice(0, 4).map((option) => ({
+    id: String(option.id ?? ''),
+    label: String(option.label ?? ''),
+    description: String(option.description ?? ''),
+  }))
+  const clarifyUi: Record<string, boolean> = {}
+  clarifyOptions.forEach((option, optionIndex) => {
+    clarifyUi[`showClarifyOption${optionIndex}`] = Boolean(option.label)
+    clarifyUi[`showClarifyDesc${optionIndex}`] = Boolean(option.description)
+  })
   const answerUi: Record<string, boolean> = {}
   answerBlocks.forEach((block, blockIndex) => {
     const hasText = Boolean(block.text.trim())
@@ -957,27 +1104,47 @@ function richCardData(
     // 正文拆成文本段和原生表格段；表格由 Table 组件自己横滚，不改成竖排列表。
     answer: { blocks: answerBlocks },
     thinking: {
-      text: flattenMarkdownTables(reasoning || (active && !hasTools ? '正在分析你的问题…' : '')),
-      preview: active && !thinkingDone ? previewLine(reasoning) : '',
+      text: flattenMarkdownTables(thinkingPreviewText),
+      // 工具执行中仍保留思考摘要；正文开始或收口后再隐藏。
+      preview: active && !thinkingDone ? previewLine(thinkingPreviewText) : '',
     },
     tools: {
       text: flattenMarkdownTables(richToolsMarkdown(details, tools)),
       preview: active && hasTools ? richToolsPreview(details, tools) : '',
     },
     attachments,
+    clarify: {
+      sessionId: String(state.clarify?.sessionId ?? ''),
+      badge: state.clarify ? '需要你确认方向' : '',
+      hint: state.clarify
+        ? state.clarify.allowCustom !== false
+          ? '**请选择一个方向继续**，也可以直接回复你自己的方向'
+          : '**请选择一个方向继续**'
+        : '',
+      options: clarifyOptions,
+    },
     thinkingDone,
     ui: {
-      // 思考面板不因工具出现而隐藏：工具阶段仍保留“已深度思考”，
+      // 思考面板不因工具出现而隐藏：工具阶段仍保留“正在思考中”，
       // 工具面板在它下面单独占一行标题 + 一行当前工具信息。
-      showThinking: Boolean(reasoning) || hasTools,
-      showThinkingPreview: active && !thinkingDone && Boolean(previewLine(reasoning)),
+      showThinking: active || Boolean(reasoning) || hasTools,
+      showThinkingPreview: active && !thinkingDone && Boolean(previewLine(thinkingPreviewText)),
       showTools: hasTools,
       showToolsPreview: active && hasTools && Boolean(richToolsPreview(details, tools)),
-      showAnswerSpinner: active && Boolean(answer),
       showAttachments: attachments.length > 0,
       showAttachment0: attachments.length > 0,
       showAttachment1: attachments.length > 1,
       showAttachment2: attachments.length > 2,
+      showClarify: clarifyOptions.length > 0,
+      showClarifyOption0: false,
+      showClarifyOption1: false,
+      showClarifyOption2: false,
+      showClarifyOption3: false,
+      showClarifyDesc0: false,
+      showClarifyDesc1: false,
+      showClarifyDesc2: false,
+      showClarifyDesc3: false,
+      ...clarifyUi,
       ...answerUi,
     },
   }
@@ -987,8 +1154,12 @@ function richCardData(
  * 思考/工具用 CollapsiblePanel 收起，默认只占标题一行；正文 Markdown 放在最后。
  * 生命周期沿用 dsh-im 的单卡流式，但组件树换成官方 A2UI 的可折叠面板。
  */
-function richCardComponents(active: boolean, thinkingDone = false): Array<Record<string, unknown>> {
-  const thinkingTitle = thinkingDone ? '✦ 已深度思考' : '✦ 正在思考…'
+function richCardComponents(
+  active: boolean,
+  thinkingDone = false,
+  clarify?: DingTalkClarifyState | null,
+): Array<Record<string, unknown>> {
+  const thinkingTitle = thinkingDone ? '✦ 已深度思考' : '✦ 正在思考中…'
   const toolTitle = active ? '🛠️ 工具调用中…' : '🛠️ 工具调用记录'
   return [
     {
@@ -997,14 +1168,14 @@ function richCardComponents(active: boolean, thinkingDone = false): Array<Record
       child: 'rootColumn',
       // 交给钉钉按当前主题解析底色，避免写死白底在桌面端变成一块灰边白卡。
       backgroundColorToken: 'common_bg_color',
-      padding: 16,
-      cornerRadius: 12,
+      padding: 18,
+      cornerRadius: 16,
     },
     {
       id: 'rootColumn',
       component: 'Column',
-      children: ['thinkingBlock', 'toolBlock', 'answerRow', 'attachmentBlock'],
-      gap: 10,
+      children: ['thinkingBlock', 'toolBlock', 'answerRow', 'clarifyBlock', 'attachmentBlock'],
+      gap: 12,
     },
     {
       id: 'thinkingBlock',
@@ -1067,13 +1238,12 @@ function richCardComponents(active: boolean, thinkingDone = false): Array<Record
       visible: { path: '/ui/showToolsPreview' },
     },
     {
-      // 正文与圆环放在同一行：Row 底部对齐，圆环落在最后一行行末，
-      // 不会被 Markdown 的块级图片规则顶到下一行。
+      // 正文是唯一渲染主体；流式光标已经拼在正文最后一段，不再额外挂 loading 图标。
       id: 'answerRow',
       component: 'Row',
       align: 'end',
       gap: 0,
-      children: active ? ['answerBlocks', 'answerSpinner'] : ['answerBlocks'],
+      children: ['answerBlocks'],
     },
     {
       id: 'answerBlocks',
@@ -1108,19 +1278,94 @@ function richCardComponents(active: boolean, thinkingDone = false): Array<Record
         visible: { path: `/ui/showAnswerTable${index}` },
       },
     ]).flat(),
-    ...(active
-      ? [
-          {
-            id: 'answerSpinner',
-            component: 'Text',
-            // 一个空格保证 Text 有可见内容，前缀图标就是那枚 14px 原生 loading GIF。
-            text: ' ',
-            icon: { url: A2UI_ANSWER_SPINNER_URL },
-            maxLine: 1,
-            visible: { path: '/ui/showAnswerSpinner' },
+    {
+      // 澄清区做成一张浅色面板：顶部标签说明当前状态，下面每个方向是一整行可点击卡片。
+      id: 'clarifyBlock',
+      component: 'Column',
+      children: ['clarifyBadge', 'clarifyHint', 'clarifyOptions'],
+      gap: 8,
+      visible: { path: '/ui/showClarify' },
+    },
+    {
+      id: 'clarifyBadge',
+      component: 'Tag',
+      text: { path: '/clarify/badge' },
+      theme: 'warning',
+      variant: 'filled',
+      visible: { path: '/ui/showClarify' },
+    },
+    {
+      id: 'clarifyHint',
+      component: 'Markdown',
+      content: { path: '/clarify/hint' },
+      visible: { path: '/ui/showClarify' },
+    },
+    {
+      id: 'clarifyOptions',
+      component: 'Column',
+      children: ['clarifyOptionCard0', 'clarifyOptionCard1', 'clarifyOptionCard2', 'clarifyOptionCard3'],
+      gap: 8,
+    },
+    // 用带背景/圆角的 Row 承载整个选项，并把 action 挂在 Row 上：
+    // 这样整行都能点，不再只有文字宽度的小按钮；Button 的 child 只能放 Text，
+    // 无法同时放标题和描述，也不方便做整行卡片。
+    ...[0, 1, 2, 3].map((index) => ({
+      id: `clarifyOptionCard${index}`,
+      component: 'Row',
+      children: [`clarifyOptionBody${index}`, `clarifyOptionArrow${index}`],
+      gap: 8,
+      align: 'center',
+      padding: 12,
+      cornerRadius: 12,
+      backgroundColor: index === 0 ? '#141F7A4D' : '#0A1F7A4D',
+      borderWidth: 1,
+      borderColor: '#261F7A4D',
+      visible: { path: `/ui/showClarifyOption${index}` },
+      action: {
+        event: {
+          name: 'eab_clarify_select',
+          // A2UI 的交互事件不会自动完成请求闭环，业务标识直接放进 context，
+          // Stream 卡片回调里再从 cardPrivateData.params 校验并续跑同一会话。
+          context: {
+            action: 'clarify_select',
+            sessionId: clarify?.sessionId ?? '',
+            optionId: clarify?.options[index]?.id ?? '',
+            optionLabel: clarify?.options[index]?.label ?? '',
           },
-        ]
-      : []),
+        },
+      },
+    })),
+    ...[0, 1, 2, 3].map((index) => ({
+      id: `clarifyOptionBody${index}`,
+      component: 'Column',
+      gap: 3,
+      weight: 1,
+      children: [`clarifyOptionLabel${index}`, `clarifyOptionDesc${index}`],
+      visible: { path: `/ui/showClarifyOption${index}` },
+    })),
+    ...[0, 1, 2, 3].flatMap((index) => [
+      {
+        id: `clarifyOptionLabel${index}`,
+        component: 'Text',
+        text: { path: `/clarify/options/${index}/label` },
+        maxLine: 2,
+      },
+      {
+        id: `clarifyOptionDesc${index}`,
+        component: 'Text',
+        variant: 'caption',
+        text: { path: `/clarify/options/${index}/description` },
+        maxLine: 2,
+        visible: { path: `/ui/showClarifyDesc${index}` },
+      },
+      {
+        id: `clarifyOptionArrow${index}`,
+        component: 'Text',
+        text: '›',
+        maxLine: 1,
+        visible: { path: `/ui/showClarifyOption${index}` },
+      },
+    ]),
     {
       // 钉盘文件卡片：File 组件整行点击走 previewUrl，钉钉客户端会打开自己的
       // 在线预览页；url 仍保留给行尾打开按钮。
@@ -1217,6 +1462,9 @@ export function buildDingTalkA2UIUpdateMessages(
   if (!previousData || JSON.stringify(data.attachments) !== JSON.stringify(previousData.attachments)) {
     pushData('/attachments', data.attachments, previousData?.attachments)
   }
+  if (!previousData || JSON.stringify(data.clarify) !== JSON.stringify(previousData.clarify)) {
+    pushData('/clarify', data.clarify, previousData?.clarify)
+  }
 
   // 思考结束 / 工具出现或结束时才重发面板组件；纯流式阶段只更新变化的数据，
   // 避免每帧都让客户端重建组件树。
@@ -1224,14 +1472,27 @@ export function buildDingTalkA2UIUpdateMessages(
     ? !active || richStructureChanged(state, previous)
     : !active || data.thinkingDone
   if (shouldUpdateComponents) {
-    const terminal = richCardComponents(active, Boolean(data.thinkingDone))
+    const terminal = richCardComponents(active, Boolean(data.thinkingDone), state.clarify)
+    const structuralIds = new Set([
+      'thinkingPanel',
+      'toolPanel',
+      'clarifyBlock',
+      'clarifyBadge',
+      'clarifyHint',
+      'clarifyOptions',
+      ...Array.from({ length: 4 }, (_, index) => [
+        `clarifyOptionCard${index}`,
+        `clarifyOptionBody${index}`,
+        `clarifyOptionLabel${index}`,
+        `clarifyOptionDesc${index}`,
+        `clarifyOptionArrow${index}`,
+      ]).flat(),
+    ])
     messages.push(
       a2uiMessage({
         updateComponents: {
           surfaceId,
-          components: terminal.filter((component) =>
-            ['thinkingPanel', 'toolPanel'].includes(String(component.id)),
-          ),
+          components: terminal.filter((component) => structuralIds.has(String(component.id))),
         },
       }),
     )
@@ -1419,6 +1680,37 @@ export class DingTalkAICardStream {
     }
   }
 
+  /**
+   * 用户点击澄清按钮后复用原卡片，而不是再发一条新消息。
+   * surfaceId 与 outTrackId 的 suffix 在创建时一一对应，这里按同一规则还原。
+   */
+  async resume(outTrackId: string, initialState: DingTalkRichCardState): Promise<boolean> {
+    if (this.phase !== 'idle') return false
+    const id = String(outTrackId ?? '').trim()
+    if (!id.startsWith('eab_a2ui_')) return false
+    const suffix = id.slice('eab_a2ui_'.length)
+    if (!suffix) return false
+    this.cardInstanceId = id
+    this.surfaceId = `${A2UI_SURFACE_PREFIX}${suffix}`
+    this.phase = 'active'
+    const state = cloneRichState(initialState)
+    this.lastSentState = null
+    this.lastSentChars = 0
+    this.lastUpdateAt = 0
+    try {
+      // 先回到处理中并清空上一轮的澄清数据，旧卡片按钮立即失效。
+      await this.putUpdate(state, A2UI_STATUS.processing, true, null)
+      this.lastSentState = state
+      this.lastSentChars = richTextLength(state)
+      this.lastUpdateAt = Date.now()
+      return true
+    } catch (error) {
+      this.phase = 'failed'
+      this.logger.warn?.('[eab] 钉钉 A2UI 卡片续用失败：', (error as Error).message)
+      return false
+    }
+  }
+
   private schedule(): void {
     if (this.phase !== 'active' || this.worker || this.pendingState === null) return
     if (this.lastSentState && !richStateChanged(this.pendingState, this.lastSentState)) return
@@ -1501,12 +1793,32 @@ export class DingTalkAICardStream {
       if (active) await active
       if (this.phase !== 'finishing') return false
       try {
+        /**
+         * 带澄清选项的卡片不能收口成 FINISH：用户点击后还要在同一张卡上继续。
+         * 钉钉的已完成卡片不接受回退到 PROCESSING，真机上会表现为“原卡保留 +
+         * 另发一条新卡”。这里保持和处理中一样的状态，只把 spinner 关掉并渲染选项，
+         * 下一轮回调直接对同一个 outTrackId 继续 update。
+         */
+        if (finalState.clarify) {
+          await this.putUpdate(cloneRichState(finalState), A2UI_STATUS.processing, false, null)
+          rememberClarifyCard(this.cardInstanceId, finalState.clarify)
+          if (summary) {
+            try {
+              await this.putLastMessage(summary)
+            } catch (error) {
+              this.logger.warn?.('[eab] 钉钉 A2UI 卡片更新外层摘要失败：', (error as Error).message)
+            }
+          }
+          this.phase = 'finished'
+          return true
+        }
         await this.putFinalStatus(cloneRichState(finalState), [
           A2UI_STATUS.finished,
           'FINISHED',
           'COMPLETED',
           'DONE',
         ])
+        rememberClarifyCard(this.cardInstanceId, finalState.clarify)
         // 外层摘要失败不能让已经收口的卡片回退成文字消息。
         if (summary) {
           try {

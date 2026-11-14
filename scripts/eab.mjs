@@ -8,15 +8,16 @@
  * 用法：node scripts/eab.mjs <command> [...]
  *   init                 检查目录与凭据，打印下一步
  *   doctor               健康 / 库 / 密钥 / 备份 / 端口 一键诊断
- *   backup               生成 SQLite 快照
- *   restore <file> --yes 停服务后替换数据库（危险）
+ *   backup               生成 SQLite 快照；backup --full 生成运行数据备份
+ *   restore <file|目录> --yes 停服务后恢复数据库或运行数据备份（危险）
  *   audit verify         校验审计哈希链
  *   audit export         导出 audit.csv 到 .eab-dev/exports
  *   user create          新建成员（参数见 --help）
  *   plugin list          列出插件
- *   serve                在前台启动服务（pnpm dev）
+ *   start / restart / stop 启动、重启、停止服务（server 子命令可省略）
+ *   server               兼容旧写法，等价 start server
  */
-import { existsSync, readFileSync, mkdirSync, copyFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, mkdirSync, copyFileSync, readdirSync, writeFileSync, cpSync, renameSync, rmSync, statSync } from 'node:fs'
 import { spawn, spawnSync } from 'node:child_process'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -51,7 +52,7 @@ function consoleBaseUrl() {
 
 function readCredentials() {
   const file = join(DEV_DIR, 'admin-credentials.txt')
-  if (!existsSync(file)) throw new Error('缺少 .eab-dev/admin-credentials.txt，先执行 pnpm dev 让服务初始化')
+  if (!existsSync(file)) throw new Error('缺少 .eab-dev/admin-credentials.txt，先执行 eab start 让服务初始化')
   const out = {}
   for (const line of readFileSync(file, 'utf8').split(/\r?\n/)) {
     const match = line.match(/^(username|password)=(.+)$/)
@@ -98,15 +99,22 @@ function argsOf(argv, start) {
   return { flags, positional }
 }
 
+/** `start/restart/stop` 后面可以写 `server`，也可以省略。 */
+function assertServerSubcommand(sub, command) {
+  if (sub !== undefined && sub !== '' && sub !== 'server' && sub !== 'serve') {
+    throw new Error(`用法：eab ${command} [server]（server 可省略）`)
+  }
+}
+
 async function doctor() {
   const checks = []
   const add = (name, ok, detail, fix = '') => checks.push({ name, ok, detail, fix })
   try {
     const res = await fetch(`${chatBaseUrl()}/api/health`)
     const body = await res.json()
-    add('服务', res.ok, `${chatBaseUrl()} · v${body?.data?.version}`, '启动：eab server')
+    add('服务', res.ok, `${chatBaseUrl()} · v${body?.data?.version}`, '启动：eab start')
   } catch {
-    add('服务', false, '连不上', '在另一个终端执行 pnpm dev')
+    add('服务', false, '连不上', '在另一个终端执行 eab start')
   }
   for (const [name, path, optional] of [
     ['数据库', join(DEV_DIR, 'eab.db'), false],
@@ -137,9 +145,23 @@ async function doctor() {
   process.exitCode = failed.length ? 1 : 0
 }
 
-async function backup() {
+async function backup(full = false) {
   const headers = await login()
-  const result = await api('/api/console/backups', headers, { method: 'POST', body: '{}' })
+  const path = full ? '/api/console/backups/runtime' : '/api/console/backups'
+  let result = await api(path, headers, { method: 'POST', body: '{}' })
+  if (full) {
+    let job = result
+    while (job.status === 'running') {
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 2000))
+      job = await api(`/api/console/backup-jobs/${encodeURIComponent(result.jobId)}`, headers)
+    }
+    if (job.status === 'failed') throw new Error(job.error || '运行数据备份失败')
+    result = job
+    console.log(`运行数据备份完成：${result.dir}（${(result.size / 1024 / 1024).toFixed(2)} MB）`)
+    console.log(`包含：${result.manifest.includes.join('、')}`)
+    console.log(`不包含：${result.manifest.excludes.join('、')}`)
+    return
+  }
   console.log(`备份完成：${result.file}（${(result.size / 1024 / 1024).toFixed(2)} MB）`)
 }
 
@@ -253,6 +275,11 @@ async function server(flags) {
   child.on('exit', (code) => process.exit(code ?? 0))
 }
 
+async function restart(flags) {
+  console.log(`服务：${await stopService()}`)
+  await server(flags)
+}
+
 async function latestRelease() {
   const repo = (process.env.EAB_UPDATE_REPO ?? 'Jydsh/EAB').trim() || 'Jydsh/EAB'
   const headers = { accept: 'application/vnd.github+json', 'user-agent': 'EAB-CLI' }
@@ -327,7 +354,7 @@ function installCli() {
     const result = spawnSync('powershell', ['-NoProfile', '-Command', ps], { encoding: 'utf8' })
     if (result.status !== 0) throw new Error(result.stderr || '写入用户 PATH 失败')
     console.log(`已安装 eab 命令：${cmd}`)
-    console.log(`已把 ${binDir} 加入用户 PATH；新开终端后执行：eab server`)
+    console.log(`已把 ${binDir} 加入用户 PATH；新开终端后执行：eab start`)
     return
   }
   const home = process.env.HOME || '~'
@@ -342,23 +369,64 @@ function installCli() {
     throw new Error(`创建 ${target} 失败：${error.message}`)
   }
   console.log(`已创建：${target} → ${script}`)
-  console.log(`确认 ${binDir} 在 PATH 中后，执行：eab server`)
+  console.log(`确认 ${binDir} 在 PATH 中后，执行：eab start`)
+}
+
+function runtimeManifest(target) {
+  try {
+    if (!statSync(target).isDirectory()) return null
+    const file = join(target, 'manifest.json')
+    if (!existsSync(file)) return null
+    const manifest = JSON.parse(readFileSync(file, 'utf8'))
+    return manifest?.format === 'eab-runtime-backup-v1' ? manifest : null
+  } catch {
+    return null
+  }
 }
 
 async function restore(file) {
-  if (!file) throw new Error('用法：node scripts/eab.mjs restore <备份文件> --yes')
+  if (!file) throw new Error('用法：node scripts/eab.mjs restore <备份文件|运行数据备份目录> --yes')
   const target = resolve(file)
-  if (!existsSync(target)) throw new Error(`备份文件不存在：${target}`)
+  if (!existsSync(target)) throw new Error(`备份不存在：${target}`)
   const db = join(DEV_DIR, 'eab.db')
   if (!existsSync(db)) throw new Error(`当前数据库不存在：${db}`)
   const stopped = await stopService()
-  const safety = `${db}.before-restore-${Date.now()}`
-  copyFileSync(db, safety)
-  copyFileSync(target, db)
+  const stamp = Date.now()
+  const safety = join(DEV_DIR, `restore-safety-${stamp}`)
+  mkdirSync(safety, { recursive: true })
+  copyFileSync(db, join(safety, 'eab.db'))
   console.log(`服务：${stopped}`)
-  console.log(`当前库已先备份到：${safety}`)
+  console.log(`当前库已先备份到：${join(safety, 'eab.db')}`)
+
+  const manifest = runtimeManifest(target)
+  if (manifest) {
+    // 先把当前运行目录整体挪到安全目录，再按 manifest 回填；失败时
+    // 至少旧目录还在 restore-safety-* 里，不会被半覆盖。
+    for (const relative of manifest.includes) {
+      if (relative === 'eab.db') continue
+      const current = join(DEV_DIR, relative)
+      if (existsSync(current)) renameSync(current, join(safety, relative))
+    }
+    copyFileSync(join(target, 'eab.db'), db)
+    for (const relative of manifest.includes) {
+      if (relative === 'eab.db') continue
+      const source = join(target, 'runtime', relative)
+      if (existsSync(source)) cpSync(source, join(DEV_DIR, relative), { recursive: true })
+    }
+    rmSync(`${db}-wal`, { force: true })
+    rmSync(`${db}-shm`, { force: true })
+    console.log(`已恢复运行数据：${target} → ${DEV_DIR}`)
+    console.log(`旧运行目录保存在：${safety}`)
+    console.log('现在重新启动：eab start')
+    return
+  }
+
+  copyFileSync(target, db)
+  rmSync(`${db}-wal`, { force: true })
+  rmSync(`${db}-shm`, { force: true })
   console.log(`已恢复：${target} → ${db}`)
-  console.log('现在重新启动：pnpm dev')
+  console.log(`当前库的安全副本：${join(safety, 'eab.db')}`)
+  console.log('现在重新启动：eab start')
 }
 
 async function audit(sub) {
@@ -417,11 +485,11 @@ function init() {
   const hasCred = existsSync(join(DEV_DIR, 'admin-credentials.txt'))
   console.log(`EAB 目录：${ROOT}`)
   console.log(`部署目录：${DEV_DIR}`)
-  console.log(hasCred ? '控制台凭据已存在（重复执行不会覆盖）。' : '还没有控制台凭据；执行 eab server 首次生成。')
+  console.log(hasCred ? '控制台凭据已存在（重复执行不会覆盖）。' : '还没有控制台凭据；执行 eab start 首次生成。')
   console.log('\n下一步：')
   console.log('1. pnpm install')
   console.log('2. pnpm typecheck && pnpm test')
-  console.log('3. eab server（或 node scripts/eab.mjs server）')
+  console.log('3. eab start（或 node scripts/eab.mjs start）')
   console.log('4. 浏览器打开 http://127.0.0.1:8788/admin 用 admin 登录')
   console.log('5. 员工打开 http://127.0.0.1:8787/chat 用工号+密码登录')
   const accounts = join(DEV_DIR, 'demo-accounts.txt')
@@ -439,14 +507,17 @@ function help() {
   console.log(`EAB CLI
   eab -v, --version    显示当前版本
   eab -h, --help       显示帮助
-  eab server [--background] [--host=0.0.0.0] [--chat-port=8787] [--admin-port=8788]
-  eab stop
+  eab start [server] [--background] [--host=0.0.0.0] [--chat-port=8787] [--admin-port=8788]
+  eab restart [server] [--background]   先停止，再按 start 参数启动
+  eab stop [server]                    停止本机 EAB 服务
+  eab server                           兼容旧写法，等价 eab start server
   eab update [--apply]
   eab install-cli
   eab init
   eab doctor
-  eab backup
-  eab restore <file> --yes
+  eab backup           生成 SQLite 快照
+  eab backup --full    生成运行数据备份（含插件包、dsh-home、workspaces，不含密钥）
+  eab restore <file|目录> --yes 停服务后恢复数据库或运行数据备份（危险）
   eab audit verify
   eab audit export
   eab user create --name=张三 --dept=d10 --password=Eab@2026demo --no=U_ZS --roles=member
@@ -456,16 +527,17 @@ function help() {
 `)
 }
 
-const [command, sub, ...rest] = process.argv.slice(2)
+const [command, rawSub, ...rest] = process.argv.slice(2)
+const sub = rawSub && !rawSub.startsWith('--') ? rawSub : undefined
 const { flags } = argsOf(process.argv, 3)
 try {
   if (!command || command === 'help' || command === '--help' || command === '-h') help()
   else if (command === 'version' || command === '-v' || command === '--version') version()
   else if (command === 'init') init()
   else if (command === 'doctor') await doctor()
-  else if (command === 'backup') await backup()
+  else if (command === 'backup') await backup(flags.full === true || flags.full === '1')
   else if (command === 'restore') {
-    if (!flags.yes) throw new Error('恢复会覆盖当前数据库，确认后加 --yes')
+    if (!flags.yes) throw new Error('恢复会覆盖当前数据库或运行数据，确认后加 --yes')
     await restore(sub)
   } else if (command === 'audit') await audit(sub)
   else if (command === 'user') {
@@ -476,7 +548,14 @@ try {
     await pluginList()
   } else if (command === 'server' || command === 'serve') {
     await server(flags)
+  } else if (command === 'start') {
+    assertServerSubcommand(sub, 'start')
+    await server(flags)
+  } else if (command === 'restart') {
+    assertServerSubcommand(sub, 'restart')
+    await restart(flags)
   } else if (command === 'stop') {
+    assertServerSubcommand(sub, 'stop')
     console.log(`服务：${await stopService()}`)
   } else if (command === 'update') {
     await update(flags)

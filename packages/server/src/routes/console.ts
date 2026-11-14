@@ -23,8 +23,20 @@ import {
 import { applyOrgSync, fetchChannelOrg, fetchDingTalkTenant, mapRemoteOrg, pollFeishuScanNative, pollWecomScan, startFeishuScanNative, startWecomScan, verifyFeishuApp } from '@eab/channel'
 import { resolveOrgSyncIntervalMs, syncChannelOrg, type ChannelProvider } from '../org-sync-scheduler.js'
 import { dispatchPluginRpc } from '../plugin-host.js'
-import { listPluginChannels, listAllPluginModels, listPluginModels, refreshPluginChannel } from '../plugin-models.js'
-import { filterHealthyModels, probePluginChannelModels } from '../model-health.js'
+import { hitRate } from '../backends/coordination.js'
+import { bumpHotVersion } from '../hot-cache.js'
+import { listPluginChannels, listAllPluginModels, listPluginModels } from '../plugin-models.js'
+import { invalidatePluginToolSpecsEverywhere, pluginToolCatalogFor } from '../plugin-tools.js'
+import {
+  listCompanyRoleOptions,
+  pluginToolAccessId,
+  readToolRoleAccess,
+  readToolRoleAccessMap,
+  setToolRoleAccess,
+} from '../tool-role-access.js'
+import { TOOLS } from './tools.js'
+import { filterHealthyModels, hydrateModelHealth } from '../model-health.js'
+import { JOB_KINDS, cancelJob, getJob, listJobs, submitJob } from '../job-queue.js'
 import {
   applyPluginModelRoles,
   loadPluginModelRoleMap,
@@ -257,7 +269,7 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
   /** 改控制台密码：校验当前口令 → 落盘 → 运行时立即生效 → 其它设备会话失效 */
   app.post<{ Body: { currentPassword?: string; newPassword?: string } }>(
     '/api/console/password',
-    async (req) => {
+    async (req, reply) => {
       requireConsole(req, deps)
       const session = sessionFromRequest(req)
       const username = session?.user ?? ''
@@ -294,6 +306,8 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
       )
       setAdminPassword(next)
       const revoked = revokeOtherSessions(req)
+      // 签名密钥已随新密码更换，旧 Cookie 全部失效；当前设备换发一张新证书继续在线。
+      reply.header('set-cookie', sessionCookie(createSession(username, req.ip ?? '')))
       appendAudit(deps.db, {
         companyId: deps.companyId,
         actorUserId: 'console-operator',
@@ -438,6 +452,119 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
         quota: quotasByRole.get(row.code) ?? null,
       })),
     })
+  })
+
+  /* ---------------- 工具角色可用性 ---------------- */
+
+  /**
+   * 工具角色配置列表。
+   *
+   * 平台工具注册表只展示内置工具与公司插件工具；个人插件工具只归安装人本人，
+   * 不进入平台列表、也不在后台展示（个人工具不需要角色授权）。
+   * 插件工具按 plugin:<pluginId>:<toolName> 归并。
+   */
+  app.get('/api/console/tools/access', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const actor = resolveActor(deps.db, deps.config, req, deps.companyId)
+    const roles = listCompanyRoleOptions(deps.db, companyId)
+    const roleAccess = readToolRoleAccessMap(deps.db, companyId)
+    const seenPluginAccess = new Set<string>()
+    const pluginTools = pluginToolCatalogFor(deps.db, actor, { allCompanyInstances: true, scope: 'company' }).filter(
+      (tool) => {
+        const accessId = pluginToolAccessId(tool.pluginId, tool.name)
+        if (seenPluginAccess.has(accessId)) return false
+        seenPluginAccess.add(accessId)
+        return true
+      },
+    )
+    const entries = [
+      ...TOOLS.map((tool) => {
+        const access = readToolRoleAccess(deps.db, companyId, tool.id)
+        return {
+          id: tool.id,
+          accessId: tool.id,
+          name: tool.name,
+          description: tool.description,
+          source: 'builtin' as const,
+          dangerous: tool.dangerous,
+          available: actor.subject.scopes.has(tool.scope),
+          mode: access.mode,
+          roleCodes: access.roles,
+        }
+      }),
+      ...pluginTools.map((tool) => {
+        const accessId = pluginToolAccessId(tool.pluginId, tool.name)
+        const access = roleAccess.get(accessId)
+        return {
+          id: tool.id,
+          accessId,
+          name: tool.name,
+          description: tool.description,
+          source: 'plugin' as const,
+          dangerous: false,
+          available: tool.available,
+          pluginId: tool.pluginId,
+          personal: tool.personal,
+          // 个人插件工具只归安装人本人使用，不参与角色授权；公司插件工具沿用历史默认所有角色。
+          mode: tool.personal ? ('owner' as const) : access ? access.mode : ('all' as const),
+          roleCodes: tool.personal ? [] : (access?.roles ?? []),
+        }
+      }),
+    ]
+    return ok({
+      companyId,
+      defaultMode: 'all' as const,
+      pluginDefaultMode: 'none' as const,
+      companyPluginDefaultMode: 'all' as const,
+      roles,
+      tools: entries,
+    })
+  })
+
+  app.put<{
+    Params: { id: string }
+    Body: { mode?: string; roles?: string[] }
+  }>('/api/console/tools/:id/roles', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const actor = resolveActor(deps.db, deps.config, req, deps.companyId)
+    const requestedId = String(req.params.id ?? '')
+    const builtin = TOOLS.find((tool) => tool.id === requestedId)
+    let accessId: string
+    let toolName: string
+
+    if (builtin) {
+      accessId = builtin.id
+      toolName = builtin.name
+    } else {
+      const pluginTool = pluginToolCatalogFor(deps.db, actor, { allCompanyInstances: true }).find(
+        (tool) =>
+          tool.id === requestedId ||
+          pluginToolAccessId(tool.pluginId, tool.name) === requestedId,
+      )
+      if (!pluginTool) throw new EabError(EC.NOT_FOUND, `工具不存在或当前不可用: ${requestedId}`)
+      accessId = pluginToolAccessId(pluginTool.pluginId, pluginTool.name)
+      toolName = pluginTool.name
+    }
+
+    const access = setToolRoleAccess(deps.db, companyId, String(accessId), {
+      mode: req.body?.mode,
+      roles: req.body?.roles,
+    })
+    appendAudit(deps.db, {
+      companyId,
+      actorUserId: 'console-operator',
+      action: 'tool.access.update',
+      resourceType: 'tool',
+      resourceId: String(accessId),
+      result: 'success',
+      detail: { toolId: accessId, name: toolName, mode: access.mode, roles: access.roles },
+      ip: req.ip ?? null,
+      channel: 'console',
+    })
+    await invalidatePluginToolSpecsEverywhere()
+    return ok({ toolId: accessId, name: toolName, mode: access.mode, roleCodes: access.roles })
   })
 
   app.put<{
@@ -631,6 +758,9 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
     // 删除自定义角色时，连带解除所有成员绑定，避免留下指向已删除角色的授权行
     deps.db.prepare('DELETE FROM user_roles WHERE role_id = ?').run(role.id)
     deps.db.prepare('DELETE FROM role_scopes WHERE role_id = ?').run(role.id)
+    deps.db
+      .prepare('DELETE FROM tool_role_bindings WHERE company_id = ? AND role_code = ?')
+      .run(companyId, role.code)
     deps.db
       .prepare('DELETE FROM workspace_quota_policies WHERE company_id = ? AND scope_type = ? AND scope_id = ?')
       .run(companyId, 'role', role.code)
@@ -1726,9 +1856,60 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
     if (!channels.some((channel) => channel.id === channelId)) {
       throw new EabError(EC.NOT_FOUND, '插件通道不存在、未启用或尚未完成注册')
     }
-    await refreshPluginChannel(companyId, channelId)
-    const probe = await probePluginChannelModels(companyId, channelId)
-    return ok({ channelId, models: probe.healthy, checked: probe.checked })
+    /**
+     * 探测每个模型最多 15 秒，6 个模型就可能把 HTTP 请求占住一分半。
+     * 改成提交异步作业：接口立刻返回 jobId，由 worker 在后台跑，
+     * 页面轮询 /api/console/jobs/:jobId 拿最终结果。
+     */
+    const job = submitJob(deps.db, {
+      companyId,
+      kind: JOB_KINDS.pluginChannelRefresh,
+      title: `刷新插件通道 ${channelId}`,
+      payload: { channelId },
+      total: 1,
+    })
+    return ok({ jobId: job.id, queued: true })
+  })
+
+  /** 异步作业状态：任何实例都能回读（状态在库里，不在进程内）。 */
+  app.get<{ Params: { jobId: string } }>('/api/console/jobs/:jobId', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const job = getJob(deps.db, companyId, String(req.params.jobId))
+    if (!job) throw new EabError(EC.NOT_FOUND, '作业不存在或已过期')
+    return ok({
+      jobId: job.id,
+      kind: job.kind,
+      title: job.title,
+      status: job.status,
+      progress: job.progress,
+      total: job.total,
+      error: job.error,
+      result: job.result,
+      createdAt: job.createdAt,
+      startedAt: job.startedAt,
+      finishedAt: job.finishedAt,
+    })
+  })
+
+  app.get<{ Querystring: { limit?: string } }>('/api/console/jobs', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const limit = Number(req.query?.limit ?? 20)
+    return ok({ jobs: listJobs(deps.db, companyId, Number.isFinite(limit) ? limit : 20) })
+  })
+
+  /** 取消排队中的作业；已经跑起来的作业由处理器自己收尾，不在这里强杀。 */
+  app.post<{ Params: { jobId: string } }>('/api/console/jobs/:jobId/cancel', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const jobId = String(req.params.jobId)
+    const job = getJob(deps.db, companyId, jobId)
+    if (!job) throw new EabError(EC.NOT_FOUND, '作业不存在或已过期')
+    if (job.status !== 'queued') {
+      throw new EabError(EC.CONFLICT, '只有还在排队的作业可以取消；已经在执行的作业请等它结束')
+    }
+    return ok({ cancelled: cancelJob(deps.db, jobId) })
   })
 
   app.post<{
@@ -2254,6 +2435,7 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
     const channels = new Map(pluginChannels.map((channel) => [channel.id, channel]))
     const channelPluginIds = new Set(pluginChannels.map((channel) => channel.pluginId))
     const pluginRoleOverrides = loadPluginModelRoleMap(deps.db, companyId)
+    await hydrateModelHealth(companyId)
     const pluginModels = applyPluginModelRoles(
       filterHealthyModels(companyId, listPluginModels(companyId)),
       pluginRoleOverrides,
@@ -2457,6 +2639,7 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
         now,
         now,
       )
+    await bumpHotVersion('models')
     return ok({
       model: {
         id,
@@ -2479,7 +2662,6 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
       },
     })
   })
-
   app.patch<{
     Params: { id: string }
     Body: {
@@ -2639,6 +2821,7 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
         Date.now(),
         id,
       )
+    await bumpHotVersion('models')
     return ok({
       model: {
         id,
@@ -2681,6 +2864,7 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
         if (unknown.length > 0) throw new EabError(EC.VALIDATION, `未知角色：${unknown.join('、')}`)
       }
       savePluginModelRoles(deps.db, companyId, id, roles)
+      await bumpHotVersion('models')
       return ok({ model: { id, roles } })
     },
   )
@@ -2694,6 +2878,7 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
       .get(id, companyId)
     if (!row) throw new EabError(EC.NOT_FOUND, '模型不存在')
     deps.db.prepare('UPDATE models SET deleted_at = ?, updated_at = ? WHERE id = ?').run(Date.now(), Date.now(), id)
+    await bumpHotVersion('models')
     return ok({ deleted: true })
   })
 
@@ -3141,7 +3326,8 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
 
     const callbackToken = existing?.callback_token ?? randomUUID().replace(/-/g, '')
     const enabled = req.body?.enabled === undefined ? Boolean(existing?.enabled) : req.body.enabled
-    const configured = Boolean(appId || webhookUrl)
+    // 企业微信只填 corpId + agentId + 密钥，没有 appId；只认 appId 会把它判成未配置。
+    const configured = Boolean(appId || webhookUrl || corpId || agentId)
     // 已绑定的渠道改 AppSecret 时不能把 status 退回 configured，
     // 否则飞书/钉钉长连接会因“未绑定”直接停掉。
     const status =
@@ -4338,7 +4524,6 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
   })
 
   /** 渠道回调入口：URL 验证 + 钉钉机器人回显；带事件去重、身份绑定与频控。 */
-  const rateBuckets = new Map<string, number[]>()
   app.post<{ Params: { provider: string }; Querystring: { token?: string }; Body: Record<string, unknown> }>(
     '/api/channel/webhooks/:provider',
     async (req, reply) => {
@@ -4399,17 +4584,17 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
             .get(provider, senderId) as { user_id: string; name: string } | undefined)
         : undefined
 
-      // CHN-06 频控：同一发送者每分钟最多 20 条
+      // CHN-06 频控：同一发送者每分钟最多 20 条。Redis 在线时跨实例共享额度，离线回退进程内计数。
       if (senderId) {
-        const key = `${provider}:${senderId}`
-        const now = Date.now()
-        const bucket = (rateBuckets.get(key) ?? []).filter((at) => now - at < 60_000)
-        if (bucket.length >= 20) {
-          rateBuckets.set(key, bucket)
-          return ok({ received: true, throttled: true, limitPerMinute: 20 })
+        const verdict = await hitRate(`${provider}:${senderId}`, 20, 60)
+        if (!verdict.allowed) {
+          return ok({
+            received: true,
+            throttled: true,
+            limitPerMinute: verdict.limit,
+            retryAfterSec: verdict.retryAfterSec,
+          })
         }
-        bucket.push(now)
-        rateBuckets.set(key, bucket)
       }
 
       if (provider === 'dingtalk') {

@@ -45,6 +45,12 @@ export interface ServerConfig {
   readonly dbDir?: string
   /** 个人 / 部门 / 公司云空间根目录 */
   readonly workspacesDir?: string
+  /** OnlyOffice DocumentServer 的浏览器访问地址；为空表示未启用在线文档编辑 */
+  readonly onlyOfficeUrl: string
+  /** OnlyOffice JWT 密钥，必须与容器里的 JWT_SECRET 一致 */
+  readonly onlyOfficeJwtSecret: string
+  /** OnlyOffice 容器回访 EAB 的内部地址；默认按 Docker Desktop 的 host.docker.internal 推导 */
+  readonly onlyOfficeInternalUrl: string
   /** 临时文件目录 */
   readonly tmpDir?: string
   /** 数据库备份目录 */
@@ -95,8 +101,36 @@ export interface ServerConfig {
   readonly agentMaxDepth?: number
   /** 单个子 Agent 最多重试几次；默认 1 */
   readonly agentMaxRetries?: number
+  /** 子 Agent 空闲多久没有新任务就自动注销；默认 120 秒 */
+  readonly agentWorkerIdleMs?: number
   /** 所有请求体同时在内存中的粗略预算（MB）；超过时新的大请求直接 429 */
   readonly maxInflightBodyMb?: number
+  /** 缓存后端：auto（有 URL 用 Redis）、memory、redis、off（仍用内存，只是不尝试外部） */
+  readonly cacheBackend: 'auto' | 'memory' | 'redis' | 'off'
+  /** Redis 连接串；为空时 auto 自动使用内存缓存 */
+  readonly redisUrl: string
+  /** Redis key 前缀，避免与服务器上其它应用冲突 */
+  readonly redisPrefix: string
+  /** PostgreSQL 后端：auto（有 URL 用镜像）、off、mirror（审计镜像） */
+  readonly postgresBackend: 'auto' | 'off' | 'mirror'
+  /** PostgreSQL 连接串；为空时 auto 自动关闭镜像 */
+  readonly postgresUrl: string
+  /**
+   * 审计读取数据源：
+   * - sqlite（默认）：始终读 SQLite 权威链；
+   * - postgres：PG 审计镜像可用时读 PG，失败回退 SQLite；
+   * - auto：PG 审计镜像可用时读 PG，否则读 SQLite。
+   */
+  readonly auditRead: 'sqlite' | 'postgres' | 'auto'
+  /**
+   * 会话列表读取数据源：
+   * - sqlite（默认）：始终读 SQLite 权威会话；
+   * - postgres：PG 会话镜像追平后读 PG，未追平/失败回退 SQLite；
+   * - auto：PG 会话镜像可用时读 PG，否则读 SQLite。
+   */
+  readonly chatRead: 'sqlite' | 'postgres' | 'auto'
+  /** 显式要求的外部后端连不上时是否启动失败；默认 false，降级继续跑 */
+  readonly backendsStrict: boolean
 }
 
 function readInt(raw: string | undefined, fallback: number, name: string): number {
@@ -116,6 +150,38 @@ function readNonNegativeInt(raw: string | undefined, fallback: number, name: str
     throw new EabError(EC.VALIDATION, `环境变量 ${name} 必须是非负整数，当前是 ${raw}`)
   }
   return value
+}
+
+function readEnum<T extends string>(
+  raw: string | undefined,
+  allowed: readonly T[],
+  fallback: T,
+  name: string,
+): T {
+  const value = (raw ?? '').trim().toLowerCase()
+  if (!value) return fallback
+  if (!allowed.includes(value as T)) {
+    throw new EabError(EC.VALIDATION, `环境变量 ${name} 只能是 ${allowed.join(' / ')}，当前是 ${raw}`)
+  }
+  return value as T
+}
+
+function normalizeBaseUrl(raw: string | undefined, name: string): string {
+  const value = (raw ?? '').trim()
+  if (!value) return ''
+  let url: URL
+  try {
+    url = new URL(value)
+  } catch {
+    throw new EabError(EC.VALIDATION, `环境变量 ${name} 不是合法地址：${value}`)
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new EabError(EC.VALIDATION, `环境变量 ${name} 只支持 http/https：${value}`)
+  }
+  if (url.search || url.hash) {
+    throw new EabError(EC.VALIDATION, `环境变量 ${name} 不能带查询参数或锚点：${value}`)
+  }
+  return `${url.origin}${url.pathname}`.replace(/\/+$/, '')
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
@@ -147,6 +213,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     throw new EabError(EC.VALIDATION, `监听地址不合法：${host}`, { hint: '本机用 127.0.0.1，局域网用 0.0.0.0' })
   }
 
+  const onlyOfficeUrl = normalizeBaseUrl(env.EAB_ONLYOFFICE_URL, 'EAB_ONLYOFFICE_URL')
+  const onlyOfficeJwtSecret = (env.EAB_ONLYOFFICE_JWT_SECRET ?? '').trim()
+  if (onlyOfficeUrl && !onlyOfficeJwtSecret) {
+    throw new EabError(EC.VALIDATION, '启用了 OnlyOffice 但缺少 JWT 密钥', {
+      hint: 'EAB_ONLYOFFICE_JWT_SECRET 必须与 OnlyOffice 容器的 JWT_SECRET 一致',
+    })
+  }
+  const onlyOfficeInternalUrl = normalizeBaseUrl(
+    env.EAB_ONLYOFFICE_INTERNAL_URL ?? `http://host.docker.internal:${port}`,
+    'EAB_ONLYOFFICE_INTERNAL_URL',
+  )
+
   return {
     host,
     port,
@@ -154,6 +232,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     dbPath: env.EAB_DB ?? DEFAULT_DB_PATH,
     companyId: env.EAB_COMPANY_ID ?? 'c1',
     devAuth: (env.EAB_DEV_AUTH ?? '0') === '1',
+    onlyOfficeUrl,
+    onlyOfficeJwtSecret,
+    onlyOfficeInternalUrl,
     /** 新名字优先；`EAB_PLATFORM_TOKEN` 只为兼容旧部署保留 */
     consoleToken: env.EAB_CONSOLE_TOKEN ?? env.EAB_PLATFORM_TOKEN ?? '',
     adminUser: env.EAB_ADMIN_USER ?? 'admin',
@@ -189,6 +270,30 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     agentMaxParallel: readInt(env.EAB_AGENT_MAX_PARALLEL, 4, 'EAB_AGENT_MAX_PARALLEL'),
     agentMaxDepth: readInt(env.EAB_AGENT_MAX_DEPTH, 2, 'EAB_AGENT_MAX_DEPTH'),
     agentMaxRetries: readInt(env.EAB_AGENT_MAX_RETRIES, 1, 'EAB_AGENT_MAX_RETRIES'),
+    agentWorkerIdleMs: readInt(env.EAB_AGENT_WORKER_IDLE_MS, 120_000, 'EAB_AGENT_WORKER_IDLE_MS'),
     maxInflightBodyMb: readInt(env.EAB_MAX_INFLIGHT_BODY_MB, 256, 'EAB_MAX_INFLIGHT_BODY_MB'),
+    cacheBackend: readEnum(env.EAB_CACHE, ['auto', 'memory', 'redis', 'off'] as const, 'auto', 'EAB_CACHE'),
+    redisUrl: (env.EAB_REDIS_URL ?? '').trim(),
+    redisPrefix: (env.EAB_REDIS_PREFIX ?? 'eab:').trim() || 'eab:',
+    postgresBackend: readEnum(
+      env.EAB_POSTGRES,
+      ['auto', 'off', 'mirror'] as const,
+      'auto',
+      'EAB_POSTGRES',
+    ),
+    postgresUrl: (env.EAB_POSTGRES_URL ?? '').trim(),
+    auditRead: readEnum(
+      env.EAB_AUDIT_READ,
+      ['sqlite', 'postgres', 'auto'] as const,
+      'sqlite',
+      'EAB_AUDIT_READ',
+    ),
+    chatRead: readEnum(
+      env.EAB_CHAT_READ,
+      ['sqlite', 'postgres', 'auto'] as const,
+      'sqlite',
+      'EAB_CHAT_READ',
+    ),
+    backendsStrict: (env.EAB_BACKENDS_STRICT ?? '0') === '1',
   }
 }

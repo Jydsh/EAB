@@ -24,15 +24,20 @@ import {
   SETTINGS_PATH,
 } from './settings.js'
 import { startRetention } from './retention.js'
+import { sweepOrphanAgentRuns, sweepSuspendedRuns } from './agent-runtime.js'
 import { startScheduleWorker } from './schedule.js'
 import { startOrgSyncScheduler } from './org-sync-scheduler.js'
-import { startModelHealthMonitor, isModelHealthy, probeUnverifiedPluginModels, forgetModelHealth } from './model-health.js'
+import { startModelHealthMonitor, isModelHealthy, probeUnverifiedPluginModels, forgetModelHealth, probePluginChannelModels } from './model-health.js'
+import { JOB_KINDS, recoverStaleJobs, startJobWorker } from './job-queue.js'
+import { refreshPluginChannel } from './plugin-models.js'
 import { reloadPluginHosts } from './plugin-host.js'
 import { setPluginModelVisibilityResolver, setPluginModelsChangedListener, startPluginModelCatalogSync } from './plugin-models.js'
 import { setPluginRoot } from './plugins.js'
+import { startPluginToolSpecsCacheInvalidation } from './plugin-tools.js'
 import { checkForUpdate } from './update.js'
 import { acquireProcessLock, type ProcessLock } from './process-lock.js'
 import { applyNetworkToConfig, type NetworkTarget } from './network-settings.js'
+import { initBackends, closeBackends } from './backends/runtime.js'
 
 // 搬迁必须在开库之前完成：旧的库、云空间、插件目录先复制并校验，成功后才切换指针。
 try {
@@ -85,6 +90,55 @@ if (migration.applied.length > 0) {
 }
 
 /**
+ * 可选后端插件：不配 PostgreSQL/Redis 时这里只启用内存缓存；
+ * 配了但连不上默认降级，不阻塞启动；strict 模式才直接失败。
+ */
+let backends: Awaited<ReturnType<typeof initBackends>>
+try {
+  backends = await initBackends(config, db)
+} catch (error) {
+  console.error(`[eab] 可选后端启动失败：${error instanceof Error ? error.message : String(error)}`)
+  console.error('[eab] 这是 EAB_BACKENDS_STRICT=1 的预期行为；修复外部服务或去掉 strict 后重启。')
+  process.exit(1)
+}
+
+/** 插件工具 schema 的跨实例失效订阅；没接 Redis 时是空操作。 */
+try {
+  await startPluginToolSpecsCacheInvalidation()
+  console.log('[eab:boot] 插件工具缓存失效订阅完成')
+} catch (error) {
+  console.warn(`[eab] 插件工具缓存失效订阅失败：${(error as Error).message}`)
+}
+
+/**
+ * 僵尸 Agent 运行记录：
+ * 进程锁保证同一数据目录只有一个实例，所以库里 running 但没有心跳的 run 只能是
+ * 上次进程异常退出留下的，启动时统一收尾，避免控制台一直显示「运行中」。
+ */
+try {
+  const sweptRuns = await sweepOrphanAgentRuns(db)
+  if (sweptRuns > 0) console.log(`[eab] 已回收 ${sweptRuns} 条僵尸 Agent 运行记录`)
+} catch (error) {
+  console.warn(`[eab] 僵尸 run 清理失败：${(error as Error).message}`)
+}
+
+/** 上次进程崩溃时还挂在 running 的异步作业：租约过期就放回队列，重启后自动接着跑。 */
+try {
+  const recoveredJobs = recoverStaleJobs(db)
+  if (recoveredJobs > 0) console.log(`[eab] 已回收 ${recoveredJobs} 个中断的异步作业`)
+} catch (error) {
+  console.warn(`[eab] 异步作业回收失败：${(error as Error).message}`)
+}
+
+/** 挂起等后台工具的 run：作业失败/丢失的判 failed，作业还在跑或已成功的留给恢复流程。 */
+try {
+  const sweptSuspended = sweepSuspendedRuns(db)
+  if (sweptSuspended > 0) console.log(`[eab] 已收尾 ${sweptSuspended} 个挂起后无法恢复的 Agent 运行`)
+} catch (error) {
+  console.warn(`[eab] 挂起 run 收尾失败：${(error as Error).message}`)
+}
+
+/**
  * 日志保留：同步记录 / 渠道事件 / 登录失败 / 插件事件按天清理；
  * 审计日志按独立保留天数只删最老的一段，并保留哈希链锚点。
  * 策略存在控制台设置文件里，改完立即生效，不用重启。
@@ -95,20 +149,24 @@ startRetention(
   (result) => {
     writeConsoleSettings({ lastCleanupAt: new Date().toISOString(), lastCleanupStats: result.deleted })
     console.log(
-      `[eab] 保留清理完成：删除 ${result.total} 条（日志 ${result.days} 天 / 审计 ${result.audit.days} 天）`,
+      `[eab] 保留清理完成：删除 ${result.total} 条（日志 ${result.days} 天 / 审计 ${result.audit.days} 天 / Agent 轨迹 ${result.agentDays > 0 ? `${result.agentDays} 天` : '永久'}）`,
     )
   },
   () => readConsoleSettings().auditRetentionDays,
+  () => readConsoleSettings().agentRetentionDays,
 )
+console.log('[eab:boot] 保留清理已启动')
 
 /**
  * 单公司本地部署：整个实例只认一个公司 ID。
  * 配置的 ID 不存在但库里恰好只有一家时（例如用扫码新建过），以库里那家为准，
  * 避免启动后控制台指向一个空公司。
  */
+console.log('[eab:boot] 查询单公司配置')
 const configuredCompany = db.prepare('SELECT id FROM companies WHERE id = ?').get(config.companyId) as
   | { id: string }
   | undefined
+console.log('[eab:boot] 单公司配置查询完成')
 if (!configuredCompany) {
   const companies = db.prepare('SELECT id FROM companies ORDER BY created_at ASC').all() as unknown as Array<{ id: string }>
   if (companies.length === 1 && companies[0]) {
@@ -117,7 +175,9 @@ if (!configuredCompany) {
     config = { ...config, companyId: correction }
   }
 }
+console.log('[eab:boot] 公司配置检查完成')
 cleanupTemp(config.tmpDir ?? join(config.dataDir ?? dirname(config.dbPath), 'tmp'))
+console.log('[eab:boot] 临时目录清理完成')
 
 if (config.devAuth) {
   const seeded = ensureDemoData(db)
@@ -145,6 +205,7 @@ if (config.devAuth) {
     console.log(`已为 ${demoAccounts.length} 名演示成员补登录密码（见 .eab-dev/demo-accounts.txt）`)
   }
 }
+console.log('[eab:boot] 演示配置检查完成')
 
 /**
  * 控制台超级管理员：开发/运维用的账号，不属于任何公司的组织成员。
@@ -182,6 +243,7 @@ const deps = {
   companyId: config.companyId,
   migrations: migration.applied,
   consoleToken: config.consoleToken,
+  backends,
   /** 控制台「一键更新」需要由服务自己退出，更新器才能安全替换文件 */
   shutdown: () => {
     void shutdown()
@@ -191,16 +253,44 @@ const deps = {
 }
 
 /** 两个入口分端口：员工对话 / 管理控制台。共用同一个库与同一套身份/审计。 */
+console.log('[eab:boot] 构建应用')
 apps.chat = buildApp(deps, 'chat')
 apps.console = buildApp(deps, 'console')
+console.log('[eab:boot] 应用已构建，启动后台工作器')
 
 /** 用户自建定时任务：到点执行并回推钉钉；停止函数在 shutdown 里调用 */
 const stopScheduleWorker = startScheduleWorker(deps)
 
+/**
+ * 异步作业队列（Phase 4）：控制台触发的慢操作（插件通道刷新、模型批量探测等）
+ * 提交后立刻返回 jobId，由 worker 在后台跑完。没配 Redis 时 worker 按 pollMs 轮询，
+ * 配了 Redis 则提交作业会通过 Pub/Sub 即时唤醒所有实例。
+ */
+const stopJobWorker = startJobWorker({
+  db,
+  handlers: {
+    [JOB_KINDS.pluginChannelRefresh]: async (job) => {
+      const payload = (job.payload ?? {}) as { channelId?: unknown }
+      const channelId = String(payload.channelId ?? '')
+      if (!channelId) throw new Error('作业缺少 channelId')
+      await refreshPluginChannel(job.companyId, channelId)
+      const probe = await probePluginChannelModels(job.companyId, channelId)
+      return {
+        channelId,
+        checked: probe.checked,
+        models: probe.healthy,
+        failed: probe.failed.map((model) => model.name),
+      }
+    },
+  },
+})
+
+console.log(`[eab:boot] 开始监听 chat=${config.port} console=${config.adminPort}`)
 await Promise.all([
   apps.chat.listen({ host: config.host, port: config.port }),
   apps.console.listen({ host: config.host, port: config.adminPort }),
 ])
+console.log('[eab:boot] 监听完成')
 
 /** 插件模型只有在真实回复探测通过后才进入模型目录。 */
 setPluginModelVisibilityResolver((companyId, modelId) => isModelHealthy(companyId, modelId))
@@ -323,6 +413,7 @@ const stopFeishuStreamMonitor = startFeishuStreamMonitor(deps)
 
 async function shutdown(): Promise<void> {
   stopScheduleWorker()
+  stopJobWorker()
   stopModelHealthMonitor()
   stopPluginModelCatalogSync()
   stopOrgSyncScheduler()
@@ -331,6 +422,7 @@ async function shutdown(): Promise<void> {
   stopFeishuStreamMonitor()
   stopFeishuStream()
   await closeApps(apps)
+  await closeBackends()
   processLock.release()
   db.close()
   process.exit(0)

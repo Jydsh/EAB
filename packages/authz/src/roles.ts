@@ -34,8 +34,11 @@ const MEMBER_SCOPES: readonly Scope[] = [
   /** 个人定时任务：任何员工都能创建自己的提醒/定时任务，到点结果回推自己的钉钉 */
   SC.SCHEDULE_READ,
   SC.SCHEDULE_WRITE,
-  /** 个人插件：任何人都能看自己的插件清单、装/卸/启停个人插件（公司级安装仍要 PLUGIN_INSTALL） */
+  /** 个人插件：员工可以查看和使用本人插件；安装、启停、卸载分别需要 PLUGIN_INSTALL / PLUGIN_CONFIGURE / PLUGIN_UNINSTALL，按角色授权 */
   SC.PLUGIN_LIST,
+  /** 技能：员工可以查看和使用已启用的技能；安装/启停/卸载按角色单独授权 */
+  SC.SKILL_LIST,
+  SC.SKILL_USE,
 ]
 
 export const BUILTIN_ROLES: readonly RoleDefinition[] = [
@@ -80,6 +83,12 @@ export const BUILTIN_ROLES: readonly RoleDefinition[] = [
       SC.PLUGIN_UNINSTALL,
       SC.PLUGIN_CONFIGURE,
       SC.PLUGIN_APPROVE,
+      SC.SKILL_LIST,
+      SC.SKILL_USE,
+      SC.SKILL_INSTALL,
+      SC.SKILL_UNINSTALL,
+      SC.SKILL_CONFIGURE,
+      SC.SKILL_APPROVE,
       SC.CHANNEL_MANAGE,
       SC.CHANNEL_BIND,
       SC.CHANNEL_SEND,
@@ -114,6 +123,9 @@ export const BUILTIN_ROLES: readonly RoleDefinition[] = [
       SC.PLUGIN_INSTALL,
       SC.PLUGIN_UNINSTALL,
       SC.PLUGIN_CONFIGURE,
+      SC.SKILL_INSTALL,
+      SC.SKILL_UNINSTALL,
+      SC.SKILL_CONFIGURE,
       SC.CHANNEL_SEND,
       SC.APPROVAL_READ,
     ],

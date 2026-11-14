@@ -20,8 +20,12 @@ describe('插件工具并发与超时', () => {
   it('超过插件并发上限时第二个调用排队', async () => {
     const pluginId = `p-concurrency-${Date.now()}`
     let releaseFirst: () => void = () => {}
+    let firstStarted = false
     const first = executePluginTool(
-      fakeTool(pluginId, () => new Promise<void>((resolve) => (releaseFirst = resolve))),
+      fakeTool(pluginId, () => {
+        firstStarted = true
+        return new Promise<void>((resolve) => (releaseFirst = resolve))
+      }),
       {},
       {},
       { maxConcurrent: 1, timeoutMs: 5000 },
@@ -35,7 +39,9 @@ describe('插件工具并发与超时', () => {
       return result
     })
 
-    await Promise.resolve()
+    // 名额是异步抢的，等第一个真正进入执行再断言，避免依赖内部调度顺序。
+    for (let i = 0; i < 100 && !firstStarted; i += 1) await sleep(5)
+    expect(firstStarted).toBe(true)
     expect(secondDone).toBe(false)
     releaseFirst()
     await first

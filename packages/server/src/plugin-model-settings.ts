@@ -46,12 +46,12 @@ export function savePluginModelRoles(
 }
 
 /** 把持久化角色应用到插件模型定义；调用方负责只在确有覆盖时覆盖默认角色。 */
-export function applyPluginModelRoles<T extends { id: string; roles: string[] }>(
+export function applyPluginModelRoles<T extends { id: string; roles: readonly string[] }>(
   models: readonly T[],
   overrides: ReadonlyMap<string, readonly string[]>,
 ): T[] {
   return models.map((model) => {
     const roles = overrides.get(model.id)
-    return roles ? { ...model, roles: [...roles] } : model
+    return roles ? ({ ...model, roles: [...roles] } as T) : model
   })
 }

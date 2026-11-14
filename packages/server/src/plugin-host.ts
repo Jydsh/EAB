@@ -53,6 +53,13 @@ export interface PluginHostRoute {
   readonly fetch: (request: Request) => Promise<Response>
 }
 
+/** Host 明确没有实现的 DSH 能力；调用时记录，状态里可见。 */
+export interface PluginHostGap {
+  readonly code: string
+  readonly message: string
+  readonly at: number
+}
+
 export interface PluginHostStatus {
   readonly id: string
   readonly companyId: string
@@ -70,6 +77,8 @@ export interface PluginHostStatus {
   readonly routes: readonly string[]
   /** 路由的形状（exact / prefix）与允许的方法，client 侧据此决定哪些同源请求要走网关 */
   readonly routeSpecs: ReadonlyArray<{ path: string; kind: 'exact' | 'prefix'; methods: readonly string[] }>
+  /** 插件主动使用了 EAB 尚未实现的 host 能力（upgrade/fallback/tapIndex/agents 等） */
+  readonly hostGaps: readonly PluginHostGap[]
   readonly logs: readonly string[]
   readonly llmProviders: number
   readonly llmModels: number
@@ -87,6 +96,8 @@ export interface HostInstance {
   readonly routes: Map<string, PluginHostRoute>
   readonly upgrades: Map<string, unknown>
   readonly logs: string[]
+  /** 插件使用但 EAB 尚未实现的 host 能力；用于状态和插件页诊断。 */
+  readonly hostGaps: PluginHostGap[]
   readonly disposers: Array<() => void | Promise<void>>
   root: Context | null
   fiber: Fiber | null
@@ -177,7 +188,7 @@ function enabledInstancesOf(db: Db, pluginId: string): Array<{ companyId: string
 
 /**
  * 模型目录用的插件有效性判断：插件目录仍在磁盘、清单有效、安装未卸载且未被停用。
- * 卸载后目录会移入 .trash，仅看 plugin_company_installs 会把“已卸载但数据库残留”的
+ * 卸载会直接删除插件目录（不再进回收站），仅看 plugin_company_installs 会把“已卸载但数据库残留”的
  * 插件模型继续暴露出来；这里以 loadPlugins 的实际可见结果为准，并保留个人安装启用。
  */
 const pluginActiveCache = new Map<string, { db: Db; at: number; ids: Set<string> }>()
@@ -742,6 +753,14 @@ function messageEvents(row: ChatMessageRow): DshSessionEvent[] {
   if (text) content.push({ type: 'text', text })
   if (content.length === 0) content.push({ type: 'text', text: '' })
 
+  const rawTiming = meta.timing && typeof meta.timing === 'object' ? meta.timing : {}
+  const timing = {
+    ttftMs: Math.max(0, Number(rawTiming.ttftMs) || 0),
+    genMs: Math.max(0, Number(rawTiming.genMs) || 0),
+    wallMs: Math.max(0, Number(rawTiming.wallMs) || 0),
+  }
+  const hasTiming = timing.ttftMs > 0 || timing.genMs > 0 || timing.wallMs > 0
+
   const events: DshSessionEvent[] = [{
     seq: 0,
     time: Number(row.created_at) || Date.now(),
@@ -754,6 +773,7 @@ function messageEvents(row: ChatMessageRow): DshSessionEvent[] {
         reasoningTokens: estimateTokens(reasoning),
       },
       model: row.model_id || row.model_name || undefined,
+      ...(hasTiming ? { timing } : {}),
     },
   }]
 
@@ -833,6 +853,8 @@ export function foldContextTiming(events: readonly DshSessionEvent[]): Record<st
   let calls = 0
   let toolCalls = 0
   let toolsMs = 0
+  let ttftMs = 0
+  let genMs = 0
   let turnStart: number | null = null
   let lastActivity = 0
   let wallMs = 0
@@ -854,6 +876,9 @@ export function foldContextTiming(events: readonly DshSessionEvent[]): Record<st
     }
     if (event.type === 'assistant/message') {
       calls += 1
+      const eventTiming = data.timing && typeof data.timing === 'object' ? data.timing : {}
+      ttftMs += Math.max(0, Number((eventTiming as any).ttftMs) || 0)
+      genMs += Math.max(0, Number((eventTiming as any).genMs) || 0)
       lastActivity = Math.max(lastActivity, time)
       continue
     }
@@ -885,8 +910,8 @@ export function foldContextTiming(events: readonly DshSessionEvent[]): Record<st
   closeTurn()
   return {
     wallMs,
-    ttftMs: 0,
-    genMs: 0,
+    ttftMs,
+    genMs,
     calls,
     toolsMs,
     toolBusyMs: toolsMs,
@@ -944,6 +969,14 @@ export function foldContextActivity(events: readonly DshSessionEvent[]): Record<
       day.toolCalls += 1
       day.cost.eab.estimated.peak.output += tokens
     }
+  }
+  // 概览顶部 KPI 的“工具执行 / 活跃时长”读取 contextActivity.days 的
+  // toolsMs / wallMs，而不是 contextTimeline.timing；补齐每日桶后再汇总。
+  for (const [key, day] of Object.entries(days)) {
+    const dayEvents = events.filter((event) => dayOf(event.time) === key)
+    const timing = foldContextTiming(dayEvents)
+    day.wallMs = timing.wallMs
+    day.toolsMs = timing.toolsMs
   }
   return { days }
 }
@@ -1196,30 +1229,73 @@ function makeControllerServices(
   }
 }
 
+function markHostGap(instance: HostInstance, code: string, message: string): void {
+  const index = instance.hostGaps.findIndex((gap) => gap.code === code && gap.message === message)
+  const gap: PluginHostGap = { code, message, at: Date.now() }
+  if (index >= 0) {
+    instance.hostGaps[index] = gap
+  } else {
+    instance.hostGaps.push(gap)
+    if (instance.hostGaps.length > 20) instance.hostGaps.splice(0, instance.hostGaps.length - 20)
+    instance.logs.push(`[${new Date().toISOString()}] warn host-gap: ${message}`)
+  }
+  if (instance.hostGaps.length > 20) instance.hostGaps.splice(0, instance.hostGaps.length - 20)
+}
+
+/** 明确不可用的服务调用：先记缺口，再抛带 code 的错误，让插件立即失败而不是空转。 */
+function unsupportedHostCall(instance: HostInstance, code: string, message: string): never {
+  markHostGap(instance, code, message)
+  const error = new Error(message) as Error & { code?: string }
+  error.code = code
+  throw error
+}
+
 function makeWebServer(
   register: (spec: { path?: unknown; methods?: unknown; method?: unknown; fetch?: unknown; handler?: unknown; kind?: unknown }) => () => void,
   instance: HostInstance,
-  logger: Record<string, (...args: unknown[]) => void>,
+  _logger: Record<string, (...args: unknown[]) => void>,
 ) {
   return {
+    available: true,
+    /** EAB 的 HTTP 网关只支持普通请求；WebSocket upgrade 尚未接入。 */
+    supportsUpgrade: false,
+    supportsFallback: false,
+    supportsTapIndex: false,
     register,
     /**
      * DSH webServer 还允许 WebSocket upgrade / fallback / index tap。
-     * HTTP 网关目前没有 upgrade 通道，但不能静默吞掉：登记下来并在状态里可见。
+     * EAB 的 HTTP 网关没有这些通道，不能静默吞掉：登记缺口并在状态里可见，
+     * 插件仍然可以启动，但插件页/控制台会显示“能力缺口”。
      */
     registerUpgrade: (spec: { path?: unknown; handler?: unknown }) => {
       const path = typeof spec?.path === 'string' ? spec.path : ''
-      if (!path) return () => undefined
+      if (!path) {
+        markHostGap(instance, 'webServer.upgrade', '插件注册 WebSocket upgrade 时缺少 path')
+        return () => undefined
+      }
       instance.upgrades.set(path, spec)
-      logger.warn(`插件注册 WebSocket upgrade ${path}：EAB HTTP 网关暂不支持 upgrade，已登记`)
+      markHostGap(
+        instance,
+        `webServer.upgrade:${path}`,
+        `插件注册 WebSocket upgrade ${path}：EAB HTTP 网关暂不支持 upgrade，已登记`,
+      )
       return () => instance.upgrades.delete(path)
     },
-    registerFallback: (_spec: unknown) => {
-      logger.warn('插件注册 webServer fallback：EAB 暂不支持 fallback 路由')
+    registerFallback: (spec: unknown) => {
+      const path = typeof (spec as { path?: unknown })?.path === 'string'
+        ? (spec as { path: string }).path
+        : ''
+      markHostGap(
+        instance,
+        path ? `webServer.fallback:${path}` : 'webServer.fallback',
+        path
+          ? `插件注册 webServer fallback ${path}：EAB 暂不支持 fallback 路由`
+          : '插件注册 webServer fallback：EAB 暂不支持 fallback 路由',
+      )
       return () => undefined
     },
     tapIndex: (_fn: unknown) => {
-      logger.warn('插件注册 tapIndex：EAB 暂不支持 index 注入')
+      markHostGap(instance, 'webServer.tapIndex', '插件注册 tapIndex：EAB 暂不支持 index 注入')
       return () => undefined
     },
   }
@@ -1340,6 +1416,49 @@ export function makeContext(db: Db, instance: HostInstance, options: DshImOption
   }
   services.set('sessionQuery', sessionQuery)
   /**
+   * DSH sessionPersistence：dsh-context 的 projection backfill 会通过
+   * `open(id, 'read')` 读取会话事件，再调用 `sessionProjectionCache.coldSnapshot`
+   * 写入投影。EAB 没有 DSH 日志文件，但可以按 id 从 chat_messages 现场读出同一组
+   * DSH 事件；没有这个服务时插件注入会直接返回，coverage 永远是 0。
+   */
+  const sessionPersistence = {
+    available: true,
+    async stat(id: unknown) {
+      const sid = String(id || '')
+      const session = sessionsService.get(sid)
+      if (!session) return undefined
+      const events = chatSessionEvents(
+        db,
+        companyId,
+        instance.scope.kind === 'user' ? instance.scope.userId : null,
+        sid,
+      )
+      return { header: session.header, eventCount: events.length }
+    },
+    async open(id: unknown) {
+      const sid = String(id || '')
+      const session = sessionsService.get(sid)
+      if (!session) throw new Error(`SessionNotFound: ${sid}`)
+      const events = chatSessionEvents(
+        db,
+        companyId,
+        instance.scope.kind === 'user' ? instance.scope.userId : null,
+        sid,
+      )
+      return {
+        header: session.header,
+        inheritedEventCount: 0,
+        async read(from = 0, to?: number) {
+          const start = Math.max(0, Number(from) || 0)
+          const end = to === undefined ? events.length : Math.min(events.length, Math.max(start, Number(to) || 0))
+          return { events: events.slice(start, end) }
+        },
+        async close() {},
+      }
+    },
+  }
+  services.set('sessionPersistence', sessionPersistence)
+  /**
    * DSH 的会话投影缓存。dsh-context 的 overview/heads/snapshot 路由要求这个服务
    * 至少有 cachedSnapshot/coldSnapshot；EAB 没有持久投影缓存，直接按需从
    * chat_messages 折叠，避免概览页把会话当成没有 Token 的空会话。
@@ -1457,37 +1576,58 @@ export function makeContext(db: Db, instance: HostInstance, options: DshImOption
   services.set('sessionProjections', sessionProjections)
   services.set('speechToText', {
     available: false,
-    transcribe: async () => {
-      throw new Error('EAB 当前没有接入语音转写服务')
-    },
+    transcribe: async () =>
+      unsupportedHostCall(instance, 'speechToText.unavailable', 'EAB 当前没有接入语音转写服务'),
   })
 
   /**
    * Cordis 的标准服务是插件启动的硬依赖。即使 EAB 暂时没有实现，也必须给
    * 形状正确的对象，并显式标记 available=false；不能再塞 undefined，否则
    * inject 会把「键存在但值是 undefined」当成就绪，插件一用就崩。
+   *
+   * 读方法保留空结果以兼容“探测式”插件，但会登记 host gap；创建/写入类方法
+   * 直接抛出带 code 的错误，避免插件把“假成功”继续传播。
    */
   const agentService = {
     available: false,
-    list: () => [],
-    roots: () => [],
-    get: () => undefined,
-    isOwnedBy: () => false,
-    create: async () => {
-      throw new Error('EAB 尚未把 DSH agents.create 接入会话运行时')
+    list: () => {
+      markHostGap(instance, 'agents.unavailable', '插件调用 agents.list：EAB 尚未接入 DSH Agent 运行时')
+      return []
     },
-    resume: async () => {
-      throw new Error('EAB 尚未把 DSH agents.resume 接入会话运行时')
+    roots: () => {
+      markHostGap(instance, 'agents.unavailable', '插件调用 agents.roots：EAB 尚未接入 DSH Agent 运行时')
+      return []
     },
+    get: () => {
+      markHostGap(instance, 'agents.unavailable', '插件调用 agents.get：EAB 尚未接入 DSH Agent 运行时')
+      return undefined
+    },
+    isOwnedBy: () => {
+      markHostGap(instance, 'agents.unavailable', '插件调用 agents.isOwnedBy：EAB 尚未接入 DSH Agent 运行时')
+      return false
+    },
+    create: async () =>
+      unsupportedHostCall(instance, 'agents.create-unavailable', 'EAB 尚未把 DSH agents.create 接入会话运行时'),
+    resume: async () =>
+      unsupportedHostCall(instance, 'agents.resume-unavailable', 'EAB 尚未把 DSH agents.resume 接入会话运行时'),
   }
   services.set('agents', agentService)
   const pluginManagerService = {
     available: false,
-    list: () => [],
-    get: () => undefined,
-    enable: async () => undefined,
-    disable: async () => undefined,
-    reload: async () => undefined,
+    list: () => {
+      markHostGap(instance, 'pluginManager.unavailable', '插件调用 pluginManager.list：EAB 尚未接入 DSH 插件管理服务')
+      return []
+    },
+    get: () => {
+      markHostGap(instance, 'pluginManager.unavailable', '插件调用 pluginManager.get：EAB 尚未接入 DSH 插件管理服务')
+      return undefined
+    },
+    enable: async () =>
+      unsupportedHostCall(instance, 'pluginManager.enable-unavailable', 'EAB 尚未接入 DSH 插件管理服务 pluginManager.enable'),
+    disable: async () =>
+      unsupportedHostCall(instance, 'pluginManager.disable-unavailable', 'EAB 尚未接入 DSH 插件管理服务 pluginManager.disable'),
+    reload: async () =>
+      unsupportedHostCall(instance, 'pluginManager.reload-unavailable', 'EAB 尚未接入 DSH 插件管理服务 pluginManager.reload'),
   }
   services.set('pluginManager', pluginManagerService)
 
@@ -1626,19 +1766,30 @@ export function makeContext(db: Db, instance: HostInstance, options: DshImOption
   })
   services.set('attachments', {
     available: false,
-    list: async () => [],
-    read: async () => null,
-    upload: async () => {
-      throw new Error('EAB 尚未把 DSH attachments 接入文件服务')
+    list: async () => {
+      markHostGap(instance, 'attachments.unavailable', '插件读取 attachments：EAB 尚未把 DSH attachments 接入文件服务')
+      return []
     },
+    read: async () => {
+      markHostGap(instance, 'attachments.unavailable', '插件读取 attachments：EAB 尚未把 DSH attachments 接入文件服务')
+      return null
+    },
+    upload: async () =>
+      unsupportedHostCall(instance, 'attachments.upload-unavailable', 'EAB 尚未把 DSH attachments 接入文件服务'),
   })
   services.set('approval', {
     available: false,
-    request: async () => ({ ok: false, code: 'approval-unavailable', message: 'EAB 尚未接入审批服务' }),
+    request: async () => {
+      markHostGap(instance, 'approval.unavailable', '插件请求 approval：EAB 尚未接入审批服务')
+      return { ok: false, code: 'approval-unavailable', message: 'EAB 尚未接入审批服务' }
+    },
   })
   services.set('userQuestions', {
     available: false,
-    ask: async () => ({ ok: false, code: 'user-questions-unavailable', message: 'EAB 尚未接入交互提问' }),
+    ask: async () => {
+      markHostGap(instance, 'userQuestions.unavailable', '插件请求 userQuestions：EAB 尚未接入交互提问')
+      return { ok: false, code: 'user-questions-unavailable', message: 'EAB 尚未接入交互提问' }
+    },
   })
 
   const register = (spec: {
@@ -1874,7 +2025,21 @@ function collectMissingPeers(dir: string): string[] {
   return [...missing.entries()].map(([name, range]) => packageSpec(name, range))
 }
 
-function runNpmInstall(dir: string, specs: string[], logger: ReturnType<typeof makeLogger>): Promise<void> {
+const PLUGIN_DEPENDENCY_INSTALL_TIMEOUT_MS = Math.max(
+  5_000,
+  Number(process.env.EAB_PLUGIN_INSTALL_TIMEOUT_MS) || 60_000,
+)
+const PLUGIN_DEPENDENCY_BUDGET_MS = Math.max(
+  5_000,
+  Number(process.env.EAB_PLUGIN_INSTALL_BUDGET_MS) || 90_000,
+)
+
+function runNpmInstall(
+  dir: string,
+  specs: string[],
+  logger: ReturnType<typeof makeLogger>,
+  signal?: AbortSignal,
+): Promise<void> {
   const shellSpecs = process.platform === 'win32'
     ? specs.map((spec) => `"${spec.replace(/"/g, '""')}"`)
     : specs
@@ -1901,11 +2066,34 @@ function runNpmInstall(dir: string, specs: string[], logger: ReturnType<typeof m
       },
     )
     let output = ''
-    const timer = setTimeout(() => {
-      output += '\n安装超时，已终止'
+    let settled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let onAbort: (() => void) | undefined
+    const cleanup = () => {
+      if (timer) clearTimeout(timer)
+      if (onAbort) signal?.removeEventListener('abort', onAbort)
+    }
+    const finish = (fn: () => void) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      fn()
+    }
+    const stop = (message: string) => {
+      output += `\n${message}`
       child.kill()
-      reject(new Error(output.slice(-800)))
-    }, 180_000)
+      finish(() => reject(new Error(output.slice(-800))))
+    }
+    onAbort = () => stop('依赖安装超出启动预算，已终止')
+    if (signal?.aborted) {
+      onAbort()
+      return
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+    timer = setTimeout(
+      () => stop('安装超时，已终止'),
+      PLUGIN_DEPENDENCY_INSTALL_TIMEOUT_MS,
+    )
     child.stdout?.on('data', (chunk) => {
       output += String(chunk)
     })
@@ -1913,19 +2101,39 @@ function runNpmInstall(dir: string, specs: string[], logger: ReturnType<typeof m
       output += String(chunk)
     })
     child.on('error', (error) => {
-      clearTimeout(timer)
-      reject(error)
+      finish(() => reject(error))
     })
     child.on('close', (code) => {
-      clearTimeout(timer)
-      if (code === 0) resolve()
-      else reject(new Error(output.slice(-800) || `npm install 退出码 ${code}`))
-      logger.info(`npm install 完成：${specs.join(',')}`)
+      finish(() => {
+        if (code === 0) resolve()
+        else reject(new Error(output.slice(-800) || `npm install 退出码 ${code}`))
+        logger.info(`npm install 完成：${specs.join(',')}`)
+      })
     })
   })
 }
 
-async function ensurePluginDependencies(instance: HostInstance): Promise<void> {
+async function withAbort<T>(
+  promise: Promise<T>,
+  signal: AbortSignal | undefined,
+  message: string,
+): Promise<T> {
+  if (!signal) return promise
+  if (signal.aborted) throw new Error(message)
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(new Error(message))
+    signal.addEventListener('abort', onAbort, { once: true })
+    promise.then(resolve, reject).finally(() => {
+      signal.removeEventListener('abort', onAbort)
+    })
+  })
+}
+
+async function ensurePluginDependencies(
+  instance: HostInstance,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (signal?.aborted) throw new Error('依赖安装超出启动预算，已终止')
   const manifest = pluginPackageManifest(instance.record.dir)
   if (!manifest) return
   const declared: Record<string, string> = { ...manifest.dependencies, ...manifest.optional }
@@ -1938,7 +2146,7 @@ async function ensurePluginDependencies(instance: HostInstance): Promise<void> {
   if (firstMissing.length === 0 && peerMissing.length === 0) return
   const existing = dependencyInstalls.get(instance.record.dir)
   if (existing) {
-    await existing
+    await withAbort(existing, signal, '依赖安装超出启动预算，已终止')
     return
   }
   const logger = makeLogger(instance)
@@ -1949,7 +2157,7 @@ async function ensurePluginDependencies(instance: HostInstance): Promise<void> {
       ? firstMissing.map((name) => packageSpec(name, declared[name]))
       : peerMissing
     for (let round = 0; round < 3 && specs.length > 0; round += 1) {
-      await runNpmInstall(instance.record.dir, specs, logger)
+      await runNpmInstall(instance.record.dir, specs, logger, signal)
       // npm 不会安装 peerDependencies；DSH 运行时包里常有 peer 的 peer，
       // 例如 dsh-session -> dsh-scope。装完直接依赖后再扫一遍已落盘的清单。
       specs = collectMissingPeers(instance.record.dir)
@@ -1998,19 +2206,20 @@ function seedPersonalPluginData(
   }
 }
 
-async function startOne(
-  db: Db,
-  record: PluginRecord,
-  options: DshImOptions | null,
-  companyId: string,
-  scope: PluginScope = companyScope(),
-): Promise<void> {
-  const entry = record.dsh?.hostEntry
-  if (!entry) return
-  const effectiveOptions = options ?? {
+function effectiveHostOptions(options: DshImOptions | null) {
+  return options ?? {
     dbPath: loadedOptions?.dbPath ?? '',
     dshHomeDir: loadedOptions?.dshHomeDir,
   }
+}
+
+function createHostInstance(
+  record: PluginRecord,
+  options: DshImOptions | null,
+  companyId: string,
+  scope: PluginScope,
+): HostInstance {
+  const effectiveOptions = effectiveHostOptions(options)
   const dataRoot = pluginDataRoot(effectiveOptions, companyId, scope)
   mkdirSync(dataRoot, { recursive: true })
   seedPersonalPluginData(record, effectiveOptions, companyId, dataRoot, scope)
@@ -2025,6 +2234,7 @@ async function startOne(
     routes: new Map(),
     upgrades: new Map(),
     logs: [],
+    hostGaps: [],
     disposers: [],
     root: null,
     fiber: null,
@@ -2034,12 +2244,62 @@ async function startOne(
     llmModels: 0,
   }
   instances.set(instance.instanceKey, instance)
+  return instance
+}
+
+/**
+ * 依赖预装与 host 启动拆开：同一个插件目录只跑一次安装，不同插件目录并发安装。
+ * 安装失败或超出预算只记在该实例上，后面的插件继续启动；DSH_HOME 仍然只在
+ * startHostInstance 的 import/apply 窗口内串行切换，避免进程级环境变量串号。
+ */
+export async function preparePluginDependencies(
+  instancesToPrepare: readonly HostInstance[],
+): Promise<Map<string, string>> {
+  const errors = new Map<string, string>()
+  const byDir = new Map<string, HostInstance>()
+  for (const instance of instancesToPrepare) {
+    if (!instance.record.dsh?.hostEntry) continue
+    if (!byDir.has(instance.record.dir)) byDir.set(instance.record.dir, instance)
+  }
+  await Promise.all(
+    [...byDir.entries()].map(async ([dir, instance]) => {
+      if (!pluginPackageManifest(dir)) return
+      const controller = new AbortController()
+      const timer = setTimeout(
+        () => controller.abort(),
+        PLUGIN_DEPENDENCY_BUDGET_MS,
+      )
+      try {
+        await withAbort(
+          ensurePluginDependencies(instance, controller.signal),
+          controller.signal,
+          '依赖安装超出启动预算，已终止',
+        )
+      } catch (error) {
+        errors.set(dir, (error as Error)?.message ?? String(error))
+      } finally {
+        clearTimeout(timer)
+      }
+    }),
+  )
+  return errors
+}
+
+async function startHostInstance(
+  db: Db,
+  instance: HostInstance,
+  options: DshImOptions | null,
+): Promise<void> {
+  const record = instance.record
+  const entry = record.dsh?.hostEntry
+  if (!entry) return
   const full = join(record.dir, entry)
   if (!existsSync(full)) {
     instance.error = `host 入口不存在：${entry}`
     makeLogger(instance).warn(instance.error)
     return
   }
+  const dataRoot = instance.dataRoot
   const envHome = process.env.DSH_HOME
   const envProfile = process.env.DSH_PROFILE
   // DSH_HOME 是进程级变量；在 import/apply 期间临时指向本实例目录。
@@ -2047,10 +2307,9 @@ async function startOne(
   process.env.DSH_HOME = dataRoot
   process.env.DSH_PROFILE = 'web'
   try {
-    await ensurePluginDependencies(instance)
     // 带 mtime + 实例 scope 的 query：同一物理包被公司/个人安装时各求值一份，
     // 模块级读取 DSH_HOME 的插件也不会共享第一次导入时捕获的路径。
-    const url = `${pathToFileURL(full).href}?v=${statSync(full).mtimeMs}&scope=${encodeURIComponent(pluginScopeKey(scope))}`
+    const url = `${pathToFileURL(full).href}?v=${statSync(full).mtimeMs}&scope=${encodeURIComponent(pluginScopeKey(instance.scope))}`
     const mod = (await import(url)) as Record<string, unknown>
     const plugin = normalizePluginModule(mod)
     if (!plugin) {
@@ -2181,6 +2440,7 @@ function disposeAll(): void {
     clearPluginContributions(instance.instanceKey)
     instance.routes.clear()
     instance.upgrades.clear()
+    instance.hostGaps.length = 0
   }
   instances.clear()
 }
@@ -2192,12 +2452,27 @@ export async function reloadPluginHosts(db: Db, options?: DshImOptions): Promise
   // 先准备 dsh-im 兼容文件树：公司实例的 DSH_HOME 就是它；个人实例另起子目录。
   if (loadedOptions) prepareDshImCompat(db, loadedOptions)
   disposeAll()
+  const targets: Array<{ record: PluginRecord; companyId: string; scope: PluginScope }> = []
   for (const item of listPluginDirectories()) {
     const record = readPluginDirectory(item.id)
     if (!record || !record.valid || record.format !== 'dsh' || !record.dsh?.hasHost) continue
     for (const enabled of enabledInstancesOf(db, record.id)) {
-      await startOne(db, record, loadedOptions, enabled.companyId, enabled.scope)
+      targets.push({ record, companyId: enabled.companyId, scope: enabled.scope })
     }
+  }
+  const pending = targets.map((target) =>
+    createHostInstance(target.record, loadedOptions, target.companyId, target.scope),
+  )
+  const dependencyErrors = await preparePluginDependencies(pending)
+  for (const instance of pending) {
+    const dependencyError = dependencyErrors.get(instance.record.dir)
+    if (dependencyError) {
+      instance.error = `依赖安装失败：${dependencyError}`
+      clearPluginContributions(instance.instanceKey)
+      makeLogger(instance).error(instance.error)
+      continue
+    }
+    await startHostInstance(db, instance, loadedOptions)
   }
 }
 
@@ -2248,6 +2523,7 @@ export function pluginHostStatus(
       kind: route.kind,
       methods: [...route.methods],
     })),
+    hostGaps: [...instance.hostGaps],
     logs: [...instance.logs].slice(-40),
     llmProviders: instance.llmProviders,
     llmModels: instance.llmModels,

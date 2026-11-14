@@ -2,12 +2,15 @@ import type { Db } from '@eab/storage'
 import type { ServerConfig } from './config.js'
 import type { ChatCapacity } from './chat-capacity.js'
 import type { NetworkApplyResult, NetworkTarget } from './network-settings.js'
+import type { BackendRuntime } from './backends/runtime.js'
 
 export interface ServerDeps {
   readonly db: Db
   readonly config: ServerConfig
   readonly companyId: string
   readonly migrations: readonly string[]
+  /** 可选后端插件状态（SQLite 内置 + Redis/PG 外部）；测试可不注入 */
+  readonly backends?: BackendRuntime
   /** 解析后的控制台口令（环境变量优先；本机演示自动生成） */
   readonly consoleToken: string
   /** 网页对话全局并发/排队闸门；buildApp 时按配置创建，测试可注入替身 */

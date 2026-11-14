@@ -81,6 +81,21 @@ export interface NetworkSettings {
   allowRemoteConsole: boolean
 }
 
+/**
+ * OnlyOffice 控制台绑定。
+ *
+ * URL 属于普通配置，直接落在 console-settings.json；JWT 密钥只保存 secret_ref，
+ * 真实值在 secrets.json（或环境变量）里，页面永远不回显。
+ */
+export interface OnlyOfficeSettings {
+  /** DocumentServer 的浏览器访问地址；null 表示未绑定 */
+  url: string | null
+  /** DocumentServer 回访 EAB 的内部地址；null 表示用部署默认值 */
+  internalUrl: string | null
+  /** JWT 密钥在 secrets.json 的引用名；null 表示未配置 */
+  jwtSecretRef: string | null
+}
+
 export interface ConsoleSettings extends NetworkSettings {
   /** 总存储位置；null 表示就用部署目录下的 .eab-dev */
   dataDir: string | null
@@ -92,6 +107,10 @@ export interface ConsoleSettings extends NetworkSettings {
   logRetentionDays: number
   /** 审计保留天数；0 = 永久保留 */
   auditRetentionDays: number
+  /** Agent 运行轨迹保留天数；0 = 永久保留（默认不清理） */
+  agentRetentionDays: number
+  /** OnlyOffice 在线文档绑定 */
+  onlyOffice: OnlyOfficeSettings
   lastCleanupAt: string | null
   lastCleanupStats: Record<string, number> | null
 }
@@ -106,6 +125,8 @@ const DEFAULTS: ConsoleSettings = {
   pendingMigrations: [],
   logRetentionDays: 90,
   auditRetentionDays: 180,
+  agentRetentionDays: 0,
+  onlyOffice: { url: null, internalUrl: null, jwtSecretRef: null },
   lastCleanupAt: null,
   lastCleanupStats: null,
   host: null,
@@ -166,6 +187,15 @@ function readMigrations(raw: unknown): StorageMigration[] {
   return jobs
 }
 
+function readOnlyOffice(raw: unknown): OnlyOfficeSettings {
+  const source = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {}
+  return {
+    url: readText(source.url),
+    internalUrl: readText(source.internalUrl),
+    jwtSecretRef: readText(source.jwtSecretRef),
+  }
+}
+
 export function readConsoleSettings(): ConsoleSettings {
   const file = settingsPath()
   if (!existsSync(file)) return defaultSettings()
@@ -173,6 +203,7 @@ export function readConsoleSettings(): ConsoleSettings {
     const raw = JSON.parse(readFileSync(file, 'utf8')) as Partial<ConsoleSettings>
     const days = Number(raw.logRetentionDays ?? DEFAULTS.logRetentionDays)
     const auditDays = Number(raw.auditRetentionDays ?? DEFAULTS.auditRetentionDays)
+    const agentDays = Number(raw.agentRetentionDays ?? DEFAULTS.agentRetentionDays)
     return {
       dataDir: readText(raw.dataDir),
       paths: readPaths(raw.paths),
@@ -180,6 +211,9 @@ export function readConsoleSettings(): ConsoleSettings {
       logRetentionDays: Number.isFinite(days) && days >= 0 ? Math.trunc(days) : DEFAULTS.logRetentionDays,
       auditRetentionDays:
         Number.isFinite(auditDays) && auditDays >= 0 ? Math.trunc(auditDays) : DEFAULTS.auditRetentionDays,
+      agentRetentionDays:
+        Number.isFinite(agentDays) && agentDays >= 0 ? Math.trunc(agentDays) : DEFAULTS.agentRetentionDays,
+      onlyOffice: readOnlyOffice(raw.onlyOffice),
       lastCleanupAt: typeof raw.lastCleanupAt === 'string' ? raw.lastCleanupAt : null,
       lastCleanupStats: raw.lastCleanupStats && typeof raw.lastCleanupStats === 'object' ? raw.lastCleanupStats : null,
       host: readText(raw.host),
@@ -197,6 +231,7 @@ export function writeConsoleSettings(patch: Partial<ConsoleSettings>): ConsoleSe
   const current = readConsoleSettings()
   const next: ConsoleSettings = { ...current, ...patch }
   if (patch.paths) next.paths = { ...current.paths, ...patch.paths }
+  if (patch.onlyOffice) next.onlyOffice = { ...current.onlyOffice, ...patch.onlyOffice }
   if (patch.pendingMigrations) next.pendingMigrations = patch.pendingMigrations
   const file = settingsPath()
   mkdirSync(dirname(file), { recursive: true })

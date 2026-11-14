@@ -14,10 +14,12 @@ import { randomUUID } from 'node:crypto'
 import { SC, scopeAllows } from '@eab/domain'
 import { appendAudit, type Db } from '@eab/storage'
 import { consumeRobotUserFileSend } from './dingtalk-file-echo.js'
+import { acquireLeaderHold, claimOnce, hitRate, type LeaderHold } from './backends/coordination.js'
 import { publishChatEvent, type ChatLiveToolEventPayload } from './chat-events.js'
 import { findActivePerson, findPerson, actorFor, type RequestActor } from './session.js'
 import type { ServerDeps } from './deps.js'
 import { resolveSecret } from './secrets.js'
+import { resolveModelForPurpose } from './model-registry.js'
 import type { ChatMessage as LlmMessage, LlmContent } from './llm.js'
 import {
   acquireTurn,
@@ -26,7 +28,7 @@ import {
   bumpUsage,
   ensureChannelSession,
   historyOf,
-  loadModelCatalog,
+  loadModelCatalogCached,
   modelSupportsVision,
   releaseTurn,
   setChannelOpenConversationId,
@@ -40,6 +42,7 @@ import type { ActiveSpace } from './space.js'
 import { saveUserWorkspaceFile } from './routes/workspace.js'
 import { prepareDshImCompat, syncDshImSession } from './dsh-im-compat.js'
 import { pluginPromptTexts } from './plugin-tools.js'
+import { skillPromptTexts } from './skills.js'
 import { assertChatQuota } from './quota.js'
 import { planChannelModelCommand } from './channel-model-command.js'
 import {
@@ -48,6 +51,7 @@ import {
   workspaceUsedBytes,
 } from './workspace-quota.js'
 import {
+  dingTalkClarifyCardState,
   DingTalkAICardStream,
   DingTalkCardStream,
   DingTalkReaction,
@@ -92,6 +96,15 @@ interface DingTalkMessage {
   openConversationId?: string
   msgId?: string
   createAt?: number
+}
+
+interface DingTalkCardCallbackPayload {
+  type?: string
+  outTrackId?: string
+  corpId?: string
+  userId?: string
+  /** JSON 字符串：{ cardPrivateData: { actionIds, params } } */
+  content?: string
 }
 
 interface DingTalkResult {
@@ -605,17 +618,12 @@ function resolveDingTalkUser(db: Db, companyId: string, externalId: string): str
   return identity.user_id
 }
 
-const rateBuckets = new Map<string, { window: number; count: number }>()
+/** 每人每分钟最多 20 条。Redis 在线时跨实例共享计数，离线回退进程内，重启清零。 */
+const RATE_LIMIT_PER_MINUTE = 20
 
-function rateLimited(externalId: string): boolean {
-  const now = Date.now()
-  const bucket = rateBuckets.get(externalId)
-  if (!bucket || now - bucket.window >= 60_000) {
-    rateBuckets.set(externalId, { window: now, count: 1 })
-    return false
-  }
-  bucket.count += 1
-  return bucket.count > 20
+async function rateLimited(externalId: string): Promise<boolean> {
+  const verdict = await hitRate(`dingtalk:dm:${externalId}`, RATE_LIMIT_PER_MINUTE, 60)
+  return !verdict.allowed
 }
 
 /**
@@ -625,7 +633,22 @@ function rateLimited(externalId: string): boolean {
 export async function handleDingTalkMessage(
   deps: ServerDeps,
   payload: DingTalkMessage,
-  options: { dedupe?: boolean } = {},
+  options: {
+    dedupe?: boolean
+    sessionId?: string
+    card?: DingTalkAICardStream
+    /**
+     * 卡片按钮回调的“隐藏续跑”：同一张卡/同一条 assistant 消息内继续，
+     * 网页端不新增“我选择了…”的用户气泡，也不新插一条 assistant 消息。
+     */
+    clarifyFlow?: {
+      flowId: string
+      step: number
+      assistantMessageId?: string
+      /** 续用原卡失败时不再新建卡片，避免真机出现两条机器人消息。 */
+      suppressNewCard?: boolean
+    }
+  } = {},
 ): Promise<DingTalkResult> {
   const externalId = String(payload.senderStaffId ?? payload.senderId ?? '').trim()
   const rawText = inboundText(payload)
@@ -640,7 +663,7 @@ export async function handleDingTalkMessage(
       reason: 'empty-text',
     }
   }
-  if (rateLimited(externalId)) {
+  if (await rateLimited(externalId)) {
     return { handled: false, text: '消息有点频繁，请 1 分钟后再发。', sessionId: null, reason: 'rate-limited' }
   }
 
@@ -648,6 +671,12 @@ export async function handleDingTalkMessage(
     String(payload.msgId ?? '').trim() ||
     `${externalId}:${payload.createAt ?? ''}:${rawText.slice(0, 40) || imageCodes[0]?.slice(0, 40) || fileAttachments[0]?.fileName.slice(0, 40) || payload.msgtype || ''}`
   if (options.dedupe !== false) {
+    // 先用 Redis 做一次跨实例的原子预去重，避免同一条事件被多个实例同时处理；
+    // 缓存层没接或抖动时放行，下面 channel_events 的唯一约束仍是最终闸门。
+    const firstSeen = await claimOnce(`dingtalk:event:${deps.companyId}:${eventKey}`, 300)
+    if (!firstSeen) {
+      return { handled: false, text: null, sessionId: null, reason: 'duplicate' }
+    }
     const inserted = deps.db
       .prepare(
         `INSERT INTO channel_events (id, company_id, provider, event_key, sender_id, received_at)
@@ -711,7 +740,7 @@ export async function handleDingTalkMessage(
   if (!scopeAllows(actor.subject.scopes, SC.MODEL_USE)) {
     return { handled: false, text: '当前身份没有使用模型的权限（model:use）。', sessionId: null, reason: 'scope-denied' }
   }
-  const catalog = loadModelCatalog(
+  const catalog = await loadModelCatalogCached(
     deps.db,
     actor.subject.companyId,
     deps.config.devAuth,
@@ -803,7 +832,17 @@ export async function handleDingTalkMessage(
     ? rawText ? `[图片] ${rawText}` : '[图片] 请识别图片内容'
     : rawText || fileTitle
 
-  const sessionId = ensureChannelSession(deps.db, actor, 'dingtalk', externalId, promptText)
+  const forcedSessionId = options.sessionId
+    ? (deps.db
+        .prepare(
+          `SELECT id FROM chat_sessions
+            WHERE id = ? AND company_id = ? AND user_id = ? AND source = 'dingtalk'
+              AND external_id = ? AND deleted_at IS NULL
+            LIMIT 1`,
+        )
+        .get(options.sessionId, actor.subject.companyId, actor.person.id, externalId) as { id: string } | undefined)?.id
+    : undefined
+  const sessionId = forcedSessionId ?? ensureChannelSession(deps.db, actor, 'dingtalk', externalId, promptText)
   // 入站 payload 的 conversationId 就是该员工与机器人单聊的 openConversationId；
   // 后续出站文件要靠它发回机器人会话，而不是应用「工作通知」。
   const openConversationId = String(payload.conversationId || payload.openConversationId || '').trim()
@@ -822,7 +861,7 @@ export async function handleDingTalkMessage(
   }
   const turnToken = await acquireTurn(sessionId)
   const started = Date.now()
-  let card: DingTalkAICardStream | null = null
+  let card: DingTalkAICardStream | null = options.card ?? null
   let legacyCard: DingTalkCardStream | null = null
   let reaction: DingTalkReaction | null = null
   let reactionOk = false
@@ -859,8 +898,19 @@ export async function handleDingTalkMessage(
         reason: 'model-not-vision',
       }
     }
+    // 用途路由「图片 / 多模态」优先：绑定模型可见且支持图片时用它，否则沿用按能力的自动挑选。
+    const visionRoute = imageUrls.length > 0
+      ? resolveModelForPurpose(deps.db, actor.subject.companyId, 'chat.vision')
+      : null
+    const visionRouted = visionRoute
+      ? available.find(
+          (item) => item.id === visionRoute.id && modelSupportsVision(item.tags, item.capabilities),
+        )
+      : undefined
     const autoModel = imageUrls.length > 0
-      ? available.find((item) => modelSupportsVision(item.tags, item.capabilities)) ?? available[0]
+      ? visionRouted ??
+        available.find((item) => modelSupportsVision(item.tags, item.capabilities)) ??
+        available[0]
       : available[0]
     const model = preferredModel ?? autoModel
     if (!model) {
@@ -896,7 +946,7 @@ export async function handleDingTalkMessage(
     // 建卡时回答还没生成，外层摘要先放中性品牌文案；
     // 收口时再把外层摘要替换成回复正文（A2UI 卡片走场域信息更新，旧模板走 sys_lastMessageI18n）。
     const conversationSummary = 'EAB 企业智能助手'
-    if (isPrivateChat && channelSecret) {
+    if (isPrivateChat && channelSecret && !card && options.clarifyFlow?.suppressNewCard !== true) {
       // 私聊优先用 A2UI 卡：保留思考/工具折叠面板。
       // 正文末尾的原生转圈由 richCardData() 拼入钉钉客户端自带 loading 素材，
       // 旧模板卡仅作为 A2UI 建卡失败时的降级方案。
@@ -946,6 +996,7 @@ export async function handleDingTalkMessage(
     const toolSpace: ActiveSpace = { kind: 'cloud', channel: card ? 'dingtalk-a2ui' : 'dingtalk-file' }
     const chatTools = toolSpecsForAgent(deps.db, actor, toolSpace, promptText)
     const pluginPrompts = pluginPromptTexts(deps.db, actor)
+    const skillPrompts = skillPromptTexts(deps.db, actor)
     const system = buildSystemPrompt({
       actor,
       chatTools,
@@ -953,6 +1004,7 @@ export async function handleDingTalkMessage(
       hits,
       hasAttachments: imageUrls.length > 0,
       pluginPrompts,
+      skillPrompts,
     })
     const imageSystemNote =
       imageUrls.length > 0
@@ -976,12 +1028,23 @@ export async function handleDingTalkMessage(
     ]
 
     const now = Date.now()
+    const continueAssistantId = String(options.clarifyFlow?.assistantMessageId ?? '').trim()
+    const assistantMessageId = continueAssistantId || `msg_${randomUUID()}`
+    const clarifyFlow = options.clarifyFlow
+      ? {
+          clarifyFlowId: String(options.clarifyFlow.flowId || '').slice(0, 80),
+          clarifyStep: Math.max(1, Math.trunc(Number(options.clarifyFlow.step) || 1)),
+          interaction: 'clarify_select',
+        }
+      : null
     const userMessageId = `msg_${randomUUID()}`
     const userMessageMeta = {
       channel: 'dingtalk',
       externalUserId: externalId,
       hasImage: imageUrls.length > 0,
       imageCount: imageUrls.length,
+      // 网页端把带 clarifyFlowId 的用户消息视为隐藏续跑，不渲染绿色气泡。
+      ...(clarifyFlow ?? {}),
     }
     deps.db
       .prepare(
@@ -1023,7 +1086,6 @@ export async function handleDingTalkMessage(
     let completionTokens = 0
     let effectiveModel = model
     let failoverNote = ''
-    const assistantMessageId = `msg_${randomUUID()}`
     const publishDelta = (kind: 'reasoning' | 'content', text: string) => {
       if (!text) return
       publishChatEvent({
@@ -1082,11 +1144,24 @@ export async function handleDingTalkMessage(
         fallbackModelIds: available
           .filter((item) => item.id !== model.id && (imageUrls.length === 0 || modelSupportsVision(item.tags, item.capabilities)))
           .map((item) => item.id),
-        bufferModelEvents: true,
+        // 钉钉卡片需要看到真实的逐字输出；缓冲会让所有事件等到模型跑完才一次性刷出，
+        // 用户看到的就是“一直转圈、最后突然出全文”。故障转移时在下方的回调里清空旧卡片状态。
+        bufferModelEvents: false,
         onModelFailover: (change) => {
           const next = available.find((item) => item.id === change.toModelId)
           if (next) effectiveModel = next
           failoverNote = `当前模型「${change.fromModelName}」暂时不可用，已自动切换到「${change.toModelName}」。\n\n`
+        },
+        onModelFallbackStart: () => {
+          // 备用模型开始输出前清空失败模型的半截内容；等成功后再清会把新模型的 token 也抹掉。
+          cardState.answer = ''
+          cardState.reasoning = ''
+          cardState.tool = ''
+          toolsUsed.splice(0, toolsUsed.length)
+          toolDetails.splice(0, toolDetails.length)
+          cardAttachments.splice(0, cardAttachments.length)
+          thinkingDone = false
+          pushCard()
         },
         messages,
         sessionId,
@@ -1103,8 +1178,8 @@ export async function handleDingTalkMessage(
             pushCard()
             publishDelta('content', event.text)
           } else if (event.type === 'tool') {
-            // 一旦真的调用工具，思考阶段同样结束；思考面板让位给工具面板。
-            thinkingDone = true
+            // 工具执行期间不是“思考结束”：保持“正在思考中”标题和下方摘要，
+            // 只把工具面板切换成“工具调用中”。
             cardState.tool = `正在使用「${event.name}」…`
             if (!toolsUsed.includes(event.name)) toolsUsed.push(event.name)
             toolDetails.push({
@@ -1182,21 +1257,40 @@ export async function handleDingTalkMessage(
       : ''
     const clarifyText = formatClarifyText(agentResult?.clarify)
     const answerText = `${modelFallbackNote}${failoverNote}${greeting}${clarifyText || agentText}`
+    const clarify = agentResult?.clarify ?? null
+    // 卡片上不重复编号文本：问题下面直接给可点击按钮，历史消息仍保留编号兜底。
+    // “也可以直接回复你自己的方向”由卡片 /clarify/hint 统一显示，避免正文重复一遍。
+    const clarifyCardAnswer = clarify
+      ? `${modelFallbackNote}${failoverNote}${greeting}${clarify.question}`
+      : answerText
 
     // 卡片成功收口时返回 null，交给调用方跳过 sessionWebhook 纯文本；失败才回退文字。
     let replyText: string | null = answerText
     const finalReasoning = (agentResult?.reasoning || cardState.reasoning || '').trim()
+    const clarifyFlowId = clarifyFlow?.clarifyFlowId ?? (clarify ? `cf_${assistantMessageId}` : '')
+    const clarifyStep = clarifyFlow?.clarifyStep ?? 1
     if (card) {
       try {
         const finalState: DingTalkRichCardState = {
-          answer: answerText,
+          answer: clarifyCardAnswer,
           reasoning: finalReasoning,
           tools: toolsUsed,
           thinkingDone: true,
           toolDetails,
           attachments: cardAttachments,
+          clarify: clarify
+            ? {
+                sessionId,
+                question: clarify.question,
+                options: clarify.options,
+                allowCustom: clarify.allowCustom,
+                flowId: clarifyFlowId,
+                step: clarifyStep,
+                messageId: assistantMessageId,
+              }
+            : null,
         }
-        if (await card.finish(finalState, answerText)) {
+        if (await card.finish(finalState, clarifyCardAnswer)) {
           replyText = null
         } else {
           await card.fail('卡片已结束，完整回答见下一条消息。')
@@ -1223,9 +1317,25 @@ export async function handleDingTalkMessage(
       }
     }
 
-    const assistantCreatedAt = Date.now()
+    const existingAssistant = continueAssistantId
+      ? (deps.db
+          .prepare(
+            `SELECT id, session_id, created_at FROM chat_messages
+              WHERE id = ? AND company_id = ? AND user_id = ? AND role = 'assistant'
+              LIMIT 1`,
+          )
+          .get(continueAssistantId, actor.subject.companyId, actor.person.id) as
+          | { id: string; session_id: string; created_at: number }
+          | undefined)
+      : undefined
+    if (existingAssistant && existingAssistant.session_id !== sessionId) {
+      return { handled: false, text: '这次引导已经失效，请重新发送一条消息。', sessionId, reason: 'clarify-message-mismatch' }
+    }
+    const assistantCreatedAt = existingAssistant?.created_at ?? Date.now()
     const assistantMeta = {
       channel: 'dingtalk',
+      ...(clarifyFlow ?? {}),
+      ...(clarify ? { clarifyFlowId, clarifyStep } : {}),
       citations: hits.map((hit, index) => ({
         index: index + 1,
         collection: hit.collectionName,
@@ -1242,22 +1352,40 @@ export async function handleDingTalkMessage(
       rounds,
       clarify: agentResult?.clarify ?? null,
     }
-    deps.db
-      .prepare(
-        `INSERT INTO chat_messages (id, company_id, session_id, user_id, role, text, model_id, model_name, meta_json, created_at)
-         VALUES (?, ?, ?, ?, 'assistant', ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        assistantMessageId,
-        actor.subject.companyId,
-        sessionId,
-        actor.person.id,
-        answerText,
-        effectiveModel.id,
-        effectiveModel.name,
-        JSON.stringify(assistantMeta),
-        assistantCreatedAt,
-      )
+    if (existingAssistant) {
+      // 续跑同一条 AI 消息：只替换正文和元数据，不新插一条，网页端也就只有同一个气泡。
+      deps.db
+        .prepare(
+          `UPDATE chat_messages
+              SET text = ?, model_id = ?, model_name = ?, meta_json = ?
+            WHERE id = ? AND session_id = ? AND role = 'assistant'`,
+        )
+        .run(
+          answerText,
+          effectiveModel.id,
+          effectiveModel.name,
+          JSON.stringify(assistantMeta),
+          assistantMessageId,
+          sessionId,
+        )
+    } else {
+      deps.db
+        .prepare(
+          `INSERT INTO chat_messages (id, company_id, session_id, user_id, role, text, model_id, model_name, meta_json, created_at)
+           VALUES (?, ?, ?, ?, 'assistant', ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          assistantMessageId,
+          actor.subject.companyId,
+          sessionId,
+          actor.person.id,
+          answerText,
+          effectiveModel.id,
+          effectiveModel.name,
+          JSON.stringify(assistantMeta),
+          assistantCreatedAt,
+        )
+    }
     publishChatEvent({
       type: 'message',
       companyId: actor.subject.companyId,
@@ -1354,6 +1482,276 @@ export interface DingTalkStreamStatus {
   readonly error: string | null
 }
 
+function cardCallbackContent(raw: unknown): {
+  actionIds: string[]
+  params: Record<string, unknown>
+} {
+  const value = typeof raw === 'string' ? JSON.parse(raw) as Record<string, unknown> : raw
+  if (!value || typeof value !== 'object') return { actionIds: [], params: {} }
+  const content = value as Record<string, unknown>
+  const privateData = content.cardPrivateData
+  const privateObject = privateData && typeof privateData === 'object'
+    ? privateData as Record<string, unknown>
+    : content
+  const actionIds = Array.isArray(privateObject.actionIds)
+    ? privateObject.actionIds.map((item) => String(item ?? '')).filter(Boolean)
+    : []
+  const rawParams = privateObject.params
+  const params = typeof rawParams === 'string'
+    ? JSON.parse(rawParams) as Record<string, unknown>
+    : rawParams && typeof rawParams === 'object'
+      ? rawParams as Record<string, unknown>
+      : privateObject
+  return { actionIds, params }
+}
+
+/** 回调参数可能是扁平对象，也可能包在 context 里；递归找第一个字符串值。 */
+function cardParamString(value: unknown, key: string, depth = 0): string {
+  if (!value || depth > 5) return ''
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = cardParamString(item, key, depth + 1)
+      if (found) return found
+    }
+    return ''
+  }
+  if (typeof value !== 'object') return ''
+  const object = value as Record<string, unknown>
+  for (const [name, item] of Object.entries(object)) {
+    if (name === key) {
+      if (typeof item === 'string' || typeof item === 'number') return String(item)
+      if (item && typeof item === 'object') {
+        const nestedValue = (item as Record<string, unknown>).value
+        if (typeof nestedValue === 'string' || typeof nestedValue === 'number') return String(nestedValue)
+      }
+    }
+  }
+  for (const item of Object.values(object)) {
+    if (item && typeof item === 'object') {
+      const found = cardParamString(item, key, depth + 1)
+      if (found) return found
+    }
+  }
+  return ''
+}
+
+/**
+ * 处理钉钉卡片按钮回调。回调本身必须在 2 秒内 ACK，所以这里只做身份/会话校验，
+ * 真正的模型回合由调用方的异步任务继续跑；同一张卡片只接受第一次选择。
+ */
+export async function handleDingTalkCardCallback(
+  deps: ServerDeps,
+  payload: DingTalkCardCallbackPayload,
+): Promise<void> {
+  if (String(payload.type ?? '') !== 'actionCallback') return
+  const outTrackId = String(payload.outTrackId ?? '').trim()
+  const externalId = String(payload.userId ?? '').trim()
+  if (!outTrackId || !externalId) return
+
+  let content: { actionIds: string[]; params: Record<string, unknown> }
+  try {
+    content = cardCallbackContent(payload.content)
+  } catch {
+    console.warn('[eab] 钉钉卡片回调 content 不是合法 JSON，已忽略')
+    return
+  }
+
+  const actionIds = content.actionIds
+  const params = content.params
+  const registered = dingTalkClarifyCardState(outTrackId)
+  let sessionId = cardParamString(params, 'sessionId') || registered?.sessionId || ''
+  let optionId = cardParamString(params, 'optionId')
+  let optionLabel = ''
+  if (!optionId) {
+    // 兼容只回传选项卡片/文案组件 ID 的情况：clarifyOptionCard0 对应 option-1。
+    const option = actionIds.find((id) => /^clarifyOption(?:Card|Body|Label)?[0-3]$/.test(id))
+    const index = option ? Number(option.match(/[0-3]$/)?.[0] ?? -1) : -1
+    if (index >= 0) optionId = `option-${index + 1}`
+  }
+  if (registered && sessionId && sessionId !== registered.sessionId) {
+    console.warn('[eab] 钉钉卡片回调：sessionId 与卡片登记不一致，已拒绝')
+    return
+  }
+  if (!sessionId || !optionId) {
+    console.warn('[eab] 钉钉卡片回调缺少 sessionId/optionId，已忽略')
+    return
+  }
+  if (registered && !registered.options.some((option) => option.id === optionId)) {
+    console.warn('[eab] 钉钉卡片回调：选项不属于当前卡片，已拒绝')
+    return
+  }
+  // 优先用服务端登记的选项文案，避免只信任客户端回传的 context。
+  optionLabel =
+    registered?.options.find((option) => option.id === optionId)?.label
+    || cardParamString(params, 'optionLabel')
+  if (!optionLabel) {
+    const index = Number(optionId.replace(/^option-/, ''))
+    optionLabel = Number.isFinite(index) && index > 0 ? `第 ${index} 个方向` : '用户选择的方向'
+  }
+
+  const userId = resolveDingTalkUser(deps.db, deps.companyId, externalId)
+  if (!userId) {
+    console.warn('[eab] 钉钉卡片回调：外部账号还没有绑定 EAB 成员')
+    return
+  }
+  const person = findActivePerson(deps.db, userId)
+  if (!person) {
+    console.warn('[eab] 钉钉卡片回调：EAB 成员不存在或已停用')
+    return
+  }
+  const actor = actorFor(deps.db, person)
+  if (!scopeAllows(actor.subject.scopes, SC.CHAT_USE) || !scopeAllows(actor.subject.scopes, SC.MODEL_USE)) {
+    console.warn('[eab] 钉钉卡片回调：当前成员没有对话或模型权限')
+    return
+  }
+
+  const session = deps.db
+    .prepare(
+      `SELECT id FROM chat_sessions
+        WHERE id = ? AND company_id = ? AND user_id = ? AND source = 'dingtalk'
+          AND external_id = ? AND deleted_at IS NULL
+        LIMIT 1`,
+    )
+    .get(sessionId, deps.companyId, userId, externalId) as { id: string } | undefined
+  if (!session) {
+    console.warn('[eab] 钉钉卡片回调：sessionId 不属于当前钉钉用户，已拒绝')
+    return
+  }
+
+  /**
+   * 服务端重启会清空内存里的卡片登记表；这时从会话里最后一条带 clarify 的
+   * assistant 消息恢复 flowId/messageId，仍然把回答写回同一条消息。
+   */
+  let assistantMessageId = registered?.messageId || ''
+  let flowId = registered?.flowId || ''
+  let questionStep = Number(registered?.step ?? 0)
+  let fallbackOptions: Array<{ id: string; label: string }> = []
+  if (!assistantMessageId) {
+    const rows = deps.db
+      .prepare(
+        `SELECT id, meta_json FROM chat_messages
+          WHERE session_id = ? AND role = 'assistant'
+          ORDER BY created_at DESC LIMIT 20`,
+      )
+      .all(sessionId) as Array<{ id: string; meta_json: string | null }>
+    for (const row of rows) {
+      try {
+        const meta = JSON.parse(row.meta_json || '{}') as {
+          clarify?: unknown
+          clarifyFlowId?: unknown
+          clarifyStep?: unknown
+        }
+        if (!meta.clarify || typeof meta.clarify !== 'object') continue
+        const clarify = meta.clarify as {
+          options?: Array<{ id?: unknown; label?: unknown }>
+        }
+        assistantMessageId = row.id
+        flowId = typeof meta.clarifyFlowId === 'string' ? meta.clarifyFlowId : ''
+        questionStep = Number(meta.clarifyStep) || 0
+        fallbackOptions = (clarify.options ?? [])
+          .map((option) => ({
+            id: String(option.id ?? ''),
+            label: String(option.label ?? ''),
+          }))
+          .filter((option) => option.id)
+        break
+      } catch {
+        // 跳过损坏的历史 meta
+      }
+    }
+  }
+  if (fallbackOptions.length > 0) {
+    const option = fallbackOptions.find((item) => item.id === optionId)
+    if (!option) {
+      console.warn('[eab] 钉钉卡片回调：选项不属于这条澄清消息，已拒绝')
+      return
+    }
+    if (!optionLabel) optionLabel = option.label
+  }
+  if (!questionStep) questionStep = 1
+  if (!flowId && assistantMessageId) flowId = `cf_${assistantMessageId}`
+
+  const cardQuestionStep = Math.max(1, Math.trunc(questionStep))
+  // 同一张卡片会承载多页澄清；幂等键必须带上当前页，否则第二页按钮会被整卡幂等挡住。
+  const cardEventKey = `card:${outTrackId}:${externalId}:${cardQuestionStep}:${optionId}`
+  const inserted = deps.db
+    .prepare(
+      `INSERT INTO channel_events (id, company_id, provider, event_key, sender_id, received_at)
+       VALUES (?, ?, 'dingtalk', ?, ?, ?)
+       ON CONFLICT (provider, event_key) DO NOTHING`,
+    )
+    .run(`evt_${randomUUID()}`, deps.companyId, cardEventKey, externalId, Date.now())
+  if (Number(inserted.changes) === 0) return
+
+  const cfg = dingTalkConfig(deps.db, deps.companyId)
+  const channelSecret = cfg?.secret_ref ? resolveSecret(deps.config.dbPath, cfg.secret_ref) : null
+  let resumedCard: DingTalkAICardStream | undefined
+  if (cfg?.app_id && channelSecret) {
+    const stream = new DingTalkAICardStream(
+      cfg.app_id,
+      channelSecret,
+      externalId,
+      cfg.robot_code || cfg.app_id,
+    )
+    const resumed = await stream.resume(outTrackId, {
+      answer: '',
+      reasoning: `已收到你的选择「${optionLabel.slice(0, 40)}」，正在继续…`,
+      tools: [],
+      thinkingDone: false,
+      toolDetails: [],
+      clarify: null,
+    })
+    if (resumed) resumedCard = stream
+  }
+  // 把续用结果留在事件里，真机排查时能直接看出是“原卡续用”还是“续用失败”。
+  deps.db
+    .prepare('UPDATE channel_events SET result_json = ? WHERE provider = ? AND event_key = ?')
+    .run(JSON.stringify({ phase: 'resume', resumed: Boolean(resumedCard), outTrackId }), 'dingtalk', cardEventKey)
+
+  const synthetic: DingTalkMessage = {
+    msgtype: 'text',
+    text: { content: `我选择了「${optionLabel.slice(0, 80)}」。` },
+    senderStaffId: externalId,
+    senderId: externalId,
+    senderNick: person.name,
+    robotCode: cfg?.robot_code ?? cfg?.app_id ?? undefined,
+    conversationType: '1',
+    msgId: `card_${outTrackId}_${optionId}`,
+    createAt: Date.now(),
+  }
+  let result: Awaited<ReturnType<typeof handleDingTalkMessage>>
+  try {
+    result = await handleDingTalkMessage(deps, synthetic, {
+      sessionId,
+      dedupe: false,
+      card: resumedCard,
+      clarifyFlow: assistantMessageId
+        ? {
+            flowId: flowId || `cf_${assistantMessageId}`,
+            step: cardQuestionStep + 1,
+            assistantMessageId,
+            // 原卡续用失败时也不新建卡片，避免真机出现第二条机器人消息。
+            suppressNewCard: true,
+          }
+        : {
+            flowId: flowId || `cf_card_${outTrackId}`,
+            step: cardQuestionStep + 1,
+            suppressNewCard: true,
+          },
+    })
+  } catch (error) {
+    if (resumedCard) await resumedCard.fail('处理失败，请稍后再试。')
+    console.warn('[eab] 钉钉卡片回调续跑失败：', (error as Error).message)
+    return
+  }
+  if (result.text) {
+    // 复用原卡片时，错误/权限提示直接落到原卡片，避免再发一条文字。
+    const shownOnCard = resumedCard ? await resumedCard.fail(result.text) : false
+    if (!shownOnCard) await notifyDingTalkUser(deps, externalId, result.text)
+  }
+}
+
+
 export function dingTalkStreamStatus(): DingTalkStreamStatus {
   return {
     // running 只代表宿主持有客户端；真正能收消息看 connected + registered。
@@ -1369,6 +1767,30 @@ export function dingTalkStreamStatus(): DingTalkStreamStatus {
 }
 
 let refreshPromise: Promise<void> | null = null
+
+/**
+ * 钉钉 Stream 长连接是「一条连接对应一个机器人」：多实例各连一份会重复收到消息、
+ * 重复给用户回复。这里用 Redis 租约选一个实例持有连接，其余实例只待命。
+ * 没接 Redis 时租约恒为「本实例持有」，行为与升级前一致。
+ */
+let streamLeader: LeaderHold | null = null
+let streamLeaderKey = ''
+
+async function ensureStreamLeadership(appId: string): Promise<boolean> {
+  const key = `dingtalk-stream:${appId}`
+  if (streamLeader && streamLeaderKey === key && streamLeader.isHeld()) return true
+  streamLeader?.release()
+  streamLeader = null
+  streamLeaderKey = key
+  streamLeader = await acquireLeaderHold(key, { ttlMs: 90_000 })
+  return Boolean(streamLeader?.isHeld())
+}
+
+function releaseStreamLeadership(): void {
+  streamLeader?.release()
+  streamLeader = null
+  streamLeaderKey = ''
+}
 
 /**
  * 启动/重建钉钉 Stream。绑定换机器人后调用它即可切换凭证，不必重启整个服务。
@@ -1389,6 +1811,7 @@ async function doRefreshDingTalkStream(deps: ServerDeps): Promise<void> {
   streamState.lastAttemptAt = Date.now()
   if (!cfg?.app_id || !cfg.secret_ref || cfg.status !== 'bound' || mode !== 'STREAM') {
     stopDingTalkStream()
+    releaseStreamLeadership()
     streamState.error = '钉钉渠道未满足 Stream 启动条件（需已绑定且 robot_mode=STREAM）'
     return
   }
@@ -1401,6 +1824,12 @@ async function doRefreshDingTalkStream(deps: ServerDeps): Promise<void> {
     console.warn(`[eab] 钉钉 Stream 未启动：${streamState.error}`)
     return
   }
+  // 多实例部署时只让一个实例持有这条长连接，避免同一条消息被两个实例各回一次。
+  if (!(await ensureStreamLeadership(cfg.app_id))) {
+    if (streamState.client) stopDingTalkStream()
+    streamState.error = '钉钉 Stream 正由另一实例持有，本实例待命（Redis 领导权）'
+    return
+  }
   if (streamState.client && streamState.appId === cfg.app_id) {
     if (streamState.client.connected || streamState.client.registered) return
     // 客户端还在建连/等待自动重连时不要拆掉它；否则每轮巡检都会打断退避。
@@ -1408,7 +1837,7 @@ async function doRefreshDingTalkStream(deps: ServerDeps): Promise<void> {
   }
 
   stopDingTalkStream()
-  const { DWClient, TOPIC_ROBOT } = await import('dingtalk-stream')
+  const { DWClient, TOPIC_CARD, TOPIC_ROBOT } = await import('dingtalk-stream')
   const client = new DWClient({
     clientId: cfg.app_id,
     clientSecret: secret,
@@ -1428,6 +1857,19 @@ async function doRefreshDingTalkStream(deps: ServerDeps): Promise<void> {
         console.warn('[eab] 钉钉 Stream 消息处理失败：', (error as Error).message)
       } finally {
         if (messageId) client.socketCallBackResponse(messageId, { status: 'SUCCESS' })
+      }
+    })()
+  })
+  client.registerCallbackListener(TOPIC_CARD, (res) => {
+    const messageId = res.headers?.messageId ?? ''
+    // 卡片回调有 2 秒超时：先 ACK，再异步校验身份、续跑模型回合。
+    if (messageId) client.socketCallBackResponse(messageId, {})
+    void (async () => {
+      try {
+        const payload = JSON.parse(res.data) as DingTalkCardCallbackPayload
+        await handleDingTalkCardCallback(deps, payload)
+      } catch (error) {
+        console.warn('[eab] 钉钉卡片回调处理失败：', (error as Error).message)
       }
     })()
   })

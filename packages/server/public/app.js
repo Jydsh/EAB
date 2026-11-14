@@ -18,6 +18,10 @@ const CHANNEL_SOURCE_LABEL = {
   local: '本地',
 }
 
+/** 模型弹窗里上下文 / 输出上限的默认值，新建模型时直接带出来（可改）。 */
+const DEFAULT_MODEL_MAX_CONTEXT = 131072
+const DEFAULT_MODEL_MAX_OUTPUT = 32768
+
 /** 与后端 thinking.ts 对齐的三档；控制台模型弹窗与对话页共用这套文案。 */
 const THINKING_LEVELS = [
   { id: 'light', label: '精简', hint: '更少思考，更快回答。' },
@@ -78,6 +82,9 @@ const state = {
   systemSection: 'runtime',
   quotaScope: 'company',
   quotaMonth: '',
+  taskStatus: 'all',
+  databaseStatus: 'all',
+  databaseDrivers: [],
   deptFilter: null,
   includeSubdepts: false,
   collapsed: new Set(),
@@ -94,6 +101,14 @@ const state = {
   personalPluginSelected: null,
   pluginTab: 'overview',
   pluginPageKey: null,
+  /** 技能页：控制台技能制品、公司与个人安装状态、最近事件；与插件页共用「列表 → 详情」结构 */
+  skillConsoleData: null,
+  skillSelected: null,
+  skillPersonalSelected: null,
+  skillTab: 'overview',
+  skillGovernanceOpen: false,
+  skillSearch: '',
+  skillPersonalSearch: '',
 }
 
 const PAGES = {
@@ -106,13 +121,17 @@ const PAGES = {
   models: { title: '模型接入', sub: '供应商端点、模型目录与用途路由', render: () => loadModels() },
   tools: { title: '工具', sub: '智能体可调用的工具与审批要求', render: () => loadTools() },
   channels: { title: '渠道', sub: '飞书 / 钉钉 / 企业微信接入', render: () => loadSync() },
-  company: { title: '公司资料', sub: '公司标识、状态与绑定关系', render: () => loadCompanyProfile() },
+  databases: { title: '数据连接', sub: '外部数据库与缓存连接、连通性测试与密钥配置', render: () => loadDatabases() },
+  documents: { title: '在线文档', sub: 'OnlyOffice 服务绑定、内部回访与 JWT 校验', render: () => loadOnlyOffice() },
+  company: { title: '公司设置', sub: '公司标识、状态与绑定关系', render: () => loadCompanyProfile() },
   usage: { title: '用量', sub: '对话请求与 token 消耗（按天 / 按人）', render: () => loadUsage() },
   quota: { title: '额度', sub: '公司 / 部门 / 成员三级月度上限', render: () => loadQuota() },
   audit: { title: '审计', sub: '追加写入、哈希链可校验的操作记录', render: () => loadAudit() },
+  tasks: { title: '任务中心', sub: '定时任务、最近执行与事件时间线', render: () => loadTasks() },
   approvals: { title: '审批', sub: '高危动作的待办与决定', render: () => loadApprovals() },
-  system: { title: '系统', sub: '运行状态、公司设置与数据运维', render: () => loadSys() },
+  system: { title: '系统', sub: '运行状态与数据运维', render: () => loadSys() },
   extra: { title: '插件', sub: '安装、启停、页面与工具', render: () => loadPlugins() },
+  skills: { title: '技能', sub: '安装、启停、风险扫描与隔离记录', render: () => loadSkillsPage() },
 }
 
 
@@ -326,6 +345,16 @@ function qs(path) {
   return `${sep}company=${encodeURIComponent(state.company)}`
 }
 
+let consoleAuthRedirecting = false
+
+function redirectToConsoleLogin() {
+  if (consoleAuthRedirecting) return
+  consoleAuthRedirecting = true
+  // 控制台未登录/会话过期时统一回到服务器侧管理员登录门，
+  // 保留 company 等查询参数，登录成功后 gate 会原样带回。
+  location.replace('/admin' + (location.search || ''))
+}
+
 async function parseResponse(res) {
   let body = null
   try {
@@ -336,6 +365,12 @@ async function parseResponse(res) {
   if (!res.ok || !body || body.ok === false) {
     const err = body && body.ok === false ? body : { code: 'EAB_INTERNAL', message: `HTTP ${res.status}` }
     err.status = res.status
+    // 控制台会话缺失或过期：不再把错误渲染到当前页/弹提示，直接跳登录门。
+    // 返回一个永不结束的 Promise，让调用方的 catch/提示逻辑没有机会执行。
+    if (res.status === 401) {
+      redirectToConsoleLogin()
+      return await new Promise(() => {})
+    }
     throw err
   }
   return body.data
@@ -2571,6 +2606,72 @@ function fmtTime(ts) {
 
 /* ---------------- 概览 ---------------- */
 
+/**
+ * 渠道是否真的可用：以「已绑定」为准（企业绑定页、渠道页签都按 status==='bound' 计数）。
+ * 只填了凭证但没绑定（status='unbound'）不算接入完成，否则概览会比实际进度好看。
+ */
+function channelBound(item) {
+  if (!item) return false
+  return String(item.status ?? '') === 'bound' || Boolean(item.tenantId)
+}
+
+/**
+ * 渠道是否填过凭证（仅用于内部判断，不作为进度口径）。
+ * 钉钉 / 飞书看 appId，企业微信走 corpId + agentId（没有 appId），Webhook 单独配置也算。
+ */
+function channelConfigured(item) {
+  if (!item) return false
+  if (item.appId || item.corpId || item.agentId || item.webhookUrl) return true
+  const status = String(item.status ?? '')
+  return Boolean(status) && status !== 'unconfigured'
+}
+
+/**
+ * 渠道进度的统一文案。
+ * 「待绑定」= 总数减已绑定，也就是还差几个渠道没接入完成（含完全没配的和只填了凭证没绑的）。
+ */
+function channelMetaOf(list) {
+  const total = list.length || 3
+  const bound = list.filter(channelBound).length
+  const pending = Math.max(0, total - bound)
+  return {
+    bound,
+    total,
+    pending,
+    text: pending > 0 ? `${bound} / ${total} 已绑定 · ${pending} 个待绑定` : `${bound} / ${total} 已绑定`,
+  }
+}
+
+/**
+ * 就地刷新概览页的渠道进度：保存渠道配置、或页面重新可见时调用。
+ * 不在概览页时直接返回，不产生请求。
+ */
+async function refreshOverviewChannels() {  const num = document.querySelector('#view [data-ov="channels-num"]')
+  if (!num) return
+  try {
+    const [channels, plugins] = await Promise.all([
+      api('/api/console/channels').catch(() => null),
+      api('/api/console/plugins').catch(() => null),
+    ])
+    if (!channels) return
+    const list = channels.channels ?? []
+    const meta = channelMetaOf(list)
+    num.textContent = String(meta.bound)
+    const unit = document.querySelector('#view [data-ov="channels-unit"]')
+    if (unit) unit.textContent = `/ ${meta.total} 渠道已绑定 · ${plugins?.stats?.installed ?? 0} 插件`
+    for (const el of document.querySelectorAll('#view [data-ov="channels-meta"], #view [data-ov="channels-link"]')) {
+      el.textContent = meta.text
+    }
+  } catch {
+    // 刷新失败保留上一屏数字，不影响其它操作
+  }
+}
+
+// 用户切走再切回来（例如去渠道页配置完再回概览），数字与真实配置对齐
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) refreshOverviewChannels()
+})
+
 async function loadOverview() {
   const view = $('#view')
   const me = state.me
@@ -2591,7 +2692,13 @@ async function loadOverview() {
   const providerCount = providers?.providers?.length ?? 0
   const modelCount = models?.models?.length ?? 0
   const channelList = channels?.channels ?? []
-  const configuredChannels = channelList.filter((item) => item.appId || item.webhookUrl).length
+  const channelMeta = channelMetaOf(channelList)
+  const boundChannels = channelMeta.bound
+  const channelTotal = channelMeta.total
+  /* 填了凭证但没完成绑定的渠道：鼠标停在进度上能看到是谁，避免"待绑定"数对不上 */
+  const channelPendingLabels = channelList
+    .filter((item) => channelConfigured(item) && !channelBound(item))
+    .map((item) => item.label || item.provider)
   const pluginCount = plugins?.stats?.installed ?? 0
   const roleCount = roles?.roles?.length ?? 0
 
@@ -2600,7 +2707,7 @@ async function loadOverview() {
     { key: 'roles', title: '成员与角色权限', meta: `${roleCount} 个角色 · 在组织页给成员授权`, done: roleCount > 0, action: '检查权限' },
     { key: 'kb', title: '知识库', meta: `${kbCount} 个知识库 · 配置可见范围与文档`, done: kbCount > 0, action: '管理知识库' },
     { key: 'models', title: '模型接入', meta: `${providerCount} 个供应商 · ${modelCount} 个模型`, done: modelCount > 0, action: '接入模型' },
-    { key: 'channels', title: '渠道接入', meta: `${configuredChannels} / 3 已配置`, done: configuredChannels > 0, action: '配置渠道' },
+    { key: 'channels', title: '渠道接入', meta: channelMeta.text, hint: channelPendingLabels.length > 0 ? `${channelPendingLabels.join('、')} 已填凭证，但还没完成绑定` : '', done: boundChannels > 0, action: '配置渠道' },
     { key: 'extra', title: '插件', meta: `${pluginCount} 个已安装`, done: pluginCount > 0, action: '插件管理' },
   ]
 
@@ -2609,7 +2716,7 @@ async function loadOverview() {
     { key: 'org', title: '组织与成员', meta: `${memberCount} 名成员` },
     { key: 'models', title: '模型接入', meta: `${modelCount} 个模型` },
     { key: 'kb', title: '知识库与 RAG', meta: `${kbCount} 个库` },
-    { key: 'channels', title: '渠道绑定', meta: `${configuredChannels} / 3 已配置` },
+    { key: 'channels', title: '渠道绑定', meta: channelMeta.text },
   ]
 
   view.innerHTML = `
@@ -2617,7 +2724,7 @@ async function loadOverview() {
       <div class="stat"><div class="stat-label">服务状态</div><div class="stat-value">${health ? '运行中' : '异常'}<span class="stat-unit">${health ? `v${esc(health.version)}` : ''}</span></div></div>
       <div class="stat"><div class="stat-label">组织规模</div><div class="stat-value">${memberCount}<span class="stat-unit">成员 · ${deptCount} 部门</span></div></div>
       <div class="stat"><div class="stat-label">知识与模型</div><div class="stat-value">${kbCount}<span class="stat-unit">库 · ${modelCount} 模型</span></div></div>
-      <div class="stat"><div class="stat-label">接入完成度</div><div class="stat-value">${configuredChannels}<span class="stat-unit">/ 3 渠道 · ${pluginCount} 插件</span></div></div>
+      <div class="stat"><div class="stat-label">接入完成度</div><div class="stat-value"><span data-ov="channels-num">${boundChannels}</span><span class="stat-unit" data-ov="channels-unit">/ ${channelTotal} 渠道已绑定 · ${pluginCount} 插件</span></div></div>
     </div>
 
     <div class="overview-grid">
@@ -2633,7 +2740,7 @@ async function loadOverview() {
             .map(
               (task) => `<div class="setup-row${task.done ? ' is-done' : ''}">
                 <span class="setup-state ${task.done ? 'done' : ''}">${task.done ? '已配置' : '待配置'}</span>
-                <div class="setup-main"><strong>${esc(task.title)}</strong><span>${esc(task.meta)}</span></div>
+                <div class="setup-main"><strong>${esc(task.title)}</strong><span data-ov="${esc(task.key)}-meta"${task.hint ? ` title="${esc(task.hint)}"` : ''}>${esc(task.meta)}</span></div>
                 <button class="btn sm${task.done ? '' : ' primary'}" type="button" data-go="${task.key}">${esc(task.action)}</button>
               </div>`,
             )
@@ -2651,7 +2758,7 @@ async function loadOverview() {
               .map(
                 (item) => `<button class="quick-link" type="button" data-go="${item.key}">
                   <span>${esc(item.title)}</span>
-                  <small>${esc(item.meta)}</small>
+                  <small data-ov="${esc(item.key)}-link">${esc(item.meta)}</small>
                   <i aria-hidden="true">→</i>
                 </button>`,
               )
@@ -3649,13 +3756,18 @@ function openModelImportModal(provider, data) {
   }
 
   const overlay = modelModal(`
-    <div class="modal-head"><h3>发现 ${data.models.length} 个模型</h3><button class="modal-x" type="button">×</button></div>
-    <div class="hint">来源：<span class="mono">${esc(data.baseUrl)}/models</span> · 勾选后加入「${esc(
+    <div class="modal-head">
+      <div class="models-modal-title">
+        <h3>发现 ${data.models.length} 个模型 ${hintBadge('导入说明', '类型是按模型名推断的，不是协议探测，可逐条修改；点保存后才会写入模型列表。', '模型导入说明')}</h3>
+        <small class="model-import-source">来源 <span class="mono">${esc(data.baseUrl)}/models</span> · 勾选后加入「${esc(
       provider.name,
-    )}」</div>
-    ${hintNote('导入说明', '类型是按模型名推断的，不是协议探测，可逐条修改；点保存后才会写入模型列表。')}
+    )}」</small>
+      </div>
+      <button class="modal-x" type="button">×</button>
+    </div>
     <div class="model-import-toolbar">
-      <span class="muted" id="imp-count"></span>
+      <input class="model-import-search" id="imp-search" type="search" placeholder="搜索模型…（名称或类型）" aria-label="搜索待导入模型" autocomplete="off" />
+      <span class="model-import-count" id="imp-count"></span>
       <button class="link-btn" type="button" id="imp-all">全选</button>
       <button class="link-btn" type="button" id="imp-none">全不选</button>
     </div>
@@ -3663,7 +3775,8 @@ function openModelImportModal(provider, data) {
       ${data.models
         .map((model, index) => {
           const suggested = suggestionOf(model)
-          return `<div class="model-import-row">
+          const search = [model.id, model.label, suggested.label].filter(Boolean).join(' ')
+          return `<div class="model-import-row" data-import-item data-search="${esc(search)}">
             <input type="checkbox" id="imp-row-${index}" data-import-key="${esc(model.id)}" checked />
             <label class="model-import-main" for="imp-row-${index}">
               <strong class="mono">${esc(model.id)}</strong>
@@ -3683,6 +3796,7 @@ function openModelImportModal(provider, data) {
           </div>`
         })
         .join('')}
+      <div class="model-import-empty" id="imp-empty" hidden>没有匹配的模型，换个关键词试试</div>
     </div>
     <div class="modal-state" id="imp-state"></div>
     <div class="modal-actions">
@@ -3693,15 +3807,42 @@ function openModelImportModal(provider, data) {
   overlay.querySelector('.modal-x').addEventListener('click', close)
   overlay.querySelector('#imp-cancel').addEventListener('click', close)
 
+  const rows = [...overlay.querySelectorAll('[data-import-item]')]
   const checks = [...overlay.querySelectorAll('[data-import-key][type="checkbox"]')]
   const typeSelects = [...overlay.querySelectorAll('[data-import-type]')]
   const save = overlay.querySelector('#imp-save')
   const count = overlay.querySelector('#imp-count')
+  const search = overlay.querySelector('#imp-search')
+  const empty = overlay.querySelector('#imp-empty')
+  const visibleChecks = () => checks.filter((input) => !input.closest('[data-import-item]').hidden)
   const update = () => {
     const selected = checks.filter((input) => input.checked).length
-    count.textContent = `已选 ${selected} / 共 ${checks.length}`
+    const filtered = rows.filter((row) => !row.hidden).length
+    count.textContent = search.value.trim()
+      ? `已选 ${selected} / 共 ${checks.length} · 筛选出 ${filtered}`
+      : `已选 ${selected} / 共 ${checks.length}`
     save.disabled = selected === 0
   }
+  // 模糊搜索：忽略大小写、空格分词，全部命中才显示；只切 hidden，已勾选状态不受影响
+  const applyFilter = () => {
+    const tokens = search.value.trim().toLowerCase().split(/\s+/).filter(Boolean)
+    let shown = 0
+    for (const row of rows) {
+      const hay = String(row.dataset.search || '').toLowerCase()
+      const hit = tokens.every((token) => hay.includes(token))
+      row.hidden = !hit
+      if (hit) shown += 1
+    }
+    empty.hidden = !(rows.length > 0 && shown === 0)
+    update()
+  }
+  search.addEventListener('input', applyFilter)
+  search.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape' || !search.value) return
+    event.stopPropagation()
+    search.value = ''
+    applyFilter()
+  })
   for (const input of checks) input.addEventListener('change', update)
   for (const select of typeSelects) {
     select.addEventListener('change', () => {
@@ -3712,11 +3853,11 @@ function openModelImportModal(provider, data) {
     })
   }
   overlay.querySelector('#imp-all').addEventListener('click', () => {
-    for (const input of checks) input.checked = true
+    for (const input of visibleChecks()) input.checked = true
     update()
   })
   overlay.querySelector('#imp-none').addEventListener('click', () => {
-    for (const input of checks) input.checked = false
+    for (const input of visibleChecks()) input.checked = false
     update()
   })
   update()
@@ -3835,8 +3976,8 @@ async function openModelModal(model, providers, roles) {
           ${fieldInfo('按模型真实窗口填写；留空不会启用 token 预算压缩。')}
         </div>
         <div class="form-cols">
-          <label class="field"><span>上下文上限 <em>tokens</em> ${fieldInfo('模型的最大上下文窗口；留空则不启用 token 预算压缩。')}</span><input id="m-context" type="number" min="1" value="${model?.maxContext ?? ''}" placeholder="例如 32768" /></label>
-          <label class="field"><span>输出上限 <em>tokens</em> ${fieldInfo('单次回答最多生成多少 token；必须小于上下文上限。')}</span><input id="m-output" type="number" min="1" value="${model?.maxOutputTokens ?? ''}" placeholder="留空默认 4096" /></label>
+          <label class="field"><span>上下文上限 <em>tokens</em> ${fieldInfo('模型的最大上下文窗口；留空则不启用 token 预算压缩。')}</span><input id="m-context" type="number" min="1" value="${model?.maxContext ?? DEFAULT_MODEL_MAX_CONTEXT}" placeholder="例如 131072" /></label>
+          <label class="field"><span>输出上限 <em>tokens</em> ${fieldInfo('单次回答最多生成多少 token；必须小于上下文上限；留空按 4096 处理。')}</span><input id="m-output" type="number" min="1" value="${model?.maxOutputTokens ?? DEFAULT_MODEL_MAX_OUTPUT}" placeholder="例如 32768" /></label>
         </div>
         <div class="field models-compress-field">
           <label class="check"><input id="m-compress" type="checkbox"${model ? (model.contextCompression !== false ? ' checked' : '') : ' checked'} /><span>上下文超限时自动压缩较早历史 ${fieldInfo('只在填写上下文上限后生效；较早对话会压成摘要，最近消息保留原文，不会额外调用模型。')}</span></label>
@@ -3879,8 +4020,7 @@ async function openModelModal(model, providers, roles) {
         <div class="models-cap-section-head">
           <div><span>能力 / 擅长场景 ${fieldInfo('可多选；勾选即决定顶部类型、筛选和图片可用性。')}</span></div>
           <div class="models-multi-actions">
-            <button class="models-inline-btn" type="button" id="m-cap-all">全选</button>
-            <button class="models-cap-clear" type="button" id="m-cap-clear">清空</button>
+            <label class="models-check-all"><input type="checkbox" id="m-cap-all" /><span>全选</span></label>
           </div>
         </div>
         <div class="models-cap-grid">${capabilityOptionsHtml(initialTags)}</div>
@@ -3891,8 +4031,7 @@ async function openModelModal(model, providers, roles) {
           <strong>可见角色</strong>
           ${fieldInfo('只勾选允许使用该模型的角色；全不选时任何成员都不能使用。')}
           <div class="models-multi-actions">
-            <button class="models-inline-btn" type="button" id="m-role-all">全选</button>
-            <button class="models-inline-btn is-muted" type="button" id="m-role-clear">全不选</button>
+            <label class="models-check-all"><input type="checkbox" id="m-role-all" /><span>全选</span></label>
           </div>
         </div>
         <div class="check-grid models-role-grid">
@@ -3928,6 +4067,7 @@ async function openModelModal(model, providers, roles) {
   endpoint.value = model?.endpointKind && model.endpointKind !== 'audio' ? model.endpointKind : defaultEndpoint(initialTags)
   const dimField = overlay.querySelector('#m-dim-field')
   const roleInputs = [...overlay.querySelectorAll('[data-mrole]')]
+  const roleAll = overlay.querySelector('#m-role-all')
   const roleState = overlay.querySelector('#m-role-state')
   const thinkEnabled = overlay.querySelector('#m-think-enabled')
   const thinkFields = overlay.querySelector('#m-think-fields')
@@ -3961,6 +4101,8 @@ async function openModelModal(model, providers, roles) {
   }
   const syncRoleState = () => {
     const count = roleInputs.filter((input) => input.checked).length
+    roleAll.checked = roleInputs.length > 0 && count === roleInputs.length
+    roleAll.indeterminate = count > 0 && count < roleInputs.length
     roleState.className = `models-role-state${count === 0 ? ' is-empty' : ''}`
     roleState.textContent =
       count === 0
@@ -3985,6 +4127,14 @@ async function openModelModal(model, providers, roles) {
     rerank: ['rerank'],
     audio: ['audio'],
     video: ['video'],
+  }
+  const capInputs = [...overlay.querySelectorAll('.models-cap-grid input')]
+  const capAll = overlay.querySelector('#m-cap-all')
+  const syncCapAll = () => {
+    const total = capInputs.length
+    const checkedCount = capInputs.filter((input) => input.checked).length
+    capAll.checked = total > 0 && checkedCount === total
+    capAll.indeterminate = checkedCount > 0 && checkedCount < total
   }
   const readTags = () => {
     const tags = [...overlay.querySelectorAll('[data-cap-key]:checked')].map((el) => el.dataset.capKey)
@@ -4017,6 +4167,7 @@ async function openModelModal(model, providers, roles) {
     const hintText = typeHints[type.value] || typeHints.custom
     typeHint.dataset.tip = hintText
     typeHint.setAttribute('aria-label', hintText)
+    syncCapAll()
   }
   for (const input of overlay.querySelectorAll('.models-cap-grid input')) {
     input.addEventListener('change', () => {
@@ -4048,21 +4199,15 @@ async function openModelModal(model, providers, roles) {
   thinkDefault.addEventListener('change', syncThinkState)
   thinkStrategy.addEventListener('change', syncThinkState)
   for (const input of roleInputs) input.addEventListener('change', syncRoleState)
-  const setAllRoles = (checked) => {
-    for (const input of roleInputs) input.checked = checked
+  roleAll.addEventListener('change', () => {
+    for (const input of roleInputs) input.checked = roleAll.checked
     syncRoleState()
-  }
-  overlay.querySelector('#m-role-all').addEventListener('click', () => setAllRoles(true))
-  overlay.querySelector('#m-role-clear').addEventListener('click', () => setAllRoles(false))
-  overlay.querySelector('#m-cap-all').addEventListener('click', () => {
-    for (const input of overlay.querySelectorAll('.models-cap-grid input')) {
-      input.checked = true
-      input.closest('.models-cap-option')?.classList.add('is-on')
-    }
-    syncPreview()
   })
-  overlay.querySelector('#m-cap-clear').addEventListener('click', () => {
-    setChecked([])
+  capAll.addEventListener('change', () => {
+    for (const input of capInputs) {
+      input.checked = capAll.checked
+      input.closest('.models-cap-option')?.classList.toggle('is-on', input.checked)
+    }
     syncPreview()
   })
   syncPreview()
@@ -4751,7 +4896,6 @@ async function loadModels() {
     const pluginProviderCount = providers.length - writableProviders.length
     const models = modelData.models
     const roles = modelData.roles || []
-    const pluginStates = modelData.pluginStates || []
     const enabledModels = models.filter((model) => model.enabled)
     const visionModels = models.filter((model) => {
       const caps = modelCapabilitySummary(model.tags)
@@ -4839,20 +4983,26 @@ async function loadModels() {
             ${options}
           </select>`
           : `<select data-route-purpose="${esc(item.purpose)}" disabled>${options}</select>`
-        const stateText = item.boundModelId
-          ? '已绑定'
+        const badgeText = item.boundModelId ? '已绑定' : item.effectiveModelId ? '自动' : '未配置'
+        const badgeHint = item.boundModelId
+          ? '已手动绑定模型，不会随优先级自动变化'
           : item.effectiveModelId
-            ? `自动：${item.effectiveModelName}`
-            : '未配置 · 降级'
+            ? '未手动绑定，按优先级自动选择'
+            : '没有可用模型，该用途会降级'
         const tone = item.boundModelId ? 'is-bound' : item.effectiveModelId ? 'is-fallback' : 'is-empty'
+        const effectiveName = (item.boundModelId ? item.boundModelName || item.effectiveModelName : item.effectiveModelName) || ''
+        const subText = effectiveName ? `当前生效：${effectiveName}` : '没有可用模型，该用途会降级'
         return `<div class="models-route-row ${tone}" data-route-row="${esc(item.purpose)}">
           <div class="models-route-copy">
             <strong>${esc(item.label)}</strong>
             <span>${esc(item.hint)}</span>
             <code>${esc(item.purpose)}</code>
           </div>
-          ${selectHtml}
-          <span class="models-route-state">${esc(stateText)}</span>
+          <div class="models-route-pick">
+            ${selectHtml}
+            <span class="models-route-sub" title="${esc(subText)}">${esc(subText)}</span>
+          </div>
+          <span class="models-route-badge" title="${esc(badgeHint)}">${esc(badgeText)}</span>
         </div>`
       })
       .join('')
@@ -4890,34 +5040,6 @@ async function loadModels() {
         <div class="models-route-list">${routeRows || '<div class="empty">还没有可路由的用途</div>'}</div>
       </section>`
 
-    const pluginSourceChips = pluginStates
-      .map((plugin) => {
-        const off = !plugin.enabled || !plugin.valid
-        const stateLabel = !plugin.valid ? '清单异常' : off ? '已停用' : '启用'
-        const idLabel = plugin.name === plugin.id ? '' : `<code>${esc(plugin.id)}</code>`
-        return `<span class="models-plugin-source${off ? ' is-off' : ''}">
-          <i aria-hidden="true"></i>
-          <strong>${esc(plugin.name)}</strong>
-          ${idLabel}
-          <b>${stateLabel}</b>
-          <small>${
-            off
-              ? '相关模型已自动清理'
-              : plugin.modelCount
-                ? `${plugin.modelCount} 个模型已通过探测`
-                : '尚未有模型通过探测'
-          }</small>
-          ${off ? '<button class="models-plugin-goto" type="button" data-plugin-goto="plugins">去启用</button>' : ''}
-        </span>`
-      })
-      .join('')
-    const pluginSourcesHtml = pluginStates.length
-      ? `<div class="models-plugin-sources" aria-label="插件模型来源状态">
-          <span class="models-plugin-sources-label">插件模型来源</span>
-          ${pluginSourceChips}
-        </div>`
-      : ''
-
     const catalogPanel = `
       <section class="panel models-panel models-catalog-panel" data-section-panel="catalog">
         <div class="models-panel-head">
@@ -4931,7 +5053,6 @@ async function loadModels() {
           </div>
         </div>
         <div class="models-filter-bar" id="model-filter"></div>
-        ${pluginSourcesHtml}
         <div class="models-table-scroll models-catalog-scroll">
           <table class="data models-table">
             <thead><tr><th>模型</th><th>供应商</th><th>类型</th><th>上下文 / 输出</th><th>能力 / 擅长场景</th><th>可见角色</th><th>状态</th><th>操作</th></tr></thead>
@@ -4976,6 +5097,19 @@ async function loadModels() {
     mountSectionNav(view, state.modelsSection, 'providers', (key) => {
       state.modelsSection = key
     })
+
+    /* 路由行改绑后，页签计数 / 面板计数 / 未绑定高亮都按当前 DOM 重算，避免各算各的。 */
+    const syncRouteCounts = () => {
+      const routeRows = [...view.querySelectorAll('[data-route-row]')]
+      const total = routeRows.length
+      const bound = routeRows.filter((row) => row.classList.contains('is-bound')).length
+      const counter = view.querySelector('.models-route-panel .models-panel-count')
+      if (counter) counter.textContent = `${bound}/${total}`
+      const tab = view.querySelector('[data-section-target="routes"]')
+      const meta = tab?.querySelector('span')
+      if (meta) meta.textContent = `${bound}/${total} 已绑定`
+      if (tab) tab.classList.toggle('is-attention', bound < total)
+    }
 
     const byId = new Map(providers.map((item) => [item.id, item]))
     const modelById = new Map(models.map((item) => [item.id, item]))
@@ -5125,7 +5259,32 @@ async function loadModels() {
         const channelId = button.dataset.refreshPluginChannel
         button.disabled = true
         try {
-          const result = await apiPost(`/api/console/plugin-channels/${encodeURIComponent(channelId)}/refresh`)
+          const queued = await apiPost(`/api/console/plugin-channels/${encodeURIComponent(channelId)}/refresh`)
+          if (queued.jobId) {
+            showTopToast('已提交后台探测，完成后自动刷新列表')
+            let job = null
+            for (let attempt = 0; attempt < 150; attempt += 1) {
+              await new Promise((resolve) => setTimeout(resolve, 1200))
+              job = await api(`/api/console/jobs/${encodeURIComponent(queued.jobId)}`)
+              if (['succeeded', 'failed', 'cancelled'].includes(job.status)) break
+            }
+            if (!job) throw new Error('作业状态读取超时')
+            if (job.status === 'succeeded') {
+              const result = job.result || {}
+              showTopToast(
+                result.checked
+                  ? `插件模型已探测：${result.models}/${result.checked} 个可正常回复`
+                  : '插件通道没有可探测的模型',
+              )
+            } else if (job.status === 'failed') {
+              showTopToast(job.error || '插件模型刷新失败', { tone: 'warn' })
+            } else {
+              showTopToast('作业已取消或仍未完成，稍后重试', { tone: 'warn' })
+            }
+            loadModels()
+            return
+          }
+          const result = queued
           showTopToast(
             result.checked
               ? `插件模型已探测：${result.models}/${result.checked} 个可正常回复`
@@ -5142,21 +5301,35 @@ async function loadModels() {
     for (const select of view.querySelectorAll('[data-route-purpose]')) {
       select.addEventListener('change', async () => {
         const row = select.closest('[data-route-row]')
-        const stateEl = row?.querySelector('.models-route-state')
-        if (stateEl) stateEl.textContent = '保存中…'
+        const badge = row?.querySelector('.models-route-badge')
+        const sub = row?.querySelector('.models-route-sub')
+        if (badge) badge.textContent = '保存中…'
         try {
           const result = await apiSend('PUT', `/api/console/model-routes/${encodeURIComponent(select.dataset.routePurpose)}`, {
             modelId: select.value || null,
           })
-          if (stateEl) {
-            stateEl.textContent = result.boundModelId
-              ? '已绑定'
-              : result.effectiveModelName
-                ? `自动：${result.effectiveModelName}`
-                : '未配置 · 降级'
+          const bound = Boolean(result.boundModelId)
+          const name = result.effectiveModelName || ''
+          const tone = bound ? 'is-bound' : name ? 'is-fallback' : 'is-empty'
+          if (row) {
+            row.classList.remove('is-bound', 'is-fallback', 'is-empty')
+            row.classList.add(tone)
+          }
+          syncRouteCounts()
+          if (badge) {
+            badge.textContent = bound ? '已绑定' : name ? '自动' : '未配置'
+            badge.title = bound
+              ? '已手动绑定模型，不会随优先级自动变化'
+              : name
+                ? '未手动绑定，按优先级自动选择'
+                : '没有可用模型，该用途会降级'
+          }
+          if (sub) {
+            sub.textContent = name ? `当前生效：${name}` : '没有可用模型，该用途会降级'
+            sub.title = sub.textContent
           }
         } catch (err) {
-          if (stateEl) stateEl.textContent = '保存失败'
+          if (badge) badge.textContent = '保存失败'
           alert(err.message || '用途路由保存失败')
         }
       })
@@ -5166,11 +5339,6 @@ async function loadModels() {
       renderModelRows()
     })
     view.onclick = async (event) => {
-      const pluginGoto = event.target.closest('[data-plugin-goto]')
-      if (pluginGoto) {
-        navigate('plugins')
-        return
-      }
       const filterButton = event.target.closest('[data-model-filter]')
       if (filterButton) {
         state.modelsFilter = filterButton.dataset.modelFilter
@@ -5373,10 +5541,22 @@ async function loadSys() {
     const settings = await api('/api/console/settings').catch(() => null)
     const update = await api('/api/console/update').catch(() => null)
     const concurrency = await api('/api/console/concurrency').catch(() => null)
+    const toolMetrics = await api('/api/console/tool-metrics?days=7').catch(() => null)
     const agentRuns = await api('/api/console/agent-runs?limit=50').catch(() => null)
+    const jobs = await api('/api/console/jobs?limit=30').catch(() => null)
+    const jobRows = jobs?.jobs ?? []
+    const jobStatusText = {
+      queued: '排队中',
+      running: '执行中',
+      succeeded: '已完成',
+      failed: '失败',
+      cancelled: '已取消',
+    }
     const cap = concurrency?.chat ?? null
     const toolStats = concurrency?.tools ?? null
     const pluginStats = concurrency?.plugins ?? null
+    const inflightRows = concurrency?.inflight ?? []
+    const inflightTotal = concurrency?.inflightTotal ?? inflightRows.length
     const toolRows = (() => {
       const rows = new Map()
       for (const row of toolStats?.keys ?? []) {
@@ -5404,6 +5584,7 @@ async function loadSys() {
     const locked = network.envLocked ?? {}
     const retentionDays = settings?.retentionDays ?? 90
     const auditRetentionDays = settings?.auditRetentionDays ?? 180
+    const agentRetentionDays = settings?.agentRetentionDays ?? 0
     const logs = settings?.logs ?? {}
     const storageRows = settings?.storage?.rows ?? []
     const storagePending = settings?.storage?.pendingMigrations ?? []
@@ -5415,11 +5596,11 @@ async function loadSys() {
         [
           { key: 'runtime', label: '运行与准入', meta: '服务状态 · 安全边界' },
           { key: 'concurrency', label: '并发与队列', meta: '对话 · 模型 · 工具 · 插件' },
+          { key: 'jobs', label: '后台作业', meta: '排队 · 进度 · 结果' },
           { key: 'agents', label: 'Agent 运行树', meta: '父任务 · 子 Agent · 工具轨迹' },
-          { key: 'company', label: '公司设置', meta: '名称 · 启停 · 删除' },
           { key: 'data', label: '数据与运维', meta: '目录 · 日志 · 备份' },
         ],
-        state.systemSection || 'runtime',
+        state.systemSection === 'company' || !state.systemSection ? 'runtime' : state.systemSection,
       )}
       <div class="section-panels">
       <section class="panel" data-section-panel="runtime">
@@ -5435,7 +5616,7 @@ async function loadSys() {
       </section>
       <section class="panel" data-section-panel="concurrency">
         <div class="panel-head">
-          <div><h2>并发与队列</h2>${hintBadge('并发说明', '对话 / 模型 / 工具 / 插件四级闸门；数字是当前进程的实时值。')}</div>
+          <div><h2>并发与队列</h2>${hintBadge('并发说明', `对话 / 模型 / 工具 / 插件四级闸门；${toolStats?.shared || pluginStats?.shared ? '工具与插件的执行数是 Redis 里的全局计数（跨实例），对话与排队是本进程实时值。' : '数字是当前进程的实时值。'}`)}</div>
           <div class="panel-actions">
             <span class="pill ${(cap?.queued ?? 0) + (toolStats?.queued ?? 0) + (pluginStats?.queued ?? 0) > 0 ? 'warn' : 'ok'}">
               ${(cap?.queued ?? 0) + (toolStats?.queued ?? 0) + (pluginStats?.queued ?? 0) > 0 ? '有请求排队' : '当前无排队'}
@@ -5446,8 +5627,8 @@ async function loadSys() {
         <div class="kv-grid kv-2">
           <div><span>对话在生成</span><strong>${cap?.active ?? 0} / ${cap?.limits?.maxConcurrent ?? 8}<span class="desc" style="display:block;font-weight:400">公司上限 ${cap?.limits?.companyMaxConcurrent ?? 8} · 模型上限 ${cap?.limits?.modelMaxConcurrent ?? 4}</span></strong></div>
           <div><span>对话排队</span><strong>${cap?.queued ?? 0}<span class="desc" style="display:block;font-weight:400">队列上限 ${cap?.limits?.queueLimit ?? 100}</span></strong></div>
-          <div><span>工具在执行 / 排队</span><strong>${toolStats?.active ?? 0} / ${toolStats?.queued ?? 0}<span class="desc" style="display:block;font-weight:400">单工具上限 ${toolStats?.limits?.maxConcurrent ?? 8}</span></strong></div>
-          <div><span>插件工具在执行 / 排队</span><strong>${pluginStats?.active ?? 0} / ${pluginStats?.queued ?? 0}<span class="desc" style="display:block;font-weight:400">单插件上限 ${pluginStats?.limits?.maxConcurrent ?? 4}</span></strong></div>
+          <div><span>工具在执行 / 排队${toolStats?.shared ? '（全局）' : ''}</span><strong>${toolStats?.active ?? 0} / ${toolStats?.queued ?? 0}<span class="desc" style="display:block;font-weight:400">单工具上限 ${toolStats?.limits?.maxConcurrent ?? 8}</span></strong></div>
+          <div><span>插件工具在执行 / 排队${pluginStats?.shared ? '（全局）' : ''}</span><strong>${pluginStats?.active ?? 0} / ${pluginStats?.queued ?? 0}<span class="desc" style="display:block;font-weight:400">单插件上限 ${pluginStats?.limits?.maxConcurrent ?? 4}</span></strong></div>
           <div><span>工具执行次数</span><strong>${fmtNum(toolStats?.runs ?? 0)}<span class="desc" style="display:block;font-weight:400">失败 ${fmtNum(toolStats?.failures ?? 0)}</span></strong></div>
           <div><span>SQLITE_BUSY</span><strong>${fmtNum(concurrency?.sqlite?.busyTotal ?? 0)}<span class="desc" style="display:block;font-weight:400">写事务抢锁次数</span></strong></div>
         </div>
@@ -5471,6 +5652,88 @@ async function loadSys() {
             </tbody>
           </table>
         </div>
+        <div class="panel-head" style="margin-top:18px">
+          <div><h2>正在执行（实时）</h2>${hintBadge('实时执行', '这是此刻真的占用名额、还没返回的工具调用；「已耗时」从占到名额起算。卡住的回合在这里最直观，不用等它跑完才有记录。')}</div>
+          <div class="panel-actions">
+            <span class="pill ${inflightRows.length ? 'warn' : 'ok'}">
+              ${inflightRows.length
+                ? `最长已执行 ${Math.round((inflightRows[0].elapsedMs ?? 0) / 1000)} 秒 · 共 ${inflightTotal} 个`
+                : '当前没有工具在执行'}
+            </span>
+          </div>
+        </div>
+        <div class="table-scroll">
+          <table class="data">
+            <thead><tr><th>工具</th><th>入口</th><th>已耗时</th></tr></thead>
+            <tbody>
+              ${inflightRows.length
+                ? inflightRows.map((row) => `<tr><td class="mono">${esc(row.toolId)}</td><td>${esc(row.channel ?? '—')}</td><td>${Math.round((row.elapsedMs ?? 0) / 1000)} 秒</td></tr>`).join('')
+                : '<tr><td colspan="3" class="muted">当前没有工具在执行</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+        <div class="panel-head" style="margin-top:18px">
+          <div><h2>工具耗时（近 ${toolMetrics?.days ?? 7} 天）</h2>${hintBadge('耗时口径', `只看真实工具步骤（模型与子 Agent 步骤不计）；p50 / p95 是分位耗时，超过 ${Math.round((toolMetrics?.thresholdMs ?? 8000) / 1000)} 秒记为慢工具。这张表就是判断「要不要做对话后台化」的依据。`)}</div>
+          <div class="panel-actions">
+            <span class="pill ${(toolMetrics?.totalSlowCalls ?? 0) > 0 ? 'warn' : 'ok'}">
+              ${(toolMetrics?.totalSlowCalls ?? 0) > 0 ? `慢工具 ${fmtNum(toolMetrics.totalSlowCalls)} 次` : '无慢工具'}
+            </span>
+            <button class="btn sm ghost" type="button" id="tool-metrics-refresh">刷新</button>
+          </div>
+        </div>
+        <div class="table-scroll">
+          <table class="data">
+            <thead><tr><th>工具</th><th>调用</th><th>p50</th><th>p95</th><th>最长</th><th>超阈值</th></tr></thead>
+            <tbody>
+              ${(toolMetrics?.tools ?? []).length
+                ? (toolMetrics.tools ?? []).map((row) => `<tr><td class="mono">${esc(row.toolId)}</td><td>${fmtNum(row.calls)}</td><td>${fmtNum(row.p50Ms)} ms</td><td>${fmtNum(row.p95Ms)} ms</td><td>${fmtNum(row.maxMs)} ms</td><td>${row.slowCalls > 0 ? `<span class="pill warn">${fmtNum(row.slowCalls)}</span>` : '0'}</td></tr>`).join('')
+                : '<tr><td colspan="6" class="muted">还没有工具执行记录</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+        <div class="desc" style="margin-top:8px">共 ${fmtNum(toolMetrics?.totalCalls ?? 0)} 次工具调用；出现「p95 集中在少数工具且明显偏大」时，才对那几个工具做两段式改造，不必整体重构回合循环。</div>
+      </section>
+      <section class="panel" data-section-panel="jobs">
+        <div class="panel-head">
+          <div><h2>后台作业</h2>${hintBadge('作业说明', '控制台触发的慢操作（插件通道刷新、模型批量探测）提交后在这里排队执行；状态存在库里，多实例下任何一台都能回读。没配 Redis 时 worker 按 1.5 秒轮询，配了 Redis 则提交后即时唤醒。')}</div>
+          <div class="panel-actions">
+            <span class="pill ${jobRows.some((job) => job.status === 'queued' || job.status === 'running') ? 'warn' : 'ok'}">
+              ${jobRows.some((job) => job.status === 'queued' || job.status === 'running')
+                ? `进行中 ${jobRows.filter((job) => job.status === 'queued' || job.status === 'running').length}`
+                : '当前无作业'}
+            </span>
+            <button class="btn sm ghost" type="button" id="jobs-refresh">刷新</button>
+          </div>
+        </div>
+        <div class="table-scroll">
+          <table class="data">
+            <thead><tr><th>作业</th><th>类型</th><th>状态</th><th>进度</th><th>耗时</th><th>结果 / 原因</th><th></th></tr></thead>
+            <tbody>
+              ${jobRows.length
+                ? jobRows.map((job) => {
+                  const started = job.startedAt ?? job.createdAt
+                  const duration = Math.max(0, Math.round(((job.finishedAt ?? Date.now()) - started) / 1000))
+                  const outcome = job.status === 'failed'
+                    ? job.error
+                    : job.status === 'succeeded'
+                      ? JSON.stringify(job.result ?? {})
+                      : ''
+                  const shown = outcome && outcome.length > 180 ? `${outcome.slice(0, 180)}…` : outcome
+                  return `<tr>
+                    <td><div>${esc(job.title)}</div><div class="desc">${esc(job.id.slice(0, 14))} · ${new Date(job.createdAt).toLocaleString('zh-CN')}</div></td>
+                    <td class="mono">${esc(job.kind)}</td>
+                    <td><span class="pill ${job.status === 'succeeded' ? 'ok' : 'warn'}">${esc(jobStatusText[job.status] ?? job.status)}</span></td>
+                    <td>${Number(job.progress) || 0}/${Number(job.total) || 0}${job.attempts > 1 ? ` <span class="desc">已重试 ${job.attempts - 1} 次</span>` : ''}</td>
+                    <td>${duration} 秒</td>
+                    <td class="desc" style="max-width:360px;word-break:break-all">${esc(shown) || '—'}</td>
+                    <td>${job.status === 'queued' ? `<button class="btn sm ghost" type="button" data-cancel-job="${esc(job.id)}">取消</button>` : ''}</td>
+                  </tr>`
+                }).join('')
+                : '<tr><td colspan="7" class="muted">还没有后台作业；在「模型接入」页点「刷新插件模型」会提交一个</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+        ${hintNote('租约说明', '执行中的作业带 5 分钟租约，实例崩溃后租约过期会被放回队列重跑；只有还在排队的作业可以取消。')}
       </section>
       <section class="panel" data-section-panel="agents">
         <div class="panel-head">
@@ -5488,7 +5751,7 @@ async function loadSys() {
                 ? (agentRuns.runs).map((row) => {
                   const duration = Math.max(0, Math.round(((row.endedAt ?? Date.now()) - row.startedAt) / 1000))
                   const statusClass = row.status === 'succeeded' ? 'ok' : row.status === 'failed' ? 'warn' : row.status === 'cancelled' ? 'warn' : 'warn'
-                  const statusText = row.status === 'succeeded' ? '成功' : row.status === 'failed' ? '失败' : row.status === 'cancelled' ? '已取消' : '运行中'
+                  const statusText = row.status === 'succeeded' ? '成功' : row.status === 'failed' ? '失败' : row.status === 'cancelled' ? '已取消' : row.status === 'suspended' ? '挂起 · 等后台工具' : '运行中'
                   const steps = row.steps ?? []
                   return `<tr>
                     <td><span style="padding-left:${row.depth * 16}px">${row.depth ? '↳ ' : ''}${esc(row.title ?? row.agentId)}</span><div class="desc">${esc(row.id.slice(0, 8))} · ${esc(row.agentId)}</div></td>
@@ -5587,17 +5850,6 @@ async function loadSys() {
         </div>
         <div class="inline-note" id="update-state" style="margin-top:10px"></div>
       </section>
-      <section class="panel" data-section-panel="company">
-        <div class="panel-head"><div><h2>公司信息</h2>${hintBadge('公司范围', '单公司实例：只此一家，ID 固定；改名会同步根部门与成员部门显示。')}</div></div>
-        <div class="form-grid" style="align-items:end">
-          <label class="field"><span>公司名称</span><input id="company-name-input" value="${esc(state.companies[0]?.name ?? '')}" maxlength="80" /></label>
-          <div class="panel-actions" style="align-self:end">
-            <button class="btn sm primary" type="button" id="company-rename">保存名称</button>
-            <button class="btn sm ghost" type="button" id="company-toggle">${state.companies[0]?.status === 'suspended' ? '恢复启用' : '停用公司'}</button>
-            <button class="btn sm ghost danger" type="button" id="company-delete">删除公司</button>
-          </div>
-        </div>
-      </section>
       <section class="panel" data-section-panel="runtime">
         <div class="panel-head"><div><h2>准入与安全</h2>${hintBadge('准入说明', '控制台不是员工入口，只有服务器本机或部署方账号能进；远程访问需部署侧显式开启。')}</div></div>
         <div class="kv-grid">
@@ -5639,7 +5891,7 @@ async function loadSys() {
       <section class="panel" data-section-panel="data">
         <div class="panel-head">
           <div><h2>日志与审计保留</h2>${hintBadge('清理说明', '同步记录、渠道事件、登录失败、插件事件按日志保留天数清理；审计按独立天数，只从最老一端连续删除，被删段最后一行会留作链锚点，所以清理本身不会造成断链。后台每 6 小时检查一次。')}</div>
-          <span class="pill">日志 ${retentionDays > 0 ? `${retentionDays} 天` : '永久'} · 审计 ${auditRetentionDays > 0 ? `${auditRetentionDays} 天` : '永久'}</span>
+          <span class="pill">日志 ${retentionDays > 0 ? `${retentionDays} 天` : '永久'} · 审计 ${auditRetentionDays > 0 ? `${auditRetentionDays} 天` : '永久'} · Agent 轨迹 ${agentRetentionDays > 0 ? `${agentRetentionDays} 天` : '永久'}</span>
         </div>
         <div class="kv-grid">
           <div><span>同步记录</span><strong>${fmtNum(logs.syncRuns ?? 0)} 条<span class="desc">差异 ${fmtNum(logs.syncDiffs ?? 0)} 条</span></strong></div>
@@ -5648,6 +5900,7 @@ async function loadSys() {
           <div><span>插件 / 扫码事件</span><strong>${fmtNum((logs.pluginEvents ?? 0) + (logs.onboardAttempts ?? 0))} 条</strong></div>
           <div><span>上次清理</span><strong>${esc(cleanupText)}</strong></div>
           <div><span>审计日志</span><strong>${fmtNum(logs.auditLogs ?? 0)} 条 ${hintBadge('审计保留', auditRetentionDays > 0 ? `超过 ${auditRetentionDays} 天自动清理；只删最老一段，保留链锚点，不会因清理断链。` : '审计日志永久保留，不自动清理。')}</strong></div>
+          <div><span>Agent 运行 / 步骤</span><strong>${fmtNum(logs.agentRuns ?? 0)} / ${fmtNum(logs.agentSteps ?? 0)} 条 ${hintBadge('轨迹保留', agentRetentionDays > 0 ? `超过 ${agentRetentionDays} 天自动清理已结束的 run 与步骤；运行中和挂起等后台结果的 run 不删。` : 'Agent 运行轨迹永久保留；设置天数后只清理已结束的 run。')}</strong></div>
         </div>
         <div class="form-grid" style="align-items:end;margin-top:14px">
           <label class="field"><span>日志保留天数（0 = 永久保留）</span>
@@ -5655,6 +5908,9 @@ async function loadSys() {
           </label>
           <label class="field"><span>审计保留天数（0 = 永久保留）</span>
             <input id="audit-retention-input" type="number" min="0" max="3650" value="${auditRetentionDays}" />
+          </label>
+          <label class="field"><span>Agent 轨迹保留天数（0 = 永久保留）</span>
+            <input id="agent-retention-input" type="number" min="0" max="3650" value="${agentRetentionDays}" />
           </label>
           <div class="panel-actions" style="align-self:end">
             <button class="btn sm primary" type="button" id="retention-save">保存策略</button>
@@ -5676,9 +5932,11 @@ async function loadSys() {
       `<section class="panel" data-section-panel="data">
         <div class="panel-head"><div><h2>平台与运维</h2>${hintBadge('运维说明', '数据库备份；渠道绑定已统一到「连接与平台 → 渠道 → 企业一键绑定」。')}</div>
           <div class="panel-actions">
-            <button class="btn sm ghost" type="button" id="backup-now">立即备份</button>
+            <button class="btn sm ghost" type="button" id="backup-now">SQLite 快照</button>
+            <button class="btn sm ghost" type="button" id="backup-runtime">运行数据备份</button>
           </div>
         </div>
+        <div id="backend-status" class="mini-list"><div class="mini-row"><span>外部后端</span><div class="muted">加载中…</div></div></div>
         <div id="backup-list" class="mini-list"><div class="mini-row"><span>备份</span><div class="muted">加载中…</div></div></div>
       </section>`,
     )
@@ -5689,73 +5947,34 @@ async function loadSys() {
     if (concurrencyRefresh) {
       concurrencyRefresh.addEventListener('click', () => PAGES.system.render())
     }
+    const toolMetricsRefresh = $('#tool-metrics-refresh')
+    if (toolMetricsRefresh) {
+      toolMetricsRefresh.addEventListener('click', () => PAGES.system.render())
+    }
     const agentsRefresh = $('#agents-refresh')
     if (agentsRefresh) {
       agentsRefresh.addEventListener('click', () => PAGES.system.render())
     }
+    const jobsRefresh = $('#jobs-refresh')
+    if (jobsRefresh) {
+      jobsRefresh.addEventListener('click', () => PAGES.system.render())
+    }
+    view.querySelectorAll('[data-cancel-job]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        button.disabled = true
+        try {
+          await apiPost(`/api/console/jobs/${encodeURIComponent(button.dataset.cancelJob)}/cancel`)
+          showTopToast('作业已取消')
+          PAGES.system.render()
+        } catch (err) {
+          showTopToast(err.message || '作业取消失败', { tone: 'warn' })
+          button.disabled = false
+        }
+      })
+    })
     const companyOnboard = $('#company-onboard')
     if (companyOnboard) companyOnboard.remove()
 
-    const companyRename = $('#company-rename')
-    if (companyRename) {
-      companyRename.addEventListener('click', async () => {
-        const name = String($('#company-name-input')?.value ?? '').trim()
-        if (!name) return alert('公司名称不能为空')
-        try {
-          await apiSend('PATCH', `/api/console/companies/${encodeURIComponent(state.company)}`, { name })
-          await loadMe()
-          await loadCompanies()
-          PAGES.system.render()
-        } catch (err) {
-          alert(err.message)
-        }
-      })
-    }
-    const companyToggle = $('#company-toggle')
-    if (companyToggle) {
-      companyToggle.addEventListener('click', async () => {
-        const current = state.companies[0]?.status === 'suspended'
-        const next = current ? 'active' : 'suspended'
-        if (next === 'suspended') {
-          const ok = await confirmCard({
-            title: '停用公司？',
-            message: '停用后所有员工将立即无法登录；控制台仍可恢复。',
-            confirmText: '停用公司',
-            tone: 'warning',
-          })
-          if (!ok) return
-        }
-        try {
-          await apiSend('PATCH', `/api/console/companies/${encodeURIComponent(state.company)}`, { status: next })
-          await loadCompanies()
-          PAGES.system.render()
-        } catch (err) {
-          alert(err.message)
-        }
-      })
-    }
-    const companyDelete = $('#company-delete')
-    if (companyDelete) {
-      companyDelete.addEventListener('click', async () => {
-        const name = state.companies[0]?.name ?? ''
-        const ok = await confirmCard({
-          title: '删除公司？',
-          message: `删除「${name}」会清空全部数据，且不可恢复。`,
-          detail: '包括部门、成员、角色、知识库、模型、渠道、会话和审计数据。',
-          requireText: name,
-          requireHint: `请输入公司名称「${name}」确认`,
-          confirmText: '删除公司',
-        })
-        if (!ok) return
-        try {
-          await apiSend('DELETE', `/api/console/companies/${encodeURIComponent(state.company)}`)
-          alert('公司及其全部数据已删除。可以到「连接与平台 → 渠道」用「绑定钉钉机器人」重新接入一家公司。')
-          location.reload()
-        } catch (err) {
-          alert(err.message)
-        }
-      })
-    }
     const backupNow = $('#backup-now')
     if (backupNow) {
       backupNow.addEventListener('click', async () => {
@@ -5765,6 +5984,32 @@ async function loadSys() {
           refreshBackups()
         } catch (err) {
           alert(err.message)
+        }
+      })
+    }
+    const backupRuntime = $('#backup-runtime')
+    if (backupRuntime) {
+      backupRuntime.addEventListener('click', async () => {
+        if (!confirm('运行数据备份会复制 SQLite 快照、插件包、dsh-home、workspaces 和 console-settings.json，可能占用数百 MB、耗时数分钟；不会复制 secrets.json / admin-credentials.txt。继续？')) return
+        backupRuntime.disabled = true
+        const original = backupRuntime.textContent
+        backupRuntime.textContent = '备份中…'
+        try {
+          const started = await apiPost('/api/console/backups/runtime', {})
+          let job = started
+          for (let i = 0; i < 600 && job.status === 'running'; i++) {
+            await new Promise((resolve) => setTimeout(resolve, 2000))
+            job = await api(`/api/console/backup-jobs/${encodeURIComponent(started.jobId)}`)
+          }
+          if (job.status === 'failed') throw new Error(job.error || '运行数据备份失败')
+          if (job.status !== 'done') throw new Error('运行数据备份仍在进行，请稍后刷新查看')
+          alert(`运行数据备份完成：${job.dir}\n${(job.size / 1024 / 1024).toFixed(1)} MB\n包含：${job.manifest.includes.join('、')}\n未包含：${job.manifest.excludes.join('、')}`)
+          refreshBackups()
+        } catch (err) {
+          alert(err.message)
+        } finally {
+          backupRuntime.disabled = false
+          backupRuntime.textContent = original
         }
       })
     }
@@ -5779,9 +6024,9 @@ async function loadSys() {
               .map(
                 (item) =>
                   `<div class="mini-row backup-row">
-                    <span class="mono backup-name">${esc(item.name)}</span>
+                    <span class="mono backup-name">${esc(item.name)} <span class="pill">${item.kind === 'runtime' ? '运行数据' : 'SQLite'}</span></span>
                     <div class="backup-meta">
-                      <span class="backup-stamp">${(item.size / 1024 / 1024).toFixed(2)} MB · ${esc(new Date(item.createdAt).toLocaleString())}</span>
+                      <span class="backup-stamp">${item.size > 0 ? `${(item.size / 1024 / 1024).toFixed(2)} MB` : '大小未记录'} · ${esc(new Date(item.createdAt).toLocaleString())}</span>
                       <div class="backup-actions">
                         <button class="btn sm ghost" type="button" data-reveal-backup="${esc(item.name)}" title="在服务器所在电脑上打开该备份所在目录">打开文件位置</button>
                         <button class="btn sm ghost danger" type="button" data-del-backup="${esc(item.name)}">删除</button>
@@ -5790,7 +6035,7 @@ async function loadSys() {
                   </div>`,
               )
               .join('')
-          : '<div class="mini-row"><span>备份</span><div class="muted">还没有备份。点「立即备份」生成一个 SQLite 快照。</div></div>'
+          : '<div class="mini-row"><span>备份</span><div class="muted">还没有备份。SQLite 快照只含数据库；运行数据备份还会包含插件包和 dsh-home。</div></div>'
         for (const button of box.querySelectorAll('[data-reveal-backup]')) {
           button.addEventListener('click', async () => {
             button.disabled = true
@@ -5822,6 +6067,33 @@ async function loadSys() {
         box.innerHTML = `<div class="mini-row"><span>备份</span><div class="muted">读取失败：${esc(err.message)}</div></div>`
       }
     }
+    async function refreshBackends() {
+      const box = $('#backend-status')
+      if (!box) return
+      try {
+        const data = await api('/api/console/backends')
+        const stateLabel = (state) => {
+          if (state === 'ready') return '可用'
+          if (state === 'degraded') return '降级'
+          if (state === 'failed') return '失败'
+          return '未启用'
+        }
+        const tone = (state) =>
+          state === 'ready' ? 'ok' : state === 'degraded' ? 'warn' : state === 'failed' ? 'danger' : ''
+        box.innerHTML = data.backends
+          .map(
+            (item) =>
+              `<div class="mini-row backend-row">
+                <span>${esc(item.label)} <span class="pill ${tone(item.state)}">${stateLabel(item.state)}</span></span>
+                <div class="muted">${esc(item.detail)}${item.capabilities?.length ? ` · ${esc(item.capabilities.join(' / '))}` : ''}</div>
+              </div>`,
+          )
+          .join('')
+      } catch (err) {
+        box.innerHTML = `<div class="mini-row"><span>外部后端</span><div class="muted">读取失败：${esc(err.message)}</div></div>`
+      }
+    }
+    refreshBackends()
     const retentionSave = $('#retention-save')
     if (retentionSave) {
       const note = $('#retention-state')
@@ -5833,9 +6105,11 @@ async function loadSys() {
       retentionSave.addEventListener('click', async () => {
         const days = Number($('#retention-input')?.value)
         const auditDays = Number($('#audit-retention-input')?.value)
+        const agentDays = Number($('#agent-retention-input')?.value)
         for (const [label, value] of [
           ['日志保留天数', days],
           ['审计保留天数', auditDays],
+          ['Agent 轨迹保留天数', agentDays],
         ]) {
           if (!Number.isInteger(value) || value < 0 || (value > 0 && value < 7) || value > 3650) {
             return setNote(`${label}只能填 0（永久）或 7–3650`, true)
@@ -5843,10 +6117,11 @@ async function loadSys() {
         }
         retentionSave.disabled = true
         try {
-          await apiSend('PUT', '/api/console/settings/retention', { days, auditDays })
+          await apiSend('PUT', '/api/console/settings/retention', { days, auditDays, agentDays })
           const policy = [
             days > 0 ? `日志超过 ${days} 天` : '日志永久保留',
             auditDays > 0 ? `审计超过 ${auditDays} 天` : '审计永久保留',
+            agentDays > 0 ? `Agent 轨迹超过 ${agentDays} 天` : 'Agent 轨迹永久保留',
           ]
           setNote(`已保存：${policy.join('；')}（后台每 6 小时检查一次）`)
         } catch (err) {
@@ -5875,6 +6150,8 @@ async function loadSys() {
               pluginEvents: '插件事件',
               onboardAttempts: '扫码尝试',
               auditLogs: '审计记录',
+              agentRuns: 'Agent 运行',
+              agentSteps: 'Agent 步骤',
             }
             const detail = Object.entries(result.deleted ?? {})
               .filter(([, n]) => Number(n) > 0)
@@ -6743,6 +7020,10 @@ function openCompanyCreate() {
 
 async function downloadConsoleFile(path, filename) {
   const res = await fetch(path + qs(path), { headers: { 'x-eab-console': '1' } })
+  if (res.status === 401) {
+    redirectToConsoleLogin()
+    return await new Promise(() => {})
+  }
   if (!res.ok) throw new Error(`导出失败 HTTP ${res.status}`)
   const blob = await res.blob()
   const url = URL.createObjectURL(blob)
@@ -6753,47 +7034,197 @@ async function downloadConsoleFile(path, filename) {
   setTimeout(() => URL.revokeObjectURL(url), 2000)
 }
 
+function openToolRoleModal(trigger, tool, access, accessData = {}, onSaved = null) {
+  const roleOptions = Array.isArray(accessData.roles) ? accessData.roles : []
+  const isPlugin = tool.source === 'plugin'
+  const isPersonalPlugin = isPlugin && (tool.personal === true || access?.personal === true || access?.mode === 'none')
+  const initialMode = access?.mode === 'all' ? 'all' : 'roles'
+  const selected = new Set(access?.roleCodes || [])
+  const overlay = modelModal(`
+    <div class="modal-head"><h3>可用角色</h3><button class="modal-x" type="button" aria-label="关闭">×</button></div>
+    <div class="modal-section-title">${esc(tool.name)} <span class="mono">${esc(tool.id)}</span></div>
+    <div class="tool-role-note">${
+      isPersonalPlugin
+        ? '个人插件工具不进入平台工具注册表，默认也不授权任何角色，安装插件不会自动获得工具。选择「指定角色」并勾选后，只有这些角色能用；工具原本要求的 agent:tool:invoke 仍然生效。'
+        : isPlugin
+          ? '公司插件工具沿用默认所有角色可用。改成「指定角色」后，只有拥有这些角色的成员能看到并调用该工具；工具原本要求的 agent:tool:invoke 仍然生效。'
+          : '默认所有角色可用。改成「指定角色」后，只有拥有这些角色的成员能看到并调用该工具；工具原本要求的 scope 仍然生效。'
+    }</div>
+    <div class="segmented tool-role-mode" id="tool-role-mode">
+      <button type="button" data-mode="all" class="${initialMode === 'all' ? 'active' : ''}">所有角色</button>
+      <button type="button" data-mode="roles" class="${initialMode === 'roles' ? 'active' : ''}">指定角色</button>
+    </div>
+    <div class="tool-role-picker" id="tool-role-picker"${initialMode === 'roles' ? '' : ' hidden'}>
+      ${roleOptions
+        .map(
+          (role) => `<label class="check"><input type="checkbox" data-tool-role="${esc(role.code)}"${
+            selected.has(role.code) ? ' checked' : ''
+          } /><span>${esc(ROLE_LABEL[role.code] || role.name || role.code)}</span><small>${esc(role.code)} · ${Number(
+            role.members || 0,
+          )} 人</small></label>`,
+        )
+        .join('') || '<div class="empty">当前公司还没有角色，先到「角色管理」创建角色。</div>'}
+    </div>
+    <div class="tool-role-note is-warn" id="tool-role-empty"${initialMode === 'roles' && selected.size === 0 ? '' : ' hidden'}>
+      ${isPlugin ? '未选择任何角色：保存后该插件工具不会下发给任何成员。' : '未选择任何角色：保存后除平台超管外，其他成员都不能使用该工具。'}
+    </div>
+    <div class="modal-actions">
+      <span class="muted" id="tool-role-msg"></span>
+      <button class="btn ghost" type="button" id="tool-role-cancel">取消</button>
+      <button class="btn primary" type="button" id="tool-role-save">保存</button>
+    </div>`)
+
+  let mode = initialMode
+  const picker = overlay.querySelector('#tool-role-picker')
+  const emptyHint = overlay.querySelector('#tool-role-empty')
+  const msg = overlay.querySelector('#tool-role-msg')
+  const close = () => {
+    overlay.remove()
+    trigger?.focus?.()
+  }
+  const syncMode = () => {
+    overlay.querySelectorAll('[data-mode]').forEach((button) => {
+      button.classList.toggle('active', button.dataset.mode === mode)
+    })
+    picker.hidden = mode !== 'roles'
+    emptyHint.hidden = !(mode === 'roles' && overlay.querySelectorAll('[data-tool-role]:checked').length === 0)
+  }
+  overlay.querySelectorAll('[data-mode]').forEach((button) => {
+    button.addEventListener('click', () => {
+      mode = button.dataset.mode === 'roles' ? 'roles' : 'all'
+      syncMode()
+    })
+  })
+  picker.addEventListener('change', syncMode)
+  overlay.querySelector('.modal-x').addEventListener('click', close)
+  overlay.querySelector('#tool-role-cancel').addEventListener('click', close)
+  overlay.querySelector('#tool-role-save').addEventListener('click', async () => {
+    msg.textContent = '保存中…'
+    const roles = [...overlay.querySelectorAll('[data-tool-role]:checked')].map((input) => input.dataset.toolRole)
+    try {
+      await apiSend('PUT', `/api/console/tools/${encodeURIComponent(tool.id)}/roles`, { mode, roles })
+      close()
+      if (onSaved) onSaved()
+      else loadTools()
+    } catch (err) {
+      msg.textContent = err.message || '保存失败'
+    }
+  })
+  overlay.querySelector('.modal-x').focus()
+}
+
 async function loadTools() {
   const view = $('#view')
   renderLoading(view)
   setSide('', true)
   try {
-    const data = await api('/api/tools')
-    const rows = data.tools
-      .map(
-        (tool) => `<tr>
-          <td><strong>${esc(tool.name)}</strong><div class="desc mono">${esc(tool.id)}</div></td>
+    const [data, accessData] = await Promise.all([api('/api/tools'), api('/api/console/tools/access')])
+    const roleNames = new Map((accessData.roles || []).map((role) => [role.code, ROLE_LABEL[role.code] || role.name || role.code]))
+    const accessByCatalogId = new Map((accessData.tools || []).map((tool) => [tool.id, tool]))
+    const accessByAccessId = new Map((accessData.tools || []).map((tool) => [tool.accessId, tool]))
+    const accessFor = (tool) => {
+      const pluginAccessId = tool.source === 'plugin' ? `plugin:${tool.pluginId}:${tool.name}` : tool.id
+      return accessByCatalogId.get(tool.id) || accessByAccessId.get(pluginAccessId) || null
+    }
+    const roleText = (access) => {
+      if (!access) return '<span class="pill warn">未配置</span>'
+      if (access.mode === 'none') return '<span class="pill warn">默认未授权</span>'
+      if (access.mode === 'all') return '<span class="pill ok">所有角色</span>'
+      if ((access.roleCodes || []).length === 0) return '<span class="pill warn">未选择角色</span>'
+      return `<span class="tool-role-chips">${access.roleCodes
+        .map((code) => `<span class="chip">${esc(roleNames.get(code) || code)}</span>`)
+        .join('')}</span>`
+    }
+    const mergedTools = [...data.tools]
+    const rows = mergedTools
+      .map((tool) => {
+        const access = accessFor(tool)
+        const roleCodes = (access?.roleCodes || []).map((code) => roleNames.get(code) || code)
+        const searchText = [
+          tool.name,
+          tool.id,
+          tool.description,
+          tool.source === 'plugin' ? '插件' : '内置',
+          tool.dangerous ? '需审批' : '',
+          tool.available ? '当前可用' : '无权限',
+          ...roleCodes,
+        ].filter(Boolean).join(' ')
+        return `<tr data-tool-row data-search="${esc(searchText)}">
+          <td class="tool-name"><strong>${esc(tool.name)}</strong><div class="desc mono" title="${esc(tool.id)}">${esc(tool.id)}</div></td>
           <td class="tool-desc"><div class="tool-desc-text" title="${esc(tool.description)}">${esc(tool.description)}</div></td>
-          <td>${tool.source === 'plugin' ? '<span class="pill">插件</span>' : '<span class="pill ok">内置</span>'} ${tool.dangerous ? '<span class="pill warn">需审批</span>' : ''}</td>
-          <td>${tool.available ? '<span class="pill ok">当前可用</span>' : '<span class="pill">无权限</span>'}</td>
-          <td class="tool-actions"><button class="link-btn accent" type="button" data-tool-test="${esc(tool.id)}"${tool.available ? '' : ' disabled'}>试运行</button></td>
-        </tr>`,
-      )
+          <td class="tool-source">${tool.source === 'plugin' ? '<span class="pill">插件</span>' : '<span class="pill ok">内置</span>'}${tool.dangerous ? '<span class="pill warn">需审批</span>' : ''}</td>
+          <td class="tool-role-cell">${roleText(access)}</td>
+          <td class="tool-status">${tool.available ? '<span class="pill ok">当前可用</span>' : '<span class="pill">无权限</span>'}</td>
+          <td class="tool-actions"><button class="btn sm ghost" type="button" data-tool-roles="${esc(tool.id)}">配置角色</button><button class="btn sm accent" type="button" data-tool-test="${esc(tool.id)}"${tool.available ? '' : ' disabled'}>试运行</button></td>
+        </tr>`
+      })
       .join('')
-    const builtinCount = data.tools.filter((tool) => tool.source !== 'plugin').length
-    const pluginCount = data.tools.length - builtinCount
+    const builtinCount = mergedTools.filter((tool) => tool.source !== 'plugin').length
+    const pluginCount = mergedTools.length - builtinCount
     view.innerHTML = `
       <section class="panel">
-        <div class="panel-head"><div><h2>工具注册表</h2><span class="hint">${builtinCount} 个内置工具 + ${pluginCount} 个插件工具</span>${hintBadge('工具说明', '插件工具随插件安装 / 停用动态出现；没有权限的工具会在当前身份列标记为不可用。')}</div></div>
-        <table class="data">
-          <thead><tr><th>工具</th><th>说明</th><th>来源 / 风险</th><th>当前身份</th><th>操作</th></tr></thead>
-          <tbody>${rows}</tbody>
-        </table>
+        <div class="panel-head"><div><h2>工具注册表</h2><span class="hint">${builtinCount} 个内置工具 + ${pluginCount} 个公司插件工具</span>${hintBadge('工具说明', '这里只展示内置工具与公司插件工具。个人插件工具不进入平台工具注册表，只留在安装人的个人工作台。公司插件工具默认所有角色可用，也可改成指定角色；个人插件工具的角色授权在「插件管理 > 个人插件详情」中单独配置。角色配置是工具原有 scope 校验之外的附加限制，不会跳过 scope。')}</div>
+          <div class="tools-panel-tools">
+            <label class="models-search"><span aria-hidden="true">⌕</span><input id="tool-search" type="search" placeholder="搜索工具、说明或角色" aria-label="搜索工具" autocomplete="off" /></label>
+            <span class="models-panel-note" id="tool-count"></span>
+          </div>
+        </div>
+        <div class="tools-table-scroll">
+          <table class="data tools-table">
+            <colgroup><col class="col-tool"><col class="col-desc"><col class="col-source"><col class="col-roles"><col class="col-status"><col class="col-actions"></colgroup>
+            <thead><tr><th>工具</th><th>说明</th><th>来源 / 风险</th><th>可用角色</th><th>状态</th><th>操作</th></tr></thead>
+            <tbody>${rows}<tr id="tool-empty" hidden><td colspan="6" class="tool-empty">没有匹配的工具，换个关键词试试</td></tr></tbody>
+          </table>
+        </div>
       </section>
       <section class="panel">
         <div class="panel-head"><h2>调用规则</h2></div>
         <div class="mini-list">
-          <div class="mini-row"><span>鉴权</span><div>每个工具声明所需 scope；没有 scope 直接 403，不进入执行。插件工具统一要求 agent:tool:invoke。</div></div>
-          <div class="mini-row"><span>插件</span><div>插件工具由插件 host 注册；公司/员工停用或卸载插件后，下一次对话立即看不到、也调不到。</div></div>
+          <div class="mini-row"><span>角色</span><div>内置工具和公司插件工具默认所有角色可用；改成指定角色后，只有拥有这些角色的成员能看到并调用。个人插件工具不进入这个注册表，只在安装人的个人工作台出现；管理员在「插件管理 > 个人插件详情」中给它配置可用角色，但不能代替安装人执行。</div></div>
+          <div class="mini-row"><span>鉴权</span><div>每个工具仍声明所需 scope；没有 scope 直接 403，不进入执行。插件工具统一要求 agent:tool:invoke。角色白名单和 scope 同时满足才会放行。</div></div>
+          <div class="mini-row"><span>插件</span><div>个人插件工具不进入平台通用工具目录，安装人只在个人工作台看到自己的工具；安装个人插件不会自动获得角色授权。公司/员工停用或卸载插件后，下一次对话立即看不到、也调不到。</div></div>
           <div class="mini-row"><span>高危</span><div>带「需审批」的工具第一次调用会生成审批待办，管理员在「审批」页通过后，带 approvalId 再调。</div></div>
-          <div class="mini-row"><span>审计</span><div>每次调用写审计（tool.invoke.&lt;id&gt;），参数与结果摘要可追溯。</div></div>
+          <div class="mini-row"><span>审计</span><div>每次调用写审计（tool.invoke.&lt;id&gt;），角色配置变更写 tool.access.update，参数与结果摘要可追溯。</div></div>
         </div>
       </section>`
+    // 工具表模糊搜索：忽略大小写、空格分词，全部命中才显示；只切 hidden，不影响按钮绑定
+    const toolSearch = view.querySelector('#tool-search')
+    const toolRows = [...view.querySelectorAll('[data-tool-row]')]
+    const toolEmpty = view.querySelector('#tool-empty')
+    const toolCount = view.querySelector('#tool-count')
+    const applyToolFilter = () => {
+      const tokens = String(toolSearch?.value || '').trim().toLowerCase().split(/\s+/).filter(Boolean)
+      let shown = 0
+      for (const row of toolRows) {
+        const hit = tokens.every((token) => String(row.dataset.search || '').toLowerCase().includes(token))
+        row.hidden = !hit
+        if (hit) shown += 1
+      }
+      if (toolEmpty) toolEmpty.hidden = !(toolRows.length > 0 && shown === 0)
+      if (toolCount) toolCount.textContent = tokens.length ? `筛选出 ${shown} / ${toolRows.length}` : ''
+    }
+    if (toolSearch) {
+      toolSearch.addEventListener('input', applyToolFilter)
+      toolSearch.addEventListener('keydown', (event) => {
+        if (event.key !== 'Escape' || !toolSearch.value) return
+        event.stopPropagation()
+        toolSearch.value = ''
+        applyToolFilter()
+      })
+    }
     for (const button of view.querySelectorAll('[data-tool-test]')) {
       button.addEventListener('click', () => {
         const id = button.dataset.toolTest
-        const tool = data.tools.find((item) => item.id === id)
+        const tool = mergedTools.find((item) => item.id === id)
         openToolRunPopover(button, tool)
+      })
+    }
+    for (const button of view.querySelectorAll('[data-tool-roles]')) {
+      button.addEventListener('click', () => {
+        const id = button.dataset.toolRoles
+        const tool = mergedTools.find((item) => item.id === id)
+        const access = tool ? accessFor(tool) : null
+        if (tool) openToolRoleModal(button, tool, access, accessData)
       })
     }
   } catch (err) {
@@ -7535,7 +7966,7 @@ async function loadAudit(action = '', page = 0) {
   const view = $('#view')
   renderLoading(view)
   setSide(`
-    <div class="side-head audit-side-head"><span class="side-title">审计</span>${hintBadge('审计说明', '审计表 append-only + 哈希链；导出行为本身也会写一条审计。')}</div>
+    <div class="side-head audit-side-head"><span class="side-title">审计</span>${hintBadge('审计说明', '审计表 append-only + 哈希链；列表/导出可配置读 PG 镜像，哈希链校验始终读 SQLite 权威链。')}</div>
     <div class="side-list">
       <button class="side-item ${action ? '' : 'is-active'}" type="button" id="audit-all">全部操作</button>
       <button class="side-item ${action === 'org.member' ? 'is-active' : ''}" type="button" data-audit-action="org.member">成员变更</button>
@@ -7566,7 +7997,7 @@ async function loadAudit(action = '', page = 0) {
     view.innerHTML = `
       <section class="panel">
         <div class="panel-head">
-          <div><h2>操作记录</h2><span class="hint">${data.total} 条${action ? ` · 过滤 ${esc(action)}` : ''}</span></div>
+          <div><h2>操作记录</h2><span class="hint">${data.total} 条${action ? ` · 过滤 ${esc(action)}` : ''} · 数据源 ${data.source === 'postgres' ? 'PostgreSQL' : 'SQLite'}${data.fallbackReason ? ` · ${esc(data.fallbackReason)}` : ''}</span></div>
           <div class="panel-actions">
             <button class="btn sm ghost" type="button" id="audit-verify">校验哈希链</button>
             <button class="btn sm ghost" type="button" id="audit-csv">导出 CSV</button>
@@ -7600,6 +8031,34 @@ async function loadAudit(action = '', page = 0) {
   }
 }
 
+const APPROVAL_STATUS_LABEL = {
+  pending: '待审批',
+  approved: '已通过',
+  rejected: '已拒绝',
+  expired: '已过期',
+}
+
+function approvalActionHtml(item) {
+  const action = String(item.action || '')
+  const payload = item.payload && typeof item.payload === 'object' ? item.payload : {}
+  if (action.startsWith('skill-tool:')) {
+    const toolId = payload.toolId || action.slice('skill-tool:'.length).split(':')[0]
+    const skillName = payload.skillName || payload.skillId || action.slice('skill-tool:'.length).split(':')[1] || ''
+    const args = payload.argsPreview ? JSON.stringify(payload.argsPreview) : ''
+    return `<span class="chip accent">技能高危工具 · ${esc(toolId)}</span><div class="desc">${esc(skillName)}${args ? ` · ${esc(args)}` : ''}</div>`
+  }
+  if (action.startsWith('skill-install:')) {
+    const skillName = payload.skillName || payload.skillId || action.slice('skill-install:'.length)
+    const detail = [payload.version ? `版本 ${payload.version}` : '', payload.sourcePath ? payload.sourcePath : payload.sourceRef || ''].filter(Boolean).join(' · ')
+    return `<span class="chip accent">公司级技能安装 · ${esc(skillName)}</span><div class="desc">${esc(detail || payload.checksum || item.resourceId || '')}</div>`
+  }
+  if (action.startsWith('skill-install-user:')) {
+    const skillName = payload.skillName || payload.skillId || action.slice('skill-install-user:'.length)
+    return `<span class="chip accent">个人技能安装 · ${esc(skillName)}</span><div class="desc">${esc(payload.sourceRef || payload.checksum || item.resourceId || '')}</div>`
+  }
+  return `<span class="chip accent">${esc(action)}</span><div class="desc">${esc(item.resourceType)} ${esc(item.resourceId || '')}</div>`
+}
+
 async function loadApprovals() {
   const view = $('#view')
   renderLoading(view)
@@ -7610,8 +8069,8 @@ async function loadApprovals() {
       .map(
         (item) => `<tr>
           <td>${esc(item.requesterName)}<div class="desc mono">${esc(item.requesterUserId)}</div></td>
-          <td><span class="chip accent">${esc(item.action)}</span><div class="desc">${esc(item.resourceType)} ${esc(item.resourceId || '')}</div></td>
-          <td><span class="pill ${item.status === 'pending' ? 'warn' : item.status === 'approved' ? 'ok' : 'danger'}">${esc(item.status)}</span></td>
+          <td>${approvalActionHtml(item)}</td>
+          <td><span class="pill ${item.status === 'pending' ? 'warn' : item.status === 'approved' ? 'ok' : 'danger'}">${esc(APPROVAL_STATUS_LABEL[item.status] || item.status)}</span></td>
           <td class="mono desc">${esc(item.createdAt)}</td>
           <td>${
             item.status === 'pending'
@@ -7623,10 +8082,10 @@ async function loadApprovals() {
       .join('')
     view.innerHTML = `
       <section class="panel">
-        <div class="panel-head"><div><h2>审批</h2>${hintBadge('审批说明', '高危动作需要先申请，再由控制台决定；通过或拒绝都会写审计。')}</div></div>
+        <div class="panel-head"><div><h2>审批</h2>${hintBadge('审批说明', '高危动作需要先申请，再由控制台决定；技能高危工具会绑定技能、工具和同一组参数，审批通过后只放行一次。')}</div></div>
         <table class="data">
           <thead><tr><th>申请人</th><th>动作</th><th>状态</th><th>提交时间</th><th>操作</th></tr></thead>
-          <tbody>${rows || '<tr><td colspan="5" class="empty">没有审批记录。插件高危能力、跨部门导出等动作会在这里生成待办。</td></tr>'}</tbody>
+          <tbody>${rows || '<tr><td colspan="5" class="empty">没有审批记录。插件高危能力、技能高危工具、跨部门导出等动作会在这里生成待办。</td></tr>'}</tbody>
         </table>
       </section>`
     for (const button of view.querySelectorAll('[data-approve], [data-reject]')) {
@@ -7643,6 +8102,982 @@ async function loadApprovals() {
     }
   } catch (err) {
     renderDenied(view, err)
+  }
+}
+
+/* ---------------- 任务中心 ---------------- */
+
+const TASK_STATUS_LABEL = {
+  active: '待触发',
+  paused: '已暂停',
+  running: '执行中',
+  done: '已完成',
+  error: '失败',
+  cancelled: '已取消',
+}
+
+const TASK_STATUS_PILL = {
+  active: 'ok',
+  paused: 'warn',
+  running: 'accent',
+  done: 'ok',
+  error: 'danger',
+  cancelled: 'muted',
+}
+
+const TASK_EVENT_LABEL = {
+  create: '创建任务',
+  delete: '取消任务',
+  pause: '暂停任务',
+  resume: '恢复任务',
+  fire: '到点派发',
+  complete: '执行完成',
+  error: '执行失败',
+  delivery: '结果投递',
+  recover: '重启恢复',
+}
+
+const TASK_RUN_LABEL = { success: '成功', error: '失败', running: '执行中' }
+const TASK_DELIVERY_LABEL = { sent: '已送达', failed: '发送失败', skipped: '未投递' }
+const WEEKDAY_LABEL = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
+
+/* ---------------- 数据连接（关系型数据库 / 文件数据库 / 键值缓存） ---------------- */
+
+const DB_STATUS_LABEL = { untested: '未检测', ok: '可用', error: '连接失败' }
+const DB_STATUS_PILL = { untested: '', ok: 'ok', error: 'danger' }
+const DB_CATEGORY_LABEL = { relational: '关系型数据库', file: '文件数据库', cache: '键值缓存' }
+
+function databaseStatusPill(item) {
+  if (!item.enabled) return '<span class="pill">已停用</span>'
+  return `<span class="pill ${DB_STATUS_PILL[item.status] || ''}">${esc(DB_STATUS_LABEL[item.status] || item.status || '未检测')}</span>`
+}
+
+function databaseDriverInfo(kind) {
+  return (state.databaseDrivers || []).find((driver) => driver.id === kind) || null
+}
+
+function databaseCategoryLabel(item) {
+  const driver = databaseDriverInfo(item?.kind)
+  return item?.categoryLabel || driver?.categoryLabel || DB_CATEGORY_LABEL[item?.category] || ''
+}
+
+function databaseKindBadge(item) {
+  const category = databaseCategoryLabel(item)
+  const categoryClass = item?.category || databaseDriverInfo(item?.kind)?.category || ''
+  return `<span class="db-kind-badge db-kind-${esc(item.kind)}">${esc(item.kindLabel || item.kind)}</span>${
+    category ? `<span class="db-category-tag db-category-${esc(categoryClass)}">${esc(category)}</span>` : ''
+  }`
+}
+
+function databaseLastTest(item) {
+  if (!item.lastTestedAt) return '<span class="muted">尚未检测</span>'
+  const latency = Number.isFinite(Number(item.latencyMs)) ? ` · ${Number(item.latencyMs)} ms` : ''
+  return `${esc(fmtTime(item.lastTestedAt))}${latency}`
+}
+
+function databaseTransport(item) {
+  if (item.category === 'file') return '<span class="desc">文件读取</span>'
+  if (item.ssl) return '<span class="pill">TLS</span>'
+  return item.supportsTls === false
+    ? '<span class="desc">不支持 TLS</span>'
+    : '<span class="desc">未启用 TLS</span>'
+}
+
+function databaseRowActions(item) {
+  const id = esc(item.id)
+  const supportsQuery = item.supportsQuery ?? item.kind !== 'redis'
+  const query = supportsQuery
+    ? `<button class="link-btn" type="button" data-db-query="${id}">查询</button>`
+    : ''
+  return `<div class="row-actions">
+    ${query}
+    <button class="link-btn accent" type="button" data-db-test="${id}">测试</button>
+    <button class="link-btn" type="button" data-db-edit="${id}">编辑</button>
+    <button class="link-btn danger-link" type="button" data-db-delete="${id}">删除</button>
+  </div>`
+}
+
+function onlyOfficeSourceText(source, fallback = '未配置') {
+  if (source === 'env') return '环境变量'
+  if (source === 'console') return '控制台'
+  if (source === 'default') return '默认值'
+  return fallback
+}
+
+async function loadOnlyOffice() {
+  const view = $('#view')
+  renderLoading(view)
+  setSide('', true)
+  setPageActions('')
+  try {
+    const data = await api('/api/console/onlyoffice')
+    const locked = data.envLocked || {}
+    const configured = Boolean(data.url && data.jwtSecretConfigured)
+    const statusTitle = configured
+      ? '在线文档已启用'
+      : data.url
+        ? '还缺 JWT 密钥'
+        : '在线文档尚未绑定'
+    const statusText = configured
+      ? '云空间里的 Office 文件会直接打开 OnlyOffice 编辑器，保存回调走内部地址。'
+      : data.url
+        ? '文档服务地址已填写，但 JWT 密钥还没配置；现在只能下载，不能在线打开。'
+        : '填写 DocumentServer 地址和 JWT 密钥后，Word / Excel / PPT 可在云空间内直接预览和编辑。'
+    const lockedNote = locked.url || locked.secret || locked.internalUrl
+      ? `<div class="oo-locked-note">部分字段由环境变量锁定：${[
+          locked.url ? '文档服务地址' : '',
+          locked.internalUrl ? '内部回访地址' : '',
+          locked.secret ? 'JWT 密钥' : '',
+        ].filter(Boolean).join('、')}。控制台只展示，不会覆盖部署值。</div>`
+      : ''
+    const urlValue = data.url || ''
+    const internalValue = data.internalUrl || ''
+    const secretPlaceholder = locked.secret
+      ? '由环境变量 EAB_ONLYOFFICE_JWT_SECRET 提供'
+      : data.jwtSecretConfigured
+        ? '已配置，留空不修改'
+        : '与容器 JWT_SECRET 一致'
+    const urlSource = onlyOfficeSourceText(data.urlSource)
+    const internalSource = onlyOfficeSourceText(data.internalUrlSource)
+    const secretSource = onlyOfficeSourceText(data.secretSource)
+
+    view.innerHTML = `
+      <section class="panel oo-panel">
+        <div class="panel-head">
+          <div>
+            <h2>在线文档</h2>
+            ${hintBadge('绑定说明', '这里绑定 OnlyOffice DocumentServer。文档服务地址供浏览器加载编辑器；内部回访地址供容器回调 EAB 读取原文件与保存结果。JWT 密钥只写入 secrets.json，页面不回显。')}
+          </div>
+          <div class="panel-actions">
+            <button class="btn sm ghost" type="button" id="oo-test">测试连接</button>
+            <button class="btn primary" type="button" id="oo-save">保存并生效</button>
+          </div>
+        </div>
+        <div class="oo-status ${configured ? 'is-on' : data.url ? 'is-warn' : 'is-off'}">
+          <span class="oo-status-mark">${configured ? '✓' : data.url ? '!' : '○'}</span>
+          <div class="oo-status-copy">
+            <strong>${statusTitle}</strong>
+            <p>${statusText}</p>
+          </div>
+          <span class="oo-state-pill">${configured ? '已启用' : '未启用'}</span>
+        </div>
+        <div class="oo-content">
+          <form class="db-form oo-form" id="oo-form" autocomplete="off">
+            <div class="db-form-grid">
+              <label class="field field-wide">
+                <span>文档服务地址 <em>浏览器访问</em></span>
+                <input id="oo-url" class="mono" value="${esc(urlValue)}" placeholder="例如 http://127.0.0.1:8080"${locked.url ? ' disabled' : ''} />
+                <em>来源：${esc(urlSource)}${locked.url ? ' · 已锁定' : ''}</em>
+              </label>
+              <label class="field">
+                <span>内部回访地址 <em>容器访问 EAB</em></span>
+                <input id="oo-internal" class="mono" value="${esc(internalValue)}" placeholder="${esc(data.defaultInternalUrl || 'http://host.docker.internal:8787')}"${locked.internalUrl ? ' disabled' : ''} />
+                <em>来源：${esc(internalSource)}${locked.internalUrl ? ' · 已锁定' : ''}</em>
+              </label>
+              <label class="field">
+                <span>JWT 密钥 <em>与容器一致</em></span>
+                <input id="oo-secret" type="password" value="" placeholder="${esc(secretPlaceholder)}" autocomplete="new-password"${locked.secret ? ' disabled' : ''} />
+                <em>来源：${esc(secretSource)}${locked.secret ? ' · 已锁定' : ''}</em>
+              </label>
+            </div>
+            ${lockedNote}
+          </form>
+          <aside class="oo-guide">
+            <span class="oo-guide-kicker">BINDING CHECKLIST</span>
+            <h3>绑定前确认</h3>
+            <div class="oo-step"><span>01</span><div><strong>DocumentServer 已启动</strong><p>浏览器能打开文档服务地址；容器开启 JWT，并与这里填的密钥一致。</p></div></div>
+            <div class="oo-step"><span>02</span><div><strong>容器能回访 EAB</strong><p>Docker Desktop 用 <code>host.docker.internal:${Number(data.defaultInternalUrl?.match(/:(\d+)$/)?.[1] || 8787)}</code>；跨机部署改成 EAB 的内网地址。</p></div></div>
+            <div class="oo-step"><span>03</span><div><strong>保存后测一次</strong><p>测试只验证 DocumentServer 连通性；真正的打开/保存还要在云空间里点一份 Office 文件。</p></div></div>
+          </aside>
+        </div>
+        <div class="inline-note" id="oo-page-state"></div>
+      </section>`
+
+    const stateEl = view.querySelector('#oo-page-state')
+    const setState = (text, tone = '') => {
+      if (!stateEl) return
+      stateEl.className = `inline-note ${tone}`.trim()
+      stateEl.textContent = text
+    }
+
+    view.querySelector('#oo-test')?.addEventListener('click', async (event) => {
+      const button = event.currentTarget
+      const url = view.querySelector('#oo-url')?.value.trim() || ''
+      if (!url) {
+        setState('请先填写文档服务地址，再测试连接。', 'is-warn')
+        return
+      }
+      button.disabled = true
+      button.textContent = '测试中…'
+      setState('正在请求 DocumentServer 的 /health 与 api.js…')
+      try {
+        const result = (await apiPost('/api/console/onlyoffice/test', { url })).result || {}
+        setState(
+          result.ok
+            ? `连接成功 · HTTP ${result.status ?? 200} · ${Number(result.latencyMs || 0)} ms · ${result.endpoint || ''}`
+            : `连接失败 · ${result.detail || result.error || '无法连接 DocumentServer'}`,
+          result.ok ? 'is-ok' : 'is-bad',
+        )
+      } catch (err) {
+        setState(`测试失败 · ${err.message || '未知错误'}`, 'is-bad')
+      } finally {
+        button.disabled = false
+        button.textContent = '测试连接'
+      }
+    })
+
+    view.querySelector('#oo-save')?.addEventListener('click', async (event) => {
+      const button = event.currentTarget
+      const body = {}
+      if (!locked.url) body.url = view.querySelector('#oo-url')?.value.trim() || ''
+      if (!locked.internalUrl) body.internalUrl = view.querySelector('#oo-internal')?.value.trim() || ''
+      if (!locked.secret) {
+        const secret = view.querySelector('#oo-secret')?.value.trim() || ''
+        if (secret) body.jwtSecret = secret
+      }
+      button.disabled = true
+      button.textContent = '保存中…'
+      setState('正在保存 OnlyOffice 绑定…')
+      try {
+        await apiSend('PUT', '/api/console/onlyoffice', body)
+        showTopToast('OnlyOffice 绑定已保存，配置已立即生效。')
+        await loadOnlyOffice()
+      } catch (err) {
+        setState(`保存失败 · ${err.message || '未知错误'}`, 'is-bad')
+        button.disabled = false
+        button.textContent = '保存并生效'
+      }
+    })
+  } catch (err) {
+    renderDenied(view, err)
+  }
+}
+
+async function loadDatabases(status = state.databaseStatus || 'all') {
+  state.databaseStatus = status
+  const view = $('#view')
+  renderLoading(view)
+  setSide('', true)
+  setPageActions('')
+  try {
+    const data = await api(`/api/console/databases?status=${encodeURIComponent(status)}`)
+    state.databaseDrivers = Array.isArray(data.drivers) ? data.drivers : []
+    const counts = data.counts || {}
+    const items = Array.isArray(data.items) ? data.items : []
+    const filters = [
+      ['all', '全部'],
+      ['ok', '可用'],
+      ['error', '失败'],
+      ['untested', '未检测'],
+    ]
+      .map(
+        ([key, label]) =>
+          `<button class="${state.databaseStatus === key ? 'active' : ''}" type="button" data-db-status="${key}">${esc(label)} <span class="muted">${Number(counts[key] || 0)}</span></button>`,
+      )
+      .join('')
+    const shown = state.databaseStatus === 'all' ? Number(data.total || 0) : items.length
+    const driverStrip = (state.databaseDrivers || [])
+      .map(
+        (driver) =>
+          `<span class="db-driver"><strong>${esc(driver.label)}</strong><span>${driver.defaultPort ? `:${Number(driver.defaultPort)}` : '文件路径'}</span></span>`,
+      )
+      .join('')
+    const driverCount = (state.databaseDrivers || []).length
+    const driverCategoryCount = new Set((state.databaseDrivers || []).map((driver) => driver.category || driver.id)).size
+    const driverSummary = hintBadge(
+      `${driverCategoryCount} 类 · ${driverCount} 种连接`,
+      '支持关系型数据库 PostgreSQL、MySQL / MariaDB，文件数据库 SQLite，以及键值缓存 Redis；测试失败只记录原因，不影响其它连接。',
+      '连接类型说明',
+      'db-driver-summary',
+    )
+
+    const rows = items
+      .map((item) => {
+        const detail = item.statusDetail || item.lastError || ''
+        const detailClass = item.lastError ? 'desc danger-text' : 'desc'
+        return `<tr>
+          <td class="name-cell">
+            <button class="link-btn db-title" type="button" data-db-edit="${esc(item.id)}">${esc(item.name)}</button>
+            <div class="desc">${databaseKindBadge(item)}${item.enabled ? '' : ' · 已停用'}</div>
+          </td>
+          <td><span class="mono db-target">${esc(item.target || '—')}</span>${item.username ? `<div class="desc">账号 ${esc(item.username)}</div>` : ''}</td>
+          <td class="db-transport">${databaseTransport(item)}</td>
+          <td>${databaseStatusPill(item)}${detail ? `<div class="${detailClass}">${esc(detail)}</div>` : ''}</td>
+          <td class="desc">${databaseLastTest(item)}</td>
+          <td>${databaseRowActions(item)}</td>
+        </tr>`
+      })
+      .join('')
+
+    view.innerHTML = `
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2>数据连接 <span class="muted">${shown}</span></h2>
+            ${hintBadge('连接说明', '这里管理外部数据连接：关系型数据库、文件数据库与键值缓存，统一做配置、真实连通性测试和停用/删除。连接按公司隔离；密码只写入 secrets.json 或环境变量，页面不回显。PostgreSQL、MySQL / SQLite 支持只读查询，Redis 只做 PING 连通性测试。')}
+          </div>
+          <div class="panel-actions">
+            <div class="segmented">${filters}</div>
+            <button class="btn primary" type="button" id="db-new">＋ 新增连接</button>
+          </div>
+        </div>
+        <div class="db-driver-strip">${driverStrip}${driverSummary}</div>
+        <div class="table-scroll">
+          <table class="data db-table">
+            <thead><tr><th>连接</th><th>地址 / 目标</th><th>传输</th><th>状态</th><th>最近检测</th><th>操作</th></tr></thead>
+            <tbody>${rows || '<tr><td colspan="6" class="empty">还没有数据连接。添加关系型数据库、SQLite 文件库或 Redis 缓存后，可在这里测试连通性。</td></tr>'}</tbody>
+          </table>
+        </div>
+        <div class="inline-note" id="db-page-state"></div>
+      </section>`
+
+    for (const button of view.querySelectorAll('[data-db-status]')) {
+      button.addEventListener('click', () => loadDatabases(button.dataset.dbStatus || 'all'))
+    }
+    view.querySelector('#db-new')?.addEventListener('click', () => openDatabaseModal(null))
+    for (const button of view.querySelectorAll('[data-db-edit]')) {
+      button.addEventListener('click', () => {
+        const item = items.find((row) => row.id === button.dataset.dbEdit)
+        if (item) openDatabaseModal(item)
+      })
+    }
+    for (const button of view.querySelectorAll('[data-db-query]')) {
+      button.addEventListener('click', () => {
+        const item = items.find((row) => row.id === button.dataset.dbQuery)
+        if (item) openDatabaseQuery(item)
+      })
+    }
+    for (const button of view.querySelectorAll('[data-db-test]')) {
+      button.addEventListener('click', async () => {
+        const id = button.dataset.dbTest
+        if (!id) return
+        const stateEl = view.querySelector('#db-page-state')
+        button.disabled = true
+        button.textContent = '测试中…'
+        if (stateEl) {
+          stateEl.className = 'inline-note'
+          stateEl.textContent = '正在建立真实连接并执行探针…'
+        }
+        try {
+          const data = await apiPost(`/api/console/databases/${encodeURIComponent(id)}/test`, {})
+          const result = data.result || {}
+          if (stateEl) {
+            stateEl.className = `inline-note ${result.ok ? 'db-result-ok' : 'db-result-bad'}`
+            stateEl.textContent = result.ok
+              ? `连接成功 · ${result.detail || '探针通过'} · ${Number(result.latencyMs || 0)} ms`
+              : `连接失败 · ${result.error || '未知错误'}`
+          }
+          await loadDatabases(state.databaseStatus)
+        } catch (err) {
+          if (stateEl) {
+            stateEl.className = 'inline-note db-result-bad'
+            stateEl.textContent = err.message || '测试失败'
+          }
+          button.disabled = false
+          button.textContent = '测试'
+        }
+      })
+    }
+    for (const button of view.querySelectorAll('[data-db-delete]')) {
+      button.addEventListener('click', async () => {
+        const item = items.find((row) => row.id === button.dataset.dbDelete)
+        if (!item) return
+        const confirmed = await confirmCard({
+          title: item.category === 'cache' ? '删除缓存连接？' : '删除数据连接？',
+          message:
+            item.category === 'cache'
+              ? `将删除「${item.name}」及其保存的密码引用；不会删除远端 Redis 中的任何键或缓存数据。`
+              : `将删除「${item.name}」及其保存的密码引用；不会删除远端数据库里的任何数据。`,
+          confirmText: '删除连接',
+        })
+        if (!confirmed) return
+        try {
+          await apiSend('DELETE', `/api/console/databases/${encodeURIComponent(item.id)}`)
+          await loadDatabases(state.databaseStatus)
+        } catch (err) {
+          alert(err.message || '删除失败')
+        }
+      })
+    }
+  } catch (err) {
+    renderDenied(view, err)
+  }
+}
+
+function databaseQueryDefault(kind) {
+  if (kind === 'sqlite') {
+    return "SELECT name, type\nFROM sqlite_master\nWHERE type IN ('table', 'view')\nORDER BY name"
+  }
+  if (kind === 'mysql') {
+    return 'SELECT DATABASE() AS database, USER() AS current_user, VERSION() AS version'
+  }
+  return 'SELECT current_database() AS database, current_user AS current_user, version() AS version'
+}
+
+function databaseQueryValue(value) {
+  if (value === null || value === undefined) return '<span class="muted">NULL</span>'
+  if (typeof value === 'object') return esc(JSON.stringify(value))
+  return esc(String(value))
+}
+
+function databaseQueryResultView(result) {
+  if (!result.ok) {
+    return `<div class="db-query-error"><strong>错误详情</strong><p>${esc(result.error || '未知错误')}</p></div>`
+  }
+  const columns = Array.isArray(result.columns) ? result.columns : []
+  const rows = Array.isArray(result.rows) ? result.rows : []
+  const meta = `${Number(result.rowCount || 0)} 行 · ${Number(result.durationMs || 0)} ms`
+  if (!columns.length || !rows.length) {
+    return `<div class="db-query-empty">查询成功 · ${meta}${rows.length ? ' · 没有可展示的列' : ' · 没有返回行'}</div>`
+  }
+  return `
+    <div class="db-query-meta"><span>${esc(meta)}</span>${result.truncated ? '<span class="db-query-warn">结果超过 100 行，仅显示前 100 行</span>' : ''}</div>
+    <div class="db-query-table-wrap">
+      <table class="db-query-table">
+        <thead><tr>${columns.map((column) => `<th>${esc(String(column))}</th>`).join('')}</tr></thead>
+        <tbody>${rows
+          .map(
+            (row) =>
+              `<tr>${columns
+                .map((column) => `<td>${databaseQueryValue(row?.[column])}</td>`)
+                .join('')}</tr>`,
+          )
+          .join('')}</tbody>
+      </table>
+    </div>`
+}
+
+function openDatabaseQuery(item) {
+  const kind = item?.kind || 'postgres'
+  const defaultSql = databaseQueryDefault(kind)
+  const overlay = modelModal(`
+    <div class="db-query-body">
+      <div class="modal-head"><h3>查询数据库</h3><button class="modal-x" type="button" aria-label="关闭">×</button></div>
+      <div class="db-query-connection">
+        <div><strong>${esc(item?.name || '数据连接')}</strong><span class="desc">${databaseKindBadge(item)}</span></div>
+        <span class="mono">${esc(item?.target || '')}</span>
+        <span class="pill db-query-readonly">只读</span>
+      </div>
+      <div class="db-query-note">查询在只读事务中执行；只允许单条 SELECT / WITH / EXPLAIN / SHOW / DESCRIBE / PRAGMA，最多返回 100 行。查询结果不会写回连接的测试状态。</div>
+      <label class="db-query-label" for="db-query-sql">SQL</label>
+      <textarea id="db-query-sql" class="db-query-input" spellcheck="false" autocomplete="off">${esc(defaultSql)}</textarea>
+      <div class="db-query-keyhint">Ctrl / Cmd + Enter 执行</div>
+      <div class="modal-state" id="db-query-state"></div>
+      <div class="db-query-result" id="db-query-result"><div class="db-query-empty">执行一条只读查询后，结果显示在这里。</div></div>
+      <div class="modal-actions">
+        <button class="btn ghost" type="button" id="db-query-cancel">关闭</button>
+        <button class="btn primary" type="button" id="db-query-run">执行查询</button>
+      </div>
+    </div>`)
+  const close = () => overlay.remove()
+  overlay.querySelector('.modal-x').addEventListener('click', close)
+  overlay.querySelector('#db-query-cancel').addEventListener('click', close)
+  const input = overlay.querySelector('#db-query-sql')
+  const stateEl = overlay.querySelector('#db-query-state')
+  const resultEl = overlay.querySelector('#db-query-result')
+  const runButton = overlay.querySelector('#db-query-run')
+  const setState = (text, tone = '') => {
+    stateEl.className = `modal-state ${tone}`.trim()
+    stateEl.textContent = text
+  }
+  const run = async () => {
+    const sql = input.value.trim()
+    if (!sql) {
+      setState('SQL 不能为空', 'bad')
+      return
+    }
+    runButton.disabled = true
+    runButton.textContent = '查询中…'
+    setState('正在执行只读查询…')
+    try {
+      const data = await apiPost(`/api/console/databases/${encodeURIComponent(item.id)}/query`, { sql })
+      const result = data.result || {}
+      resultEl.innerHTML = databaseQueryResultView(result)
+      setState(result.ok ? '查询完成' : '查询失败', result.ok ? 'good' : 'bad')
+    } catch (err) {
+      resultEl.innerHTML = ''
+      setState(`查询失败 · ${err.message || '未知错误'}`, 'bad')
+    } finally {
+      runButton.disabled = false
+      runButton.textContent = '执行查询'
+    }
+  }
+  runButton.addEventListener('click', run)
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+      event.preventDefault()
+      run()
+    }
+  })
+  input.focus()
+  input.setSelectionRange(input.value.length, input.value.length)
+}
+
+function openDatabaseModal(item = null) {
+  const fallbackDrivers = [
+    { id: 'postgres', label: 'PostgreSQL', category: 'relational', categoryLabel: '关系型数据库', defaultPort: 5432, supportsSsl: true, supportsTls: true, supportsQuery: true, notes: '关系型数据库：主机、端口、数据库名、账号；可选 TLS。' },
+    { id: 'mysql', label: 'MySQL / MariaDB', category: 'relational', categoryLabel: '关系型数据库', defaultPort: 3306, supportsSsl: true, supportsTls: true, supportsQuery: true, notes: '关系型数据库：主机、端口、数据库名、账号；MySQL 8 默认使用 caching_sha2_password。' },
+    { id: 'sqlite', label: 'SQLite', category: 'file', categoryLabel: '文件数据库', defaultPort: null, supportsSsl: false, supportsTls: false, supportsQuery: true, notes: '文件数据库：填写服务器上的绝对路径；探测只读打开，不会创建新文件。' },
+    { id: 'redis', label: 'Redis', category: 'cache', categoryLabel: '键值缓存', defaultPort: 6379, supportsSsl: true, supportsTls: true, supportsQuery: false, notes: '键值缓存：主机、端口、DB 编号、可选 ACL 账号；探针执行 PING，不开放 SQL 查询。' },
+  ]
+  const drivers = (state.databaseDrivers.length ? state.databaseDrivers : fallbackDrivers).map((driver) => {
+    const category = driver.category || (driver.id === 'sqlite' ? 'file' : driver.id === 'redis' ? 'cache' : 'relational')
+    return {
+      ...driver,
+      category,
+      categoryLabel: driver.categoryLabel || DB_CATEGORY_LABEL[category] || '数据连接',
+      supportsQuery: driver.supportsQuery ?? driver.id !== 'redis',
+      supportsTls: driver.supportsTls ?? Boolean(driver.supportsSsl),
+    }
+  })
+  const driverOf = (kindValue) => drivers.find((entry) => entry.id === kindValue) || drivers[0]
+  const kind = item?.kind && drivers.some((driver) => driver.id === item.kind) ? item.kind : drivers[0].id
+  const categoryOrder = ['relational', 'file', 'cache']
+  const kindOptions = categoryOrder
+    .map((category) => {
+      const choices = drivers.filter((driver) => driver.category === category)
+      if (!choices.length) return ''
+      return `<optgroup label="${esc(DB_CATEGORY_LABEL[category] || category)}">${choices
+        .map((driver) => `<option value="${esc(driver.id)}"${driver.id === kind ? ' selected' : ''}>${esc(driver.label)}</option>`)
+        .join('')}</optgroup>`
+    })
+    .join('')
+  const initialDriver = driverOf(kind)
+  const initialDraft = {
+    host: item?.host || '127.0.0.1',
+    port: item?.port ?? initialDriver?.defaultPort ?? '',
+    database: item?.database ?? (kind === 'redis' ? '0' : ''),
+    username: item?.username || '',
+    filePath: item?.filePath || '',
+    ssl: Boolean(item?.ssl),
+  }
+  const passwordPlaceholder = item
+    ? item.passwordConfigured
+      ? '已保存，留空不修改'
+      : '未设置密码；可留空'
+    : '可留空；写入 secrets.json，不回显'
+  const overlay = modelModal(`
+    <div class="modal-head"><h3>${item ? '编辑数据连接' : '新增数据连接'}</h3><button class="modal-x" type="button" aria-label="关闭">×</button></div>
+    ${hintNote('连接说明', '关系型数据库填写主机、端口、数据库名与账号；SQLite 只填写服务器上的文件路径；Redis 填写主机、端口、DB 编号和可选 ACL 账号。测试连接会真实建立连接；保存只写配置与 secret_ref，不写密码明文。')}
+    <form class="db-form" id="db-form" autocomplete="off">
+      <div class="db-form-grid">
+        <label class="field"><span>连接名称</span><input id="db-name" required maxlength="60" value="${esc(item?.name || '')}" placeholder="例如 生产报表库" /></label>
+        <label class="field"><span>连接类型</span><select id="db-kind">${kindOptions}</select></label>
+      </div>
+      <div class="db-driver-note" id="db-driver-note"><span class="pill db-driver-category" id="db-category-pill"></span><span id="db-driver-notes"></span></div>
+      <div class="db-form-grid" id="db-server-fields">
+        <label class="field"><span>主机</span><input id="db-host" class="mono" value="${esc(initialDraft.host)}" placeholder="127.0.0.1" /></label>
+        <label class="field"><span>端口</span><input id="db-port" type="number" min="1" max="65535" value="${esc(initialDraft.port)}" placeholder="选择类型后自动填入" /></label>
+      </div>
+      <div class="db-form-grid" id="db-sqlite-fields" hidden>
+        <label class="field field-wide"><span>SQLite 文件路径</span><input id="db-file" class="mono" value="${esc(initialDraft.filePath)}" placeholder="D:\\data\\business.db" /></label>
+      </div>
+      <div class="db-form-grid" id="db-auth-fields">
+        <label class="field"><span id="db-database-label">数据库名</span><input id="db-database" class="mono" value="${esc(initialDraft.database)}" placeholder="例如 postgres" /></label>
+        <label class="field"><span id="db-user-label">用户名</span><input id="db-user" class="mono" value="${esc(initialDraft.username)}" placeholder="例如 postgres" /></label>
+        <label class="field field-wide"><span>密码</span><input id="db-password" type="password" value="" placeholder="${esc(passwordPlaceholder)}" autocomplete="new-password" /></label>
+        <label class="check db-ssl-row" id="db-ssl-row"><input id="db-ssl" type="checkbox"${initialDraft.ssl ? ' checked' : ''} /><span>使用 TLS</span></label>
+      </div>
+      <label class="check db-enabled-row"><input id="db-enabled" type="checkbox"${item?.enabled === false ? '' : ' checked'} /><span>启用此连接</span></label>
+    </form>
+    <div class="modal-state" id="db-state"></div>
+    <div class="modal-actions db-modal-actions">
+      <button class="btn ghost" type="button" id="db-test">测试连接</button>
+      <div>
+        <button class="btn ghost" type="button" id="db-cancel">取消</button>
+        <button class="btn primary" type="button" id="db-save">保存</button>
+      </div>
+    </div>`)
+  const close = () => overlay.remove()
+  overlay.querySelector('.modal-x').addEventListener('click', close)
+  overlay.querySelector('#db-cancel').addEventListener('click', close)
+
+  const kindSelect = overlay.querySelector('#db-kind')
+  const portInput = overlay.querySelector('#db-port')
+  const hostInput = overlay.querySelector('#db-host')
+  const serverFields = overlay.querySelector('#db-server-fields')
+  const sqliteFields = overlay.querySelector('#db-sqlite-fields')
+  const authFields = overlay.querySelector('#db-auth-fields')
+  const fileInput = overlay.querySelector('#db-file')
+  const databaseLabel = overlay.querySelector('#db-database-label')
+  const databaseInput = overlay.querySelector('#db-database')
+  const userLabel = overlay.querySelector('#db-user-label')
+  const userInput = overlay.querySelector('#db-user')
+  const sslRow = overlay.querySelector('#db-ssl-row')
+  const sslInput = overlay.querySelector('#db-ssl')
+  const categoryPill = overlay.querySelector('#db-category-pill')
+  const noteText = overlay.querySelector('#db-driver-notes')
+  const stateEl = overlay.querySelector('#db-state')
+  const setState = (text, tone = '') => {
+    stateEl.className = `modal-state ${tone}`.trim()
+    stateEl.textContent = text
+  }
+  let activeKind = kind
+  const drafts = { [kind]: { ...initialDraft } }
+
+  const defaultDraft = (kindValue) => {
+    const driver = driverOf(kindValue)
+    return {
+      host: '127.0.0.1',
+      port: driver?.defaultPort ? String(driver.defaultPort) : '',
+      database: kindValue === 'redis' ? '0' : '',
+      username: '',
+      filePath: '',
+      ssl: false,
+    }
+  }
+  const readDraft = () => ({
+    host: hostInput.value.trim(),
+    port: portInput.value,
+    database: databaseInput.value.trim(),
+    username: userInput.value.trim(),
+    filePath: fileInput.value.trim(),
+    ssl: sslInput.checked,
+  })
+  const applyDraft = (draft) => {
+    hostInput.value = draft.host || ''
+    portInput.value = draft.port === null || draft.port === undefined ? '' : String(draft.port)
+    databaseInput.value = draft.database || ''
+    userInput.value = draft.username || ''
+    fileInput.value = draft.filePath || ''
+    sslInput.checked = Boolean(draft.ssl)
+  }
+
+  const syncFields = () => {
+    const kindValue = kindSelect.value
+    const driver = driverOf(kindValue)
+    const isSqlite = kindValue === 'sqlite'
+    const isRedis = kindValue === 'redis'
+    const supportsTls = Boolean(driver?.supportsTls)
+    serverFields.hidden = isSqlite
+    sqliteFields.hidden = !isSqlite
+    authFields.hidden = isSqlite
+    hostInput.disabled = isSqlite
+    sslRow.hidden = !supportsTls
+    sslInput.disabled = !supportsTls
+    if (!supportsTls) sslInput.checked = false
+    databaseLabel.textContent = isRedis ? 'DB 编号' : '数据库名'
+    if (isRedis) {
+      databaseInput.type = 'number'
+      databaseInput.min = '0'
+      databaseInput.max = '15'
+      databaseInput.step = '1'
+      databaseInput.inputMode = 'numeric'
+      databaseInput.placeholder = '0~15，默认 0'
+    } else {
+      databaseInput.type = 'text'
+      databaseInput.removeAttribute('min')
+      databaseInput.removeAttribute('max')
+      databaseInput.removeAttribute('step')
+      databaseInput.removeAttribute('inputmode')
+      databaseInput.placeholder = '例如 postgres'
+    }
+    userLabel.textContent = isRedis ? 'ACL 用户名（可选）' : '用户名'
+    userInput.placeholder = isRedis ? '默认用户可留空' : '例如 postgres'
+    categoryPill.className = `pill db-driver-category db-category-${driver?.category || ''}`.trim()
+    categoryPill.textContent = driver?.categoryLabel || ''
+    noteText.textContent = driver?.notes || ''
+    portInput.placeholder = driver?.defaultPort ? `默认 ${Number(driver.defaultPort)}` : 'SQLite 不需要端口'
+  }
+  kindSelect.addEventListener('change', () => {
+    drafts[activeKind] = readDraft()
+    activeKind = kindSelect.value
+    applyDraft(drafts[activeKind] || defaultDraft(activeKind))
+    setState('')
+    syncFields()
+  })
+  syncFields()
+  overlay.querySelector('#db-form').addEventListener('input', () => {
+    if (stateEl.textContent) setState('')
+  })
+
+  const payload = () => {
+    const kindValue = kindSelect.value
+    const body = {
+      name: overlay.querySelector('#db-name').value.trim(),
+      kind: kindValue,
+      enabled: overlay.querySelector('#db-enabled').checked,
+      password: overlay.querySelector('#db-password').value,
+    }
+    if (kindValue === 'sqlite') {
+      body.filePath = fileInput.value.trim()
+    } else {
+      const driver = driverOf(kindValue)
+      body.host = hostInput.value.trim()
+      body.port = Number(portInput.value)
+      body.database = databaseInput.value.trim()
+      body.username = userInput.value.trim()
+      body.ssl = driver?.supportsTls ? sslInput.checked : false
+    }
+    return body
+  }
+  const validateBody = (body) => {
+    if (!body.name) return '请先填写连接名称'
+    if (body.kind === 'sqlite') return body.filePath ? '' : '请填写 SQLite 文件路径'
+    if (!body.host) return '请填写连接主机'
+    if (!Number.isInteger(body.port) || body.port <= 0 || body.port > 65535) return '端口需要在 1~65535 之间'
+    if (body.kind === 'redis') {
+      const index = Number(body.database)
+      if (!Number.isInteger(index) || index < 0 || index > 15) return 'Redis DB 编号需要是 0~15 的整数'
+      return ''
+    }
+    return body.database ? '' : '请填写数据库名'
+  }
+
+  overlay.querySelector('#db-test').addEventListener('click', async () => {
+    const testButton = overlay.querySelector('#db-test')
+    const body = payload()
+    const problem = validateBody(body)
+    if (problem) {
+      setState(problem, 'bad')
+      return
+    }
+    testButton.disabled = true
+    testButton.textContent = '测试中…'
+    setState('正在建立真实连接并执行最小探针…')
+    try {
+      if (item) body.id = item.id
+      const data = await apiPost('/api/console/databases/test', body)
+      const result = data.result || {}
+      setState(
+        result.ok
+          ? `连接成功 · ${result.detail || '探针通过'} · ${Number(result.latencyMs || 0)} ms`
+          : `连接失败 · ${result.error || '未知错误'}`,
+        result.ok ? 'good' : 'bad',
+      )
+    } catch (err) {
+      setState(`测试失败 · ${err.message || '未知错误'}`, 'bad')
+    } finally {
+      testButton.disabled = false
+      testButton.textContent = '测试连接'
+    }
+  })
+
+  overlay.querySelector('#db-save').addEventListener('click', async () => {
+    const saveButton = overlay.querySelector('#db-save')
+    const body = payload()
+    const problem = validateBody(body)
+    if (problem) {
+      setState(problem, 'bad')
+      return
+    }
+    saveButton.disabled = true
+    setState('保存中…')
+    try {
+      if (item) {
+        await apiSend('PATCH', `/api/console/databases/${encodeURIComponent(item.id)}`, body)
+      } else {
+        await apiPost('/api/console/databases', body)
+      }
+      close()
+      await loadDatabases(state.databaseStatus)
+    } catch (err) {
+      setState(`保存失败 · ${err.message || '未知错误'}`, 'bad')
+      saveButton.disabled = false
+    }
+  })
+}
+
+function taskRuleText(task) {
+  const rule = task.rule || {}
+  const mode = rule.mode || task.mode
+  if (mode === 'once') return '一次'
+  if (mode === 'daily') return `每天 ${rule.time || '—'}`
+  if (mode === 'weekly') {
+    const days = Array.isArray(rule.days) && rule.days.length
+      ? rule.days.map((day) => WEEKDAY_LABEL[Number(day)] || day).join('、')
+      : '—'
+    const every = Array.isArray(rule.days) && rule.days.length === 1 ? `每${days}` : `每周 ${days}`
+    return `${every} ${rule.time || '—'}`
+  }
+  if (mode === 'interval') return `每 ${rule.intervalMinutes || '—'} 分钟`
+  return mode || '—'
+}
+
+function taskPromptBrief(value) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim()
+  return text.length > 100 ? `${text.slice(0, 100)}…` : text || '—'
+}
+
+function taskPayloadText(payload) {
+  if (!payload || typeof payload !== 'object') return '—'
+  const copy = { ...payload }
+  if (typeof copy.scheduledFor === 'number') {
+    copy.scheduledFor = new Date(copy.scheduledFor).toLocaleString('zh-CN')
+  }
+  return JSON.stringify(copy)
+}
+
+function taskStatusPill(status) {
+  return `<span class="pill ${TASK_STATUS_PILL[status] || ''}">${esc(TASK_STATUS_LABEL[status] || status || '—')}</span>`
+}
+
+function taskRunPill(status) {
+  const tone = status === 'success' ? 'ok' : status === 'running' ? 'accent' : 'danger'
+  return `<span class="pill ${tone}">${esc(TASK_RUN_LABEL[status] || status || '—')}</span>`
+}
+
+function taskRowActions(item) {
+  const id = esc(item.id)
+  const detail = `<button class="link-btn" type="button" data-task-open="${id}">详情</button>`
+  if (item.status === 'running') return detail
+  if (item.status === 'done' || item.status === 'cancelled') return detail
+  const pause =
+    item.status === 'active'
+      ? `<button class="link-btn" type="button" data-task-act="pause" data-task-id="${id}">暂停</button>`
+      : ''
+  const resume =
+    item.status === 'paused'
+      ? `<button class="link-btn accent" type="button" data-task-act="resume" data-task-id="${id}">恢复</button>`
+      : ''
+  return `<div class="row-actions">${pause}${resume}<button class="link-btn danger-link" type="button" data-task-act="cancel" data-task-id="${id}">取消</button></div>`
+}
+
+async function loadTasks(status = state.taskStatus || 'all') {
+  state.taskStatus = status
+  const view = $('#view')
+  renderLoading(view)
+  setSide('', true)
+  setPageActions('')
+  try {
+    const data = await api(`/api/console/schedules?status=${encodeURIComponent(status)}`)
+    const counts = data.counts || {}
+    const rows = (data.items || [])
+      .map(
+        (item) => `<tr>
+          <td>
+            <button class="link-btn task-title" type="button" data-task-open="${esc(item.id)}">${esc(item.title)}</button>
+            <div class="desc">${esc(taskPromptBrief(item.prompt))}</div>
+          </td>
+          <td class="task-owner" title="${esc(item.userId || '')}">${esc(item.userName || item.userId || '—')}</td>
+          <td>${esc(taskRuleText(item))}<div class="desc">${esc(item.nextRunLocal)} · ${esc(item.timezone)}</div></td>
+          <td>${taskStatusPill(item.status)}${item.lastError ? `<div class="desc danger-text">${esc(item.lastError)}</div>` : ''}</td>
+          <td class="desc">${
+            item.lastRun
+              ? `${esc(new Date(item.lastRun.startedAt).toLocaleString('zh-CN'))}<div class="desc">${esc(TASK_RUN_LABEL[item.lastRun.status] || item.lastRun.status)}${item.lastRun.delivery ? ` · ${esc(TASK_DELIVERY_LABEL[item.lastRun.delivery] || item.lastRun.delivery)}` : ''}</div>`
+              : '还没有执行记录'
+          }</td>
+          <td>${taskRowActions(item)}</td>
+        </tr>`,
+      )
+      .join('')
+    const filters = [
+      ['all', '全部'],
+      ['active', '待触发'],
+      ['paused', '已暂停'],
+      ['running', '执行中'],
+      ['done', '已完成'],
+      ['error', '失败'],
+      ['cancelled', '已取消'],
+    ]
+      .map(
+        ([key, label]) =>
+          `<button class="${state.taskStatus === key ? 'active' : ''}" type="button" data-task-status="${key}">${esc(label)} <span class="muted">${Number(counts[key] || 0)}</span></button>`,
+      )
+      .join('')
+    const shown = state.taskStatus === 'all' ? Number(data.total || 0) : (data.items || []).length
+    view.innerHTML = `
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2>任务中心 <span class="muted">${shown}</span></h2>
+            ${hintBadge('任务中心说明', '定时任务由员工在对话或 HTTP 创建；这里可以看到全公司的任务、最近一次执行和 append-only 事件时间线，暂停/恢复/取消会写审计。')}
+          </div>
+          <div class="panel-actions"><div class="segmented">${filters}</div></div>
+        </div>
+        <table class="data task-table">
+          <thead><tr><th>任务</th><th>创建人</th><th>规则 / 下一次</th><th>状态</th><th>最近执行</th><th>操作</th></tr></thead>
+          <tbody>${rows || '<tr><td colspan="6" class="empty">还没有定时任务。员工在对话里让助手创建提醒后，会出现在这里。</td></tr>'}</tbody>
+        </table>
+      </section>`
+
+    for (const button of view.querySelectorAll('[data-task-status]')) {
+      button.addEventListener('click', () => loadTasks(button.dataset.taskStatus || 'all'))
+    }
+    for (const button of view.querySelectorAll('[data-task-open]')) {
+      button.addEventListener('click', () => openTaskDetail(button.dataset.taskOpen))
+    }
+    for (const button of view.querySelectorAll('[data-task-act]')) {
+      button.addEventListener('click', async () => {
+        const id = button.dataset.taskId
+        const action = button.dataset.taskAct
+        if (!id || !action) return
+        if (action === 'cancel') {
+          const okToCancel = await confirmCard({
+            title: '取消定时任务？',
+            message: '取消后不会再触发；历史执行记录和事件时间线会保留。',
+            confirmText: '取消任务',
+          })
+          if (!okToCancel) return
+        }
+        try {
+          await apiPost(`/api/console/schedules/${encodeURIComponent(id)}/${action}`, {})
+          loadTasks(state.taskStatus)
+        } catch (err) {
+          alert(err.message || '操作失败')
+        }
+      })
+    }
+  } catch (err) {
+    renderDenied(view, err)
+  }
+}
+
+async function openTaskDetail(id) {
+  const overlay = modelModal(`
+    <div class="modal-head"><h3>任务详情</h3><button class="modal-x" type="button">×</button></div>
+    <div class="task-detail-body" id="task-detail-body"><div class="empty">加载中…</div></div>
+    <div class="modal-actions"><button class="btn ghost" type="button" id="task-detail-close">关闭</button></div>`)
+  const close = () => overlay.remove()
+  overlay.querySelector('.modal-x').addEventListener('click', close)
+  overlay.querySelector('#task-detail-close').addEventListener('click', close)
+  try {
+    const task = await api(`/api/console/schedules/${encodeURIComponent(id)}`)
+    const runs = (task.runs || [])
+      .map(
+        (run) => `<tr>
+          <td class="desc">${esc(new Date(run.startedAt).toLocaleString('zh-CN'))}</td>
+          <td>${taskRunPill(run.status)}</td>
+          <td class="desc">${esc(run.resultText ? taskPromptBrief(run.resultText) : run.error || '—')}</td>
+          <td class="desc">${esc(TASK_DELIVERY_LABEL[run.delivery] || run.delivery || '—')}${run.deliveryError ? `<div class="desc danger-text">${esc(run.deliveryError)}</div>` : ''}</td>
+        </tr>`,
+      )
+      .join('')
+    const events = (task.events || [])
+      .slice()
+      .reverse()
+      .map(
+        (event) => `<li>
+          <span class="task-event-dot"></span>
+          <div>
+            <strong>${esc(TASK_EVENT_LABEL[event.type] || event.type)}</strong>
+            <span class="desc">${esc(new Date(event.createdAt).toLocaleString('zh-CN'))}</span>
+            <div class="desc mono task-event-payload">${esc(taskPayloadText(event.payload))}</div>
+          </div>
+        </li>`,
+      )
+      .join('')
+    overlay.querySelector('#task-detail-body').innerHTML = `
+      <div class="task-detail-grid">
+        <div><span>创建人</span><strong>${esc(task.userName || task.userId || '—')}</strong></div>
+        <div><span>状态</span><strong>${taskStatusPill(task.status)}</strong></div>
+        <div><span>规则</span><strong>${esc(taskRuleText(task))}</strong></div>
+        <div><span>时区</span><strong>${esc(task.timezone)}</strong></div>
+        <div><span>下一次</span><strong>${esc(task.nextRunLocal)}</strong></div>
+        <div><span>最近执行</span><strong>${esc(task.lastRunLocal || '—')}</strong></div>
+        <div><span>渠道</span><strong>${esc(task.channel)}</strong></div>
+        <div><span>会话</span><strong class="mono">${esc(task.sessionId || '—')}</strong></div>
+      </div>
+      <div class="task-prompt"><span>任务指令</span><pre>${esc(task.prompt)}</pre></div>
+      <h3>最近执行 <span class="muted">${(task.runs || []).length}</span></h3>
+      <table class="data">
+        <thead><tr><th>开始时间</th><th>状态</th><th>结果 / 错误</th><th>投递</th></tr></thead>
+        <tbody>${runs || '<tr><td colspan="4" class="empty">还没有执行记录。</td></tr>'}</tbody>
+      </table>
+      <h3>事件时间线 <span class="muted">${(task.events || []).length}</span></h3>
+      <ol class="task-timeline">${events || '<li class="empty">还没有事件。</li>'}</ol>`
+  } catch (err) {
+    overlay.querySelector('#task-detail-body').innerHTML = `<div class="empty">${esc(err.message || '加载失败')}</div>`
   }
 }
 
@@ -8357,6 +9792,7 @@ async function openChannelModal(item) {
       })
       close()
       loadSync()
+      refreshOverviewChannels()
     } catch (err) {
       stateEl.className = 'modal-state bad'
       stateEl.textContent = err.message || '保存失败'
@@ -9068,7 +10504,6 @@ function pluginEventDetail(event) {
     bits.push(ref.startsWith('npm:') ? 'npm' : ref.startsWith('github:') ? 'GitHub' : '本地目录')
   }
   if (detail.shared) bits.push('共享目录保留')
-  if (detail.trashPath) bits.push('<span class="muted">已移入回收站</span>')
   if (!bits.length && detail.reason) bits.push(esc(detail.reason))
   return bits.length ? `<div class="plugin-event-detail">${bits.join('<span class="muted">·</span>')}</div>` : '<span class="muted">—</span>'
 }
@@ -9173,13 +10608,13 @@ async function openPluginInstall(prefill = {}) {
 
     ${existing ? `<div class="install-existing">
       <span class="pill ok">已装 ${esc(existing.id)}@${esc(existing.version)}</span>
-      <span>更新会保留首次安装时间，只改版本 / 来源 / 指纹；旧目录移到 <span class="mono">plugins/.trash</span>。</span>
+      <span>更新会保留首次安装时间，只改版本 / 来源 / 指纹；旧版本目录在替换成功后直接删除。</span>
     </div>` : ''}
 
     <div class="install-options">
       <label class="install-check">
         <input type="checkbox" id="pg-overwrite"${existing ? ' checked' : ''} />
-        <span><strong>覆盖更新</strong><small>仅本司已安装且没有其他公司在用时才能覆盖；旧目录移到 plugins/.trash</small></span>
+        <span><strong>覆盖更新</strong><small>仅本司已安装且没有其他公司在用时才能覆盖；旧目录替换成功即删除，失败时自动回滚</small></span>
       </label>
       <label class="install-check">
         <input type="checkbox" id="pg-enable" checked />
@@ -9373,8 +10808,8 @@ function openPluginUninstall(plugin) {
     <div class="modal-head"><h3>从「${esc(companyName)}」卸载 ${esc(plugin.name)}</h3><button class="modal-x" type="button">×</button></div>
     <div class="legend" style="margin-top:0">
       卸载只解除 <strong>当前公司</strong> 的安装与启停记录，不影响其他公司。
-      如果当前公司是最后一家使用它的公司，<span class="mono">plugins/${esc(plugin.id)}</span> 会移到
-      <span class="mono">plugins/.trash/</span>（可恢复）；否则共享目录保留。
+      如果当前公司是最后一家使用它的公司，<span class="mono">plugins/${esc(plugin.id)}</span> 会被
+      <strong>直接删除</strong>（不保留回收站副本）；否则共享目录保留。
     </div>
     <div class="modal-state" id="pu-state"></div>
     <div class="modal-actions">
@@ -9404,12 +10839,88 @@ function pluginHostOf(data, id) {
 
 function pluginPageUrl(data, plugin, page) {
   const version = encodeURIComponent(plugin.version || '')
+  const checksum = encodeURIComponent(plugin.checksum || '')
   const company = encodeURIComponent(data.companyId || '')
   if ((page.kind || 'html') === 'dsh-client') {
     const inject = encodeURIComponent((plugin.dsh?.clientInject || []).join(','))
-    return `/plugin-kernel.html?id=${encodeURIComponent(plugin.id)}&entry=${encodeURIComponent(page.file)}&company=${company}&version=${version}&title=${encodeURIComponent(page.title)}&inject=${inject}`
+    return `/plugin-kernel.html?id=${encodeURIComponent(plugin.id)}&entry=${encodeURIComponent(page.file)}&company=${company}&version=${version}&h=${checksum}&title=${encodeURIComponent(page.title)}&inject=${inject}`
   }
   return `/plugins/assets/${encodeURIComponent(plugin.id)}/${page.file}${qs()}`
+}
+
+/** 插件 client bundle 的稳定 URL；v= 版本、h= 校验和，同版本覆盖更新也能失效。 */
+function pluginClientAssetUrl(plugin, page) {
+  const path = String(page.file || '')
+    .split('/')
+    .map((part) => encodeURIComponent(part))
+    .join('/')
+  const version = encodeURIComponent(plugin.version || '')
+  const checksum = encodeURIComponent(plugin.checksum || '')
+  const versionKey = version ? `&v=${version}` : ''
+  const checksumKey = checksum ? `&h=${checksum}` : ''
+  return `/plugins/assets/${encodeURIComponent(plugin.id)}/${path}?scope=console${versionKey}${checksumKey}`
+}
+
+let pluginKernelWarmStarted = false
+const prefetchedPluginAssets = new Set()
+
+/** 只拉进 HTTP 缓存，不解析、不执行插件代码；同一 URL 在一次页面会话里只发一次。 */
+function prefetchPluginClientBundles(plugins) {
+  for (const plugin of plugins || []) {
+    if (!plugin.valid || !plugin.enabled) continue
+    for (const page of plugin.pages || []) {
+      if ((page.kind || 'html') !== 'dsh-client') continue
+      const url = pluginClientAssetUrl(plugin, page)
+      if (prefetchedPluginAssets.has(url)) continue
+      prefetchedPluginAssets.add(url)
+      fetch(url, { credentials: 'include', cache: 'force-cache' }).catch(() => {})
+    }
+  }
+}
+/**
+ * 控制台打开插件页时先把共享内核预热，并把各插件的 client bundle 拉进 HTTP 缓存。
+ * 预热页只执行 Cordis/slots/primitives/renderer，不执行任何插件代码，避免为了“快”
+ * 把多个插件的副作用一起启动；真正的插件仍在用户点击时按 iframe 隔离启动。
+ */
+function warmPluginKernel(data) {
+  if (!data || !data.companyId) return
+  const run = () => {
+    // 共享内核只启动一次；每轮插件列表刷新只补拉新增/升级的 bundle。
+    if (!pluginKernelWarmStarted) {
+      pluginKernelWarmStarted = true
+      const frame = document.createElement('iframe')
+      frame.src = `/plugin-kernel.html?warm=1&scope=console&company=${encodeURIComponent(data.companyId)}`
+      frame.title = 'DSH 插件内核预热'
+      frame.tabIndex = -1
+      frame.setAttribute('aria-hidden', 'true')
+      frame.style.cssText = 'position:absolute;width:1px;height:1px;left:-10px;top:-10px;opacity:0;pointer-events:none;border:0'
+      let cleaned = false
+      const cleanup = () => {
+        if (cleaned) return
+        cleaned = true
+        frame.remove()
+        window.removeEventListener('message', onMessage)
+      }
+      const onMessage = (event) => {
+        if (event.origin !== location.origin) return
+        if (event.source !== frame.contentWindow) return
+        if (event.data && event.data.type === 'eab-plugin-kernel-warm') cleanup()
+      }
+      window.addEventListener('message', onMessage)
+      frame.addEventListener('load', () => {
+        // 页面 load 不代表异步内核加载完成；正常由 postMessage 清理，这里只做兜底。
+        setTimeout(cleanup, 8000)
+      }, { once: true })
+      document.body.appendChild(frame)
+    }
+
+    prefetchPluginClientBundles(data.plugins || [])
+  }
+  if (typeof window.requestIdleCallback === 'function') {
+    window.requestIdleCallback(run, { timeout: 2000 })
+  } else {
+    setTimeout(run, 800)
+  }
 }
 
 function pluginFormatBadge(plugin) {
@@ -9422,10 +10933,55 @@ function pluginStatusPill(plugin, host) {
   if (!plugin.valid) return '<span class="pill danger">清单不合法</span>'
   if (!plugin.enabled) return '<span class="pill warn">已停用</span>'
   if (host && host.error) return '<span class="pill warn">启用 · host 异常</span>'
+  if (host && Array.isArray(host.hostGaps) && host.hostGaps.length) {
+    return `<span class="pill warn" title="${esc(host.hostGaps.map((gap) => gap.message).join('\n'))}">启用 · 能力缺口</span>`
+  }
   if (host) return '<span class="pill ok">运行中</span>'
   if (plugin.install && plugin.install.removedAt) return '<span class="pill">已卸载</span>'
   if (!plugin.install) return '<span class="pill">已发现</span>'
   return '<span class="pill ok">已启用</span>'
+}
+
+/** 插件侧栏的搜索词：重新渲染侧栏后仍然保留，避免边搜边被刷掉 */
+const pluginRailSearch = { company: '', personal: '' }
+
+/** 模糊过滤插件列表：忽略大小写、空格分词，所有词都命中才显示（只切 hidden，不重绘 DOM） */
+function filterPluginRail(kind) {
+  const list = document.querySelector(`[data-plugin-list="${kind}"]`)
+  if (!list) return
+  const tokens = String(pluginRailSearch[kind] || '').trim().toLowerCase().split(/\s+/).filter(Boolean)
+  const items = Array.from(list.querySelectorAll('[data-plugin-item]'))
+  let shown = 0
+  for (const item of items) {
+    const hay = String(item.dataset.search || item.textContent || '').toLowerCase()
+    const hit = tokens.every((token) => hay.includes(token))
+    item.hidden = !hit
+    if (hit) shown += 1
+  }
+  const empty = list.querySelector('[data-plugin-search-empty]')
+  if (empty) empty.hidden = !(items.length > 0 && shown === 0)
+}
+
+/** 绑定两个搜索框（用 oninput 赋值，重复绑定不会叠加监听） */
+function bindPluginRailSearch() {
+  for (const input of document.querySelectorAll('[data-plugin-search]')) {
+    const kind = input.dataset.pluginSearch
+    if (!kind) continue
+    input.value = pluginRailSearch[kind] || ''
+    input.oninput = () => {
+      pluginRailSearch[kind] = input.value
+      filterPluginRail(kind)
+    }
+    input.onkeydown = (event) => {
+      if (event.key !== 'Escape' || !input.value) return
+      event.stopPropagation()
+      input.value = ''
+      pluginRailSearch[kind] = ''
+      filterPluginRail(kind)
+    }
+  }
+  filterPluginRail('company')
+  filterPluginRail('personal')
 }
 
 function pluginRailItem(plugin, selected) {
@@ -9433,7 +10989,8 @@ function pluginRailItem(plugin, selected) {
   const sub = plugin.format === 'dsh'
     ? `DSH · ${plugin.dsh?.hasHost ? 'host+client' : 'client'}`
     : `EAB · ${plugin.pages.length} 页`
-  return `<button class="plugin-rail-item${selected ? ' is-active' : ''}" type="button" data-select-plugin="${esc(plugin.id)}">
+  const search = [plugin.name, plugin.id, plugin.version, plugin.format].filter(Boolean).join(' ')
+  return `<button class="plugin-rail-item${selected ? ' is-active' : ''}" type="button" data-select-plugin="${esc(plugin.id)}" data-plugin-item data-search="${esc(search)}">
     <span class="plugin-rail-avatar">${esc(initial)}</span>
     <span class="plugin-rail-text">
       <strong>${esc(plugin.name)}</strong>
@@ -9445,7 +11002,8 @@ function pluginRailItem(plugin, selected) {
 
 function personalPluginRailItem(plugin, selected) {
   const initial = (plugin.name || plugin.pluginId || '?').trim().slice(0, 1).toUpperCase()
-  return `<button class="plugin-rail-item is-personal${selected ? ' is-active' : ''}" type="button" data-select-personal-plugin="${esc(plugin.key)}">
+  const search = [plugin.name, plugin.pluginId, plugin.key, plugin.userName, plugin.version].filter(Boolean).join(' ')
+  return `<button class="plugin-rail-item is-personal${selected ? ' is-active' : ''}" type="button" data-select-personal-plugin="${esc(plugin.key)}" data-plugin-item data-search="${esc(search)}">
     <span class="plugin-rail-avatar">${esc(initial)}</span>
     <span class="plugin-rail-text">
       <strong>${esc(plugin.name)}</strong>
@@ -9552,7 +11110,7 @@ function pluginVersionsBody(data, plugin) {
       <div><span>来源</span><strong class="mono">${esc(registry)}</strong></div>
       <div><span>安装范围</span><strong>${plugin.personal ? '个人' : '当前公司'}</strong></div>
     </div>
-    ${hintNote('更新说明', '更新只改版本 / 来源 / 指纹，保留首次安装时间；旧目录移到 plugins/.trash。同版本也可重装（覆盖更新）。')}`
+    ${hintNote('更新说明', '更新只改版本 / 来源 / 指纹，保留首次安装时间；旧版本目录在替换成功后直接删除。同版本也可重装（覆盖更新）。')}`
 }
 
 function pluginSettingsBody(data, plugin, host) {
@@ -9579,7 +11137,7 @@ function pluginSettingsBody(data, plugin, host) {
     </div>
     ${dshSettings}
     <div class="plugin-danger-zone">
-      <div><strong>卸载</strong><span>解除当前公司的安装与启停记录；最后一家公司卸载时目录移入 plugins/.trash。</span></div>
+      <div><strong>卸载</strong><span>解除当前公司的安装与启停记录；最后一家公司卸载时直接删除插件目录。</span></div>
       <button class="btn danger sm" type="button" data-uninstall-plugin="${esc(plugin.id)}">卸载…</button>
     </div>`
 }
@@ -9670,7 +11228,7 @@ function personalPluginDetailHtml(plugin) {
     </div>
     <div class="plugin-personal-notice">
       <strong>后台只读</strong>
-      <span>这个插件由 ${esc(plugin.userName)} 在个人工作台安装，只对本人可见、只影响本人。后台不能安装、更新、启停、卸载或修改它的设置。</span>
+      <span>这个插件由 ${esc(plugin.userName)} 在个人工作台安装，只对本人可见、只影响本人。后台不能安装、更新、启停、卸载或修改它的设置；工具角色授权可在下方单独配置。</span>
     </div>
     <div class="plugin-overview">
       <div class="plugin-block">
@@ -9695,6 +11253,10 @@ function personalPluginDetailHtml(plugin) {
         <div class="plugin-personal-desc"><span>说明</span><strong>${esc(plugin.description || '未填写')}</strong></div>
         ${plugin.scopes?.length ? `<div class="plugin-inject-row"><span>声明权限</span><div>${plugin.scopes.map((scope) => `<span class="chip" title="${esc(scope)}">${esc(scope)}</span>`).join('')}</div></div>` : ''}
       </div>
+    </div>
+    <div class="plugin-block personal-tool-block">
+      <h3>工具归属</h3>
+      <div class="plugin-personal-desc"><span>范围</span><strong>个人插件注册的工具只属于安装人本人：只在他自己的对话工作台可见、可用，后台不展示，也不需要按角色授权。管理员要收回，只能用停用或卸载这个个人安装。</strong></div>
     </div>
     ${plugin.valid ? '' : `<div class="banner danger" style="margin-top:12px"><strong>${esc(plugin.error || '清单不合法')}</strong><span>个人插件清单异常；由安装人本人在个人工作台修复或卸载，后台不代操作。</span></div>`}
   </section>`
@@ -9754,10 +11316,15 @@ function pluginRailHtml(data) {
       <button class="btn ghost sm" type="button" data-reload-plugins>刷新</button>
     </div>
     <div class="side-head">公司插件 <span class="muted">${data.plugins.length}</span></div>
-    <div class="side-list plugin-rail-list">${installed || '<div class="side-note">当前公司还没有安装插件</div>'}</div>
-    <div class="side-head plugin-personal-head">个人插件 <span class="muted">${personal.length}</span> <span class="plugin-readonly-tag">只读</span></div>
-    <div class="plugin-rail-personal-note">员工个人工作台安装，只属于本人；后台不能启停、卸载或改设置。</div>
-    <div class="side-list plugin-rail-list plugin-personal-list">${personalItems || '<div class="side-note">还没有员工安装个人插件</div>'}</div>
+    <div class="plugin-rail-search">
+      <input type="search" data-plugin-search="company" value="${esc(pluginRailSearch.company)}" placeholder="搜索公司插件…" aria-label="搜索公司插件" autocomplete="off" />
+    </div>
+    <div class="side-list plugin-rail-list" data-plugin-list="company">${installed || '<div class="side-note">当前公司还没有安装插件</div>'}<div class="side-note" data-plugin-search-empty hidden>没有匹配的插件</div></div>
+    <div class="side-head plugin-personal-head"><span>个人插件 <span class="muted">${personal.length}</span> ${hintBadge('只读', '员工个人工作台安装，只属于本人；后台不能启停、卸载或改设置。', '个人插件说明', 'plugin-readonly-tag')}</span></div>
+    <div class="plugin-rail-search">
+      <input type="search" data-plugin-search="personal" value="${esc(pluginRailSearch.personal)}" placeholder="搜索个人插件…（插件名 / 员工）" aria-label="搜索个人插件" autocomplete="off" />
+    </div>
+    <div class="side-list plugin-rail-list plugin-personal-list" data-plugin-list="personal">${personalItems || '<div class="side-note">还没有员工安装个人插件</div>'}<div class="side-note" data-plugin-search-empty hidden>没有匹配的插件</div></div>
     `
 }
 
@@ -9906,6 +11473,7 @@ async function loadPlugins() {
     }
     renderPluginSide()
     renderPluginView()
+    warmPluginKernel(data)
   } catch (err) {
     state.pluginData = null
     renderNavRail()
@@ -9914,7 +11482,1147 @@ async function loadPlugins() {
 }
 
 
+/* ---------------- 技能管理 ---------------- */
+
+const SKILL_RISK_LABEL = { low: '低风险', medium: '中风险', high: '高风险', critical: '严重' }
+const SKILL_LEVEL_LABEL = { L0: '提示词', L1: '只读', L2: '工具' }
+const SKILL_EVENT_LABEL = {
+  install: '安装',
+  update: '更新',
+  install_blocked: '安装被拦截',
+  load_blocked: '加载被拦截',
+  checksum_mismatch: '文件指纹不一致',
+  enable: '启用',
+  disable: '停用',
+  uninstall: '卸载',
+  company_policy: '公司总开关',
+  tool_blocked: '运行时工具拦截',
+  tool_approval: '高危工具审批待办',
+  tool_approval_approved: '高危工具审批通过',
+  tool_approval_rejected: '高危工具审批拒绝',
+  tool_approved: '高危工具已放行',
+  install_approval: '技能安装审批待办',
+  install_approval_approved: '技能安装审批通过',
+  install_approval_rejected: '技能安装审批拒绝',
+  install_approved: '技能安装审批已消费',
+  quarantine_review: '隔离记录复核',
+}
+
+function skillRiskPill(risk) {
+  const tone = risk === 'low' ? 'ok' : risk === 'medium' ? 'warn' : 'danger'
+  return `<span class="pill ${tone}">${esc(SKILL_RISK_LABEL[risk] || risk || '未知')}</span>`
+}
+
+function skillEventSummary(event) {
+  const detail = event.detail || {}
+  const parts = []
+  if (detail.scope) parts.push(detail.scope === 'company' ? '公司级' : '个人级')
+  if (detail.source) parts.push(`来源 ${detail.source}`)
+  if (detail.risk) parts.push(`风险 ${detail.risk}`)
+  if (Array.isArray(detail.findings)) parts.push(`${detail.findings.length} 条命中`)
+  if (detail.quarantinePath) parts.push('已写入隔离目录')
+  if (detail.enabled === true) parts.push('公司技能已启用')
+  if (detail.enabled === false) parts.push('公司技能已停用')
+  if (detail.toolId) parts.push(`工具 ${detail.toolId}`)
+  if (detail.approvalId) parts.push(`审批单 ${detail.approvalId}`)
+  if (detail.decision === 'approved') parts.push('审批通过')
+  if (detail.decision === 'rejected') parts.push('审批拒绝')
+  if (detail.reason) parts.push(String(detail.reason).slice(0, 120))
+  if (detail.action === 'acknowledge') parts.push('标记已复核')
+  if (detail.action === 'delete') parts.push('删除隔离元数据')
+  if (detail.note) parts.push(`备注 ${String(detail.note).slice(0, 80)}`)
+  return parts.join(' · ') || '—'
+}
+
+function skillSourceLabel(source) {
+  const labels = { 'server-path': '服务器目录', 'browser-dir': '浏览器上传', http: '压缩包 URL', git: 'GitHub 仓库' }
+  return labels[source] || source || '—'
+}
+
+function skillLevelText(level) {
+  return `${level || 'L0'} · ${SKILL_LEVEL_LABEL[level] || '未分级'}`
+}
+
+function skillStatusPill(skill) {
+  if (!skill.valid) return '<span class="pill danger">校验异常</span>'
+  if (skill.companyInstalled && skill.companyEnabled) return '<span class="pill ok">公司启用</span>'
+  if (skill.companyInstalled) return '<span class="pill warn">公司停用</span>'
+  return '<span class="pill">未安装到公司</span>'
+}
+
+function skillPolicyPills(policy = {}) {
+  return `<span class="pill ${policy.enabled ? 'ok' : 'danger'}">公司技能：${policy.enabled ? '已启用' : '已停用'}</span>
+    <span class="pill ${policy.requirePersonalInstallApproval ? 'warn' : ''}">个人审批：${policy.requirePersonalInstallApproval ? '已开启' : '未开启'}</span>`
+}
+
+function skillRailItem(skill, selected) {
+  const initial = (skill.name || skill.id || '?').trim().slice(0, 1).toUpperCase()
+  const dot = !skill.valid ? 'bad' : skill.companyInstalled ? (skill.companyEnabled ? 'ok' : 'warn') : ''
+  const dotTitle = !skill.valid ? '校验异常' : skill.companyInstalled ? (skill.companyEnabled ? '公司启用' : '公司停用') : '未安装到公司'
+  const search = [skill.name, skill.id, skill.version, skill.level, skill.risk, ...(skill.tools || []), ...(skill.triggers || [])]
+    .filter(Boolean)
+    .join(' ')
+  return `<button class="plugin-rail-item${selected ? ' is-active' : ''}" type="button" data-select-skill="${esc(skill.id)}" data-skill-item data-search="${esc(search)}">
+    <span class="plugin-rail-avatar">${esc(initial)}</span>
+    <span class="plugin-rail-text">
+      <strong>${esc(skill.name)}</strong>
+      <small><span class="mono">v${esc(skill.version)}</span> · ${esc(skill.level || 'L0')} · ${esc(SKILL_RISK_LABEL[skill.risk] || skill.risk || '未知风险')}</small>
+    </span>
+    <span class="plugin-rail-dot ${dot}" title="${esc(dotTitle)}"></span>
+  </button>`
+}
+
+function skillPersonalRailItem(item, selected) {
+  const initial = (item.name || item.id || '?').trim().slice(0, 1).toUpperCase()
+  const dot = !item.valid ? 'bad' : item.enabled ? 'ok' : 'warn'
+  const dotTitle = !item.valid ? '校验异常' : item.enabled ? '个人启用' : '个人停用'
+  const search = [item.name, item.id, item.version, item.level, item.risk, item.userName, item.userId, ...(item.tools || []), ...(item.triggers || [])]
+    .filter(Boolean)
+    .join(' ')
+  return `<button class="plugin-rail-item is-personal${selected ? ' is-active' : ''}" type="button" data-select-personal-skill="${esc(item.key)}" data-skill-personal-item data-search="${esc(search)}">
+    <span class="plugin-rail-avatar">${esc(initial)}</span>
+    <span class="plugin-rail-text">
+      <strong>${esc(item.name)}</strong>
+      <small><span class="plugin-personal-badge">个人</span> ${esc(item.userName)} · <span class="mono">v${esc(item.version)}</span></small>
+    </span>
+    <span class="plugin-rail-dot ${dot}" title="${esc(dotTitle)}"></span>
+  </button>`
+}
+
+function skillRailHtml(data) {
+  const companyId = data.companyId || state.company
+  const companyName = state.companies?.find((item) => item.id === companyId)?.name || state.me?.company?.name || companyId || '当前公司'
+  const list = data.skills || []
+  const personal = data.personalSkills || []
+  const installed = list.filter((skill) => skill.companyInstalled).length
+  const quarantine = data.quarantine || []
+  const auditDegraded = Number(data.audit?.degradedCount || 0)
+  const policy = data.policy || {}
+  return `<div class="plugin-scope-block">
+      <div class="plugin-scope-kicker">
+        <span class="plugin-scope-eyebrow">当前公司</span>
+        ${hintBadge('归属说明', '公司技能安装 / 启停 / 卸载记在本司名下；个人技能属于员工本人，后台只读。')}
+      </div>
+      <strong>${esc(companyName)}</strong>
+      <div class="skill-rail-policy">${skillPolicyPills(policy)}</div>
+    </div>
+    <div class="plugin-rail-metrics">
+      <div><strong>${list.length}</strong><span>制品</span></div>
+      <div><strong>${installed}</strong><span>公司安装</span></div>
+      <div><strong>${quarantine.length}</strong><span>隔离</span></div>
+    </div>
+    <div class="plugin-rail-actions">
+      <button class="btn primary sm" type="button" data-skill-install>安装技能…</button>
+      <button class="btn ghost sm" type="button" data-skill-refresh>刷新</button>
+    </div>
+    <div class="side-head">技能制品 <span class="muted">${list.length}</span></div>
+    <div class="plugin-rail-search">
+      <input type="search" data-skill-search value="${esc(state.skillSearch)}" placeholder="搜索技能…（名称 / id / 工具）" aria-label="搜索技能" autocomplete="off" />
+    </div>
+    <div class="side-list plugin-rail-list" data-skill-list>
+      ${list.length ? list.map((skill) => skillRailItem(skill, skill.id === state.skillSelected)).join('') : '<div class="side-note">服务器上还没有技能制品</div>'}
+      <div class="side-note" data-skill-search-empty hidden>没有匹配的技能</div>
+    </div>
+    <div class="side-head plugin-personal-head"><span>个人技能 <span class="muted">${personal.length}</span> ${hintBadge('只读', '员工在个人工作台安装，只对本人可见、只影响本人；后台不能安装、更新、启停或卸载。', '个人技能只读', 'plugin-readonly-tag')}</span></div>
+    <div class="plugin-rail-search skill-personal-search">
+      <input type="search" data-skill-personal-search value="${esc(state.skillPersonalSearch)}" placeholder="搜索个人技能…（技能 / 员工）" aria-label="搜索个人技能" autocomplete="off" />
+    </div>
+    <div class="side-list plugin-rail-list plugin-personal-list" data-skill-personal-list>
+      ${personal.length ? personal.map((item) => skillPersonalRailItem(item, item.key === state.skillPersonalSelected)).join('') : '<div class="side-note">还没有员工在本公司安装个人技能</div>'}
+      <div class="side-note" data-skill-personal-search-empty hidden>没有匹配的个人技能</div>
+    </div>
+    <div class="side-head plugin-personal-head"><span>安全治理 <span class="muted">${quarantine.length + auditDegraded}</span> ${hintBadge('治理范围', '隔离记录与审计降级是全局数据，不随单个技能切换；管理员可在这里复核或删除隔离元数据。', '安全治理说明', 'plugin-readonly-tag')}</span></div>
+    <div class="side-list plugin-rail-list">
+      <button class="plugin-rail-item${state.skillGovernanceOpen ? ' is-active' : ''}" type="button" data-skill-governance>
+        <span class="plugin-rail-avatar ghost">G</span>
+        <span class="plugin-rail-text">
+          <strong>隔离与审计</strong>
+          <small>隔离 ${quarantine.length} · 审计降级 ${auditDegraded}</small>
+        </span>
+        <span class="plugin-rail-dot ${quarantine.length || auditDegraded ? 'warn' : 'ok'}"></span>
+      </button>
+    </div>`
+}
+
+function filterSkillRail() {
+  const value = String(state.skillSearch || '').trim().toLowerCase()
+  const items = [...document.querySelectorAll('[data-skill-list] [data-skill-item]')]
+  let visible = 0
+  for (const item of items) {
+    const match = !value || String(item.dataset.search || '').toLowerCase().includes(value)
+    item.hidden = !match
+    if (match) visible += 1
+  }
+  const empty = document.querySelector('[data-skill-search-empty]')
+  if (empty) empty.hidden = visible > 0 || !items.length
+
+  const personalValue = String(state.skillPersonalSearch || '').trim().toLowerCase()
+  const personalItems = [...document.querySelectorAll('[data-skill-personal-list] [data-skill-personal-item]')]
+  let personalVisible = 0
+  for (const item of personalItems) {
+    const match = !personalValue || String(item.dataset.search || '').toLowerCase().includes(personalValue)
+    item.hidden = !match
+    if (match) personalVisible += 1
+  }
+  const personalEmpty = document.querySelector('[data-skill-personal-search-empty]')
+  if (personalEmpty) personalEmpty.hidden = personalVisible > 0 || !personalItems.length
+}
+
+function bindSkillRail() {
+  const input = document.querySelector('[data-skill-search]')
+  if (input) {
+    input.oninput = () => {
+      state.skillSearch = input.value
+      filterSkillRail()
+    }
+    input.onkeydown = (event) => {
+      if (event.key !== 'Escape' || !input.value) return
+      event.stopPropagation()
+      input.value = ''
+      state.skillSearch = ''
+      filterSkillRail()
+    }
+  }
+  const personalInput = document.querySelector('[data-skill-personal-search]')
+  if (personalInput) {
+    personalInput.oninput = () => {
+      state.skillPersonalSearch = personalInput.value
+      filterSkillRail()
+    }
+    personalInput.onkeydown = (event) => {
+      if (event.key !== 'Escape' || !personalInput.value) return
+      event.stopPropagation()
+      personalInput.value = ''
+      state.skillPersonalSearch = ''
+      filterSkillRail()
+    }
+  }
+  for (const button of document.querySelectorAll('[data-select-skill]')) {
+    button.addEventListener('click', () => {
+      const id = button.dataset.selectSkill
+      if (id !== state.skillSelected) state.skillTab = 'overview'
+      state.skillSelected = id
+      state.skillPersonalSelected = null
+      state.skillGovernanceOpen = false
+      renderNavRail()
+      renderSkillsConsole()
+    })
+  }
+  for (const button of document.querySelectorAll('[data-select-personal-skill]')) {
+    button.addEventListener('click', () => {
+      state.skillPersonalSelected = button.dataset.selectPersonalSkill
+      state.skillSelected = null
+      state.skillGovernanceOpen = false
+      renderNavRail()
+      renderSkillsConsole()
+    })
+  }
+  for (const button of document.querySelectorAll('[data-skill-governance]')) {
+    button.addEventListener('click', () => {
+      state.skillGovernanceOpen = true
+      renderNavRail()
+      renderSkillsConsole()
+    })
+  }
+  for (const button of document.querySelectorAll('[data-skill-install]')) {
+    button.addEventListener('click', () => openSkillInstallModal())
+  }
+  for (const button of document.querySelectorAll('[data-skill-refresh]')) {
+    button.addEventListener('click', () => loadSkillsPage())
+  }
+  filterSkillRail()
+}
+
+function personalSkillDetailHtml(item) {
+  const initial = (item.name || item.id || '?').trim().slice(0, 1).toUpperCase()
+  const status = !item.valid
+    ? '<span class="pill danger">校验异常</span>'
+    : item.enabled
+      ? '<span class="pill ok">个人启用</span>'
+      : '<span class="pill warn">个人停用</span>'
+  const source = skillSourceLabel(item.install?.source || item.source)
+  const tools = (item.tools || []).map((tool) => `<span class="chip mono" title="${esc(tool)}">${esc(tool)}</span>`).join('')
+  const triggers = (item.triggers || []).map((trigger) => `<span class="chip" title="${esc(trigger)}">${esc(trigger)}</span>`).join('')
+  const scopes = (item.scopes || []).map((scope) => `<span class="chip mono" title="${esc(scope)}">${esc(scope)}</span>`).join('')
+  return `<section class="panel plugin-detail plugin-personal-detail skill-personal-detail">
+    <div class="plugin-detail-head">
+      <div class="plugin-title">
+        <div class="plugin-avatar">${esc(initial)}</div>
+        <div class="plugin-title-text">
+          <div class="plugin-title-row"><h2>${esc(item.name)}</h2>
+            <span class="plugin-format-badge">${esc(item.level || 'L0')}</span>
+            ${skillRiskPill(item.risk)}
+            <span class="plugin-personal-badge">个人技能</span>
+            ${status}
+          </div>
+          <div class="plugin-subline"><span class="mono">${esc(item.id)}@${esc(item.version)}</span><span class="muted">· 归属：${esc(item.userName)}</span></div>
+        </div>
+      </div>
+      <div class="plugin-detail-actions">
+        <button class="btn ghost sm" type="button" data-close-personal-skill>收起</button>
+      </div>
+    </div>
+    <div class="plugin-personal-notice">
+      <strong>后台只读</strong>
+      <span>这个技能由 ${esc(item.userName)} 在个人工作台安装，只对本人可见、只影响本人。后台不能安装、更新、启停、卸载或修改它的设置；如需收回，由员工本人在个人工作台操作。</span>
+    </div>
+    <div class="plugin-overview">
+      <div class="plugin-block">
+        <h3>归属与安装</h3>
+        <div class="kv plugin-kv">
+          <div><span>安装人</span><strong>${esc(item.userName)}</strong></div>
+          <div><span>安装归属</span><strong>个人 · 仅本人</strong></div>
+          <div><span>当前状态</span><strong>${item.valid ? (item.enabled ? '个人启用' : '个人停用') : '校验异常'}</strong></div>
+          <div><span>首次安装</span><strong>${esc(fmtPluginTime(item.installedAt))}</strong></div>
+          <div><span>最后更新</span><strong>${esc(fmtPluginTime(item.updatedAt))}</strong></div>
+          <div><span>来源类型</span><strong>${esc(source)}</strong></div>
+          <div><span>来源标识</span><strong class="mono" title="${esc(item.install?.sourceRef || '')}">${esc(item.install?.sourceRef || '—')}</strong></div>
+        </div>
+      </div>
+      <div class="plugin-block">
+        <h3>技能信息</h3>
+        <div class="kv plugin-kv">
+          <div><span>版本</span><strong class="mono">${esc(item.version)}</strong></div>
+          <div><span>级别</span><strong>${esc(skillLevelText(item.level))}</strong></div>
+          <div><span>风险</span><strong>${esc(SKILL_RISK_LABEL[item.risk] || item.risk || '未知')}</strong></div>
+          <div><span>作者</span><strong>${esc(item.author || '未填写')}</strong></div>
+          <div><span>校验和</span><strong class="mono">${esc(item.checksum || '—')}</strong></div>
+          <div><span>安全命中</span><strong>${(item.findings || []).length} 条</strong></div>
+        </div>
+        <div class="plugin-personal-desc"><span>说明</span><strong>${esc(item.description || '未填写')}</strong></div>
+        ${tools ? `<div class="plugin-inject-row"><span>可用工具</span><div>${tools}</div></div>` : ''}
+        ${triggers ? `<div class="plugin-inject-row"><span>触发词</span><div>${triggers}</div></div>` : ''}
+        ${scopes ? `<div class="plugin-inject-row"><span>声明权限</span><div>${scopes}</div></div>` : ''}
+      </div>
+    </div>
+    ${item.valid ? '' : `<div class="banner danger" style="margin: 12px 18px 18px"><strong>${esc(item.error || '技能制品校验异常')}</strong><span>个人技能异常由安装人本人在个人工作台修复或卸载，后台不代操作。</span></div>`}
+  </section>`
+}
+
+function skillWelcomeHtml(data) {
+  const list = data.skills || []
+  const personal = data.personalSkills || []
+  const installed = list.filter((skill) => skill.companyInstalled).length
+  const enabled = list.filter((skill) => skill.companyInstalled && skill.companyEnabled).length
+  const quarantine = data.quarantine || []
+  const pendingQuarantine = quarantine.filter((entry) => (entry.review?.status || 'pending') !== 'acknowledged').length
+  const auditDegraded = Number(data.audit?.degradedCount || 0)
+  const policy = data.policy || { enabled: true, requirePersonalInstallApproval: false }
+  return `<section class="panel plugin-welcome skill-welcome">
+    <div class="plugin-welcome-mark">S</div>
+    <span class="install-eyebrow">SKILL WORKSPACE</span>
+    <h2>${list.length ? '从左侧选择一个技能制品' : '当前公司还没有技能制品'}</h2>
+    <div class="hint-note" style="justify-content:center">${hintBadge(
+      list.length ? '工作区说明' : '安装来源',
+      list.length
+        ? '公司技能由后台统一安装、启停、卸载；个人技能在左侧单独只读展示，归属员工本人。'
+        : '从服务器目录导入技能包；安装前会扫描 skill.json、SKILL.md、references 与 assets。',
+    )}</div>
+    <div class="plugin-welcome-stats">
+      <div><strong>${list.length}</strong><span>技能制品</span></div>
+      <div><strong>${installed}</strong><span>公司安装</span></div>
+      <div><strong>${enabled}</strong><span>公司启用</span></div>
+      <div><strong>${pendingQuarantine}</strong><span>待复核隔离</span></div>
+    </div>
+    <div class="plugin-personal-welcome"><span>个人技能 ${personal.length} 项 · 由员工本人安装，后台只读</span>${skillPolicyPills(policy)}${auditDegraded ? `<span class="danger-text">审计降级 ${auditDegraded} 条</span>` : '<span>审计链路正常</span>'}</div>
+    <div class="plugin-welcome-actions">
+      <button class="btn primary" type="button" data-skill-install>安装技能…</button>
+      <button class="btn ghost" type="button" data-skill-refresh>重新扫描</button>
+      <button class="btn ghost${policy.enabled ? ' danger-text' : ''}" type="button" data-skill-policy-toggle data-next-enabled="${policy.enabled ? '0' : '1'}">${policy.enabled ? '停用全部技能' : '启用技能'}</button>
+      <button class="btn ghost" type="button" data-skill-personal-approval-toggle data-next-enabled="${policy.requirePersonalInstallApproval ? '0' : '1'}">${policy.requirePersonalInstallApproval ? '关闭个人安装审批' : '开启个人安装审批'}</button>
+    </div>
+  </section>`
+}
+
+function skillOverviewBody(skill) {
+  const description = skill.description || '（没有写描述）'
+  const tools = skill.tools?.length
+    ? skill.tools.map((tool) => `<span class="chip mono">${esc(tool)}</span>`).join('')
+    : '<span class="muted">未声明工具</span>'
+  const triggers = skill.triggers?.length
+    ? skill.triggers.map((trigger) => `<span class="chip">${esc(trigger)}</span>`).join('')
+    : '<span class="muted">未声明触发词</span>'
+  const scopes = skill.scopes?.length
+    ? skill.scopes.map((scope) => `<span class="chip mono" title="${esc(scope)}">${esc(scope)}</span>`).join('')
+    : '<span class="muted">未声明权限</span>'
+  const installText = skill.companyInstalled
+    ? (skill.companyEnabled ? '公司已安装 · 启用' : '公司已安装 · 停用')
+    : '未安装到公司'
+  return `<div class="plugin-overview">
+    <div class="plugin-block">
+      <h3>技能清单</h3>
+      <div class="plugin-personal-desc"><span>说明</span><strong>${esc(description)}</strong></div>
+      <div class="kv plugin-kv">
+        <div><span>制品 ID</span><strong class="mono">${esc(skill.id)}</strong></div>
+        <div><span>版本</span><strong class="mono">${esc(skill.version)}</strong></div>
+        <div><span>级别</span><strong>${esc(skillLevelText(skill.level))}</strong></div>
+        <div><span>静态风险</span><strong>${skillRiskPill(skill.risk)}</strong></div>
+        <div><span>清单校验</span><strong>${skill.valid ? '<span class="pill ok">通过</span>' : '<span class="pill danger">未通过</span>'}</strong></div>
+        <div><span>作者</span><strong>${esc(skill.author || '未填写')}</strong></div>
+      </div>
+      ${skill.valid ? '' : `<div class="banner danger" style="margin-top:10px"><strong>${esc(skill.error || '清单校验未通过')}</strong><span>该技能不会被注入聊天；修好清单后重新安装，或直接卸载。</span></div>`}
+    </div>
+    <div class="plugin-block">
+      <h3>能力与边界</h3>
+      <div class="kv plugin-kv">
+        <div><span>公司安装</span><strong>${esc(installText)}</strong></div>
+        <div><span>技能文件</span><strong>${skill.references?.length ? `${skill.references.length} 个` : '—'}</strong></div>
+        <div><span>清单指纹</span><strong class="mono">${esc(skill.checksum || '—')}</strong></div>
+        <div><span>安装登记</span><strong>${skill.companyInstalled ? '公司已登记' : '未登记公司安装'}</strong></div>
+      </div>
+      <div class="plugin-inject-row"><span>声明工具</span><div>${tools}</div></div>
+      <div class="plugin-inject-row"><span>触发词</span><div>${triggers}</div></div>
+      <div class="plugin-inject-row"><span>声明权限</span><div>${scopes}</div></div>
+    </div>
+  </div>`
+}
+
+function skillSecurityBody(skill) {
+  const findings = skill.findings || []
+  const rows = findings.length
+    ? findings
+        .map((finding) => {
+          const tone = finding.severity === 'critical' || finding.severity === 'high' ? 'danger' : finding.severity === 'medium' ? 'warn' : ''
+          return `<tr>
+            <td><span class="pill ${tone}">${esc(finding.severity || '—')}</span></td>
+            <td>${esc(finding.category || '—')}</td>
+            <td class="mono">${esc(finding.file || '—')}${finding.line ? `:${esc(finding.line)}` : ''}</td>
+            <td>${esc(finding.message || '—')}</td>
+          </tr>`
+        })
+        .join('')
+    : '<tr><td colspan="4"><div class="empty">这个技能没有扫描命中</div></td></tr>'
+  return `<div class="plugin-overview">
+    <div class="plugin-block">
+      <h3>扫描结论</h3>
+      <div class="kv plugin-kv">
+        <div><span>静态风险</span><strong>${skillRiskPill(skill.risk)}</strong></div>
+        <div><span>清单校验</span><strong>${skill.valid ? '<span class="pill ok">通过</span>' : '<span class="pill danger">未通过</span>'}</strong></div>
+        <div><span>命中数量</span><strong>${findings.length ? `${findings.length} 条` : '0 条'}</strong></div>
+        <div><span>清单指纹</span><strong class="mono">${esc(skill.checksum || '—')}</strong></div>
+      </div>
+    </div>
+    <div class="plugin-block">
+      <h3>安装与加载门禁</h3>
+      <div class="kv plugin-kv">
+        <div><span>安装前扫描</span><strong>skill.json、SKILL.md、references、assets</strong></div>
+        <div><span>加载时复核</span><strong>重新扫描并比对 checksum</strong></div>
+        <div><span>高风险结果</span><strong>拒绝安装并写入隔离记录</strong></div>
+        <div><span>提示词注入</span><strong>校验不通过时跳过注入</strong></div>
+      </div>
+      <div class="plugin-note">命中破坏命令、代码执行、凭证读取、外发、提权、持久化、提示词注入或越权 scope 时，安装会被拒绝。</div>
+    </div>
+  </div>
+  <div class="plugin-block" style="margin-top:14px">
+    <h3>命中明细</h3>
+    <div class="table-wrap"><table class="data plugin-events-table skill-security-table">
+      <thead><tr><th>严重度</th><th>类别</th><th>位置</th><th>说明</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>
+  </div>`
+}
+
+function skillInstallBody(data, skill) {
+  const policy = data.policy || { enabled: true, requirePersonalInstallApproval: false }
+  const install = skill.install || {}
+  const installLabel = skill.companyInstalled ? (skill.companyEnabled ? '已安装 · 启用' : '已安装 · 停用') : '未安装到公司'
+  const installedAt = skill.companyInstalled ? fmtPluginTime(install.installedAt) : '—'
+  const updatedAt = skill.companyInstalled ? fmtPluginTime(install.updatedAt) : '—'
+  const action = skill.companyInstalled
+    ? `<button class="btn sm" type="button" data-skill-company-toggle data-skill-id="${esc(skill.id)}" data-next-enabled="${skill.companyEnabled ? '0' : '1'}">${skill.companyEnabled ? '停用（本司）' : '启用（本司）'}</button>
+       <button class="btn sm" type="button" data-skill-company-install data-skill-id="${esc(skill.id)}">重装…</button>`
+    : `<button class="btn primary sm" type="button" data-skill-company-install data-skill-id="${esc(skill.id)}">公司安装</button>`
+  return `<div class="plugin-version-current">
+      <div><span class="plugin-version-label">公司安装状态</span><strong>${esc(installLabel)}</strong></div>
+      <div class="plugin-version-actions">${action}</div>
+    </div>
+    <div class="kv plugin-kv">
+      <div><span>来源类型</span><strong>${esc(skillSourceLabel(install.source))}</strong></div>
+      <div><span>来源标识</span><strong class="mono" title="${esc(install.sourceRef || '')}">${esc(install.sourceRef || '—')}</strong></div>
+      <div><span>安装目录</span><strong class="mono">${esc(skill.dir || '—')}</strong></div>
+      <div><span>首次安装</span><strong>${esc(installedAt)}</strong></div>
+      <div><span>最后更新</span><strong>${esc(updatedAt)}</strong></div>
+      <div><span>清单指纹</span><strong class="mono">${esc(skill.checksum || '—')}</strong></div>
+      <div><span>安装归属</span><strong>${skill.companyInstalled ? '当前公司' : '未登记'}</strong></div>
+    </div>
+    <div class="plugin-setting-row">
+      <div><strong>公司技能总开关</strong><span>停用后员工聊天不会注入任何技能；已安装列表、事件和隔离记录仍保留。</span></div>
+      <div class="plugin-actions">
+        <span class="pill ${policy.enabled ? 'ok' : 'danger'}">${policy.enabled ? '已启用' : '已停用'}</span>
+        <button class="btn sm ghost" type="button" data-skill-policy-toggle data-next-enabled="${policy.enabled ? '0' : '1'}">${policy.enabled ? '停用全部技能' : '启用技能'}</button>
+      </div>
+    </div>
+    <div class="plugin-setting-row">
+      <div><strong>个人安装审批</strong><span>开启后，员工个人安装技能只创建审批单；管理员在「审批」页通过后，员工重新提交同一技能包才会落盘。</span></div>
+      <div class="plugin-actions">
+        <span class="pill ${policy.requirePersonalInstallApproval ? 'warn' : ''}">${policy.requirePersonalInstallApproval ? '已开启' : '未开启'}</span>
+        <button class="btn sm ghost" type="button" data-skill-personal-approval-toggle data-next-enabled="${policy.requirePersonalInstallApproval ? '0' : '1'}">${policy.requirePersonalInstallApproval ? '关闭审批' : '开启审批'}</button>
+      </div>
+    </div>
+    <div class="plugin-note">公司级技能安装始终需要审批：先提交同一目录生成审批单，管理员通过后再次提交才会落盘。可预见的目录冲突会在审批前拦截。</div>
+    ${skill.companyInstalled ? `<div class="plugin-danger-zone">
+      <div><strong>卸载公司安装</strong><span>只解除当前公司的安装与启停记录，不删除技能目录、个人安装和审计记录。</span></div>
+      <button class="btn danger sm" type="button" data-skill-company-uninstall data-skill-id="${esc(skill.id)}">卸载…</button>
+    </div>` : ''}`
+}
+
+function skillEventsBody(data, skill) {
+  const events = (data.events || []).filter((event) => event.skillId === skill.id)
+  return `<div class="plugin-note">最近 40 条公司级技能事件中，属于这个技能的有 ${events.length} 条；安装、启停、卸载、拦截和审批都会留痕。</div>
+    <div class="table-wrap"><table class="data plugin-events-table skill-events-table">
+      <thead><tr><th>时间</th><th>事件</th><th>操作人</th><th>摘要</th></tr></thead>
+      <tbody>${events.length
+        ? events.map((event) => `<tr>
+            <td class="mono">${esc(fmtPluginTime(event.at))}</td>
+            <td><span class="pill">${esc(SKILL_EVENT_LABEL[event.event] || event.event)}</span></td>
+            <td>${esc(event.actorId || event.userId || '系统')}</td>
+            <td class="desc">${esc(skillEventSummary(event))}</td>
+          </tr>`).join('')
+        : '<tr><td colspan="4"><div class="empty">这个技能还没有事件记录</div></td></tr>'}</tbody>
+    </table></div>`
+}
+
+function skillQuarantineRows(quarantine, canReview) {
+  if (!quarantine.length) return '<tr><td colspan="6"><div class="empty">暂无隔离记录。被拒绝的危险包、未知工具包和加载失败会出现在这里。</div></td></tr>'
+  return quarantine
+    .map((entry) => {
+      const review = entry.review || { status: 'pending' }
+      const reviewTone = review.status === 'acknowledged' ? 'ok' : 'warn'
+      const reviewText = review.status === 'acknowledged' ? '已复核' : '待复核'
+      const reviewMeta = review.status === 'acknowledged'
+        ? `<div class="desc">${esc(review.by || '管理员')} · ${esc(new Date(review.at || entry.at).toLocaleString())}${review.note ? ` · ${esc(review.note)}` : ''}</div>`
+        : ''
+      const actions = canReview
+        ? `<div class="skill-action-cell">
+            <button class="btn sm ghost" type="button" data-skill-quarantine-ack data-quarantine-file="${esc(entry.file)}" data-quarantine-id="${esc(entry.id)}">${review.status === 'acknowledged' ? '更新备注' : '标记已复核'}</button>
+            <button class="btn sm ghost danger-text" type="button" data-skill-quarantine-delete data-quarantine-file="${esc(entry.file)}" data-quarantine-id="${esc(entry.id)}">删除…</button>
+          </div>`
+        : '<span class="desc">需要审批权限</span>'
+      return `<tr>
+        <td class="mono">${esc(fmtPluginTime(entry.at))}</td>
+        <td class="name-cell"><strong>${esc(entry.id)}</strong><div class="desc mono">${esc(entry.file)}</div></td>
+        <td>${skillRiskPill(entry.risk)}</td>
+        <td>${entry.findings?.length ? `${entry.findings.length} 条命中` : '—'}</td>
+        <td class="desc">${esc(entry.error || entry.findings?.[0]?.message || '已隔离，等待复核')}</td>
+        <td><span class="pill ${reviewTone}">${reviewText}</span>${reviewMeta}${actions}</td>
+      </tr>`
+    })
+    .join('')
+}
+
+function skillAuditRows(degraded) {
+  if (!degraded.length) return '<tr><td colspan="5"><div class="empty">没有审计双写失败记录。</div></td></tr>'
+  return degraded
+    .map((item) => `<tr>
+      <td class="mono">${esc(fmtPluginTime(item.at))}</td>
+      <td class="mono">${esc(item.event)}</td>
+      <td class="mono">${esc(item.skillId)}</td>
+      <td>${esc(item.actorId || '系统')}</td>
+      <td class="desc">${esc(item.message)}</td>
+    </tr>`)
+    .join('')
+}
+
+function skillGovernanceHtml(data) {
+  const quarantine = data.quarantine || []
+  const audit = data.audit || {}
+  const degraded = audit.degraded || []
+  const pending = quarantine.filter((entry) => (entry.review?.status || 'pending') !== 'acknowledged').length
+  const canReview = Boolean(data.permissions?.approve)
+  return `<section class="panel plugin-detail skill-detail">
+    <div class="plugin-detail-head">
+      <div class="plugin-title">
+        <div class="plugin-avatar">G</div>
+        <div class="plugin-title-text">
+          <div class="plugin-title-row"><h2>安全治理</h2><span class="plugin-format-badge">GOVERNANCE</span>
+            <span class="pill ${pending ? 'warn' : 'ok'}">${pending ? `${pending} 条待复核` : '隔离已复核'}</span>
+            <span class="pill ${degraded.length ? 'danger' : 'ok'}">审计${degraded.length ? `降级 ${degraded.length}` : '正常'}</span>
+          </div>
+          <div class="plugin-subline"><span>隔离记录与审计降级是全局数据，不随单个技能切换</span></div>
+        </div>
+      </div>
+      <div class="plugin-detail-actions">
+        <button class="btn ghost sm" type="button" data-close-skill-governance>收起</button>
+      </div>
+    </div>
+    <div id="skill-governance-body" class="skill-governance-stack">
+      <div class="plugin-block">
+        <h3>隔离记录</h3>
+        <div class="plugin-note">只展示隔离元数据，不读取危险包正文；管理员可标记复核或删除元数据。危险包正文从未保留，不能从这里还原执行。</div>
+        <div class="table-wrap"><table class="data plugin-events-table skill-quarantine-table">
+          <thead><tr><th>时间</th><th>技能 / 文件</th><th>风险</th><th>命中</th><th>摘要</th><th>复核</th></tr></thead>
+          <tbody>${skillQuarantineRows(quarantine, canReview)}</tbody>
+        </table></div>
+      </div>
+      <div class="plugin-block">
+        <h3>审计降级</h3>
+        <div class="plugin-note">技能主事件已写入 skill_events，但全局 audit 链双写失败时记录在这里；不影响安装、启停和拦截结果。</div>
+        <div class="table-wrap"><table class="data plugin-events-table skill-audit-table">
+          <thead><tr><th>时间</th><th>事件</th><th>技能</th><th>操作人</th><th>失败原因</th></tr></thead>
+          <tbody>${skillAuditRows(degraded)}</tbody>
+        </table></div>
+      </div>
+    </div>
+  </section>`
+}
+
+function skillDetailHtml(data, skill) {
+  const tab = state.skillTab || 'overview'
+  const eventCount = (data.events || []).filter((event) => event.skillId === skill.id).length
+  const tabs = [
+    ['overview', '概览', ''],
+    ['security', `安全${skill.findings?.length ? ` <span class="plugin-tab-count">${skill.findings.length}</span>` : ''}`, ''],
+    ['install', '安装', ''],
+    ['events', `事件${eventCount ? ` <span class="plugin-tab-count">${eventCount}</span>` : ''}`, ''],
+  ]
+  const tabBar = tabs
+    .map(([key, label]) => `<button class="plugin-tab${tab === key ? ' is-active' : ''}" type="button" data-skill-tab="${key}">${label}</button>`)
+    .join('')
+  let body = skillOverviewBody(skill)
+  if (tab === 'security') body = skillSecurityBody(skill)
+  else if (tab === 'install') body = skillInstallBody(data, skill)
+  else if (tab === 'events') body = skillEventsBody(data, skill)
+  const initial = (skill.name || skill.id || '?').trim().slice(0, 1).toUpperCase()
+  const actions = skill.companyInstalled
+    ? `<button class="btn sm" type="button" data-skill-company-toggle data-skill-id="${esc(skill.id)}" data-next-enabled="${skill.companyEnabled ? '0' : '1'}">${skill.companyEnabled ? '停用' : '启用'}</button>
+       <button class="btn sm" type="button" data-skill-company-install data-skill-id="${esc(skill.id)}">重装…</button>
+       <button class="btn ghost sm" type="button" data-skill-company-uninstall data-skill-id="${esc(skill.id)}">卸载…</button>`
+    : `<button class="btn sm" type="button" data-skill-company-install data-skill-id="${esc(skill.id)}">公司安装</button>`
+  return `<section class="panel plugin-detail skill-detail">
+    <div class="plugin-detail-head">
+      <div class="plugin-title">
+        <div class="plugin-avatar">${esc(initial)}</div>
+        <div class="plugin-title-text">
+          <div class="plugin-title-row"><h2>${esc(skill.name)}</h2>
+            <span class="plugin-format-badge">${esc(skill.level || 'L0')}</span>
+            ${skillRiskPill(skill.risk)}
+            ${skillStatusPill(skill)}
+          </div>
+          <div class="plugin-subline"><span class="mono">${esc(skill.id)}@${esc(skill.version)}</span><span class="muted">· ${esc(skillLevelText(skill.level))} · checksum ${esc(skill.checksum || '—')}</span></div>
+        </div>
+      </div>
+      <div class="plugin-detail-actions">
+        <button class="btn ghost sm" type="button" data-close-skill>收起</button>
+        ${actions}
+      </div>
+    </div>
+    <div class="plugin-tabs">${tabBar}</div>
+    <div id="skill-tab-body">${body}</div>
+  </section>`
+}
+
+function renderSkillsConsole() {
+  const data = state.skillConsoleData
+  const view = $('#view')
+  if (!data || !view) return
+  const selected = state.skillSelected
+    ? (data.skills || []).find((skill) => skill.id === state.skillSelected) || null
+    : null
+  const personalSelected = state.skillPersonalSelected
+    ? (data.personalSkills || []).find((item) => item.key === state.skillPersonalSelected) || null
+    : null
+  if (state.skillSelected && !selected) state.skillSelected = null
+  if (state.skillPersonalSelected && !personalSelected) state.skillPersonalSelected = null
+  if (state.skillGovernanceOpen) {
+    view.innerHTML = skillGovernanceHtml(data)
+  } else if (selected) {
+    view.innerHTML = skillDetailHtml(data, selected)
+  } else if (personalSelected) {
+    view.innerHTML = personalSkillDetailHtml(personalSelected)
+  } else {
+    view.innerHTML = skillWelcomeHtml(data)
+  }
+  bindSkillsConsole(view)
+}
+
+function bindSkillsConsole(root) {
+  root.querySelectorAll('[data-skill-refresh]').forEach((button) => {
+    button.onclick = () => loadSkillsPage()
+  })
+  root.querySelectorAll('[data-skill-install]').forEach((button) => {
+    button.onclick = () => openSkillInstallModal()
+  })
+  root.querySelectorAll('[data-skill-policy-toggle]').forEach((button) => {
+    button.onclick = () => openSkillPolicyModal(button.dataset.nextEnabled === '1')
+  })
+  root.querySelectorAll('[data-skill-personal-approval-toggle]').forEach((button) => {
+    button.onclick = () => openSkillPersonalApprovalModal(button.dataset.nextEnabled === '1')
+  })
+  root.querySelectorAll('[data-skill-tab]').forEach((button) => {
+    button.onclick = () => {
+      state.skillTab = button.dataset.skillTab
+      renderSkillsConsole()
+    }
+  })
+  root.querySelectorAll('[data-close-skill]').forEach((button) => {
+    button.onclick = () => {
+      state.skillSelected = null
+      renderNavRail()
+      renderSkillsConsole()
+    }
+  })
+  root.querySelectorAll('[data-close-personal-skill]').forEach((button) => {
+    button.onclick = () => {
+      state.skillPersonalSelected = null
+      renderNavRail()
+      renderSkillsConsole()
+    }
+  })
+  root.querySelectorAll('[data-close-skill-governance]').forEach((button) => {
+    button.onclick = () => {
+      state.skillGovernanceOpen = false
+      renderNavRail()
+      renderSkillsConsole()
+    }
+  })
+  root.querySelectorAll('[data-skill-company-install]').forEach((button) => {
+    button.onclick = () => {
+      const skill = (state.skillConsoleData?.skills || []).find((item) => item.id === button.dataset.skillId)
+      if (!skill) return
+      openSkillInstallModal(skill.install?.sourceRef || skill.dir || '', skill)
+    }
+  })
+  root.querySelectorAll('[data-skill-company-toggle]').forEach((button) => {
+    button.onclick = async () => {
+      const enabled = button.dataset.nextEnabled === '1'
+      button.disabled = true
+      try {
+        await apiSend('POST', `/api/console/skills/${encodeURIComponent(button.dataset.skillId)}/state`, { enabled })
+        showTopToast(enabled ? '公司级技能已启用' : '公司级技能已停用')
+        await loadSkillsPage()
+      } catch (err) {
+        showTopToast(err.message || '启停失败')
+        button.disabled = false
+      }
+    }
+  })
+  root.querySelectorAll('[data-skill-company-uninstall]').forEach((button) => {
+    button.onclick = () => openSkillUninstallModal(button.dataset.skillId)
+  })
+  root.querySelectorAll('[data-skill-quarantine-ack]').forEach((button) => {
+    button.onclick = () => openSkillQuarantineModal(button.dataset.quarantineFile, 'acknowledge')
+  })
+  root.querySelectorAll('[data-skill-quarantine-delete]').forEach((button) => {
+    button.onclick = () => openSkillQuarantineModal(button.dataset.quarantineFile, 'delete')
+  })
+}
+
+function openSkillQuarantineModal(file, action) {
+  const ack = action === 'acknowledge'
+  const entry = (state.skillConsoleData?.quarantine || []).find((item) => item.file === file)
+  const overlay = modelModal(`
+    <div class="modal-head">
+      <div><h3>${ack ? '标记隔离记录已复核' : '删除隔离元数据'}</h3></div>
+      <button class="modal-x" type="button">×</button>
+    </div>
+    <div class="models-modal-body">
+      <section class="models-form-section">
+        <div class="models-form-section-head">
+          <strong>${esc(entry?.id || file)}</strong>
+          ${fieldInfo(ack ? '只更新复核状态和备注，隔离文件继续保留，供后续审计追查。' : '会删除 skills/.quarantine 下的元数据文件；危险包正文从未保留，不能还原执行。')}
+        </div>
+        <p class="desc mono">${esc(file)}</p>
+        <label class="field"><span>${ack ? '复核备注（可选）' : '删除原因（建议填写）'}</span><input id="skill-quarantine-note" maxlength="500" placeholder="${ack ? '例如：确认是误报，已通知提交人' : '例如：确认无保留价值，已归档到工单 #123'}" autocomplete="off" /></label>
+        ${ack ? '' : '<p class="desc danger-text">这是不可逆操作：删除后控制台不再显示这条隔离记录。</p>'}
+      </section>
+    </div>
+    <div class="modal-state" id="skill-quarantine-state"></div>
+    <div class="modal-actions">
+      <button class="btn ${ack ? 'primary' : 'ghost danger-text'}" type="button" id="skill-quarantine-confirm">${ack ? '确认已复核' : '确认删除'}</button>
+      <button class="btn ghost" type="button" id="skill-quarantine-cancel">取消</button>
+    </div>`)
+  const close = () => overlay.remove()
+  overlay.querySelector('.modal-x').addEventListener('click', close)
+  overlay.querySelector('#skill-quarantine-cancel').addEventListener('click', close)
+  overlay.querySelector('#skill-quarantine-confirm').addEventListener('click', async () => {
+    const stateEl = overlay.querySelector('#skill-quarantine-state')
+    const button = overlay.querySelector('#skill-quarantine-confirm')
+    const note = overlay.querySelector('#skill-quarantine-note').value.trim()
+    stateEl.className = 'modal-state'
+    stateEl.textContent = ack ? '正在标记复核…' : '正在删除隔离元数据…'
+    button.disabled = true
+    try {
+      await apiSend('POST', '/api/console/skills/quarantine/review', { file, action, note })
+      close()
+      showTopToast(ack ? '隔离记录已标记复核' : '隔离元数据已删除')
+      await loadSkillsPage()
+    } catch (err) {
+      stateEl.className = 'modal-state bad'
+      stateEl.textContent = err.message || '操作失败'
+      button.disabled = false
+    }
+  })
+}
+
+function openSkillPolicyModal(enabled) {
+  const overlay = modelModal(`
+    <div class="modal-head">
+      <div><h3>${enabled ? '启用公司技能' : '停用全部技能'}</h3></div>
+      <button class="modal-x" type="button">×</button>
+    </div>
+    <div class="models-modal-body">
+      <section class="models-form-section">
+        <div class="models-form-section-head">
+          <strong>${enabled ? '恢复技能提示词注入' : '公司级技能总开关'}</strong>
+          ${fieldInfo(enabled ? '启用后，员工聊天会按公司安装、个人安装和启停状态注入技能说明。' : '停用后，员工聊天不会注入任何技能；已安装列表仍可查看，不会被删除。')}
+        </div>
+        <p class="desc">${enabled ? '这是恢复操作，不会改变各技能的安装或启停状态。' : '这是高风险操作，会影响全公司员工的聊天行为，但不会删除技能或隔离记录。'}</p>
+      </section>
+    </div>
+    <div class="modal-state" id="skill-policy-state"></div>
+    <div class="modal-actions">
+      <button class="btn ${enabled ? 'primary' : 'ghost danger-text'}" type="button" id="skill-policy-confirm">${enabled ? '确认启用' : '确认停用'}</button>
+      <button class="btn ghost" type="button" id="skill-policy-cancel">取消</button>
+    </div>`)
+  const close = () => overlay.remove()
+  overlay.querySelector('.modal-x').addEventListener('click', close)
+  overlay.querySelector('#skill-policy-cancel').addEventListener('click', close)
+  overlay.querySelector('#skill-policy-confirm').addEventListener('click', async () => {
+    const stateEl = overlay.querySelector('#skill-policy-state')
+    const button = overlay.querySelector('#skill-policy-confirm')
+    stateEl.className = 'modal-state'
+    stateEl.textContent = enabled ? '正在启用…' : '正在停用…'
+    button.disabled = true
+    try {
+      await apiSend('POST', '/api/console/skills/policy', { enabled })
+      close()
+      showTopToast(enabled ? '公司技能已启用' : '公司技能已停用')
+      await loadSkillsPage()
+    } catch (err) {
+      stateEl.className = 'modal-state bad'
+      stateEl.textContent = err.message || '操作失败'
+      button.disabled = false
+    }
+  })
+}
+
+function openSkillPersonalApprovalModal(enabled) {
+  const overlay = modelModal(`
+    <div class="modal-head">
+      <div><h3>${enabled ? '开启个人技能安装审批' : '关闭个人技能安装审批'}</h3></div>
+      <button class="modal-x" type="button">×</button>
+    </div>
+    <div class="models-modal-body">
+      <section class="models-form-section">
+        <div class="models-form-section-head">
+          <strong>${enabled ? '个人安装先提交审批' : '个人安装恢复即时安装'}</strong>
+          ${fieldInfo(enabled ? '开启后，员工个人安装技能只创建审批单；管理员在「审批」页通过后，员工重新提交同一技能包才会落盘。' : '关闭后，拥有安装权限的员工上传技能包会直接扫描并安装，不再创建个人安装审批。')}
+        </div>
+        <p class="desc">公司级技能安装始终需要审批，不受这里影响。</p>
+      </section>
+    </div>
+    <div class="modal-state" id="skill-personal-approval-state"></div>
+    <div class="modal-actions">
+      <button class="btn ${enabled ? 'primary' : 'ghost danger-text'}" type="button" id="skill-personal-approval-confirm">${enabled ? '确认开启' : '确认关闭'}</button>
+      <button class="btn ghost" type="button" id="skill-personal-approval-cancel">取消</button>
+    </div>`)
+  const close = () => overlay.remove()
+  overlay.querySelector('.modal-x').addEventListener('click', close)
+  overlay.querySelector('#skill-personal-approval-cancel').addEventListener('click', close)
+  overlay.querySelector('#skill-personal-approval-confirm').addEventListener('click', async () => {
+    const stateEl = overlay.querySelector('#skill-personal-approval-state')
+    const button = overlay.querySelector('#skill-personal-approval-confirm')
+    stateEl.className = 'modal-state'
+    stateEl.textContent = '正在保存…'
+    button.disabled = true
+    try {
+      await apiSend('POST', '/api/console/skills/policy', { requirePersonalInstallApproval: enabled })
+      close()
+      showTopToast(enabled ? '个人技能安装审批已开启' : '个人技能安装审批已关闭')
+      await loadSkillsPage()
+    } catch (err) {
+      stateEl.className = 'modal-state bad'
+      stateEl.textContent = err.message || '操作失败'
+      button.disabled = false
+    }
+  })
+}
+
+function parseSkillUrlSourceRef(ref) {
+  const value = String(ref || '')
+  if (!value.startsWith('url:')) return ''
+  return value.slice(4)
+}
+
+function openSkillInstallModal(prefillPath = '', prefillSkill = null) {
+  const gitPrefill = parseGithubSourceRef(prefillSkill?.install?.sourceRef) || null
+  const urlPrefill = parseSkillUrlSourceRef(prefillSkill?.install?.sourceRef)
+  const serverPathPrefill = (!prefillSkill || prefillSkill.install?.source === 'server-path') ? prefillPath : ''
+  const initialSource = gitPrefill
+    ? 'git'
+    : urlPrefill
+      ? 'http'
+      : serverPathPrefill || prefillSkill
+        ? 'server-path'
+        : 'git'
+  const companyName = state.companies?.find((item) => item.id === state.skillConsoleData?.companyId)?.name
+    || state.skillConsoleData?.companyId
+    || '当前公司'
+  const overlay = modelModal(`
+    <div class="modal-head install-modal-head">
+      <div>
+        <span class="install-eyebrow">SKILL INSTALLER</span>
+        <h3>${prefillSkill ? '更新公司技能' : '安装公司技能'} ${hintBadge('安装范围', `安装到「${companyName}」 · GitHub / 压缩包 URL / 服务器目录三种来源；只记当前公司名下，其他公司看不到，也不共用启停状态。公司级安装始终需要管理员审批。`, '技能安装范围说明')}</h3>
+      </div>
+      <button class="modal-x" type="button">×</button>
+    </div>
+
+    <div class="install-source-tabs" role="tablist" aria-label="技能安装来源">
+      <button class="install-source-tab" type="button" data-skill-install-source="git">
+        <span class="install-source-icon">◐</span>
+        <span><strong>GitHub 仓库</strong><small>仓库 + 分支 / 子目录</small></span>
+      </button>
+      <button class="install-source-tab" type="button" data-skill-install-source="http">
+        <span class="install-source-icon">⇣</span>
+        <span><strong>压缩包 URL</strong><small>tar.gz / zip 直链</small></span>
+      </button>
+      <button class="install-source-tab" type="button" data-skill-install-source="server-path">
+        <span class="install-source-icon">⌂</span>
+        <span><strong>服务器目录</strong><small>服务器上已有包</small></span>
+      </button>
+    </div>
+
+    <div class="install-panel" data-skill-install-panel="git">
+      <div class="install-grid">
+        <label class="install-field install-span-2"><span class="install-label">GitHub 仓库 ${hintBadge('访问范围', '当前只支持公开仓库匿名下载；仓库里必须有 skill.json 和 SKILL.md。只取包内容，不执行仓库脚本或 Git hooks。', 'GitHub 仓库访问范围')}</span>
+          <input id="skill-git-repo" value="${esc(gitPrefill?.repo || '')}" placeholder="owner/repo，例如 Jydsh/eab-skills" autocomplete="off" />
+        </label>
+        <label class="install-field"><span class="install-label">分支 / 标签</span>
+          <input id="skill-git-ref" value="${esc(gitPrefill?.ref || '')}" placeholder="留空 = 默认分支；也可填 v1.0.0" autocomplete="off" />
+        </label>
+        <label class="install-field"><span class="install-label">仓库内子目录</span>
+          <input id="skill-git-subdir" value="${esc(gitPrefill?.subdir || '')}" placeholder="可选，例如 skills/fixed-field-edit" autocomplete="off" />
+        </label>
+      </div>
+    </div>
+
+    <div class="install-panel" data-skill-install-panel="http">
+      <label class="install-field"><span class="install-label">技能压缩包 URL ${hintBadge('下载边界', '只支持 .tar.gz / .tgz / .zip；默认只允许公网 https，压缩包和解压后都有体积上限。解包后会照常做静态安全扫描，高风险包不会落盘。', '压缩包下载边界')}</span>
+        <input id="skill-http-url" value="${esc(urlPrefill)}" placeholder="https://example.com/skills/fixed-field-edit.tar.gz" autocomplete="off" />
+      </label>
+    </div>
+
+    <div class="install-panel" data-skill-install-panel="server-path">
+      <label class="install-field"><span class="install-label">技能包目录（服务器绝对路径） ${hintBadge('包格式', '目录内必须有 skill.json 和 SKILL.md。目录名不必等于技能 id；安装后按 skill.json 的 id 落盘。', '服务器目录技能包格式')}</span>
+        <input id="skill-install-path" value="${esc(serverPathPrefill)}" placeholder="例如 D:\\AI kaifa\\EAB\\skills\\eab-fixed-doc-edit" autocomplete="off" />
+      </label>
+    </div>
+
+    <div class="install-flow">
+      <span>① ${initialSource === 'server-path' ? '读取目录' : '下载并解包'}</span><i>→</i><span>② 静态安全扫描</span><i>→</i><span>③ 审批后落盘</span>
+      <div class="install-note" id="skill-install-note"></div>
+    </div>
+    <div class="install-progress" id="skill-install-progress" hidden aria-live="polite">
+      <div class="install-progress-track"><span class="install-progress-bar"></span></div>
+      <div class="install-progress-meta">
+        <span id="skill-install-progress-text">正在安装…</span>
+        <span id="skill-install-progress-time" class="mono">0s</span>
+      </div>
+    </div>
+    <div class="modal-state" id="skill-install-state"></div>
+    <div class="modal-actions">
+      <button class="btn primary" type="button" id="skill-install-confirm">${prefillSkill ? '扫描并更新' : '扫描并安装'}</button>
+      <button class="btn ghost" type="button" id="skill-install-cancel">取消</button>
+    </div>`)
+  overlay.querySelector('.modal').classList.add('plugin-install-modal')
+  const close = () => {
+    if (progressTimer) clearInterval(progressTimer)
+    overlay.remove()
+  }
+  const tabs = Array.from(overlay.querySelectorAll('[data-skill-install-source]'))
+  const panels = Array.from(overlay.querySelectorAll('[data-skill-install-panel]'))
+  const noteEl = overlay.querySelector('#skill-install-note')
+  const stateEl = overlay.querySelector('#skill-install-state')
+  const confirmBtn = overlay.querySelector('#skill-install-confirm')
+  const progressEl = overlay.querySelector('#skill-install-progress')
+  const progressText = overlay.querySelector('#skill-install-progress-text')
+  const progressTime = overlay.querySelector('#skill-install-progress-time')
+  let source = initialSource
+  let progressTimer = null
+  let progressStartedAt = 0
+
+  const sourceNotes = {
+    git: 'GitHub：下载仓库 tarball 后解包；仓库里必须有 skill.json 和 SKILL.md。只取内容，不执行仓库脚本。',
+    http: '压缩包 URL：只支持 tar.gz / zip；解包后照常静态扫描。默认只允许公网 https，内网来源需服务端显式开启。',
+    'server-path': '服务器目录：直接扫描本机绝对路径；目录名不必等于技能 id，安装后按 skill.json 的 id 落盘。',
+  }
+
+  const stopProgressClock = () => {
+    if (progressTimer) clearInterval(progressTimer)
+    progressTimer = null
+  }
+  const setInstalling = (busy) => {
+    for (const control of overlay.querySelectorAll('.install-source-tab, .install-field input')) control.disabled = busy
+  }
+  const startProgress = (text) => {
+    stopProgressClock()
+    progressStartedAt = Date.now()
+    progressEl.hidden = false
+    progressEl.classList.remove('is-done')
+    progressText.textContent = text
+    progressTime.textContent = '0s'
+    stateEl.className = 'modal-state'
+    stateEl.textContent = ''
+    setInstalling(true)
+    progressTimer = setInterval(() => {
+      const seconds = Math.max(0, Math.floor((Date.now() - progressStartedAt) / 1000))
+      progressTime.textContent = `${seconds}s`
+    }, 500)
+  }
+  const completeProgress = (text) => {
+    stopProgressClock()
+    progressEl.hidden = false
+    progressEl.classList.add('is-done')
+    progressText.textContent = text
+    progressTime.textContent = '完成'
+  }
+  const failProgress = () => {
+    stopProgressClock()
+    progressEl.hidden = true
+    setInstalling(false)
+  }
+
+  const syncSource = (next) => {
+    source = next
+    for (const tab of tabs) {
+      const active = tab.dataset.skillInstallSource === next
+      tab.classList.toggle('is-active', active)
+      tab.setAttribute('aria-selected', active ? 'true' : 'false')
+    }
+    for (const panel of panels) panel.classList.toggle('is-hidden', panel.dataset.skillInstallPanel !== next)
+    noteEl.innerHTML = hintBadge('安装方式', sourceNotes[next] || '', '安装方式说明')
+    stateEl.className = 'modal-state'
+    stateEl.textContent = ''
+  }
+
+  for (const tab of tabs) tab.addEventListener('click', () => syncSource(tab.dataset.skillInstallSource))
+  syncSource(source)
+
+  overlay.querySelector('.modal-x').addEventListener('click', close)
+  overlay.querySelector('#skill-install-cancel').addEventListener('click', close)
+  confirmBtn.addEventListener('click', async () => {
+    const body = { source, overwrite: true }
+    if (source === 'git') {
+      body.repo = overlay.querySelector('#skill-git-repo').value.trim()
+      body.ref = overlay.querySelector('#skill-git-ref').value.trim()
+      body.subdir = overlay.querySelector('#skill-git-subdir').value.trim()
+      if (!body.repo) {
+        stateEl.className = 'modal-state bad'
+        stateEl.textContent = '请填 GitHub 仓库（owner/repo）'
+        return
+      }
+    } else if (source === 'http') {
+      body.url = overlay.querySelector('#skill-http-url').value.trim()
+      if (!body.url) {
+        stateEl.className = 'modal-state bad'
+        stateEl.textContent = '请填写技能压缩包 URL'
+        return
+      }
+    } else {
+      body.path = overlay.querySelector('#skill-install-path').value.trim()
+      if (!body.path) {
+        stateEl.className = 'modal-state bad'
+        stateEl.textContent = '请填写技能目录路径'
+        return
+      }
+    }
+
+    const originText = source === 'git'
+      ? '正在从 GitHub 下载仓库 tarball 并解包…'
+      : source === 'http'
+        ? '正在下载技能压缩包并解包…'
+        : '正在读取服务器目录并做静态安全扫描…'
+    startProgress(originText)
+    confirmBtn.disabled = true
+    confirmBtn.textContent = prefillSkill ? '更新中…' : '安装中…'
+    try {
+      const result = await apiSend('POST', '/api/console/skills/install', body)
+      completeProgress('扫描通过，正在刷新技能列表…')
+      try {
+        await loadSkillsPage()
+      } catch {
+        // 安装已经成功；列表刷新失败不改变安装结果。
+      }
+      await new Promise((resolve) => setTimeout(resolve, 700))
+      close()
+      showTopToast(`技能已安装：${result.skill?.name || body.repo || body.path || '技能包'}`)
+    } catch (err) {
+      failProgress()
+      confirmBtn.disabled = false
+      confirmBtn.textContent = prefillSkill ? '扫描并更新' : '扫描并安装'
+      if (err?.details?.approvalId || err?.code === 'EAB_APPROVAL_REQUIRED') {
+        stateEl.className = 'modal-state'
+        stateEl.innerHTML = `${esc(err.message || '已提交安装审批')}<div class="desc"><a href="/admin?goto=approvals" target="_blank">打开审批页</a> · 审批通过后点击“扫描并安装”重新提交同一来源</div>`
+      } else {
+        stateEl.className = 'modal-state bad'
+        stateEl.textContent = err.message || '安装失败'
+      }
+    }
+  })
+}
+
+function openSkillUninstallModal(skillId) {
+  const skill = (state.skillConsoleData?.skills || []).find((item) => item.id === skillId)
+  if (!skill) return
+  const overlay = modelModal(`
+    <div class="modal-head">
+      <div><h3>卸载公司级技能</h3></div>
+      <button class="modal-x" type="button">×</button>
+    </div>
+    <div class="models-modal-body">
+      <section class="models-form-section">
+        <div class="models-form-section-head"><strong>${esc(skill.name)}</strong></div>
+        <p class="hint">只解除公司级安装，不删除技能目录、个人安装和审计记录。个人已安装的同一技能仍然可用。</p>
+      </section>
+    </div>
+    <div class="modal-state" id="skill-uninstall-state"></div>
+    <div class="modal-actions">
+      <button class="btn danger" type="button" id="skill-uninstall-confirm">卸载</button>
+      <button class="btn ghost" type="button" id="skill-uninstall-cancel">取消</button>
+    </div>`)
+  const close = () => overlay.remove()
+  overlay.querySelector('.modal-x').addEventListener('click', close)
+  overlay.querySelector('#skill-uninstall-cancel').addEventListener('click', close)
+  overlay.querySelector('#skill-uninstall-confirm').addEventListener('click', async () => {
+    const stateEl = overlay.querySelector('#skill-uninstall-state')
+    stateEl.textContent = '卸载中…'
+    try {
+      await apiSend('DELETE', `/api/console/skills/${encodeURIComponent(skillId)}`)
+      close()
+      showTopToast('公司级技能已卸载')
+      await loadSkillsPage()
+    } catch (err) {
+      stateEl.className = 'modal-state bad'
+      stateEl.textContent = err.message || '卸载失败'
+    }
+  })
+}
+
+async function loadSkillsPage() {
+  const view = $('#view')
+  renderLoading(view)
+  setSide('', true)
+  try {
+    const data = await api('/api/console/skills')
+    state.skillConsoleData = data
+    if (state.skillSelected && !(data.skills || []).some((skill) => skill.id === state.skillSelected)) {
+      state.skillSelected = null
+      state.skillTab = 'overview'
+    }
+    if (state.skillPersonalSelected && !(data.personalSkills || []).some((item) => item.key === state.skillPersonalSelected)) {
+      state.skillPersonalSelected = null
+    }
+    renderNavRail()
+    renderSkillsConsole()
+  } catch (err) {
+    state.skillConsoleData = null
+    renderNavRail()
+    renderDenied(view, err)
+  }
+}
+
 /* ---------------- 导航 ---------------- */
+
 
 /**
  * 一级：业务域；二级：域内页面。
@@ -9925,9 +12633,10 @@ const DOMAINS = [
   { id: 'overview', label: '概览', kicker: 'OVERVIEW', pages: ['overview'] },
   { id: 'org', label: '组织与权限', kicker: 'ORGANIZATION & ACCESS', pages: ['org', 'departments', 'roles', 'access'] },
   { id: 'knowledge', label: '知识与模型', kicker: 'KNOWLEDGE & MODELS', pages: ['kb', 'models', 'tools'] },
-  { id: 'platform', label: '连接与平台', kicker: 'PLATFORMS', pages: ['channels', 'company', 'system'] },
+  { id: 'platform', label: '连接与平台', kicker: 'PLATFORMS', pages: ['channels', 'databases', 'documents', 'company', 'system'] },
   { id: 'plugins', label: '插件管理', kicker: 'PLUGIN ECOSYSTEM', pages: ['extra'] },
-  { id: 'ops', label: '运营与审计', kicker: 'OPERATIONS', pages: ['usage', 'quota', 'audit', 'approvals'] },
+  { id: 'skills', label: '技能管理', kicker: 'SKILL ECOSYSTEM', pages: ['skills'] },
+  { id: 'ops', label: '运营与审计', kicker: 'OPERATIONS', pages: ['usage', 'quota', 'audit', 'tasks', 'approvals'] },
 ]
 
 const PAGE_DOMAIN = DOMAINS.reduce((map, domain) => {
@@ -9961,14 +12670,28 @@ function renderNavRail() {
   // 插件管理域只有一页，左侧改成插件概览 + 插件列表，避免“域→唯一页面”的重复导航
   if (state.page === 'extra') {
     rail.classList.add('plugin-mode')
+    rail.classList.remove('skill-mode')
     if (state.pluginData) {
       rail.innerHTML = pluginRailHtml(state.pluginData)
+      bindPluginRailSearch()
     } else {
       rail.innerHTML = `<div class="side-note muted">插件加载中…</div>`
     }
     return
   }
-  rail.classList.remove('plugin-mode')
+  // 技能管理同样只有一页：左侧承载技能概览、搜索列表和安全治理入口
+  if (state.page === 'skills') {
+    rail.classList.remove('plugin-mode', 'org-rail-mode')
+    rail.classList.add('skill-mode')
+    if (state.skillConsoleData) {
+      rail.innerHTML = skillRailHtml(state.skillConsoleData)
+      bindSkillRail()
+    } else {
+      rail.innerHTML = `<div class="side-note muted">技能加载中…</div>`
+    }
+    return
+  }
+  rail.classList.remove('plugin-mode', 'skill-mode')
   const domain = domainOf(state.page)
   if (domain.id === 'org') {
     const orgPages = [
@@ -9994,15 +12717,23 @@ function renderNavRail() {
     return
   }
   rail.classList.remove('org-rail-mode')
+  // 「连接与平台」页面的说明文字改成一个信息角标：悬停才展开，左侧导航不再被长句撑高
+  const hintIcon =
+    '<span class="nav-hint-icon"><svg aria-hidden="true" width="9" height="9" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6.2" stroke="currentColor" stroke-width="1.3"/><path d="M8 7.3v3.7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><circle cx="8" cy="4.5" r=".9" fill="currentColor"/></svg></span>'
+  const hintMode = domain.id === 'platform'
   rail.innerHTML = `
     ${domain.pages
       .map((page) => {
         const meta = PAGES[page]
         if (!meta) return ''
         const active = page === state.page ? ' is-active' : ''
-        return `<button class="nav-rail-item${active}" type="button" data-page="${page}">
+        return `<button class="nav-rail-item${active}${hintMode ? ' has-hint' : ''}" type="button" data-page="${page}">
           <span class="nav-rail-label">${esc(meta.title)}</span>
-          <span class="nav-rail-sub">${esc(meta.sub)}</span>
+          ${
+            hintMode
+              ? `<span class="nav-rail-hint" title="${esc(meta.sub)}" aria-label="${esc(meta.sub)}">${hintIcon}</span>`
+              : `<span class="nav-rail-sub">${esc(meta.sub)}</span>`
+          }
         </button>`
       })
       .join('')}`
@@ -10033,9 +12764,10 @@ function navigate(page) {
   for (const button of document.querySelectorAll('.nav-primary[data-domain]')) {
     button.classList.toggle('is-active', button.dataset.domain === state.domain)
   }
-  // 插件域：左侧栏承载插件概览与列表，内容区不再保留页内 rail，右侧视图铺满
+  // 插件域 / 技能域：左侧栏承载概览与列表，内容区不再保留页内 rail，右侧视图铺满
   const workspace = document.querySelector('.workspace')
   workspace?.classList.toggle('is-plugin-domain', state.domain === 'plugins')
+  workspace?.classList.toggle('is-skill-domain', state.domain === 'skills')
   // 概览域只有一页，左侧二级导航没有可切换项；收起侧栏，让概览卡片铺满内容区
   workspace?.classList.toggle('no-side', state.domain === 'overview')
   // 所有页面统一不显示大标题/副标题；page-head 只作为页面操作的右侧工具条保留。

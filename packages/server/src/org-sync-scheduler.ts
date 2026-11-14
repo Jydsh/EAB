@@ -10,6 +10,7 @@ import { EC, EabError } from '@eab/domain'
 import type { Db } from '@eab/storage'
 import type { ServerConfig } from './config.js'
 import { resolveSecret } from './secrets.js'
+import { runAsLeader } from './backends/coordination.js'
 
 export type ChannelProvider = 'feishu' | 'dingtalk' | 'wecom'
 
@@ -254,10 +255,12 @@ export function startOrgSyncScheduler(
     if (stopped || running) return
     running = true
     try {
-      const outcomes = await syncBoundChannels(db, config, companyId, options)
-      for (const outcome of outcomes) {
-        if (!outcome.ok) console.warn(`[eab] 自动同步${CHANNEL_PROVIDER_LABEL[outcome.provider]}失败：${outcome.error}`)
-      }
+      await runAsLeader('org-sync', 10 * 60_000, async () => {
+        const outcomes = await syncBoundChannels(db, config, companyId, options)
+        for (const outcome of outcomes) {
+          if (!outcome.ok) console.warn(`[eab] 自动同步${CHANNEL_PROVIDER_LABEL[outcome.provider]}失败：${outcome.error}`)
+        }
+      })
     } catch (error) {
       console.warn('[eab] 自动同步任务失败：', (error as Error).message)
     } finally {

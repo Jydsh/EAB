@@ -18,6 +18,13 @@
   }
 }
 </script>
+<!-- 内核资源提前并发拉取：不再等 boot() 里逐个 import 才发现要下载 4MB primitives。 -->
+<link rel="modulepreload" href="/vendor/dsh-kernel/cordis.js" />
+<link rel="modulepreload" href="/vendor/dsh-kernel/slots.js" />
+<link rel="modulepreload" href="/vendor/dsh-kernel/primitives.js" />
+<link rel="preload" as="script" href="/vendor/dsh-kernel/renderer.js" />
+<link rel="preload" as="script" href="/vendor/react.production.min.js" />
+<link rel="preload" as="script" href="/vendor/react-dom.production.min.js" />
 <link rel="stylesheet" href="/vendor/dsh-kernel/primitives.css" />
 <style>
   :root {
@@ -44,8 +51,15 @@
   .pk-btn { white-space: nowrap; appearance: none; border: 1px solid #d1d5db; background: #fff; color: #374151; border-radius: 8px; padding: 5px 11px; font-size: 12px; cursor: pointer; }
   .pk-btn:hover { border-color: #0f766e; color: #0f766e; }
   .pk-shell { display: grid; grid-template-columns: 220px minmax(0, 1fr); min-height: calc(100vh - 63px); }
-  .pk-kernel-shell { display: grid; grid-template-columns: 220px minmax(0, 1fr); min-height: calc(100vh - 63px); }
-  .pk-kernel-rail { background: #fff; border-right: 1px solid #e4e7ec; padding: 14px 10px; min-width: 0; }
+  .pk-kernel-shell { display: grid; grid-template-columns: minmax(0, 1fr); min-height: calc(100vh - 63px); }
+  .pk-kernel-shell.has-top-rail { grid-template-rows: auto minmax(0, 1fr); }
+  .pk-kernel-rail {
+    display: flex; align-items: center; gap: 10px; min-width: 0;
+    background: #fff; border-right: 0; border-bottom: 1px solid #e4e7ec; padding: 8px 20px; overflow-x: auto;
+  }
+  .pk-kernel-rail-title { flex: none; color: #94a3b8; font-size: 11px; letter-spacing: .06em; }
+  .pk-kernel-rail-items { display: flex; align-items: center; gap: 6px; min-width: 0; }
+  .pk-kernel-rail-items > * { flex: none; }
   .pk-kernel-main { padding: 18px 20px 40px; min-width: 0; }
   .pk-kernel-tabs { display: flex; gap: 6px; margin-bottom: 10px; }
   .pk-kernel-tab { appearance: none; border: 1px solid #d1d5db; background: #fff; color: #6b7280; border-radius: 8px; padding: 4px 12px; font-size: 12px; cursor: pointer; }
@@ -56,6 +70,7 @@
   .pk-main { padding: 18px 20px 40px; min-width: 0; }
   .pk-panel { background: #fff; border: 1px solid #e4e7ec; border-radius: 12px; padding: 18px; min-height: 360px; }
   .pk-error { color: #b91c1c; background: #fef2f2; border: 1px solid #fecaca; border-radius: 10px; padding: 10px 12px; margin-bottom: 12px; font-size: 12px; white-space: pre-wrap; }
+  .pk-gap { color: #92400e; background: #fffbeb; border: 1px solid #fde68a; border-radius: 10px; padding: 10px 12px; margin-bottom: 12px; font-size: 12px; white-space: pre-wrap; }
   .pk-hidden { display: none; }
   .pk-empty { color: #6b7280; padding: 40px 10px; text-align: center; }
 </style>
@@ -74,8 +89,9 @@
   </div>
 </div>
 <div class="pk-error pk-hidden" id="pk-error"></div>
+<div class="pk-gap pk-hidden" id="pk-gap"></div>
 <div id="pk-root">
-  <div class="pk-empty">正在准备 DSH 官方插件内核…</div>
+  <div class="pk-empty">正在加载插件页面…</div>
 </div>
 
 <script src="/vendor/react.production.min.js"></script>
@@ -89,6 +105,8 @@
   const entry = query.get('entry') || ''
   const company = query.get('company') || ''
   const version = query.get('version') || ''
+  const checksum = query.get('h') || ''
+  const warmOnly = query.get('warm') === '1'
   const title = query.get('title') || pluginId
   const scope = query.get('scope') === 'user' ? 'user' : 'console'
   const asUser = query.get('as') || ''
@@ -96,10 +114,37 @@
     ? '/api/my/plugins/' + encodeURIComponent(pluginId) + '/gateway'
     : '/api/console/plugins/' + encodeURIComponent(pluginId) + '/gateway'
 
+  // 插件 iframe 不能把 401 留在自己的页面里显示“需要登录”：
+  // 会话过期时把最外层页面带回对应的登录入口。
+  let hostAuthRedirectStarted = false
+  function redirectHostLogin() {
+    if (hostAuthRedirectStarted) return
+    hostAuthRedirectStarted = true
+    const company = new URLSearchParams(location.search).get('company') || ''
+    let target
+    if (scope === 'user') {
+      const params = new URLSearchParams()
+      if (company) params.set('company', company)
+      params.set('login', '1')
+      target = '/chat?' + params.toString()
+    } else {
+      target = '/admin' + (company ? '?company=' + encodeURIComponent(company) : '')
+    }
+    try {
+      ;(window.top || window).location.replace(target)
+    } catch (_) {
+      location.replace(target)
+    }
+  }
+  function waitForHostLogin() {
+    return new Promise(() => {})
+  }
+
   const nameEl = document.getElementById('pk-name')
   const subEl = document.getElementById('pk-sub')
   const statusEl = document.getElementById('pk-status')
   const errorEl = document.getElementById('pk-error')
+  const gapEl = document.getElementById('pk-gap')
   const mountEl = document.getElementById('pk-root')
 
   nameEl.textContent = title
@@ -109,6 +154,21 @@
   function showError(message) {
     errorEl.textContent = message
     errorEl.classList.remove('pk-hidden')
+  }
+
+  // 未声明 slot 不能静默：官方 SlotCore 会抛 "slot ... is not declared"，
+  // 但插件若在 apply 里自己 catch 掉，页面就会只剩空白。这里统一记录并常驻提示。
+  const slotGaps = []
+  function recordSlotGap(message) {
+    if (!message || slotGaps.some((item) => item.message === message)) return
+    slotGaps.push({ message, at: Date.now() })
+    gapEl.textContent = '插件使用了 EAB 尚未声明的 slot：\n' + slotGaps.map((item) => '- ' + item.message).join('\n')
+    gapEl.classList.remove('pk-hidden')
+    if (statusEl.textContent === '内核已就绪') {
+      statusEl.textContent = '内核已就绪 · ' + slotGaps.length + ' 个 slot 未声明'
+      statusEl.classList.add('warn')
+    }
+    console.warn('[eab-plugin-kernel]', message)
   }
 
   document.getElementById('pk-reload').addEventListener('click', () => location.reload())
@@ -139,7 +199,13 @@
     try { url = new URL(raw, location.href) } catch (_) { return '' }
     if (url.origin !== location.origin) return ''
     if (!isPluginPath(url.pathname)) return ''
-    return gatewayBase + url.pathname + url.search
+    const mapped = gatewayBase + url.pathname + url.search
+    if (scope === 'user' && asUser) {
+      const target = new URL(mapped, location.href)
+      target.searchParams.set('as', asUser)
+      return target.pathname + target.search
+    }
+    return mapped
   }
   function bridgeHeaders(headers) {
     const next = new Headers(headers || {})
@@ -157,6 +223,10 @@
       headers: bridgeHeaders({ 'content-type': 'application/json' }),
       body: JSON.stringify({ channel, call }),
     }).then(async (response) => {
+      if (response.status === 401) {
+        redirectHostLogin()
+        return waitForHostLogin()
+      }
       const payload = await response.json().catch(() => null)
       if (!payload || payload.ok !== true) throw new Error((payload && (payload.message || payload.error)) || 'RPC 请求失败')
       return payload.data
@@ -197,18 +267,28 @@
   }
   function installFetchBridge() {
     const nativeFetch = window.fetch.bind(window)
-    window.fetch = function (input, init) {
+    window.fetch = async function (input, init) {
       const mapped = mapPluginUrl(input)
       if (!mapped) return nativeFetch(input, init)
       const next = {}
       if (init) for (const key in init) if (Object.prototype.hasOwnProperty.call(init, key)) next[key] = init[key]
       next.headers = bridgeHeaders(next.headers)
-      return nativeFetch(mapped, next)
+      const response = await nativeFetch(mapped, next)
+      if (response.status === 401) {
+        redirectHostLogin()
+        return waitForHostLogin()
+      }
+      return response
     }
     const nativeOpen = XMLHttpRequest.prototype.open
     XMLHttpRequest.prototype.open = function (method, url) {
       const mapped = mapPluginUrl(url)
       this.__eabGateway = Boolean(mapped)
+      if (mapped) {
+        this.addEventListener('load', () => {
+          if (this.status === 401) redirectHostLogin()
+        })
+      }
       return nativeOpen.apply(this, mapped ? [method, mapped].concat(Array.prototype.slice.call(arguments, 2)) : arguments)
     }
     const nativeSend = XMLHttpRequest.prototype.send
@@ -258,7 +338,14 @@
     has(name) { return seed[name] !== undefined || factories.has(name) || cache.has(name) },
   }
 
-  function loadScript(url) {
+  async function loadScript(url) {
+    // script 标签加载失败只给 onerror，拿不到 401；先探测一次，会话过期时把外层带回登录页。
+    const probe = await fetch(url, { method: 'HEAD', credentials: 'same-origin' })
+    if (probe.status === 401) {
+      redirectHostLogin()
+      return waitForHostLogin()
+    }
+    if (!probe.ok) throw new Error(`client bundle 加载失败（HTTP ${probe.status}）：${url}`)
     return new Promise((resolve, reject) => {
       const script = document.createElement('script')
       script.src = url
@@ -355,35 +442,80 @@
     if (active && active !== activePanel) setActivePanel(active)
     const hasMain = keys.length > 0
     const hasSettings = !!(registry && registry.entries && registry.entries('settings.section').length)
-    const [view, setView] = React.useState(hasMain ? 'main' : 'settings')
+    const selectedSessionId = readSelectedSessionId()
+    // 没有选中会话时 conversation.view 会渲染成空统计，不如不显示这个页签。
+    const hasConversation = Boolean(selectedSessionId) && !!(registry && registry.entries && registry.entries('conversation.view').length)
+    const [view, setView] = React.useState(hasMain ? 'main' : (hasConversation ? 'conversation' : 'settings'))
     const showSettings = view === 'settings' && hasSettings
+    const showConversation = view === 'conversation' && hasConversation
     const sidebar = renderSlot('sidebar.panellist', { activePanelId: active })
-    // main 与 settings/config 是不同视图，不能同时渲染，否则同一个插件页会出现两份。
-    const main = showSettings ? null : (active ? renderSlot('main', {}, { entryKey: active }) : null)
+    const sidebarEntries = registry && registry.entries ? registry.entries('sidebar.panellist') : []
+    // 单个插件入口时不再保留空的左侧栏；多个入口时横排到主内容上方。
+    const showSidebarRail = sidebarEntries.length > 1
+    // main / conversation / settings 是不同视图，不能同时渲染，否则同一个插件页会出现多份。
+    const main = view === 'main' && active ? renderSlot('main', {}, { entryKey: active }) : null
+    // conversation.view 的组件按 sessionId 读会话投影；EAB 插件页没有官方 conversation shell，
+    // 这里把当前 URL/localStorage 选中的会话作为 owner props 传进去，避免渲染成空会话。
+    const conversation = showConversation
+      ? renderSlot('conversation.view', { sessionId: selectedSessionId, host: 'main' })
+      : null
     const settings = showSettings ? renderSlot('settings.section') : null
     const config = (!hasMain && !showSettings) ? renderSlot('plugins.bundle.config', {}, { entryKey: pluginId }) : null
-    const tabs = (hasMain && hasSettings)
-      ? h('div', { className: 'pk-kernel-tabs', key: 'tabs' }, [
-          h('button', { key: 'main', type: 'button', className: 'pk-kernel-tab' + (!showSettings ? ' active' : ''), onClick: () => setView('main') }, '页面'),
-          h('button', { key: 'settings', type: 'button', className: 'pk-kernel-tab' + (showSettings ? ' active' : ''), onClick: () => setView('settings') }, '设置'),
-        ])
-      : null
-    return h('div', { className: 'pk-kernel-shell' }, [
-      h('div', { className: 'pk-kernel-rail', key: 'rail' }, sidebar),
+    const tabItems = []
+    if (hasMain) tabItems.push(h('button', { key: 'main', type: 'button', className: 'pk-kernel-tab' + (view === 'main' ? ' active' : ''), onClick: () => setView('main') }, '页面'))
+    if (hasConversation) tabItems.push(h('button', { key: 'conversation', type: 'button', className: 'pk-kernel-tab' + (showConversation ? ' active' : ''), onClick: () => setView('conversation') }, '会话上下文'))
+    if (hasSettings) tabItems.push(h('button', { key: 'settings', type: 'button', className: 'pk-kernel-tab' + (showSettings ? ' active' : ''), onClick: () => setView('settings') }, '设置'))
+    const tabs = tabItems.length > 1 ? h('div', { className: 'pk-kernel-tabs', key: 'tabs' }, tabItems) : null
+    return h('div', { className: 'pk-kernel-shell' + (showSidebarRail ? ' has-top-rail' : '') }, [
+      showSidebarRail
+        ? h('div', { className: 'pk-kernel-rail', key: 'rail' }, [
+            h('span', { className: 'pk-kernel-rail-title', key: 'rail-title' }, '插件入口'),
+            h('div', { className: 'pk-kernel-rail-items', key: 'rail-items' }, sidebar),
+          ])
+        : null,
       h('div', { className: 'pk-kernel-main', key: 'main' }, [
         tabs,
-        main || settings || h('div', { className: 'pk-empty', key: 'empty' }, '插件还没有注册 main 页面。'),
+        main || conversation || settings || h('div', { className: 'pk-empty', key: 'empty' }, '插件还没有注册 main 页面。'),
         config,
       ]),
     ])
   }
 
+  async function waitForPluginSlots(ctx, timeout = 500) {
+    const names = [
+      'main',
+      'settings.section',
+      'sidebar.panellist',
+      'conversation.view',
+      'conversation.chat.assistant-actions',
+      'conversation.input.overlay',
+      'plugins.bundle.config',
+    ]
+    const ready = () => {
+      try { return names.some((name) => ctx.slots.entries(name).length > 0) } catch (_) { return false }
+    }
+    if (ready()) return
+    const deadline = Date.now() + timeout
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25))
+      if (ready()) return
+    }
+  }
+
   async function boot() {
-    const Cordis = await import('@deepseek-ai/cordis')
-    const Slots = await import('@deepseek-ai/dsh-client-ui-slots')
+    if (!warmOnly) {
+      statusEl.textContent = '正在加载共享内核'
+      mountEl.innerHTML = '<div class="pk-empty">正在加载共享内核…</div>'
+    }
+    // Cordis / slots / primitives 互不依赖，并发加载；renderer 依赖前两者注册的全局模块加载器。
+    const [Cordis, Slots, primitives] = await Promise.all([
+      import('@deepseek-ai/cordis'),
+      import('@deepseek-ai/dsh-client-ui-slots'),
+      import('@deepseek-ai/dsh-client-ui-primitives'),
+    ])
     seed['@deepseek-ai/cordis'] = Cordis
     seed['@deepseek-ai/dsh-client-ui-slots'] = Slots
-    seed['@deepseek-ai/dsh-client-ui-primitives'] = await import('/vendor/dsh-kernel/primitives.js')
+    seed['@deepseek-ai/dsh-client-ui-primitives'] = primitives
     await loadScript('/vendor/dsh-kernel/renderer.js')
     const ctx = new Cordis.Context()
     // 兼容层：EAB 的服务表是直接放在 ctx 上的，没有走 Cordis loader 的 inject 服务注册。
@@ -404,6 +536,16 @@
     await ctx.plugin(renderer)
     ctx.slots.installLocale(locale)
 
+    // 预热页只加载共享内核，不执行任何插件 client bundle；避免在控制台打开时
+    // 一次性启动所有插件（副作用、额外请求和隔离问题都不允许）。
+    if (warmOnly) {
+      statusEl.textContent = '内核已预热'
+      statusEl.classList.remove('warn')
+      mountEl.innerHTML = ''
+      try { parent.postMessage({ type: 'eab-plugin-kernel-warm', ready: true }, location.origin) } catch (_) {}
+      return
+    }
+
     const emptyBinding = { key: undefined }
     const emptySession = { getSnapshot: () => emptyBinding, subscribe: () => () => {} }
     ctx.slots.installScope('session', { current: emptySession, bindingSource: () => emptySession })
@@ -423,11 +565,32 @@
       inject: () => ({ __slotRegistry: ctx.slots }),
     }, Root)
 
+    // 只包住插件自己后续的 slot 注册：缺声明、重复声明、缺 select 都留痕，
+    // 但不改变官方 SlotCore 的抛错语义，避免把真正的契约错误吞成“看起来能用”。
+    const slotRegister = ctx.slots.register.bind(ctx.slots)
+    try {
+      ctx.slots.register = (options, component) => {
+        try {
+          return slotRegister(options, component)
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          if (/is not declared|already declared|requires options\.select/.test(message)) {
+            recordSlotGap('slot "' + String(options && options.name) + '": ' + message)
+          }
+          throw error
+        }
+      }
+    } catch (_) {}
+
     if (!entry || entry.indexOf('..') >= 0 || entry.charAt(0) === '/' || /^[A-Za-z]:/.test(entry)) {
       throw new Error('插件没有声明合法的 client 入口（exports["./client"]）。')
     }
     const assetUrl = '/plugins/assets/' + encodeURIComponent(pluginId) + '/' + entry.split('/').map(encodeURIComponent).join('/')
       + '?scope=' + (scope === 'user' ? 'user' : 'console')
+      + (version ? '&v=' + encodeURIComponent(version) : '')
+      + (checksum ? '&h=' + encodeURIComponent(checksum) : '')
+    statusEl.textContent = '正在加载插件代码'
+    mountEl.innerHTML = '<div class="pk-empty">正在加载插件代码…</div>'
     await loadScript(assetUrl)
     const factory = factories.get(pluginId)
     if (!factory) throw new Error('client bundle 没有注册 ModuleLoader 模块：' + pluginId)
@@ -439,9 +602,11 @@
       plugin = { name: plugin.name, inject: plugin.inject, apply: plugin.apply }
     }
     await ctx.plugin(plugin)
-    // Cordis 的 ctx.inject(...) 回调在依赖服务就绪后的后续微任务里执行；
-    // 给插件一次注册 slot 的机会，再挂载 renderer，否则首帧会看到 0 个页面。
-    await new Promise((resolve) => setTimeout(resolve, 500))
+    // 不再固定 sleep 500ms：插件通常在本轮 apply 内就注册了 slot；轮询到第一个
+    // slot 立即挂载，只有异步注册时才等到最多 500ms。
+    statusEl.textContent = '正在渲染页面'
+    mountEl.innerHTML = '<div class="pk-empty">正在渲染插件页面…</div>'
+    await waitForPluginSlots(ctx)
 
     statusEl.textContent = '内核已就绪'
     statusEl.classList.remove('warn')
@@ -457,8 +622,9 @@
   boot().catch((error) => {
     statusEl.textContent = '内核启动失败'
     statusEl.classList.add('warn')
-    showError((error && error.stack) || String(error))
-    mountEl.innerHTML = '<div class="pk-empty">插件页面没有启动。</div>'
+    const message = (error && error.stack) || String(error)
+    showError('插件 ' + pluginId + (entry ? '（入口 ' + entry + '）' : '') + ' 启动失败：\n' + message)
+    mountEl.innerHTML = '<div class="pk-empty">插件页面没有启动。可以点右上角「重新加载」重试；若反复失败，请检查插件版本或入口文件。</div>'
   })
 })()
 </script>

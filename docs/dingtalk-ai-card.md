@@ -5,17 +5,10 @@
 EAB 私聊回复**默认走新版 A2UI JSON 卡片**，保留思考/工具折叠面板；
 只有 A2UI 建卡失败时才回退 dsh-im 同款模板卡（`02fcf2f4-...schema`）。
 
-- A2UI 本身没有旧模板那种「正文末尾原生转圈」的流式 widget：`Icon.SpinLoading_L_outlined`
-  官方注明不自转，`Text.textEffect: shimmer` 只在 iOS 生效且是扫光，`ProgressBar variant: block`
-  是 32×32 块状进度。这几种原生组件都不能直接当 spinner 用。
-- 但旧模板那个圆环的**视觉素材就在钉钉客户端安装目录**：
-  `image_resource/taiji_loading.gif`，96×96、30 帧、30ms、无限循环，黑色主弧 + 灰色拖尾。
-  与 dsh-im 真机截图里的圆环形状一致。
-- 现在把这个原生 GIF 缩到 14px（白底、无彩色抖动）后，作为 `Text` 的前置图标放到
-  `answerRow` 的末尾：`Row[Markdown(正文, weight:1), Text(零宽字符 + icon url)]`，
-  底部对齐。圆环与正文最后一行同高、同一行，不靠 Markdown 的块级图片，也不显示百分比/文字。
-  14px 版 CDN 为 `https://aka.doubaocdn.com/s/8Q14U759NP`；正文已出现且未收口时显示，
-  收口/失败时用 `/ui/showAnswerSpinner` 置为 false。
+- A2UI 没有旧模板那种「正文末尾原生转圈」的流式 widget。新版不再使用客户端
+  `taiji_loading.gif`，改为在「最后一个非空正文块」末尾拼一个静态细光标 `▍`：
+  光标和流式文字在同一行，随正文增长移动；如果回答以表格结尾，则在表格后补一个
+  小光标块。收口或进入澄清时移除，不再单独挂 loading 图标。
 - 旧模板卡仍保留为 A2UI 失败时的降级路径；它的 `msgContent` 是钉钉原生流式组件，
   客户端会在正文末尾自动转圈，但只能显示一段文字，无法保留折叠面板。
 - 思考/工具用公开 Catalog 的 `CollapsiblePanel`，`defaultExpanded: false`；
