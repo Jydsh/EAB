@@ -102,16 +102,17 @@ export function findActivePerson(db: Db, userId: string): PersonRow | null {
   return row ? toPerson(row) : null
 }
 
-export function roleCodesOf(db: Db, userId: string): string[] {
+export function roleCodesOf(db: Db, userId: string, now = Date.now()): string[] {
   const rows = db
     .prepare(
       `SELECT r.code AS code
          FROM user_roles ur
          JOIN roles r ON r.id = ur.role_id
         WHERE ur.user_id = ?
+          AND (ur.expires_at IS NULL OR ur.expires_at > ?)
         ORDER BY r.code`,
     )
-    .all(userId) as unknown as RoleRow[]
+    .all(userId, now) as unknown as RoleRow[]
   return rows.map((row) => row.code)
 }
 

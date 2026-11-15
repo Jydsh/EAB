@@ -4,14 +4,16 @@
  * 顺序：读配置 → 开库 → 迁移 → （开发模式）造数据 → 起服务。
  * 任何一步失败都直接退出并打印人话原因，不留半启动状态。
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { networkInterfaces } from 'node:os'
 import { randomBytes } from 'node:crypto'
 import type { FastifyInstance } from 'fastify'
-import { migrate, openDatabase } from '@eab/storage'
+import { migrate } from '@eab/storage'
+import { EC, EabError } from '@eab/domain'
 import { buildApp } from './app.js'
-import { refreshDingTalkStream, startDingTalkStreamMonitor, stopDingTalkStream } from './dingtalk-bot.js'
+import { recoverInterruptedDingTalkTurns, refreshDingTalkStream, startDingTalkStreamMonitor, stopDingTalkStream } from './dingtalk-bot.js'
+import { startPermissionApprovalCardRetry } from './permission-approval-dingtalk.js'
 import { refreshFeishuStream, startFeishuStreamMonitor, stopFeishuStream } from './feishu-bot.js'
 import { cleanupTemp } from './routes/workspace.js'
 import { loadConfig } from './config.js'
@@ -21,10 +23,16 @@ import {
   readConsoleSettings,
   resolveStorage,
   writeConsoleSettings,
+  copyDatabaseCompanionFiles,
+  migrateStorageJobs,
+  type StorageApplyPlan,
   SETTINGS_PATH,
 } from './settings.js'
+import { LiveDatabase } from './live-db.js'
 import { startRetention } from './retention.js'
+import { pruneWorkspaceRecycle, workspaceRootFor } from './workspace-recycle.js'
 import { sweepOrphanAgentRuns, sweepSuspendedRuns } from './agent-runtime.js'
+import { recoverInterruptedAgentTasks } from './agent-team.js'
 import { startScheduleWorker } from './schedule.js'
 import { startOrgSyncScheduler } from './org-sync-scheduler.js'
 import { startModelHealthMonitor, isModelHealthy, probeUnverifiedPluginModels, forgetModelHealth, probePluginChannelModels } from './model-health.js'
@@ -83,7 +91,8 @@ if (storage.pluginsSeededFrom) {
   console.log(`插件目录已初始化：${storage.pluginsSeededFrom} → ${storage.pluginsDir}`)
 }
 
-const db = openDatabase({ path: config.dbPath })
+const liveDb = new LiveDatabase(config.dbPath)
+const db = liveDb.db
 const migration = migrate(db)
 if (migration.applied.length > 0) {
   console.log(`迁移已执行: ${migration.applied.join(', ')}`)
@@ -124,6 +133,14 @@ try {
 
 /** 上次进程崩溃时还挂在 running 的异步作业：租约过期就放回队列，重启后自动接着跑。 */
 try {
+  const recoveredTasks = recoverInterruptedAgentTasks(db)
+  if (recoveredTasks > 0) console.log(`[eab] 已收尾 ${recoveredTasks} 个中断的团队后台任务（检查点保留）`)
+} catch (error) {
+  console.warn(`[eab] 团队后台任务收尾失败：${(error as Error).message}`)
+}
+
+/** 上次进程崩溃时还挂在 running 的异步作业：租约过期就放回队列，重启后自动接着跑。 */
+try {
   const recoveredJobs = recoverStaleJobs(db)
   if (recoveredJobs > 0) console.log(`[eab] 已回收 ${recoveredJobs} 个中断的异步作业`)
 } catch (error) {
@@ -147,13 +164,30 @@ startRetention(
   db,
   () => readConsoleSettings().logRetentionDays,
   (result) => {
-    writeConsoleSettings({ lastCleanupAt: new Date().toISOString(), lastCleanupStats: result.deleted })
-    console.log(
-      `[eab] 保留清理完成：删除 ${result.total} 条（日志 ${result.days} 天 / 审计 ${result.audit.days} 天 / Agent 轨迹 ${result.agentDays > 0 ? `${result.agentDays} 天` : '永久'}）`,
+    const settings = readConsoleSettings()
+    const recycle = pruneWorkspaceRecycle(
+      db,
+      workspaceRootFor(config.dbPath, config.workspacesDir),
+      settings.workspaceRecycleDays,
     )
+    const stats = { ...result.deleted }
+    if (recycle.files > 0) stats.workspaceRecycleFiles = recycle.files
+    if (recycle.bytes > 0) stats.workspaceRecycleBytes = recycle.bytes
+    if (recycle.rows > 0) stats.workspaceRecycleRows = recycle.rows
+    writeConsoleSettings({ lastCleanupAt: new Date().toISOString(), lastCleanupStats: stats })
+    if (result.total > 0 || recycle.files > 0 || recycle.rows > 0) {
+      const recycleText = recycle.skipped
+        ? ''
+        : ` / 回收区 ${recycle.files} 个文件（${(recycle.bytes / 1024 / 1024).toFixed(1)} MB）`
+      console.log(
+        `[eab] 保留清理完成：删除 ${result.total} 条（日志 ${result.days} 天 / 审计 ${result.audit.days} 天 / Agent 轨迹 ${result.agentDays > 0 ? `${result.agentDays} 天` : '永久'} / 项目记录 ${result.recordDays > 0 ? `${result.recordDays} 天` : '永久'}${recycleText}）`,
+      )
+    }
   },
   () => readConsoleSettings().auditRetentionDays,
   () => readConsoleSettings().agentRetentionDays,
+  () => readConsoleSettings().recordRetentionDays,
+  workspaceRootFor(config.dbPath, config.workspacesDir),
 )
 console.log('[eab:boot] 保留清理已启动')
 
@@ -236,6 +270,131 @@ if (!adminPassword) {
 /** 解析后的口令要进入 config：身份解析（session.ts）靠它识别控制台操作员 */
 config = { ...config, consoleToken: config.consoleToken, adminPassword, adminPasswordSource }
 
+/** 把新解析出的存储路径原地写进 config；deps 和各路由持有的是同一个对象。 */
+function applyStoragePathsToConfig(paths: StorageApplyPlan['paths']): void {
+  const mutable = config as unknown as Record<string, unknown>
+  mutable.dataDir = paths.dataDir
+  mutable.dbDir = paths.dbDir
+  mutable.dbPath = paths.dbPath
+  mutable.workspacesDir = paths.workspacesDir
+  mutable.tmpDir = paths.tmpDir
+  mutable.backupsDir = paths.backupsDir
+  mutable.pluginsDir = paths.pluginsDir
+  mutable.dshHomeDir = paths.dshHomeDir
+}
+
+/**
+ * 立即应用存储位置：目录复制校验 + 数据库快照校验 + 写设置 + 切连接。
+ * 全部在同步段内完成，迁移过程中不会插入其它数据库写操作。
+ * 任意一步失败：删除本次新建的目标、保留旧路径与旧连接。
+ */
+function applyStoragePlanNow(plan: StorageApplyPlan): { moved: string[]; skipped: string[] } {
+  const old = {
+    dataDir: config.dataDir ?? dirname(config.dbPath),
+    dbPath: config.dbPath,
+    pluginsDir: config.pluginsDir,
+    dshHomeDir: config.dshHomeDir,
+  }
+  let nextLock: ProcessLock | null = null
+  if (plan.paths.dataDir !== old.dataDir) {
+    mkdirSync(plan.paths.dataDir, { recursive: true })
+    // 先拿新目录的进程锁，成功前不释放旧锁；失败只释放新锁。
+    nextLock = acquireProcessLock(plan.paths.dataDir, plan.paths.dbPath)
+  }
+
+  let directories: { moved: string[]; skipped: string[] } | null = null
+  let prepared: ReturnType<LiveDatabase['prepareAt']> | null = null
+  let dbTarget: string | null = null
+  try {
+    directories = migrateStorageJobs(plan.jobs.filter((job) => job.kind === 'directory'))
+
+    if (plan.paths.dbPath !== old.dbPath) {
+      dbTarget = plan.paths.dbPath
+      mkdirSync(dirname(dbTarget), { recursive: true })
+      if (existsSync(dbTarget)) {
+        throw new EabError(EC.VALIDATION, `目标数据库文件已存在，不能自动覆盖：${dbTarget}`)
+      }
+      liveDb.snapshotTo(dbTarget)
+      copyDatabaseCompanionFiles(dirname(old.dbPath), plan.paths.dbDir)
+      prepared = liveDb.prepareAt(dbTarget)
+    }
+
+    // 设置写入成功之前绝不切换连接；写失败时旧库仍是当前库。
+    writeConsoleSettings(plan.settingsPatch)
+    if (prepared) prepared.activate()
+
+    applyStoragePathsToConfig(plan.paths)
+    setPluginRoot(plan.paths.pluginsDir)
+    if (nextLock) {
+      const previous = processLock
+      processLock = nextLock
+      nextLock = null
+      try {
+        previous.release()
+      } catch {
+        // 旧锁释放失败不影响新锁；进程退出时还会再尝试一次。
+      }
+    }
+
+    const pluginRuntimeChanged =
+      plan.paths.dbPath !== old.dbPath ||
+      plan.paths.pluginsDir !== old.pluginsDir ||
+      plan.paths.dshHomeDir !== old.dshHomeDir
+    if (pluginRuntimeChanged) {
+      void reloadPluginHosts(db, {
+        dbPath: plan.paths.dbPath,
+        dshHomeDir: plan.paths.dshHomeDir,
+        companyId: config.companyId,
+      }).catch((error) => {
+        console.warn('[eab] 存储切换后重载插件宿主失败：', (error as Error).message)
+      })
+    }
+
+    return {
+      moved: [...(directories?.moved ?? []), ...(dbTarget ? [dbTarget] : [])],
+      skipped: directories?.skipped ?? [],
+    }
+  } catch (error) {
+    if (prepared) {
+      prepared.discard()
+      prepared = null
+    }
+    if (dbTarget) {
+      for (const name of ['eab.db', 'eab.db-wal', 'eab.db-shm', 'secrets.json', 'admin-credentials.txt', 'demo-accounts.txt']) {
+        try {
+          rmSync(join(plan.paths.dbDir, name), { force: true })
+        } catch {
+          // 清理失败不覆盖原始错误
+        }
+      }
+      try {
+        rmSync(plan.paths.dbDir, { recursive: false, force: true })
+      } catch {
+        // 目录非空时保留，说明里面不是本次迁移独占的文件
+      }
+    }
+    for (const target of directories?.moved ?? []) {
+      try {
+        rmSync(target, { recursive: true, force: true })
+      } catch {
+        // 回滚失败时保留现场
+      }
+    }
+    nextLock?.release()
+    throw error
+  }
+}
+
+let storageApplyChain: Promise<unknown> = Promise.resolve()
+
+/** 同一时间只允许一个存储迁移；第二次保存排在第一次之后。 */
+function applyStorage(plan: StorageApplyPlan): Promise<{ moved: string[]; skipped: string[] }> {
+  const run = () => applyStoragePlanNow(plan)
+  const next = storageApplyChain.then(run, run)
+  storageApplyChain = next.catch(() => undefined)
+  return next
+}
+
 const apps: { chat?: FastifyInstance; console?: FastifyInstance } = {}
 const deps = {
   db,
@@ -250,6 +409,8 @@ const deps = {
   },
   /** 网络设置保存后在本进程内重建两个监听，不重启服务 */
   applyNetwork: (next: NetworkTarget) => rebindNetwork(next, apps),
+  /** 存储位置保存后立即复制/切换，不重启服务 */
+  applyStorage,
 }
 
 /** 两个入口分端口：员工对话 / 管理控制台。共用同一个库与同一套身份/审计。 */
@@ -401,6 +562,21 @@ void refreshDingTalkStream(deps).catch((error) => {
 })
 /** 每 30 秒巡检一次：密钥缺失、网关断开、客户端卡死都要在控制台可见并自动重建。 */
 const stopDingTalkStreamMonitor = startDingTalkStreamMonitor(deps)
+/** 审批卡失败/半发送状态低频补偿；只补当前 active 步骤，不重复打扰已处理节点。 */
+const stopPermissionApprovalCardRetry = startPermissionApprovalCardRetry(deps)
+
+/**
+ * 上次进程被重启/崩溃时没跑完的钉钉回合：Stream 重连不会替我们重推已 ACK 的消息，
+ * 所以启动后必须自己从 channel_turns 里捞出来，复用原卡、原消息 id 和原工具幂等键继续跑。
+ * 延迟 10 秒等插件模型和工具注册完成，避免恢复时模型目录还没就绪就直接判失败；
+ * 异步执行，不阻塞健康检查；单个回合失败只收口，不影响其它回合。
+ */
+const recoverTimer = setTimeout(() => {
+  void recoverInterruptedDingTalkTurns(deps).catch((error) => {
+    console.warn('[eab] 中断的钉钉回合恢复失败：', (error as Error).message)
+  })
+}, 10_000)
+recoverTimer.unref?.()
 
 /**
  * 飞书同理：本地没有公网回调，默认用长连接接收 im.message.receive_v1；
@@ -418,13 +594,14 @@ async function shutdown(): Promise<void> {
   stopPluginModelCatalogSync()
   stopOrgSyncScheduler()
   stopDingTalkStreamMonitor()
+  stopPermissionApprovalCardRetry()
   stopDingTalkStream()
   stopFeishuStreamMonitor()
   stopFeishuStream()
   await closeApps(apps)
   await closeBackends()
   processLock.release()
-  db.close()
+  liveDb.close()
   process.exit(0)
 }
 

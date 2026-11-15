@@ -276,6 +276,22 @@ function waitForLoginRedirect() {
   return new Promise(() => {})
 }
 
+function withTimeout(promise, ms, message) {
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => reject(new Error(message)), ms)
+    promise.then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      (err) => {
+        clearTimeout(timer)
+        reject(err)
+      },
+    )
+  })
+}
+
 async function api(path, options) {
   const response = await fetch(path, options)
   const payload = await response.json().catch(() => null)
@@ -302,6 +318,8 @@ const state = {
   autoModelId: null,
   canChat: true,
   selected: '',
+  /** 模型目录并发刷新：同一时刻只发一个请求 */
+  modelRefreshPromise: null,
   /** 当前会话选中的思考档位；模型没有思考菜单时为空 */
   reasoningEffort: '',
   /** 会话切换序号：连续点击多个会话时只接受最后一次请求的结果 */
@@ -326,6 +344,8 @@ const state = {
   localLiveMessageIds: new Set(),
   /** 当前等待用户在底部输入区选择方向的澄清请求 */
   pendingClarify: null,
+  /** 非当前会话的钉钉实时输出提示（不强行切换会话） */
+  remoteLive: null,
   /** 多页引导式澄清的当前流程：复用同一条 AI 消息继续推进，不新增用户气泡 */
   clarifyFlow: null,
   /** 右键“编辑后重发”暂存的消息；下一次发送会先回退并替换它 */
@@ -360,6 +380,17 @@ const state = {
   workbenchTab: 'team',
   /** 团队与文件是否并排显示 */
   workbenchSplit: false,
+  /** 右侧工作台是否折叠为窄条；只收起外观，不丢 tab / 并排状态 */
+  workbenchCollapsed: false,
+  /** 权限审批面板是否被用户主动打开；它不是常驻栏，避免每次对话都占右栏 */
+  permOpen: false,
+  permView: 'apply',
+  permRoleCode: '',
+  permConfig: null,
+  permRequests: { mine: [], todo: [] },
+  permSelected: '',
+  permError: '',
+  permSuccess: '',
   /** 顶部吊顶卡片当前跟踪的文件操作；不随 AI 气泡销毁，整个会话内保留。 */
   fileActivity: null,
   fileDockClosed: false,
@@ -377,6 +408,7 @@ const SIDEBAR_COLLAPSED_KEY = 'eab.chat.sidebarCollapsed'
 const FILE_SPLIT_RATIO_KEY = 'eab.chat.fileSplitRatio'
 /** 右栏（Agent 团队 / 文件）与对话之间的宽度比例，独立于文件预览记住 */
 const TEAM_SPLIT_RATIO_KEY = 'eab.chat.teamSplitRatio'
+const WORKBENCH_COLLAPSED_KEY = 'eab.chat.workbenchCollapsed'
 const TEAM_LIST_WIDTH_KEY = 'eab.chat.teamListWidth'
 const SIDE_SECTION_RATIO_KEY = 'eab.chat.sideSectionRatio'
 /** 用户主动上滚后，流式输出不再抢滚动；滚回触底附近才恢复跟随。 */
@@ -513,6 +545,22 @@ async function loadPersonas() {
   }
 }
 
+function markLoginBoot(surface) {
+  try {
+    sessionStorage.setItem('eab.boot.next', surface)
+  } catch {
+    /* 隐私模式禁用 sessionStorage 时只影响启动动画，不影响登录 */
+  }
+}
+
+function endBoot(text) {
+  try {
+    window.EABBoot?.ready(text)
+  } catch {
+    /* 启动层不可用时不能阻断工作台 */
+  }
+}
+
 function showLogin() {
   $('#login-gate').hidden = false
   // 登录页是独占页面：把背后的工作台整体收掉，避免空状态或历史会话从登录卡上方/下方透出来。
@@ -548,6 +596,7 @@ async function doLogin(event) {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ account, password }),
     })
+    markLoginBoot('chat')
     location.href = '/chat'
   } catch (err) {
     errorBox.textContent = `${err.message}${err.code ? `（${err.code}）` : ''}`
@@ -677,6 +726,18 @@ function updateKnownMessage(message, sessionId) {
   setMessageTime(node, message.createdAt)
   const bubble = node.querySelector('.bubble')
   if (!bubble) return false
+  if (
+    role !== 'me' &&
+    message.meta?.clarify &&
+    node.querySelector('.clarify-slot .clarify-card')
+  ) {
+    // 本地 POST 收尾时已经把可交互面板渲染进实时气泡；随后 SSE 的最终消息
+    // 不能再用 historyAiBubble 覆盖整个气泡，否则面板会被冲掉。
+    refreshMessageActions(node)
+    syncMessageActionAvailability()
+    queueScrollBottomButtonUpdate()
+    return true
+  }
   if (role === 'me') {
     bubble.textContent = String(message.text || '')
   } else {
@@ -712,22 +773,29 @@ function appendLiveMessage(message, sessionId) {
     if (runtime.sending) return
   }
   state.historyMessageIds.add(id)
+  const messageClarify =
+    message.role === 'assistant' && message.meta?.clarify && typeof message.meta.clarify === 'object'
+      ? message.meta.clarify
+      : null
+  // 最新一条带 clarify 的 assistant 消息就是当前待答问题：
+  // 不能按“中间澄清步骤”隐藏，否则网页只显示正文/空气泡，看不到可交互面板。
+  if (messageClarify) {
+    showClarifyDock(messageClarify, { flowMeta: message.meta, auto: true })
+    if (sessionId && sessionId === state.sessionId) scheduleSessionRefresh()
+    return
+  }
   // 多页引导的中间选择/追问只用于续跑，不进入聊天消息流。
   if (isHiddenClarifyStep(message)) return
 
   const thread = $('#thread')
   const follow = Boolean(thread && threadScrollPinned)
-  const messageClarify =
-    message.role === 'assistant' && message.meta?.clarify && typeof message.meta.clarify === 'object'
-      ? message.meta.clarify
-      : null
   appendMessage(
     message.role === 'user' ? 'me' : 'ai',
     message.text,
     message.role === 'assistant' && message.modelName ? message.modelName : undefined,
     message.meta && message.meta.attachments,
     message.role === 'assistant' ? message.meta : undefined,
-    { scroll: false, messageId: id, channel: message.meta?.channel, pendingClarify: Boolean(messageClarify), createdAt: message.createdAt },
+    { scroll: false, messageId: id, channel: message.meta?.channel, pendingClarify: false, createdAt: message.createdAt },
   )
   if (message.role === 'user') clearClarifyDock()
   else if (messageClarify) showClarifyDock(messageClarify, { flowMeta: message.meta, auto: true })
@@ -850,10 +918,61 @@ async function loadActiveRuns() {
  * 钉钉私聊和网页对话共用 chat_messages；钉钉侧落库后由服务端广播到这里，
  * 当前会话直接追加，新会话则刷新左侧列表，不需要用户再手动刷新页面。
  */
+/**
+ * 非当前会话的实时输出：不强行切走用户正在看的对话，只在输入框上方
+ * 显示一条可点击的“正在生成”提示，避免钉钉侧流式内容完全不可见。
+ */
+function renderRemoteLive() {
+  const button = $('#remote-live')
+  const label = $('#remote-live-text')
+  if (!button || !label) return
+  const live = state.remoteLive
+  if (!live?.sessionId) {
+    button.hidden = true
+    label.textContent = ''
+    return
+  }
+  const session = state.sessions.find((item) => item.id === live.sessionId)
+  const title = session ? String(session.title || '').replace(/^钉钉\s*·\s*/, '') : '钉钉会话'
+  label.textContent = `${title} · ${live.preview || '正在生成…'}`
+  button.title = `打开「${title}」查看实时回复`
+  button.hidden = false
+}
+
+let remoteLivePaint = 0
+function updateRemoteLive(payload, snapshot) {
+  if (!payload?.sessionId || payload.sessionId === state.sessionId) return
+  const text = String(snapshot?.text || snapshot?.reasoning || '').replace(/\s+/g, ' ').trim()
+  state.remoteLive = {
+    sessionId: payload.sessionId,
+    preview: text ? text.slice(-80) : '正在生成…',
+  }
+  if (remoteLivePaint) return
+  remoteLivePaint = window.setTimeout(() => {
+    remoteLivePaint = 0
+    renderRemoteLive()
+  }, 120)
+}
+
+function clearRemoteLive(sessionId) {
+  if (sessionId && state.remoteLive?.sessionId !== sessionId) return
+  state.remoteLive = null
+  renderRemoteLive()
+}
+
 function setupChatEvents() {
   if (state.liveEventSource || typeof EventSource === 'undefined') return
   const source = new EventSource(`/api/chat/events${qs()}`)
   state.liveEventSource = source
+  const remoteLive = $('#remote-live')
+  if (remoteLive) {
+    remoteLive.addEventListener('click', () => {
+      const sessionId = state.remoteLive?.sessionId
+      if (!sessionId) return
+      clearRemoteLive()
+      void openSession(sessionId)
+    })
+  }
 
   source.addEventListener('chat', (event) => {
     let payload = null
@@ -877,7 +996,10 @@ function setupChatEvents() {
       if (!wasKnown && payload.sessionId !== state.sessionId) renderSessions()
       if (payload.kind === 'reasoning') snapshot.reasoning += String(payload.text)
       else snapshot.text += String(payload.text)
-      if (payload.sessionId !== state.sessionId) return
+      if (payload.sessionId !== state.sessionId) {
+        updateRemoteLive(payload, snapshot)
+        return
+      }
       const entry = liveTurnForSnapshot(snapshot, { fromEvent: true })
       if (!entry) return
       if (entry.skipPayload) {
@@ -932,6 +1054,7 @@ function setupChatEvents() {
     }
 
     if (payload.type !== 'message' || !payload.message) return
+    if (payload.message.role === 'assistant') clearRemoteLive(payload.sessionId)
     if (payload.message.id) state.activeRunSnapshots.delete(String(payload.message.id))
     if (payload.sessionId === state.sessionId) {
       const id = String(payload.message.id || '')
@@ -990,6 +1113,15 @@ function setupChatEvents() {
       }
       scheduleSessionRefresh()
     }
+  })
+
+  // 管理后台改了模型目录：后端通过 SSE 推 models 事件，页面收到后重拉一次目录。
+  source.addEventListener('models', () => {
+    void refreshModelCatalog()
+  })
+  // SSE 首次连上或断线重连后补一次，覆盖“连接建立前目录已变化”的空档。
+  source.addEventListener('ready', () => {
+    void refreshModelCatalog()
   })
 
   // EventSource 会自己重连；这里不主动 close，避免服务重启后永久失去推送。
@@ -1215,7 +1347,72 @@ function fillHistoryIfNeeded() {
   if (thread.scrollHeight <= thread.clientHeight + 4) loadOlderMessages()
 }
 
+async function loadPersistedAgentTeam(sessionId, seq) {
+  if (!sessionId) return
+  try {
+    const data = await api(`/api/chat/agents?sessionId=${encodeURIComponent(sessionId)}`)
+    if (seq !== agentTeamPollSeq || state.sessionId !== sessionId) return
+    const workers = Array.isArray(data.workers) ? data.workers : []
+    const tasks = Array.isArray(data.tasks) ? data.tasks : []
+    if (workers.length === 0) {
+      renderAgentDock()
+      return
+    }
+    const taskByKey = new Map()
+    for (const task of tasks) {
+      if (task && task.key && !taskByKey.has(task.key)) taskByKey.set(task.key, task)
+    }
+    for (const worker of workers) {
+      const previous = state.agentRuns.get(`${sessionId}:k:${worker.key}`) || {}
+      const latestTask = taskByKey.get(worker.key)
+      const status = worker.status === 'waiting'
+        ? 'waiting'
+        : worker.status === 'idle'
+          ? (latestTask?.status === 'failed' ? 'failed' : latestTask?.status === 'cancelled' ? 'cancelled' : 'done')
+          : 'running'
+      const lastText = String(worker.lastText || '')
+      const thread = Array.isArray(previous.thread) && previous.thread.length > 0
+        ? previous.thread
+        : lastText
+          ? [{ kind: status === 'done' ? 'report' : 'content', text: lastText, at: Number(worker.lastTaskAt) || Date.now() }]
+          : []
+      state.agentRuns.set(`${sessionId}:k:${worker.key}`, {
+        ...previous,
+        childId: `${sessionId}:k:${worker.key}`,
+        key: worker.key,
+        parentRunId: previous.parentRunId || latestTask?.parentRunId || '',
+        runId: previous.runId || worker.runId || '',
+        index: Number(worker.index) || previous.index || 1,
+        title: worker.name || previous.title || worker.key,
+        modelId: worker.modelId || previous.modelId || '',
+        modelName: worker.modelName || previous.modelName || '',
+        status,
+        text: lastText || previous.text || '',
+        thread,
+        error: previous.error || latestTask?.error || '',
+        updatedAt: Date.now(),
+      })
+    }
+    renderAgentDock()
+  } catch {
+    // 团队进度是辅助信息，接口失败不影响对话主流程。
+  }
+}
+
+function startAgentTeamPolling(sessionId) {
+  if (agentTeamPollTimer) clearInterval(agentTeamPollTimer)
+  agentTeamPollTimer = null
+  if (!sessionId) return
+  const seq = ++agentTeamPollSeq
+  void loadPersistedAgentTeam(sessionId, seq)
+  agentTeamPollTimer = setInterval(() => {
+    if (state.sessionId !== sessionId) return
+    void loadPersistedAgentTeam(sessionId, seq)
+  }, 4000)
+}
+
 async function openSession(sessionId) {
+  clearRemoteLive()
   hideSettings()
   setChatMode('chat')
   resetAgentRuns()
@@ -1269,6 +1466,7 @@ async function openSession(sessionId) {
       if (thread) thread.style.visibility = ''
     }
     attachLiveTurnForSession(data.session.id)
+    startAgentTeamPolling(data.session.id)
     if (pendingClarify?.meta?.clarify) {
       showClarifyDock(pendingClarify.meta.clarify, { flowMeta: pendingClarify.meta, auto: true })
     } else {
@@ -1804,7 +2002,10 @@ function renderWorkspaceFiles() {
     )
     .join('')
   for (const button of box.querySelectorAll('[data-file-open]')) {
-    button.addEventListener('click', () => openWorkspaceFile(button.dataset.fileOpen))
+    button.addEventListener('click', (event) => {
+      if (event.isTrusted) setWorkbenchCollapsed(false)
+      openWorkspaceFile(button.dataset.fileOpen)
+    })
   }
   for (const button of box.querySelectorAll('[data-file-more]')) {
     button.addEventListener('click', (event) => {
@@ -1941,7 +2142,7 @@ function deleteWorkspaceFile(file, fromPreview = false) {
   overlay.className = 'modal-overlay'
   overlay.innerHTML = `<div class="modal">
     <div class="modal-head"><h3>删除文件</h3><button class="modal-x" type="button">×</button></div>
-    <p class="hint">「${esc(file.name)}」会移到回收区并保留元数据，可在审计中追溯。</p>
+    <p class="hint">「${esc(file.name)}」会移到回收区并保留元数据，后台按回收区保留天数自动物理清理；设为 0 时永久保留。</p>
     <div class="modal-state" id="ws-delete-state"></div>
     <div class="modal-actions"><button class="btn ghost" type="button" id="ws-delete-cancel">取消</button><button class="btn danger" type="button" id="ws-delete-confirm">删除</button></div>
   </div>`
@@ -2014,30 +2215,41 @@ function syncWorkbenchLayout() {
   const rail = $('#workbench-rail')
   const teamPane = $('#team-pane')
   const filePane = $('#file-pane')
+  const permPane = $('#perm-pane')
   const main = $('.chat-main')
-  if (!rail || !teamPane || !filePane || !main) return
+  if (!rail || !teamPane || !filePane || !permPane || !main) return
 
   const inChat = state.mode === 'chat'
   const hasTeam = inChat && state.agentRuns.size > 0
-  const hasFile = inChat && Boolean(state.filePreview)
-  rail.hidden = !(hasTeam || hasFile)
+  // 工作台整页预览也复用同一个文件栏；只看对话模式会把它藏掉，导致 PDF/Office 预览只剩 DOM。
+  const hasFile = Boolean(state.filePreview)
+  const hasPerm = inChat && state.permOpen
+  const hasWorkbench = hasTeam || hasFile || hasPerm
+  rail.hidden = !hasWorkbench
+  const collapsed = hasWorkbench && state.workbenchCollapsed
+  rail.classList.toggle('is-collapsed', collapsed)
 
   // 当前面板没有内容时自动切到另一个，避免打开一个空白面板。
-  if (state.workbenchTab === 'team' && !hasTeam && hasFile) state.workbenchTab = 'file'
-  if (state.workbenchTab === 'file' && !hasFile && hasTeam) state.workbenchTab = 'team'
+  const tabAvailable = (name) => (name === 'team' ? hasTeam : name === 'file' ? hasFile : hasPerm)
+  if (state.workbenchSplit && !(hasTeam && hasFile)) state.workbenchSplit = false
+  if (!tabAvailable(state.workbenchTab)) {
+    state.workbenchTab = hasTeam ? 'team' : hasFile ? 'file' : hasPerm ? 'perm' : state.workbenchTab
+  }
 
   const showTeam = hasTeam && (state.workbenchSplit || state.workbenchTab === 'team')
   const showFile = hasFile && (state.workbenchSplit || state.workbenchTab === 'file')
+  const showPerm = hasPerm && !state.workbenchSplit && state.workbenchTab === 'perm'
   teamPane.hidden = !showTeam
   filePane.hidden = !showFile
+  permPane.hidden = !showPerm
   $('#workbench-body')?.classList.toggle('is-split', state.workbenchSplit && showTeam && showFile)
 
   const tabs = $('#workbench-tabs')
   if (tabs) {
-    tabs.hidden = !hasTeam && !hasFile
+    tabs.hidden = !hasWorkbench
     tabs.querySelectorAll('[data-workbench-tab]').forEach((tab) => {
       const name = tab.getAttribute('data-workbench-tab')
-      const available = name === 'team' ? hasTeam : hasFile
+      const available = tabAvailable(name)
       tab.hidden = !available
       const selected = state.workbenchSplit || state.workbenchTab === name
       tab.classList.toggle('is-active', selected)
@@ -2049,21 +2261,478 @@ function syncWorkbenchLayout() {
       count.hidden = total === 0
       count.textContent = String(total)
     }
+    const permCount = $('#workbench-perm-count')
+    if (permCount) {
+      const total = state.permRequests.todo.length
+      permCount.hidden = total === 0
+      permCount.textContent = String(total)
+    }
     const split = $('#workbench-split')
     if (split) {
       split.hidden = !(hasTeam && hasFile)
       split.classList.toggle('is-active', state.workbenchSplit)
       split.setAttribute('aria-pressed', state.workbenchSplit ? 'true' : 'false')
     }
+    const collapse = $('#workbench-collapse')
+    if (collapse) {
+      collapse.hidden = !hasWorkbench
+      collapse.setAttribute('aria-expanded', collapsed ? 'false' : 'true')
+      collapse.title = collapsed ? '展开右侧工作台' : '收起右侧工作台'
+      collapse.setAttribute('aria-label', collapse.title)
+    }
+  }
+
+  const restore = $('#workbench-restore')
+  if (restore) {
+    restore.hidden = !collapsed
+    restore.setAttribute('aria-expanded', collapsed ? 'false' : 'true')
+    const restoreLabel = $('#workbench-restore-label')
+    if (restoreLabel) restoreLabel.textContent = hasTeam ? '团队' : hasFile ? '文件' : '权限'
+    const restoreCount = $('#workbench-restore-count')
+    if (restoreCount) {
+      const total = hasTeam ? state.agentRuns.size : hasPerm ? state.permRequests.todo.length : 0
+      restoreCount.hidden = total === 0
+      restoreCount.textContent = String(total)
+    }
   }
 
   if (inChat) main.classList.toggle('is-split-preview', !rail.hidden)
   // 右栏（团队或文件）出现时就是可拖拽分栏，鼠标拖分界线即可改两边宽度。
   main.classList.toggle('is-workbench-open', !rail.hidden)
+  main.classList.toggle('is-workbench-collapsed', collapsed)
   main.classList.toggle('is-team-only', !rail.hidden && hasTeam && !hasFile)
   main.classList.toggle('is-team-file', !rail.hidden && hasTeam && hasFile)
+  main.classList.toggle('is-perm-only', !rail.hidden && hasPerm && !hasTeam && !hasFile)
   const resizer = $('#file-split-resizer')
-  if (resizer) resizer.hidden = !(inChat && !rail.hidden)
+  if (resizer) resizer.hidden = !(inChat && !rail.hidden && !collapsed)
+}
+
+function setWorkbenchCollapsed(collapsed, options = {}) {
+  const next = Boolean(collapsed)
+  if (state.workbenchCollapsed === next) return
+  state.workbenchCollapsed = next
+  if (options.persist !== false) {
+    try {
+      localStorage.setItem(WORKBENCH_COLLAPSED_KEY, next ? '1' : '0')
+    } catch {
+      /* 本地存储不可用时只影响记忆，不影响本次折叠 */
+    }
+  }
+  syncWorkbenchLayout()
+}
+
+/* ---------------- 权限审批面板 ---------------- */
+
+const PERM_STATUS_TEXT = {
+  pending: '审批中',
+  approved: '已通过',
+  rejected: '已拒绝',
+  cancelled: '已撤回',
+  expired: '已超时',
+}
+
+const PERM_STEP_TEXT = {
+  pending: '待处理',
+  active: '待审批',
+  approved: '已同意',
+  rejected: '已拒绝',
+  skipped: '已跳过',
+  expired: '已超时',
+}
+
+function permTime(value) {
+  const time = Number(value)
+  if (!Number.isFinite(time) || time <= 0) return '—'
+  return new Date(time).toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+}
+
+function permStatusHtml(status) {
+  const key = String(status || '')
+  return `<span class="perm-status is-${esc(key)}">${esc(PERM_STATUS_TEXT[key] || key)}</span>`
+}
+
+function permRoleOf(code) {
+  return (state.permConfig?.roles || []).find((role) => role.code === code) || null
+}
+
+function permApplyHtml() {
+  const roles = state.permConfig?.roles || []
+  if (!roles.length) {
+    return `<div class="perm-empty"><span class="perm-empty-title">暂无可申请角色</span>需要管理员先把角色标记为可申请，并配置按权限范围的审批策略。</div>`
+  }
+  const selectedCode = state.permRoleCode || roles.find((role) => role.applicable)?.code || ''
+  const cards = roles.map((role) => {
+    const selected = role.code === selectedCode
+    const disabled = !role.applicable
+    const scopes = (role.scopes || []).map((scope) => esc(scope)).join('、') || '—'
+    const policy = role.policy
+      ? `审批链：最多 ${role.policy.maxLevels} 级，${role.policy.includeCompanyAdmin ? '公司管理员兜底' : '不兜底'}，${role.policy.timeoutHours} 小时内处理`
+      : role.reason || '暂不可申请'
+    return `
+      <label class="perm-role${selected ? ' is-selected' : ''}${disabled ? ' is-disabled' : ''}">
+        <input type="radio" name="perm-role" value="${esc(role.code)}"${selected ? ' checked' : ''}${disabled ? ' disabled' : ''}>
+        <span class="perm-role-radio" aria-hidden="true"></span>
+        <span class="perm-role-main">
+          <span class="perm-role-title">${esc(role.name)} <span class="perm-role-code">${esc(role.code)}</span></span>
+          <span class="perm-role-scopes">${scopes}</span>
+          <span class="perm-role-note">${esc(policy)}</span>
+        </span>
+      </label>`
+  }).join('')
+  return `
+    <form class="perm-form" id="perm-apply-form">
+      <div class="perm-field">
+        <span class="perm-field-label">申请角色</span>
+        <div class="perm-role-list" id="perm-role-list">${cards}</div>
+        <span class="perm-field-hint">只能本人申请；管理角色不走自助申请。</span>
+      </div>
+      <div class="perm-field">
+        <label class="perm-field-label" for="perm-reason">申请原因</label>
+        <textarea class="perm-textarea" id="perm-reason" maxlength="500" placeholder="说明你要用这个角色做什么，审批人会看到"></textarea>
+        <span class="perm-field-hint">选填，最多 500 字。</span>
+      </div>
+      <div class="perm-field">
+        <label class="perm-field-label" for="perm-duration">授权有效期</label>
+        <select class="perm-select" id="perm-duration">
+          <option value="72">3 天</option>
+          <option value="168" selected>7 天</option>
+          <option value="720">30 天</option>
+        </select>
+        <span class="perm-field-hint">最后一级同意后开始计时，到期自动失效；最长 30 天。</span>
+      </div>
+      ${state.permError ? `<div class="perm-error">${esc(state.permError)}</div>` : ''}
+      ${state.permSuccess ? `<div class="perm-success">${esc(state.permSuccess)}</div>` : ''}
+      <div class="perm-form-actions">
+        <button class="btn primary" type="submit" id="perm-submit">提交申请</button>
+      </div>
+    </form>`
+}
+
+function permRequestCardHtml(request, activeId) {
+  const total = Math.max(1, Number(request.totalSteps) || 1)
+  const done = Math.max(0, Math.min(total, Number(request.currentStep) - 1))
+  const width = request.status === 'approved' ? 100 : Math.round((done / total) * 100)
+  return `
+    <button class="perm-card${request.id === activeId ? ' is-active' : ''}" type="button" data-perm-request="${esc(request.id)}">
+      <span class="perm-card-top">
+        <span class="perm-card-role">${esc(request.roleName)}</span>
+        ${permStatusHtml(request.status)}
+      </span>
+      <span class="perm-card-meta">${esc(request.requesterName)} · ${esc(permTime(request.createdAt))} · ${Number(request.durationHours) / 24 || 1} 天</span>
+      <span class="perm-card-progress">
+        <span class="perm-progress-track"><span class="perm-progress-fill" style="width:${width}%"></span></span>
+        <span>${done}/${total} 级</span>
+      </span>
+    </button>`
+}
+
+function permDetailHtml(request) {
+  if (!request) return ''
+  const meId = state.me?.person?.id || ''
+  const current = (request.steps || []).find((step) => step.stepNo === Number(request.currentStep))
+  const canDecideHere = request.status === 'pending' && current && current.approverUserId === meId && current.status === 'active'
+  const canCancel = request.status === 'pending' && request.requesterUserId === meId
+  const canResend = request.status === 'pending' && current && (current.cardStatus === 'failed' || current.cardStatus === 'sending')
+  const steps = (request.steps || []).map((step, index) => `
+    <div class="perm-step">
+      <div class="perm-step-rail">
+        <span class="perm-step-dot is-${esc(step.status)}" aria-hidden="true"></span>
+        ${index < request.steps.length - 1 ? '<span class="perm-step-line" aria-hidden="true"></span>' : ''}
+      </div>
+      <div class="perm-step-main">
+        <div class="perm-step-title"><span>第 ${step.stepNo} 级 · ${esc(step.approverName)}</span><span>${esc(PERM_STEP_TEXT[step.status] || step.status)}</span></div>
+        <div class="perm-step-sub">${step.decidedAt ? `处理于 ${esc(permTime(step.decidedAt))}` : step.cardStatus === 'failed' ? '审批卡投递失败，可重发' : '等待处理'}${step.comment ? ` · ${esc(step.comment)}` : ''}</div>
+      </div>
+    </div>`).join('')
+  const actionHtml = canDecideHere
+    ? `
+      <div class="perm-comment">
+        <label class="perm-field-label" for="perm-comment">审批意见</label>
+        <textarea class="perm-textarea" id="perm-comment" maxlength="500" placeholder="拒绝时建议写明原因"></textarea>
+      </div>
+      <div class="perm-detail-actions">
+        <button class="btn primary" type="button" data-perm-decide="approve">同意</button>
+        <button class="btn danger" type="button" data-perm-decide="reject">拒绝</button>
+      </div>`
+    : canCancel
+      ? `<div class="perm-detail-actions"><button class="btn ghost" type="button" data-perm-cancel="1">撤回申请</button></div>`
+      : canResend
+        ? `<div class="perm-detail-actions"><button class="btn ghost" type="button" data-perm-resend="1">重发钉钉审批卡</button></div>`
+        : ''
+  return `
+    <div class="perm-detail" data-perm-detail="${esc(request.id)}">
+      <div class="perm-detail-head">
+        <div class="perm-detail-title">
+          <strong>${esc(request.roleName)}</strong>
+          ${permStatusHtml(request.status)}
+          <button class="icon-btn" type="button" data-perm-back="1" title="返回列表" aria-label="返回列表">←</button>
+        </div>
+        <dl class="perm-detail-facts">
+          <dt>申请人</dt><dd>${esc(request.requesterName)}</dd>
+          <dt>权限范围</dt><dd>${(request.scopes || []).map((scope) => esc(scope)).join('、') || '—'}</dd>
+          <dt>审批进度</dt><dd>第 ${Number(request.currentStep)} / ${Number(request.totalSteps)} 级</dd>
+          <dt>有效期</dt><dd>${Number(request.durationHours) / 24 || 1} 天</dd>
+          <dt>申请原因</dt><dd>${esc(request.reason || '未填写')}</dd>
+          <dt>提交时间</dt><dd>${esc(permTime(request.createdAt))}</dd>
+          <dt>处理时限</dt><dd>${esc(permTime(request.requestDeadline))}</dd>
+        </dl>
+      </div>
+      <div class="perm-steps">${steps}</div>
+      ${state.permError ? `<div class="perm-error">${esc(state.permError)}</div>` : ''}
+      ${state.permSuccess ? `<div class="perm-success">${esc(state.permSuccess)}</div>` : ''}
+      ${actionHtml}
+    </div>`
+}
+
+function renderPermissionPane() {
+  const body = $('#perm-body')
+  if (!body) return
+  const counts = { mine: state.permRequests.mine.length, todo: state.permRequests.todo.length }
+  const todoCount = $('#perm-todo-count')
+  if (todoCount) {
+    todoCount.hidden = counts.todo === 0
+    todoCount.textContent = String(counts.todo)
+  }
+  const entryCount = $('#perm-entry-count')
+  if (entryCount) {
+    entryCount.hidden = counts.todo === 0
+    entryCount.textContent = String(counts.todo)
+  }
+  document.querySelectorAll('[data-perm-view]').forEach((button) => {
+    const view = button.getAttribute('data-perm-view')
+    const active = view === state.permView
+    button.classList.toggle('is-active', active)
+    button.setAttribute('aria-selected', active ? 'true' : 'false')
+  })
+  if (state.permLoading) {
+    body.innerHTML = '<div class="perm-loading muted">正在读取权限审批…</div>'
+    return
+  }
+  if (state.permView === 'apply') {
+    body.innerHTML = permApplyHtml()
+    return
+  }
+  const list = state.permView === 'todo' ? state.permRequests.todo : state.permRequests.mine
+  if (state.permSelected) {
+    const selected = list.find((request) => request.id === state.permSelected)
+    if (selected) {
+      body.innerHTML = permDetailHtml(selected)
+      return
+    }
+  }
+  if (!list.length) {
+    body.innerHTML = state.permView === 'todo'
+      ? '<div class="perm-empty"><span class="perm-empty-title">没有待你审批的申请</span>当前步骤轮到你时，钉钉会收到审批卡，也会出现在这里。</div>'
+      : '<div class="perm-empty"><span class="perm-empty-title">还没有发起过申请</span>切到「申请权限」，选一个可申请角色提交即可。</div>'
+    return
+  }
+  body.innerHTML = `<div class="perm-list">${list.map((request) => permRequestCardHtml(request, state.permSelected)).join('')}</div>`
+}
+
+async function loadPermissionData(options = {}) {
+  if (!state.permOpen && !options.silent) return
+  state.permLoading = true
+  if (!options.silent) renderPermissionPane()
+  try {
+    const [config, mine, todo] = await Promise.all([
+      api('/api/permissions/config'),
+      api('/api/permissions/requests?mode=mine'),
+      api('/api/permissions/requests?mode=todo'),
+    ])
+    state.permConfig = config
+    state.permRequests = { mine: mine.requests || [], todo: todo.requests || [] }
+    state.permError = ''
+    if (state.permSelected && ![...state.permRequests.mine, ...state.permRequests.todo].some((item) => item.id === state.permSelected)) {
+      state.permSelected = ''
+    }
+  } catch (error) {
+    state.permError = `${error.message}${error.hint ? `（${error.hint}）` : ''}`
+  } finally {
+    state.permLoading = false
+    if (state.permOpen && !options.silent) renderPermissionPane()
+    syncWorkbenchLayout()
+  }
+}
+
+async function refreshPermissionBadge() {
+  try {
+    const todo = await api('/api/permissions/requests?mode=todo')
+    state.permRequests.todo = todo.requests || []
+    if (state.permConfig) renderPermissionPane()
+    syncWorkbenchLayout()
+  } catch {
+    // 没有审批权限或后端未迁移时，徽标安静地不显示。
+  }
+}
+
+function openPermissionPane() {
+  state.permOpen = true
+  state.workbenchTab = 'perm'
+  state.permSuccess = ''
+  setWorkbenchCollapsed(false)
+  syncWorkbenchLayout()
+  renderPermissionPane()
+  void loadPermissionData()
+  $('#perm-body')?.scrollTo?.({ top: 0 })
+}
+
+function closePermissionPane() {
+  state.permOpen = false
+  state.permSelected = ''
+  state.permError = ''
+  state.permSuccess = ''
+  syncWorkbenchLayout()
+}
+
+async function submitPermissionApply(event) {
+  event.preventDefault()
+  const form = event.currentTarget
+  const role = form?.querySelector('input[name="perm-role"]:checked')?.value || ''
+  if (!role) {
+    state.permError = '请先选择一个可申请角色'
+    renderPermissionPane()
+    return
+  }
+  const reason = $('#perm-reason')?.value || ''
+  const durationHours = Number($('#perm-duration')?.value || 168)
+  const button = $('#perm-submit')
+  if (button) {
+    button.disabled = true
+    button.textContent = '提交中…'
+  }
+  state.permError = ''
+  try {
+    const result = await api('/api/permissions/requests', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ roleCode: role, reason, durationHours }),
+    })
+    state.permSuccess = result.cardPending
+      ? '申请已提交，正在给第一级审批人发钉钉审批卡。'
+      : '申请已提交。'
+    state.permSelected = result.request?.id || ''
+    state.permView = 'mine'
+    await loadPermissionData()
+    if (state.permSelected) renderPermissionPane()
+  } catch (error) {
+    state.permError = `${error.message}${error.hint ? `（${error.hint}）` : ''}`
+  } finally {
+    if (button) {
+      button.disabled = false
+      button.textContent = '提交申请'
+    }
+    renderPermissionPane()
+  }
+}
+
+async function decidePermissionFromWeb(requestId, decision) {
+  const comment = $('#perm-comment')?.value || ''
+  state.permError = ''
+  try {
+    const result = await api(`/api/permissions/requests/${encodeURIComponent(requestId)}/decide`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ decision, comment }),
+    })
+    state.permSuccess = decision === 'approve' ? '已同意，流程已推进。' : '已拒绝，流程已结束。'
+    state.permSelected = result.request?.id || ''
+    await loadPermissionData()
+    if (state.permSelected) renderPermissionPane()
+  } catch (error) {
+    state.permError = `${error.message}${error.hint ? `（${error.hint}）` : ''}`
+    renderPermissionPane()
+  }
+}
+
+async function cancelPermissionFromWeb(requestId) {
+  state.permError = ''
+  try {
+    const result = await api(`/api/permissions/requests/${encodeURIComponent(requestId)}/cancel`, { method: 'POST' })
+    state.permSuccess = '申请已撤回。'
+    state.permSelected = result.request?.id || ''
+    await loadPermissionData()
+    if (state.permSelected) renderPermissionPane()
+  } catch (error) {
+    state.permError = `${error.message}${error.hint ? `（${error.hint}）` : ''}`
+    renderPermissionPane()
+  }
+}
+
+async function resendPermissionCard(requestId) {
+  state.permError = ''
+  try {
+    const result = await api(`/api/permissions/requests/${encodeURIComponent(requestId)}/resend-card`, { method: 'POST' })
+    state.permSuccess = result.sent ? '审批卡已重新投递。' : '审批卡未投递成功，请检查审批人钉钉绑定。'
+    await loadPermissionData()
+    if (state.permSelected) renderPermissionPane()
+  } catch (error) {
+    state.permError = `${error.message}${error.hint ? `（${error.hint}）` : ''}`
+    renderPermissionPane()
+  }
+}
+
+function bindPermissionPane() {
+  $('#perm-entry')?.addEventListener('click', () => {
+    if (state.permOpen && state.workbenchTab === 'perm' && !state.workbenchCollapsed) {
+      closePermissionPane()
+      return
+    }
+    openPermissionPane()
+  })
+  $('#perm-pane-close')?.addEventListener('click', closePermissionPane)
+  $('#perm-switch')?.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-perm-view]')
+    if (!button) return
+    state.permView = button.getAttribute('data-perm-view') || 'apply'
+    state.permSelected = ''
+    state.permError = ''
+    state.permSuccess = ''
+    renderPermissionPane()
+  })
+  $('#perm-body')?.addEventListener('change', (event) => {
+    const input = event.target.closest('input[name="perm-role"]')
+    if (!input) return
+    state.permRoleCode = input.value
+    document.querySelectorAll('.perm-role').forEach((card) => {
+      const radio = card.querySelector('input[name="perm-role"]')
+      card.classList.toggle('is-selected', Boolean(radio?.checked))
+    })
+  })
+  $('#perm-body')?.addEventListener('submit', (event) => {
+    if (event.target?.id !== 'perm-apply-form') return
+    void submitPermissionApply(event)
+  })
+  $('#perm-body')?.addEventListener('click', (event) => {
+    const card = event.target.closest('[data-perm-request]')
+    if (card) {
+      state.permSelected = card.getAttribute('data-perm-request') || ''
+      state.permError = ''
+      state.permSuccess = ''
+      renderPermissionPane()
+      return
+    }
+    if (event.target.closest('[data-perm-back]')) {
+      state.permSelected = ''
+      state.permError = ''
+      state.permSuccess = ''
+      renderPermissionPane()
+      return
+    }
+    const decide = event.target.closest('[data-perm-decide]')
+    if (decide) {
+      const requestId = state.permSelected
+      if (requestId) void decidePermissionFromWeb(requestId, decide.getAttribute('data-perm-decide'))
+      return
+    }
+    if (event.target.closest('[data-perm-cancel]') && state.permSelected) {
+      void cancelPermissionFromWeb(state.permSelected)
+      return
+    }
+    if (event.target.closest('[data-perm-resend]') && state.permSelected) {
+      void resendPermissionCard(state.permSelected)
+    }
+  })
+  void refreshPermissionBadge()
 }
 
 function beginParentAgentTurn(runId) {
@@ -2126,7 +2795,9 @@ function updateAgentEvent(data) {
     text: previous.text || '',
     steps: Array.isArray(previous.steps) ? previous.steps.slice() : [],
     thread,
-    error: data.error || previous.error || '',
+    error: data.action === 'done' && (data.status === 'unregistered' || data.status === 'succeeded')
+      ? ''
+      : (data.error || previous.error || ''),
     durationMs: Number(data.durationMs) || previous.durationMs || 0,
     toolCount: Number.isFinite(Number(data.toolCount)) ? Number(data.toolCount) : (previous.toolCount || 0),
     updatedAt: Date.now(),
@@ -2134,7 +2805,14 @@ function updateAgentEvent(data) {
   }
 
   if (data.action === 'assign') {
-    pushThreadEntry(thread, { kind: 'assign', text: String(data.text || '（派发任务）'), at: Date.now() })
+    // 子 Agent 处于 waiting 时的再次 assign，实际是父 Agent 对提问的答复/续跑指令，
+    // 不能再显示成「派发」，否则多轮对话看起来像反复下新任务。
+    const kind = previous.status === 'waiting' ? 'answer' : 'assign'
+    pushThreadEntry(thread, {
+      kind,
+      text: String(data.text || (kind === 'answer' ? '（父 Agent 答复）' : '（派发任务）')),
+      at: Date.now(),
+    })
     // 新任务派下来 → 取消上一次的注销计划，并把窗口展开看过程。
     if (next.retireTimer) {
       clearTimeout(next.retireTimer)
@@ -2146,7 +2824,8 @@ function updateAgentEvent(data) {
     pushThreadEntry(thread, { kind: 'content', text: String(data.text || ''), at: Date.now() })
   } else if (data.action === 'report') {
     next.text = `${next.text}${next.text ? '\n' : ''}${data.text || ''}`.slice(-4000)
-    pushThreadEntry(thread, { kind: 'report', text: String(data.text || ''), at: Date.now(), error: data.error || '' })
+    // 重试过程保留为普通过程记录，最终状态由 done 决定，避免成功任务还挂着红字。
+    pushThreadEntry(thread, { kind: 'report', text: String(data.text || ''), at: Date.now(), error: '' })
   } else if (data.action === 'question') {
     // 子 Agent 主动向父 Agent 提问：本轮暂停，等父 Agent 回复后继续。
     next.status = 'waiting'
@@ -2221,8 +2900,33 @@ function updateAgentEvent(data) {
   ) {
     state.agentSelectedId = data.childId
   }
-  renderAgentDock()
+  updateParentAgentProgress()
+  // 一个 token 就全量重建工作台会把主线程压住，流式看起来像“卡一下再整段弹出”。
+  // 合并到 ~25fps，既保留并行观感，又给主对话留出渲染时间。
+  scheduleAgentDockRender()
   if (data.action === 'done') scheduleAgentRetire(data.childId, next.updatedAt)
+}
+
+/** 父气泡在等待子 Agent 时的实时进度；有正文/思考后自动让位。 */
+function updateParentAgentProgress() {
+  const runtime = currentRuntime()
+  if (!runtime?.turn) return
+  const parentRunId = String(state.agentParentRunId || '')
+  if (!parentRunId || (runtime.runId && runtime.runId !== parentRunId)) return
+  const runs = Array.from(state.agentRuns.values())
+  if (runs.length === 0) return
+  const done = runs.filter((run) => run.status !== 'running' && run.status !== 'waiting').length
+  const active = runs.filter((run) => run.status === 'running' || run.status === 'waiting').length
+  runtime.turn.agentStatus(
+    active > 0
+      ? `子 Agent 并行工作中 · ${done}/${runs.length} 已完成`
+      : '子 Agent 已全部完成 · 正在汇总…',
+  )
+}
+
+/** 子 Agent 对话里模型返回的正文按 Markdown 排版；工具过程和短状态仍保持纯文本。 */
+function agentBubbleContent(text) {
+  return `<div class="agent-markdown">${renderAnswer(String(text ?? ''))}</div>`
 }
 
 function agentThreadEntryHtml(entry) {
@@ -2231,7 +2935,16 @@ function agentThreadEntryHtml(entry) {
     return `<div class="agent-chat-row is-parent">
       <div class="agent-chat-main">
         <div class="agent-chat-meta"><span>父 Agent · 派发</span>${time ? `<time>${esc(time)}</time>` : ''}</div>
-        <div class="agent-chat-bubble is-parent">${esc(entry.text)}</div>
+        <div class="agent-chat-bubble is-parent is-markdown">${agentBubbleContent(entry.text)}</div>
+      </div>
+      <span class="agent-chat-avatar is-parent" aria-hidden="true">父</span>
+    </div>`
+  }
+  if (entry.kind === 'answer') {
+    return `<div class="agent-chat-row is-parent">
+      <div class="agent-chat-main">
+        <div class="agent-chat-meta"><span>父 Agent · 回答</span>${time ? `<time>${esc(time)}</time>` : ''}</div>
+        <div class="agent-chat-bubble is-parent is-answer is-markdown">${agentBubbleContent(entry.text)}</div>
       </div>
       <span class="agent-chat-avatar is-parent" aria-hidden="true">父</span>
     </div>`
@@ -2241,7 +2954,7 @@ function agentThreadEntryHtml(entry) {
       <span class="agent-chat-avatar is-agent" aria-hidden="true">子</span>
       <div class="agent-chat-main">
         <div class="agent-chat-meta"><span>子 Agent · 提问</span>${time ? `<time>${esc(time)}</time>` : ''}</div>
-        <div class="agent-chat-bubble is-question">${esc(entry.text)}</div>
+        <div class="agent-chat-bubble is-question is-markdown">${agentBubbleContent(entry.text)}</div>
       </div>
     </div>`
   }
@@ -2250,7 +2963,7 @@ function agentThreadEntryHtml(entry) {
       <span class="agent-chat-avatar is-agent" aria-hidden="true">子</span>
       <div class="agent-chat-main">
         <div class="agent-chat-meta"><span>子 Agent · 过程记录</span>${time ? `<time>${esc(time)}</time>` : ''}</div>
-        <div class="agent-chat-bubble is-report${entry.error ? ' is-error' : ''}">${esc(entry.text)}</div>
+        <div class="agent-chat-bubble is-report${entry.error ? ' is-error' : ''} is-markdown">${agentBubbleContent(entry.text)}</div>
       </div>
     </div>`
   }
@@ -2260,7 +2973,7 @@ function agentThreadEntryHtml(entry) {
       <span class="agent-chat-avatar is-agent" aria-hidden="true">子</span>
       <div class="agent-chat-main">
         <div class="agent-chat-meta"><span>${label}</span>${time ? `<time>${esc(time)}</time>` : ''}</div>
-        <div class="agent-chat-bubble is-agent${entry.final ? ' is-final' : ''}">${esc(entry.text)}</div>
+        <div class="agent-chat-bubble is-agent${entry.final ? ' is-final' : ''} is-markdown">${agentBubbleContent(entry.text)}</div>
       </div>
     </div>`
   }
@@ -2301,6 +3014,8 @@ function agentListRowHtml(run, selected) {
   const status = run.status || 'running'
   const time = run.durationMs ? formatElapsed(run.durationMs) : ''
   const meta = [run.key, `${run.toolCount || 0} 次工具`, time].filter(Boolean).join(' · ')
+  const latest = [...(run.thread || [])].reverse().find((entry) => entry.kind === 'content' || entry.kind === 'report')
+  const preview = oneLinePreview(latest?.text || run.text || '').slice(0, 42)
   return `<button class="agent-row ${agentStatusClass(status)}${selected ? ' is-selected' : ''}" type="button" role="listitem" data-agent-select="${esc(run.childId)}" aria-current="${selected ? 'true' : 'false'}" title="${esc(run.title)}">
     <span class="agent-row-index">${String(run.index || 1).padStart(2, '0')}</span>
     <span class="agent-row-body">
@@ -2309,6 +3024,7 @@ function agentListRowHtml(run, selected) {
         <span class="agent-row-state"><span class="agent-status-dot" aria-hidden="true"></span>${agentStatusShort(status)}</span>
       </span>
       <span class="agent-row-meta">${esc(meta)}</span>
+      ${preview ? `<span class="agent-row-preview">${esc(preview)}</span>` : ''}
     </span>
   </button>`
 }
@@ -2348,6 +3064,16 @@ function agentDetailHtml(run) {
       ${status === 'running' || status === 'waiting' ? '' : `<button class="agent-chat-continue" type="button" data-agent-continue="${esc(key)}" title="让父 Agent 继续和这个子 Agent 对话">继续对话</button>`}
     </footer>
   </article>`
+}
+
+/** 合并高频子 Agent 事件，避免每个 token 都整块重建工作台。 */
+let agentDockRenderTimer = 0
+function scheduleAgentDockRender(delay = 40) {
+  if (agentDockRenderTimer) return
+  agentDockRenderTimer = setTimeout(() => {
+    agentDockRenderTimer = 0
+    renderAgentDock()
+  }, delay)
 }
 
 function renderAgentDock() {
@@ -2410,14 +3136,31 @@ function resetAgentRuns() {
 /* ---------------- 个人工作区：右侧文件预览与编辑 ---------------- */
 
 let workspacePreviewText = ''
+let agentTeamPollTimer = null
+let agentTeamPollSeq = 0
 let workspacePreviewTextLoaded = false
+/** 打开文本预览时的云端原文，用于编辑态的逐行/字符差异对比。 */
+let workspacePreviewOriginalText = ''
+let workspaceDiffVisible = false
 let workspacePreviewObjectUrl = ''
 let workspacePreviewSaving = false
 let workspacePreviewToken = 0
+/** PDF 降级预览状态；只对当前打开的 PDF 文件有效。 */
+let workspacePdfState = null
+let workspacePdfjsPromise = null
+let workspacePdfjsLib = null
+let workspacePdfLoadSeq = 0
+/** 预览打开期间的权限巡检；访问被撤销、文件被删或预览能力失效时关闭右栏。 */
+let workspacePreviewWatchTimer = null
+let workspacePreviewWatchBusy = false
+let workspacePreviewWatchEpoch = 0
+const WORKSPACE_PREVIEW_WATCH_MS = 30_000
 /** 模型正在生成的文件内容草稿；只在右侧预览层展示，不参与磁盘写入。 */
 let fileStreamDraft = null
 /** 当前预览的字符揭示动画；tool 参数一次性到达时也保留打字机可见性。 */
 let fileStreamReveal = null
+/** Markdown 预览重绘节流：流式参数高频到达时不必每个字符都重排整篇文档。 */
+let workspaceMarkdownRenderTimer = 0
 let onlyOfficeScriptPromise = null
 let onlyOfficeEditor = null
 let onlyOfficeMode = 'view'
@@ -2603,7 +3346,8 @@ function refreshPreviewSelection() {
     return
   }
   const selection = window.getSelection()
-  const text = String(selection?.toString?.() || '').replace(/\s+/g, ' ').trim()
+  const rangeText = selection?.rangeCount ? String(selection.getRangeAt(0).toString() || '') : ''
+  const text = String(selection?.toString?.() || rangeText || '').replace(/\s+/g, ' ').trim()
   const anchor = selection?.anchorNode
   if (!text || !anchor || !body.contains(anchor)) {
     hidePreviewSelection()
@@ -2634,11 +3378,1122 @@ function quotePreviewSelection() {
   selection?.removeAllRanges?.()
 }
 
+const WORKSPACE_DIFF_MAX_LINES = 20_000
+const WORKSPACE_DIFF_MAX_MATRIX = 1_000_000
+const WORKSPACE_DIFF_MAX_CHAR_MATRIX = 160_000
+const WORKSPACE_DIFF_CONTEXT = 2
+const WORKSPACE_DIFF_MAX_RENDER = 5_000
+
+function splitWorkspaceDiffLines(text) {
+  return String(text ?? '').replace(/\r\n?/g, '\n').split('\n')
+}
+
+/**
+ * 行级 LCS + 相邻删除/新增行的字符级 LCS。
+ * 大文件先按共同前后缀裁剪；改动块过大时退化为整段删除/新增，避免 UI 卡死。
+ */
+function buildWorkspaceTextDiff(oldText, newText) {
+  const oldLines = splitWorkspaceDiffLines(oldText)
+  const newLines = splitWorkspaceDiffLines(newText)
+  if (oldLines.length > WORKSPACE_DIFF_MAX_LINES || newLines.length > WORKSPACE_DIFF_MAX_LINES) {
+    return { tooManyLines: true, rows: [], changed: false, oldLines: oldLines.length, newLines: newLines.length }
+  }
+  const oldCount = oldLines.length
+  const newCount = newLines.length
+  const maxCommon = Math.min(oldCount, newCount)
+  let prefix = 0
+  while (prefix < maxCommon && oldLines[prefix] === newLines[prefix]) prefix += 1
+  let suffix = 0
+  while (suffix < maxCommon - prefix && oldLines[oldCount - 1 - suffix] === newLines[newCount - 1 - suffix]) suffix += 1
+
+  const rows = []
+  for (let i = 0; i < prefix; i += 1) {
+    rows.push({ type: 'same', text: oldLines[i], oldNo: i + 1, newNo: i + 1 })
+  }
+  const oldMid = oldLines.slice(prefix, oldCount - suffix)
+  const newMid = newLines.slice(prefix, newCount - suffix)
+  let coarse = false
+  if (oldMid.length * newMid.length > WORKSPACE_DIFF_MAX_MATRIX) {
+    coarse = true
+    for (let i = 0; i < oldMid.length; i += 1) {
+      rows.push({ type: 'del', text: oldMid[i], oldNo: prefix + i + 1, newNo: null })
+    }
+    for (let j = 0; j < newMid.length; j += 1) {
+      rows.push({ type: 'add', text: newMid[j], oldNo: null, newNo: prefix + j + 1 })
+    }
+  } else {
+    const midRows = buildWorkspaceLineDiffRows(oldMid, newMid, prefix)
+    for (const row of midRows) rows.push(row)
+  }
+  for (let k = 0; k < suffix; k += 1) {
+    rows.push({
+      type: 'same',
+      text: oldLines[oldCount - suffix + k],
+      oldNo: oldCount - suffix + k + 1,
+      newNo: newCount - suffix + k + 1,
+    })
+  }
+
+  const stats = annotateWorkspaceDiffRows(rows)
+  const changed = stats.added + stats.removed + stats.modified > 0
+  return { tooManyLines: false, rows, changed, stats, coarse, oldLines: oldCount, newLines: newCount }
+}
+
+function buildWorkspaceLineDiffRows(oldLines, newLines, startLine) {
+  const m = oldLines.length
+  const n = newLines.length
+  const width = n + 1
+  const dp = new Uint32Array((m + 1) * width)
+  for (let i = m - 1; i >= 0; i -= 1) {
+    const row = i * width
+    const next = (i + 1) * width
+    for (let j = n - 1; j >= 0; j -= 1) {
+      dp[row + j] = oldLines[i] === newLines[j]
+        ? dp[next + j + 1] + 1
+        : Math.max(dp[next + j], dp[row + j + 1])
+    }
+  }
+  const rows = []
+  let i = 0
+  let j = 0
+  while (i < m && j < n) {
+    if (oldLines[i] === newLines[j]) {
+      rows.push({ type: 'same', text: oldLines[i], oldNo: startLine + i + 1, newNo: startLine + j + 1 })
+      i += 1
+      j += 1
+    } else if (dp[(i + 1) * width + j] >= dp[i * width + j + 1]) {
+      rows.push({ type: 'del', text: oldLines[i], oldNo: startLine + i + 1, newNo: null })
+      i += 1
+    } else {
+      rows.push({ type: 'add', text: newLines[j], oldNo: null, newNo: startLine + j + 1 })
+      j += 1
+    }
+  }
+  while (i < m) {
+    rows.push({ type: 'del', text: oldLines[i], oldNo: startLine + i + 1, newNo: null })
+    i += 1
+  }
+  while (j < n) {
+    rows.push({ type: 'add', text: newLines[j], oldNo: null, newNo: startLine + j + 1 })
+    j += 1
+  }
+  return rows
+}
+
+function annotateWorkspaceDiffRows(rows) {
+  const stats = { added: 0, removed: 0, modified: 0 }
+  let i = 0
+  while (i < rows.length) {
+    if (rows[i].type === 'same') {
+      i += 1
+      continue
+    }
+    let end = i
+    while (end < rows.length && rows[end].type !== 'same') end += 1
+    const dels = []
+    const adds = []
+    for (let k = i; k < end; k += 1) {
+      if (rows[k].type === 'del') dels.push(rows[k])
+      else if (rows[k].type === 'add') adds.push(rows[k])
+    }
+    const paired = Math.min(dels.length, adds.length)
+    for (let k = 0; k < paired; k += 1) {
+      const charDiff = buildWorkspaceCharDiff(dels[k].text, adds[k].text)
+      if (charDiff) {
+        dels[k].segments = charDiff.old
+        adds[k].segments = charDiff.new
+      }
+      stats.modified += 1
+    }
+    stats.removed += dels.length - paired
+    stats.added += adds.length - paired
+    i = end
+  }
+  return stats
+}
+
+function buildWorkspaceCharDiff(oldLine, newLine) {
+  const a = String(oldLine ?? '')
+  const b = String(newLine ?? '')
+  if (a === b) {
+    return { old: [{ text: a, changed: false }], new: [{ text: b, changed: false }] }
+  }
+  if (!a || !b) {
+    return {
+      old: a ? [{ text: a, changed: true }] : [],
+      new: b ? [{ text: b, changed: true }] : [],
+    }
+  }
+  if (a.length * b.length > WORKSPACE_DIFF_MAX_CHAR_MATRIX || a.length > 1_000 || b.length > 1_000) return null
+  const m = a.length
+  const n = b.length
+  const width = n + 1
+  const dp = new Uint32Array((m + 1) * width)
+  for (let i = m - 1; i >= 0; i -= 1) {
+    const row = i * width
+    const next = (i + 1) * width
+    for (let j = n - 1; j >= 0; j -= 1) {
+      dp[row + j] = a[i] === b[j]
+        ? dp[next + j + 1] + 1
+        : Math.max(dp[next + j], dp[row + j + 1])
+    }
+  }
+  const oldSegments = []
+  const newSegments = []
+  let i = 0
+  let j = 0
+  while (i < m && j < n) {
+    if (a[i] === b[j]) {
+      appendWorkspaceDiffSegment(oldSegments, a[i], false)
+      appendWorkspaceDiffSegment(newSegments, b[j], false)
+      i += 1
+      j += 1
+    } else if (dp[(i + 1) * width + j] >= dp[i * width + j + 1]) {
+      appendWorkspaceDiffSegment(oldSegments, a[i], true)
+      i += 1
+    } else {
+      appendWorkspaceDiffSegment(newSegments, b[j], true)
+      j += 1
+    }
+  }
+  while (i < m) {
+    appendWorkspaceDiffSegment(oldSegments, a[i], true)
+    i += 1
+  }
+  while (j < n) {
+    appendWorkspaceDiffSegment(newSegments, b[j], true)
+    j += 1
+  }
+  return { old: oldSegments, new: newSegments }
+}
+
+function appendWorkspaceDiffSegment(list, text, changed) {
+  const value = String(text ?? '')
+  if (!value) return
+  const last = list[list.length - 1]
+  if (last && last.changed === changed) last.text += value
+  else list.push({ text: value, changed })
+}
+
+function renderWorkspaceDiff(result) {
+  if (result.tooManyLines) {
+    return `<div class="file-diff-empty" role="status">文件超过 ${WORKSPACE_DIFF_MAX_LINES.toLocaleString('zh-CN')} 行，暂不生成逐行差异。<br>可保存后下载，用本地工具比较。</div>`
+  }
+  if (!result.changed) {
+    return '<div class="file-diff-empty" role="status">当前编辑内容与打开时的云端原文一致。</div>'
+  }
+  const label = []
+  if (result.stats.modified) label.push(`修改 ${result.stats.modified} 行`)
+  if (result.stats.added) label.push(`新增 ${result.stats.added} 行`)
+  if (result.stats.removed) label.push(`删除 ${result.stats.removed} 行`)
+  const visible = new Set()
+  for (let i = 0; i < result.rows.length; i += 1) {
+    if (result.rows[i].type === 'same') continue
+    const from = Math.max(0, i - WORKSPACE_DIFF_CONTEXT)
+    const to = Math.min(result.rows.length - 1, i + WORKSPACE_DIFF_CONTEXT)
+    for (let k = from; k <= to; k += 1) visible.add(k)
+  }
+  let html = `<div class="file-diff-head"><div class="file-diff-summary" role="status">${esc(label.join(' · '))}</div><div class="file-diff-meta">基线：打开时的云端原文 · ${result.oldLines} 行 → 当前 ${result.newLines} 行</div></div>`
+  if (result.coarse) {
+    html += '<div class="file-diff-note">改动区域较大，已按整段标记，未做字符级细分。</div>'
+  }
+  let lastShown = -1
+  let rendered = 0
+  for (let i = 0; i < result.rows.length; i += 1) {
+    if (!visible.has(i)) continue
+    const gap = lastShown < 0 ? i : i - lastShown - 1
+    if (gap > 0) html += `<div class="file-diff-gap">… 未改动 ${gap} 行 …</div>`
+    const row = result.rows[i]
+    const gutter = row.type === 'add' ? '+' : row.type === 'del' ? '-' : ' '
+    const oldNo = row.oldNo == null ? '' : String(row.oldNo)
+    const newNo = row.newNo == null ? '' : String(row.newNo)
+    const code = renderWorkspaceDiffCode(row)
+    html += `<div class="file-diff-row is-${row.type}"><span class="file-diff-gutter">${gutter}</span><span class="file-diff-no">${oldNo}</span><span class="file-diff-no">${newNo}</span><span class="file-diff-code">${code}</span></div>`
+    lastShown = i
+    rendered += 1
+    if (rendered >= WORKSPACE_DIFF_MAX_RENDER && i < result.rows.length - 1) {
+      html += `<div class="file-diff-gap">差异较多，仅显示前 ${WORKSPACE_DIFF_MAX_RENDER.toLocaleString('zh-CN')} 行。</div>`
+      return html
+    }
+  }
+  if (lastShown >= 0 && lastShown < result.rows.length - 1) {
+    html += `<div class="file-diff-gap">… 未改动 ${result.rows.length - lastShown - 1} 行 …</div>`
+  }
+  return html
+}
+
+function renderWorkspaceDiffCode(row) {
+  if (row.type === 'same' || !row.segments) {
+    return esc(row.text || '') || '&nbsp;'
+  }
+  return row.segments
+    .map((segment) => `<span class="file-diff-char is-${row.type}${segment.changed ? ' is-changed' : ''}">${esc(segment.text) || '&nbsp;'}</span>`)
+    .join('')
+}
+
+function toggleWorkspaceDiff() {
+  const file = state.filePreview
+  if (!file || !workspacePreviewTextLoaded) return
+  const textarea = $('#file-pane-text')
+  const panel = $('#file-pane-diff')
+  const toggle = $('#file-pane-diff-toggle')
+  if (!textarea || !panel || !toggle) return
+  if (workspaceDiffVisible) {
+    panel.hidden = true
+    panel.innerHTML = ''
+    textarea.hidden = false
+    workspaceDiffVisible = false
+    toggle.textContent = '查看差异'
+    toggle.setAttribute('aria-pressed', 'false')
+    textarea.focus()
+    return
+  }
+  const result = buildWorkspaceTextDiff(workspacePreviewOriginalText, textarea.value)
+  panel.innerHTML = renderWorkspaceDiff(result)
+  panel.hidden = false
+  textarea.hidden = true
+  workspaceDiffVisible = true
+  toggle.textContent = '返回编辑'
+  toggle.setAttribute('aria-pressed', 'true')
+}
+
+
 function releaseWorkspacePreviewUrl() {
+  releaseWorkspacePdf()
   if (workspacePreviewObjectUrl) {
     URL.revokeObjectURL(workspacePreviewObjectUrl)
     workspacePreviewObjectUrl = ''
   }
+}
+
+function releaseWorkspacePdf() {
+  const preview = workspacePdfState
+  workspacePdfState = null
+  workspacePdfLoadSeq += 1
+  if (!preview) return
+  try {
+    preview.resizeObserver?.disconnect()
+  } catch {
+    // 旧浏览器没有 ResizeObserver，忽略。
+  }
+  if (preview.resizeTimer) clearTimeout(preview.resizeTimer)
+  try {
+    preview.renderTask?.cancel()
+  } catch {
+    // 渲染任务可能已经结束。
+  }
+  try {
+    preview.textLayerTask?.cancel()
+  } catch {
+    // 文本层可能已经结束。
+  }
+  try {
+    preview.doc?.destroy()
+  } catch {
+    // 文档已经销毁。
+  }
+}
+
+const PDF_ANNOTATION_PREFIX = 'eab:pdf-annotations:v1:'
+const PDF_ANNOTATION_MAX = 100
+const PDF_VIEW_MAX_TEXT = 200_000
+
+function ensureWorkspacePdfjs() {
+  if (workspacePdfjsLib) return Promise.resolve(workspacePdfjsLib)
+  if (!workspacePdfjsPromise) {
+    workspacePdfjsPromise = import('/vendor/pdfjs/build/pdf.min.mjs')
+      .then((lib) => {
+        lib.GlobalWorkerOptions.workerSrc = '/vendor/pdfjs/build/pdf.worker.min.mjs'
+        workspacePdfjsLib = lib
+        return lib
+      })
+      .catch((err) => {
+        workspacePdfjsPromise = null
+        throw err
+      })
+  }
+  return workspacePdfjsPromise
+}
+
+function workspacePdfAnnotationKey(file) {
+  return `${PDF_ANNOTATION_PREFIX}${file.id}:${file.updatedAt || file.size || 0}`
+}
+
+function readWorkspacePdfAnnotations(file) {
+  try {
+    const raw = JSON.parse(localStorage.getItem(workspacePdfAnnotationKey(file)) || '[]')
+    if (!Array.isArray(raw)) return []
+    return raw
+      .filter((item) => {
+        const rect = item?.rect
+        return (
+          typeof item?.id === 'string' &&
+          Number.isFinite(item?.page) &&
+          Array.isArray(rect) &&
+          rect.length === 4 &&
+          rect.every((value) => Number.isFinite(value) && value >= 0 && value <= 1) &&
+          rect[2] - rect[0] > 0.002 &&
+          rect[3] - rect[1] > 0.002
+        )
+      })
+      .slice(0, PDF_ANNOTATION_MAX)
+  } catch {
+    return []
+  }
+}
+
+function writeWorkspacePdfAnnotations(file, annotations) {
+  try {
+    localStorage.setItem(workspacePdfAnnotationKey(file), JSON.stringify(annotations.slice(0, PDF_ANNOTATION_MAX)))
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function openWorkspacePdfPreview(file, blob, token) {
+  const lib = await ensureWorkspacePdfjs()
+  if (token !== workspacePreviewToken || state.filePreview?.id !== file.id) return
+  const data = await blob.arrayBuffer()
+  if (token !== workspacePreviewToken || state.filePreview?.id !== file.id) return
+  filePaneMessage('正在加载 PDF…')
+  const loadSeq = ++workspacePdfLoadSeq
+  const doc = await lib.getDocument({
+    data,
+    cMapUrl: '/vendor/pdfjs/cmaps/',
+    cMapPacked: true,
+    standardFontDataUrl: '/vendor/pdfjs/standard_fonts/',
+    wasmUrl: '/vendor/pdfjs/wasm/',
+    iccUrl: '/vendor/pdfjs/iccs/',
+    useSystemFonts: true,
+  }).promise
+  if (loadSeq !== workspacePdfLoadSeq || token !== workspacePreviewToken || state.filePreview?.id !== file.id) {
+    try {
+      doc.destroy()
+    } catch {
+      // 过期文档直接丢弃。
+    }
+    return
+  }
+  const annotations = readWorkspacePdfAnnotations(file)
+  const viewer = buildWorkspacePdfViewer(file, doc, annotations, lib)
+  workspacePdfState = viewer
+  setFilePaneBody(viewer.root)
+  bindWorkspacePdfViewer(viewer)
+  await renderWorkspacePdfPage({ resetScroll: true })
+  // 独立云空间里把焦点交给页码；对话内预览不抢聊天输入框的焦点。
+  if (state.mode === 'workspace') viewer.root.querySelector('[data-pdf-page-input]')?.focus({ preventScroll: true })
+}
+
+function buildWorkspacePdfViewer(file, doc, annotations, lib) {
+  const root = document.createElement('div')
+  root.className = 'pdf-viewer'
+  root.innerHTML = `
+    <div class="pdf-toolbar">
+      <div class="pdf-nav" role="group" aria-label="PDF 翻页">
+        <button class="btn ghost sm" type="button" data-pdf-prev aria-label="上一页">‹</button>
+        <span class="pdf-page-label">第 <input class="pdf-page-input" data-pdf-page-input type="number" min="1" value="1" inputmode="numeric" aria-label="页码" /> / <span data-pdf-page-count>—</span> 页</span>
+        <button class="btn ghost sm" type="button" data-pdf-next aria-label="下一页">›</button>
+      </div>
+      <div class="pdf-actions">
+        <div class="pdf-zoom" role="group" aria-label="PDF 缩放">
+          <button class="btn ghost sm" type="button" data-pdf-zoom-out aria-label="缩小">−</button>
+          <span class="pdf-zoom-label" data-pdf-zoom-label>适应</span>
+          <button class="btn ghost sm" type="button" data-pdf-zoom-in aria-label="放大">＋</button>
+          <button class="btn ghost sm" type="button" data-pdf-fit>适应宽度</button>
+        </div>
+        <button class="btn ghost sm is-active" type="button" data-pdf-tool="select" aria-pressed="true">选文本</button>
+        <button class="btn ghost sm" type="button" data-pdf-tool="region" aria-pressed="false">框选区域</button>
+        <button class="btn ghost sm" type="button" data-pdf-text-toggle aria-expanded="false">提取文本</button>
+        <button class="btn ghost sm" type="button" data-pdf-annotations-toggle aria-expanded="false">批注 <span class="pdf-count" data-pdf-annotation-count>0</span></button>
+      </div>
+    </div>
+    <div class="pdf-draft" data-pdf-draft hidden>
+      <div class="pdf-draft-head"><strong>区域批注</strong><span data-pdf-draft-page>第 1 页</span></div>
+      <blockquote class="pdf-draft-quote" data-pdf-draft-quote>（图片区域，未识别到文本）</blockquote>
+      <textarea class="pdf-draft-comment" data-pdf-draft-comment rows="2" maxlength="500" placeholder="补充批注（可选）"></textarea>
+      <div class="pdf-draft-actions">
+        <button class="btn ghost sm" type="button" data-pdf-draft-cancel>取消</button>
+        <button class="btn primary sm" type="button" data-pdf-draft-save>添加高亮</button>
+      </div>
+    </div>
+    <div class="pdf-text-panel" data-pdf-text-panel hidden>
+      <div class="pdf-panel-head">
+        <strong>本页文本</strong>
+        <span class="muted" data-pdf-text-page>第 1 页</span>
+        <button class="btn ghost sm" type="button" data-pdf-text-copy>复制</button>
+        <button class="btn ghost sm" type="button" data-pdf-text-quote>引用到对话</button>
+        <button class="icon-btn" type="button" data-pdf-text-close aria-label="关闭文本面板">×</button>
+      </div>
+      <pre class="pdf-text-content" data-pdf-text-content></pre>
+    </div>
+    <div class="pdf-annotation-panel" data-pdf-annotation-panel hidden>
+      <div class="pdf-panel-head">
+        <strong>批注</strong>
+        <span class="muted" data-pdf-annotation-note>仅保存在本机</span>
+        <button class="icon-btn" type="button" data-pdf-annotations-close aria-label="关闭批注面板">×</button>
+      </div>
+      <div class="pdf-annotation-list" data-pdf-annotation-list></div>
+    </div>
+    <div class="pdf-stage" data-pdf-stage tabindex="0" aria-label="PDF 页面">
+      <div class="pdf-page-shell">
+        <div class="pdf-page" data-pdf-page>
+          <div class="pdf-page-loading" data-pdf-loading>正在渲染第 1 页…</div>
+        </div>
+      </div>
+    </div>
+    <div class="pdf-status" role="status" aria-live="polite" data-pdf-status>正在加载 PDF…</div>
+  `
+  const page = root.querySelector('[data-pdf-page]')
+  const canvas = document.createElement('canvas')
+  canvas.className = 'pdf-canvas'
+  canvas.setAttribute('aria-hidden', 'true')
+  const textLayer = document.createElement('div')
+  textLayer.className = 'pdf-text-layer textLayer'
+  textLayer.setAttribute('aria-hidden', 'true')
+  const annotationLayer = document.createElement('div')
+  annotationLayer.className = 'pdf-annotation-layer'
+  const draftLayer = document.createElement('div')
+  draftLayer.className = 'pdf-region-draft'
+  draftLayer.hidden = true
+  const loading = root.querySelector('[data-pdf-loading]')
+  page.prepend(draftLayer, annotationLayer, textLayer, canvas)
+
+  return {
+    root,
+    file,
+    doc,
+    lib,
+    annotations,
+    page: 1,
+    pageCount: doc.numPages,
+    zoom: 1,
+    tool: 'select',
+    pageEl: page,
+    stage: root.querySelector('[data-pdf-stage]'),
+    canvas,
+    textLayer,
+    annotationLayer,
+    draftLayer,
+    loading,
+    textContent: null,
+    textItems: [],
+    pageText: '',
+    pendingRegion: null,
+    renderTask: null,
+    textLayerTask: null,
+    renderSeq: 0,
+    resizeObserver: null,
+    resizeTimer: null,
+    statusEl: root.querySelector('[data-pdf-status]'),
+    pageInput: root.querySelector('[data-pdf-page-input]'),
+    pageCountEl: root.querySelector('[data-pdf-page-count]'),
+    zoomLabel: root.querySelector('[data-pdf-zoom-label]'),
+    draft: root.querySelector('[data-pdf-draft]'),
+    draftPage: root.querySelector('[data-pdf-draft-page]'),
+    draftQuote: root.querySelector('[data-pdf-draft-quote]'),
+    draftComment: root.querySelector('[data-pdf-draft-comment]'),
+    textPanel: root.querySelector('[data-pdf-text-panel]'),
+    textPage: root.querySelector('[data-pdf-text-page]'),
+    textContentEl: root.querySelector('[data-pdf-text-content]'),
+    annotationPanel: root.querySelector('[data-pdf-annotation-panel]'),
+    annotationList: root.querySelector('[data-pdf-annotation-list]'),
+  }
+}
+
+function setWorkspacePdfStatus(text, bad = false) {
+  const preview = workspacePdfState
+  if (!preview?.statusEl) return
+  preview.statusEl.textContent = text
+  preview.statusEl.classList.toggle('is-bad', bad)
+}
+
+function workspacePdfTextFromContent(content) {
+  const items = (content?.items || []).filter((item) => typeof item?.str === 'string')
+  let text = ''
+  for (const item of items) {
+    text += item.str
+    if (item.hasEOL) text += '\n'
+    else if (item.str) text += ' '
+  }
+  return text
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+    .slice(0, PDF_VIEW_MAX_TEXT)
+}
+
+function workspacePdfTextItemsFromContent(content, viewport) {
+  const items = []
+  for (const item of content?.items || []) {
+    if (typeof item?.str !== 'string' || !item.str.trim()) continue
+    const tx = workspacePdfState?.lib?.Util?.transform?.(viewport.transform, item.transform)
+    if (!tx) continue
+    const height = Math.hypot(tx[2], tx[3])
+    const width = Math.max(0, Number(item.width) || 0) * viewport.scale
+    if (!Number.isFinite(height) || height <= 0) continue
+    items.push({
+      str: item.str,
+      left: tx[4],
+      top: tx[5] - height,
+      right: tx[4] + Math.max(1, width),
+      bottom: tx[5],
+    })
+  }
+  items.sort((a, b) => Math.abs(a.top - b.top) > 2 ? a.top - b.top : a.left - b.left)
+  return items
+}
+
+function workspacePdfPageCssSize(preview) {
+  return {
+    width: parseFloat(preview?.pageEl?.style.width) || preview?.pageEl?.clientWidth || 1,
+    height: parseFloat(preview?.pageEl?.style.height) || preview?.pageEl?.clientHeight || 1,
+  }
+}
+
+function workspacePdfTextFromRegion(preview, rect) {
+  const { width, height } = workspacePdfPageCssSize(preview)
+  const box = {
+    left: rect[0] * width,
+    top: rect[1] * height,
+    right: rect[2] * width,
+    bottom: rect[3] * height,
+  }
+  const selected = preview.textItems.filter((item) => {
+    const cx = (item.left + item.right) / 2
+    const cy = (item.top + item.bottom) / 2
+    return cx >= box.left && cx <= box.right && cy >= box.top && cy <= box.bottom
+  })
+  return selected.map((item) => item.str).join(' ').replace(/[ \t]{2,}/g, ' ').trim().slice(0, 800)
+}
+
+function paintWorkspacePdfDraft(preview) {
+  if (!preview?.pendingRegion) {
+    preview.draftLayer.hidden = true
+    return
+  }
+  const { width, height } = workspacePdfPageCssSize(preview)
+  const [x1, y1, x2, y2] = preview.pendingRegion.rect
+  preview.draftLayer.hidden = false
+  preview.draftLayer.style.left = `${x1 * width}px`
+  preview.draftLayer.style.top = `${y1 * height}px`
+  preview.draftLayer.style.width = `${(x2 - x1) * width}px`
+  preview.draftLayer.style.height = `${(y2 - y1) * height}px`
+}
+
+function updateWorkspacePdfChrome(preview) {
+  const prev = preview.root.querySelector('[data-pdf-prev]')
+  const next = preview.root.querySelector('[data-pdf-next]')
+  preview.pageInput.value = String(preview.page)
+  preview.pageInput.max = String(preview.pageCount)
+  preview.pageCountEl.textContent = String(preview.pageCount)
+  if (prev) prev.disabled = preview.page <= 1
+  if (next) next.disabled = preview.page >= preview.pageCount
+  preview.zoomLabel.textContent = preview.zoom === 1 ? '适应' : `${Math.round(preview.zoom * 100)}%`
+  preview.root.querySelector('[data-pdf-annotation-count]').textContent = String(preview.annotations.length)
+}
+
+function applyWorkspacePdfTool(tool, { silent = false } = {}) {
+  const preview = workspacePdfState
+  if (!preview) return
+  preview.tool = tool === 'region' ? 'region' : 'select'
+  preview.pageEl.classList.toggle('is-region-mode', preview.tool === 'region')
+  for (const button of preview.root.querySelectorAll('[data-pdf-tool]')) {
+    const active = button.dataset.pdfTool === preview.tool
+    button.classList.toggle('is-active', active)
+    button.setAttribute('aria-pressed', String(active))
+  }
+  if (preview.tool === 'select') cancelWorkspacePdfDraft({ silent: true })
+  if (!silent) {
+    setWorkspacePdfStatus(preview.tool === 'region' ? '在页面上拖拽框选区域，松开后可添加高亮批注' : '可拖选文本，或切换到“框选区域”做高亮批注')
+  }
+}
+
+function cancelWorkspacePdfDraft({ silent = false } = {}) {
+  const preview = workspacePdfState
+  if (!preview) return
+  preview.pendingRegion = null
+  preview.draft.hidden = true
+  preview.draftLayer.hidden = true
+  preview.draftComment.value = ''
+  if (!silent) setWorkspacePdfStatus('已取消框选')
+}
+
+function startWorkspacePdfDraft(preview, rect) {
+  const quote = workspacePdfTextFromRegion(preview, rect)
+  preview.pendingRegion = { rect, quote }
+  preview.draft.hidden = false
+  paintWorkspacePdfDraft(preview)
+  preview.draftPage.textContent = `第 ${preview.page} 页`
+  preview.draftQuote.textContent = quote || '（图片区域，未识别到文本）'
+  preview.draftComment.value = ''
+  preview.draftComment.focus({ preventScroll: true })
+  setWorkspacePdfStatus('已框选区域，可补充批注后添加高亮')
+}
+
+function saveWorkspacePdfDraft() {
+  const preview = workspacePdfState
+  if (!preview?.pendingRegion) return
+  const quote = String(preview.pendingRegion.quote || '').slice(0, 800)
+  const comment = String(preview.draftComment.value || '').trim().slice(0, 500)
+  if (preview.annotations.length >= PDF_ANNOTATION_MAX) {
+    setWorkspacePdfStatus(`最多保存 ${PDF_ANNOTATION_MAX} 条批注，请先删除旧批注`, true)
+    return
+  }
+  const annotation = {
+    id: `pdf-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    page: preview.page,
+    rect: preview.pendingRegion.rect,
+    quote,
+    comment,
+    createdAt: Date.now(),
+  }
+  preview.annotations.push(annotation)
+  const persisted = writeWorkspacePdfAnnotations(preview.file, preview.annotations)
+  preview.pendingRegion = null
+  preview.draft.hidden = true
+  preview.draftLayer.hidden = true
+  preview.draftComment.value = ''
+  applyWorkspacePdfTool('select', { silent: true })
+  updateWorkspacePdfChrome(preview)
+  renderWorkspacePdfAnnotations()
+  renderWorkspacePdfAnnotationList()
+  preview.stage.focus({ preventScroll: true })
+  setWorkspacePdfStatus(
+    persisted
+      ? `已添加第 ${preview.annotations.length} 条高亮批注（仅保存在本机）`
+      : '高亮已添加，但本机存储失败，刷新后会丢失',
+    !persisted,
+  )
+}
+
+function flashWorkspacePdfAnnotation(id) {
+  const preview = workspacePdfState
+  if (!preview) return
+  const element = [...preview.annotationLayer.querySelectorAll('[data-pdf-annotation-id]')].find(
+    (node) => node.dataset.pdfAnnotationId === id,
+  )
+  if (!element) return
+  element.classList.add('is-pulse')
+  window.setTimeout(() => element.classList.remove('is-pulse'), 1600)
+}
+
+function renderWorkspacePdfAnnotations() {
+  const preview = workspacePdfState
+  if (!preview?.annotationLayer) return
+  preview.annotationLayer.innerHTML = ''
+  preview.annotations
+    .filter((annotation) => annotation.page === preview.page)
+    .forEach((annotation) => {
+      const index = preview.annotations.indexOf(annotation) + 1
+      const node = document.createElement('div')
+      node.className = 'pdf-annotation'
+      node.dataset.pdfAnnotationId = annotation.id
+      node.style.left = `${annotation.rect[0] * 100}%`
+      node.style.top = `${annotation.rect[1] * 100}%`
+      node.style.width = `${(annotation.rect[2] - annotation.rect[0]) * 100}%`
+      node.style.height = `${(annotation.rect[3] - annotation.rect[1]) * 100}%`
+      node.title = [annotation.quote, annotation.comment].filter(Boolean).join('\n')
+      const badge = document.createElement('span')
+      badge.className = 'pdf-annotation-index'
+      badge.textContent = String(index)
+      node.appendChild(badge)
+      preview.annotationLayer.appendChild(node)
+    })
+}
+
+function renderWorkspacePdfAnnotationList() {
+  const preview = workspacePdfState
+  if (!preview?.annotationList) return
+  preview.annotationList.innerHTML = ''
+  const note = preview.root.querySelector('[data-pdf-annotation-note]')
+  if (note) note.textContent = `${preview.annotations.length} 条 · 仅保存在本机`
+  if (!preview.annotations.length) {
+    const empty = document.createElement('div')
+    empty.className = 'pdf-panel-empty'
+    empty.textContent = '还没有批注。切换到“框选区域”，在页面上拖拽即可添加高亮。'
+    preview.annotationList.appendChild(empty)
+    return
+  }
+  preview.annotations.forEach((annotation, index) => {
+    const row = document.createElement('div')
+    row.className = 'pdf-annotation-item'
+    row.dataset.pdfAnnotationId = annotation.id
+    const open = document.createElement('button')
+    open.type = 'button'
+    open.className = 'pdf-annotation-open'
+    open.dataset.pdfAnnotationOpen = annotation.id
+    open.setAttribute('aria-label', `定位第 ${index + 1} 条批注`)
+    const quote = annotation.quote || '图片区域'
+    const comment = annotation.comment ? `<span class="pdf-annotation-comment">${esc(annotation.comment)}</span>` : ''
+    open.innerHTML = `
+      <span class="pdf-annotation-item-index">${index + 1}</span>
+      <span class="pdf-annotation-item-main">
+        <span class="pdf-annotation-item-meta">第 ${annotation.page} 页</span>
+        <span class="pdf-annotation-item-quote">${esc(quote)}</span>
+        ${comment}
+      </span>
+    `
+    const remove = document.createElement('button')
+    remove.type = 'button'
+    remove.className = 'icon-btn pdf-annotation-delete'
+    remove.dataset.pdfAnnotationDelete = annotation.id
+    remove.setAttribute('aria-label', `删除第 ${index + 1} 条批注`)
+    remove.textContent = '×'
+    row.append(open, remove)
+    preview.annotationList.appendChild(row)
+  })
+}
+
+function renderWorkspacePdfTextPanel() {
+  const preview = workspacePdfState
+  if (!preview?.textPanel) return
+  preview.textPage.textContent = `第 ${preview.page} 页`
+  preview.textContentEl.textContent = preview.pageText || '本页没有可提取的文本（可能是扫描件）。'
+  for (const button of preview.root.querySelectorAll('[data-pdf-text-copy], [data-pdf-text-quote]')) {
+    button.disabled = !preview.pageText
+  }
+}
+
+function workspacePdfPageText(preview) {
+  return String(preview?.pageText || '').slice(0, 800)
+}
+
+function copyWorkspacePdfText(text, label = '本页文本') {
+  if (!text) {
+    setWorkspacePdfStatus('没有可复制的文本', true)
+    return
+  }
+  const done = () => setWorkspacePdfStatus(`已复制${label}`)
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(text).then(done, () => fallbackCopyWorkspacePdfText(text, done))
+    return
+  }
+  fallbackCopyWorkspacePdfText(text, done)
+}
+
+function fallbackCopyWorkspacePdfText(text, done) {
+  const area = document.createElement('textarea')
+  area.value = text
+  area.setAttribute('readonly', '')
+  area.style.position = 'fixed'
+  area.style.left = '-9999px'
+  document.body.appendChild(area)
+  area.select()
+  try {
+    if (document.execCommand('copy')) done()
+    else setWorkspacePdfStatus('复制失败，请手动选中文本复制', true)
+  } catch {
+    setWorkspacePdfStatus('复制失败，请手动选中文本复制', true)
+  } finally {
+    area.remove()
+  }
+}
+
+function quoteWorkspacePdfPage(preview) {
+  const text = workspacePdfPageText(preview)
+  if (!text) {
+    setWorkspacePdfStatus('本页没有可引用的文本', true)
+    return
+  }
+  if (state.mode !== 'chat') {
+    setChatMode('chat')
+    if (state.filePreview?.id) void openWorkspaceFile(state.filePreview.id, { split: true })
+  }
+  const input = $('#input')
+  if (!input) return
+  const truncated = String(preview.pageText).length >= 800 ? '\n（本页文本较长，已截取前 800 字）' : ''
+  input.value = `请基于《${preview.file.name}》第 ${preview.page} 页的这段内容继续：\n"""${text}"""${truncated}\n\n`
+  input.style.height = '44px'
+  input.dispatchEvent(new Event('input', { bubbles: true }))
+  input.focus()
+  const end = input.value.length
+  input.setSelectionRange(end, end)
+  setWorkspacePdfStatus('已把本页文本引用到对话输入框')
+}
+
+async function renderWorkspacePdfPage({ resetScroll = false } = {}) {
+  const preview = workspacePdfState
+  if (!preview) return
+  const seq = ++preview.renderSeq
+  try {
+    preview.renderTask?.cancel()
+  } catch {
+    // 上一页可能已经渲染完成。
+  }
+  try {
+    preview.textLayerTask?.cancel()
+  } catch {
+    // 文本层可能已经结束。
+  }
+  preview.loading.hidden = false
+  preview.loading.textContent = `正在渲染第 ${preview.page} 页…`
+  preview.textLayer.innerHTML = ''
+  preview.annotationLayer.innerHTML = ''
+  preview.pageEl.setAttribute('aria-label', `PDF 第 ${preview.page} 页`)
+  preview.pageEl.classList.toggle('is-region-mode', preview.tool === 'region')
+  try {
+    const page = await preview.doc.getPage(preview.page)
+    if (seq !== preview.renderSeq || workspacePdfState !== preview) return
+    const baseViewport = page.getViewport({ scale: 1 })
+    const stageWidth = Math.max(260, preview.stage.clientWidth || 520)
+    // clientWidth 含 .pdf-stage 的左右各 16px 内边距；只留页面本身，否则会多出 4px 横向滚动。
+    const fitScale = Math.max(0.2, (stageWidth - 32) / baseViewport.width)
+    const scale = fitScale * preview.zoom
+    const viewport = page.getViewport({ scale })
+    const dpr = Math.min(2, window.devicePixelRatio || 1)
+    preview.canvas.width = Math.floor(viewport.width * dpr)
+    preview.canvas.height = Math.floor(viewport.height * dpr)
+    preview.canvas.style.width = `${viewport.width}px`
+    preview.canvas.style.height = `${viewport.height}px`
+    preview.pageEl.style.width = `${viewport.width}px`
+    preview.pageEl.style.height = `${viewport.height}px`
+    preview.pageEl.style.setProperty('--total-scale-factor', String(viewport.scale))
+    preview.pageEl.style.setProperty('--scale-round-x', '1px')
+    preview.pageEl.style.setProperty('--scale-round-y', '1px')
+    preview.pageWidth = viewport.width
+    preview.pageHeight = viewport.height
+    const ctx = preview.canvas.getContext('2d', { alpha: false })
+    preview.renderTask = page.render({
+      canvasContext: ctx,
+      viewport,
+      // 后台标签页的 requestAnimationFrame 会被暂停；用 print 意图完成一次性绘制，避免预览一直停在“正在渲染”。
+      intent: document.hidden ? 'print' : 'display',
+      transform: dpr === 1 ? undefined : [dpr, 0, 0, dpr, 0, 0],
+    })
+    await preview.renderTask.promise
+    if (seq !== preview.renderSeq || workspacePdfState !== preview) return
+    let content = null
+    try {
+      content = await page.getTextContent()
+    } catch {
+      content = null
+    }
+    if (seq !== preview.renderSeq || workspacePdfState !== preview) return
+    preview.textContent = content
+    preview.pageText = workspacePdfTextFromContent(content)
+    preview.textItems = content ? workspacePdfTextItemsFromContent(content, viewport) : []
+    if (content) {
+      try {
+        preview.textLayer.style.setProperty('--total-scale-factor', String(viewport.scale))
+        preview.textLayer.style.setProperty('--scale-round-x', '1px')
+        preview.textLayer.style.setProperty('--scale-round-y', '1px')
+        const layer = new preview.lib.TextLayer({
+          textContentSource: content,
+          container: preview.textLayer,
+          viewport,
+        })
+        preview.textLayerTask = layer
+        await layer.render()
+      } catch {
+        // 文本层失败不影响页面阅读，文本面板仍可用 getTextContent 的结果。
+      }
+    }
+    if (seq !== preview.renderSeq || workspacePdfState !== preview) return
+    preview.loading.hidden = true
+    updateWorkspacePdfChrome(preview)
+    renderWorkspacePdfAnnotations()
+    renderWorkspacePdfAnnotationList()
+    renderWorkspacePdfTextPanel()
+    paintWorkspacePdfDraft(preview)
+    if (resetScroll) preview.stage.scrollTop = 0
+    setWorkspacePdfStatus(`第 ${preview.page} / ${preview.pageCount} 页 · ${preview.pageText ? '可拖选文本' : '未提取到文本'}`)
+  } catch (err) {
+    if (seq !== preview.renderSeq || workspacePdfState !== preview) return
+    preview.loading.hidden = true
+    preview.loading.textContent = `第 ${preview.page} 页渲染失败：${err.message}`
+    setWorkspacePdfStatus(`PDF 渲染失败：${err.message}`, true)
+  }
+}
+
+function bindWorkspacePdfViewer(preview) {
+  const goToPage = async (page) => {
+    if (!workspacePdfState || workspacePdfState !== preview) return
+    const next = Math.min(preview.pageCount, Math.max(1, Number(page) || 1))
+    if (next === preview.page) {
+      preview.pageInput.value = String(preview.page)
+      return
+    }
+    cancelWorkspacePdfDraft({ silent: true })
+    preview.page = next
+    await renderWorkspacePdfPage({ resetScroll: true })
+  }
+
+  preview.root.addEventListener('click', (event) => {
+    const target = event.target.closest('button')
+    if (!target) return
+    if (workspacePdfState !== preview) return
+    if (target.hasAttribute('data-pdf-prev')) {
+      void goToPage(preview.page - 1)
+    } else if (target.hasAttribute('data-pdf-next')) {
+      void goToPage(preview.page + 1)
+    } else if (target.hasAttribute('data-pdf-zoom-out')) {
+      preview.zoom = Math.max(0.7, Math.round((preview.zoom - 0.1) * 10) / 10)
+      void renderWorkspacePdfPage()
+    } else if (target.hasAttribute('data-pdf-zoom-in')) {
+      preview.zoom = Math.min(2.2, Math.round((preview.zoom + 0.1) * 10) / 10)
+      void renderWorkspacePdfPage()
+    } else if (target.hasAttribute('data-pdf-fit')) {
+      preview.zoom = 1
+      void renderWorkspacePdfPage()
+    } else if (target.dataset.pdfTool) {
+      applyWorkspacePdfTool(target.dataset.pdfTool)
+    } else if (target.hasAttribute('data-pdf-text-toggle')) {
+      const open = preview.textPanel.hidden
+      preview.textPanel.hidden = !open
+      target.setAttribute('aria-expanded', String(open))
+      if (open) {
+        preview.annotationPanel.hidden = true
+        preview.root.querySelector('[data-pdf-annotations-toggle]')?.setAttribute('aria-expanded', 'false')
+        renderWorkspacePdfTextPanel()
+      }
+    } else if (target.hasAttribute('data-pdf-text-close')) {
+      preview.textPanel.hidden = true
+      preview.root.querySelector('[data-pdf-text-toggle]')?.setAttribute('aria-expanded', 'false')
+    } else if (target.hasAttribute('data-pdf-text-copy')) {
+      copyWorkspacePdfText(preview.pageText)
+    } else if (target.hasAttribute('data-pdf-text-quote')) {
+      quoteWorkspacePdfPage(preview)
+    } else if (target.hasAttribute('data-pdf-annotations-toggle')) {
+      const open = preview.annotationPanel.hidden
+      preview.annotationPanel.hidden = !open
+      target.setAttribute('aria-expanded', String(open))
+      if (open) {
+        preview.textPanel.hidden = true
+        preview.root.querySelector('[data-pdf-text-toggle]')?.setAttribute('aria-expanded', 'false')
+        renderWorkspacePdfAnnotationList()
+      }
+    } else if (target.hasAttribute('data-pdf-annotations-close')) {
+      preview.annotationPanel.hidden = true
+      preview.root.querySelector('[data-pdf-annotations-toggle]')?.setAttribute('aria-expanded', 'false')
+    } else if (target.hasAttribute('data-pdf-draft-save')) {
+      saveWorkspacePdfDraft()
+    } else if (target.hasAttribute('data-pdf-draft-cancel')) {
+      cancelWorkspacePdfDraft()
+      preview.stage.focus({ preventScroll: true })
+    } else if (target.dataset.pdfAnnotationOpen) {
+      const annotation = preview.annotations.find((item) => item.id === target.dataset.pdfAnnotationOpen)
+      if (!annotation) return
+      preview.page = annotation.page
+      void renderWorkspacePdfPage({ resetScroll: true }).then(() => flashWorkspacePdfAnnotation(annotation.id))
+    } else if (target.dataset.pdfAnnotationDelete) {
+      const id = target.dataset.pdfAnnotationDelete
+      const index = preview.annotations.findIndex((item) => item.id === id)
+      if (index < 0) return
+      preview.annotations.splice(index, 1)
+      writeWorkspacePdfAnnotations(preview.file, preview.annotations)
+      updateWorkspacePdfChrome(preview)
+      renderWorkspacePdfAnnotations()
+      renderWorkspacePdfAnnotationList()
+      setWorkspacePdfStatus('已删除 1 条批注')
+    }
+  })
+
+  preview.pageInput.addEventListener('change', () => {
+    const page = Number(preview.pageInput.value)
+    if (Number.isFinite(page)) void goToPage(page)
+    else preview.pageInput.value = String(preview.page)
+  })
+  preview.pageInput.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter') return
+    event.preventDefault()
+    const page = Number(preview.pageInput.value)
+    if (Number.isFinite(page)) void goToPage(page)
+  })
+
+  preview.stage.addEventListener('keydown', (event) => {
+    if (event.target.closest('input, textarea')) return
+    if (event.key === 'ArrowLeft' || event.key === 'PageUp') {
+      event.preventDefault()
+      void goToPage(preview.page - 1)
+    } else if (event.key === 'ArrowRight' || event.key === 'PageDown') {
+      event.preventDefault()
+      void goToPage(preview.page + 1)
+    }
+  })
+
+  let drag = null
+  const localPoint = (event) => {
+    const rect = preview.pageEl.getBoundingClientRect()
+    const fallback = workspacePdfPageCssSize(preview)
+    const width = rect.width || fallback.width
+    const height = rect.height || fallback.height
+    return {
+      x: Math.min(width, Math.max(0, event.clientX - rect.left)),
+      y: Math.min(height, Math.max(0, event.clientY - rect.top)),
+      width,
+      height,
+    }
+  }
+  const paintDrag = (from, to) => {
+    preview.draftLayer.hidden = false
+    preview.draftLayer.style.left = `${Math.min(from.x, to.x)}px`
+    preview.draftLayer.style.top = `${Math.min(from.y, to.y)}px`
+    preview.draftLayer.style.width = `${Math.abs(to.x - from.x)}px`
+    preview.draftLayer.style.height = `${Math.abs(to.y - from.y)}px`
+  }
+  preview.pageEl.addEventListener('pointerdown', (event) => {
+    if (preview.tool !== 'region' || event.button !== 0) return
+    if (event.target.closest('button, input, textarea, a')) return
+    const point = localPoint(event)
+    drag = { pointerId: event.pointerId, start: point, last: point }
+    try {
+      preview.pageEl.setPointerCapture?.(event.pointerId)
+    } catch {
+      // 合成事件或已释放的指针没有可捕获的 pointer。
+    }
+    cancelWorkspacePdfDraft({ silent: true })
+    paintDrag(point, point)
+    event.preventDefault()
+  })
+  preview.pageEl.addEventListener('pointermove', (event) => {
+    if (!drag || drag.pointerId !== event.pointerId) return
+    drag.last = localPoint(event)
+    paintDrag(drag.start, drag.last)
+  })
+  const finishDrag = (event) => {
+    if (!drag || drag.pointerId !== event.pointerId) return
+    const { start, last } = drag
+    const width = start.width
+    const height = start.height
+    drag = null
+    try {
+      preview.pageEl.releasePointerCapture?.(event.pointerId)
+    } catch {
+      // 指针已经释放。
+    }
+    if (Math.abs(last.x - start.x) < 8 || Math.abs(last.y - start.y) < 8 || width <= 0 || height <= 0) {
+      preview.draftLayer.hidden = true
+      setWorkspacePdfStatus('框选太小，请重新拖拽一个区域')
+      return
+    }
+    const rect = [
+      Math.min(start.x, last.x) / width,
+      Math.min(start.y, last.y) / height,
+      Math.max(start.x, last.x) / width,
+      Math.max(start.y, last.y) / height,
+    ]
+    startWorkspacePdfDraft(preview, rect)
+  }
+  preview.pageEl.addEventListener('pointerup', finishDrag)
+  preview.pageEl.addEventListener('pointercancel', (event) => {
+    if (!drag || drag.pointerId !== event.pointerId) return
+    drag = null
+    preview.draftLayer.hidden = true
+  })
+
+  if (typeof ResizeObserver === 'function') {
+    preview.resizeObserver = new ResizeObserver(() => {
+      if (workspacePdfState !== preview || !preview.stage.clientWidth) return
+      if (preview.resizeTimer) clearTimeout(preview.resizeTimer)
+      preview.resizeTimer = window.setTimeout(() => {
+        if (workspacePdfState === preview) void renderWorkspacePdfPage()
+      }, 180)
+    })
+    preview.resizeObserver.observe(preview.stage)
+  }
+  updateWorkspacePdfChrome(preview)
 }
 
 function previewKindForFile(file) {
@@ -2649,12 +4504,74 @@ function previewKindForFile(file) {
   return 'none'
 }
 
+function markdownPreviewHtml(text) {
+  const value = String(text ?? '').replace(/\r\n?/g, '\n')
+  return value.trim() ? renderAnswer(value) : '<p class="file-markdown-empty">（空文件）</p>'
+}
+
 async function fetchPreviewCapability(file) {
   try {
     return await api(`/api/workspace/files/${encodeURIComponent(file.id)}/preview-capability`)
   } catch {
     // 老服务或网络抖动时退回本地类型判断，打开失败由现有错误提示兜住。
     return null
+  }
+}
+
+function stopWorkspacePreviewWatch() {
+  if (workspacePreviewWatchTimer) {
+    window.clearInterval(workspacePreviewWatchTimer)
+    workspacePreviewWatchTimer = null
+  }
+  workspacePreviewWatchBusy = false
+  workspacePreviewWatchEpoch += 1
+}
+
+/**
+ * 预览打开后每 30 秒确认一次访问资格与预览能力。
+ * 权限撤销、文件删除由服务端返回 403/404；OnlyOffice 失效会返回 kind=none。
+ */
+function startWorkspacePreviewWatch(file) {
+  stopWorkspacePreviewWatch()
+  const expectedId = String(file.id)
+  const epoch = workspacePreviewWatchEpoch
+  workspacePreviewWatchTimer = window.setInterval(() => {
+    void checkWorkspacePreviewAccess(expectedId, epoch)
+  }, WORKSPACE_PREVIEW_WATCH_MS)
+}
+
+async function checkWorkspacePreviewAccess(expectedId, epoch) {
+  if (epoch !== workspacePreviewWatchEpoch) return
+  if (document.hidden || workspacePreviewWatchBusy) return
+  const file = state.filePreview
+  if (!file || String(file.id) !== expectedId) return
+  workspacePreviewWatchBusy = true
+  try {
+    const capability = await api(`/api/workspace/files/${encodeURIComponent(file.id)}/preview-capability`)
+    if (epoch !== workspacePreviewWatchEpoch) return
+    if (!state.filePreview || String(state.filePreview.id) !== expectedId) return
+    if (capability?.kind === 'none') {
+      const reason = String(capability.reason || '').replace(/。$/, '')
+      stopWorkspacePreviewWatch()
+      closeWorkspaceFile()
+      banner(`《${file.name}》${reason ? `${reason}，` : ''}预览已关闭。`, 'warn')
+    }
+  } catch (err) {
+    if (epoch !== workspacePreviewWatchEpoch) return
+    if (!state.filePreview || String(state.filePreview.id) !== expectedId) return
+    if (err.status === 404 || err.status === 403) {
+      stopWorkspacePreviewWatch()
+      closeWorkspaceFile()
+      void loadWorkspaceFiles()
+      const message =
+        err.status === 404
+          ? `《${file.name}》已被删除，预览已关闭。`
+          : `《${file.name}》的访问权限已失效，预览已关闭。`
+      banner(message, err.status === 404 ? 'warn' : 'bad')
+    }
+    // 网络抖动或服务端临时错误不关闭预览，等下一轮巡检继续确认。
+  } finally {
+    if (epoch === workspacePreviewWatchEpoch) workspacePreviewWatchBusy = false
   }
 }
 
@@ -2677,14 +4594,21 @@ async function openWorkspaceFile(id, options = {}) {
     return
   }
   const requestSeq = ++workspacePreviewToken
+  // 打开另一个文件时先冻结旧预览的巡检；若新文件不可预览，旧预览仍在，稍后恢复巡检。
+  const previousFile = state.filePreview
+  const replacing = Boolean(previousFile && previousFile.id !== file.id)
+  if (replacing) stopWorkspacePreviewWatch()
   const capability = await fetchPreviewCapability(file)
   if (requestSeq !== workspacePreviewToken) return
   const kind = capability?.kind || previewKindForFile(file)
   if (kind === 'none') {
     // 没有可用预览能力时不创建面板，也不让右栏出现空白占位。
+    if (replacing && state.filePreview?.id === previousFile.id) startWorkspacePreviewWatch(previousFile)
     banner(capability?.reason || `《${file.name}》暂不支持在线预览，请下载后查看。`, 'warn')
     return
   }
+  // 新文件即将替换旧预览，先让上一份文件的巡检失效，避免旧请求关掉新面板。
+  stopWorkspacePreviewWatch()
   if (fileStreamDraft && fileStreamDraft.fileId !== file.id) finishStreamingFilePreview()
   releaseWorkspacePreviewUrl()
   destroyOnlyOfficeEditor()
@@ -2694,6 +4618,8 @@ async function openWorkspaceFile(id, options = {}) {
   state.filePreview = file
   workspacePreviewText = ''
   workspacePreviewTextLoaded = false
+  workspacePreviewOriginalText = ''
+  workspaceDiffVisible = false
   hidePreviewSelection()
   const pane = $('#file-pane')
   pane.hidden = false
@@ -2708,6 +4634,8 @@ async function openWorkspaceFile(id, options = {}) {
   $('#workspace-pane').hidden = true
   $('.composer').hidden = !split
   $('#file-pane-editor').hidden = true
+  $('#file-pane-diff').hidden = true
+  $('#file-pane-diff-toggle').hidden = true
   $('#file-pane-body').hidden = false
   $('#file-pane-kicker').textContent = split ? '对话内预览' : '云空间'
   $('#file-pane-name').textContent = file.name
@@ -2721,9 +4649,13 @@ async function openWorkspaceFile(id, options = {}) {
   $('#file-pane-edit').textContent = '编辑'
   $('#file-pane-edit').title = '编辑文件内容'
   $('#file-pane-delete').hidden = !owner
+  $('#file-pane-versions').hidden = !owner
+  $('#file-pane-export').hidden = !(isOfficeLike(file) && capability?.kind === 'office')
+  $('#file-pane-gui').hidden = !(owner && isOfficeLike(file) && capability?.kind === 'office')
   $('#file-pane-download').hidden = false
   $('#file-pane-send-dingtalk').hidden = false
   renderWorkspaceFiles()
+  startWorkspacePreviewWatch(file)
   if (isOfficeLike(file)) {
     await openWorkspaceOffice(file, options.mode === 'edit' ? 'edit' : 'view')
     return
@@ -2748,11 +4680,19 @@ async function openWorkspaceFile(id, options = {}) {
       const liveDraft = fileStreamDraft && fileStreamDraft.fileId === file.id ? fileStreamDraft : null
       const shownText = liveDraft ? liveDraft.text : text
       workspacePreviewText = shownText
+      workspacePreviewOriginalText = text
       workspacePreviewTextLoaded = true
-      const pre = document.createElement('pre')
-      pre.className = `file-text-view${liveDraft ? ' is-streaming' : ''}`
-      pre.textContent = shownText || '（空文件）'
-      setFilePaneBody(pre)
+      if (isMarkdownLike(file)) {
+        const view = document.createElement('div')
+        view.className = `file-markdown-view${liveDraft ? ' is-streaming' : ''}`
+        view.innerHTML = markdownPreviewHtml(shownText)
+        setFilePaneBody(view)
+      } else {
+        const pre = document.createElement('pre')
+        pre.className = `file-text-view${liveDraft ? ' is-streaming' : ''}`
+        pre.textContent = shownText || '（空文件）'
+        setFilePaneBody(pre)
+      }
       $('#file-pane-edit').hidden = !owner
       return
     }
@@ -2766,12 +4706,20 @@ async function openWorkspaceFile(id, options = {}) {
       return
     }
     if (isPdfLike(file)) {
-      workspacePreviewObjectUrl = URL.createObjectURL(blob)
-      const frame = document.createElement('iframe')
-      frame.className = 'file-pdf-view'
-      frame.title = file.name
-      frame.src = workspacePreviewObjectUrl
-      setFilePaneBody(frame)
+      try {
+        await openWorkspacePdfPreview(file, blob, token)
+      } catch (err) {
+        if (token !== workspacePreviewToken || state.filePreview?.id !== file.id) return
+        releaseWorkspacePdf()
+        if (workspacePreviewObjectUrl) URL.revokeObjectURL(workspacePreviewObjectUrl)
+        workspacePreviewObjectUrl = URL.createObjectURL(blob)
+        const frame = document.createElement('iframe')
+        frame.className = 'file-pdf-view'
+        frame.title = file.name
+        frame.src = workspacePreviewObjectUrl
+        setFilePaneBody(frame)
+        banner(`PDF 增强预览不可用，已退回浏览器原生预览：${err.message}`, 'warn')
+      }
       return
     }
     filePaneMessage('这个文件类型不能直接预览，点右上角「下载」查看内容。')
@@ -2825,12 +4773,19 @@ async function toggleFilePreviewFullscreen() {
 }
 
 function closeWorkspaceFile() {
+  stopWorkspacePreviewWatch()
   void exitFilePreviewFullscreen()
   finishStreamingFilePreview()
+  if (workspaceMarkdownRenderTimer) {
+    window.clearTimeout(workspaceMarkdownRenderTimer)
+    workspaceMarkdownRenderTimer = 0
+  }
   workspacePreviewToken += 1
   state.filePreview = null
   workspacePreviewText = ''
   workspacePreviewTextLoaded = false
+  workspacePreviewOriginalText = ''
+  workspaceDiffVisible = false
   releaseWorkspacePreviewUrl()
   destroyOnlyOfficeEditor()
   hideFilePaneSyncNotice()
@@ -2839,6 +4794,8 @@ function closeWorkspaceFile() {
   $('.chat-main').classList.remove('is-file-preview')
   hidePreviewSelection()
   $('#file-pane-editor').hidden = true
+  $('#file-pane-diff').hidden = true
+  $('#file-pane-diff-toggle').hidden = true
   $('#file-pane-rename').hidden = true
   $('#file-pane-body').hidden = false
   $('#file-pane-body').innerHTML = ''
@@ -2856,14 +4813,32 @@ function beginWorkspaceEdit() {
   if (!file || !workspacePreviewTextLoaded) return
   $('#file-pane-body').hidden = true
   $('#file-pane-editor').hidden = false
-  $('#file-pane-text').value = workspacePreviewText
+  workspaceDiffVisible = false
+  const textarea = $('#file-pane-text')
+  textarea.value = workspacePreviewText
+  textarea.hidden = false
+  const diff = $('#file-pane-diff')
+  diff.hidden = true
+  diff.innerHTML = ''
+  const toggle = $('#file-pane-diff-toggle')
+  toggle.hidden = false
+  toggle.disabled = false
+  toggle.textContent = '查看差异'
+  toggle.setAttribute('aria-pressed', 'false')
   $('#file-pane-editor-hint').textContent = '保存后会覆盖原文件内容；空内容也可以保存。'
-  $('#file-pane-text').focus()
+  textarea.focus()
 }
 
 function cancelWorkspaceEdit() {
+  workspaceDiffVisible = false
   $('#file-pane-editor').hidden = true
+  $('#file-pane-diff').hidden = true
+  $('#file-pane-diff').innerHTML = ''
+  $('#file-pane-text').hidden = false
+  $('#file-pane-diff-toggle').hidden = true
   $('#file-pane-body').hidden = false
+  const editButton = $('#file-pane-edit')
+  if (editButton && !editButton.hidden) editButton.focus()
 }
 
 async function saveWorkspaceEdit() {
@@ -2876,7 +4851,7 @@ async function saveWorkspaceEdit() {
     await api(`/api/workspace/files${qs()}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ path: file.relPath, text, mime: file.mime || 'text/plain; charset=utf-8' }),
+      body: JSON.stringify({ path: file.relPath, text, mime: file.mime || 'text/plain; charset=utf-8', baseVersion: file.updatedAt }),
     })
     banner('文件内容已保存', 'ok')
     await loadWorkspaceFiles()
@@ -2920,21 +4895,551 @@ function downloadWorkspacePreview() {
   downloadWorkspaceFile(file).catch((err) => banner(err.message, 'bad'))
 }
 
+function versionSourceLabel(source) {
+  const labels = {
+    'onlyoffice.save': 'OnlyOffice 保存前',
+    'workspace.snapshot': '手动快照',
+    'workspace.restore': '恢复前',
+    'office.replace': '文本替换前',
+    'office.insert': '结构修改前',
+    'office.format': '格式修改前',
+    'office.comment': '批注修改前',
+    'office.revisions': '修订修改前',
+    'workspace.edit': '文本编辑前',
+  }
+  return labels[String(source || '')] || String(source || '未知来源')
+}
+
+function formatVersionTime(value) {
+  const time = Number(value)
+  if (!Number.isFinite(time) || time <= 0) return '—'
+  return new Date(time).toLocaleString('zh-CN', { hour12: false })
+}
+
+/** 历史版本弹窗：只给文件本人看，避免共享文件泄露旧内容。 */
+async function openWorkspaceVersionHistory(file) {
+  const previousFocus = document.activeElement
+  const overlay = document.createElement('div')
+  overlay.className = 'modal-overlay version-overlay'
+  overlay.innerHTML = `<div class="modal version-card" role="dialog" aria-modal="true" aria-labelledby="version-card-title">
+    <div class="version-card-head">
+      <div>
+        <span class="version-card-eyebrow">版本历史</span>
+        <h3 id="version-card-title">${esc(file.name)}</h3>
+        <p class="version-card-sub">每次保存或 Agent 修改前自动留一份；最多保留最近 20 个版本。</p>
+      </div>
+      <button class="modal-x" type="button" aria-label="关闭历史版本">×</button>
+    </div>
+    <div class="version-card-toolbar">
+      <div class="version-card-actions">
+        <button class="btn ghost sm" type="button" data-version-snapshot>保存当前版本</button>
+        <button class="btn ghost sm" type="button" data-version-restore-last disabled>恢复到上一版本</button>
+      </div>
+      <span class="version-card-count" data-version-count>正在读取…</span>
+    </div>
+    <div class="version-card-list" data-version-list></div>
+    <div class="version-card-status" data-version-status hidden></div>
+  </div>`
+  document.body.appendChild(overlay)
+
+  let settled = false
+  const status = overlay.querySelector('[data-version-status]')
+  const list = overlay.querySelector('[data-version-list]')
+  const count = overlay.querySelector('[data-version-count]')
+  const quickRestore = overlay.querySelector('[data-version-restore-last]')
+  const close = () => {
+    if (settled) return
+    settled = true
+    document.removeEventListener('keydown', onKey)
+    overlay.remove()
+    if (previousFocus instanceof HTMLElement && previousFocus.isConnected && !previousFocus.closest('[hidden]')) {
+      previousFocus.focus({ preventScroll: true })
+    } else {
+      $('#input')?.focus()
+    }
+  }
+  const onKey = (event) => {
+    if (event.key === 'Escape') close()
+  }
+  document.addEventListener('keydown', onKey)
+  overlay.addEventListener('click', (event) => {
+    if (event.target === overlay) close()
+  })
+  overlay.querySelector('.modal-x').addEventListener('click', close)
+
+  const showStatus = (text, tone = '') => {
+    if (!status) return
+    status.hidden = !text
+    status.textContent = text
+    status.className = `version-card-status${tone ? ` is-${tone}` : ''}`
+  }
+
+  const render = (items) => {
+    count.textContent = `${items.length} 个版本`
+    quickRestore.disabled = true
+    delete quickRestore.dataset.versionId
+    delete quickRestore.dataset.versionLabel
+    if (!items.length) {
+      list.innerHTML = '<div class="version-card-empty">还没有历史版本。保存当前版本后，这里会出现可恢复的快照。</div>'
+      return
+    }
+    list.innerHTML = items.map((item) => {
+      const current = Number(item.version) === Number(file.updatedAt)
+      const versionName = `v${item.version}`
+      return `<div class="version-row${current ? ' is-current' : ''}">
+        <div class="version-row-main">
+          <div class="version-row-title">
+            <strong>${esc(versionName)}</strong>
+            ${current ? '<span class="version-current-badge">当前</span>' : ''}
+            <span class="version-row-size">${esc(fmtSize(item.size))}</span>
+          </div>
+          <div class="version-row-meta">${esc(versionSourceLabel(item.source))} · ${esc(formatVersionTime(item.createdAt))}</div>
+          ${item.summary ? `<div class="version-row-summary">${esc(item.summary)}</div>` : ''}
+        </div>
+        <div class="version-row-actions">
+          <a class="btn ghost sm" href="/api/workspace/files/${encodeURIComponent(file.id)}/versions/${encodeURIComponent(item.id)}/download" download>下载</a>
+          <button class="btn ghost sm" type="button" data-version-restore="${esc(item.id)}" ${current ? 'disabled' : ''}>${current ? '当前版本' : '恢复'}</button>
+        </div>
+      </div>`
+    }).join('')
+    const previous = items.find((item) => Number(item.version) !== Number(file.updatedAt))
+    if (previous) {
+      quickRestore.disabled = false
+      quickRestore.dataset.versionId = previous.id
+      quickRestore.dataset.versionLabel = `v${previous.version}`
+    }
+  }
+
+  const load = async () => {
+    try {
+      const data = await api(`/api/workspace/files/${encodeURIComponent(file.id)}/versions`)
+      render(Array.isArray(data?.items) ? data.items : [])
+      showStatus('')
+    } catch (err) {
+      count.textContent = '读取失败'
+      list.innerHTML = `<div class="version-card-empty is-error">读取版本历史失败：${esc(err.message)}</div>`
+    }
+  }
+
+  overlay.querySelector('[data-version-snapshot]').addEventListener('click', async (event) => {
+    const button = event.currentTarget
+    button.disabled = true
+    button.textContent = '保存中…'
+    try {
+      const result = await api(`/api/workspace/files/${encodeURIComponent(file.id)}/versions`, { method: 'POST' })
+      showStatus(result?.created ? '已保存当前版本快照' : '当前版本已有快照', 'ok')
+      await load()
+    } catch (err) {
+      showStatus(`保存快照失败：${err.message}`, 'bad')
+    } finally {
+      button.disabled = false
+      button.textContent = '保存当前版本'
+    }
+  })
+
+  const restoreVersion = async (versionId, versionLabel, triggerButton) => {
+    if (!versionId) return
+    const confirmed = await openConfirmCard({
+      eyebrow: '恢复历史版本',
+      title: `恢复到 ${versionLabel}？`,
+      targetLabel: '文件',
+      target: file.name,
+      message: '当前内容会先自动保存为一份新快照，然后写回所选历史版本；恢复后编辑器需要重新打开。',
+      confirmText: '恢复此版本',
+    })
+    if (!confirmed) return
+    const originalText = triggerButton?.textContent
+    if (triggerButton) {
+      triggerButton.disabled = true
+      triggerButton.textContent = '恢复中…'
+    }
+    try {
+      await api(`/api/workspace/files/${encodeURIComponent(file.id)}/versions/${encodeURIComponent(versionId)}/restore`, {
+        method: 'POST',
+      })
+      close()
+      await loadWorkspaceFiles()
+      const latest = state.files.find((item) => item.id === file.id)
+      if (latest) await openWorkspaceFile(latest.id, { mode: 'view' })
+      banner('已恢复到所选历史版本', 'ok')
+    } catch (err) {
+      showStatus(`恢复失败：${err.message}`, 'bad')
+      if (triggerButton) {
+        triggerButton.disabled = false
+        triggerButton.textContent = originalText || '恢复'
+      }
+    }
+  }
+
+  list.addEventListener('click', async (event) => {
+    const button = event.target.closest('[data-version-restore]')
+    if (!button || button.disabled) return
+    const versionId = button.getAttribute('data-version-restore') || ''
+    const row = button.closest('.version-row')
+    const versionLabel = row?.querySelector('.version-row-title strong')?.textContent || '该版本'
+    await restoreVersion(versionId, versionLabel, button)
+  })
+
+  quickRestore.addEventListener('click', async () => {
+    if (quickRestore.disabled) return
+    await restoreVersion(
+      quickRestore.dataset.versionId || '',
+      quickRestore.dataset.versionLabel || '上一版本',
+      quickRestore,
+    )
+  })
+
+  await load()
+}
+
+const GUI_FALLBACK_OPTIONS = [
+  {
+    id: 'print',
+    label: '打印 / 打印设置',
+    description: '打开 OnlyOffice 原生打印对话框；查看态也可用。',
+    needsEdit: false,
+  },
+  {
+    id: 'export',
+    label: '导出选项',
+    description: '打开原生导出/另存为，选择格式和本地保存位置；查看态也可用。',
+    needsEdit: false,
+  },
+  {
+    id: 'macro',
+    label: '宏管理器',
+    description: '只打开宏管理器；EAB 不会读取、保存或自动执行宏代码。',
+    needsEdit: true,
+  },
+  {
+    id: 'dialog',
+    label: '原生对话框',
+    description: '页面设置、页眉页脚；仅 docx，且需要先切到编辑态。',
+    needsEdit: true,
+  },
+]
+
+/**
+ * GUI 兜底：前端负责用户确认和步骤引导，真正的原生按钮由用户自己点。
+ * 服务端只认白名单动作，不做任意坐标点击或宏执行。
+ */
+async function openWorkspaceGuiFallback(file) {
+  if (!file) return
+  const previousFocus = document.activeElement
+  const overlay = document.createElement('div')
+  overlay.className = 'modal-overlay gui-overlay'
+  const optionsHtml = GUI_FALLBACK_OPTIONS.map((option, index) => `
+    <label class="gui-option">
+      <input type="radio" name="gui-action" value="${esc(option.id)}"${index === 0 ? ' checked' : ''}>
+      <span>
+        <strong>${esc(option.label)}</strong>
+        <em>${esc(option.description)}</em>
+      </span>
+    </label>`).join('')
+  overlay.innerHTML = `<div class="modal gui-card" role="dialog" aria-modal="true" aria-labelledby="gui-card-title">
+    <div class="gui-card-head">
+      <div>
+        <span class="gui-card-eyebrow">受控人工兜底</span>
+        <h3 id="gui-card-title">${esc(file.name)}</h3>
+        <p class="gui-card-sub">仅支持白名单里的原生入口。确认后由你自己在 OnlyOffice 点击；失败一次即停，不会自动重试。</p>
+      </div>
+      <button class="modal-x" type="button" aria-label="关闭 GUI 兜底">×</button>
+    </div>
+    <div class="gui-card-body">
+      <section class="gui-setup" data-gui-setup>
+        <div class="gui-options" role="radiogroup" aria-label="选择兜底动作">${optionsHtml}</div>
+        <div class="gui-field" data-gui-dialog-row hidden>
+          <label for="gui-dialog-select">原生对话框</label>
+          <select id="gui-dialog-select" data-gui-dialog>
+            <option value="page_setup">页面设置</option>
+            <option value="header_footer">页眉页脚</option>
+          </select>
+        </div>
+        <div class="gui-field" data-gui-format-row hidden>
+          <label for="gui-format-select">导出格式提示</label>
+          <select id="gui-format-select" data-gui-format>
+            <option value="pdf">PDF</option>
+            <option value="docx">Word (docx)</option>
+            <option value="xlsx">Excel (xlsx)</option>
+            <option value="pptx">PowerPoint (pptx)</option>
+            <option value="csv">CSV</option>
+          </select>
+        </div>
+        <p class="gui-note">当前只允许打印、宏管理器、导出选项、页面设置/页眉页脚。白名单外动作会被服务端拒绝。</p>
+      </section>
+      <section class="gui-steps" data-gui-steps hidden>
+        <div class="gui-steps-head">
+          <strong data-gui-steps-title>操作步骤</strong>
+          <span data-gui-steps-meta></span>
+        </div>
+        <ol data-gui-steps-list></ol>
+      </section>
+      <div class="gui-card-status" data-gui-status hidden></div>
+      <div class="gui-failure" data-gui-failure-row hidden>
+        <label for="gui-failure-detail">失败原因</label>
+        <textarea id="gui-failure-detail" data-gui-failure-detail rows="2" maxlength="500" placeholder="例如：打印对话框报错、宏被安全策略拦截、页面设置无法保存"></textarea>
+        <button class="btn ghost sm" type="button" data-gui-submit-failure>提交失败原因</button>
+      </div>
+    </div>
+    <div class="gui-card-actions">
+      <button class="btn ghost" type="button" data-gui-cancel>取消</button>
+      <button class="btn" type="button" data-gui-prepare>生成操作步骤</button>
+      <button class="btn" type="button" data-gui-confirm hidden>我确认，开始操作</button>
+      <button class="btn ghost" type="button" data-gui-success hidden>我已完成</button>
+      <button class="btn ghost" type="button" data-gui-failure hidden>遇到问题</button>
+      <button class="btn" type="button" data-gui-finish hidden>完成</button>
+    </div>
+  </div>`
+  for (const existing of document.querySelectorAll('.gui-overlay')) {
+    const closeButton = existing.querySelector('.modal-x')
+    if (closeButton instanceof HTMLElement) closeButton.click()
+    else existing.remove()
+  }
+  document.body.appendChild(overlay)
+
+  let settled = false
+  let fallback = null
+  const status = overlay.querySelector('[data-gui-status]')
+  const setup = overlay.querySelector('[data-gui-setup]')
+  const stepsBox = overlay.querySelector('[data-gui-steps]')
+  const stepsList = overlay.querySelector('[data-gui-steps-list]')
+  const stepsTitle = overlay.querySelector('[data-gui-steps-title]')
+  const stepsMeta = overlay.querySelector('[data-gui-steps-meta]')
+  const dialogRow = overlay.querySelector('[data-gui-dialog-row]')
+  const formatRow = overlay.querySelector('[data-gui-format-row]')
+  const dialogSelect = overlay.querySelector('[data-gui-dialog]')
+  const formatSelect = overlay.querySelector('[data-gui-format]')
+  const failureRow = overlay.querySelector('[data-gui-failure-row]')
+  const failureDetail = overlay.querySelector('[data-gui-failure-detail]')
+  const prepareButton = overlay.querySelector('[data-gui-prepare]')
+  const confirmButton = overlay.querySelector('[data-gui-confirm]')
+  const successButton = overlay.querySelector('[data-gui-success]')
+  const failureButton = overlay.querySelector('[data-gui-failure]')
+  const finishButton = overlay.querySelector('[data-gui-finish]')
+  const cancelButton = overlay.querySelector('[data-gui-cancel]')
+  const actionInputs = [...overlay.querySelectorAll('input[name="gui-action"]')]
+
+  const close = () => {
+    document.removeEventListener('keydown', onKey)
+    overlay.remove()
+    if (settled) return
+    settled = true
+    if (previousFocus instanceof HTMLElement && previousFocus.isConnected && !previousFocus.closest('[hidden]')) {
+      previousFocus.focus({ preventScroll: true })
+    } else {
+      $('#input')?.focus()
+    }
+  }
+  const onKey = (event) => {
+    if (event.key === 'Escape') close()
+  }
+  document.addEventListener('keydown', onKey)
+  overlay.addEventListener('click', (event) => {
+    if (event.target === overlay) close()
+  })
+  overlay.querySelector('.modal-x').addEventListener('click', close)
+  cancelButton.addEventListener('click', close)
+
+  const showStatus = (message, tone = '') => {
+    status.className = `gui-card-status${tone ? ` is-${tone}` : ''}`
+    status.hidden = !message
+    status.textContent = message || ''
+  }
+  const selectedAction = () => overlay.querySelector('input[name="gui-action"]:checked')?.value || 'print'
+  const syncFields = () => {
+    const action = selectedAction()
+    dialogRow.hidden = action !== 'dialog'
+    formatRow.hidden = action !== 'export'
+  }
+  const setBusy = (busy) => {
+    for (const button of [prepareButton, confirmButton, successButton, failureButton, finishButton]) {
+      if (button) button.disabled = busy
+    }
+    for (const input of actionInputs) input.disabled = busy
+  }
+  const renderSteps = (data) => {
+    setup.hidden = true
+    stepsBox.hidden = false
+    stepsTitle.textContent = data.guiLabel || '操作步骤'
+    const expires = Number(data.expiresAt)
+    stepsMeta.textContent = `${Number.isFinite(expires) ? `${formatVersionTime(expires)} 前有效` : ''}${data.mode === 'edit' ? ' · 编辑态' : ' · 查看态'}`
+    stepsList.innerHTML = (data.steps || []).map((step) => `<li>${esc(step)}</li>`).join('')
+  }
+  const report = async (result) => {
+    if (!fallback?.fallbackId) return
+    let detail = ''
+    if (result === 'failure') {
+      detail = String(failureDetail?.value || '').trim()
+      if (!detail) {
+        showStatus('请先写清楚失败原因，提交后本次会停止，不能自动重试。', 'bad')
+        failureDetail?.focus()
+        return
+      }
+    }
+    setBusy(true)
+    try {
+      fallback = await api(qsAppend(`/api/workspace/files/${encodeURIComponent(file.id)}/gui-fallback/${encodeURIComponent(fallback.fallbackId)}/report`), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ result, detail }),
+      })
+      failureRow.hidden = true
+      successButton.hidden = true
+      failureButton.hidden = true
+      finishButton.hidden = false
+      setBusy(false)
+      if (result === 'success') {
+        showStatus('已记录完成。审计已写入 workspace.file.agent_gui。', 'ok')
+        finishButton.textContent = '完成'
+      } else {
+        showStatus('已记录失败。本次已停止，不会自动重试；需要再试时请关闭后重新发起。', 'bad')
+        finishButton.textContent = '关闭'
+      }
+    } catch (err) {
+      setBusy(false)
+      showStatus(`上报失败：${err.message}`, 'bad')
+    }
+  }
+
+  actionInputs.forEach((input) => input.addEventListener('change', syncFields))
+  syncFields()
+
+  prepareButton.addEventListener('click', async () => {
+    const action = selectedAction()
+    const option = GUI_FALLBACK_OPTIONS.find((item) => item.id === action)
+    if (option?.needsEdit && onlyOfficeMode !== 'edit') {
+      showStatus('当前是查看态。请先关闭本弹窗，点右上角「编辑」切换到编辑态后再发起。', 'bad')
+      return
+    }
+    setBusy(true)
+    showStatus('正在生成步骤…')
+    try {
+      fallback = await api(qsAppend(`/api/workspace/files/${encodeURIComponent(file.id)}/gui-fallback`), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          action,
+          dialog: action === 'dialog' ? dialogSelect?.value : undefined,
+          format: action === 'export' ? formatSelect?.value : undefined,
+        }),
+      })
+      setBusy(false)
+      prepareButton.hidden = true
+      confirmButton.hidden = false
+      renderSteps(fallback)
+      showStatus('步骤已生成。确认前不会执行任何操作；确认后由你本人在 OnlyOffice 完成。', 'warn')
+      confirmButton.focus()
+    } catch (err) {
+      setBusy(false)
+      showStatus(`生成失败：${err.message}`, 'bad')
+    }
+  })
+
+  confirmButton.addEventListener('click', async () => {
+    if (!fallback?.fallbackId) return
+    setBusy(true)
+    try {
+      fallback = await api(qsAppend(`/api/workspace/files/${encodeURIComponent(file.id)}/gui-fallback/${encodeURIComponent(fallback.fallbackId)}/confirm`), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({}),
+      })
+      setBusy(false)
+      confirmButton.hidden = true
+      successButton.hidden = false
+      failureButton.hidden = false
+      showStatus('已确认。请按上面步骤在 OnlyOffice 完成，然后回来点「我已完成」；遇到问题就点「遇到问题」。', 'ok')
+      successButton.focus()
+    } catch (err) {
+      setBusy(false)
+      showStatus(`确认失败：${err.message}`, 'bad')
+    }
+  })
+
+  successButton.addEventListener('click', () => void report('success'))
+  failureButton.addEventListener('click', () => {
+    failureRow.hidden = false
+    showStatus('请填写失败原因。提交后本次兜底即停止，同一条记录不能再次确认或上报。', 'warn')
+    failureDetail?.focus()
+  })
+  overlay.querySelector('[data-gui-submit-failure]').addEventListener('click', () => void report('failure'))
+  finishButton.addEventListener('click', close)
+  cancelButton.focus()
+}
+
+async function exportWorkspacePreviewPdf(file) {
+  const button = $('#file-pane-export')
+  if (!file || !button) return
+  const original = button.textContent
+  button.disabled = true
+  button.textContent = '导出中…'
+  try {
+    const response = await fetch(`/api/workspace/files/${encodeURIComponent(file.id)}/export`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ format: 'pdf' }),
+    })
+    if (response.status === 401) {
+      redirectToLogin()
+      return waitForLoginRedirect()
+    }
+    if (!response.ok) {
+      const payload = await response.json().catch(() => null)
+      throw new Error(payload?.error?.message || payload?.message || `导出失败（HTTP ${response.status}）`)
+    }
+    const blob = await response.blob()
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `${String(file.name || '文档').replace(/\.[^.]+$/, '')}.pdf`
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    setTimeout(() => URL.revokeObjectURL(url), 2000)
+    banner('已导出 PDF', 'ok')
+  } catch (err) {
+    banner(`导出 PDF 失败：${err.message}`, 'bad')
+  } finally {
+    button.disabled = false
+    button.textContent = original
+  }
+}
+
 /** 右侧工作台：团队 / 文件 / 并排。两个面板同级，团队不在文件预览里面。 */
 function bindWorkbenchTabs() {
+  try {
+    state.workbenchCollapsed = localStorage.getItem(WORKBENCH_COLLAPSED_KEY) === '1'
+  } catch {
+    state.workbenchCollapsed = false
+  }
   const tabs = $('#workbench-tabs')
   if (tabs) {
     tabs.addEventListener('click', (event) => {
       const tab = event.target.closest('[data-workbench-tab]')
       if (!tab) return
+      const name = tab.getAttribute('data-workbench-tab')
       state.workbenchSplit = false
-      state.workbenchTab = tab.getAttribute('data-workbench-tab') === 'file' ? 'file' : 'team'
+      state.workbenchTab = name === 'file' ? 'file' : name === 'perm' ? 'perm' : 'team'
+      if (state.workbenchTab === 'perm') {
+        state.permOpen = true
+        state.permError = ''
+        void loadPermissionData()
+      }
       syncWorkbenchLayout()
     })
   }
   $('#workbench-split')?.addEventListener('click', () => {
     state.workbenchSplit = !state.workbenchSplit
     syncWorkbenchLayout()
+  })
+  $('#workbench-collapse')?.addEventListener('click', () => {
+    setWorkbenchCollapsed(true)
+    $('#workbench-restore')?.focus()
+  })
+  $('#workbench-restore')?.addEventListener('click', () => {
+    setWorkbenchCollapsed(false)
+    $('#workbench-collapse')?.focus()
   })
   // 子 Agent 列表：点哪一行，右边的详情窗口就切到哪个 Agent 的工作过程。
   $('#team-list')?.addEventListener('click', (event) => {
@@ -2959,11 +5464,24 @@ function bindWorkbenchTabs() {
     input.setSelectionRange(input.value.length, input.value.length)
     input.dispatchEvent(new Event('input', { bubbles: true }))
   })
+  syncWorkbenchLayout()
 }
 
 function bindWorkspaceFilePane() {
   $('#file-pane-close')?.addEventListener('click', closeWorkspaceFile)
   $('#file-pane-download')?.addEventListener('click', downloadWorkspacePreview)
+  $('#file-pane-versions')?.addEventListener('click', () => {
+    const file = state.filePreview
+    if (file) void openWorkspaceVersionHistory(file)
+  })
+  $('#file-pane-export')?.addEventListener('click', () => {
+    const file = state.filePreview
+    if (file) void exportWorkspacePreviewPdf(file)
+  })
+  $('#file-pane-gui')?.addEventListener('click', () => {
+    const file = state.filePreview
+    if (file) void openWorkspaceGuiFallback(file)
+  })
   $('#file-pane-refresh')?.addEventListener('click', () => {
     void refreshFilePaneToCloudVersion()
   })
@@ -3036,6 +5554,7 @@ function bindWorkspaceFilePane() {
   })
   $('#file-pane-cancel')?.addEventListener('click', cancelWorkspaceEdit)
   $('#file-pane-save')?.addEventListener('click', saveWorkspaceEdit)
+  $('#file-pane-diff-toggle')?.addEventListener('click', toggleWorkspaceDiff)
   $('#file-pane-delete')?.addEventListener('click', deleteWorkspacePreview)
 }
 
@@ -3063,6 +5582,13 @@ const TEXT_MIME = /^text\/|application\/(json|xml|x-yaml|yaml|x-ndjson|csv)/i
 function isTextLike(file) {
   const mime = file.mime || file.type || ''
   return TEXT_EXT.test(file.name || '') || TEXT_MIME.test(mime)
+}
+
+/** 只有 Markdown 文件走文档排版；txt/json/log 等仍按等宽原文预览。 */
+function isMarkdownLike(file) {
+  const name = String(file.name || '')
+  const mime = String(file.mime || file.type || '')
+  return /\.(md|markdown)$/i.test(name) || /^(?:text|application)\/(?:x-)?markdown/i.test(mime)
 }
 
 function safeFileName(file) {
@@ -4324,9 +6850,18 @@ function showSkillInstall() {
   let progressStartedAt = 0
 
   const sourceNotes = {
-    'browser-dir': '本机文件夹：浏览器只上传文件副本，服务端落到临时目录扫描；安装后立即删除临时目录。',
-    git: 'GitHub：下载仓库 tarball 后解包；仓库里必须有 skill.json 和 SKILL.md。只取内容，不执行仓库脚本。',
-    http: '压缩包 URL：只支持 tar.gz / zip；解包后照常静态扫描。默认只允许公网 https。',
+    'browser-dir': {
+      label: '本机副本',
+      tip: '本机文件夹：浏览器只上传文件副本，服务端落到临时目录扫描；安装后立即删除临时目录。',
+    },
+    git: {
+      label: '只取内容',
+      tip: 'GitHub：下载仓库 tarball 后解包；仓库里必须有 skill.json 和 SKILL.md。只取内容，不执行仓库脚本。',
+    },
+    http: {
+      label: '仅 HTTPS',
+      tip: '压缩包 URL：只支持 tar.gz / zip；解包后照常静态扫描。默认只允许公网 https。',
+    },
   }
   const setInstalling = (busy) => {
     for (const control of overlay.querySelectorAll('.install-source-tab, .install-field input, .install-check input, #si-pick-folder')) control.disabled = busy
@@ -4366,7 +6901,8 @@ function showSkillInstall() {
       tab.setAttribute('aria-selected', active ? 'true' : 'false')
     }
     for (const panel of panels) panel.classList.toggle('is-hidden', panel.dataset.siPanel !== next)
-    noteEl.innerHTML = `${String(sourceNotes[next] || '')}`
+    const note = sourceNotes[next] || { label: '来源说明', tip: '' }
+    noteEl.innerHTML = `<span class="install-tab-badge hint-badge" data-tip="${esc(note.tip)}" tabindex="0" aria-label="安装来源说明">${esc(note.label)}</span>`
     flowFirst.textContent = next === 'browser-dir' ? '① 读取文件夹' : '① 下载并解包'
     stateEl.className = 'modal-state'
     stateEl.textContent = ''
@@ -4405,6 +6941,7 @@ function showSkillInstall() {
     apply(files.map((file) => ({ rel: String(file.webkitRelativePath || file.name), file })), files[0]?.webkitRelativePath?.split('/')[0] || '技能文件夹')
   })
   syncSource(source)
+  bindHintTips(overlay)
 
   submit.addEventListener('click', async () => {
     const body = {
@@ -5050,19 +7587,36 @@ async function persistSessionModel(modelId, reasoningEffort = state.reasoningEff
  * 自动模式下一次就直接选它，不再先撞刚失败的模型。
  */
 async function refreshModelCatalog() {
-  try {
-    const data = await api(`/api/chat/models${qs()}`)
-    if (!data?.models?.length) return
+  if (state.modelRefreshPromise) {
+    try {
+      await state.modelRefreshPromise
+    } catch {
+      /* 同一轮刷新失败由发起方统一处理 */
+    }
+    return
+  }
+  state.modelRefreshPromise = (async () => {
+    const data = await api(`/api/chat/models${qs()}`, { cache: 'no-store' })
+    if (!data || !Array.isArray(data.models)) return
     state.models = data.models
-    state.autoModelId = data.autoModelId
+    state.autoModelId = data.autoModelId ?? null
+    state.canChat = Boolean(data.canChat && data.canUseModel)
     if (state.selected && !state.models.some((model) => model.id === state.selected)) {
       state.selected = ''
     }
     renderModelMenus()
     $('#model-chip-label').textContent = modelLabel(state.selected)
     syncThinkingChip()
+    updateSendState()
+    if (state.me) renderEmpty(state.me)
+    $('#demo-pill').hidden = !state.models.length || !state.models.every((model) => model.provider === 'demo')
+  })()
+  try {
+    await state.modelRefreshPromise
   } catch {
     // 目录刷新失败不影响已经完成的回答，下一轮服务端仍按健康顺序选择。
+  } finally {
+    state.modelRefreshPromise = null
   }
 }
 
@@ -5390,7 +7944,8 @@ function fileBadgeLabel(name) {
   if (['xls', 'xlsx', 'xlsm', 'csv', 'ods'].includes(ext)) return { label: 'XLS', tone: 'sheet' }
   if (['ppt', 'pptx', 'pptm', 'odp'].includes(ext)) return { label: 'PPT', tone: 'slide' }
   if (ext === 'pdf') return { label: 'PDF', tone: 'pdf' }
-  if (['md', 'markdown', 'txt', 'log', 'json', 'yml', 'yaml'].includes(ext)) return { label: 'TXT', tone: 'text' }
+  if (['md', 'markdown'].includes(ext)) return { label: 'MD', tone: 'text' }
+  if (['txt', 'log', 'json', 'yml', 'yaml'].includes(ext)) return { label: 'TXT', tone: 'text' }
   return { label: 'FILE', tone: 'file' }
 }
 
@@ -5536,6 +8091,36 @@ function filePreviewMatchesPath(file, path) {
   )
 }
 
+function streamingMarkdownNode() {
+  const body = $('#file-pane-body')
+  if (!body || body.hidden) return null
+  const existing = body.querySelector('.file-markdown-view')
+  if (existing) return existing
+  // 已有等宽文本预览（例如非 Markdown 文件）时不替换宿主。
+  if (body.querySelector('#onlyoffice-editor, iframe, img, pre.file-text-view')) return null
+  const view = document.createElement('div')
+  view.className = 'file-markdown-view'
+  body.innerHTML = ''
+  body.appendChild(view)
+  return view
+}
+
+function scheduleMarkdownPreviewRender(view, text, body) {
+  const stickToBottom = body ? body.scrollHeight - body.scrollTop - body.clientHeight < 80 : true
+  if (workspaceMarkdownRenderTimer) {
+    window.clearTimeout(workspaceMarkdownRenderTimer)
+    workspaceMarkdownRenderTimer = 0
+  }
+  // 工具参数会高频到达；Markdown 需要整篇重排，合并到 ~20fps 避免每个字符都重排。
+  workspaceMarkdownRenderTimer = window.setTimeout(() => {
+    workspaceMarkdownRenderTimer = 0
+    if (!view.isConnected) return
+    const atBottom = body ? body.scrollHeight - body.scrollTop - body.clientHeight < 80 : false
+    view.innerHTML = markdownPreviewHtml(text)
+    if (body && (stickToBottom || atBottom)) body.scrollTop = body.scrollHeight
+  }, 50)
+}
+
 function streamingPreviewNode() {
   const body = $('#file-pane-body')
   if (!body || body.hidden) return null
@@ -5578,6 +8163,16 @@ function applyStreamingFilePreview(path, text) {
     return
   }
   if (!isTextLike(file)) return
+  if (isMarkdownLike(file)) {
+    const view = streamingMarkdownNode()
+    if (!view) return
+    view.classList.add('is-streaming')
+    const body = $('#file-pane-body')
+    scheduleMarkdownPreviewRender(view, draft.text, body)
+    workspacePreviewText = draft.text
+    workspacePreviewTextLoaded = true
+    return
+  }
   const pre = streamingPreviewNode()
   if (!pre) return
   const body = $('#file-pane-body')
@@ -5647,10 +8242,15 @@ function revealPreviewText(el, text, body) {
 }
 
 function clearStreamingPreviewArtifacts() {
+  if (workspaceMarkdownRenderTimer) {
+    window.clearTimeout(workspaceMarkdownRenderTimer)
+    workspaceMarkdownRenderTimer = 0
+  }
   const body = $('#file-pane-body')
   if (!body) return
   body.querySelector('.file-stream-draft')?.remove()
   body.querySelector('pre.file-text-view.is-streaming')?.classList.remove('is-streaming')
+  body.querySelector('.file-markdown-view.is-streaming')?.classList.remove('is-streaming')
   fileStreamReveal = null
 }
 
@@ -5664,6 +8264,14 @@ function finishStreamingFilePreview(onDone) {
   if (!draft && !fileStreamReveal) {
     onDone?.()
     return
+  }
+  // 生成完成后用完整草稿做最终 Markdown 排版，避免停在未闭合语法或半段内容。
+  if (draft && state.filePreview && isMarkdownLike(state.filePreview)) {
+    const view = $('#file-pane-body')?.querySelector('.file-markdown-view')
+    if (view) {
+      view.innerHTML = markdownPreviewHtml(draft.text)
+      view.classList.remove('is-streaming')
+    }
   }
   clearStreamingPreviewArtifacts()
   onDone?.()
@@ -5818,6 +8426,7 @@ function fileOpsPanelHtml(tools) {
 
 async function openFileOperationPreview(button) {
   if (!button || button.disabled) return
+  setWorkbenchCollapsed(false)
   let fileId = String(button.dataset.fileOpOpen || '').trim()
   const path = String(button.dataset.fileOpPath || '').trim()
   button.disabled = true
@@ -6032,6 +8641,7 @@ function clearFileActivity() {
 }
 
 async function openFileDockPreview() {
+  setWorkbenchCollapsed(false)
   const activity = state.fileActivity
   if (!activity) return
   if (activity.status === 'running' && !activity.fileId) {
@@ -6173,51 +8783,96 @@ function historyAiBubble(text, meta, rich, options = {}) {
     ${metaText || channel ? `<span class="meta">${channel}${metaText ? esc(metaText) : ''}</span>` : ''}`
 }
 
-/** AI 没有足够方向时给出的结构化问题 + 可点击方向 + 自定义补充入口。 */
+/** AI 没有足够方向时给出的结构化问题：单选、多选、填空或多题题组。 */
 function clarifyPanelHtml(clarify, options = {}) {
   if (!clarify || typeof clarify !== 'object') return ''
-  const question = String(clarify.question || '').trim()
-  const optionsList = Array.isArray(clarify.options) ? clarify.options.slice(0, 4) : []
-  if (!question || optionsList.length < 2) return ''
-  const allowCustom = clarify.allowCustom !== false
+  const questions = Array.isArray(clarify.questions) ? clarify.questions : []
+  const total = questions.length > 1 ? questions.length : 0
+  const index = total > 0
+    ? Math.min(Math.max(0, Math.trunc(Number(clarify.index) || 0)), total - 1)
+    : 0
+  const current = total > 0 ? (questions[index] || {}) : clarify
+  const kind = current.kind === 'multiple' || current.kind === 'text' ? current.kind : 'single'
+  const question = String(current.question || '').trim()
+  const optionsList = Array.isArray(current.options) ? current.options.slice(0, 4) : []
+  if (!question) return ''
+  if (kind !== 'text' && optionsList.length < 2) return ''
+  const allowCustom = current.allowCustom !== false
+  const placeholder = String(current.placeholder || (kind === 'text' ? '请输入你的答案…' : '也可以直接补充你的方向…')).trim()
   const docked = options.docked === true
   const step = Math.max(0, Math.trunc(Number(options.step) || 0))
   const previous = String(options.previous || '').trim()
   const exitable = options.exitable === true
-  const stepLine =
-    step > 0
+  const answerKey = String(index + 1)
+  const draft = total > 0 && clarify.answers && clarify.answers[answerKey]
+    ? clarify.answers[answerKey]
+    : null
+  const selectedLabels = Array.isArray(draft?.selected) ? draft.selected.map((value) => String(value)) : []
+  const draftText = String(draft?.text || '')
+  const stepLine = total > 0
+    ? `<div class="clarify-stepline">
+        <span class="clarify-step">第 ${index + 1} / ${total} 题</span>
+        ${previous ? `<span class="clarify-prev">上一步：${esc(oneLinePreview(previous, 24))}</span>` : ''}
+        ${exitable ? '<button class="clarify-exit" type="button" data-clarify-exit>退出引导</button>' : ''}
+      </div>`
+    : step > 0
       ? `<div class="clarify-stepline">
           <span class="clarify-step">第 ${step} 步</span>
           ${previous ? `<span class="clarify-prev">上一步：${esc(oneLinePreview(previous, 24))}</span>` : ''}
           ${exitable ? '<button class="clarify-exit" type="button" data-clarify-exit>退出引导</button>' : ''}
         </div>`
       : ''
-  return `<div class="clarify-card${docked ? ' is-docked' : ''}" role="group" aria-label="需要你确认方向">
+  const head =
+    kind === 'text' ? '需要你填写答案' : kind === 'multiple' ? '本题可多选' : '需要你确认方向'
+  const optionHtml = optionsList.map((option) => {
+    const label = String(option?.label || '').trim()
+    const description = String(option?.description || '').trim()
+    if (!label) return ''
+    const selected = selectedLabels.includes(label)
+    return `<button class="clarify-option${kind === 'multiple' ? ' clarify-option-check' : ''}${selected ? ' is-selected' : ''}" type="button"
+      data-clarify-answer="${esc(label)}" aria-pressed="${selected ? 'true' : 'false'}">
+      ${kind === 'multiple' ? '<span class="clarify-check" aria-hidden="true">✓</span>' : ''}
+      <span class="clarify-option-label">${esc(label)}</span>
+      ${description ? `<span class="clarify-option-desc">${esc(description)}</span>` : ''}
+    </button>`
+  }).join('')
+  const submitHtml = total > 0
+    ? index === total - 1
+      ? '<button class="clarify-send clarify-batch-submit" type="button" data-clarify-batch-submit>提交全部</button>'
+      : ''
+    : kind === 'multiple'
+      ? '<button class="clarify-send clarify-multi-submit" type="button" data-clarify-multi-submit>提交多选</button>'
+      : ''
+  const inputHtml = kind === 'text'
+    ? `<div class="clarify-custom">
+        <input class="clarify-input" type="text" maxlength="200" value="${esc(draftText)}" placeholder="${esc(placeholder)}" aria-label="填写答案">
+        ${total > 0 ? '' : '<button class="clarify-send" type="button" data-clarify-text-submit>提交答案</button>'}
+      </div>`
+    : kind === 'single' && allowCustom && total === 0
+      ? docked
+        ? '<div class="clarify-hint">也可以直接在下方输入框补充自己的方向。</div>'
+        : `<div class="clarify-custom">
+            <input class="clarify-input" type="text" maxlength="200" placeholder="${esc(placeholder)}" aria-label="补充你的方向">
+            <button class="clarify-send" type="button">发送</button>
+          </div>`
+      : ''
+  const navHtml = total > 0
+    ? `<div class="clarify-nav">
+        <button class="clarify-nav-btn" type="button" data-clarify-prev ${index === 0 ? 'disabled' : ''}>上一题</button>
+        <span class="clarify-nav-progress">${index + 1} / ${total}</span>
+        <button class="clarify-nav-btn" type="button" data-clarify-next ${index === total - 1 ? 'disabled' : ''}>下一题</button>
+      </div>`
+    : ''
+  return `<div class="clarify-card${docked ? ' is-docked' : ''}" role="group" aria-label="${esc(head)}" data-clarify-kind="${kind}" data-clarify-total="${total}" data-clarify-index="${index}">
     ${stepLine}
-    <div class="clarify-head"><span class="clarify-mark" aria-hidden="true">?</span><span>需要你确认方向</span></div>
+    <div class="clarify-head"><span class="clarify-mark" aria-hidden="true">?</span><span>${esc(head)}</span></div>
     <div class="clarify-question">${esc(question)}</div>
-    <div class="clarify-options">
-      ${optionsList.map((option) => {
-        const label = String(option?.label || '').trim()
-        const description = String(option?.description || '').trim()
-        if (!label) return ''
-        return `<button class="clarify-option" type="button" data-clarify-answer="${esc(label)}">
-          <span class="clarify-option-label">${esc(label)}</span>
-          ${description ? `<span class="clarify-option-desc">${esc(description)}</span>` : ''}
-        </button>`
-      }).join('')}
-    </div>
+    ${optionHtml ? `<div class="clarify-options${kind === 'multiple' ? ' is-multi' : ''}">
+      ${optionHtml}
+    </div>${submitHtml}` : ''}
     <div class="clarify-auto" id="clarify-auto" hidden></div>
-    ${
-      allowCustom
-        ? docked
-          ? '<div class="clarify-hint">也可以直接在下方输入框补充自己的方向。</div>'
-          : `<div class="clarify-custom">
-              <input class="clarify-input" type="text" maxlength="200" placeholder="也可以直接补充你的方向…" aria-label="补充你的方向">
-              <button class="clarify-send" type="button">发送</button>
-            </div>`
-        : ''
-    }
+    ${inputHtml}
+    ${navHtml}
   </div>`
 }
 
@@ -6321,6 +8976,10 @@ function updateClarifyAutoHint(flow = state.clarifyFlow) {
 function startClarifyAutoSelect(flow = state.clarifyFlow) {
   const clarify = state.pendingClarify
   if (!flow || !clarify || flow.busy) return
+  // 多选/填空没有唯一默认答案，自动替用户提交会污染答案，必须让用户自己确认。
+  if (clarify.kind === 'multiple' || clarify.kind === 'text') return
+  // 题组必须逐题作答后统一提交，不能自动选第一项。
+  if (Array.isArray(clarify.questions) && clarify.questions.length > 1) return
   const optionsList = Array.isArray(clarify.options) ? clarify.options : []
   const first = optionsList.map((option) => String(option?.label || '').trim()).find(Boolean)
   if (!first) return
@@ -6371,8 +9030,7 @@ function showClarifyDock(clarify, options = {}) {
   turn.showClarifyPrompt(clarify, { step: flow.step, previous, auto: options.auto })
 }
 
-function showClarifyBusy(flow, answer, options = {}) {
-  stopClarifyAuto(flow)
+function showClarifyBusy(flow, answer, options = {}) {  stopClarifyAuto(flow)
   hideClarifyDockView()
   const turn = flow.turn?.node?.isConnected ? flow.turn : null
   if (turn?.waitForReply) {
@@ -6393,21 +9051,177 @@ function clearClarifyDock(options = {}) {
   if (input) input.placeholder = DEFAULT_INPUT_PLACEHOLDER
 }
 
+/** 题组模式下，从当前卡片读取本题草稿；选项统一存标签，提交时直接拼给模型。 */
+function clarifyDraftFromCard(card, question) {
+  const kind = question?.kind === 'multiple' || question?.kind === 'text' ? question.kind : 'single'
+  if (kind === 'text') {
+    return { selected: [], text: String(card.querySelector('.clarify-input')?.value || '').trim() }
+  }
+  const selected = [...card.querySelectorAll('.clarify-option.is-selected')]
+    .map((option) => String(option.dataset.clarifyAnswer || '').trim())
+    .filter(Boolean)
+  return { selected, text: '' }
+}
+
+function clarifyDraftEmpty(question, draft) {
+  const kind = question?.kind === 'text' ? 'text' : question?.kind === 'multiple' ? 'multiple' : 'single'
+  return kind === 'text' ? !String(draft?.text || '').trim() : !(draft?.selected || []).length
+}
+
+/** 当前页改动只写本地题组草稿，不触发服务端。 */
+function saveClarifyBatchDraft(card, index) {
+  const clarify = state.pendingClarify
+  if (!clarify || !Array.isArray(clarify.questions)) return null
+  const question = clarify.questions[index]
+  if (!question) return null
+  const draft = clarifyDraftFromCard(card, question)
+  clarify.answers = clarify.answers || {}
+  clarify.answers[String(index + 1)] = draft
+  clarify.index = index
+  return draft
+}
+
+function rerenderClarifyBatch() {
+  const clarify = state.pendingClarify
+  const flow = state.clarifyFlow
+  if (!clarify || !flow?.turn?.showClarifyPrompt) return
+  const previous = flow.answers.length
+    ? flow.answers[flow.answers.length - 1].answer
+    : ''
+  flow.turn.showClarifyPrompt(clarify, { step: flow.step, previous, exitable: true })
+}
+
+/** 多题统一提交：校验每一题都有答案，再拼成一条完整答卷。 */
+function submitClarifyBatch(card, index) {
+  const clarify = state.pendingClarify
+  if (!clarify || !Array.isArray(clarify.questions)) return
+  const questions = clarify.questions
+  saveClarifyBatchDraft(card, index)
+  const missing = questions.findIndex((question, questionIndex) =>
+    clarifyDraftEmpty(question, clarify.answers?.[String(questionIndex + 1)]))
+  if (missing >= 0) {
+    clarify.index = missing
+    rerenderClarifyBatch()
+    banner(`第 ${missing + 1} 题还没有作答，请先完成`, 'warn')
+    return
+  }
+  const lines = questions.map((question, questionIndex) => {
+    const draft = clarify.answers?.[String(questionIndex + 1)] || { selected: [], text: '' }
+    const value = String(question.kind === 'text' ? draft.text : draft.selected.join('、')).trim()
+    return `第${questionIndex + 1}题（${question.question}）：${value}`
+  })
+  const flow = ensureClarifyFlow()
+  // 题组最终提交只续跑一次模型；step 直接推到总题数，下一轮 meta 即为 N+1。
+  flow.step = questions.length
+  advanceClarifyFlow(`我完成了以下 ${questions.length} 道题：\n${lines.join('\n')}`)
+}
+
+/** 题组翻页：保存当前页草稿并切换本地页，不产生模型请求；允许空答案先浏览后面的题。 */
+function moveClarifyBatch(card, index, direction) {
+  const clarify = state.pendingClarify
+  if (!clarify || !Array.isArray(clarify.questions)) return
+  const total = clarify.questions.length
+  const draft = saveClarifyBatchDraft(card, index)
+  if (!draft) return
+  const target = direction === 'prev' ? index - 1 : index + 1
+  if (target < 0 || target >= total) return
+  clarify.index = target
+  rerenderClarifyBatch()
+}
+
 function bindClarifyPanel(node) {
   for (const card of node.querySelectorAll('.clarify-card')) {
     if (card.dataset.bound === 'true') continue
     card.dataset.bound = 'true'
+    const kind = card.dataset.clarifyKind || 'single'
+    const batchTotal = Math.max(0, Math.trunc(Number(card.dataset.clarifyTotal) || 0))
+    const batchIndex = Math.max(0, Math.trunc(Number(card.dataset.clarifyIndex) || 0))
     const submit = (value) => {
       const text = String(value || '').trim()
       if (!text) return
       advanceClarifyFlow(text)
     }
-    for (const option of card.querySelectorAll('.clarify-option')) {
-      option.addEventListener('click', () => submit(option.dataset.clarifyAnswer || option.textContent))
+    if (batchTotal > 1) {
+      // 题组：点选项只记本地草稿，翻页/最后一页“提交全部”才产生请求。
+      for (const option of card.querySelectorAll('.clarify-option')) {
+        option.addEventListener('click', () => {
+          if (kind === 'multiple') {
+            const selected = option.classList.toggle('is-selected')
+            option.setAttribute('aria-pressed', selected ? 'true' : 'false')
+            return
+          }
+          for (const other of card.querySelectorAll('.clarify-option')) {
+            other.classList.toggle('is-selected', other === option)
+            other.setAttribute('aria-pressed', other === option ? 'true' : 'false')
+          }
+          // 单选点完自动进入下一题；最后一页不自动提交，留给“提交全部”。
+          if (batchIndex < batchTotal - 1) {
+            const from = batchIndex
+            const pendingTimer = Number(card.dataset.clarifyAutoNextTimer || '')
+            if (pendingTimer) window.clearTimeout(pendingTimer)
+            const timer = window.setTimeout(() => {
+              delete card.dataset.clarifyAutoNextTimer
+              if (card.isConnected) moveClarifyBatch(card, from, 'next')
+            }, 240)
+            card.dataset.clarifyAutoNextTimer = String(timer)
+          }
+        })
+      }
+      const prev = card.querySelector('[data-clarify-prev]')
+      const next = card.querySelector('[data-clarify-next]')
+      if (prev) prev.addEventListener('click', () => moveClarifyBatch(card, batchIndex, 'prev'))
+      if (next) next.addEventListener('click', () => moveClarifyBatch(card, batchIndex, 'next'))
+      const batchSubmit = card.querySelector('[data-clarify-batch-submit]')
+      if (batchSubmit) batchSubmit.addEventListener('click', () => submitClarifyBatch(card, batchIndex))
+      const batchInput = card.querySelector('.clarify-input')
+      if (batchInput) {
+        batchInput.addEventListener('keydown', (event) => {
+          if (event.key === 'Enter' && !event.isComposing) {
+            event.preventDefault()
+            if (batchIndex >= batchTotal - 1) submitClarifyBatch(card, batchIndex)
+            else moveClarifyBatch(card, batchIndex, 'next')
+          }
+        })
+      }
+      const batchExit = card.querySelector('[data-clarify-exit]')
+      if (batchExit) {
+        batchExit.addEventListener('click', () => {
+          clearClarifyDock()
+          banner('已退出这次引导，之后可以直接发消息继续', 'warn')
+        })
+      }
+      return
+    }
+
+    if (kind === 'multiple') {
+      // 多选：先本地勾选，点“提交多选”再一次性发回，避免每勾一项都触发 Agent。
+      for (const option of card.querySelectorAll('.clarify-option')) {
+        option.addEventListener('click', () => {
+          const selected = option.classList.toggle('is-selected')
+          option.setAttribute('aria-pressed', selected ? 'true' : 'false')
+        })
+      }
+      const submitButton = card.querySelector('[data-clarify-multi-submit]')
+      if (submitButton) {
+        submitButton.addEventListener('click', () => {
+          const labels = [...card.querySelectorAll('.clarify-option.is-selected')]
+            .map((option) => String(option.dataset.clarifyAnswer || '').trim())
+            .filter(Boolean)
+          if (labels.length === 0) {
+            banner('请至少选择一个选项', 'warn')
+            return
+          }
+          submit(labels.join('、'))
+        })
+      }
+    } else {
+      for (const option of card.querySelectorAll('.clarify-option')) {
+        option.addEventListener('click', () => submit(option.dataset.clarifyAnswer || option.textContent))
+      }
     }
     const input = card.querySelector('.clarify-input')
     const sendButton = card.querySelector('.clarify-send')
-    if (input && sendButton) {
+    if (input && sendButton && kind !== 'multiple') {
       sendButton.addEventListener('click', () => submit(input.value))
       input.addEventListener('keydown', (event) => {
         if (event.key === 'Enter' && !event.isComposing) {
@@ -6860,6 +9674,7 @@ function createAiTurn(options = {}) {
   let firstAnswerAt = 0
   let rawAnswer = ''
   let answerRenderQueued = false
+  let answerRenderTimer = 0
   let scrollQueued = false
   let renderGeneration = 0
   const toolTraces = []
@@ -6970,17 +9785,20 @@ function createAiTurn(options = {}) {
     const lastFileTrace = [...toolTraces].reverse().find((entry) => FILE_OPERATION_TOOLS.has(entry.toolId))
     if (lastFileTrace) updateFileActivity(lastFileTrace)
   }
-  // 流式阶段也按 Markdown 渲染；每帧最多重排一次，避免逐 token 抖动。
+  // 流式阶段也按 Markdown 渲染；合并到 ~30fps，避免长回答逐 token 反复解析整段 Markdown。
   const renderStreamingAnswer = () => {
     if (answerRenderQueued) return
     answerRenderQueued = true
     const generation = renderGeneration
-    requestAnimationFrame(() => {
-      answerRenderQueued = false
-      if (generation !== renderGeneration) return
-      answer.innerHTML = renderAnswer(rawAnswer, { omitCodeBlocks: writtenFileContentBlocks(toolTraces) })
-      scroll()
-    })
+    answerRenderTimer = setTimeout(() => {
+      answerRenderTimer = 0
+      requestAnimationFrame(() => {
+        answerRenderQueued = false
+        if (generation !== renderGeneration) return
+        answer.innerHTML = renderAnswer(rawAnswer, { omitCodeBlocks: writtenFileContentBlocks(toolTraces) })
+        scroll()
+      })
+    }, 28)
   }
   let turn = null
   const hideWaiting = () => {
@@ -7050,6 +9868,11 @@ function createAiTurn(options = {}) {
     /** 引导续跑时复用同一条 AI 气泡，清空上一问的内容但保留节点位置。 */
     reset(options = {}) {
       renderGeneration += 1
+      if (answerRenderTimer) {
+        clearTimeout(answerRenderTimer)
+        answerRenderTimer = 0
+      }
+      answerRenderQueued = false
       startedAt = Date.now()
       firstAnswerAt = 0
       rawAnswer = ''
@@ -7117,6 +9940,14 @@ function createAiTurn(options = {}) {
       }
       thinkBody.scrollTop = thinkBody.scrollHeight
       scroll()
+    },
+    /** 父 Agent 等待子 Agent 时的轻量状态；一旦有思考或正文就让位。 */
+    agentStatus(text) {
+      if (!text) return
+      if (rawAnswer) return
+      // 思考流式展开时不抢状态位；收起后继续显示子 Agent 进度。
+      if (!think.hidden && think.classList.contains('is-active')) return
+      setStatus(text)
     },
     content(text) {
       if (!text) return
@@ -8040,6 +10871,7 @@ let ssoWatchTimer = 0
 let qrExpiryTimer = 0
 /** 钉钉登录二维码官方有效期为 15 分钟；到期先罩一层灰，不让用户继续扫死码。 */
 const DINGTALK_QR_TTL_MS = 15 * 60 * 1000
+const SSO_EXCHANGE_TIMEOUT_MS = 15 * 1000
 
 function hideQrExpired() {
   const overlay = $('#login-qr-expired')
@@ -8142,24 +10974,35 @@ async function showDingTalkQr(force = false) {
         prompt: 'consent',
       },
       async (result) => {
+        // 钉钉组件确认扫码后先铺加载层，避免停在二维码上等 exchange 返回。
+        window.EABBoot?.beginLogin?.('已识别扫码，正在登录…')
         try {
-          const login = await api('/api/auth/dingtalk/exchange', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({
-              company,
-              authCode: result.authCode,
-              state: result.state || data.state,
+          const login = await withTimeout(
+            api('/api/auth/dingtalk/exchange', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({
+                company,
+                authCode: result.authCode,
+                state: result.state || data.state,
+              }),
             }),
-          })
+            SSO_EXCHANGE_TIMEOUT_MS,
+            '登录请求超时，请重新扫码或改用账号密码登录',
+          )
+          markLoginBoot('chat')
           location.href = (login && login.redirectPath) || '/chat'
         } catch (err) {
+          // 扫码/登录失败：撤掉加载层，回到仍可重试的二维码页。
+          window.EABBoot?.finish?.(true)
           renderSsoError(err)
         }
       },
       (msg) => {
         // 组件偶尔会用空消息回调一次；此时二维码通常仍可扫，不弹误导性的红条
         if (!msg) return
+        const bootOverlay = document.getElementById('eab-boot')
+        if (bootOverlay && !bootOverlay.hidden) window.EABBoot?.finish?.(true)
         const text = String(msg)
         if (/过期|失效|expired|refresh/i.test(text)) {
           showQrExpired()
@@ -8221,8 +11064,9 @@ function paintSsoAppId() {
 function paintLoginBrand() {
   const el = $('#login-brand-name')
   if (!el) return
+  const base = String(window.EABBrand?.current?.chat?.brandName || '').trim() || '企业智能体基座'
   const companyName = String(ssoMethods?.companyName || ssoMethods?.dingtalk?.tenantName || '').trim()
-  el.textContent = companyName ? `企业智能体基座 · ${companyName}` : '企业智能体基座'
+  el.textContent = companyName ? `${base} · ${companyName}` : base
 }
 
 async function setupLoginSso() {
@@ -8729,6 +11573,7 @@ async function boot() {
   bindSideSectionResizer()
   bindWorkspaceFilePane()
   bindWorkbenchTabs()
+  bindPermissionPane()
   bindSpacePicker()
   setChatMode('chat')
   syncSideSectionSplit()
@@ -8748,6 +11593,7 @@ async function boot() {
     showLogin()
     await renderLogin()
     await setupLoginSso()
+    endBoot('正在打开登录入口…')
     return
   }
 
@@ -8776,6 +11622,7 @@ async function boot() {
     await setupLoginSso()
     $('#login-sub').textContent = `登录态无效（${err.message}），请重新登录。`
     $('#login-sub').hidden = false
+    endBoot('登录态失效，正在打开登录入口…')
     return
   }
 
@@ -8789,10 +11636,12 @@ async function boot() {
     state.canChat = models.canChat && models.canUseModel
     if (!state.canChat) {
       renderDenied(new Error('当前账号没有对话 / 使用模型的权限（chat:use、model:use）'))
+      endBoot('权限校验完成…')
       return
     }
     if (models.models.length === 0) {
       renderDenied(new Error('你的角色里没有任何可用模型，请联系管理员授权'))
+      endBoot('模型配置已加载…')
       return
     }
     renderModelMenus()
@@ -8821,6 +11670,7 @@ async function boot() {
     await loadWorkspaceFiles()
   } catch (err) {
     renderDenied(err)
+    endBoot('工作台加载遇到问题…')
     return
   }
 
@@ -9053,6 +11903,10 @@ async function boot() {
     hideQuota()
     hideMessageMenu()
   })
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden || !workspacePreviewWatchTimer || !state.filePreview) return
+    void checkWorkspacePreviewAccess(String(state.filePreview.id), workspacePreviewWatchEpoch)
+  })
 
   // 个人工作区
   $('#ws-upload').addEventListener('click', () => $('#ws-input').click())
@@ -9069,9 +11923,13 @@ async function boot() {
   })
 
   $('#input').focus()
+  endBoot('正在进入工作台…')
 }
 
 bindSettings()
+window.addEventListener('eab:branding', () => {
+  try { paintLoginBrand() } catch { /* 登录页不在当前视图时忽略 */ }
+})
 bindHintTips($('#workspace-pane'))
 bindWorkspaceKindSwitch()
 boot()

@@ -253,7 +253,7 @@ describe('钉钉 A2UI 卡片可见性与底色', () => {
       previous,
     )
     const answer = updateValues(messages)['/answer'] as { blocks: Array<Record<string, any>> }
-    expect(answer.blocks[0]?.text).toBe('你好，世界▍')
+    expect(answer.blocks[0]?.text).toBe('你好，世界')
     expect(Object.keys(updateValues(messages))).toEqual(['/answer'])
     expect(messages.some((message) => 'updateComponents' in JSON.parse(message))).toBe(false)
   })
@@ -301,13 +301,13 @@ describe('钉钉 A2UI 卡片可见性与底色', () => {
     expect(tables.at(-1)?.table?.meta?.map((column: any) => column.colName)).toEqual(['检查人', '站名'])
   })
 
-  it('正文流式时把光标拼在最后一段正文里，不再追加 loading GIF 组件', () => {
+  it('正文流式时不追加光标或 loading GIF 组件', () => {
     const streaming = buildDingTalkA2UIUpdateMessages(
       's',
       { answer: '答案', reasoning: '', tools: [], thinkingDone: true },
       true,
     )
-    expect(answerBlock(streaming)?.text).toBe('答案▍')
+    expect(answerBlock(streaming)?.text).toBe('答案')
     expect(uiValues(streaming)).not.toHaveProperty('/ui/showAnswerSpinner')
 
     const final = buildDingTalkA2UIUpdateMessages(
@@ -350,7 +350,12 @@ describe('钉钉 A2UI 卡片可见性与底色', () => {
     expect(root.child).toBe('rootColumn')
     expect(thinking.defaultExpanded).toBe(false)
     expect(thinking.title).toBe('✦ 正在思考中…')
+    // 进行中的标题保留流光；只在标题文字上生效，面板内容和正文不动。
+    expect(thinking.textEffect).toBe('shimmer')
     expect(tool.defaultExpanded).toBe(false)
+    // 首帧还没有工具在跑，工具面板应显示“记录”而不是“调用中”。
+    expect(tool.title).toBe('🛠️ 工具调用记录')
+    expect(tool.textEffect).toBeUndefined()
     expect(preview).toMatchObject({
       component: 'Text',
       text: { path: '/thinking/preview' },
@@ -363,6 +368,38 @@ describe('钉钉 A2UI 卡片可见性与底色', () => {
       align: 'end',
       children: ['answerBlocks'],
     })
+  })
+
+  it('工具执行中标题流光，工具结束后切回“记录”并停止', () => {
+    const running = {
+      answer: '',
+      reasoning: '正在查询组织架构…',
+      tools: ['org.search'],
+      thinkingDone: false,
+      toolDetails: [{ id: 'tool-1', name: 'org.search', status: 'running' as const }],
+    }
+    const runningComponents = componentsOf(buildDingTalkA2UICreateMessages('s-running', running))
+    const runningTool = runningComponents.find((component) => component.id === 'toolPanel')!
+    expect(runningTool).toMatchObject({
+      title: '🛠️ 工具调用中…',
+      textEffect: 'shimmer',
+    })
+
+    const done = {
+      ...running,
+      tools: ['org.search'],
+      thinkingDone: true,
+      toolDetails: [{ id: 'tool-1', name: 'org.search', status: 'done' as const, durationMs: 128 }],
+    }
+    const finalComponents = finalComponentsOf(
+      buildDingTalkA2UIUpdateMessages('s-running', done, false, running),
+    )
+    const finalTool = finalComponents.find((component) => component.id === 'toolPanel')!
+    const finalThinking = finalComponents.find((component) => component.id === 'thinkingPanel')!
+    expect(finalTool.title).toBe('🛠️ 工具调用记录')
+    expect(finalTool.textEffect).toBeUndefined()
+    expect(finalThinking.title).toBe('✦ 已深度思考')
+    expect(finalThinking.textEffect).toBeUndefined()
   })
 
   it('旧模板卡显示流式预览，工具执行期间不退回“已深度思考”', () => {
@@ -570,6 +607,54 @@ describe('钉钉 A2UI 卡片可见性与底色', () => {
     })
   })
 
+  it('题组卡的正文不再重复渲染当前题干，题干只由澄清区展示', () => {
+    const question = '第 1 题 · 判断题（安全）\n\n检修作业中，发现设备出现异常，应立即停止作业并报告。'
+    const messages = buildDingTalkA2UIUpdateMessages(
+      's',
+      {
+        answer: question,
+        reasoning: '',
+        tools: [],
+        thinkingDone: true,
+        clarify: {
+          sessionId: 'chat_test',
+          question,
+          kind: 'single',
+          options: [
+            { id: 'option-1', label: '正确' },
+            { id: 'option-2', label: '错误' },
+          ],
+          index: 0,
+          questions: [
+            { id: 'q1', question, kind: 'single', options: [
+              { id: 'option-1', label: '正确' },
+              { id: 'option-2', label: '错误' },
+            ] },
+            { id: 'q2', question: '第 2 题 · 选择题\n\n红灯表示什么？', kind: 'single', options: [
+              { id: 'option-1', label: '停车' },
+              { id: 'option-2', label: '通行' },
+            ] },
+          ],
+        },
+      },
+      false,
+    )
+
+    const answerBlocks = updateValues(messages)['/answer'] as { blocks: Array<Record<string, any>> }
+    expect(answerBlocks.blocks[0]?.text).toBe('')
+    expect(uiValues(messages)).toMatchObject({
+      '/ui/showAnswerText0': false,
+      '/ui/showAnswerUnit0': false,
+    })
+    expect(updateValues(messages)['/clarify']).toMatchObject({
+      question,
+      progress: '第 1 / 2 题',
+      total: 2,
+      index: 0,
+      badge: '请选择答案',
+    })
+  })
+
   it('带澄清选项的卡片收口后仍保持 PROCESSING，下一次点击才能续用同一张卡', async () => {
     const requests: Array<{ url: string; body: Record<string, any> }> = []
     const realFetch = globalThis.fetch
@@ -625,6 +710,114 @@ describe('钉钉 A2UI 卡片可见性与底色', () => {
             ['FINISH', 'FINISHED', 'COMPLETED', 'DONE'].includes(String(request.body.flowStatus)),
         ),
       ).toBe(false)
+    } finally {
+      globalThis.fetch = realFetch
+    }
+  })
+
+  it('网页已作答时把同一张澄清卡真正收口成完成态', async () => {
+    const requests: Array<{ url: string; body: Record<string, any> }> = []
+    const realFetch = globalThis.fetch
+    globalThis.fetch = (async (input: any, init?: RequestInit) => {
+      const url = String(input)
+      const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, any>
+      requests.push({ url, body })
+      const response = url.includes('/v1.0/oauth2/accessToken')
+        ? { accessToken: 'test-token', expireIn: 7200 }
+        : { success: true }
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify(response),
+      } as Response
+    }) as typeof fetch
+
+    try {
+      const card = new DingTalkAICardStream('web-sync-app', 'secret', 'user-1', 'robot-1')
+      await card.start(
+        { answer: '', reasoning: '正在分析…', tools: [], thinkingDone: false },
+        'EAB 企业智能助手',
+      )
+      requests.length = 0
+      await card.finish({
+        answer: '你想先做哪件事？',
+        reasoning: '分析完成',
+        tools: [],
+        thinkingDone: true,
+        clarify: {
+          sessionId: 'chat_test',
+          question: '你想先做哪件事？',
+          allowCustom: true,
+          options: [{ id: 'option-1', label: '查公司部门' }],
+          flowId: 'cf_test',
+          step: 1,
+          messageId: 'msg_assistant',
+        },
+      })
+      requests.length = 0
+      const cardId = card.providerMessageIds[0]
+      expect(
+        await card.completeClarify(cardId, {
+          answer: '✅ 已在网页工作台作答',
+          reasoning: '',
+          tools: [],
+          thinkingDone: true,
+          clarify: null,
+        }),
+      ).toBe(true)
+      const update = requests.find((request) => request.url.endsWith('/v1.0/card/ai/instances/update'))
+      expect(update?.body.flowStatus).toBe('FINISH')
+      expect(update?.body.flowStatus).not.toBe('PROCESSING')
+    } finally {
+      globalThis.fetch = realFetch
+    }
+  })
+
+  it('单次流式刷新失败后保留卡片并继续收口，正文不残留光标', async () => {
+    const requests: Array<{ url: string; body: Record<string, any> }> = []
+    let updateAttempts = 0
+    const realFetch = globalThis.fetch
+    globalThis.fetch = (async (input: any, init?: RequestInit) => {
+      const url = String(input)
+      const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, any>
+      requests.push({ url, body })
+      const response = url.includes('/v1.0/oauth2/accessToken')
+        ? { accessToken: 'test-token', expireIn: 7200 }
+        : { success: true }
+      if (url.endsWith('/v1.0/card/ai/instances/update')) {
+        updateAttempts += 1
+        if (updateAttempts === 1) throw new Error('temporary network error')
+      }
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify(response),
+      } as Response
+    }) as typeof fetch
+
+    try {
+      const card = new DingTalkAICardStream('retry-finish-app', 'secret', 'user-1', 'robot-1')
+      expect(
+        await card.start(
+          { answer: '', reasoning: '正在分析…', tools: [], thinkingDone: false },
+          'EAB 企业智能助手',
+        ),
+      ).toBe(true)
+      requests.length = 0
+      card.update({ answer: '答', reasoning: '', tools: [], thinkingDone: true })
+      // 等第一次刷新失败并把最新状态放回队列。
+      await new Promise((resolve) => setTimeout(resolve, 400))
+      expect(updateAttempts).toBeGreaterThanOrEqual(2)
+      expect(await card.finish({ answer: '答', reasoning: '', tools: [], thinkingDone: true }, '答')).toBe(true)
+
+      const updateBodies = requests
+        .filter((request) => request.url.endsWith('/v1.0/card/ai/instances/update'))
+        .flatMap((request) => request.body.a2uiMessages ?? [])
+        .map((message: string) => JSON.parse(message) as Record<string, any>)
+      const answer = updateBodies.find((message) => message.updateDataModel?.path === '/answer')?.updateDataModel
+        ?.value as { blocks?: Array<Record<string, any>> } | undefined
+      expect(answer?.blocks?.[0]?.text).toBe('答')
+      expect(JSON.stringify(answer)).not.toMatch(/[▍▏]/)
     } finally {
       globalThis.fetch = realFetch
     }
@@ -711,6 +904,57 @@ describe('钉钉 A2UI 卡片可见性与底色', () => {
       globalThis.fetch = realFetch
     }
   })
+
+  it('续用失败后尽力收口旧卡，不让它一直停在处理中', async () => {
+    const requests: Array<{ url: string; body: Record<string, any> }> = []
+    let updateAttempts = 0
+    const realFetch = globalThis.fetch
+    globalThis.fetch = (async (input: any, init?: RequestInit) => {
+      const url = String(input)
+      const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, any>
+      requests.push({ url, body })
+      if (url.includes('/v1.0/oauth2/accessToken')) {
+        return {
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify({ accessToken: 'test-token', expireIn: 7200 }),
+        } as Response
+      }
+      if (url.endsWith('/v1.0/card/ai/instances/update')) {
+        updateAttempts += 1
+        if (updateAttempts === 1) throw new Error('temporary network error')
+      }
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ success: true }),
+      } as Response
+    }) as typeof fetch
+
+    try {
+      const card = new DingTalkAICardStream('resume-fail-app', 'secret', 'user-1', 'robot-1')
+      expect(
+        await card.resume('eab_a2ui_existing', {
+          answer: '',
+          reasoning: '正在继续…',
+          tools: [],
+          thinkingDone: false,
+        }),
+      ).toBe(false)
+      expect(
+        await card.closeAfterResumeFailure('eab_a2ui_existing', '这一轮已转到新消息继续'),
+      ).toBe(true)
+
+      const update = requests
+        .filter((request) => request.url.endsWith('/v1.0/card/ai/instances/update'))
+        .at(-1)
+      expect(update?.body.outTrackId).toBe('eab_a2ui_existing')
+      expect(update?.body.flowStatus).toBe('FAILED')
+      expect(JSON.stringify(update?.body)).toContain('这一轮已转到新消息继续')
+    } finally {
+      globalThis.fetch = realFetch
+    }
+  })
 })
 
 function updatesOfTooling(): string[] {
@@ -736,3 +980,338 @@ function updatesOfTooling(): string[] {
     true,
   )
 }
+
+describe('钉钉 A2UI 多选与填空澄清', () => {
+  function clarifyMessages(clarify: Record<string, unknown>) {
+    return buildDingTalkA2UIUpdateMessages(
+      's',
+      {
+        answer: String(clarify.question || ''),
+        reasoning: '',
+        tools: [],
+        thinkingDone: true,
+        clarify: {
+          sessionId: 'chat_test',
+          question: '',
+          options: [],
+          allowCustom: true,
+          ...clarify,
+        },
+      },
+      false,
+    )
+  }
+
+  it('多选渲染为 ChoicePicker + 提交按钮，不显示单选行', () => {
+    const messages = clarifyMessages({
+      kind: 'multiple',
+      question: '以下哪些必须完成？',
+      options: [
+        { id: 'option-1', label: '办理作业票' },
+        { id: 'option-2', label: '安全预想' },
+        { id: 'option-3', label: '挂设接地线' },
+      ],
+    })
+    expect(updateValues(messages)['/clarify']).toMatchObject({
+      kind: 'multiple',
+      selected: [],
+      options: [{ id: 'option-1' }, { id: 'option-2' }, { id: 'option-3' }],
+    })
+    expect(uiValues(messages)).toMatchObject({
+      '/ui/showClarifyMultiple': true,
+      '/ui/showClarifySingle': false,
+      '/ui/showClarifyText': false,
+      '/ui/showClarifySubmit': true,
+      '/ui/showClarifyOption0': false,
+    })
+    const components = finalComponentsOf(messages)
+    expect(components.find((component) => component.id === 'clarifyPicker')).toMatchObject({
+      component: 'ChoicePicker',
+      variant: 'multipleSelection',
+      displayStyle: 'checkbox',
+      visible: { path: '/ui/showClarifyMultiple' },
+      value: { path: '/clarify/selected' },
+      options: [
+        { label: '办理作业票', value: 'option-1' },
+        { label: '安全预想', value: 'option-2' },
+        { label: '挂设接地线', value: 'option-3' },
+      ],
+    })
+    expect(components.find((component) => component.id === 'clarifySubmit')).toMatchObject({
+      component: 'Button',
+      visible: { path: '/ui/showClarifySubmit' },
+      action: {
+        event: {
+          name: 'eab_clarify_submit',
+          context: {
+            action: 'clarify_multi',
+            sessionId: 'chat_test',
+            selected: { path: '/clarify/selected' },
+          },
+        },
+      },
+    })
+    expect(components.find((component) => component.id === 'clarifySubmitLabel')).toMatchObject({
+      component: 'Text',
+      text: '提交多选',
+    })
+  })
+
+  it('填空渲染为 TextField + 提交按钮，context 带回文本路径', () => {
+    const messages = clarifyMessages({
+      kind: 'text',
+      question: '请填写你的工号',
+      placeholder: '例如 021724',
+      options: [],
+    })
+    expect(updateValues(messages)['/clarify']).toMatchObject({
+      kind: 'text',
+      placeholder: '例如 021724',
+      selected: [],
+      text: '',
+    })
+    expect(uiValues(messages)).toMatchObject({
+      '/ui/showClarifyText': true,
+      '/ui/showClarifyMultiple': false,
+      '/ui/showClarifySingle': false,
+      '/ui/showClarifySubmit': true,
+    })
+    const components = finalComponentsOf(messages)
+    expect(components.find((component) => component.id === 'clarifyTextField_0_1')).toMatchObject({
+      component: 'TextField',
+      variant: 'shortText',
+      visible: { path: '/ui/showClarifyText' },
+      label: '你的答案',
+      placeholder: { path: '/clarify/placeholder' },
+      value: { path: '/clarify/text' },
+    })
+    expect(components.find((component) => component.id === 'clarifySubmit')).toMatchObject({
+      action: {
+        event: {
+          name: 'eab_clarify_submit',
+          context: {
+            action: 'clarify_text',
+            text: { path: '/clarify/text' },
+          },
+        },
+      },
+    })
+    expect(components.find((component) => component.id === 'clarifySubmitLabel')).toMatchObject({
+      component: 'Text',
+      text: '提交答案',
+    })
+  })
+
+  it('填空题按题干里的每个横线渲染独立输入框', () => {
+    const question = '第10题·填空题（制度）检修作业的基本安全原则是：\n\n“先 ______、再 ______、后作业”'
+    const messages = clarifyMessages({
+      kind: 'text',
+      question,
+      placeholder: '请填写答案',
+      options: [],
+    })
+    expect(updateValues(messages)['/clarify']).toMatchObject({
+      kind: 'text',
+      displayQuestion: '第10题·填空题（制度）检修作业的基本安全原则是：\n\n“先 〔空1〕、再 〔空2〕、后作业”',
+      blanks: ['', ''],
+    })
+    expect(uiValues(messages)).toMatchObject({
+      '/ui/showClarifyBlanks': true,
+      '/ui/showClarifyText': false,
+      '/ui/showClarifySubmit': true,
+    })
+    const components = finalComponentsOf(messages)
+    expect(components.find((component) => component.id === 'clarifyBlanks')).toMatchObject({
+      component: 'Column',
+      children: ['clarifyBlank_0_1_0', 'clarifyBlank_0_1_1'],
+      visible: { path: '/ui/showClarifyBlanks' },
+    })
+    expect(components.find((component) => component.id === 'clarifyBlank_0_1_0')).toMatchObject({
+      component: 'TextField',
+      label: '第 1 空',
+      value: { path: '/clarify/blanks/0' },
+    })
+    expect(components.find((component) => component.id === 'clarifyBlank_0_1_1')).toMatchObject({
+      component: 'TextField',
+      label: '第 2 空',
+      value: { path: '/clarify/blanks/1' },
+    })
+    expect(components.find((component) => component.id === 'clarifySubmit')).toMatchObject({
+      action: {
+        event: {
+          name: 'eab_clarify_submit',
+          context: {
+            action: 'clarify_text',
+            blanks: { path: '/clarify/blanks' },
+          },
+        },
+      },
+    })
+  })
+
+
+  it('题组翻页时输入框按页换组件 ID，只回填当前题的答案', () => {
+    const questions = [
+      { id: 'q1', question: '第一题：先 ______、再 ______', kind: 'text', options: [] },
+      { id: 'q2', question: '第二题：______', kind: 'text', options: [] },
+    ]
+    const first = clarifyMessages({
+      questions,
+      index: 0,
+      answers: { 1: { selected: [], text: '停电、验电', blanks: ['停电', '验电'] } },
+    })
+    const second = clarifyMessages({ questions, index: 1 })
+    const firstComponents = finalComponentsOf(first)
+    const secondComponents = finalComponentsOf(second)
+    expect(firstComponents.find((component) => component.id === 'clarifyBlanks')).toMatchObject({
+      children: ['clarifyBlank_0_1_0', 'clarifyBlank_0_1_1'],
+    })
+    expect(secondComponents.find((component) => component.id === 'clarifyBlanks')).toMatchObject({
+      children: ['clarifyBlank_1_1_0'],
+    })
+    expect(updateValues(second)['/clarify']).toMatchObject({ blanks: [''] })
+    expect(secondComponents.find((component) => component.id === 'clarifyBlank_1_1_0')).toMatchObject({
+      value: { path: '/clarify/blanks/0' },
+    })
+  })
+
+
+  it('题组按当前页取题、回填草稿，并渲染上一题/下一题', () => {
+    const questions = [
+      { id: 'q1', question: '判断题', kind: 'single', options: [
+        { id: 'option-1', label: '正确' },
+        { id: 'option-2', label: '错误' },
+      ] },
+      { id: 'q2', question: '多选题', kind: 'multiple', options: [
+        { id: 'option-1', label: '办理作业票' },
+        { id: 'option-2', label: '安全预想' },
+      ] },
+      { id: 'q3', question: '填空题', kind: 'text', options: [], placeholder: '请输入编号' },
+    ]
+    const messages = clarifyMessages({
+      questions,
+      index: 1,
+      answers: {
+        1: { selected: ['正确'], text: '' },
+        2: { selected: ['办理作业票'], text: '' },
+      },
+    })
+    expect(updateValues(messages)['/clarify']).toMatchObject({
+      kind: 'multiple',
+      question: '多选题',
+      total: 3,
+      index: 1,
+      progress: '第 2 / 3 题',
+      selected: ['办理作业票'],
+    })
+    expect(uiValues(messages)).toMatchObject({
+      '/ui/showClarifyMultiple': true,
+      '/ui/showClarifyNav': true,
+      '/ui/showClarifyPrev': true,
+      '/ui/showClarifyNext': true,
+      '/ui/showClarifySubmit': false,
+    })
+    const components = finalComponentsOf(messages)
+    expect(components.find((component) => component.id === 'clarifyPrev')).toMatchObject({
+      action: { event: { name: 'eab_clarify_nav', context: { direction: 'prev', index: 1 } } },
+    })
+    expect(components.find((component) => component.id === 'clarifyNext')).toMatchObject({
+      action: { event: { name: 'eab_clarify_nav', context: { direction: 'next', index: 1 } } },
+    })
+    expect(components.find((component) => component.id === 'clarifyQuestion')).toMatchObject({
+      component: 'Markdown',
+      content: { path: '/clarify/displayQuestion' },
+      visible: { path: '/ui/showClarify' },
+    })
+  })
+
+  it('题组单选当前页的已选项带“✓ 已选”标记，未选项不变', () => {
+    const questions = [
+      { id: 'q1', question: '单选题', kind: 'single', options: [
+        { id: 'option-1', label: '正确', description: '符合规程' },
+        { id: 'option-2', label: '错误', description: '不符合规程' },
+      ] },
+      { id: 'q2', question: '第二题', kind: 'single', options: [
+        { id: 'option-1', label: '甲' },
+        { id: 'option-2', label: '乙' },
+      ] },
+    ]
+    const messages = clarifyMessages({
+      questions,
+      index: 0,
+      answers: { 1: { selected: ['option-1'], text: '' } },
+    })
+    expect(updateValues(messages)['/clarify']).toMatchObject({
+      options: [
+        { id: 'option-1', label: '正确', description: '✓ 已选 · 符合规程' },
+        { id: 'option-2', label: '错误', description: '不符合规程' },
+      ],
+    })
+  })
+
+  it('题组最后一页只显示“提交全部”，并阻止继续下一题', () => {
+    const questions = [
+      { id: 'q1', question: '第一题', kind: 'single', options: [
+        { id: 'option-1', label: 'A' },
+        { id: 'option-2', label: 'B' },
+      ] },
+      { id: 'q2', question: '第二题', kind: 'text', options: [] },
+    ]
+    const messages = clarifyMessages({
+      questions,
+      index: 1,
+      answers: {
+        1: { selected: ['A'], text: '' },
+        2: { selected: [], text: '已填写' },
+      },
+    })
+    expect(updateValues(messages)['/clarify']).toMatchObject({
+      kind: 'text',
+      total: 2,
+      index: 1,
+      canNext: false,
+      isLast: true,
+      text: '已填写',
+    })
+    expect(uiValues(messages)).toMatchObject({
+      '/ui/showClarifySubmit': true,
+      '/ui/showClarifyPrev': true,
+      '/ui/showClarifyNext': false,
+    })
+    const components = finalComponentsOf(messages)
+    expect(components.find((component) => component.id === 'clarifySubmitLabel')).toMatchObject({
+      text: '提交全部',
+    })
+  })
+
+  it('题组单选点选项走翻页动作：非末页下一题，末页只记选中', () => {
+    const questions = [
+      { id: 'q1', question: '第一题', kind: 'single', options: [
+        { id: 'option-1', label: 'A' },
+        { id: 'option-2', label: 'B' },
+      ] },
+      { id: 'q2', question: '第二题', kind: 'single', options: [
+        { id: 'option-1', label: 'C' },
+        { id: 'option-2', label: 'D' },
+      ] },
+    ]
+    const first = clarifyMessages({ questions, index: 0 })
+    expect(finalComponentsOf(first).find((component) => component.id === 'clarifyOptionCard0')).toMatchObject({
+      action: { event: { name: 'eab_clarify_nav', context: {
+        direction: 'next',
+        index: 0,
+        optionId: 'option-1',
+        optionLabel: 'A',
+      } } },
+    })
+    const last = clarifyMessages({ questions, index: 1 })
+    expect(finalComponentsOf(last).find((component) => component.id === 'clarifyOptionCard0')).toMatchObject({
+      action: { event: { name: 'eab_clarify_nav', context: {
+        direction: 'pick',
+        index: 1,
+        optionId: 'option-1',
+        optionLabel: 'C',
+      } } },
+    })
+  })
+})

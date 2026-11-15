@@ -30,6 +30,7 @@ export type ModelCapability = (typeof MODEL_CAPABILITIES)[number]
 
 export const MODEL_ENDPOINT_KINDS = [
   'chat',
+  'systemone',
   'embeddings',
   'rerank',
   'asr',
@@ -44,6 +45,7 @@ export const MODEL_ROUTE_PURPOSES = [
   { purpose: 'chat.default', label: '默认对话', hint: '普通问答与工作台默认模型' },
   { purpose: 'chat.vision', label: '图片 / 多模态', hint: '带图片的消息优先走它' },
   { purpose: 'router.intent', label: '意图判定', hint: '决定查人、查制度还是普通问答' },
+  { purpose: 'agent.model_choice', label: '子 Agent 模型分配', hint: '父 Agent 用 SystemOne 按子任务内容选择模型' },
   { purpose: 'kb.embed', label: '知识库向量化', hint: '切片入库与问题向量化共用' },
   { purpose: 'kb.rerank', label: '检索重排', hint: '可选，提升混合检索准确率' },
   { purpose: 'asr.default', label: '语音转写', hint: '钉钉/企微语音消息转文本' },
@@ -333,6 +335,22 @@ export function inferModelProfile(modelKey: string): ModelProfileSuggestion {
       },
     }
   }
+  if (has(/systemone|system-one|system_one/)) {
+    return {
+      modelType: 'decision',
+      label: '决策 / SystemOne',
+      capabilities: ['chat', 'reasoning', 'decision'],
+      endpointKind: 'systemone',
+      confidence: 'high',
+      basis: '模型名包含 systemone 特征',
+      api: {
+        method: 'POST',
+        path: '/systemone',
+        request: '{ model, state, questions[] }',
+        response: 'structured_decision{ answers[], usage }',
+      },
+    }
+  }
   if (has(/router|intent|classifier|guard|moderation|decision|judge/)) {
     return {
       modelType: 'decision',
@@ -380,6 +398,11 @@ function purposeMatches(model: ModelCapabilityRecord, purpose: string): boolean 
       return (
         (capability.includes('decision') || capability.includes('reasoning') || capability.includes('chat')) &&
         model.endpointKind === 'chat'
+      )
+    case 'agent.model_choice':
+      return (
+        (capability.includes('decision') || capability.includes('reasoning') || capability.includes('chat')) &&
+        model.endpointKind === 'systemone'
       )
     case 'kb.embed':
       return capability.includes('embedding') || model.endpointKind === 'embeddings'

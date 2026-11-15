@@ -1,23 +1,119 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" style="background:#04110d">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>EAB 管理控制台</title>
-    <link rel="stylesheet" href="/app.css?v=20261112b" />
+    <style>
+      /* 首帧兜底：只保留启动层最必要的绘制规则，详细视觉仍由 boot-splash.css 接管。 */
+      html { background: #04110d; }
+      html.eab-booting,
+      html.eab-booting body { background: #04110d; overflow: hidden; }
+      .eab-boot {
+        position: fixed;
+        inset: 0;
+        z-index: 2147483000;
+        display: grid;
+        place-items: center;
+        overflow: hidden;
+        background: #04110d;
+        color: #e8f6f0;
+      }
+      .eab-boot[hidden] { display: none; }
+    </style>
+    <script src="/theme.js?v=20261115b"></script>
+    <script src="/brand.js?v=20261115c" defer></script>
+    <link rel="stylesheet" href="/app.css?v=20261115h" />
+    <link rel="stylesheet" href="/theme.css?v=20261115b" />
+    <link rel="stylesheet" href="/boot-splash.css?v=20261115i" />
   </head>
   <body>
+    <script src="/boot/config.js?surface=admin" defer></script>
+    <div class="eab-boot" id="eab-boot" hidden aria-hidden="true" aria-live="polite">
+      <div class="eab-boot-atmosphere" aria-hidden="true">
+        <span class="eab-boot-glow"></span>
+        <span class="eab-boot-grid"></span>
+        <span class="eab-boot-sweep"></span>
+        <span class="eab-boot-grain"></span>
+      </div>
+      <video class="eab-boot-video" id="eab-boot-video" muted playsinline preload="metadata" hidden></video>
+      <div class="eab-boot-code" id="eab-boot-code" aria-hidden="true">
+        <div class="eab-boot-mark">
+          <span class="eab-boot-square s1"></span>
+          <span class="eab-boot-square s2"></span>
+          <span class="eab-boot-square s3"></span>
+          <span class="eab-boot-square s4"></span>
+        </div>
+        <div class="eab-boot-word" id="eab-boot-title">EAB</div>
+        <div class="eab-boot-sub" id="eab-boot-subtitle">管理控制台</div>
+      </div>
+      <div class="eab-boot-film-copy" aria-hidden="true">
+        <strong id="eab-boot-film-title">EAB</strong>
+        <span id="eab-boot-film-subtitle">管理控制台</span>
+      </div>
+      <div class="eab-boot-ui">
+        <span class="eab-boot-ring" aria-hidden="true"></span>
+        <span class="eab-boot-status" id="eab-boot-status">正在加载控制台配置…</span>
+      </div>
+      <div class="eab-boot-actions">
+        <button class="eab-boot-sound" id="eab-boot-sound" type="button" hidden>开启声音</button>
+        <button class="eab-boot-skip" id="eab-boot-skip" type="button" hidden>跳过</button>
+      </div>
+      <button class="eab-boot-play" id="eab-boot-play" type="button" hidden>点击播放片头</button>
+    </div>
+    <script>
+      (function () {
+        // 启动层必须先于配置请求出现：配置即使失败或很慢，也不能先露出白底。
+        var overlay = document.getElementById('eab-boot')
+        if (overlay) {
+          overlay.hidden = false
+          overlay.setAttribute('aria-hidden', 'false')
+          document.documentElement.classList.add('eab-booting')
+          document.documentElement.style.background = '#04110d'
+        }
+        setTimeout(function () {
+          if (!window.EABBoot && overlay) {
+            overlay.hidden = true
+            overlay.setAttribute('aria-hidden', 'true')
+            document.documentElement.classList.remove('eab-booting')
+            document.documentElement.style.background = 'transparent'
+          }
+        }, 2500)
+      })()
+    </script>
     <!-- 顶栏：品牌 + 当前公司 + 服务状态 + 退出。控制台不登录组织成员，这里没有"我是谁"。 -->
     <header class="topbar">
       <div class="brand">
-        <span class="logo">EAB</span>
+        <span class="logo" data-brand-logo>EAB</span>
         <div class="brand-text">
-          <h1>企业智能体基座</h1>
+          <h1 data-brand-name>企业智能体基座</h1>
           <p class="sub">管理控制台</p>
         </div>
       </div>
       <div class="topbar-company" id="company-picker" aria-label="当前管理公司"></div>
       <div class="who">
+        <button class="theme-toggle" type="button" data-theme-toggle role="switch" aria-checked="false" aria-label="切换到深色主题" title="切换深浅色主题">
+          <span class="theme-toggle-track">
+            <span class="theme-toggle-knob" aria-hidden="true">
+              <svg class="theme-icon sun" viewBox="0 0 16 16" shape-rendering="crispEdges" fill="currentColor">
+                <rect x="7" y="0" width="2" height="3" />
+                <rect x="7" y="13" width="2" height="3" />
+                <rect x="0" y="7" width="3" height="2" />
+                <rect x="13" y="7" width="3" height="2" />
+                <rect x="2" y="2" width="2" height="2" />
+                <rect x="12" y="2" width="2" height="2" />
+                <rect x="2" y="12" width="2" height="2" />
+                <rect x="12" y="12" width="2" height="2" />
+                <rect x="5" y="5" width="6" height="1" />
+                <rect x="4" y="6" width="8" height="4" />
+                <rect x="5" y="10" width="6" height="1" />
+              </svg>
+              <svg class="theme-icon moon" viewBox="0 0 16 16" fill="currentColor">
+                <path d="M13.6 8.6A5.6 5.6 0 1 1 7.4 3 4.4 4.4 0 0 0 6.6 6.4 4.4 4.4 0 0 0 13.6 8.6Z" />
+              </svg>
+            </span>
+          </span>
+        </button>
         <span id="health-dot" class="dot" title="服务状态"></span>
         <span id="health-text" class="health-text">连接中</span>
         <button class="update-badge" id="update-badge" type="button" hidden></button>
@@ -91,6 +187,7 @@
       </main>
     </div>
 
-    <script src="/app.js?v=20261112b"></script>
+    <script src="/boot-splash.js?v=20261115j" data-surface="admin" defer></script>
+    <script src="/app.js?v=20261115n" defer></script>
   </body>
 </html>

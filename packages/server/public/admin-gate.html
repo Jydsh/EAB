@@ -4,7 +4,8 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>EAB 管理控制台 · 管理员登录</title>
-    <link rel="stylesheet" href="/app.css" />
+    <script src="/brand.js?v=20261115c" defer></script>
+    <link rel="stylesheet" href="/app.css?v=20261115d" />
     <style>
       .gate-body {
         min-height: 100vh;
@@ -143,9 +144,9 @@
   <body class="gate-body">
     <section class="gate-card">
       <div class="gate-brand">
-        <span class="logo">EAB</span>
+        <span class="logo" data-brand-logo>EAB</span>
         <div>
-          <h1>企业智能体基座</h1>
+          <h1 data-brand-name>企业智能体基座</h1>
           <p>管理控制台 · 服务器侧</p>
         </div>
       </div>
@@ -205,6 +206,9 @@
               fail((body && (body.message || body.error)) || '账号或密码不正确（HTTP ' + res.status + '）')
               return
             }
+            try {
+              sessionStorage.setItem('eab.boot.next', 'admin')
+            } catch (e) {}
             location.replace('/admin' + location.search)
           } catch (e) {
             fail('请求失败：' + (e && e.message ? e.message : e))

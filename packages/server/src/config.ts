@@ -103,6 +103,10 @@ export interface ServerConfig {
   readonly agentMaxRetries?: number
   /** 子 Agent 空闲多久没有新任务就自动注销；默认 120 秒 */
   readonly agentWorkerIdleMs?: number
+  /** 子 Agent 单次任务最多几个模型→工具循环；默认 12（父 Agent 仍为 4） */
+  readonly agentChildMaxRounds?: number
+  /** 父 Agent 等待子 Agent 事件的最长时间；默认 30 秒 */
+  readonly agentWaitTimeoutMs?: number
   /** 所有请求体同时在内存中的粗略预算（MB）；超过时新的大请求直接 429 */
   readonly maxInflightBodyMb?: number
   /** 缓存后端：auto（有 URL 用 Redis）、memory、redis、off（仍用内存，只是不尝试外部） */
@@ -271,6 +275,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     agentMaxDepth: readInt(env.EAB_AGENT_MAX_DEPTH, 2, 'EAB_AGENT_MAX_DEPTH'),
     agentMaxRetries: readInt(env.EAB_AGENT_MAX_RETRIES, 1, 'EAB_AGENT_MAX_RETRIES'),
     agentWorkerIdleMs: readInt(env.EAB_AGENT_WORKER_IDLE_MS, 120_000, 'EAB_AGENT_WORKER_IDLE_MS'),
+    agentChildMaxRounds: readInt(env.EAB_AGENT_CHILD_MAX_ROUNDS, 12, 'EAB_AGENT_CHILD_MAX_ROUNDS'),
+    agentWaitTimeoutMs: readInt(env.EAB_AGENT_WAIT_TIMEOUT_MS, 30_000, 'EAB_AGENT_WAIT_TIMEOUT_MS'),
     maxInflightBodyMb: readInt(env.EAB_MAX_INFLIGHT_BODY_MB, 256, 'EAB_MAX_INFLIGHT_BODY_MB'),
     cacheBackend: readEnum(env.EAB_CACHE, ['auto', 'memory', 'redis', 'off'] as const, 'auto', 'EAB_CACHE'),
     redisUrl: (env.EAB_REDIS_URL ?? '').trim(),

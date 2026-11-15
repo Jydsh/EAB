@@ -3,9 +3,10 @@
  *
  * 两个设置都写在部署目录的 `.eab-dev/console-settings.json`：
  * - 保留天数立即生效（后台定时清理读同一份文件）；
- * - 数据目录要重启才生效，启动时由 main.ts 负责搬迁，运行中不动库文件。
+ * - 存储位置保存后由运行时立即复制/切换，不重启；启动迁移只保留给旧版本遗留的 pending。
  */
 import type { FastifyInstance, FastifyRequest } from 'fastify'
+import { randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { networkInterfaces } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
@@ -16,11 +17,18 @@ import { ok } from '../http.js'
 import { isConsoleRequest } from '../console-auth.js'
 import { effectiveNetwork } from '../network-settings.js'
 import { runRetention } from '../retention.js'
+import { pruneWorkspaceRecycle, workspaceRootFor } from '../workspace-recycle.js'
+import { pickSystemDirectory } from '../directory-picker.js'
+import { listServerDirectories } from '../directory-browser.js'
+import { hasInteractiveWindowsDesktop, requestIsLocal } from '../console-locality.js'
 import {
   defaultHomeDir,
   readConsoleSettings,
   storageDefaults,
   writeConsoleSettings,
+  type BrandSurfaceSettings,
+  type BrandingSettings,
+  type StorageApplyPaths,
   type StorageMigration,
   type StoragePathKey,
   type StorageSettingKey,
@@ -35,6 +43,10 @@ function requireConsole(req: FastifyRequest, deps: ServerDeps): void {
 
 function count(db: ServerDeps['db'], sql: string): number {
   return Number((db.prepare(sql).get() as { n: number }).n)
+}
+
+function sum(db: ServerDeps['db'], sql: string): number {
+  return Number((db.prepare(sql).get() as { n: number | null }).n ?? 0)
 }
 
 function localAddresses(): string[] {
@@ -189,8 +201,140 @@ function baseMigrationJobs(
   return jobs
 }
 
-function storageView(deps: ServerDeps, settings: ConsoleSettings): {
-  baseDir: string
+/**
+ * 保存成功后各分类应落到的绝对路径。
+ * 用于迁移计划和热切换后的 config 更新；环境变量锁定的分类保持原路径。
+ */
+function storagePathsAfter(
+  deps: ServerDeps,
+  settings: ConsoleSettings,
+  key: StorageSettingKey,
+  target: string,
+): StorageApplyPaths {
+  const base = key === 'dataDir' ? target : deps.config.dataDir ?? defaultHomeDir()
+  const defaults = storageDefaults(base)
+  const currentDbDir = deps.config.dbDir ?? dirname(deps.config.dbPath)
+  const paths: StorageApplyPaths = {
+    dataDir: base,
+    dbDir: currentDbDir,
+    dbPath: deps.config.dbPath,
+    workspacesDir: deps.config.workspacesDir ?? defaults.workspaces,
+    tmpDir: deps.config.tmpDir ?? defaults.tmp,
+    backupsDir: deps.config.backupsDir ?? defaults.backups,
+    pluginsDir: deps.config.pluginsDir ?? defaults.plugins,
+    dshHomeDir: deps.config.dshHomeDir ?? defaults.dshHome,
+  }
+
+  if (key === 'dataDir') {
+    paths.dbDir = deps.config.dataDirEnvLocked
+      ? currentDbDir
+      : settings.paths.database ?? defaults.database
+    paths.dbPath = deps.config.dataDirEnvLocked ? deps.config.dbPath : join(paths.dbDir, 'eab.db')
+    paths.workspacesDir = settings.paths.workspaces ?? defaults.workspaces
+    paths.tmpDir = settings.paths.tmp ?? defaults.tmp
+    paths.backupsDir = settings.paths.backups ?? defaults.backups
+    paths.pluginsDir = deps.config.pluginsEnvLocked
+      ? deps.config.pluginsDir ?? defaults.plugins
+      : settings.paths.plugins ?? defaults.plugins
+    paths.dshHomeDir = settings.paths.dshHome ?? defaults.dshHome
+    return paths
+  }
+
+  switch (key) {
+    case 'database':
+      paths.dbDir = target
+      paths.dbPath = join(target, 'eab.db')
+      break
+    case 'workspaces':
+      paths.workspacesDir = target
+      break
+    case 'tmp':
+      paths.tmpDir = target
+      break
+    case 'backups':
+      paths.backupsDir = target
+      break
+    case 'plugins':
+      paths.pluginsDir = target
+      break
+    case 'dshHome':
+      paths.dshHomeDir = target
+      break
+  }
+  return paths
+}
+
+function applyResultView(deps: ServerDeps, moved: string[], skipped: string[]): {
+  applied: true
+  restartRequired: false
+  moved: string[]
+  skipped: string[]
+  storage: ReturnType<typeof storageView>
+  hint: string
+} {
+  return {
+    applied: true,
+    restartRequired: false,
+    moved,
+    skipped,
+    storage: storageView(deps, readConsoleSettings()),
+    hint: moved.length
+      ? `已立即迁移并切换；旧目录保留。新位置：${moved.join('；')}`
+      : '已立即切换；没有需要搬迁的旧数据，旧目录保留。',
+  }
+}
+
+const BRAND_ICON_MAX_CHARS = 360_000
+const BRAND_ICON_MIMES = ['png', 'jpeg', 'webp', 'svg+xml', 'x-icon', 'vnd.microsoft.icon']
+
+function brandText(raw: unknown, label: string, max: number, fallback: string): string {
+  if (raw === undefined) return fallback
+  if (typeof raw !== 'string') throw new EabError(EC.VALIDATION, `${label}必须是文本`)
+  const value = raw.trim()
+  if (!value) throw new EabError(EC.VALIDATION, `${label}不能为空`)
+  if ([...value].length > max) throw new EabError(EC.VALIDATION, `${label}最多 ${max} 个字符`)
+  return value
+}
+
+function brandIcon(raw: unknown, fallback: string | null): string | null {
+  if (raw === undefined) return fallback
+  if (raw === null || raw === '') return null
+  if (typeof raw !== 'string') throw new EabError(EC.VALIDATION, '图标必须是图片 Data URL')
+  const value = raw.trim()
+  if (value.length > BRAND_ICON_MAX_CHARS) {
+    throw new EabError(EC.VALIDATION, '图标文件不能超过 256KB')
+  }
+  const comma = value.indexOf(',')
+  const header = comma >= 0 ? value.slice(0, comma) : ''
+  if (!header.startsWith('data:image/') || !header.includes(';base64')) {
+    throw new EabError(EC.VALIDATION, '图标必须是 base64 编码的图片')
+  }
+  const mime = header.slice('data:image/'.length).split(';')[0]?.toLowerCase() ?? ''
+  if (!BRAND_ICON_MIMES.includes(mime)) {
+    throw new EabError(EC.VALIDATION, '图标只支持 PNG、JPEG、WebP、SVG 或 ICO')
+  }
+  return value
+}
+
+function parseBrandSurface(raw: unknown, fallback: BrandSurfaceSettings, label: string): BrandSurfaceSettings {
+  const source = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {}
+  return {
+    logoText: brandText(source.logoText, `${label}图标文字`, 8, fallback.logoText),
+    brandName: brandText(source.brandName, `${label}品牌名称`, 40, fallback.brandName),
+    tabTitle: brandText(source.tabTitle, `${label}标签页标题`, 80, fallback.tabTitle),
+    iconDataUrl: brandIcon(source.iconDataUrl, fallback.iconDataUrl),
+  }
+}
+
+function parseBranding(raw: unknown, current: BrandingSettings): BrandingSettings {
+  const source = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {}
+  return {
+    console: parseBrandSurface(source.console, current.console, '管理控制台'),
+    chat: parseBrandSurface(source.chat, current.chat, '员工对话'),
+  }
+}
+
+function storageView(deps: ServerDeps, settings: ConsoleSettings): {  baseDir: string
   dbPath: string
   dbSizeBytes: number
   rows: StorageRowView[]
@@ -241,6 +385,21 @@ function storageView(deps: ServerDeps, settings: ConsoleSettings): {
 }
 
 export function registerSettingsRoutes(app: FastifyInstance, deps: ServerDeps): void {
+  type PendingNativePick = {
+    done: boolean
+    path: string
+    canceled: boolean
+    error?: string
+    cleanup: ReturnType<typeof setTimeout>
+  }
+  const pendingNativePicks = new Map<string, PendingNativePick>()
+
+  // 品牌设置要在登录页也能读到，所以单独提供一个公开只读接口；
+  // 写入仍必须走控制台会话。
+  app.get('/api/branding', async () => {
+    return ok({ branding: readConsoleSettings().branding })
+  })
+
   app.get('/api/console/settings', async (req) => {
     requireConsole(req, deps)
     const settings = readConsoleSettings()
@@ -257,9 +416,12 @@ export function registerSettingsRoutes(app: FastifyInstance, deps: ServerDeps): 
       dbSizeBytes,
       envLocked: Boolean(deps.config.dataDirEnvLocked),
       storage: storageView(deps, settings),
+      branding: settings.branding,
       retentionDays: settings.logRetentionDays,
       auditRetentionDays: settings.auditRetentionDays,
       agentRetentionDays: settings.agentRetentionDays,
+      recordRetentionDays: settings.recordRetentionDays,
+      workspaceRecycleDays: settings.workspaceRecycleDays,
       lastCleanupAt: settings.lastCleanupAt,
       lastCleanupStats: settings.lastCleanupStats,
       network: {
@@ -283,63 +445,125 @@ export function registerSettingsRoutes(app: FastifyInstance, deps: ServerDeps): 
         pluginEvents: count(deps.db, 'SELECT COUNT(*) AS n FROM plugin_events'),
         onboardAttempts: count(deps.db, 'SELECT COUNT(*) AS n FROM dingtalk_onboard_attempts'),
         auditLogs: count(deps.db, 'SELECT COUNT(*) AS n FROM audit_logs'),
+        databaseQueries: count(
+          deps.db,
+          "SELECT COUNT(*) AS n FROM audit_logs WHERE action = 'database.query'",
+        ),
         agentRuns: count(deps.db, 'SELECT COUNT(*) AS n FROM agent_runs'),
         agentSteps: count(deps.db, 'SELECT COUNT(*) AS n FROM agent_steps'),
+        chatSessions: count(deps.db, 'SELECT COUNT(*) AS n FROM chat_sessions'),
+        chatMessages: count(deps.db, 'SELECT COUNT(*) AS n FROM chat_messages'),
+        workspaceVersions: count(deps.db, 'SELECT COUNT(*) AS n FROM workspace_file_versions'),
+        toolOperations: count(deps.db, 'SELECT COUNT(*) AS n FROM tool_operations'),
+        skillEvents: count(deps.db, 'SELECT COUNT(*) AS n FROM skill_events'),
+        agentTeamMessages: count(deps.db, 'SELECT COUNT(*) AS n FROM agent_team_messages'),
+        scheduleRuns: count(deps.db, 'SELECT COUNT(*) AS n FROM schedule_runs'),
+        asyncJobs: count(deps.db, 'SELECT COUNT(*) AS n FROM async_jobs'),
+        workspaceDeletedRows: count(
+          deps.db,
+          'SELECT COUNT(*) AS n FROM workspace_files WHERE deleted_at IS NOT NULL',
+        ),
+        workspaceRecycleFiles: count(
+          deps.db,
+          'SELECT COUNT(*) AS n FROM workspace_files WHERE deleted_at IS NOT NULL AND recycled_path IS NOT NULL',
+        ),
+        workspaceRecycleBytes: sum(
+          deps.db,
+          'SELECT SUM(size) AS n FROM workspace_files WHERE deleted_at IS NOT NULL AND recycled_path IS NOT NULL',
+        ),
       },
     })
   })
 
-  app.put<{ Body: { days?: number; auditDays?: number; agentDays?: number } }>(
-    '/api/console/settings/retention',
-    async (req) => {
-      requireConsole(req, deps)
-      const current = readConsoleSettings()
-      const days = req.body?.days === undefined ? current.logRetentionDays : Number(req.body?.days)
-      const auditDays =
-        req.body?.auditDays === undefined ? current.auditRetentionDays : Number(req.body?.auditDays)
-      const agentDays =
-        req.body?.agentDays === undefined ? current.agentRetentionDays : Number(req.body?.agentDays)
-      for (const [label, value] of [
-        ['日志保留天数', days],
-        ['审计保留天数', auditDays],
-        ['Agent 轨迹保留天数', agentDays],
-      ] as const) {
-        if (!Number.isInteger(value) || value < 0 || (value > 0 && value < 7) || value > 3650) {
-          throw new EabError(EC.VALIDATION, `${label}只能是 0（永久保留）或 7–3650 天`)
-        }
+  app.put<{
+    Body: Record<string, unknown>
+  }>('/api/console/settings/branding', async (req) => {
+    requireConsole(req, deps)
+    const current = readConsoleSettings()
+    const branding = parseBranding(req.body, current.branding)
+    const settings = writeConsoleSettings({ branding })
+    audit(deps, req, 'ops.settings.branding', {
+      console: { ...branding.console, iconDataUrl: branding.console.iconDataUrl ? '[uploaded]' : null },
+      chat: { ...branding.chat, iconDataUrl: branding.chat.iconDataUrl ? '[uploaded]' : null },
+    })
+    return ok({ branding: settings.branding, applied: true })
+  })
+
+  app.put<{
+    Body: { days?: number; auditDays?: number; agentDays?: number; recordDays?: number; workspaceDays?: number }
+  }>('/api/console/settings/retention', async (req) => {
+    requireConsole(req, deps)
+    const current = readConsoleSettings()
+    const days = req.body?.days === undefined ? current.logRetentionDays : Number(req.body?.days)
+    const auditDays =
+      req.body?.auditDays === undefined ? current.auditRetentionDays : Number(req.body?.auditDays)
+    const agentDays =
+      req.body?.agentDays === undefined ? current.agentRetentionDays : Number(req.body?.agentDays)
+    const recordDays =
+      req.body?.recordDays === undefined ? current.recordRetentionDays : Number(req.body?.recordDays)
+    const workspaceDays =
+      req.body?.workspaceDays === undefined ? current.workspaceRecycleDays : Number(req.body?.workspaceDays)
+    for (const [label, value] of [
+      ['日志保留天数', days],
+      ['审计保留天数', auditDays],
+      ['Agent 轨迹保留天数', agentDays],
+      ['项目记录保留天数', recordDays],
+      ['回收区保留天数', workspaceDays],
+    ] as const) {
+      if (!Number.isInteger(value) || value < 0 || (value > 0 && value < 7) || value > 3650) {
+        throw new EabError(EC.VALIDATION, `${label}只能是 0（永久保留）或 7–3650 天`)
       }
-      const settings = writeConsoleSettings({
-        logRetentionDays: days,
-        auditRetentionDays: auditDays,
-        agentRetentionDays: agentDays,
-      })
-      audit(deps, req, 'ops.settings.retention', { days, auditDays, agentDays })
-      return ok({
-        retentionDays: settings.logRetentionDays,
-        auditRetentionDays: settings.auditRetentionDays,
-        agentRetentionDays: settings.agentRetentionDays,
-        applied: true,
-      })
-    },
-  )
+    }
+    const settings = writeConsoleSettings({
+      logRetentionDays: days,
+      auditRetentionDays: auditDays,
+      agentRetentionDays: agentDays,
+      recordRetentionDays: recordDays,
+      workspaceRecycleDays: workspaceDays,
+    })
+    audit(deps, req, 'ops.settings.retention', { days, auditDays, agentDays, recordDays, workspaceDays })
+    return ok({
+      retentionDays: settings.logRetentionDays,
+      auditRetentionDays: settings.auditRetentionDays,
+      agentRetentionDays: settings.agentRetentionDays,
+      recordRetentionDays: settings.recordRetentionDays,
+      workspaceRecycleDays: settings.workspaceRecycleDays,
+      applied: true,
+    })
+  })
 
   app.post('/api/console/settings/retention/run', async (req) => {
     requireConsole(req, deps)
     const settings = readConsoleSettings()
+    const workspaceRoot = workspaceRootFor(deps.config.dbPath, deps.config.workspacesDir)
     const result = runRetention(
       deps.db,
       settings.logRetentionDays,
       settings.auditRetentionDays,
       settings.agentRetentionDays,
+      settings.recordRetentionDays,
+      workspaceRoot,
     )
-    writeConsoleSettings({ lastCleanupAt: new Date().toISOString(), lastCleanupStats: result.deleted })
+    const workspaceRecycle = pruneWorkspaceRecycle(
+      deps.db,
+      workspaceRoot,
+      settings.workspaceRecycleDays,
+    )
+    const stats = { ...result.deleted }
+    if (workspaceRecycle.files > 0) stats.workspaceRecycleFiles = workspaceRecycle.files
+    if (workspaceRecycle.bytes > 0) stats.workspaceRecycleBytes = workspaceRecycle.bytes
+    if (workspaceRecycle.rows > 0) stats.workspaceRecycleRows = workspaceRecycle.rows
+    writeConsoleSettings({ lastCleanupAt: new Date().toISOString(), lastCleanupStats: stats })
     audit(deps, req, 'ops.settings.retention.run', {
       days: result.days,
       auditDays: result.audit.days,
       agentDays: result.agentDays,
+      recordDays: result.recordDays,
       deleted: result.deleted,
+      project: result.project,
+      workspaceRecycle,
     })
-    return ok(result)
+    return ok({ ...result, deleted: stats, workspaceRecycle })
   })
 
   app.put<{
@@ -420,6 +644,92 @@ export function registerSettingsRoutes(app: FastifyInstance, deps: ServerDeps): 
     })
   })
 
+  app.get<{ Querystring: { path?: string } }>('/api/console/system/directories', async (req) => {
+    requireConsole(req, deps)
+    return ok(listServerDirectories(String(req.query?.path ?? '')))
+  })
+
+  app.post<{ Body: { initial?: string } }>('/api/console/system/pick-directory', async (req) => {
+    requireConsole(req, deps)
+    const initial = String(req.body?.initial ?? '').trim()
+    if (initial.includes('\0')) {
+      throw new EabError(EC.VALIDATION, '初始目录包含非法字符')
+    }
+    if (initial && !isAbsolute(initial)) {
+      throw new EabError(EC.VALIDATION, '初始目录必须是绝对路径')
+    }
+
+    // 远程管理后台不弹服务器桌面上的原生框，改为在前端浏览服务器目录。
+    const forwarded = req.headers['x-forwarded-for']
+    if (!requestIsLocal(req.socket.remoteAddress, forwarded) || !hasInteractiveWindowsDesktop()) {
+      return ok({
+        path: '',
+        canceled: false,
+        mode: 'browse',
+        hint: hasInteractiveWindowsDesktop()
+          ? '检测到远程访问，已打开服务器目录浏览'
+          : '当前服务没有可交互的 Windows 桌面，已打开服务器目录浏览',
+      })
+    }
+
+    try {
+      const ticket = randomUUID()
+      const entry: PendingNativePick = {
+        done: false,
+        path: '',
+        canceled: false,
+        cleanup: setTimeout(() => pendingNativePicks.delete(ticket), 10 * 60_000),
+      }
+      entry.cleanup.unref?.()
+      pendingNativePicks.set(ticket, entry)
+      void pickSystemDirectory(initial)
+        .then((path) => {
+          entry.done = true
+          entry.path = path ?? ''
+          entry.canceled = path === null
+        })
+        .catch((error: unknown) => {
+          entry.done = true
+          entry.error = error instanceof Error ? error.message : String(error)
+        })
+      // 先返回 native + ticket，原生框在后台启动并保持；前端轮询结果，
+      // 不再让一个 HTTP 请求一直挂到用户关掉系统框。
+      return ok({ path: '', canceled: false, mode: 'native', pending: true, ticket })
+    } catch (error) {
+      if (!(error instanceof EabError)) throw error
+      // 原生框不可用时不要让用户卡在超时错误，直接回退到服务器目录浏览。
+      return ok({
+        path: '',
+        canceled: false,
+        mode: 'browse',
+        hint: error.message,
+      })
+    }
+  })
+
+  app.get<{ Querystring: { ticket?: string } }>(
+    '/api/console/system/pick-directory/result',
+    async (req) => {
+      requireConsole(req, deps)
+      const ticket = String(req.query?.ticket ?? '').trim()
+      const entry = pendingNativePicks.get(ticket)
+      if (!entry) {
+        throw new EabError(EC.VALIDATION, '目录选择已失效，请重新点击「选择目录…」')
+      }
+      const body = {
+        done: entry.done,
+        path: entry.path,
+        canceled: entry.canceled,
+        ...(entry.error ? { error: entry.error } : {}),
+      }
+      if (entry.done) {
+        clearTimeout(entry.cleanup)
+        pendingNativePicks.delete(ticket)
+      }
+      return ok(body)
+    },
+  )
+
   app.put<{ Body: { key?: StorageSettingKey; path?: string | null; reset?: boolean } }>(
     '/api/console/settings/storage',
     async (req) => {
@@ -475,10 +785,10 @@ export function registerSettingsRoutes(app: FastifyInstance, deps: ServerDeps): 
       probeWritable(target)
 
       const jobs: StorageMigration[] = []
-      let patch: Parameters<typeof writeConsoleSettings>[0]
+      let settingsPatch: Partial<ConsoleSettings>
       if (key === 'dataDir') {
         jobs.push(...baseMigrationJobs(deps, settings, target))
-        patch = { dataDir: reset ? null : target, pendingMigrations: jobs }
+        settingsPatch = { dataDir: reset ? null : target }
       } else {
         const from = current
         jobs.push({
@@ -488,13 +798,37 @@ export function registerSettingsRoutes(app: FastifyInstance, deps: ServerDeps): 
           to: target,
           createdAt: new Date().toISOString(),
         })
-        patch = {
+        settingsPatch = {
           paths: { ...settings.paths, [key]: reset ? null : target },
-          pendingMigrations: jobs,
         }
       }
 
-      const next = writeConsoleSettings(patch)
+      if (deps.applyStorage) {
+        const paths = storagePathsAfter(deps, settings, key, target)
+        const result = await deps.applyStorage({
+          key,
+          target,
+          settingsPatch,
+          paths,
+          jobs,
+        })
+        audit(deps, req, 'ops.settings.storage', {
+          key,
+          from: current,
+          to: target,
+          reset,
+          jobs: jobs.length,
+          applied: true,
+        })
+        return ok({
+          key,
+          path: target,
+          changed: true,
+          ...applyResultView(deps, result.moved, result.skipped),
+        })
+      }
+
+      const next = writeConsoleSettings({ ...settingsPatch, pendingMigrations: jobs })
       audit(deps, req, 'ops.settings.storage', { key, from: current, to: target, reset, jobs: jobs.length })
       return ok({
         key,
@@ -547,6 +881,21 @@ export function registerSettingsRoutes(app: FastifyInstance, deps: ServerDeps): 
     ensureNonEmptyTarget(target)
     probeWritable(target)
     const jobs = baseMigrationJobs(deps, settingsBefore, target)
+    const settingsPatch: Partial<ConsoleSettings> = { dataDir }
+    if (deps.applyStorage) {
+      const paths = storagePathsAfter(deps, settingsBefore, 'dataDir', target)
+      const result = await deps.applyStorage({ key: 'dataDir', target, settingsPatch, paths, jobs })
+      audit(deps, req, 'ops.settings.data_dir', { dataDir, reset, jobs: jobs.length, applied: true })
+      return ok({
+        dataDir: deps.config.dataDir ?? '',
+        changed: true,
+        savedAt: deps.config.dataDir,
+        ...applyResultView(deps, result.moved, result.skipped),
+        hint: reset
+          ? '已立即回到部署目录并切换；旧目录保留'
+          : '已按新的总存储位置立即迁移并切换；旧目录保留',
+      })
+    }
     const settings = writeConsoleSettings({ dataDir, pendingMigrations: jobs })
     audit(deps, req, 'ops.settings.data_dir', { dataDir, reset, jobs: jobs.length })
     return ok({

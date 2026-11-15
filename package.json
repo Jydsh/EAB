@@ -1,6 +1,6 @@
 {
   "name": "eab",
-  "version": "2026.11.14",
+  "version": "2026.11.15",
   "private": true,
   "type": "module",
   "description": "EAB 企业智能体基座（Enterprise Agent Base）",
@@ -10,7 +10,7 @@
     "eab": "./scripts/eab.mjs"
   },
   "engines": {
-    "node": ">=22.5.0"
+    "node": ">=22.13.0"
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json --noEmit",

@@ -8,7 +8,8 @@
  */
 import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
-import { extname, join } from 'node:path'
+import { createRequire } from 'node:module'
+import { dirname, extname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify'
 import { EC, EabError, toEabError } from '@eab/domain'
@@ -19,10 +20,13 @@ import { hasConsoleSession, configureConsoleAuth } from './console-auth.js'
 import { initChatEventBridge } from './chat-events.js'
 import { initRealtimeControl } from './realtime-control.js'
 import { getBackendRuntime } from './backends/runtime.js'
+import { configureDingTalkClarifyCardStore } from './dingtalk-card.js'
+import { createDingTalkClarifyCardStore } from './dingtalk-clarify-store.js'
 import { readSessionUserId } from './employee-session.js'
 import { findActivePerson } from './session.js'
 import { registerAdminRoutes } from './routes/admin.js'
 import { registerAuthRoutes } from './routes/auth.js'
+import { registerBootRoutes } from './routes/boot.js'
 import { registerChannelRoutes } from './routes/channel.js'
 import { registerChatRoutes } from './routes/chat.js'
 import { registerConsoleRoutes } from './routes/console.js'
@@ -33,6 +37,7 @@ import { registerKbRoutes } from './routes/kb.js'
 import { registerMemoryRoutes } from './routes/memory.js'
 import { registerOrgRoutes } from './routes/org.js'
 import { registerOrgSyncRoutes } from './routes/org-sync.js'
+import { registerPermissionRoutes } from './routes/permissions.js'
 import { registerPluginRoutes } from './routes/plugins.js'
 import { registerQuotaRoutes } from './routes/quota.js'
 import { registerSettingsRoutes } from './routes/settings.js'
@@ -48,6 +53,11 @@ const CONTENT_TYPES: Record<string, string> = {
   'admin-gate.html': 'text/html; charset=utf-8',
   'app.js': 'text/javascript; charset=utf-8',
   'app.css': 'text/css; charset=utf-8',
+  'theme.css': 'text/css; charset=utf-8',
+  'theme.js': 'text/javascript; charset=utf-8',
+  'brand.js': 'text/javascript; charset=utf-8',
+  'boot-splash.css': 'text/css; charset=utf-8',
+  'boot-splash.js': 'text/javascript; charset=utf-8',
   'chat.html': 'text/html; charset=utf-8',
   'chat.js': 'text/javascript; charset=utf-8',
   'chat.css': 'text/css; charset=utf-8',
@@ -156,6 +166,46 @@ function servePublic(name: string, reply: FastifyReply, cacheControl = 'no-store
   return reply.send(body)
 }
 
+/**
+ * PDF.js 由服务端自托管，避免预览依赖外网 CDN。
+ * 只放行渲染真正需要的构建产物、CMap、标准字体、WASM 和 ICC，不把 node_modules 变成通配静态站。
+ */
+const requireFromServer = createRequire(import.meta.url)
+let pdfjsDistRoot = ''
+const PDFJS_ASSET_RE =
+  /^(?:build\/pdf(?:\.worker)?(?:\.min)?\.mjs|cmaps\/[A-Za-z0-9._-]+\.bcmap|standard_fonts\/[A-Za-z0-9._-]+\.(?:pfb|ttf|otf)|wasm\/[A-Za-z0-9._-]+\.(?:wasm|js)|iccs\/[A-Za-z0-9._-]+\.icc)$/u
+
+function servePdfjsAsset(asset: string, reply: FastifyReply): FastifyReply {
+  if (!PDFJS_ASSET_RE.test(asset)) {
+    return reply.code(404).send({ ok: false, code: 'EAB_NOT_FOUND', message: 'unknown pdfjs asset' })
+  }
+  if (!pdfjsDistRoot) pdfjsDistRoot = dirname(requireFromServer.resolve('pdfjs-dist/package.json'))
+  let body: Buffer
+  try {
+    body = readFileSync(join(pdfjsDistRoot, asset))
+  } catch {
+    return reply.code(404).send({ ok: false, code: 'EAB_NOT_FOUND', message: 'unknown pdfjs asset' })
+  }
+  const ext = extname(asset).toLowerCase()
+  const type =
+    ext === '.mjs' || ext === '.js'
+      ? 'text/javascript; charset=utf-8'
+      : ext === '.wasm'
+        ? 'application/wasm'
+        : ext === '.pfb'
+          ? 'application/x-font-type1'
+          : ext === '.ttf'
+            ? 'font/ttf'
+            : ext === '.otf'
+              ? 'font/otf'
+              : ext === '.icc'
+                ? 'application/vnd.iccprofile'
+                : 'application/octet-stream'
+  reply.type(type)
+  reply.header('cache-control', 'private, max-age=3600, must-revalidate')
+  return reply.send(body)
+}
+
 /** 只允许读取 lab 自己的静态目录，避免把整个 public 变成通配静态站。 */
 function serveKernelVendor(file: string, reply: FastifyReply): FastifyReply {
   if (!/^[A-Za-z0-9._-]+\.(?:js|css)$/u.test(file)) {
@@ -238,6 +288,8 @@ export function buildApp(deps: ServerDeps, surface: AppSurface = 'all'): Fastify
   // 控制台会话是签名 Cookie：先把当前管理员密码登记成签名密钥，
   // 这样多实例/重启后彼此的 Cookie 都认，改密码时旧 Cookie 自动失效。
   configureConsoleAuth(deps.config)
+  // 钉钉答题卡状态落库：进程重启后旧卡仍能翻页/提交。
+  configureDingTalkClarifyCardStore(createDingTalkClarifyCardStore(deps.db, deps.companyId))
   // 配了 Redis 的话，SSE 的实时事件同时跨实例广播；没配就是纯进程内。
   initChatEventBridge(getBackendRuntime()?.pubsub ?? null)
   // 「停止生成 / 取消 Agent 任务树」跨实例转发，同样只在接了 Redis 时生效。
@@ -270,6 +322,10 @@ export function buildApp(deps: ServerDeps, surface: AppSurface = 'all'): Fastify
     reply.header('x-eab-version', readVersion())
   })
 
+  // 两端共用的启动层样式与控制器；只含视觉与状态机，不暴露配置或管理能力。
+  app.get('/boot-splash.css', async (_req, reply) => servePublic('boot-splash.css', reply))
+  app.get('/boot-splash.js', async (_req, reply) => servePublic('boot-splash.js', reply))
+
   // ---- 页面 ----
   /**
    * 员工入口就是对话。`/` 不再落到管理控制台：
@@ -282,8 +338,17 @@ export function buildApp(deps: ServerDeps, surface: AppSurface = 'all'): Fastify
     app.get('/chat.html', async (_req, reply) => servePublic('chat.html', reply))
     app.get('/chat.js', async (_req, reply) => servePublic('chat.js', reply))
     app.get('/chat.css', async (_req, reply) => servePublic('chat.css', reply))
+    // 深/浅色主题在聊天页与控制台共用同一份令牌和开关脚本。
+    app.get('/theme.css', async (_req, reply) => servePublic('theme.css', reply))
+    app.get('/theme.js', async (_req, reply) => servePublic('theme.js', reply))
+    // 控制台与对话页共用的品牌图标 / 标签文字渲染脚本。
+    app.get('/brand.js', async (_req, reply) => servePublic('brand.js', reply))
     // 设计令牌与共享组件都在 app.css；对话页只读这份静态样式，不因此获得任何管理接口。
     app.get('/app.css', async (_req, reply) => servePublic('app.css', reply))
+    /** PDF 降级预览的 PDF.js 资源；只放行预览需要的文件。 */
+    app.get<{ Params: { '*': string } }>('/vendor/pdfjs/*', async (req, reply) =>
+      servePdfjsAsset(req.params['*'], reply),
+    )
     /**
      * EAB OnlyOffice 插件静态资源。
      * 只放行插件自己的三个文件，不把 public 变成通配静态站；config.json 走
@@ -337,6 +402,9 @@ export function buildApp(deps: ServerDeps, surface: AppSurface = 'all'): Fastify
     app.get('/admin.html', adminPage)
     app.get('/app.js', async (_req, reply) => servePublic('app.js', reply))
     app.get('/app.css', async (_req, reply) => servePublic('app.css', reply))
+    app.get('/theme.css', async (_req, reply) => servePublic('theme.css', reply))
+    app.get('/theme.js', async (_req, reply) => servePublic('theme.js', reply))
+    app.get('/brand.js', async (_req, reply) => servePublic('brand.js', reply))
     // DSH 插件页面宿主：独立的 iframe 页面 + React UMD + DSH client 兼容运行时
     app.get('/plugin-host.html', async (_req, reply) => servePublic('plugin-host.html', reply))
     app.get('/dsh-runtime.js', async (_req, reply) => servePublic('dsh-runtime.js', reply))
@@ -353,9 +421,11 @@ export function buildApp(deps: ServerDeps, surface: AppSurface = 'all'): Fastify
   // ---- API ----
   registerSystemRoutes(app, runtimeDeps)
   registerAuthRoutes(app, deps)
+  registerBootRoutes(app, deps)
   registerOrgRoutes(app, deps)
   registerChannelRoutes(app, deps)
   registerOrgSyncRoutes(app, deps)
+  registerPermissionRoutes(app, deps)
   registerKbRoutes(app, deps)
   registerChatRoutes(app, runtimeDeps)
   registerMemoryRoutes(app, deps)

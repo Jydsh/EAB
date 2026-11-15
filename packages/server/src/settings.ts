@@ -70,6 +70,35 @@ export interface StorageMigration {
   createdAt: string
 }
 
+/** 保存存储位置时交给运行时执行的目标路径集合。 */
+export interface StorageApplyPaths {
+  dataDir: string
+  dbDir: string
+  dbPath: string
+  workspacesDir: string
+  tmpDir: string
+  backupsDir: string
+  pluginsDir: string
+  dshHomeDir: string
+}
+
+/** 控制台保存某一类存储位置时的完整执行计划。 */
+export interface StorageApplyPlan {
+  key: StorageSettingKey
+  target: string
+  /** 成功后才写入的设置补丁 */
+  settingsPatch: Partial<ConsoleSettings>
+  paths: StorageApplyPaths
+  /** 需要复制的目录；database 分类由运行时用 SQLite 快照单独处理 */
+  jobs: readonly StorageMigration[]
+}
+
+export interface StorageApplyResult {
+  moved: string[]
+  skipped: string[]
+}
+
+
 export interface NetworkSettings {
   /** 监听地址；null 表示用默认 127.0.0.1 */
   host: string | null
@@ -79,6 +108,43 @@ export interface NetworkSettings {
   adminPort: number | null
   /** 是否允许非本机地址登录控制台 */
   allowRemoteConsole: boolean
+}
+
+/**
+ * 控制台 / 员工对话的品牌外观。
+ *
+ * 图标以 data URL 存在 console-settings.json 里，避免为了一个 favicon
+ * 再引入单独的上传目录；数据只由控制台写入，读取端只用来渲染 img/favicon。
+ */
+export interface BrandSurfaceSettings {
+  /** 没有上传图标时，Logo 方块里显示的字；上传图标后以图标为准 */
+  logoText: string
+  /** 图标旁的应用内品牌名称 */
+  brandName: string
+  /** 浏览器标签页标题 */
+  tabTitle: string
+  /** 自定义 favicon / 品牌图标；null 表示沿用默认标记 */
+  iconDataUrl: string | null
+}
+
+export interface BrandingSettings {
+  console: BrandSurfaceSettings
+  chat: BrandSurfaceSettings
+}
+
+export const BRANDING_DEFAULTS: BrandingSettings = {
+  console: {
+    logoText: 'EAB',
+    brandName: '企业智能体基座',
+    tabTitle: 'EAB 管理控制台',
+    iconDataUrl: null,
+  },
+  chat: {
+    logoText: 'EAB',
+    brandName: '企业AI智能体基座',
+    tabTitle: 'EAB 工作台',
+    iconDataUrl: null,
+  },
 }
 
 /**
@@ -96,6 +162,140 @@ export interface OnlyOfficeSettings {
   jwtSecretRef: string | null
 }
 
+export type BootAnimationMode = 'off' | 'code' | 'film'
+export type BootPlayOn = 'login' | 'new-session' | 'always'
+
+export interface BootSurfaceSettings {
+  mode: BootAnimationMode
+  /** 媒体库 ID；null 表示没有片源，film 会自动回退 code */
+  assetId: string | null
+  /** 片长上限（秒），也是电影片头的硬上限 */
+  durationMax: number
+  /** 是否允许用户点开声音；默认仍然静音起播 */
+  allowSound: boolean
+  /** 是否显示跳过 */
+  allowSkip: boolean
+  playOn: BootPlayOn
+  title: string
+  subtitle: string
+}
+
+export interface BootAnimationSettings {
+  enabled: boolean
+  /** 每次保存自增，用于客户端缓存失效 */
+  revision: number
+  admin: BootSurfaceSettings
+  chat: BootSurfaceSettings
+}
+
+/** 公司级只允许覆盖员工端；管理端始终用全局配置。 */
+export interface CompanyBootSettings {
+  useGlobal: boolean
+  chat: Partial<BootSurfaceSettings>
+}
+
+const DEFAULT_BOOT_SURFACE: BootSurfaceSettings = {
+  mode: 'code',
+  assetId: null,
+  durationMax: 2.6,
+  allowSound: false,
+  allowSkip: true,
+  playOn: 'login',
+  title: 'EAB',
+  subtitle: '企业智能体基座',
+}
+
+export const DEFAULT_BOOT_ANIMATION: BootAnimationSettings = {
+  enabled: true,
+  revision: 0,
+  admin: { ...DEFAULT_BOOT_SURFACE, subtitle: '管理控制台', durationMax: 2.6 },
+  chat: { ...DEFAULT_BOOT_SURFACE, durationMax: 6.5, allowSound: true },
+}
+
+export const DEFAULT_COMPANY_BOOT: CompanyBootSettings = {
+  useGlobal: true,
+  chat: {},
+}
+
+function normalizeBootText(raw: unknown, fallback: string, max = 60): string {
+  const text = typeof raw === 'string' ? raw.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim() : ''
+  return text ? text.slice(0, max) : fallback
+}
+
+function readBootMode(raw: unknown, fallback: BootAnimationMode): BootAnimationMode {
+  return raw === 'off' || raw === 'code' || raw === 'film' ? raw : fallback
+}
+
+function readBootPlayOn(raw: unknown, fallback: BootPlayOn): BootPlayOn {
+  return raw === 'login' || raw === 'new-session' || raw === 'always' ? raw : fallback
+}
+
+function readBootSurface(raw: unknown, fallback: BootSurfaceSettings): BootSurfaceSettings {
+  const value = raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {}
+  const duration = Number(value.durationMax ?? fallback.durationMax)
+  return {
+    mode: readBootMode(value.mode, fallback.mode),
+    assetId:
+      typeof value.assetId === 'string' && /^boot-[a-f0-9]{24}$/.test(value.assetId)
+        ? value.assetId
+        : value.assetId === null
+          ? null
+          : fallback.assetId,
+    durationMax:
+      Number.isFinite(duration) && duration >= 0.8 && duration <= 8
+        ? Math.round(duration * 10) / 10
+        : fallback.durationMax,
+    allowSound: value.allowSound === undefined ? fallback.allowSound : value.allowSound === true,
+    allowSkip: value.allowSkip === undefined ? fallback.allowSkip : value.allowSkip === true,
+    playOn: readBootPlayOn(value.playOn, fallback.playOn),
+    title: normalizeBootText(value.title, fallback.title),
+    subtitle: normalizeBootText(value.subtitle, fallback.subtitle),
+  }
+}
+
+export function readBootAnimation(raw: unknown): BootAnimationSettings {
+  const value = raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {}
+  const revision = Number(value.revision)
+  return {
+    enabled: value.enabled === undefined ? DEFAULT_BOOT_ANIMATION.enabled : value.enabled === true,
+    revision: Number.isFinite(revision) && revision >= 0 ? Math.trunc(revision) : 0,
+    admin: readBootSurface(value.admin, DEFAULT_BOOT_ANIMATION.admin),
+    chat: readBootSurface(value.chat, DEFAULT_BOOT_ANIMATION.chat),
+  }
+}
+
+export function readCompanyBoot(raw: unknown): CompanyBootSettings {
+  const value = raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {}
+  const chat = value.chat && typeof value.chat === 'object' && !Array.isArray(value.chat)
+    ? (value.chat as Record<string, unknown>)
+    : {}
+  const partial: Partial<BootSurfaceSettings> = {}
+  if (value.chat && typeof value.chat === 'object') {
+    if (chat.mode !== undefined) partial.mode = readBootMode(chat.mode, 'code')
+    if (chat.assetId !== undefined) {
+      partial.assetId =
+        typeof chat.assetId === 'string' && /^boot-[a-f0-9]{24}$/.test(chat.assetId)
+          ? chat.assetId
+          : null
+    }
+    if (chat.durationMax !== undefined) {
+      const duration = Number(chat.durationMax)
+      if (Number.isFinite(duration) && duration >= 0.8 && duration <= 8) {
+        partial.durationMax = Math.round(duration * 10) / 10
+      }
+    }
+    if (chat.allowSound !== undefined) partial.allowSound = chat.allowSound === true
+    if (chat.allowSkip !== undefined) partial.allowSkip = chat.allowSkip === true
+    if (chat.playOn !== undefined) partial.playOn = readBootPlayOn(chat.playOn, 'login')
+    if (chat.title !== undefined) partial.title = normalizeBootText(chat.title, 'EAB')
+    if (chat.subtitle !== undefined) partial.subtitle = normalizeBootText(chat.subtitle, '企业智能体基座')
+  }
+  return {
+    useGlobal: value.useGlobal === undefined ? DEFAULT_COMPANY_BOOT.useGlobal : value.useGlobal === true,
+    chat: partial,
+  }
+}
+
 export interface ConsoleSettings extends NetworkSettings {
   /** 总存储位置；null 表示就用部署目录下的 .eab-dev */
   dataDir: string | null
@@ -109,8 +309,16 @@ export interface ConsoleSettings extends NetworkSettings {
   auditRetentionDays: number
   /** Agent 运行轨迹保留天数；0 = 永久保留（默认不清理） */
   agentRetentionDays: number
+  /** 项目记录保留天数：会话、历史版本、工具/技能/团队/计划/异步任务记录；0 = 永久保留 */
+  recordRetentionDays: number
+  /** 云空间回收区保留天数；超过后物理删除 `_recycle` 文件并清理元数据 */
+  workspaceRecycleDays: number
   /** OnlyOffice 在线文档绑定 */
   onlyOffice: OnlyOfficeSettings
+  /** 管理控制台 / 员工对话的品牌图标与标签文字 */
+  branding: BrandingSettings
+  /** 登录后启动动画：全局默认 + 公司覆盖 */
+  bootAnimation: BootAnimationSettings
   lastCleanupAt: string | null
   lastCleanupStats: Record<string, number> | null
 }
@@ -126,7 +334,11 @@ const DEFAULTS: ConsoleSettings = {
   logRetentionDays: 90,
   auditRetentionDays: 180,
   agentRetentionDays: 0,
+  recordRetentionDays: 0,
+  workspaceRecycleDays: 30,
   onlyOffice: { url: null, internalUrl: null, jwtSecretRef: null },
+  branding: BRANDING_DEFAULTS,
+  bootAnimation: DEFAULT_BOOT_ANIMATION,
   lastCleanupAt: null,
   lastCleanupStats: null,
   host: null,
@@ -136,7 +348,22 @@ const DEFAULTS: ConsoleSettings = {
 }
 
 function defaultSettings(): ConsoleSettings {
-  return { ...DEFAULTS, paths: emptyPaths(), pendingMigrations: [] }
+  return {
+    ...DEFAULTS,
+    paths: emptyPaths(),
+    pendingMigrations: [],
+    branding: cloneBranding(BRANDING_DEFAULTS),
+    bootAnimation: cloneBootAnimation(DEFAULT_BOOT_ANIMATION),
+  }
+}
+
+function cloneBootAnimation(value: BootAnimationSettings): BootAnimationSettings {
+  return {
+    enabled: value.enabled,
+    revision: value.revision,
+    admin: { ...value.admin },
+    chat: { ...value.chat },
+  }
 }
 
 function readPort(raw: unknown): number | null {
@@ -147,6 +374,47 @@ function readPort(raw: unknown): number | null {
 
 function readText(raw: unknown): string | null {
   return typeof raw === 'string' && raw.trim() ? raw.trim() : null
+}
+
+const ICON_DATA_URL_MAX = 360_000
+const ICON_MIME_TYPES = ['png', 'jpeg', 'webp', 'svg+xml', 'x-icon', 'vnd.microsoft.icon']
+
+function isIconDataUrl(value: string): boolean {
+  if (value.length > ICON_DATA_URL_MAX) return false
+  const comma = value.indexOf(',')
+  if (comma < 0) return false
+  const header = value.slice(0, comma)
+  if (!header.startsWith('data:image/') || !header.includes(';base64')) return false
+  const mime = header.slice('data:image/'.length).split(';')[0]?.toLowerCase() ?? ''
+  return ICON_MIME_TYPES.includes(mime)
+}
+
+function cloneBranding(source: BrandingSettings): BrandingSettings {
+  return {
+    console: { ...source.console },
+    chat: { ...source.chat },
+  }
+}
+
+function readBrandSurface(raw: unknown, fallback: BrandSurfaceSettings): BrandSurfaceSettings {
+  const source = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {}
+  const icon = typeof source.iconDataUrl === 'string' && source.iconDataUrl.trim()
+    ? source.iconDataUrl.trim()
+    : null
+  return {
+    logoText: readText(source.logoText) ?? fallback.logoText,
+    brandName: readText(source.brandName) ?? fallback.brandName,
+    tabTitle: readText(source.tabTitle) ?? fallback.tabTitle,
+    iconDataUrl: icon && isIconDataUrl(icon) ? icon : null,
+  }
+}
+
+function readBranding(raw: unknown): BrandingSettings {
+  const source = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {}
+  return {
+    console: readBrandSurface(source.console, BRANDING_DEFAULTS.console),
+    chat: readBrandSurface(source.chat, BRANDING_DEFAULTS.chat),
+  }
 }
 
 const STORAGE_KEYS: readonly StoragePathKey[] = ['database', 'workspaces', 'tmp', 'backups', 'plugins', 'dshHome']
@@ -204,6 +472,8 @@ export function readConsoleSettings(): ConsoleSettings {
     const days = Number(raw.logRetentionDays ?? DEFAULTS.logRetentionDays)
     const auditDays = Number(raw.auditRetentionDays ?? DEFAULTS.auditRetentionDays)
     const agentDays = Number(raw.agentRetentionDays ?? DEFAULTS.agentRetentionDays)
+    const recordDays = Number(raw.recordRetentionDays ?? DEFAULTS.recordRetentionDays)
+    const workspaceRecycleDays = Number(raw.workspaceRecycleDays ?? DEFAULTS.workspaceRecycleDays)
     return {
       dataDir: readText(raw.dataDir),
       paths: readPaths(raw.paths),
@@ -213,7 +483,15 @@ export function readConsoleSettings(): ConsoleSettings {
         Number.isFinite(auditDays) && auditDays >= 0 ? Math.trunc(auditDays) : DEFAULTS.auditRetentionDays,
       agentRetentionDays:
         Number.isFinite(agentDays) && agentDays >= 0 ? Math.trunc(agentDays) : DEFAULTS.agentRetentionDays,
+      recordRetentionDays:
+        Number.isFinite(recordDays) && recordDays >= 0 ? Math.trunc(recordDays) : DEFAULTS.recordRetentionDays,
+      workspaceRecycleDays:
+        Number.isFinite(workspaceRecycleDays) && workspaceRecycleDays >= 0
+          ? Math.trunc(workspaceRecycleDays)
+          : DEFAULTS.workspaceRecycleDays,
       onlyOffice: readOnlyOffice(raw.onlyOffice),
+      branding: readBranding(raw.branding),
+      bootAnimation: readBootAnimation(raw.bootAnimation),
       lastCleanupAt: typeof raw.lastCleanupAt === 'string' ? raw.lastCleanupAt : null,
       lastCleanupStats: raw.lastCleanupStats && typeof raw.lastCleanupStats === 'object' ? raw.lastCleanupStats : null,
       host: readText(raw.host),
@@ -232,6 +510,15 @@ export function writeConsoleSettings(patch: Partial<ConsoleSettings>): ConsoleSe
   const next: ConsoleSettings = { ...current, ...patch }
   if (patch.paths) next.paths = { ...current.paths, ...patch.paths }
   if (patch.onlyOffice) next.onlyOffice = { ...current.onlyOffice, ...patch.onlyOffice }
+  if (patch.branding) next.branding = cloneBranding(patch.branding)
+  if (patch.bootAnimation) {
+    next.bootAnimation = cloneBootAnimation({
+      ...current.bootAnimation,
+      ...patch.bootAnimation,
+      admin: { ...current.bootAnimation.admin, ...patch.bootAnimation.admin },
+      chat: { ...current.bootAnimation.chat, ...patch.bootAnimation.chat },
+    })
+  }
   if (patch.pendingMigrations) next.pendingMigrations = patch.pendingMigrations
   const file = settingsPath()
   mkdirSync(dirname(file), { recursive: true })
@@ -309,7 +596,7 @@ function portableStats(dir: string): { files: number; bytes: number } {
   return { files, bytes }
 }
 
-function copyPortableDatabaseFiles(fromDir: string, toDir: string): void {
+export function copyPortableDatabaseFiles(fromDir: string, toDir: string): void {
   const portable = [
     DB_FILE,
     `${DB_FILE}-wal`,
@@ -319,6 +606,20 @@ function copyPortableDatabaseFiles(fromDir: string, toDir: string): void {
     'demo-accounts.txt',
   ]
   for (const name of portable) {
+    const from = join(fromDir, name)
+    if (!existsSync(from)) continue
+    const to = join(toDir, name)
+    if (existsSync(to)) continue
+    cpSync(from, to)
+  }
+}
+
+/**
+ * 运行时切库只需要凭据类伴随文件。
+ * 数据库本身由 `VACUUM INTO` 生成，绝不能把旧库的 -wal/-shm 复制到快照旁边。
+ */
+export function copyDatabaseCompanionFiles(fromDir: string, toDir: string): void {
+  for (const name of ['secrets.json', 'admin-credentials.txt', 'demo-accounts.txt']) {
     const from = join(fromDir, name)
     if (!existsSync(from)) continue
     const to = join(toDir, name)
@@ -475,17 +776,14 @@ function applyOneMigration(job: StorageMigration): string | null {
 }
 
 /**
- * 启动前执行控制台保存的搬迁任务。
- * 先复制、再校验，成功后才清空 pending；失败会删除已复制的新目录并中止启动，
- * 旧目录始终保留，不会出现“配置改了但数据找不到”。
+ * 立即执行一批目录迁移（只复制、校验，不改设置文件）。
+ * 失败时删除本次已经复制出来的目标目录，旧目录始终保留。
  */
-export function applyPendingStorageMigrations(): { moved: string[]; skipped: string[] } {
-  const settings = readConsoleSettings()
-  if (settings.pendingMigrations.length === 0) return { moved: [], skipped: [] }
+export function migrateStorageJobs(jobs: readonly StorageMigration[]): { moved: string[]; skipped: string[] } {
   const moved: string[] = []
   const skipped: string[] = []
   try {
-    for (const job of settings.pendingMigrations) {
+    for (const job of jobs) {
       const target = applyOneMigration(job)
       if (target) moved.push(target)
       else skipped.push(job.to)
@@ -500,6 +798,18 @@ export function applyPendingStorageMigrations(): { moved: string[]; skipped: str
     }
     throw error
   }
-  writeConsoleSettings({ pendingMigrations: [] })
   return { moved, skipped }
+}
+
+/**
+ * 启动前执行控制台保存的搬迁任务。
+ * 先复制、再校验，成功后才清空 pending；失败会删除已复制的新目录并中止启动，
+ * 旧目录始终保留，不会出现“配置改了但数据找不到”。
+ */
+export function applyPendingStorageMigrations(): { moved: string[]; skipped: string[] } {
+  const settings = readConsoleSettings()
+  if (settings.pendingMigrations.length === 0) return { moved: [], skipped: [] }
+  const result = migrateStorageJobs(settings.pendingMigrations)
+  writeConsoleSettings({ pendingMigrations: [] })
+  return result
 }

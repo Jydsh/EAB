@@ -3,15 +3,19 @@
  *
  * 边界：
  * - 运维/事件类日志：组织同步记录与差异、渠道事件、登录失败计数、插件事件、扫码尝试。
+ * - 项目记录：会话与消息、云空间历史版本、工具/技能/团队/计划/异步任务记录
+ *   （由 project-retention.ts 执行，独立天数，默认永久）。
  * - 审计日志：按独立的审计保留天数，只从最老一端连续删除；被删段最后一行
  *   的哈希记成新锚点，哈希链校验从锚点继续，所以清理不会把链判成断裂。
- * - 用户对话、知识库、工作区文件仍不在自动清理范围内（业务数据）。
+ * - 工作区回收区：按独立保留天数删除 `_recycle` 副本及其元数据。
+ *   活跃文件不删；历史版本快照由项目记录清理按独立天数处理。
  *
  * 清理是可重复执行的幂等操作：按时间阈值删除，重复跑只会删到同样的边界。
  */
 import type { AuditPruneResult, Db } from '@eab/storage'
 import { runAsLeader } from './backends/coordination.js'
 import { pruneAuditLogs, withTransaction } from '@eab/storage'
+import { runProjectRetention, type ProjectRetentionResult } from './project-retention.js'
 
 export interface RetentionStats {
   [table: string]: number
@@ -24,8 +28,12 @@ export interface RetentionResult {
   cutoff: string | null
   /** 生效的 Agent 轨迹保留天数；0 表示永久保留 */
   agentDays: number
+  /** 生效的项目记录保留天数；0 表示永久保留 */
+  recordDays: number
+  /** 项目记录清理的详细结果 */
+  project: ProjectRetentionResult
   deleted: RetentionStats
-  /** 实际删掉的记录总数（包含审计） */
+  /** 实际删掉的记录总数（包含审计与项目记录） */
   total: number
   skipped: boolean
   /** 审计清理结果；审计保留为 0 时 skipped=true */
@@ -38,7 +46,14 @@ function deleteOlder(db: Db, table: string, column: string, cutoff: number, extr
   return Number(result.changes ?? 0)
 }
 
-export function runRetention(db: Db, days: number, auditDays = 0, agentDays = 0): RetentionResult {
+export function runRetention(
+  db: Db,
+  days: number,
+  auditDays = 0,
+  agentDays = 0,
+  recordDays = 0,
+  workspaceRoot?: string,
+): RetentionResult {
   const logDays = Number.isFinite(days) && days > 0 ? Math.trunc(days) : 0
   const deleted: RetentionStats = {}
   let cutoff: string | null = null
@@ -60,6 +75,14 @@ export function runRetention(db: Db, days: number, auditDays = 0, agentDays = 0)
       )
       deleted['syncRuns'] = deleteOlder(db, 'org_sync_runs', 'started_at', cutoffMs)
       deleted['channelEvents'] = deleteOlder(db, 'channel_events', 'received_at', cutoffMs)
+      // 只清已经收口的回合；running/recovering 还要留给启动恢复扫描。
+      deleted['channelTurns'] = deleteOlder(
+        db,
+        'channel_turns',
+        'updated_at',
+        cutoffMs,
+        " AND status IN ('completed', 'failed')",
+      )
       deleted['loginAttempts'] = deleteOlder(db, 'login_attempts', 'updated_at', cutoffMs)
       deleted['pluginEvents'] = deleteOlder(db, 'plugin_events', 'at', cutoffMs)
       deleted['onboardAttempts'] = deleteOlder(db, 'dingtalk_onboard_attempts', 'expires_at', cutoffMs)
@@ -102,14 +125,21 @@ export function runRetention(db: Db, days: number, auditDays = 0, agentDays = 0)
   const audit = pruneAuditLogs(db, auditDays)
   if (audit.deleted > 0) deleted['auditLogs'] = audit.deleted
 
+  const project = runProjectRetention(db, recordDays, workspaceRoot)
+  for (const [key, value] of Object.entries(project.deleted)) {
+    if (value > 0) deleted[key] = value
+  }
+
   const total = Object.values(deleted).reduce((sum, n) => sum + n, 0)
   return {
     days: logDays,
     cutoff,
     agentDays: agentLogDays,
+    recordDays: project.days,
+    project,
     deleted,
     total,
-    skipped: logDays === 0 && agentLogDays === 0 && audit.skipped,
+    skipped: logDays === 0 && agentLogDays === 0 && audit.skipped && project.skipped,
     audit,
   }
 }
@@ -124,12 +154,23 @@ export function startRetention(
   onDone?: (result: RetentionResult) => void,
   readAuditDays?: () => number,
   readAgentDays?: () => number,
+  readRecordDays?: () => number,
+  workspaceRoot?: string,
 ): () => void {
   const tick = () => {
     void runAsLeader('retention', 10 * 60_000, () => {
       try {
-        const result = runRetention(db, readDays(), readAuditDays?.() ?? 0, readAgentDays?.() ?? 0)
-        if (!result.skipped) onDone?.(result)
+        const result = runRetention(
+          db,
+          readDays(),
+          readAuditDays?.() ?? 0,
+          readAgentDays?.() ?? 0,
+          readRecordDays?.() ?? 0,
+          workspaceRoot,
+        )
+        // 即使日志/审计/轨迹都设为永久，回收区仍可能按自己的天数清理；
+        // 交给上层回调统一处理，避免工作区策略被 skipped 短路。
+        onDone?.(result)
       } catch (err) {
         console.warn(`[eab] 保留清理失败：${(err as Error).message}`)
       }

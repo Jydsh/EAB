@@ -2,6 +2,7 @@ import type { Db } from '@eab/storage'
 import type { ServerConfig } from './config.js'
 import type { ChatCapacity } from './chat-capacity.js'
 import type { NetworkApplyResult, NetworkTarget } from './network-settings.js'
+import type { StorageApplyPlan, StorageApplyResult } from './settings.js'
 import type { BackendRuntime } from './backends/runtime.js'
 
 export interface ServerDeps {
@@ -19,4 +20,6 @@ export interface ServerDeps {
   readonly shutdown?: () => void
   /** 控制台保存监听地址/端口后重建监听；由 main.ts 注入，测试环境没有时只写设置。 */
   readonly applyNetwork?: (next: NetworkTarget) => Promise<NetworkApplyResult> | NetworkApplyResult
+  /** 控制台保存存储位置后立即复制/切换，不重启；由 main.ts 注入，测试环境没有时退回 pending+重启。 */
+  readonly applyStorage?: (plan: StorageApplyPlan) => Promise<StorageApplyResult> | StorageApplyResult
 }

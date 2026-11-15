@@ -14,6 +14,19 @@ import { randomUUID } from 'node:crypto'
 import { SC, scopeAllows } from '@eab/domain'
 import { appendAudit, type Db } from '@eab/storage'
 import { consumeRobotUserFileSend } from './dingtalk-file-echo.js'
+import { clearDingTalkClarifySync, registerDingTalkClarifySync } from './dingtalk-clarify-sync.js'
+import { handlePermissionApprovalCardCallback } from './permission-approval-dingtalk.js'
+import {
+  adoptLegacyInterruptedTurns,
+  beginChannelTurn,
+  claimChannelTurn,
+  finishChannelTurn,
+  getChannelTurn,
+  listRecoverableChannelTurns,
+  setChannelTurnCard,
+  setChannelTurnProgress,
+  type ChannelTurn,
+} from './channel-turns.js'
 import { acquireLeaderHold, claimOnce, hitRate, type LeaderHold } from './backends/coordination.js'
 import { publishChatEvent, type ChatLiveToolEventPayload } from './chat-events.js'
 import { findActivePerson, findPerson, actorFor, type RequestActor } from './session.js'
@@ -59,7 +72,11 @@ import {
   dingTalkConversationSummary,
   renderDingTalkFinalCard,
   renderDingTalkProgressCard,
+  updateDingTalkClarifyDraft,
+  updateDingTalkClarifyIndex,
   type DingTalkCardAttachment,
+  type DingTalkClarifyAnswer,
+  type DingTalkClarifyQuestion,
   type DingTalkRichCardState,
   type DingTalkToolRecord,
 } from './dingtalk-card.js'
@@ -648,6 +665,19 @@ export async function handleDingTalkMessage(
       /** 续用原卡失败时不再新建卡片，避免真机出现两条机器人消息。 */
       suppressNewCard?: boolean
     }
+    /**
+     * 服务重启后的恢复：复用上次已落库的消息 id / 卡片 / 工具幂等键。
+     * 只由 recoverInterruptedDingTalkTurns 传入，普通入站不设置。
+     */
+    resume?: {
+      turnId: string
+      userMessageId: string
+      assistantMessageId: string
+      cardInstanceId?: string | null
+      cardKind?: string | null
+      agentTurnId?: string | null
+      priorTools?: string[]
+    }
   } = {},
 ): Promise<DingTalkResult> {
   const externalId = String(payload.senderStaffId ?? payload.senderId ?? '').trim()
@@ -663,14 +693,14 @@ export async function handleDingTalkMessage(
       reason: 'empty-text',
     }
   }
-  if (await rateLimited(externalId)) {
+  if (!options.resume && (await rateLimited(externalId))) {
     return { handled: false, text: '消息有点频繁，请 1 分钟后再发。', sessionId: null, reason: 'rate-limited' }
   }
 
   const eventKey =
     String(payload.msgId ?? '').trim() ||
     `${externalId}:${payload.createAt ?? ''}:${rawText.slice(0, 40) || imageCodes[0]?.slice(0, 40) || fileAttachments[0]?.fileName.slice(0, 40) || payload.msgtype || ''}`
-  if (options.dedupe !== false) {
+  if (options.dedupe !== false && !options.resume) {
     // 先用 Redis 做一次跨实例的原子预去重，避免同一条事件被多个实例同时处理；
     // 缓存层没接或抖动时放行，下面 channel_events 的唯一约束仍是最终闸门。
     const firstSeen = await claimOnce(`dingtalk:event:${deps.companyId}:${eventKey}`, 300)
@@ -865,6 +895,7 @@ export async function handleDingTalkMessage(
   let legacyCard: DingTalkCardStream | null = null
   let reaction: DingTalkReaction | null = null
   let reactionOk = false
+  let trackedTurnId: string | null = null
   try {
     if (fileAttachments.length > 0) {
       return await handleInboundFiles(deps, actor, sessionId, cfg, externalId, payload, fileAttachments)
@@ -930,6 +961,53 @@ export async function handleDingTalkMessage(
       }
     }
 
+    /**
+     * 先把这一轮的 id 固定下来并落库，再建卡/跑模型。
+     * 这样进程在任意时刻被重启，启动后都能拿回同一条用户消息、同一张卡片和同一组工具幂等键。
+     */
+    const now = Date.now()
+    const continueAssistantId = String(
+      options.resume?.assistantMessageId ?? options.clarifyFlow?.assistantMessageId ?? '',
+    ).trim()
+    const assistantMessageId = continueAssistantId || `msg_${randomUUID()}`
+    const userMessageId =
+      String(options.resume?.userMessageId ?? '').trim() || `msg_${randomUUID()}`
+    const agentTurnId = String(options.resume?.agentTurnId ?? '').trim() || randomUUID()
+    const clarifyFlow = options.clarifyFlow
+      ? {
+          clarifyFlowId: String(options.clarifyFlow.flowId || '').slice(0, 80),
+          clarifyStep: Math.max(1, Math.trunc(Number(options.clarifyFlow.step) || 1)),
+          interaction: 'clarify_select',
+        }
+      : null
+    const userMessageMeta = {
+      channel: 'dingtalk',
+      externalUserId: externalId,
+      hasImage: imageUrls.length > 0,
+      imageCount: imageUrls.length,
+      // 网页端把带 clarifyFlowId 的用户消息视为隐藏续跑，不渲染绿色气泡。
+      ...(clarifyFlow ?? {}),
+    }
+    // 卡片按钮的隐藏续跑沿用同一条 assistant 消息，不单独登记恢复回合。
+    const trackTurn = Boolean(options.resume) || !options.clarifyFlow
+    trackedTurnId = trackTurn ? assistantMessageId : null
+    if (trackTurn && !options.resume) {
+      beginChannelTurn(deps.db, {
+        id: assistantMessageId,
+        companyId: actor.subject.companyId,
+        provider: 'dingtalk',
+        externalId,
+        userId: actor.person.id,
+        sessionId,
+        eventKey,
+        payload,
+        userMessageId,
+        assistantMessageId,
+        agentTurnId,
+        startedAt: started,
+      })
+    }
+
     // 先投递一张「正在思考」的 AI 卡片，后续 reasoning/content/tool 事件都在这张卡片里流式刷新。
     // 优先用 A2UI 折叠面板（思考/工具收起、正文最后）；权限未开通时自动回退旧模板卡片。
     // 只对私聊用 IM_ROBOT 卡片；群聊仍走 sessionWebhook 文字，避免把回答私发给提问人而群里看不到。
@@ -938,7 +1016,11 @@ export async function handleDingTalkMessage(
     const robotCode = cfg.robot_code || cfg.app_id
     const initialRichState: DingTalkRichCardState = {
       answer: '',
-      reasoning: imageUrls.length > 0 ? '正在读取图片内容…' : '正在分析你的问题…',
+      reasoning: options.resume
+        ? '服务重启，正在继续上一轮回答…'
+        : imageUrls.length > 0
+          ? '正在读取图片内容…'
+          : '正在分析你的问题…',
       tools: [],
       thinkingDone: false,
       toolDetails: [],
@@ -947,25 +1029,67 @@ export async function handleDingTalkMessage(
     // 收口时再把外层摘要替换成回复正文（A2UI 卡片走场域信息更新，旧模板走 sys_lastMessageI18n）。
     const conversationSummary = 'EAB 企业智能助手'
     if (isPrivateChat && channelSecret && !card && options.clarifyFlow?.suppressNewCard !== true) {
-      // 私聊优先用 A2UI 卡：保留思考/工具折叠面板。
-      // 正文末尾的原生转圈由 richCardData() 拼入钉钉客户端自带 loading 素材，
-      // 旧模板卡仅作为 A2UI 建卡失败时的降级方案。
-      card = new DingTalkAICardStream(cfg.app_id, channelSecret, externalId, robotCode)
-      if (!(await card.start(initialRichState, conversationSummary))) {
-        card = null
-        legacyCard = new DingTalkCardStream(cfg.app_id, channelSecret, externalId, robotCode)
-        if (
-          !(await legacyCard.start(
-            imageUrls.length > 0
-              ? '**EAB 正在读取图片…**\n\n> 已收到你的图片，正在识别。'
-              : '**EAB 正在思考…**\n\n> 已收到你的问题，正在分析。',
-            conversationSummary,
-          ))
-        ) {
-          legacyCard = null
+      // 服务重启恢复时优先复用原卡：不新建机器人消息，直接在旧卡里继续刷新。
+      const resumeCardId = String(options.resume?.cardInstanceId ?? '').trim()
+      if (resumeCardId) {
+        const resumeKind =
+          options.resume?.cardKind || (resumeCardId.startsWith('eab_a2ui_') ? 'a2ui' : 'legacy')
+        if (resumeKind === 'legacy') {
+          const resumed = new DingTalkCardStream(cfg.app_id, channelSecret, externalId, robotCode)
+          if (
+            await resumed.resume(
+              resumeCardId,
+              imageUrls.length > 0
+                ? '**EAB 正在读取图片…**\n\n> 服务重启，正在继续上一轮。'
+                : '**EAB 正在继续上一轮回答…**\n\n> 服务重启前的这一轮已恢复。',
+            )
+          ) {
+            legacyCard = resumed
+          } else {
+            // 续用失败但卡片可能只是瞬时不可用：尽力把旧卡收口，避免它永久停在处理中。
+            await resumed.closeAfterResumeFailure(
+              resumeCardId,
+              '服务重启后这一轮已转到新消息继续，请查看下方回复。',
+            )
+          }
+        } else {
+          const resumed = new DingTalkAICardStream(cfg.app_id, channelSecret, externalId, robotCode)
+          if (await resumed.resume(resumeCardId, initialRichState)) {
+            card = resumed
+            console.info('[eab] 钉钉 A2UI 卡片已复用，继续中断的回合：', resumeCardId)
+          } else {
+            await resumed.closeAfterResumeFailure(
+              resumeCardId,
+              '服务重启后这一轮已转到新消息继续，请查看下方回复。',
+            )
+          }
         }
-      } else {
-        console.info('[eab] 钉钉私聊回复使用 A2UI 折叠面板，正文末尾拼钉钉原生 loading 素材')
+      }
+      // 原卡不在、或续用失败（例如卡片已过期）时才新建一张，至少保证用户能拿到完整回答。
+      if (!card && !legacyCard) {
+        clearDingTalkClarifySync(sessionId)
+        // 私聊优先用 A2UI 卡：保留思考/工具折叠面板，正文保持纯 Markdown，不加光标或 loading 素材。
+        card = new DingTalkAICardStream(cfg.app_id, channelSecret, externalId, robotCode)
+        if (!(await card.start(initialRichState, conversationSummary))) {
+          card = null
+          legacyCard = new DingTalkCardStream(cfg.app_id, channelSecret, externalId, robotCode)
+          if (
+            !(await legacyCard.start(
+              imageUrls.length > 0
+                ? '**EAB 正在读取图片…**\n\n> 已收到你的图片，正在识别。'
+                : '**EAB 正在思考…**\n\n> 已收到你的问题，正在分析。',
+              conversationSummary,
+            ))
+          ) {
+            legacyCard = null
+          }
+        } else {
+          console.info('[eab] 钉钉私聊回复使用 A2UI 折叠面板，正文保持纯 Markdown')
+        }
+      }
+      const cardId = card?.providerMessageIds[0] ?? legacyCard?.providerMessageIds[0] ?? ''
+      if (trackTurn && cardId) {
+        setChannelTurnCard(deps.db, assistantMessageId, cardId, card ? 'a2ui' : 'legacy')
       }
     }
 
@@ -1012,7 +1136,15 @@ export async function handleDingTalkMessage(
         : ''
     const fileSendSystemNote =
       '当前版本已经支持把个人云空间文件作为钉钉文件消息发给用户，也支持重命名和删除云空间文件：用户要求发文件时，先调用 workspace_list 找到文件名或相对路径，再调用 workspace_send_dingtalk（参数 path 或 fileId）；用户要求改名时，调用 workspace_rename（参数 path 或 fileId，以及 newName）；用户明确要求删除某个文件时，调用 workspace_delete（参数 path 或 fileId，只能删当前员工自己的文件，软删到回收目录）。在钉钉单聊里，发文件会优先用“用户方向”的原生文件消息：文件气泡出现在用户与机器人的单聊右侧、显示为用户发出，这是机器人代发；机器人能识别自己代发的文件，不会把它再存进个人云空间，只会补一句“你要的文件已发送”。不要声称文件一定是机器人头像发出，也不要声称一定能在钉钉内预览或在线编辑。不要把文件正文当成附件发送，也不要沿用历史里“没有发送文件附件的通道/没有重命名功能/没有删除文件的工具”的旧说法。'
-    const systemContent = `${system}\n\n${[imageSystemNote, fileSendSystemNote].filter(Boolean).join('\n\n')}`
+    const recoveryNote = options.resume
+      ? [
+          '本轮对话在 EAB 服务重启前中断，现在正在恢复同一轮回答。',
+          options.resume.priorTools && options.resume.priorTools.length > 0
+            ? `重启前已经调用过这些工具：${options.resume.priorTools.join('、')}。不要重复执行已经成功的写操作（写文件、发文件、删改数据、发消息）；如果必须再次执行，先向用户说明原因。`
+            : '重启前还没有调用过会产生副作用的工具，可以正常继续。',
+        ].join('')
+      : ''
+    const systemContent = `${system}\n\n${[imageSystemNote, fileSendSystemNote, recoveryNote].filter(Boolean).join('\n\n')}`
     const modelPromptText = fileNote ? `${promptText}\n\n${fileNote}` : promptText
     const userContent: LlmContent =
       imageUrls.length > 0
@@ -1023,60 +1155,55 @@ export async function handleDingTalkMessage(
         : modelPromptText
     const messages: LlmMessage[] = [
       { role: 'system', content: systemContent },
-      ...historyOf(deps.db, sessionId, 16, 'dingtalk'),
+      // 恢复时当前用户消息可能已经落库；先排除它再单独拼一次，避免模型看到两遍相同提问。
+      ...historyOf(deps.db, sessionId, 16, 'dingtalk', options.resume?.userMessageId),
       { role: 'user', content: userContent },
     ]
 
-    const now = Date.now()
-    const continueAssistantId = String(options.clarifyFlow?.assistantMessageId ?? '').trim()
-    const assistantMessageId = continueAssistantId || `msg_${randomUUID()}`
-    const clarifyFlow = options.clarifyFlow
-      ? {
-          clarifyFlowId: String(options.clarifyFlow.flowId || '').slice(0, 80),
-          clarifyStep: Math.max(1, Math.trunc(Number(options.clarifyFlow.step) || 1)),
-          interaction: 'clarify_select',
-        }
-      : null
-    const userMessageId = `msg_${randomUUID()}`
-    const userMessageMeta = {
-      channel: 'dingtalk',
-      externalUserId: externalId,
-      hasImage: imageUrls.length > 0,
-      imageCount: imageUrls.length,
-      // 网页端把带 clarifyFlowId 的用户消息视为隐藏续跑，不渲染绿色气泡。
-      ...(clarifyFlow ?? {}),
+    const existingUserMessage = options.resume?.userMessageId
+      ? (deps.db
+          .prepare(
+            `SELECT id FROM chat_messages
+              WHERE id = ? AND session_id = ? AND role = 'user'
+              LIMIT 1`,
+          )
+          .get(options.resume.userMessageId, sessionId) as { id: string } | undefined)
+      : undefined
+    if (!existingUserMessage) {
+      deps.db
+        .prepare(
+          `INSERT INTO chat_messages (id, company_id, session_id, user_id, role, text, model_id, model_name, meta_json, created_at)
+           VALUES (?, ?, ?, ?, 'user', ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          userMessageId,
+          actor.subject.companyId,
+          sessionId,
+          actor.person.id,
+          displayText,
+          model.id,
+          model.name,
+          JSON.stringify(userMessageMeta),
+          now,
+        )
     }
-    deps.db
-      .prepare(
-        `INSERT INTO chat_messages (id, company_id, session_id, user_id, role, text, model_id, model_name, meta_json, created_at)
-         VALUES (?, ?, ?, ?, 'user', ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        userMessageId,
-        actor.subject.companyId,
+    if (!existingUserMessage) {
+      publishChatEvent({
+        type: 'message',
+        companyId: actor.subject.companyId,
+        userId: actor.person.id,
         sessionId,
-        actor.person.id,
-        displayText,
-        model.id,
-        model.name,
-        JSON.stringify(userMessageMeta),
-        now,
-      )
-    publishChatEvent({
-      type: 'message',
-      companyId: actor.subject.companyId,
-      userId: actor.person.id,
-      sessionId,
-      message: {
-        id: userMessageId,
-        role: 'user',
-        text: displayText,
-        modelId: model.id,
-        modelName: model.name,
-        meta: userMessageMeta,
-        createdAt: new Date(now).toISOString(),
-      },
-    })
+        message: {
+          id: userMessageId,
+          role: 'user',
+          text: displayText,
+          modelId: model.id,
+          modelName: model.name,
+          meta: userMessageMeta,
+          createdAt: new Date(now).toISOString(),
+        },
+      })
+    }
 
     let agentText = ''
     let agentResult: AgentTurnResult | null = null
@@ -1136,11 +1263,24 @@ export async function handleDingTalkMessage(
         )
       }
     }
+    /** 只在工具状态变化时写一次进度，供进程重启后提示模型哪些工具已经执行过。 */
+    const noteTurnProgress = () => {
+      if (!trackTurn) return
+      setChannelTurnProgress(deps.db, assistantMessageId, {
+        tools: toolDetails.map((tool) => ({
+          name: tool.name,
+          toolId: tool.toolId,
+          status: tool.status,
+        })),
+        updatedAt: Date.now(),
+      })
+    }
     try {
       agentResult = await runAgentTurn({
         deps,
         actor,
         modelId: model.id,
+        turnId: agentTurnId,
         fallbackModelIds: available
           .filter((item) => item.id !== model.id && (imageUrls.length === 0 || modelSupportsVision(item.tags, item.capabilities)))
           .map((item) => item.id),
@@ -1162,6 +1302,7 @@ export async function handleDingTalkMessage(
           cardAttachments.splice(0, cardAttachments.length)
           thinkingDone = false
           pushCard()
+          noteTurnProgress()
         },
         messages,
         sessionId,
@@ -1193,6 +1334,7 @@ export async function handleDingTalkMessage(
             })
             pushCard()
             publishTool({ type: 'tool', id: event.id, name: event.name, toolId: event.toolId, args: event.args })
+            noteTurnProgress()
           } else if (event.type === 'tool_result') {
             const record = toolDetails.find((tool) => tool.id === event.id)
             if (record) {
@@ -1223,6 +1365,7 @@ export async function handleDingTalkMessage(
               summary: event.summary,
               durationMs: event.durationMs,
             })
+            noteTurnProgress()
           }
         },
       })
@@ -1283,15 +1426,49 @@ export async function handleDingTalkMessage(
                 sessionId,
                 question: clarify.question,
                 options: clarify.options,
+                kind: clarify.kind === 'multiple' || clarify.kind === 'text' ? clarify.kind : 'single',
+                placeholder: clarify.placeholder,
                 allowCustom: clarify.allowCustom,
                 flowId: clarifyFlowId,
                 step: clarifyStep,
                 messageId: assistantMessageId,
+                ...(clarify.questions && clarify.questions.length > 1
+                  ? {
+                      questions: clarify.questions.map((question) => ({
+                        id: question.id,
+                        question: question.question,
+                        options: question.options,
+                        kind: question.kind,
+                        placeholder: question.placeholder,
+                        allowCustom: question.allowCustom,
+                      })),
+                      answers: {},
+                      index: 0,
+                    }
+                  : {}),
               }
             : null,
         }
         if (await card.finish(finalState, clarifyCardAnswer)) {
           replyText = null
+          // 同一会话也可能在网页工作台继续作答；登记后网页提交会把这张卡切到已作答，
+          // 避免钉钉这边一直停在旧选项。只登记最近一张带澄清的卡。
+          const cardInstanceId = card.providerMessageIds[0] ?? ''
+          if (clarify && cardInstanceId) {
+            const cardStream = card
+            registerDingTalkClarifySync(sessionId, async (answer) => {
+              const answeredState: DingTalkRichCardState = {
+                answer: `✅ 已在网页工作台作答\n\n> ${String(answer ?? '').replace(/\n/g, '\n> ')}`,
+                reasoning: '',
+                tools: [],
+                thinkingDone: true,
+                toolDetails: [],
+                attachments: [],
+                clarify: null,
+              }
+              return cardStream.completeClarify(cardInstanceId, answeredState)
+            })
+          }
         } else {
           await card.fail('卡片已结束，完整回答见下一条消息。')
         }
@@ -1421,11 +1598,18 @@ export async function handleDingTalkMessage(
       .prepare('UPDATE channel_events SET result_json = ? WHERE provider = ? AND event_key = ?')
       .run(JSON.stringify({ sessionId, modelId: effectiveModel.id, durationMs: Date.now() - started }), 'dingtalk', eventKey)
 
+    if (trackedTurnId) finishChannelTurn(deps.db, trackedTurnId, 'completed')
     reactionOk = true
     return { handled: true, text: replyText, sessionId, reason: 'ok' }
   } catch (error) {
     if (card) await card.fail('处理失败，请稍后重试。').catch(() => undefined)
     if (legacyCard) await legacyCard.fail('处理失败，请稍后重试。').catch(() => undefined)
+    const message = error instanceof Error ? error.message : 'unknown'
+    if (trackedTurnId) finishChannelTurn(deps.db, trackedTurnId, 'failed', message)
+    // 事件结果也写上失败原因，控制台不会把它误认为「还在处理」。
+    deps.db
+      .prepare('UPDATE channel_events SET result_json = ? WHERE provider = ? AND event_key = ?')
+      .run(JSON.stringify({ sessionId, status: 'failed', error: message }), 'dingtalk', eventKey)
     appendAudit(deps.db, {
       companyId: actor.subject.companyId,
       actorUserId: actor.person.id,
@@ -1433,7 +1617,7 @@ export async function handleDingTalkMessage(
       resourceType: 'chat_session',
       resourceId: sessionId,
       result: 'failure',
-      detail: { channel: 'dingtalk', error: error instanceof Error ? error.message : 'unknown' },
+      detail: { channel: 'dingtalk', error: message },
       channel: 'dingtalk',
       ip: null,
     })
@@ -1442,6 +1626,193 @@ export async function handleDingTalkMessage(
     void reaction?.finish(reactionOk)
     releaseTurn(sessionId, turnToken)
   }
+}
+
+// ---------- 服务重启后的中断回合恢复 ----------
+
+const MAX_TURN_RECOVERY_ATTEMPTS = 3
+/** 超过 24 小时的旧回合不再重新调用模型，只把卡片收口，避免把很早以前的问题重新答一遍。 */
+const TURN_RECOVERY_MAX_AGE_MS = 24 * 60 * 60 * 1000
+
+function priorToolNames(turn: ChannelTurn): string[] {
+  const progress = turn.progress as { tools?: Array<{ name?: unknown }> } | null
+  if (!progress || !Array.isArray(progress.tools)) return []
+  return progress.tools
+    .map((tool) => String(tool?.name ?? '').trim())
+    .filter((name, index, all) => Boolean(name) && all.indexOf(name) === index)
+    .slice(0, 20)
+}
+
+/**
+ * 把一张没能恢复的旧卡收口成明确终态。
+ * 只复用已有 outTrackId，不新建卡片；否则用户会看到“旧的还在转圈 + 新的又发一条”。
+ */
+async function closeInterruptedCard(
+  deps: ServerDeps,
+  turn: ChannelTurn,
+  message: string,
+): Promise<void> {
+  const cardId = String(turn.cardInstanceId ?? '').trim()
+  if (!cardId) return
+  const cfg = dingTalkConfig(deps.db, deps.companyId)
+  if (!cfg?.app_id || cfg.status !== 'bound') return
+  const secret = cfg.secret_ref ? resolveSecret(deps.config.dbPath, cfg.secret_ref) : null
+  if (!secret) return
+  const robotCode = cfg.robot_code || cfg.app_id
+  const state: DingTalkRichCardState = {
+    answer: message,
+    reasoning: '服务重启导致这一轮中断。',
+    tools: [],
+    thinkingDone: true,
+    toolDetails: [],
+  }
+  try {
+    if (turn.cardKind === 'legacy') {
+      const card = new DingTalkCardStream(cfg.app_id, secret, turn.externalId, robotCode)
+      if (await card.resume(cardId, message)) {
+        await card.finish(renderDingTalkFinalCard(message, '', []), message)
+      }
+      return
+    }
+    const card = new DingTalkAICardStream(cfg.app_id, secret, turn.externalId, robotCode)
+    if (await card.resume(cardId, state)) {
+      await card.finish(state, message)
+    }
+  } catch (error) {
+    console.warn('[eab] 中断回合卡片收口失败：', (error as Error).message)
+  }
+}
+
+function markInterruptedEventFailed(deps: ServerDeps, turn: ChannelTurn, error: string): void {
+  deps.db
+    .prepare('UPDATE channel_events SET result_json = ? WHERE provider = ? AND event_key = ?')
+    .run(JSON.stringify({ sessionId: turn.sessionId, status: 'recovery-failed', error }), 'dingtalk', turn.eventKey)
+}
+
+/**
+ * 启动后扫描上次进程留下的 running/recovering 回合：
+ * - 复用原卡、原消息 id、原工具幂等键，重新跑同一轮；
+ * - 会话已删/超过 24h/重试超限的，只把卡片收口成“请重发”，不再自动重跑。
+ *
+ * 由 main.ts 在钉钉 Stream 启动后异步调用，不阻塞服务监听。
+ */
+export async function recoverInterruptedDingTalkTurns(
+  deps: ServerDeps,
+  runTurn: typeof handleDingTalkMessage = handleDingTalkMessage,
+): Promise<{ resumed: number; closed: number; failed: number }> {
+  const summary = { resumed: 0, closed: 0, failed: 0 }
+  // 先把升级前只留下 channel_events、没有 channel_turns 的旧中断事件补登，
+  // 这样它们和 0057 之后的新回合走同一条恢复路径。
+  try {
+    const adopted = adoptLegacyInterruptedTurns(deps.db, deps.companyId, {
+      sinceMs: 7 * TURN_RECOVERY_MAX_AGE_MS,
+      limit: 10,
+    })
+    if (adopted > 0) console.log(`[eab] 补登 ${adopted} 个升级前遗留的钉钉中断回合`)
+  } catch (error) {
+    console.warn('[eab] 补登旧钉钉中断回合失败：', (error as Error).message)
+  }
+  let turns: ChannelTurn[] = []
+  try {
+    turns = listRecoverableChannelTurns(deps.db, 'dingtalk', {
+      sinceMs: 7 * TURN_RECOVERY_MAX_AGE_MS,
+      limit: 10,
+    })
+  } catch (error) {
+    console.warn('[eab] 查询中断回合失败：', (error as Error).message)
+    return summary
+  }
+  if (turns.length === 0) return summary
+  console.log(`[eab] 发现 ${turns.length} 个重启前未完成的钉钉回合，开始恢复`)
+
+  for (const turn of turns) {
+    if (!claimChannelTurn(deps.db, turn.id, MAX_TURN_RECOVERY_ATTEMPTS)) {
+      const current = getChannelTurn(deps.db, turn.id)
+      if (current && current.status !== 'completed' && current.attempts >= MAX_TURN_RECOVERY_ATTEMPTS) {
+        markInterruptedEventFailed(deps, current, '恢复次数超过上限')
+        await closeInterruptedCard(deps, current, '服务重启导致这一轮多次恢复失败，请重新发送一次。')
+        finishChannelTurn(deps.db, current.id, 'failed', '恢复次数超过上限')
+        summary.closed += 1
+      }
+      // 否则是其它实例已经接手，当前实例不重复跑。
+      continue
+    }
+
+    const age = Date.now() - turn.startedAt
+    if (age > TURN_RECOVERY_MAX_AGE_MS) {
+      const message = '这一轮对话在服务重启前中断，已经超过自动恢复时限，请重新发送一次。'
+      markInterruptedEventFailed(deps, turn, '超过恢复时限')
+      await closeInterruptedCard(deps, turn, message)
+      finishChannelTurn(deps.db, turn.id, 'failed', '超过恢复时限')
+      summary.closed += 1
+      continue
+    }
+
+    const payload = turn.payload
+    if (!payload || typeof payload !== 'object') {
+      const message = '服务重启导致这一轮中断，请重新发送一次。'
+      markInterruptedEventFailed(deps, turn, '原始消息缺失')
+      await closeInterruptedCard(deps, turn, message)
+      finishChannelTurn(deps.db, turn.id, 'failed', '原始消息缺失')
+      summary.failed += 1
+      continue
+    }
+
+    const session = deps.db
+      .prepare('SELECT id FROM chat_sessions WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1')
+      .get(turn.sessionId, deps.companyId) as { id: string } | undefined
+    if (!session) {
+      const message = '服务重启导致这一轮中断，原会话已失效，请重新发送一次。'
+      markInterruptedEventFailed(deps, turn, '会话已失效')
+      await closeInterruptedCard(deps, turn, message)
+      finishChannelTurn(deps.db, turn.id, 'failed', '会话已失效')
+      summary.failed += 1
+      continue
+    }
+
+    const user = findActivePerson(deps.db, turn.userId)
+    if (!user) {
+      const message = '服务重启导致这一轮中断，原成员身份已失效，请重新发送一次。'
+      markInterruptedEventFailed(deps, turn, '成员已失效')
+      await closeInterruptedCard(deps, turn, message)
+      finishChannelTurn(deps.db, turn.id, 'failed', '成员已失效')
+      summary.failed += 1
+      continue
+    }
+
+    try {
+      console.log(`[eab] 恢复中断回合 ${turn.id}（第 ${turn.attempts + 1} 次，会话 ${turn.sessionId}）`)
+      const result = await runTurn(deps, payload as DingTalkMessage, {
+        dedupe: false,
+        sessionId: turn.sessionId,
+        resume: {
+          turnId: turn.id,
+          userMessageId: turn.userMessageId || '',
+          assistantMessageId: turn.assistantMessageId || turn.id,
+          cardInstanceId: turn.cardInstanceId,
+          cardKind: turn.cardKind,
+          agentTurnId: turn.agentTurnId,
+          priorTools: priorToolNames(turn),
+        },
+      })
+      if (!result.handled) {
+        throw new Error(result.text || result.reason || '恢复后未能继续回答')
+      }
+      summary.resumed += 1
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      console.warn(`[eab] 中断回合恢复失败 ${turn.id}：`, message)
+      finishChannelTurn(deps.db, turn.id, 'failed', message)
+      markInterruptedEventFailed(deps, turn, message)
+      await closeInterruptedCard(deps, turn, '服务重启导致这一轮回答中断，请重新发送一次。')
+      summary.failed += 1
+    }
+  }
+
+  console.log(
+    `[eab] 中断回合恢复完成：继续 ${summary.resumed} / 收口 ${summary.closed} / 失败 ${summary.failed}`,
+  )
+  return summary
 }
 
 // ---------- Stream 长连接（本地无公网地址时使用） ----------
@@ -1535,8 +1906,154 @@ function cardParamString(value: unknown, key: string, depth = 0): string {
   return ''
 }
 
-/**
- * 处理钉钉卡片按钮回调。回调本身必须在 2 秒内 ACK，所以这里只做身份/会话校验，
+/** A2UI 提交按钮的 context 可能是数组；优先取原始值，兼容包在 value 里的回传。 */
+function cardParamValue(value: unknown, key: string, depth = 0): unknown {
+  if (!value || depth > 5) return undefined
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = cardParamValue(item, key, depth + 1)
+      if (found !== undefined) return found
+    }
+    return undefined
+  }
+  if (typeof value !== 'object') return undefined
+  const object = value as Record<string, unknown>
+  if (key in object) {
+    const item = object[key]
+    if (item && typeof item === 'object' && !Array.isArray(item) && 'value' in (item as Record<string, unknown>)) {
+      return (item as Record<string, unknown>).value
+    }
+    return item
+  }
+  for (const item of Object.values(object)) {
+    if (item && typeof item === 'object') {
+      const found = cardParamValue(item, key, depth + 1)
+      if (found !== undefined) return found
+    }
+  }
+  return undefined
+}
+
+/** 多选值可能回传数组、JSON 字符串或顿号分隔文本；统一拆成 id/标签列表。 */
+function cardParamList(value: unknown, key: string): string[] {
+  const raw = cardParamValue(value, key)
+  let items: unknown[] = []
+  if (Array.isArray(raw)) items = raw
+  else if (typeof raw === 'string') {
+    const text = raw.trim()
+    if (text.startsWith('[')) {
+      try {
+        const parsed = JSON.parse(text) as unknown
+        if (Array.isArray(parsed)) items = parsed
+      } catch {
+        items = text.split(/[,，、]/)
+      }
+    } else {
+      items = text.split(/[,，、]/)
+    }
+  } else if (raw !== undefined && raw !== null) {
+    items = [raw]
+  }
+  return items
+    .map((item) => {
+      if (typeof item === 'string' || typeof item === 'number') return String(item).trim()
+      if (item && typeof item === 'object') {
+        const object = item as Record<string, unknown>
+        return String(object.value ?? object.id ?? object.label ?? '').trim()
+      }
+      return ''
+    })
+    .filter(Boolean)
+}
+
+/** 逐空输入值需要保留位置和空串，不能复用按顿号/逗号拆分的多选解析。 */
+function cardParamTextList(value: unknown, key: string): string[] {
+  const raw = cardParamValue(value, key)
+  let items: unknown[] = []
+  if (Array.isArray(raw)) items = raw
+  else if (typeof raw === 'string') {
+    const text = raw.trim()
+    if (text.startsWith('[')) {
+      try {
+        const parsed = JSON.parse(text) as unknown
+        if (Array.isArray(parsed)) items = parsed
+      } catch {
+        items = [text]
+      }
+    } else if (text) {
+      items = [text]
+    }
+  } else if (raw !== undefined && raw !== null) {
+    items = [raw]
+  }
+  return items
+    .slice(0, 8)
+    .map((item) => {
+      if (typeof item === 'string' || typeof item === 'number') return String(item).trim().slice(0, 200)
+      if (item && typeof item === 'object') {
+        const object = item as Record<string, unknown>
+        return String(object.value ?? object.text ?? object.label ?? '').trim().slice(0, 200)
+      }
+      return ''
+    })
+}
+
+/** 当前页回传的勾选/文本整理成草稿。 */
+function clarifyAnswerFor(
+  question: DingTalkClarifyQuestion,
+  selectedIds: string[],
+  answerInput: string,
+  blankInputs: string[] = [],
+): DingTalkClarifyAnswer {
+  const kind = question.kind === 'multiple' || question.kind === 'text' ? question.kind : 'single'
+  if (kind === 'text') {
+    const blanks = blankInputs.map((value) => String(value ?? '').trim().slice(0, 200))
+    return {
+      selected: [],
+      text: blanks.length > 0 ? blanks.join('、') : String(answerInput ?? '').trim().slice(0, 500),
+      ...(blanks.length > 0 ? { blanks } : {}),
+    }
+  }
+  return { selected: selectedIds.map((value) => String(value)), text: '' }
+}
+
+/** 把选项 id 还原成用户能读懂的标签；找不到时回退原始值。 */
+function clarifyAnswerLabel(question: DingTalkClarifyQuestion, answer: DingTalkClarifyAnswer): string {
+  const kind = question.kind === 'multiple' || question.kind === 'text' ? question.kind : 'single'
+  if (kind === 'text') {
+    const blanks = (answer.blanks ?? []).map((value) => String(value ?? '').trim()).filter(Boolean)
+    if (blanks.length > 0) return blanks.map((value, index) => `第${index + 1}空：${value}`).join('；')
+    return String(answer.text ?? '').trim()
+  }
+  const labels = (answer.selected ?? []).map((id) => {
+    const option = (question.options ?? []).find((item) => item.id === id || item.label === id)
+    return option?.label ?? id
+  })
+  return labels.filter(Boolean).join('、')
+}
+
+function clarifyAnswerEmpty(question: DingTalkClarifyQuestion, answer: DingTalkClarifyAnswer): boolean {
+  const kind = question.kind === 'multiple' || question.kind === 'text' ? question.kind : 'single'
+  if (kind !== 'text') return (answer.selected ?? []).length === 0
+  const blanks = answer.blanks ?? []
+  if (blanks.length > 0) return blanks.some((value) => !String(value ?? '').trim())
+  return !String(answer.text ?? '').trim()
+}
+
+/** 多题统一提交时合成一条完整答卷，模型只看到这一条 user 消息。 */
+function composeClarifyBatchText(
+  questions: DingTalkClarifyQuestion[],
+  answers: Record<string, DingTalkClarifyAnswer>,
+): string {
+  const lines = questions.map((question, index) => {
+    const answer = answers[String(index + 1)] ?? { selected: [], text: '' }
+    const value = clarifyAnswerLabel(question, answer) || '（未作答）'
+    return `第${index + 1}题（${question.question}）：${value}`
+  })
+  return `我完成了以下 ${questions.length} 道题：\n${lines.join('\n')}`
+}
+
+/** 处理钉钉卡片按钮回调。回调本身必须在 2 秒内 ACK，所以这里只做身份/会话校验，
  * 真正的模型回合由调用方的异步任务继续跑；同一张卡片只接受第一次选择。
  */
 export async function handleDingTalkCardCallback(
@@ -1560,33 +2077,220 @@ export async function handleDingTalkCardCallback(
   const params = content.params
   const registered = dingTalkClarifyCardState(outTrackId)
   let sessionId = cardParamString(params, 'sessionId') || registered?.sessionId || ''
+  const cardAction = cardParamString(params, 'action')
+  const batchQuestions = registered?.questions ?? []
+  const batchIndex = Math.min(
+    Math.max(0, Math.trunc(Number(registered?.index ?? 0) || 0)),
+    Math.max(0, batchQuestions.length - 1),
+  )
+  const batchCurrent = batchQuestions.length > 0 ? batchQuestions[batchIndex] : null
+  const registeredOptions = batchCurrent?.options ?? registered?.options ?? []
+  const registeredKind: 'single' | 'multiple' | 'text' =
+    batchCurrent?.kind === 'multiple' || batchCurrent?.kind === 'text'
+      ? batchCurrent.kind
+      : batchCurrent
+        ? 'single'
+        : registered?.kind === 'multiple' || registered?.kind === 'text'
+          ? registered.kind
+          : cardAction === 'clarify_multi'
+            ? 'multiple'
+            : cardAction === 'clarify_text'
+              ? 'text'
+              : 'single'
+  const selectedIds = cardParamList(params, 'selected')
+  const blankInputs = cardParamTextList(params, 'blanks')
+  const answerInput = (blankInputs.length > 0 ? blankInputs.join('、') : cardParamString(params, 'text')).trim().slice(0, 500)
   let optionId = cardParamString(params, 'optionId')
   let optionLabel = ''
-  if (!optionId) {
-    // 兼容只回传选项卡片/文案组件 ID 的情况：clarifyOptionCard0 对应 option-1。
-    const option = actionIds.find((id) => /^clarifyOption(?:Card|Body|Label)?[0-3]$/.test(id))
-    const index = option ? Number(option.match(/[0-3]$/)?.[0] ?? -1) : -1
-    if (index >= 0) optionId = `option-${index + 1}`
-  }
+
   if (registered && sessionId && sessionId !== registered.sessionId) {
     console.warn('[eab] 钉钉卡片回调：sessionId 与卡片登记不一致，已拒绝')
     return
   }
-  if (!sessionId || !optionId) {
-    console.warn('[eab] 钉钉卡片回调缺少 sessionId/optionId，已忽略')
+  if (!sessionId) {
+    console.warn('[eab] 钉钉卡片回调缺少 sessionId，已忽略')
     return
   }
-  if (registered && !registered.options.some((option) => option.id === optionId)) {
-    console.warn('[eab] 钉钉卡片回调：选项不属于当前卡片，已拒绝')
+
+  // 权限审批卡复用 clarify 的选项组件，但 sessionId 是 approval:<requestId>:<stepNo>；
+  // 必须在题组/模型分支前拦截，直接走审批状态机。
+  if (sessionId.startsWith('approval:')) {
+    const consumed = await handlePermissionApprovalCardCallback(deps, {
+      outTrackId,
+      externalUserId: externalId,
+      sessionId,
+      optionId,
+      actionIds,
+    })
+    if (consumed) return
+  }
+
+  // 题组翻页：保存当前页草稿、切换 index，只更新同一张卡；不写幂等事件、不调用模型。
+  if (cardAction === 'clarify_nav') {
+    const questions = registered?.questions ?? []
+    if (!registered || questions.length < 2) {
+      console.warn('[eab] 钉钉题组翻页：卡片没有题组登记，已忽略')
+      return
+    }
+    const userId = resolveDingTalkUser(deps.db, deps.companyId, externalId)
+    if (!userId) {
+      console.warn('[eab] 钉钉题组翻页：外部账号还没有绑定 EAB 成员')
+      return
+    }
+    const person = findActivePerson(deps.db, userId)
+    if (!person) {
+      console.warn('[eab] 钉钉题组翻页：EAB 成员不存在或已停用')
+      return
+    }
+    const actor = actorFor(deps.db, person)
+    if (!scopeAllows(actor.subject.scopes, SC.CHAT_USE) || !scopeAllows(actor.subject.scopes, SC.MODEL_USE)) {
+      console.warn('[eab] 钉钉题组翻页：当前成员没有对话或模型权限')
+      return
+    }
+    const session = deps.db
+      .prepare(
+        `SELECT id FROM chat_sessions
+          WHERE id = ? AND company_id = ? AND user_id = ? AND source = 'dingtalk'
+            AND external_id = ? AND deleted_at IS NULL
+          LIMIT 1`,
+      )
+      .get(sessionId, deps.companyId, userId, externalId) as { id: string } | undefined
+    if (!session) {
+      console.warn('[eab] 钉钉题组翻页：sessionId 不属于当前钉钉用户，已拒绝')
+      return
+    }
+    const current = Math.min(
+      Math.max(0, Math.trunc(Number(cardParamString(params, 'index') ?? registered.index ?? 0) || 0)),
+      questions.length - 1,
+    )
+    const direction = cardParamString(params, 'direction').toLowerCase()
+    const navOptionId = cardParamString(params, 'optionId')
+    const target =
+      direction === 'prev'
+        ? current - 1
+        : direction === 'next'
+          ? current + 1
+          : current
+    // pick：最后一题点选项只保存选中，不离开当前页；其余方向必须真的换页。
+    if (target < 0 || target >= questions.length || (target === current && direction !== 'pick')) return
+    const draftSelected = navOptionId ? [navOptionId] : selectedIds
+    const draft = clarifyAnswerFor(questions[current], draftSelected, answerInput, blankInputs)
+    // 先存当前页草稿，再切到目标页；返回上一题时能把刚答的内容回填。
+    updateDingTalkClarifyDraft(outTrackId, current, draft)
+    const next = updateDingTalkClarifyIndex(outTrackId, target)
+    if (!next) return
+    const cfg = dingTalkConfig(deps.db, deps.companyId)
+    const channelSecret = cfg?.secret_ref ? resolveSecret(deps.config.dbPath, cfg.secret_ref) : null
+    if (!cfg?.app_id || !channelSecret) return
+    const stream = new DingTalkAICardStream(
+      cfg.app_id,
+      channelSecret,
+      externalId,
+      cfg.robot_code || cfg.app_id,
+    )
+    const updated = await stream.updateClarify(outTrackId, {
+      answer: '',
+      reasoning: '',
+      tools: [],
+      thinkingDone: true,
+      toolDetails: [],
+      clarify: next,
+    })
+    if (!updated) console.warn('[eab] 钉钉题组翻页：更新原卡失败')
     return
   }
-  // 优先用服务端登记的选项文案，避免只信任客户端回传的 context。
-  optionLabel =
-    registered?.options.find((option) => option.id === optionId)?.label
-    || cardParamString(params, 'optionLabel')
-  if (!optionLabel) {
-    const index = Number(optionId.replace(/^option-/, ''))
-    optionLabel = Number.isFinite(index) && index > 0 ? `第 ${index} 个方向` : '用户选择的方向'
+
+  if (registeredKind === 'single') {
+    // 题组单选在最后一页先点选项、再点“提交全部”；提交按钮本身不带 optionId，
+    // 从当前页选中值或已存草稿里取回，避免被单题校验挡掉。
+    if (!optionId && batchCurrent) {
+      optionId =
+        selectedIds[0]
+        || registered?.answers?.[String(batchIndex + 1)]?.selected?.[0]
+        || ''
+    }
+    if (!optionId) {
+      // 兼容只回传选项卡片/文案组件 ID 的情况：clarifyOptionCard0 对应 option-1。
+      const option = actionIds.find((id) => /^clarifyOption(?:Card|Body|Label)?[0-3]$/.test(id))
+      const index = option ? Number(option.match(/[0-3]$/)?.[0] ?? -1) : -1
+      if (index >= 0) optionId = `option-${index + 1}`
+    }
+    if (!optionId) {
+      console.warn('[eab] 钉钉卡片回调缺少 sessionId/optionId，已忽略')
+      return
+    }
+    if (registered && !registeredOptions.some((option) => option.id === optionId)) {
+      console.warn('[eab] 钉钉卡片回调：选项不属于当前卡片，已拒绝')
+      return
+    }
+    // 优先用服务端登记的选项文案，避免只信任客户端回传的 context。
+    optionLabel =
+      registeredOptions.find((option) => option.id === optionId)?.label
+      || cardParamString(params, 'optionLabel')
+    if (!optionLabel) {
+      const index = Number(optionId.replace(/^option-/, ''))
+      optionLabel = Number.isFinite(index) && index > 0 ? `第 ${index} 个方向` : '用户选择的方向'
+    }
+  } else if (registeredKind === 'multiple') {
+    if (selectedIds.length === 0) {
+      console.warn('[eab] 钉钉卡片回调：多选提交为空，已忽略')
+      return
+    }
+    const matched = selectedIds.map((id) => {
+      const option = registeredOptions.find((item) => item.id === id || item.label === id)
+      return option || { id, label: id }
+    })
+    optionLabel = matched.map((option) => option.label).join('、')
+  } else if (registeredKind === 'text') {
+    if (blankInputs.length > 0 && blankInputs.some((value) => !value.trim())) {
+      console.warn('[eab] 钉钉卡片回调：填空题还有空位未填写，已忽略')
+      return
+    }
+    if (!answerInput) {
+      console.warn('[eab] 钉钉卡片回调：填空提交为空，已忽略')
+      return
+    }
+    optionLabel = blankInputs.length > 0
+      ? blankInputs.map((value, index) => `第${index + 1}空：${value}`).join('；')
+      : answerInput
+  }
+  if (registered && registeredKind !== 'single' && cardAction && cardAction !== 'clarify_multi' && cardAction !== 'clarify_text') {
+    console.warn('[eab] 钉钉卡片回调：未知的提交动作，已拒绝')
+    return
+  }
+
+  const isBatch = Boolean(registered && batchQuestions.length > 1 && batchCurrent)
+  let batchAnswers: Record<string, DingTalkClarifyAnswer> = registered?.answers ?? {}
+  let answerText = registeredKind === 'text'
+    ? `我的答案是「${optionLabel.slice(0, 200)}」。`
+    : `我选择了「${optionLabel.slice(0, 200)}」。`
+
+  if (isBatch && batchCurrent) {
+    let draft = clarifyAnswerFor(batchCurrent, selectedIds, answerInput, blankInputs)
+    const existing = batchAnswers[String(batchIndex + 1)]
+    // 单选选项在上一次点击时已经存进草稿；提交按钮可能不再回传选中值，沿用已有答案。
+    if (clarifyAnswerEmpty(batchCurrent, draft) && existing && !clarifyAnswerEmpty(batchCurrent, existing)) {
+      draft = existing
+    }
+    if (clarifyAnswerEmpty(batchCurrent, draft)) {
+      console.warn('[eab] 钉钉题组提交：当前题还没有作答，已忽略')
+      return
+    }
+    const updated = updateDingTalkClarifyDraft(outTrackId, batchIndex, draft)
+    batchAnswers = updated?.answers ?? { ...batchAnswers, [String(batchIndex + 1)]: draft }
+    const missing = batchQuestions.findIndex((question, index) => {
+      const answer = batchAnswers[String(index + 1)]
+      return !answer || clarifyAnswerEmpty(question, answer)
+    })
+    if (missing >= 0) {
+      console.warn(`[eab] 钉钉题组提交：第 ${missing + 1} 题还没有作答，已忽略`)
+      return
+    }
+    optionLabel = batchQuestions
+      .map((question, index) => clarifyAnswerLabel(question, batchAnswers[String(index + 1)] ?? { selected: [], text: '' }))
+      .filter(Boolean)
+      .join('；')
+    answerText = composeClarifyBatchText(batchQuestions, batchAnswers)
   }
 
   const userId = resolveDingTalkUser(deps.db, deps.companyId, externalId)
@@ -1660,7 +2364,7 @@ export async function handleDingTalkCardCallback(
       }
     }
   }
-  if (fallbackOptions.length > 0) {
+  if (fallbackOptions.length > 0 && registeredKind === 'single') {
     const option = fallbackOptions.find((item) => item.id === optionId)
     if (!option) {
       console.warn('[eab] 钉钉卡片回调：选项不属于这条澄清消息，已拒绝')
@@ -1671,9 +2375,18 @@ export async function handleDingTalkCardCallback(
   if (!questionStep) questionStep = 1
   if (!flowId && assistantMessageId) flowId = `cf_${assistantMessageId}`
 
-  const cardQuestionStep = Math.max(1, Math.trunc(questionStep))
-  // 同一张卡片会承载多页澄清；幂等键必须带上当前页，否则第二页按钮会被整卡幂等挡住。
-  const cardEventKey = `card:${outTrackId}:${externalId}:${cardQuestionStep}:${optionId}`
+  const clarifyNextStep = isBatch
+    ? batchQuestions.length + 1
+    : Math.max(1, Math.trunc(questionStep)) + 1
+  const cardQuestionStep = isBatch ? clarifyNextStep : Math.max(1, Math.trunc(questionStep))
+  // 同一张卡片会承载多页澄清；幂等键必须带上当前页和实际提交值，
+  // 否则第二页按钮、或多选题里不同选择会被整卡幂等挡住。
+  const answerKey = isBatch
+    ? `batch:${batchQuestions.length}:${optionLabel}`
+    : registeredKind === 'single'
+      ? optionId
+      : `${registeredKind}:${optionLabel}`
+  const cardEventKey = `card:${outTrackId}:${externalId}:${cardQuestionStep}:${answerKey.slice(0, 120)}`
   const inserted = deps.db
     .prepare(
       `INSERT INTO channel_events (id, company_id, provider, event_key, sender_id, received_at)
@@ -1695,7 +2408,9 @@ export async function handleDingTalkCardCallback(
     )
     const resumed = await stream.resume(outTrackId, {
       answer: '',
-      reasoning: `已收到你的选择「${optionLabel.slice(0, 40)}」，正在继续…`,
+      reasoning: isBatch
+        ? `已收到全部 ${batchQuestions.length} 道题的答案，正在统一判分…`
+        : `已收到你的${registeredKind === 'text' ? '答案' : '选择'}「${optionLabel.slice(0, 40)}」，正在继续…`,
       tools: [],
       thinkingDone: false,
       toolDetails: [],
@@ -1710,13 +2425,13 @@ export async function handleDingTalkCardCallback(
 
   const synthetic: DingTalkMessage = {
     msgtype: 'text',
-    text: { content: `我选择了「${optionLabel.slice(0, 80)}」。` },
+    text: { content: answerText },
     senderStaffId: externalId,
     senderId: externalId,
     senderNick: person.name,
     robotCode: cfg?.robot_code ?? cfg?.app_id ?? undefined,
     conversationType: '1',
-    msgId: `card_${outTrackId}_${optionId}`,
+    msgId: `card_${outTrackId}_${answerKey.slice(0, 60)}`,
     createAt: Date.now(),
   }
   let result: Awaited<ReturnType<typeof handleDingTalkMessage>>
@@ -1728,14 +2443,14 @@ export async function handleDingTalkCardCallback(
       clarifyFlow: assistantMessageId
         ? {
             flowId: flowId || `cf_${assistantMessageId}`,
-            step: cardQuestionStep + 1,
+            step: clarifyNextStep,
             assistantMessageId,
             // 原卡续用失败时也不新建卡片，避免真机出现第二条机器人消息。
             suppressNewCard: true,
           }
         : {
             flowId: flowId || `cf_card_${outTrackId}`,
-            step: cardQuestionStep + 1,
+            step: clarifyNextStep,
             suppressNewCard: true,
           },
     })

@@ -25,6 +25,8 @@ import { resolveOrgSyncIntervalMs, syncChannelOrg, type ChannelProvider } from '
 import { dispatchPluginRpc } from '../plugin-host.js'
 import { hitRate } from '../backends/coordination.js'
 import { bumpHotVersion } from '../hot-cache.js'
+import { isPermissionAdminRole } from '../permission-approvals.js'
+import { publishChatEvent } from '../chat-events.js'
 import { listPluginChannels, listAllPluginModels, listPluginModels } from '../plugin-models.js'
 import { invalidatePluginToolSpecsEverywhere, pluginToolCatalogFor } from '../plugin-tools.js'
 import {
@@ -72,6 +74,12 @@ import {
   setAdminPassword,
   verifyAdminCredentials,
 } from '../console-auth.js'
+
+/** 模型目录变更：清掉原始目录缓存，并把“目录已变化”推给同公司的网页工作台。 */
+async function modelCatalogChanged(companyId: string): Promise<void> {
+  await bumpHotVersion('models')
+  publishChatEvent({ type: 'models', companyId, revision: Date.now() })
+}
 
 const PROVIDER_KINDS = [
   { kind: 'openai', label: 'OpenAI', defaultBaseUrl: 'https://api.openai.com/v1', protocol: 'openai' },
@@ -390,7 +398,7 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
     const companyId = companyOf(req, deps)
     const rows = deps.db
       .prepare(
-        `SELECT r.id, r.code, r.name, r.data_scope, r.builtin,
+        `SELECT r.id, r.code, r.name, r.data_scope, r.builtin, r.requestable,
                 (SELECT COUNT(*) FROM user_roles ur WHERE ur.role_id = r.id) AS members
            FROM roles r
           WHERE r.company_id = ? AND r.deleted_at IS NULL
@@ -419,6 +427,9 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
       list.push(row.scope)
       scopesByRole.set(row.role_id, list)
     }
+    const roleRequestableOf = new Set(
+      rows.filter((row) => Number((row as { requestable?: number }).requestable) === 1).map((row) => row.id),
+    )
 
     const roleQuotaRows = deps.db
       .prepare(
@@ -447,11 +458,155 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
         name: row.name,
         dataScope: row.data_scope,
         builtin: row.builtin === 1,
+        requestable: roleRequestableOf.has(row.id),
         members: Number(row.members),
         scopes: (scopesByRole.get(row.id) ?? []).sort(),
         quota: quotasByRole.get(row.code) ?? null,
       })),
     })
+  })
+
+  /* ---------------- 权限审批策略 ---------------- */
+
+  app.get('/api/console/permission-policies', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const policyRows = deps.db
+      .prepare(
+        `SELECT id, target_type, target_key, max_levels, include_company_admin,
+                timeout_hours, approver_strategy, fixed_approvers_json, updated_at
+           FROM permission_approval_policies
+          WHERE company_id = ?
+          ORDER BY target_type, target_key`,
+      )
+      .all(companyId) as unknown as Array<{
+      id: string
+      target_type: string
+      target_key: string
+      max_levels: number
+      include_company_admin: number
+      timeout_hours: number
+      approver_strategy: string
+      fixed_approvers_json: string | null
+      updated_at: number
+    }>
+    const roleRows = deps.db
+      .prepare(
+        `SELECT code, name, requestable, builtin FROM roles
+          WHERE company_id = ? AND deleted_at IS NULL
+          ORDER BY builtin DESC, code ASC`,
+      )
+      .all(companyId) as unknown as Array<{ code: string; name: string; requestable: number; builtin: number }>
+    const registry = SCOPE_REGISTRY as unknown as Record<string, { group?: string; label?: string }>
+    return ok({
+      policies: policyRows.map((row) => ({
+        id: row.id,
+        targetType: row.target_type,
+        targetKey: row.target_key,
+        maxLevels: Number(row.max_levels),
+        includeCompanyAdmin: Number(row.include_company_admin) === 1,
+        timeoutHours: Number(row.timeout_hours),
+        approverStrategy: row.approver_strategy,
+        fixedApprovers: row.fixed_approvers_json ? JSON.parse(row.fixed_approvers_json) : [],
+        updatedAt: Number(row.updated_at),
+      })),
+      roles: roleRows.map((row) => ({
+        code: row.code,
+        name: row.name,
+        requestable: Number(row.requestable) === 1,
+        builtin: Number(row.builtin) === 1,
+        management: isPermissionAdminRole(row.code),
+      })),
+      scopes: ALL_SCOPES.map((scope) => ({
+        scope,
+        group: registry[scope]?.group ?? '',
+        label: registry[scope]?.label ?? scope,
+      })),
+    })
+  })
+
+  app.post<{
+    Body: {
+      targetType?: string
+      targetKey?: string
+      maxLevels?: number
+      includeCompanyAdmin?: boolean
+      timeoutHours?: number
+      approverStrategy?: string
+      fixedApprovers?: string[]
+    }
+  }>('/api/console/permission-policies', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const targetType = String(req.body?.targetType ?? '').trim()
+    const targetKey = String(req.body?.targetKey ?? '').trim()
+    if (targetType !== 'scope' && targetType !== 'role') {
+      throw new EabError(EC.VALIDATION, 'targetType 只能是 scope / role')
+    }
+    if (!targetKey) throw new EabError(EC.VALIDATION, 'targetKey 不能为空')
+    if (targetType === 'scope' && !isKnownScope(targetKey)) {
+      throw new EabError(EC.VALIDATION, `未登记的权限点：${targetKey}`)
+    }
+    if (targetType === 'role') {
+      const role = deps.db
+        .prepare(`SELECT id FROM roles WHERE company_id = ? AND code = ? AND deleted_at IS NULL LIMIT 1`)
+        .get(companyId, targetKey)
+      if (!role) throw new EabError(EC.NOT_FOUND, '角色不存在')
+    }
+    const maxLevels = Math.min(10, Math.max(1, Math.trunc(Number(req.body?.maxLevels ?? 3) || 3)))
+    const timeoutHours = Math.min(720, Math.max(1, Math.trunc(Number(req.body?.timeoutHours ?? 72) || 72)))
+    const approverStrategy = req.body?.approverStrategy === 'fixed_users' ? 'fixed_users' : 'dept_chain'
+    const fixedApprovers = (req.body?.fixedApprovers ?? []).map((id) => String(id).trim()).filter(Boolean).slice(0, 50)
+    if (approverStrategy === 'fixed_users' && fixedApprovers.length === 0) {
+      throw new EabError(EC.VALIDATION, 'fixed_users 策略必须提供固定审批人')
+    }
+    const includeCompanyAdmin = req.body?.includeCompanyAdmin === true
+    const now = Date.now()
+    deps.db
+      .prepare(
+        `INSERT INTO permission_approval_policies
+           (id, company_id, target_type, target_key, max_levels, include_company_admin,
+            timeout_hours, approver_strategy, fixed_approvers_json, created_by, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(company_id, target_type, target_key) DO UPDATE SET
+           max_levels = excluded.max_levels,
+           include_company_admin = excluded.include_company_admin,
+           timeout_hours = excluded.timeout_hours,
+           approver_strategy = excluded.approver_strategy,
+           fixed_approvers_json = excluded.fixed_approvers_json,
+           created_by = excluded.created_by,
+           updated_at = excluded.updated_at`,
+      )
+      .run(
+        `pap_${randomUUID().replace(/-/g, '')}`,
+        companyId,
+        targetType,
+        targetKey,
+        maxLevels,
+        includeCompanyAdmin ? 1 : 0,
+        timeoutHours,
+        approverStrategy,
+        approverStrategy === 'fixed_users' ? JSON.stringify(fixedApprovers) : null,
+        'console',
+        now,
+        now,
+      )
+    return ok({ saved: true, targetType, targetKey })
+  })
+
+  app.post<{
+    Params: { code: string }
+    Body: { requestable?: boolean }
+  }>('/api/console/permission-policies/roles/:code/requestable', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const role = deps.db
+      .prepare(`SELECT id, code FROM roles WHERE company_id = ? AND code = ? AND deleted_at IS NULL LIMIT 1`)
+      .get(companyId, req.params.code) as { id: string; code: string } | undefined
+    if (!role) throw new EabError(EC.NOT_FOUND, '角色不存在')
+    const requestable = req.body?.requestable === true
+    deps.db.prepare(`UPDATE roles SET requestable = ? WHERE id = ?`).run(requestable ? 1 : 0, role.id)
+    return ok({ code: role.code, requestable })
   })
 
   /* ---------------- 工具角色可用性 ---------------- */
@@ -1993,6 +2148,7 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
     deps.db
       .prepare('UPDATE model_providers SET kind = ?, name = ?, base_url = ?, api_key_env = ?, status = ?, updated_at = ? WHERE id = ?')
       .run(kind, name, baseUrl || null, apiKeyEnv || null, status, Date.now(), id)
+    await modelCatalogChanged(companyId)
     return ok({ provider: { id, kind, name, baseUrl: baseUrl || null, apiKeyEnv: apiKeyEnv || null, status } })
   })
 
@@ -2399,6 +2555,8 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
       channel: 'console',
     })
 
+    if (added.length > 0 || promotedFromDemo) await modelCatalogChanged(companyId)
+
     return ok({
       providerId: row.id,
       added,
@@ -2639,7 +2797,7 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
         now,
         now,
       )
-    await bumpHotVersion('models')
+    await modelCatalogChanged(companyId)
     return ok({
       model: {
         id,
@@ -2821,7 +2979,7 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
         Date.now(),
         id,
       )
-    await bumpHotVersion('models')
+    await modelCatalogChanged(companyId)
     return ok({
       model: {
         id,
@@ -2864,7 +3022,7 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
         if (unknown.length > 0) throw new EabError(EC.VALIDATION, `未知角色：${unknown.join('、')}`)
       }
       savePluginModelRoles(deps.db, companyId, id, roles)
-      await bumpHotVersion('models')
+      await modelCatalogChanged(companyId)
       return ok({ model: { id, roles } })
     },
   )
@@ -2878,7 +3036,7 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
       .get(id, companyId)
     if (!row) throw new EabError(EC.NOT_FOUND, '模型不存在')
     deps.db.prepare('UPDATE models SET deleted_at = ?, updated_at = ? WHERE id = ?').run(Date.now(), Date.now(), id)
-    await bumpHotVersion('models')
+    await modelCatalogChanged(companyId)
     return ok({ deleted: true })
   })
 

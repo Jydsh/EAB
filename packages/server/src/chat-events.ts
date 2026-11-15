@@ -54,7 +54,14 @@ export interface ChatLiveToolEvent {
   tool: ChatLiveToolEventPayload
 }
 
-export type ChatLiveEventPayload = ChatLiveEvent | ChatLiveDeltaEvent | ChatLiveToolEvent
+export type ChatLiveEventPayload = ChatLiveEvent | ChatLiveDeltaEvent | ChatLiveToolEvent | ChatModelsChangedEvent
+
+/** 管理后台模型目录发生变化：通知同一公司已打开的网页重新拉取目录。 */
+export interface ChatModelsChangedEvent {
+  type: 'models'
+  companyId: string
+  revision: number
+}
 
 type ChatEventListener = (event: ChatLiveEventPayload) => void
 
@@ -91,7 +98,13 @@ export function initChatEventBridge(pubsub: PubSubBackend | null): void {
     .subscribe(BRIDGE_CHANNEL, (payload) => {
       try {
         const event = JSON.parse(payload) as ChatLiveEventPayload
-        if (event && (event.type === 'message' || event.type === 'delta' || event.type === 'tool')) {
+        if (
+          event &&
+          (event.type === 'message' ||
+            event.type === 'delta' ||
+            event.type === 'tool' ||
+            event.type === 'models')
+        ) {
           deliverLocal(event)
         }
       } catch {

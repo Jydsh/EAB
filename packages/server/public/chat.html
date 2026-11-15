@@ -1,18 +1,93 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" style="background:#04110d">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>EAB 工作台</title>
-    <link rel="stylesheet" href="/app.css?v=20261113u" />
-    <link rel="stylesheet" href="/chat.css?v=20261113v" />
+    <style>
+      /* 首帧兜底：只保留启动层最必要的绘制规则，详细视觉仍由 boot-splash.css 接管。 */
+      html { background: #04110d; }
+      html.eab-booting,
+      html.eab-booting body { background: #04110d; overflow: hidden; }
+      .eab-boot {
+        position: fixed;
+        inset: 0;
+        z-index: 2147483000;
+        display: grid;
+        place-items: center;
+        overflow: hidden;
+        background: #04110d;
+        color: #e8f6f0;
+      }
+      .eab-boot[hidden] { display: none; }
+    </style>
+    <script src="/theme.js?v=20261115b"></script>
+    <script src="/brand.js?v=20261115c" defer></script>
+    <link rel="stylesheet" href="/app.css?v=20261115e" />
+    <link rel="stylesheet" href="/chat.css?v=20261115s" />
+    <link rel="stylesheet" href="/theme.css?v=20261115b" />
+    <link rel="stylesheet" href="/boot-splash.css?v=20261115i" />
   </head>
   <body class="chat-body">
+    <script src="/boot/config.js?surface=chat" defer></script>
+    <div class="eab-boot" id="eab-boot" hidden aria-hidden="true" aria-live="polite">
+      <div class="eab-boot-atmosphere" aria-hidden="true">
+        <span class="eab-boot-glow"></span>
+        <span class="eab-boot-grid"></span>
+        <span class="eab-boot-sweep"></span>
+        <span class="eab-boot-grain"></span>
+      </div>
+      <video class="eab-boot-video" id="eab-boot-video" muted playsinline preload="metadata" hidden></video>
+      <div class="eab-boot-code" id="eab-boot-code" aria-hidden="true">
+        <div class="eab-boot-mark">
+          <span class="eab-boot-square s1"></span>
+          <span class="eab-boot-square s2"></span>
+          <span class="eab-boot-square s3"></span>
+          <span class="eab-boot-square s4"></span>
+        </div>
+        <div class="eab-boot-word" id="eab-boot-title">EAB</div>
+        <div class="eab-boot-sub" id="eab-boot-subtitle">企业智能体基座</div>
+      </div>
+      <div class="eab-boot-film-copy" aria-hidden="true">
+        <strong id="eab-boot-film-title">EAB</strong>
+        <span id="eab-boot-film-subtitle">企业智能体基座</span>
+      </div>
+      <div class="eab-boot-ui">
+        <span class="eab-boot-ring" aria-hidden="true"></span>
+        <span class="eab-boot-status" id="eab-boot-status">正在验证登录状态…</span>
+      </div>
+      <div class="eab-boot-actions">
+        <button class="eab-boot-sound" id="eab-boot-sound" type="button" hidden>开启声音</button>
+        <button class="eab-boot-skip" id="eab-boot-skip" type="button" hidden>跳过</button>
+      </div>
+      <button class="eab-boot-play" id="eab-boot-play" type="button" hidden>点击播放片头</button>
+    </div>
+    <script>
+      (function () {
+        // 启动层必须先于配置请求出现：配置即使失败或很慢，也不能先露出白底。
+        var overlay = document.getElementById('eab-boot')
+        if (overlay) {
+          overlay.hidden = false
+          overlay.setAttribute('aria-hidden', 'false')
+          document.documentElement.classList.add('eab-booting')
+          document.documentElement.style.background = '#04110d'
+        }
+        setTimeout(function () {
+          if (!window.EABBoot && overlay) {
+            overlay.hidden = true
+            overlay.setAttribute('aria-hidden', 'true')
+            document.documentElement.classList.remove('eab-booting')
+            document.documentElement.style.background = 'transparent'
+          }
+        }, 2500)
+      })()
+    </script>
+
     <!-- 左侧：账号与可用模型。桌面网页对话产品的常规布局，右侧只放对话。 -->
     <aside class="chat-side" id="chat-side">
       <div class="side-brand">
-        <span class="logo">EAB</span>
-        <span class="side-brand-text">企业AI智能体基座</span>
+        <span class="logo" data-brand-logo>EAB</span>
+        <span class="side-brand-text" data-brand-name>企业AI智能体基座</span>
       </div>
 
       <div class="side-user" id="side-user" hidden>
@@ -95,6 +170,32 @@
         </div>
         <div class="chat-head-title" id="chat-title">新对话</div>
         <div class="chat-head-right">
+          <button class="perm-entry" id="perm-entry" type="button" aria-haspopup="dialog" aria-controls="workbench-rail" title="打开权限审批">
+            <span>权限</span>
+            <span class="perm-entry-count" id="perm-entry-count" hidden>0</span>
+          </button>
+          <button class="theme-toggle" type="button" data-theme-toggle role="switch" aria-checked="false" aria-label="切换到深色主题" title="切换深浅色主题">
+            <span class="theme-toggle-track">
+              <span class="theme-toggle-knob" aria-hidden="true">
+                <svg class="theme-icon sun" viewBox="0 0 16 16" shape-rendering="crispEdges" fill="currentColor">
+                  <rect x="7" y="0" width="2" height="3" />
+                  <rect x="7" y="13" width="2" height="3" />
+                  <rect x="0" y="7" width="3" height="2" />
+                  <rect x="13" y="7" width="3" height="2" />
+                  <rect x="2" y="2" width="2" height="2" />
+                  <rect x="12" y="2" width="2" height="2" />
+                  <rect x="2" y="12" width="2" height="2" />
+                  <rect x="12" y="12" width="2" height="2" />
+                  <rect x="5" y="5" width="6" height="1" />
+                  <rect x="4" y="6" width="8" height="4" />
+                  <rect x="5" y="10" width="6" height="1" />
+                </svg>
+                <svg class="theme-icon moon" viewBox="0 0 16 16" fill="currentColor">
+                  <path d="M13.6 8.6A5.6 5.6 0 1 1 7.4 3 4.4 4.4 0 0 0 6.6 6.4 4.4 4.4 0 0 0 13.6 8.6Z" />
+                </svg>
+              </span>
+            </span>
+          </button>
           <span class="chat-demo-pill" id="demo-pill" hidden>演示回声</span>
           <button class="btn ghost sm" id="login-btn" type="button" hidden>登录</button>
         </div>
@@ -105,7 +206,7 @@
       <main class="chat-main">
         <section class="chat-thread" id="thread">
           <div class="chat-empty" id="chat-empty">
-            <div class="chat-empty-logo">EAB</div>
+            <div class="chat-empty-logo" data-brand-logo>EAB</div>
             <h2 id="empty-title">你好</h2>
             <p class="muted" id="empty-sub">问点什么开始。你的身份、能用的模型都由组织与权限决定。</p>
             <div class="chat-suggest" id="suggest"></div>
@@ -120,7 +221,11 @@
               Agent 团队 <span class="workbench-tab-count" id="workbench-team-count" hidden>0</span>
             </button>
             <button class="workbench-tab" type="button" role="tab" data-workbench-tab="file" aria-selected="false">文件预览</button>
+            <button class="workbench-tab" type="button" role="tab" data-workbench-tab="perm" aria-selected="false">
+              权限审批 <span class="workbench-tab-count" id="workbench-perm-count" hidden>0</span>
+            </button>
             <button class="workbench-tab workbench-split-btn" type="button" id="workbench-split" title="团队与文件并排显示" aria-pressed="false">并排</button>
+            <button class="workbench-collapse" type="button" id="workbench-collapse" title="收起右侧工作台" aria-label="收起右侧工作台" aria-controls="workbench-rail" aria-expanded="true">收起</button>
           </div>
 
           <div class="workbench-body" id="workbench-body">
@@ -152,6 +257,9 @@
               <div class="file-pane-meta muted" id="file-pane-meta"></div>
             </div>
             <div class="file-pane-actions">
+              <button class="btn ghost sm" id="file-pane-versions" type="button" hidden>历史版本</button>
+              <button class="btn ghost sm" id="file-pane-export" type="button" hidden>导出 PDF</button>
+              <button class="btn ghost sm" id="file-pane-gui" type="button" hidden>GUI 兜底</button>
               <button class="btn ghost sm" id="file-pane-download" type="button">下载</button>
               <button class="btn ghost sm file-pane-fullscreen" id="file-pane-fullscreen" type="button" title="全屏预览" aria-label="全屏预览" aria-pressed="false">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M21 16v5h-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
@@ -172,14 +280,41 @@
           <button class="file-selection-action" id="file-selection-action" type="button" hidden>引用选中内容并修改</button>
           <div class="file-pane-editor" id="file-pane-editor" hidden>
             <textarea id="file-pane-text" spellcheck="false" aria-label="编辑文件内容"></textarea>
+            <div class="file-pane-diff" id="file-pane-diff" hidden></div>
             <div class="file-pane-editor-actions">
               <span class="hint" id="file-pane-editor-hint"></span>
+              <button class="btn ghost sm" id="file-pane-diff-toggle" type="button" aria-controls="file-pane-diff" aria-pressed="false" hidden>查看差异</button>
               <button class="btn ghost" id="file-pane-cancel" type="button">取消</button>
               <button class="btn primary" id="file-pane-save" type="button">保存</button>
             </div>
           </div>
         </section>
+
+        <section class="perm-pane" id="perm-pane" hidden aria-label="权限审批">
+          <div class="perm-pane-head">
+            <div class="perm-pane-head-main">
+              <span class="perm-pane-kicker">PERMISSION APPROVAL</span>
+              <h2>权限审批</h2>
+              <p class="perm-pane-sub">本人申请角色，按权限范围走多级审批；最后一级同意后立即授权，到期自动失效。</p>
+            </div>
+            <button class="icon-btn perm-pane-x" id="perm-pane-close" type="button" title="关闭权限审批" aria-label="关闭权限审批">×</button>
           </div>
+          <div class="perm-switch" id="perm-switch" role="tablist" aria-label="权限审批视图">
+            <button class="perm-switch-btn is-active" type="button" role="tab" data-perm-view="apply" aria-selected="true">申请权限</button>
+            <button class="perm-switch-btn" type="button" role="tab" data-perm-view="mine" aria-selected="false">我的申请</button>
+            <button class="perm-switch-btn" type="button" role="tab" data-perm-view="todo" aria-selected="false">
+              待我审批 <span class="perm-switch-count" id="perm-todo-count" hidden>0</span>
+            </button>
+          </div>
+          <div class="perm-body" id="perm-body" aria-live="polite">
+            <div class="perm-loading muted">正在读取权限审批…</div>
+          </div>
+        </section>
+          </div>
+          <button class="workbench-restore" id="workbench-restore" type="button" hidden aria-controls="workbench-rail" aria-expanded="false" title="展开右侧工作台">
+            <span class="workbench-restore-label" id="workbench-restore-label">工作台</span>
+            <span class="workbench-restore-count" id="workbench-restore-count" hidden>0</span>
+          </button>
         </div>
 
         <section class="workspace-pane" id="workspace-pane" hidden>
@@ -221,6 +356,11 @@
             <span id="message-edit-text">正在编辑这条消息，发送后将替换原消息</span>
             <button class="message-edit-cancel" id="message-edit-cancel" type="button">取消</button>
           </div>
+          <button class="remote-live" id="remote-live" type="button" hidden>
+            <span class="remote-live-dot" aria-hidden="true"></span>
+            <span class="remote-live-text" id="remote-live-text"></span>
+            <span class="remote-live-open">查看</span>
+          </button>
           <div class="composer-box" id="composer-box">
             <textarea
               id="input"
@@ -345,7 +485,7 @@
     <!-- 未登录：只显示登录，不展示任何组织/成员信息 -->
     <div class="login-gate" id="login-gate" hidden>
       <div class="login-card login-shell" id="login-card">
-        <div class="login-brand"><span class="logo">EAB</span><strong id="login-brand-name">企业智能体基座</strong></div>
+        <div class="login-brand"><span class="logo" data-brand-logo>EAB</span><strong id="login-brand-name" data-brand-name>企业智能体基座</strong></div>
 
         <div class="login-mode-tabs" id="login-mode-tabs" hidden>
           <button class="login-mode-tab is-active" id="login-mode-qr" type="button" data-login-mode="qr">扫码登录</button>
@@ -429,6 +569,7 @@
         if (gate) gate.hidden = false
       }
     </script>
-    <script src="/chat.js?v=20261113y"></script>
+    <script src="/boot-splash.js?v=20261115j" data-surface="chat" defer></script>
+    <script src="/chat.js?v=20261115z8" defer></script>
   </body>
 </html>

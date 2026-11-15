@@ -4,6 +4,7 @@
  * 造的东西够页面看得懂就行：一家公司、6 个部门、7 个人、6 个知识库。
  * 生产环境不会走这里（company 表非空即跳过，且 main.ts 里只在 devAuth 时调用）。
  */
+import { randomUUID } from 'node:crypto'
 import { BUILTIN_ROLES } from '@eab/authz'
 import type { Classification } from '@eab/domain'
 import { withTransaction, type Db } from '@eab/storage'
@@ -11,6 +12,16 @@ import { hashPassword } from './password.js'
 
 export const COMPANY_ID = 'c1'
 export const COMPANY_NAME = '甲科技'
+
+/** 开发库在没有既有策略时补默认审批链；迁移已给老库写过时这里会因唯一索引跳过。 */
+function seedPermissionPolicy(db: Db, companyId: string, scope: string, now: number): void {
+  db.prepare(
+    `INSERT OR IGNORE INTO permission_approval_policies
+       (id, company_id, target_type, target_key, max_levels, include_company_admin,
+        timeout_hours, approver_strategy, fixed_approvers_json, created_by, created_at, updated_at)
+     VALUES (?, ?, 'scope', ?, 3, 1, 72, 'dept_chain', NULL, 'system-seed', ?, ?)`,
+  ).run(`pap_${randomUUID()}`, companyId, scope, now, now)
+}
 
 export interface SeedPerson {
   readonly id: string
@@ -230,13 +241,18 @@ function seedSecondCompany(db: Db): void {
   }
 
   const insertRole = db.prepare(
-    'INSERT INTO roles (id, company_id, code, name, data_scope, builtin, created_at) VALUES (?, ?, ?, ?, ?, 1, ?)',
+    'INSERT INTO roles (id, company_id, code, name, data_scope, builtin, created_at, requestable) VALUES (?, ?, ?, ?, ?, 1, ?, ?)',
   )
   const insertRoleScope = db.prepare('INSERT INTO role_scopes (role_id, scope) VALUES (?, ?)')
   for (const role of BUILTIN_ROLES) {
-    insertRole.run(`role_${C2}_${role.code}`, C2, role.code, role.name, role.dataScope, now)
+    insertRole.run(`role_${C2}_${role.code}`, C2, role.code, role.name, role.dataScope, now, role.code === 'kb_admin' || role.code === 'auditor' ? 1 : 0)
     for (const scope of new Set(role.scopes)) {
       insertRoleScope.run(`role_${C2}_${role.code}`, scope)
+    }
+    if (role.code === 'kb_admin' || role.code === 'auditor') {
+      for (const scope of new Set(role.scopes)) {
+        seedPermissionPolicy(db, C2, scope, now)
+      }
     }
   }
 
@@ -330,14 +346,19 @@ function seedAll(db: Db): void {
 
   // 角色：直接按内置角色落库（DB 是控制台展示的事实来源，判定仍用同一份定义）
   const insertRole = db.prepare(
-    'INSERT INTO roles (id, company_id, code, name, data_scope, builtin, created_at) VALUES (?, ?, ?, ?, ?, 1, ?)',
+    'INSERT INTO roles (id, company_id, code, name, data_scope, builtin, created_at, requestable) VALUES (?, ?, ?, ?, ?, 1, ?, ?)',
   )
   const insertRoleScope = db.prepare('INSERT INTO role_scopes (role_id, scope) VALUES (?, ?)')
   for (const role of BUILTIN_ROLES) {
-    insertRole.run(`role_${role.code}`, COMPANY_ID, role.code, role.name, role.dataScope, now)
+    insertRole.run(`role_${role.code}`, COMPANY_ID, role.code, role.name, role.dataScope, now, role.code === 'kb_admin' || role.code === 'auditor' ? 1 : 0)
     // 去重：角色定义里 dept_admin 的 MEMBER_SCOPES 已含 approval:read，直接逐条插会撞主键
     for (const scope of new Set(role.scopes)) {
       insertRoleScope.run(`role_${role.code}`, scope)
+    }
+    if (role.code === 'kb_admin' || role.code === 'auditor') {
+      for (const scope of new Set(role.scopes)) {
+        seedPermissionPolicy(db, COMPANY_ID, scope, now)
+      }
     }
   }
 

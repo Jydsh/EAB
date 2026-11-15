@@ -234,6 +234,54 @@ export function loadSuspendedRun(db: Db, runId: string): SuspendedRun | null {
   }
 }
 
+/**
+ * 保存长任务的检查点：只存恢复所需的最小状态（当前轮次、最近消息、已生成文本），
+ * 真正的会话正文仍在 chat_messages / agent_steps 里。写失败不影响主流程。
+ */
+export function checkpointAgentRun(db: Db, runId: string, state: unknown): void {
+  try {
+    const max = 24_000
+    let json = JSON.stringify(state ?? {})
+    // 直接截断 JSON 会留下半截对象，恢复时 JSON.parse 必然失败；
+    // 超长时优先丢掉最早的若干条消息，仍然超长才降级成一条合法的精简检查点。
+    if (json.length > max && state && typeof state === 'object') {
+      const candidate = { ...(state as Record<string, unknown>) }
+      if (Array.isArray(candidate.messages)) {
+        const messages = candidate.messages
+        for (let keep = Math.min(messages.length, 6); keep >= 1; keep -= 1) {
+          candidate.messages = messages.slice(-keep)
+          json = JSON.stringify(candidate)
+          if (json.length <= max) break
+        }
+      }
+      if (json.length > max) {
+        const system = typeof candidate.system === 'string' ? candidate.system.slice(0, 6_000) : ''
+        const prompt = typeof candidate.prompt === 'string' ? candidate.prompt.slice(0, 6_000) : ''
+        const messages = [
+          ...(system ? [{ role: 'system', content: system }] : []),
+          ...(prompt ? [{ role: 'user', content: prompt }] : []),
+        ]
+        json = JSON.stringify({
+          truncated: true,
+          round: candidate.round,
+          turnId: candidate.turnId,
+          system,
+          prompt,
+          text: typeof candidate.text === 'string' ? candidate.text.slice(0, 2_000) : '',
+          messages,
+        })
+      }
+    }
+    if (json.length > max) return
+    db.prepare(
+      `UPDATE agent_runs SET resume_state_json = ?, updated_at = ?
+        WHERE id = ? AND status = 'running'`,
+    ).run(json, Date.now(), runId)
+  } catch {
+    // 检查点只是恢复辅助，不能反噬对话结果。
+  }
+}
+
 /** 后台结果回来后续跑：挂起态改回 running，并清掉 pending 作业指针。 */
 export function resumeAgentRun(db: Db, runId: string): boolean {
   const now = Date.now()

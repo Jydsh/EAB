@@ -21,6 +21,8 @@ export interface OfficeTokenPayload {
   readonly userId: string
   readonly mode: OfficeMode
   readonly version: number
+  /** 同一次编辑会话的稳定标识，用于区分本会话连续保存与另一个旧编辑器回写。 */
+  readonly sid?: string
   readonly iat: number
   readonly exp: number
 }
@@ -275,9 +277,111 @@ export async function forceSaveOfficeDocument(input: {
 }
 
 /**
- * EAB 自定义插件的 config.json。
- * 插件入口绝对地址带短期 plugin token；OnlyOffice 启动插件时由浏览器加载。
+ * 调用 OnlyOffice ConvertService.ashx 把当前文档转成 PDF。
+ * 只做无状态转换，权限、文件名和落盘由 workspace 路由负责。
  */
+function decodeXmlValue(value: string): string {
+  return value
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#(\d+);/g, (_, code: string) => String.fromCharCode(Number(code)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, code: string) => String.fromCharCode(Number.parseInt(code, 16)))
+}
+
+function xmlTagValue(text: string, tag: string): string | null {
+  const match = text.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, 'i'))
+  return match ? decodeXmlValue(match[1].trim()) : null
+}
+
+/**
+ * ConvertService.ashx 在不同 OnlyOffice 版本/网关下可能返回 JSON，也可能返回
+ * XML（`<FileResult><FileUrl>…</FileUrl><Error>0</Error></FileResult>`）。
+ * 两种都要接受，否则真实转换会在“成功但无法解析”处失败。
+ */
+function parseConversionResponse(text: string): {
+  fileUrl: string
+  error: string | null
+  endConvert: string | null
+} | null {
+  const trimmed = text.trim()
+  if (!trimmed) return null
+  if (trimmed.startsWith('{')) {
+    let json: Record<string, unknown>
+    try {
+      json = JSON.parse(trimmed) as Record<string, unknown>
+    } catch {
+      return null
+    }
+    const fileUrl = json.fileUrl ?? json.FileUrl ?? json.fileURL ?? json.FileURL
+    const error = json.error ?? json.Error
+    const endConvert = json.endConvert ?? json.EndConvert
+    return {
+      fileUrl: typeof fileUrl === 'string' ? fileUrl : '',
+      error: error === undefined || error === null ? null : String(error),
+      endConvert: endConvert === undefined || endConvert === null ? null : String(endConvert),
+    }
+  }
+  if (trimmed.startsWith('<')) {
+    return {
+      fileUrl: xmlTagValue(trimmed, 'FileUrl') ?? xmlTagValue(trimmed, 'FileURL') ?? '',
+      error: xmlTagValue(trimmed, 'Error'),
+      endConvert: xmlTagValue(trimmed, 'EndConvert'),
+    }
+  }
+  return null
+}
+
+export async function convertOfficeDocumentToPdf(input: {
+  readonly url: string
+  readonly secret: string
+  readonly fileUrl: string
+  readonly fileType: string
+  readonly title: string
+  readonly key: string
+  readonly fetchImpl?: typeof fetch
+  readonly timeoutMs?: number
+}): Promise<Buffer> {
+  const base = String(input.url || '').replace(/\/+$/, '')
+  if (!base) throw new Error('OnlyOffice 文档服务地址未配置')
+  if (!input.secret) throw new Error('OnlyOffice JWT 密钥未配置')
+  if (!input.fileUrl) throw new Error('OnlyOffice 转换缺少文件地址')
+  const fetchImpl = input.fetchImpl ?? fetch
+  const payload = {
+    async: false,
+    filetype: input.fileType,
+    key: input.key,
+    outputtype: 'pdf',
+    title: input.title,
+    url: input.fileUrl,
+  }
+  const body = JSON.stringify({ ...payload, token: signOfficeJwt(payload, input.secret) })
+  const response = await fetchImpl(`${base}/ConvertService.ashx`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body,
+    signal: AbortSignal.timeout(input.timeoutMs ?? 30_000),
+  })
+  if (!response.ok) throw new Error(`OnlyOffice 转换服务返回 HTTP ${response.status}`)
+  const result = parseConversionResponse(await response.text())
+  if (!result) throw new Error('OnlyOffice 转换服务返回了无法解析的响应')
+  if (result.error !== null && result.error !== '' && result.error !== '0') {
+    throw new Error(`OnlyOffice 转换失败（错误码 ${result.error}）`)
+  }
+  if (result.endConvert !== null && /^false$/i.test(result.endConvert)) {
+    throw new Error('OnlyOffice 转换尚未完成')
+  }
+  if (!result.fileUrl) throw new Error('OnlyOffice 转换没有返回 PDF 地址')
+  const fileResponse = await fetchImpl(result.fileUrl, { signal: AbortSignal.timeout(30_000) })
+  if (!fileResponse.ok) throw new Error(`下载转换后的 PDF 失败（HTTP ${fileResponse.status}）`)
+  const buffer = Buffer.from(await fileResponse.arrayBuffer())
+  if (buffer.length === 0) throw new Error('转换后的 PDF 为空')
+  if (buffer.length > 80 * 1024 * 1024) throw new Error('转换后的 PDF 超过 80 MB')
+  return buffer
+}
+
 export function buildOfficePluginConfig(
   token: string,
   editorTypes: OfficeDocumentType | OfficeDocumentType[] = ['word', 'cell', 'slide'],

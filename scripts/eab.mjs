@@ -266,12 +266,24 @@ async function server(flags) {
     return
   }
   console.log(`启动 EAB 服务：员工端 ${effective.chatPort} · 控制台 ${effective.adminPort}（地址 ${effective.host}）`)
-  const child = spawn('pnpm', ['--filter', '@eab/server', 'dev'], {
-    cwd: ROOT,
-    stdio: 'inherit',
-    shell: true,
-    env,
-  })
+  // 有些 Windows 环境的 PATH 里没有 pnpm（例如从任务计划或隐藏窗口启动）。
+  // 此时回退到等价的 tsx 直启，避免“服务没起来但只提示找不到 pnpm”。
+  const hasPnpm = spawnSync('pnpm', ['--version'], { shell: true, stdio: 'ignore', env }).status === 0
+  const child = hasPnpm
+    ? spawn('pnpm', ['--filter', '@eab/server', 'dev'], {
+        cwd: ROOT,
+        stdio: 'inherit',
+        shell: true,
+        env,
+      })
+    : (() => {
+        console.warn('PATH 中找不到 pnpm，改用 tsx 直启服务。')
+        return spawn(process.execPath, [join(ROOT, 'node_modules', 'tsx', 'dist', 'cli.mjs'), join(ROOT, 'packages', 'server', 'src', 'main.ts')], {
+          cwd: ROOT,
+          stdio: 'inherit',
+          env,
+        })
+      })()
   child.on('exit', (code) => process.exit(code ?? 0))
 }
 

@@ -49,10 +49,18 @@ import {
 } from '../dingtalk-file-echo.js'
 import {
   applyWorkspaceTextEdits,
+  createWorkspaceFileSnapshot,
   deleteUserWorkspaceFile,
+  exportWorkspaceFileToPdf,
+  getWorkspaceGuiFallback,
   isTextEditableFile,
+  listWorkspaceFileVersions,
+  prepareWorkspaceGuiFallback,
   readUserWorkspaceFile,
   renameUserWorkspaceFile,
+  reportWorkspaceGuiFallback,
+  restoreWorkspaceFileVersion,
+  saveUserWorkspaceFile,
   editUserWorkspaceFile,
   userScopeDir,
   type WorkspaceTextEdit,
@@ -326,7 +334,7 @@ export const TOOLS: readonly ToolDef[] = [
     id: 'agent.spawn',
     name: '并行子 Agent',
     description:
-      '把一个复杂任务拆成多个互不依赖的子任务，并行交给多个子 Agent 执行。适合“同时查三份资料”“分别分析几个文件”“多模型各给一版方案”这类可以并行的任务。每个子 Agent 有独立运行记录和会话锁；一个子任务失败不会取消其他子任务。tasks 必须是 JSON 数组字符串，每项形如 {"key":"research-a","title":"资料A","prompt":"完整子任务指令","modelId":"可选模型 id","retries":1}。key 是团队内的稳定标识（建议英文短名），后续可用 agent_task 凭 key 继续给它派活，复用同一个子 Agent 窗口与会话；子 Agent 完成一次任务后若没有新任务，会在空闲一段时间后自动注销，需要再工作时重新 agent_spawn。不要让子任务互相依赖，不要用子 Agent 代替普通的一次工具调用。',
+      '把一个复杂任务拆成多个互不依赖的子任务，并行交给多个子 Agent 执行。适合“同时查三份资料”“分别分析几个文件”“多模型各给一版方案”这类可以并行的任务。每个子 Agent 有独立运行记录和会话锁；一个子任务失败不会取消其他子任务。tasks 必须是 JSON 数组字符串，每项形如 {"key":"research-a","title":"资料A","prompt":"完整子任务指令","modelId":"可选模型 id","retries":1}。key 是团队内的稳定标识（建议英文短名），后续可用 agent_task 凭 key 继续给它派活，复用同一个子 Agent 窗口与会话；子 Agent 完成一次任务后若没有新任务，会在空闲一段时间后自动注销，需要再工作时重新 agent_spawn。不要让子任务互相依赖，不要用子 Agent 代替普通的一次工具调用。除非任务明确需要视觉/多模态等专用模型，否则不要给多个子任务填同一个 modelId，留空由系统按能力和并发负载分散分配。',
     scope: SC.AGENT_TOOL_INVOKE,
     dangerous: false,
     concurrency: 'read',
@@ -335,6 +343,10 @@ export const TOOLS: readonly ToolDef[] = [
         type: 'string',
         description: 'JSON 数组字符串；每项必须包含 prompt，可选 title、modelId、retries',
         required: true,
+      },
+      background: {
+        type: 'boolean',
+        description: '可选：true 表示后台执行，立即返回 taskId，父 Agent 可用 agent_wait 取事件；默认 false 同步等待',
       },
     },
   },
@@ -349,6 +361,55 @@ export const TOOLS: readonly ToolDef[] = [
     input: {
       agent: { type: 'string', description: '目标子 Agent 的团队 key', required: true },
       prompt: { type: 'string', description: '这次要它做的完整任务指令', required: true },
+      background: {
+        type: 'boolean',
+        description: '可选：true 表示后台执行，立即返回 taskId；子 Agent 处于 waiting 时通常应同步等待它把本轮做完',
+      },
+    },
+  },
+  {
+    id: 'agent.wait',
+    name: '等待子 Agent 事件',
+    description:
+      '父 Agent 专用。后台子 Agent 完成任务、提出问题或失败时会产生事件；调用本工具等待下一个事件，而不是用 Promise.all 等整批结束。返回 event=null 表示超时，可继续用 agent_wait 等，或先处理别的事情。事件里的 key 可直接用于 agent_task 继续派活。',
+    scope: SC.AGENT_TOOL_INVOKE,
+    dangerous: false,
+    concurrency: 'read',
+    input: {
+      timeoutSeconds: {
+        type: 'number',
+        description: '最多等多少秒；默认 30，范围 1-120',
+      },
+    },
+  },
+  {
+    id: 'agent.message',
+    name: '给运行中的子 Agent 发指示',
+    description:
+      '父 Agent 专用。子 Agent 正在后台执行、还没有提出问题时，可追加一条方向性指示（例如“优先看 2025 年数据”“不要改原文件”）。子 Agent 会在下一轮工具循环前读到；它已经完成或正在等待回答时不要用本工具，改用 agent_task 继续派活。',
+    scope: SC.AGENT_TOOL_INVOKE,
+    dangerous: false,
+    concurrency: 'read',
+    input: {
+      agent: { type: 'string', description: '目标子 Agent 的团队 key', required: true },
+      text: { type: 'string', description: '要追加的指示，写清约束或优先级', required: true },
+    },
+  },
+  {
+    id: 'agent.resume',
+    name: '从检查点继续子 Agent',
+    description:
+      '父 Agent 专用。某个子 Agent 的后台任务因为服务重启被打断、状态为 failed 且保留了检查点时，用本工具从上次进度继续，而不是从头再做。默认后台执行并立即返回新 taskId；如果没有可用检查点会明确报错，这时改用 agent_task 重新派活。已经成功完成的任务不要 resume，应派新任务。',
+    scope: SC.AGENT_TOOL_INVOKE,
+    dangerous: false,
+    concurrency: 'read',
+    input: {
+      agent: { type: 'string', description: '目标子 Agent 的团队 key', required: true },
+      taskId: { type: 'string', description: '可选：指定要恢复的任务 id；不填则取该 key 最近一条任务' },
+      background: {
+        type: 'boolean',
+        description: '可选：默认 true 后台续跑；false 则同步等待续跑结果',
+      },
     },
   },
   {
@@ -708,6 +769,58 @@ export const TOOLS: readonly ToolDef[] = [
     },
   },
   {
+    id: 'office.versions',
+    name: '管理文档历史版本',
+    description:
+      '管理个人云空间 Office 文档的历史版本。action=list（默认）列出快照，返回 version、size、source、summary、createdAt 和当前文件版本；action=snapshot 把当前内容存为手动快照，无变化时复用已有快照并返回 created=false；action=restore 恢复到 versionId 指定的历史版本，恢复前自动再存一份当前版本。仅文件本人可用；共享只读用户不能查看或恢复旧版本。先用 workspace.list 或 office.read_outline 找到文件，再传 fileId 或 path。',
+    scope: SC.WORKSPACE_WRITE,
+    dangerous: false,
+    concurrency: 'write',
+    lockKey: (deps, actor, args) => workspaceFileLockKey(deps, actor, args),
+    input: {
+      action: { type: 'string', description: 'list（默认）、snapshot 或 restore' },
+      fileId: { type: 'string', description: '云空间文件 id；和 path 二选一' },
+      path: { type: 'string', description: '云空间相对路径或文件名；和 fileId 二选一' },
+      versionId: { type: 'string', description: 'restore 时的版本 id，来自 action=list 返回的 id' },
+    },
+  },
+  {
+    id: 'office.export',
+    name: '导出 Office 文档为 PDF',
+    description:
+      '把个人云空间里的 docx/xlsx/pptx 通过 OnlyOffice 转成 PDF，并在云空间生成一个同名 PDF 新文件（重名时自动加序号），不覆盖源文件、不修改源文件版本。当前只支持 format=pdf。导出共享只读文件时也允许。先用 workspace.list 找到文件，再传 fileId 或 path。',
+    scope: SC.WORKSPACE_READ,
+    dangerous: false,
+    concurrency: 'write',
+    input: {
+      fileId: { type: 'string', description: '云空间文件 id；和 path 二选一' },
+      path: { type: 'string', description: '云空间相对路径或文件名；和 fileId 二选一' },
+      format: { type: 'string', description: '导出格式，当前只支持 pdf，默认 pdf' },
+    },
+  },
+  {
+    id: 'office.gui',
+    name: '准备或上报 GUI 兜底',
+    description:
+      '为 OnlyOffice 里没有 API 的原生入口准备受控人工兜底，或查询/上报结果。只允许四类动作：print（打印/打印设置）、macro（只打开宏管理器，EAB 不读取、不保存、不执行宏代码）、export（导出选项）、dialog（仅 docx 的 page_setup 页面设置 / header_footer 页眉页脚）。action=prepare 只登记白名单动作、生成用户操作步骤并写审计，不会自动点击、打印或执行宏；用户必须在前端弹窗点击确认后，才能由用户自己在 OnlyOffice 界面完成。action=status 查询状态；action=report 上报用户看到的结果（result=success/failure）。失败后同一条 fallbackId 不得再次确认或上报，必须重新发起；不要尝试白名单外的按钮、任意坐标或伪造成功。',
+    scope: SC.WORKSPACE_WRITE,
+    dangerous: false,
+    concurrency: 'write',
+    lockKey: (deps, actor, args) => workspaceFileLockKey(deps, actor, args),
+    input: {
+      action: { type: 'string', description: 'prepare（默认）、status 或 report' },
+      fileId: { type: 'string', description: '云空间文件 id；和 path 二选一' },
+      path: { type: 'string', description: '云空间相对路径或文件名；和 fileId 二选一' },
+      guiAction: { type: 'string', description: '白名单动作：print、macro、export 或 dialog；prepare 必填' },
+      dialog: { type: 'string', description: 'guiAction=dialog 时必填：page_setup 或 header_footer，仅 docx' },
+      format: { type: 'string', description: 'guiAction=export 时的目标格式提示：pdf、docx、xlsx、pptx 或 csv' },
+      note: { type: 'string', description: '给用户看的备注，最多 200 字' },
+      fallbackId: { type: 'string', description: 'status/report 时的兜底 id，来自 prepare 返回' },
+      result: { type: 'string', description: 'report 时必填：success 或 failure' },
+      detail: { type: 'string', description: 'report=failure 时必填的失败原因，最多 500 字' },
+    },
+  },
+  {
     id: 'workspace.send_dingtalk',
     name: '发送云空间文件到钉钉',
     description:
@@ -1063,6 +1176,9 @@ export const AGENT_CORE_TOOL_IDS: readonly string[] = [
   'agent.spawn',
   'agent.task',
   'agent.ask_parent',
+  'agent.wait',
+  'agent.message',
+  'agent.resume',
   'org.directory',
   'kb.search',
   'schedule.create',
@@ -1077,6 +1193,9 @@ export const AGENT_CORE_TOOL_IDS: readonly string[] = [
   'office.insert',
   'office.format',
   'office.comment',
+  'office.versions',
+  'office.export',
+  'office.gui',
   'memory.propose',
 ]
 
@@ -1138,6 +1257,9 @@ const TOOL_SEARCH_ALIASES: Record<string, string> = {
   'office.insert': '插入段落 新增段落 插入整行 插入整列 删除整行 删除整列 合并单元格 拆分单元格 删除表格行 删除表格列 xlsx Excel insert delete merge split paragraph row column office',
   'office.format': '设置格式 加粗 斜体 下划线 字体颜色 高亮 填充 数字格式 字号 format bold italic underline color highlight fill numberFormat number format font size xlsx',
   'office.comment': '加批注 批注 评论 单元格批注 工作表批注 Excel批注 回复批注 解决批注 删除批注 批注列表 短语批注 comment annotation note list reply resolve delete xlsx Excel cell comment',
+  'office.versions': '历史版本 版本列表 版本快照 手动快照 恢复到历史版本 回退 撤销 旧版本 version versions snapshot restore rollback history',
+  'office.export': '导出PDF 转PDF 文档转PDF 导出图片 export pdf convert print',
+  'office.gui': '打印 打印设置 宏 宏管理器 导出选项 页面设置 页眉页脚 原生对话框 GUI兜底 人工兜底 print macro export dialog fallback',
   'workspace.send_dingtalk': '发送文件 发文件 发给我 钉钉 send file dingtalk attachment',
   'workspace.rename': '重命名 改名 文件名 rename file',
   'workspace.delete': '删除文件 删掉 清理文件 delete file remove',
@@ -1894,6 +2016,7 @@ export async function executeTool(
           break
         }
         const saved = editUserWorkspaceFile(deps, actor, file.fileId, edit.buffer, {
+          baseVersion: Number(file.version),
           source: 'office.revisions',
           operationId,
           action,
@@ -1947,6 +2070,7 @@ export async function executeTool(
         break
       }
       const saved = editUserWorkspaceFile(deps, actor, file.fileId, edit.buffer, {
+        baseVersion: Number(file.version),
         source: 'office.revisions',
         operationId,
         action: edit.action,
@@ -1998,6 +2122,7 @@ export async function executeTool(
             })
           }
           const saved = editUserWorkspaceFile(deps, actor, file.fileId, edit.buffer, {
+            baseVersion: Number(file.version),
             source: 'office.insert',
             operationId,
             elementId: 'workbook',
@@ -2031,6 +2156,7 @@ export async function executeTool(
             })
           }
           const saved = editUserWorkspaceFile(deps, actor, file.fileId, edit.buffer, {
+            baseVersion: Number(file.version),
             source: 'office.insert',
             operationId,
             elementId,
@@ -2080,6 +2206,7 @@ export async function executeTool(
           })
         }
         const saved = editUserWorkspaceFile(deps, actor, file.fileId, edit.buffer, {
+          baseVersion: Number(file.version),
           source: 'office.insert',
           operationId,
           elementId: edit.elementId,
@@ -2119,6 +2246,7 @@ export async function executeTool(
           })
         }
         const saved = editUserWorkspaceFile(deps, actor, docx.fileId, split.buffer, {
+          baseVersion: Number(docx.version),
           source: 'office.insert',
           operationId,
           action,
@@ -2154,6 +2282,7 @@ export async function executeTool(
           })
         }
         const saved = editUserWorkspaceFile(deps, actor, docx.fileId, merged.buffer, {
+          baseVersion: Number(docx.version),
           source: 'office.insert',
           operationId,
           action,
@@ -2194,6 +2323,7 @@ export async function executeTool(
           })
         }
         const saved = editUserWorkspaceFile(deps, actor, docx.fileId, deletion.buffer, {
+          baseVersion: Number(docx.version),
           source: 'office.insert',
           operationId,
           action,
@@ -2231,6 +2361,7 @@ export async function executeTool(
         })
       }
       const saved = editUserWorkspaceFile(deps, actor, docx.fileId, edit.buffer, {
+        baseVersion: Number(docx.version),
         source: 'office.insert',
         operationId,
         elementId: edit.elementId,
@@ -2369,6 +2500,7 @@ export async function executeTool(
             })
           }
           const saved = editUserWorkspaceFile(deps, actor, file.fileId, edit.buffer, {
+            baseVersion: Number(file.version),
             source: 'office.format',
             operationId,
             elementId: edit.elementId,
@@ -2412,6 +2544,7 @@ export async function executeTool(
           })
         }
         const saved = editUserWorkspaceFile(deps, actor, file.fileId, edit.buffer, {
+          baseVersion: Number(file.version),
           source: 'office.format',
           operationId,
           elementId: edit.elementId,
@@ -2462,6 +2595,7 @@ export async function executeTool(
         })
       }
       const saved = editUserWorkspaceFile(deps, actor, docx.fileId, edit.buffer, {
+        baseVersion: Number(docx.version),
         source: 'office.format',
         operationId,
         elementId: edit.elementId,
@@ -2536,6 +2670,7 @@ export async function executeTool(
             })
           }
           const saved = editUserWorkspaceFile(deps, actor, file.fileId, edit.buffer, {
+            baseVersion: Number(file.version),
             source: 'office.comment',
             operationId,
             action,
@@ -2587,6 +2722,7 @@ export async function executeTool(
           })
         }
         const saved = editUserWorkspaceFile(deps, actor, file.fileId, edit.buffer, {
+          baseVersion: Number(file.version),
           source: 'office.comment',
           operationId,
           action,
@@ -2667,6 +2803,7 @@ export async function executeTool(
             ...(end === undefined ? {} : { end }),
           })
           const saved = editUserWorkspaceFile(deps, actor, docx.fileId, edit.buffer, {
+            baseVersion: Number(docx.version),
             source: 'office.comment',
             operationId,
             action,
@@ -2719,6 +2856,7 @@ export async function executeTool(
         })
       }
       const saved = editUserWorkspaceFile(deps, actor, docx.fileId, edit.buffer, {
+        baseVersion: Number(docx.version),
         source: 'office.comment',
         operationId,
         action: edit.action,
@@ -2766,6 +2904,7 @@ export async function executeTool(
           })
         }
         const saved = editUserWorkspaceFile(deps, actor, file.fileId, edit.buffer, {
+          baseVersion: Number(file.version),
           source: 'office.replace',
           operationId,
           elementId: edit.elementId,
@@ -2802,6 +2941,7 @@ export async function executeTool(
           })
         }
         const saved = editUserWorkspaceFile(deps, actor, file.fileId, edit.buffer, {
+          baseVersion: Number(file.version),
           source: 'office.replace',
           operationId,
           elementId: edit.elementId,
@@ -2839,6 +2979,7 @@ export async function executeTool(
         })
       }
       const saved = editUserWorkspaceFile(deps, actor, docx.fileId, edit.buffer, {
+        baseVersion: Number(docx.version),
         source: 'office.replace',
         operationId,
         elementId: edit.elementId,
@@ -2859,6 +3000,161 @@ export async function executeTool(
         wrote: true,
         saved: true,
         editorSync: false,
+      }
+      break
+    }
+    case 'office.versions': {
+      const file = resolveOfficeFile(deps, actor, args)
+      const action = String(args.action ?? 'list').trim().toLowerCase() || 'list'
+      if (action === 'list') {
+        const versions = listWorkspaceFileVersions(deps, actor, file.fileId)
+        result = {
+          fileId: file.fileId,
+          name: file.name,
+          relPath: file.relPath,
+          version: Number(file.version),
+          count: versions.length,
+          versions,
+          wrote: false,
+        }
+        break
+      }
+      if (action === 'snapshot') {
+        const snapshot = createWorkspaceFileSnapshot(deps, actor, file.fileId)
+        result = {
+          fileId: file.fileId,
+          name: file.name,
+          relPath: file.relPath,
+          created: snapshot.created,
+          version: snapshot.version,
+          versionId: snapshot.id,
+          size: snapshot.size,
+          source: snapshot.source,
+          summary: snapshot.summary,
+          wrote: snapshot.created,
+        }
+        break
+      }
+      if (action === 'restore') {
+        const versionId = String(args.versionId ?? '').trim()
+        if (!versionId) throw new EabError(EC.VALIDATION, 'restore 需要 versionId；先调用 action=list 获取')
+        const restored = restoreWorkspaceFileVersion(deps, actor, file.fileId, versionId)
+        result = {
+          fileId: restored.file.id,
+          name: restored.file.name,
+          relPath: restored.file.relPath,
+          version: restored.file.updatedAt,
+          size: restored.file.size,
+          restoredVersion: {
+            id: restored.restoredVersion.id,
+            version: restored.restoredVersion.version,
+            createdAt: restored.restoredVersion.createdAt,
+          },
+          snapshot: restored.file.snapshot ?? null,
+          wrote: true,
+        }
+        break
+      }
+      throw new EabError(EC.VALIDATION, 'action 只能是 list、snapshot 或 restore')
+    }
+    case 'office.export': {
+      const file = resolveOfficeFile(deps, actor, args)
+      const format = (String(args.format ?? 'pdf').trim().toLowerCase() || 'pdf')
+      if (format !== 'pdf') throw new EabError(EC.VALIDATION, '当前只支持导出 PDF')
+      let exported: Awaited<ReturnType<typeof exportWorkspaceFileToPdf>>
+      try {
+        exported = await exportWorkspaceFileToPdf(deps, actor, file.fileId)
+      } catch (error) {
+        throw error instanceof EabError
+          ? error
+          : new EabError(EC.INTERNAL, `导出 PDF 失败：${error instanceof Error ? error.message : String(error)}`)
+      }
+      const stem = file.name.replace(/\.[^.]+$/, '')
+      const saved = saveUserWorkspaceFile(deps, actor, {
+        relPath: `${stem}.pdf`,
+        buffer: exported.buffer,
+        mime: 'application/pdf',
+        channel: 'agent',
+      })
+      result = {
+        sourceFileId: file.fileId,
+        sourceName: file.name,
+        fileId: saved.id,
+        name: saved.name,
+        relPath: saved.relPath,
+        size: saved.size,
+        format: 'pdf',
+        wrote: true,
+      }
+      break
+    }
+    case 'office.gui': {
+      const action = (String(args.action ?? 'prepare').trim().toLowerCase() || 'prepare')
+      if (action !== 'prepare' && action !== 'status' && action !== 'report') {
+        throw new EabError(EC.VALIDATION, 'action 只能是 prepare、status 或 report')
+      }
+      const fallbackId = String(args.fallbackId ?? '').trim()
+      let fileId = String(args.fileId ?? '').trim()
+      if (action !== 'prepare' && !fileId) {
+        if (!fallbackId) throw new EabError(EC.VALIDATION, 'status/report 需要 fallbackId，或同时提供 fileId')
+        const row = deps.db
+          .prepare(
+            `SELECT file_id FROM workspace_gui_fallbacks
+              WHERE id = ? AND company_id = ? AND user_id = ? LIMIT 1`,
+          )
+          .get(fallbackId, actor.subject.companyId, actor.subject.userId) as { file_id: string } | undefined
+        if (!row) throw new EabError(EC.NOT_FOUND, 'GUI 兜底记录不存在')
+        fileId = row.file_id
+      }
+      const ctx = {
+        actor,
+        traceId: context.turnId,
+        channel: 'agent' as const,
+      }
+      if (action === 'prepare') {
+        const prepared = prepareWorkspaceGuiFallback(deps, ctx, {
+          fileId: fileId || undefined,
+          path: String(args.path ?? '').trim() || undefined,
+          action: String(args.guiAction ?? '').trim() || undefined,
+          dialog: String(args.dialog ?? '').trim() || undefined,
+          format: String(args.format ?? '').trim() || undefined,
+          note: String(args.note ?? '').trim() || undefined,
+        })
+        result = {
+          ...prepared,
+          wrote: false,
+          requiresUserConfirmation: true,
+          agentCanConfirm: false,
+          hint: '已生成兜底步骤；请让用户在前端“GUI 兜底”弹窗里点击确认，再由用户自己在 OnlyOffice 完成。不要自行确认或伪造结果。',
+        }
+        break
+      }
+      if (action === 'status') {
+        const status = getWorkspaceGuiFallback(deps, ctx, fileId, fallbackId)
+        result = {
+          ...status,
+          wrote: false,
+          agentCanConfirm: false,
+        }
+        break
+      }
+      const reportStatus = String(args.result ?? '').trim().toLowerCase()
+      if (reportStatus !== 'success' && reportStatus !== 'failure') {
+        throw new EabError(EC.VALIDATION, 'report 需要 result=success 或 failure')
+      }
+      const reported = reportWorkspaceGuiFallback(
+        deps,
+        ctx,
+        fileId,
+        fallbackId,
+        reportStatus,
+        String(args.detail ?? '').trim(),
+      )
+      result = {
+        ...reported,
+        wrote: false,
+        reported: true,
+        retryable: reportStatus === 'success',
       }
       break
     }

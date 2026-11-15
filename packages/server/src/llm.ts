@@ -231,6 +231,22 @@ async function readError(res: Response): Promise<string> {
     const error = json.error as Record<string, unknown> | string | undefined
     if (typeof error === 'string') return error
     if (error && typeof error.message === 'string') return error.message
+    if (typeof json.detail === 'string' && json.detail) return json.detail
+    if (Array.isArray(json.detail)) {
+      const detail = json.detail
+        .map((item) => {
+          if (typeof item === 'string') return item
+          if (item && typeof item === 'object') {
+            const record = item as Record<string, unknown>
+            if (typeof record.msg === 'string') return record.msg
+            if (typeof record.message === 'string') return record.message
+          }
+          return ''
+        })
+        .filter(Boolean)
+        .join('；')
+      if (detail) return detail
+    }
     if (typeof json.message === 'string') return json.message
   } catch {
     // 非 JSON 就截断原文
@@ -835,6 +851,147 @@ export async function callEmbeddings(
   if (provider.kind === 'gemini') return callGeminiEmbeddings(base, key, provider.modelKey, texts)
   if (provider.kind === 'azure_openai') return callAzureEmbeddings(base, key, provider.modelKey, texts)
   return callOpenAiEmbeddings(base, key, provider.modelKey, texts)
+}
+
+export interface SystemOneChoiceQuestion {
+  readonly type: 'choice'
+  readonly instructions: string
+  readonly criteria: Record<string, string>
+}
+
+export interface SystemOneNoUlQuestion {
+  readonly type: 'noul'
+  readonly instructions: string
+}
+
+export interface SystemOneScoreQuestion {
+  readonly type: 'score'
+  readonly instructions: string
+  readonly criteria: readonly string[]
+}
+
+export type SystemOneQuestion = SystemOneChoiceQuestion | SystemOneNoUlQuestion | SystemOneScoreQuestion
+
+export interface SystemOneAnswer {
+  readonly choice?: string
+  readonly noul?: boolean | string
+  readonly score?: number
+  readonly probabilities?: Record<string, number>
+  readonly confidence?: number
+}
+
+export interface SystemOneResult {
+  readonly id: string
+  readonly model: string
+  readonly answers: Record<string, SystemOneAnswer>
+  readonly usage: Record<string, unknown>
+}
+
+export interface SystemOneOptions {
+  readonly images?: readonly string[]
+  readonly timeoutMs?: number
+  readonly signal?: AbortSignal
+}
+
+/**
+ * SystemOne 是结构化决策协议：输入状态 + 若干问题，输出每个问题的选择/概率/置信度，
+ * 不生成自然语言。它和 chat completions 是两套端点，不能走 callModel 的 OpenAI 分支。
+ */
+export async function callSystemOne(
+  db: Db,
+  dbPath: string,
+  companyId: string,
+  modelId: string,
+  state: string | Record<string, unknown>,
+  questions: Record<string, SystemOneQuestion>,
+  options: SystemOneOptions = {},
+): Promise<SystemOneResult> {
+  const provider = providerOf(db, companyId, modelId)
+  if (provider.kind === 'demo') {
+    throw new EabError(EC.VALIDATION, '演示模型不提供 SystemOne 决策能力', {
+      hint: '请接入华东师大 SystemOne 或其他兼容 POST /v1/systemone 的决策端点',
+    })
+  }
+  const base = provider.base_url || ''
+  if (!base) {
+    throw new EabError(EC.VALIDATION, `供应商「${provider.name}」还没有填写 SystemOne Base URL`, {
+      hint: 'SystemOne 不是内置协议，必须在供应商里填写自定义 Base URL，例如 https://chat.ecnu.edu.cn/open/api/v1',
+    })
+  }
+  if (state === null || state === undefined || (typeof state === 'string' && !state.trim())) {
+    throw new EabError(EC.VALIDATION, 'SystemOne 的 state 不能为空')
+  }
+  const entries = Object.entries(questions)
+  if (entries.length === 0) throw new EabError(EC.VALIDATION, 'SystemOne 至少需要 1 个问题')
+  if (entries.length > 64) throw new EabError(EC.VALIDATION, 'SystemOne 单次最多 64 个问题')
+
+  const key = apiKeyOf(provider, dbPath)
+  const url = /\/systemone$/i.test(base) ? trimBase(base) : `${trimBase(base)}/systemone`
+  const timeoutMs = Math.max(1_000, Math.min(options.timeoutMs ?? 20_000, 120_000))
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(new Error(`SystemOne 超时（${timeoutMs}ms）`)), timeoutMs)
+  const onAbort = () => controller.abort(options.signal?.reason)
+  if (options.signal) {
+    if (options.signal.aborted) onAbort()
+    else options.signal.addEventListener('abort', onAbort, { once: true })
+  }
+
+  try {
+    let res: Response
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          accept: 'application/json',
+          ...(key ? { authorization: `Bearer ${key}` } : {}),
+        },
+        body: JSON.stringify({
+          model: provider.modelKey,
+          state,
+          questions,
+          ...(options.images && options.images.length > 0 ? { images: options.images } : {}),
+        }),
+        signal: controller.signal,
+      })
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error)
+      throw new EabError(EC.UPSTREAM, `SystemOne 请求失败：${reason}`, {
+        hint: '检查 Base URL 是否填到 /v1，以及上游是否支持 POST /v1/systemone',
+      })
+    }
+
+    if (!res.ok) {
+      const detail = await readError(res)
+      throw new EabError(EC.UPSTREAM, `SystemOne 返回 HTTP ${res.status}：${detail}`, {
+        hint: '网关 detail 数组或后端 error.message 已原样带出；检查模型标识、state 结构与问题格式',
+      })
+    }
+
+    let payload: Record<string, unknown>
+    try {
+      payload = (await res.json()) as Record<string, unknown>
+    } catch {
+      throw new EabError(EC.UPSTREAM, 'SystemOne 返回的不是 JSON', {
+        hint: '该端点可能不是 SystemOne 协议，确认 Base URL 和 /v1/systemone 路径',
+      })
+    }
+    const answers = payload.answers
+    if (!answers || typeof answers !== 'object' || Array.isArray(answers)) {
+      throw new EabError(EC.UPSTREAM, 'SystemOne 响应缺少 answers', {
+        hint: '期望 structured_decision.answers，按问题 ID 返回选择与置信度',
+      })
+    }
+    return {
+      id: String(payload.id ?? ''),
+      model: String(payload.model ?? ''),
+      answers: answers as Record<string, SystemOneAnswer>,
+      usage: payload.usage && typeof payload.usage === 'object' ? (payload.usage as Record<string, unknown>) : {},
+    }
+  } finally {
+    clearTimeout(timer)
+    options.signal?.removeEventListener('abort', onAbort)
+  }
 }
 
 export interface RerankHit {

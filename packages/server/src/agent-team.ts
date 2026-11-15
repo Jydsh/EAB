@@ -1,13 +1,20 @@
 /**
- * 子 Agent 团队登记表（只存内存，不落库）。
+ * 子 Agent 团队登记表。
  *
- * 语义对齐用户要的「经理 + 团队」：
- * - 父 Agent（经理）通过 agent_spawn 注册子 Agent（worker），每个 worker 有稳定的 key；
- * - 同一 key 再次派活复用同一个窗口与会话身份（childId 稳定），所以父子对话能接着上一轮；
- * - worker 完成一次任务后进入 idle；超过空闲期没有任何新任务，就视为已注销，
- *   父 Agent 再派活必须先 agent_spawn 重新注册，避免长期占着资源；
- * - 真正的执行资源（子 run、会话锁、模型调用）在子 run 结束时就已经释放，这里只管身份与可视窗口。
+ * 两套实现共存：
+ * - 下面的自由函数是进程内内存表，保留给现有测试和没有 DB 上下文的轻量调用；
+ * - `AgentTeamStore` 是生产路径，把 worker、消息、任务和事件落库，支持同一会话
+ *   跨轮次继续派活、服务重启后恢复团队视图，以及父 Agent 的事件等待。
+ *
+ * 设计边界：
+ * - worker 只保存身份、状态和最近一次摘要；真正的运行轨迹在 `agent_runs` /
+ *   `agent_steps`，不在这里重复维护；
+ * - 消息只保存文本，不保存工具调用细节；读取时仍然只取最近 20 条 / 约 16k 字符；
+ * - waiting 不是 idle，不会被空闲退休误删；只有父 Agent 答复、取消或服务端
+ *   显式清理才会改变它。
  */
+import type { Db } from '@eab/storage'
+import { randomUUID } from 'node:crypto'
 
 export interface TeamMessage {
   role: 'user' | 'assistant'
@@ -30,10 +37,55 @@ export interface TeamWorker {
   messages: TeamMessage[]
 }
 
-const teams = new Map<string, Map<string, TeamWorker>>()
+export interface AgentTeamTask {
+  id: string
+  teamId: string
+  workerKey: string
+  parentRunId: string | null
+  childRunId: string | null
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled'
+  prompt: string
+  resultText: string
+  error: string
+  modelId: string
+  startedAt: number | null
+  finishedAt: number | null
+  /** 父 Agent 是否已因这条任务被唤醒 */
+  wakeAt: number | null
+  createdAt: number
+  updatedAt: number
+}
+
+export interface AgentTeamEvent {
+  id: string
+  teamId: string
+  workerKey: string
+  taskId: string | null
+  kind: string
+  payload: unknown
+  createdAt: number
+}
+
+export interface AgentTeamStoreOptions {
+  readonly db: Db
+  readonly teamId: string
+  readonly companyId: string
+  readonly userId: string
+  readonly idleMs?: number
+}
 
 /** 默认空闲退休时间：2 分钟没有新任务就自动注销。 */
 export const DEFAULT_WORKER_IDLE_MS = 120_000
+
+const MAX_MESSAGES = 20
+const MAX_MESSAGE_CHARS = 16_000
+const MAX_MESSAGE_CHARS_EACH = 4_000
+
+/* ------------------------------------------------------------------ */
+/* 内存实现：保留给现有测试和没有 DB 上下文的轻量调用                  */
+/* ------------------------------------------------------------------ */
+
+const teams = new Map<string, Map<string, TeamWorker>>()
 
 function teamOf(parentRunId: string, create = false): Map<string, TeamWorker> | undefined {
   let team = teams.get(parentRunId)
@@ -113,11 +165,10 @@ export function appendWorkerMessage(
   if (!worker) return
   const text = String(content ?? '').trim()
   if (!text) return
-  worker.messages.push({ role, content: text.slice(0, 4_000), at: now })
-  // 只保留最近 20 条，避免长会话无限占内存；总字符数也封顶。
-  while (worker.messages.length > 20) worker.messages.shift()
+  worker.messages.push({ role, content: text.slice(0, MAX_MESSAGE_CHARS_EACH), at: now })
+  while (worker.messages.length > MAX_MESSAGES) worker.messages.shift()
   let total = worker.messages.reduce((sum, message) => sum + message.content.length, 0)
-  while (total > 16_000 && worker.messages.length > 2) {
+  while (total > MAX_MESSAGE_CHARS && worker.messages.length > 2) {
     const removed = worker.messages.shift()
     total -= removed?.content.length ?? 0
   }
@@ -174,19 +225,10 @@ export function clearTeam(parentRunId: string): void {
 
 export function resetAgentTeamsForTest(): void {
   teams.clear()
+  waiters.clear()
 }
 
-/**
- * 给父 Agent 的本轮提示：会话里还有哪些子 Agent、各自空闲还是工作中、上次回报是什么。
- * 没有团队或全部已注销时返回空串，提示词里就不会出现这一段。
- */
-export function teamRoster(
-  teamId: string,
-  idleMs: number = DEFAULT_WORKER_IDLE_MS,
-  now: number = Date.now(),
-): string {
-  pruneIdleWorkers(teamId, idleMs, now)
-  const workers = listWorkers(teamId)
+function rosterText(workers: TeamWorker[]): string {
   if (workers.length === 0) return ''
   const lines = workers.map((worker) => {
     const state = worker.status === 'running' ? '工作中' : worker.status === 'waiting' ? '等待父 Agent 回答' : '空闲'
@@ -201,4 +243,647 @@ export function teamRoster(
     '需要它们接着做事时调用 agent_task {agent:"key", prompt:"完整任务"}；已注销的 key 不能再用，要先用 agent_spawn 重新注册。',
     '如果某个子 Agent 处于「等待父 Agent 回答」，先判断你能不能直接答；需要用户补充信息或授权时，用 ask_user 问用户，拿到答复后必须用 agent_task 把答复发回该子 Agent，让它继续。',
   ].join('\n')
+}
+
+/**
+ * 给父 Agent 的本轮提示：会话里还有哪些子 Agent、各自空闲还是工作中、上次回报是什么。
+ * 没有团队或全部已注销时返回空串，提示词里就不会出现这一段。
+ */
+export function teamRoster(
+  teamId: string,
+  idleMs: number = DEFAULT_WORKER_IDLE_MS,
+  now: number = Date.now(),
+): string {
+  pruneIdleWorkers(teamId, idleMs, now)
+  return rosterText(listWorkers(teamId))
+}
+
+/* ------------------------------------------------------------------ */
+/* 事件等待：内存版和 DB 版共用一个进程内唤醒器                        */
+/* ------------------------------------------------------------------ */
+
+const waiters = new Map<string, Set<() => void>>()
+
+function wakeTeam(teamId: string): void {
+  const set = waiters.get(teamId)
+  if (!set) return
+  for (const resolve of [...set]) {
+    try {
+      resolve()
+    } catch {
+      // 单个等待者失效不能影响其它等待者
+    }
+  }
+}
+
+function waitOnce(teamId: string, timeoutMs: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const done = (): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', onAbort)
+      waiters.get(teamId)?.delete(done)
+      if (waiters.get(teamId)?.size === 0) waiters.delete(teamId)
+      resolve()
+    }
+    const onAbort = (): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      waiters.get(teamId)?.delete(done)
+      if (waiters.get(teamId)?.size === 0) waiters.delete(teamId)
+      reject(signal?.reason instanceof Error ? signal.reason : new Error('等待子 Agent 事件已取消'))
+    }
+    const timer = setTimeout(done, Math.max(0, timeoutMs))
+    timer.unref?.()
+    if (!waiters.has(teamId)) waiters.set(teamId, new Set())
+    waiters.get(teamId)!.add(done)
+    if (signal?.aborted) onAbort()
+    else signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+/* ------------------------------------------------------------------ */
+/* DB 实现：生产路径                                                   */
+/* ------------------------------------------------------------------ */
+
+interface WorkerRow {
+  key: string
+  name: string
+  idx: number
+  status: string
+  run_id: string
+  model_id: string
+  model_name: string
+  last_task_at: number
+  last_text: string
+  created_at: number
+  updated_at: number
+}
+
+interface MessageRow {
+  id: string
+  role: string
+  content: string
+  created_at: number
+}
+
+interface TaskRow {
+  id: string
+  team_id: string
+  worker_key: string
+  parent_run_id: string | null
+  child_run_id: string | null
+  status: string
+  prompt: string
+  result_text: string | null
+  error: string | null
+  model_id: string | null
+  started_at: number | null
+  finished_at: number | null
+  wake_at: number | null
+  created_at: number
+  updated_at: number
+}
+
+interface EventRow {
+  id: string
+  team_id: string
+  worker_key: string
+  task_id: string | null
+  kind: string
+  payload_json: string
+  created_at: number
+}
+
+function parseJson(value: string | null): unknown {
+  if (!value) return null
+  try {
+    return JSON.parse(value)
+  } catch {
+    return null
+  }
+}
+
+function toTask(row: TaskRow): AgentTeamTask {
+  return {
+    id: row.id,
+    teamId: row.team_id,
+    workerKey: row.worker_key,
+    parentRunId: row.parent_run_id,
+    childRunId: row.child_run_id,
+    status: row.status as AgentTeamTask['status'],
+    prompt: row.prompt,
+    resultText: row.result_text ?? '',
+    error: row.error ?? '',
+    modelId: row.model_id ?? '',
+    startedAt: row.started_at,
+    finishedAt: row.finished_at,
+    wakeAt: row.wake_at,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  }
+}
+
+function toEvent(row: EventRow): AgentTeamEvent {
+  return {
+    id: row.id,
+    teamId: row.team_id,
+    workerKey: row.worker_key,
+    taskId: row.task_id,
+    kind: row.kind,
+    payload: parseJson(row.payload_json),
+    createdAt: row.created_at,
+  }
+}
+
+export class AgentTeamStore {
+  private readonly db: Db
+  readonly teamId: string
+  private readonly companyId: string
+  private readonly userId: string
+  readonly idleMs: number
+
+  constructor(options: AgentTeamStoreOptions) {
+    this.db = options.db
+    this.teamId = options.teamId
+    this.companyId = options.companyId
+    this.userId = options.userId
+    this.idleMs = options.idleMs ?? DEFAULT_WORKER_IDLE_MS
+  }
+
+  private rowToWorker(row: WorkerRow): TeamWorker {
+    return {
+      key: row.key,
+      name: row.name,
+      index: Number(row.idx) || 1,
+      status: (row.status === 'waiting' || row.status === 'idle' ? row.status : 'running') as TeamWorker['status'],
+      runId: row.run_id,
+      modelId: row.model_id,
+      modelName: row.model_name,
+      lastTaskAt: Number(row.last_task_at) || 0,
+      lastText: row.last_text,
+      messages: this.workerMessages(row.key),
+    }
+  }
+
+  registerWorker(
+    worker: { key: string; name: string; index?: number; modelId?: string; modelName?: string },
+    now = Date.now(),
+  ): TeamWorker {
+    const previous = this.findWorker(worker.key)
+    const index = previous?.index ?? worker.index ?? this.listWorkers().length + 1
+    this.db.prepare(
+      `INSERT INTO agent_workers
+         (id, team_id, company_id, user_id, key, name, idx, status, run_id, model_id,
+          model_name, last_task_at, last_text, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(team_id, key) DO UPDATE SET
+         name = excluded.name,
+         status = 'running',
+         run_id = CASE WHEN agent_workers.run_id = '' THEN excluded.run_id ELSE agent_workers.run_id END,
+         model_id = excluded.model_id,
+         model_name = excluded.model_name,
+         last_task_at = excluded.last_task_at,
+         updated_at = excluded.updated_at`,
+    ).run(
+      `${this.teamId}:${worker.key}`,
+      this.teamId,
+      this.companyId,
+      this.userId,
+      worker.key,
+      worker.name || previous?.name || worker.key,
+      index,
+      previous?.runId ?? '',
+      worker.modelId ?? previous?.modelId ?? '',
+      worker.modelName ?? previous?.modelName ?? '',
+      now,
+      previous?.lastText ?? '',
+      Number(previous ? this.createdAtOf(worker.key) : now),
+      now,
+    )
+    return this.findWorker(worker.key) as TeamWorker
+  }
+
+  private createdAtOf(key: string): number {
+    const row = this.db
+      .prepare('SELECT created_at FROM agent_workers WHERE team_id = ? AND key = ?')
+      .get(this.teamId, key) as { created_at: number } | undefined
+    return Number(row?.created_at) || Date.now()
+  }
+
+  markWorkerRun(key: string, runId: string, now = Date.now()): void {
+    this.db.prepare(
+      `UPDATE agent_workers SET run_id = ?, updated_at = ?
+        WHERE team_id = ? AND key = ?`,
+    ).run(runId, now, this.teamId, key)
+  }
+
+  appendWorkerMessage(
+    key: string,
+    role: TeamMessage['role'],
+    content: string,
+    now = Date.now(),
+  ): void {
+    const text = String(content ?? '').trim()
+    if (!text) return
+    this.db.prepare(
+      `INSERT INTO agent_team_messages (id, team_id, worker_key, role, content, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(`msg_${randomUUID()}`, this.teamId, key, role, text.slice(0, MAX_MESSAGE_CHARS_EACH), now)
+    this.trimMessages(key)
+  }
+
+  private trimMessages(key: string): void {
+    const rows = this.db.prepare(
+      `SELECT id, content FROM agent_team_messages
+        WHERE team_id = ? AND worker_key = ?
+        ORDER BY created_at ASC, rowid ASC`,
+    ).all(this.teamId, key) as unknown as Array<{ id: string; content: string }>
+    let total = rows.reduce((sum, row) => sum + row.content.length, 0)
+    let count = rows.length
+    for (const row of rows) {
+      if (count <= MAX_MESSAGES && total <= MAX_MESSAGE_CHARS) break
+      if (count <= 2) break
+      this.db.prepare('DELETE FROM agent_team_messages WHERE id = ?').run(row.id)
+      total -= row.content.length
+      count -= 1
+    }
+  }
+
+  workerMessages(key: string): TeamMessage[] {
+    const rows = this.db.prepare(
+      `SELECT role, content, created_at FROM agent_team_messages
+        WHERE team_id = ? AND worker_key = ?
+        ORDER BY created_at DESC, rowid DESC
+        LIMIT ?`,
+    ).all(this.teamId, key, MAX_MESSAGES) as unknown as MessageRow[]
+    let messages = rows.reverse().map((row) => ({
+      role: (row.role === 'assistant' ? 'assistant' : 'user') as TeamMessage['role'],
+      content: row.content,
+      at: Number(row.created_at) || 0,
+    }))
+    let total = messages.reduce((sum, message) => sum + message.content.length, 0)
+    while (total > MAX_MESSAGE_CHARS && messages.length > 2) {
+      const removed = messages.shift()
+      total -= removed?.content.length ?? 0
+    }
+    return messages
+  }
+
+  markWorkerWaiting(key: string, question: string, now = Date.now()): TeamWorker | undefined {
+    this.db.prepare(
+      `UPDATE agent_workers SET status = 'waiting', last_task_at = ?, last_text = ?, updated_at = ?
+        WHERE team_id = ? AND key = ?`,
+    ).run(now, String(question || '').slice(-1200), now, this.teamId, key)
+    return this.findWorker(key)
+  }
+
+  markWorkerIdle(key: string, text = '', now = Date.now()): TeamWorker | undefined {
+    this.db.prepare(
+      `UPDATE agent_workers SET status = 'idle', last_task_at = ?, last_text = ?, updated_at = ?
+        WHERE team_id = ? AND key = ?`,
+    ).run(now, String(text || '').slice(-1200), now, this.teamId, key)
+    return this.findWorker(key)
+  }
+
+  findWorker(key: string): TeamWorker | undefined {
+    const row = this.db.prepare(
+      `SELECT key, name, idx, status, run_id, model_id, model_name, last_task_at, last_text, created_at, updated_at
+         FROM agent_workers WHERE team_id = ? AND key = ?`,
+    ).get(this.teamId, key) as WorkerRow | undefined
+    return row ? this.rowToWorker(row) : undefined
+  }
+
+  listWorkers(): TeamWorker[] {
+    const rows = this.db.prepare(
+      `SELECT key, name, idx, status, run_id, model_id, model_name, last_task_at, last_text, created_at, updated_at
+         FROM agent_workers WHERE team_id = ? ORDER BY idx ASC, created_at ASC`,
+    ).all(this.teamId) as unknown as WorkerRow[]
+    return rows.map((row) => this.rowToWorker(row))
+  }
+
+  pruneIdleWorkers(now = Date.now()): string[] {
+    const cutoff = now - this.idleMs
+    const rows = this.db.prepare(
+      `SELECT key FROM agent_workers
+        WHERE team_id = ? AND status = 'idle' AND last_task_at < ?`,
+    ).all(this.teamId, cutoff) as unknown as Array<{ key: string }>
+    if (rows.length === 0) return []
+    for (const row of rows) {
+      this.db.prepare('DELETE FROM agent_workers WHERE team_id = ? AND key = ?').run(this.teamId, row.key)
+      this.db.prepare('DELETE FROM agent_team_messages WHERE team_id = ? AND worker_key = ?').run(this.teamId, row.key)
+    }
+    return rows.map((row) => row.key)
+  }
+
+  clearTeam(): void {
+    this.db.prepare('DELETE FROM agent_workers WHERE team_id = ?').run(this.teamId)
+    this.db.prepare('DELETE FROM agent_team_messages WHERE team_id = ?').run(this.teamId)
+    this.db.prepare('DELETE FROM agent_events WHERE team_id = ?').run(this.teamId)
+  }
+
+  roster(now = Date.now()): string {
+    this.pruneIdleWorkers(now)
+    const lines = [rosterText(this.listWorkers())]
+    const pending = this.listPendingEvents(5)
+    if (pending.length > 0) {
+      lines.push(
+        '还有未处理的子 Agent 事件：\n' +
+          pending
+            .map((event) => `- ${event.workerKey}：${event.kind}（${JSON.stringify(event.payload).slice(0, 220)}）`)
+            .join('\n') +
+          '\n用 agent_wait 取事件；需要它继续时用 agent_task 把答复或下一步发回去。',
+      )
+    }
+    const tasks = this.listTasks(5).filter((task) => task.status === 'queued' || task.status === 'running')
+    if (tasks.length > 0) {
+      lines.push(
+        '后台任务仍在执行：\n' +
+          tasks
+            .map((task) => `- ${task.workerKey}（${task.status}，task=${task.id}）：${task.prompt.slice(0, 120)}`)
+            .join('\n'),
+      )
+    }
+    return lines.filter(Boolean).join('\n')
+  }
+
+  /** 父 Agent 在子 Agent 运行中追加一条指示；子 Agent 下一轮工具循环前会读到。 */
+  sendGuidance(workerKey: string, text: string, now = Date.now()): AgentTeamEvent {
+    return this.recordEvent({ workerKey, kind: 'guidance', payload: { text: text.slice(0, 2000) }, now })
+  }
+
+  /** 子 Agent 取走父 Agent 的指示；只消费，不重复投递。 */
+  takeGuidance(workerKey: string, limit = 5): string[] {
+    const rows = this.db.prepare(
+      `SELECT id, payload_json FROM agent_events
+        WHERE team_id = ? AND worker_key = ? AND kind = 'guidance' AND consumed_at IS NULL
+        ORDER BY created_at ASC, rowid ASC LIMIT ?`,
+    ).all(this.teamId, workerKey, limit) as unknown as Array<{ id: string; payload_json: string }>
+    const texts: string[] = []
+    for (const row of rows) {
+      const payload = parseJson(row.payload_json) as { text?: unknown } | null
+      if (typeof payload?.text === 'string' && payload.text.trim()) texts.push(payload.text.trim())
+      this.consumeEvent(row.id)
+    }
+    return texts
+  }
+
+  /* ---------------------------- 任务 ---------------------------- */
+
+  createTask(input: {
+    id?: string
+    workerKey: string
+    prompt: string
+    parentRunId?: string | null
+    modelId?: string
+    now?: number
+  }): AgentTeamTask {
+    const id = input.id ?? `task_${randomUUID()}`
+    const now = input.now ?? Date.now()
+    this.db.prepare(
+      `INSERT INTO agent_tasks
+         (id, team_id, company_id, user_id, worker_key, parent_run_id, child_run_id, status,
+          prompt, result_text, error, model_id, started_at, finished_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, NULL, 'queued', ?, '', '', ?, NULL, NULL, ?, ?)`,
+    ).run(
+      id,
+      this.teamId,
+      this.companyId,
+      this.userId,
+      input.workerKey,
+      input.parentRunId ?? null,
+      input.prompt,
+      input.modelId ?? '',
+      now,
+      now,
+    )
+    return this.getTask(id) as AgentTeamTask
+  }
+
+  markTaskRunning(id: string, childRunId: string, now = Date.now()): void {
+    this.db.prepare(
+      `UPDATE agent_tasks SET status = 'running', child_run_id = ?, started_at = COALESCE(started_at, ?), updated_at = ?
+        WHERE id = ?`,
+    ).run(childRunId, now, now, id)
+  }
+
+  markTaskDone(id: string, resultText: string, now = Date.now()): void {
+    this.db.prepare(
+      `UPDATE agent_tasks SET status = 'succeeded', result_text = ?, error = '', finished_at = ?, updated_at = ?
+        WHERE id = ?`,
+    ).run(resultText.slice(0, 4000), now, now, id)
+  }
+
+  markTaskFailed(id: string, error: string, now = Date.now()): void {
+    this.db.prepare(
+      `UPDATE agent_tasks SET status = 'failed', error = ?, finished_at = ?, updated_at = ?
+        WHERE id = ?`,
+    ).run(error.slice(0, 500), now, now, id)
+  }
+
+  markTaskCancelled(id: string, reason = '已取消', now = Date.now()): void {
+    this.db.prepare(
+      `UPDATE agent_tasks SET status = 'cancelled', error = ?, finished_at = ?, updated_at = ?
+        WHERE id = ?`,
+    ).run(reason.slice(0, 500), now, now, id)
+  }
+
+  getTask(id: string): AgentTeamTask | undefined {
+    const row = this.db.prepare(
+      `SELECT id, team_id, worker_key, parent_run_id, child_run_id, status, prompt, result_text,
+              error, model_id, started_at, finished_at, wake_at, created_at, updated_at
+         FROM agent_tasks WHERE team_id = ? AND id = ?`,
+    ).get(this.teamId, id) as TaskRow | undefined
+    return row ? toTask(row) : undefined
+  }
+
+  listTasks(limit = 20): AgentTeamTask[] {
+    const rows = this.db.prepare(
+      `SELECT id, team_id, worker_key, parent_run_id, child_run_id, status, prompt, result_text,
+              error, model_id, started_at, finished_at, wake_at, created_at, updated_at
+         FROM agent_tasks WHERE team_id = ?
+         ORDER BY created_at DESC LIMIT ?`,
+    ).all(this.teamId, Math.max(1, Math.min(100, limit))) as unknown as TaskRow[]
+    return rows.map(toTask)
+  }
+
+  /** 已经结束、或正在等父 Agent 回答、但父 Agent 还没有被唤醒的任务。 */
+  listTasksAwaitingWake(limit = 10): AgentTeamTask[] {
+    const rows = this.db.prepare(
+      `SELECT t.id, t.team_id, t.worker_key, t.parent_run_id, t.child_run_id, t.status, t.prompt,
+              t.result_text, t.error, t.model_id, t.started_at, t.finished_at, t.wake_at, t.created_at, t.updated_at
+         FROM agent_tasks t
+        WHERE t.team_id = ? AND t.wake_at IS NULL
+          AND (
+            t.status IN ('succeeded', 'failed', 'cancelled')
+            OR EXISTS (
+              SELECT 1 FROM agent_events e
+               WHERE e.team_id = t.team_id AND e.task_id = t.id
+                 AND e.kind = 'question' AND e.consumed_at IS NULL
+            )
+          )
+        ORDER BY COALESCE(t.finished_at, t.created_at) ASC LIMIT ?`,
+    ).all(this.teamId, Math.max(1, Math.min(50, limit))) as unknown as TaskRow[]
+    return rows.map(toTask)
+  }
+
+  markTasksWoken(ids: string[], now = Date.now()): void {
+    for (const id of ids) {
+      this.db.prepare(
+        'UPDATE agent_tasks SET wake_at = ?, wake_state = ?, updated_at = ? WHERE team_id = ? AND id = ?',
+      ).run(now, 'woken', now, this.teamId, id)
+    }
+  }
+
+  /* ---------------------------- 事件 ---------------------------- */
+
+  recordEvent(input: {
+    workerKey: string
+    kind: string
+    payload?: unknown
+    taskId?: string | null
+    now?: number
+  }): AgentTeamEvent {
+    const now = input.now ?? Date.now()
+    const id = `evt_${randomUUID()}`
+    this.db.prepare(
+      `INSERT INTO agent_events
+         (id, team_id, company_id, user_id, worker_key, task_id, kind, payload_json, created_at, consumed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+    ).run(
+      id,
+      this.teamId,
+      this.companyId,
+      this.userId,
+      input.workerKey,
+      input.taskId ?? null,
+      input.kind,
+      JSON.stringify(input.payload ?? {}),
+      now,
+    )
+    // 同一个任务可能先提问、后完成：新事件必须重新获得唤醒资格，
+    // 否则上一次 question 唤醒会把这条任务的 wake_at 永久写死。
+    if (input.taskId) {
+      this.db.prepare(
+        'UPDATE agent_tasks SET wake_at = NULL, wake_state = NULL, updated_at = ? WHERE team_id = ? AND id = ?',
+      ).run(now, this.teamId, input.taskId)
+    }
+    wakeTeam(this.teamId)
+    return {
+      id,
+      teamId: this.teamId,
+      workerKey: input.workerKey,
+      taskId: input.taskId ?? null,
+      kind: input.kind,
+      payload: input.payload ?? {},
+      createdAt: now,
+    }
+  }
+
+  private takePendingEvent(kinds?: string[]): AgentTeamEvent | null {
+    const kindFilter = kinds && kinds.length > 0
+      ? ` AND kind IN (${kinds.map(() => '?').join(', ')})`
+      : ''
+    const row = this.db.prepare(
+      `SELECT id, team_id, worker_key, task_id, kind, payload_json, created_at
+         FROM agent_events
+        WHERE team_id = ? AND consumed_at IS NULL${kindFilter}
+        ORDER BY created_at ASC, rowid ASC LIMIT 1`,
+    ).get(this.teamId, ...(kinds && kinds.length > 0 ? kinds : [])) as EventRow | undefined
+    if (!row) return null
+    this.db.prepare('UPDATE agent_events SET consumed_at = ? WHERE id = ?').run(Date.now(), row.id)
+    return toEvent(row)
+  }
+
+  listPendingEvents(limit = 20): AgentTeamEvent[] {
+    const rows = this.db.prepare(
+      `SELECT id, team_id, worker_key, task_id, kind, payload_json, created_at
+         FROM agent_events
+        WHERE team_id = ? AND consumed_at IS NULL
+        ORDER BY created_at ASC, rowid ASC LIMIT ?`,
+    ).all(this.teamId, Math.max(1, Math.min(100, limit))) as unknown as EventRow[]
+    return rows.map(toEvent)
+  }
+
+  consumeEvent(id: string): void {
+    this.db.prepare('UPDATE agent_events SET consumed_at = ? WHERE team_id = ? AND id = ?')
+      .run(Date.now(), this.teamId, id)
+  }
+
+  /** 等待下一个未消费事件；超时返回 null。父 Agent 用 agent_wait 调用。 */
+  async waitForEvent(
+    timeoutMs = 30_000,
+    signal?: AbortSignal,
+    kinds?: string[],
+  ): Promise<AgentTeamEvent | null> {
+    const deadline = Date.now() + Math.max(0, timeoutMs)
+    while (true) {
+      const immediate = this.takePendingEvent(kinds)
+      if (immediate) return immediate
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) return null
+      await waitOnce(this.teamId, remaining, signal)
+    }
+  }
+}
+
+/**
+ * 启动时收尾上次进程留下的后台任务和 running worker。
+ *
+ * 这不是“自动重跑”：任务原文和 `agent_runs.resume_state_json` 里的检查点都还在，
+ * 但没有可信的调用方身份，不能擅自再花一次模型费用。先把状态改成可解释的失败/
+ * 空闲，避免 UI 和控制台一直显示“运行中”；需要继续时由用户或父 Agent 明确发起。
+ */
+export function recoverInterruptedAgentTasks(db: Db, now = Date.now()): number {
+  let count = 0
+  try {
+    const tasks = db.prepare(
+      `SELECT id, team_id, worker_key, company_id, user_id, child_run_id
+         FROM agent_tasks WHERE status IN ('queued', 'running')`,
+    ).all() as unknown as Array<{
+      id: string
+      team_id: string
+      worker_key: string
+      company_id: string
+      user_id: string
+      child_run_id: string | null
+    }>
+    for (const task of tasks) {
+      db.prepare(
+        `UPDATE agent_tasks
+            SET status = 'failed', error = ?, finished_at = ?, updated_at = ?, wake_at = NULL, wake_state = NULL
+          WHERE id = ? AND status IN ('queued', 'running')`,
+      ).run('服务重启中断；任务和检查点已保留，需要时请重新派活', now, now, task.id)
+      try {
+        db.prepare(
+          `INSERT INTO agent_events
+             (id, team_id, company_id, user_id, worker_key, task_id, kind, payload_json, created_at, consumed_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'error', ?, ?, NULL)`,
+        ).run(
+          `evt_${randomUUID()}`,
+          task.team_id,
+          task.company_id,
+          task.user_id,
+          task.worker_key,
+          task.id,
+          JSON.stringify({ taskId: task.id, error: '服务重启中断；任务和检查点已保留' }),
+          now,
+        )
+      } catch {
+        // 事件写失败不影响收尾。
+      }
+      count += 1
+    }
+    db.prepare(
+      `UPDATE agent_workers
+          SET status = 'idle', last_text = ?, updated_at = ?
+        WHERE status = 'running'`,
+    ).run('服务重启中断，等待父 Agent 重新派活', now)
+  } catch {
+    // 启动收尾失败只影响展示，不阻断服务启动。
+  }
+  return count
 }

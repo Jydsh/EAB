@@ -15,6 +15,7 @@ import {
   mkdirSync,
   readFileSync,
   writeFileSync,
+  copyFileSync,
   statSync,
   renameSync,
   readdirSync,
@@ -22,7 +23,7 @@ import {
 } from 'node:fs'
 import { basename, dirname, extname, join } from 'node:path'
 import { EC, EabError, ulid, SC } from '@eab/domain'
-import { appendAudit } from '@eab/storage'
+import { appendAudit, type Db } from '@eab/storage'
 import { normalizeRelativePath, safeJoin, toSlug } from '@eab/workspace'
 import type { ServerDeps } from '../deps.js'
 import { ok, requireScope } from '../http.js'
@@ -31,9 +32,11 @@ import { sendDingTalkFileToUser } from '../dingtalk-outbound.js'
 import {
   buildOfficeEditorConfig,
   buildOfficePluginConfig,
+  convertOfficeDocumentToPdf,
   forceSaveOfficeDocument,
   officeDocumentKey,
   officeDocumentType,
+  officeFileType,
   officeScriptUrl,
   signOfficeJwt,
   verifyOfficeJwt,
@@ -54,9 +57,36 @@ const MAX_TEXT_BYTES = 5 * 1024 * 1024
  * 编辑态“刷新到云端版本”的版本水位。
  * 刷新时旧编辑器关闭会触发 OnlyOffice 保存回调；若回调携带的版本早于刷新水位，
  * 说明它是被放弃的旧会话，必须丢弃，不能让旧内容覆盖刚刷新的云端版本。
- * 进程内保存即可：回调在编辑器关闭后几秒内到达，不跨重启。
+ * 水位落 `workspace_office_refresh_guards`，服务重启后仍然有效。
  */
-const officeRefreshCutoffs = new Map<string, number>()
+export function setOfficeRefreshCutoff(
+  db: Db,
+  companyId: string,
+  fileId: string,
+  cutoff: number,
+): void {
+  const now = Date.now()
+  db.prepare(
+    `INSERT INTO workspace_office_refresh_guards (company_id, file_id, cutoff, updated_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(company_id, file_id)
+     DO UPDATE SET cutoff = excluded.cutoff, updated_at = excluded.updated_at`,
+  ).run(companyId, fileId, cutoff, now)
+}
+
+export function readOfficeRefreshCutoff(
+  db: Db,
+  companyId: string,
+  fileId: string,
+): number | undefined {
+  const row = db
+    .prepare('SELECT cutoff FROM workspace_office_refresh_guards WHERE company_id = ? AND file_id = ?')
+    .get(companyId, fileId) as { cutoff?: number } | undefined
+  return row?.cutoff === undefined ? undefined : Number(row.cutoff)
+}
+
+/** 记录每个文件最近一次成功回写的编辑会话，允许同一编辑器连续 status=2/6 保存。 */
+const officeAcceptedCallbackSessions = new Map<string, string>()
 
 function officeRefreshKey(companyId: string, fileId: string): string {
   return `${companyId}:${fileId}`
@@ -235,11 +265,718 @@ function diskPathOf(deps: ServerDeps, row: FileRow): string {
   return current
 }
 
+/** 每个文件最多保留最近 20 个保存前快照；旧快照按创建时间清理，避免磁盘无限增长。 */
+const WORKSPACE_VERSION_RETENTION = 20
+
+interface WorkspaceVersionRow {
+  id: string
+  company_id: string
+  file_id: string
+  version: number
+  size: number
+  storage_path: string
+  operation_id: string | null
+  source: string
+  summary: string | null
+  created_by: string
+  created_at: number
+}
+
+interface WorkspaceVersionInput {
+  readonly source: string
+  readonly operationId: string
+  readonly summary?: string
+  readonly createdBy: string
+}
+
+function versionExtOf(name: string): string {
+  const ext = extname(name).toLowerCase()
+  return /^\.[a-z0-9]{1,8}$/.test(ext) ? ext : '.bin'
+}
+
+function versionDirOf(deps: ServerDeps, row: FileRow): string {
+  return join(scopeDir(deps, row.company_id, row.scope_type, row.scope_id), '_versions', toSlug(row.id, 'f'))
+}
+
+/**
+ * 在覆盖文件前把当前磁盘内容复制到 `_versions/<fileId>/`，并写一条版本记录。
+ * 同一 `updated_at` 已存在快照时直接复用，避免回调重试产生重复副本。
+ * 快照失败必须中断写入，否则会留下“已改但无法回退”的文件。
+ */
+function snapshotWorkspaceVersion(
+  deps: ServerDeps,
+  row: FileRow,
+  input: WorkspaceVersionInput,
+): WorkspaceVersionRow {
+  const existing = deps.db
+    .prepare(
+      `SELECT * FROM workspace_file_versions
+        WHERE file_id = ? AND version = ? LIMIT 1`,
+    )
+    .get(row.id, row.updated_at) as unknown as WorkspaceVersionRow | undefined
+  if (existing) return existing
+
+  const sourcePath = diskPathOf(deps, row)
+  if (!existsSync(sourcePath)) throw new EabError(EC.NOT_FOUND, '原文件不在磁盘，无法创建版本快照')
+  const id = `ver_${ulid()}`
+  const dir = versionDirOf(deps, row)
+  mkdirSync(dir, { recursive: true })
+  const storagePath = join(dir, `${row.updated_at}-${id}${versionExtOf(row.name)}`)
+  copyFileSync(sourcePath, storagePath)
+  const now = Date.now()
+  try {
+    deps.db
+      .prepare(
+        `INSERT INTO workspace_file_versions
+          (id, company_id, file_id, version, size, storage_path, operation_id, source, summary, created_by, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        id,
+        row.company_id,
+        row.id,
+        row.updated_at,
+        row.size,
+        storagePath,
+        input.operationId,
+        input.source,
+        input.summary ?? null,
+        input.createdBy,
+        now,
+      )
+  } catch (error) {
+    rmSync(storagePath, { force: true })
+    throw error
+  }
+
+  // 只保留最近 N 条；先删记录再删文件，避免清理中断留下无主文件。
+  const expired = deps.db
+    .prepare(
+      `SELECT id, storage_path FROM workspace_file_versions
+        WHERE file_id = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT -1 OFFSET ?`,
+    )
+    .all(row.id, WORKSPACE_VERSION_RETENTION) as unknown as Array<{ id: string; storage_path: string }>
+  for (const item of expired) {
+    deps.db.prepare('DELETE FROM workspace_file_versions WHERE id = ?').run(item.id)
+    rmSync(item.storage_path, { force: true })
+  }
+
+  return deps.db
+    .prepare('SELECT * FROM workspace_file_versions WHERE id = ?')
+    .get(id) as unknown as WorkspaceVersionRow
+}
+
+function versionListRow(row: WorkspaceVersionRow) {
+  return {
+    id: row.id,
+    version: row.version,
+    size: row.size,
+    source: row.source,
+    operationId: row.operation_id,
+    summary: row.summary,
+    createdBy: row.created_by,
+    createdAt: row.created_at,
+  }
+}
+
+/** 版本历史只给文件本人看；共享文件不暴露旧内容。 */
+export function listWorkspaceFileVersions(
+  deps: ServerDeps,
+  actor: RequestActor,
+  fileId: string,
+): ReturnType<typeof versionListRow>[] {
+  requireEnabled(actor)
+  const row = deps.db
+    .prepare('SELECT * FROM workspace_files WHERE id = ? AND company_id = ? AND deleted_at IS NULL')
+    .get(fileId, actor.subject.companyId) as unknown as FileRow | undefined
+  if (!row) throw new EabError(EC.NOT_FOUND, '文件不存在')
+  if (row.owner_user_id !== actor.subject.userId) throw new EabError(EC.FORBIDDEN, '只能查看自己的文件版本')
+  const versions = deps.db
+    .prepare(
+      `SELECT * FROM workspace_file_versions
+        WHERE company_id = ? AND file_id = ?
+        ORDER BY created_at DESC, id DESC`,
+    )
+    .all(actor.subject.companyId, fileId) as unknown as WorkspaceVersionRow[]
+  return versions.map(versionListRow)
+}
+
+/** 手动把当前版本存为快照；没有变化时复用已有快照，返回 created=false。 */
+export function createWorkspaceFileSnapshot(
+  deps: ServerDeps,
+  actor: RequestActor,
+  fileId: string,
+): ReturnType<typeof versionListRow> & { created: boolean } {
+  requireEnabled(actor)
+  const row = deps.db
+    .prepare('SELECT * FROM workspace_files WHERE id = ? AND company_id = ? AND deleted_at IS NULL')
+    .get(fileId, actor.subject.companyId) as unknown as FileRow | undefined
+  if (!row) throw new EabError(EC.NOT_FOUND, '文件不存在')
+  if (row.owner_user_id !== actor.subject.userId) throw new EabError(EC.FORBIDDEN, '只能给自己的文件创建版本快照')
+  const existed = deps.db
+    .prepare('SELECT id FROM workspace_file_versions WHERE file_id = ? AND version = ? LIMIT 1')
+    .get(fileId, row.updated_at) as { id?: string } | undefined
+  const version = snapshotWorkspaceVersion(deps, row, {
+    source: 'workspace.snapshot',
+    operationId: `op_${ulid()}`,
+    summary: '手动版本快照',
+    createdBy: actor.subject.userId,
+  })
+  return { ...versionListRow(version), created: !existed }
+}
+
+export function readWorkspaceFileVersion(
+  deps: ServerDeps,
+  actor: RequestActor,
+  fileId: string,
+  versionId: string,
+): { row: FileRow; version: WorkspaceVersionRow; buffer: Buffer } {
+  requireEnabled(actor)
+  const row = deps.db
+    .prepare('SELECT * FROM workspace_files WHERE id = ? AND company_id = ? AND deleted_at IS NULL')
+    .get(fileId, actor.subject.companyId) as unknown as FileRow | undefined
+  if (!row) throw new EabError(EC.NOT_FOUND, '文件不存在')
+  if (row.owner_user_id !== actor.subject.userId) throw new EabError(EC.FORBIDDEN, '只能读取自己的文件版本')
+  const version = deps.db
+    .prepare(
+      `SELECT * FROM workspace_file_versions
+        WHERE id = ? AND company_id = ? AND file_id = ? LIMIT 1`,
+    )
+    .get(versionId, actor.subject.companyId, fileId) as unknown as WorkspaceVersionRow | undefined
+  if (!version) throw new EabError(EC.NOT_FOUND, '版本不存在或已被清理')
+  if (!existsSync(version.storage_path)) throw new EabError(EC.NOT_FOUND, '版本快照已不在磁盘')
+  return { row, version, buffer: readFileSync(version.storage_path) }
+}
+
+/** 恢复到指定历史版本：先把当前版本再存一份，保证恢复本身也可回退。 */
+export function restoreWorkspaceFileVersion(
+  deps: ServerDeps,
+  actor: RequestActor,
+  fileId: string,
+  versionId: string,
+): { file: WorkspaceFileEditResult; restoredVersion: ReturnType<typeof versionListRow> } {
+  const { row, version, buffer } = readWorkspaceFileVersion(deps, actor, fileId, versionId)
+  const file = editUserWorkspaceFile(deps, actor, fileId, buffer, {
+    source: 'workspace.restore',
+    operationId: `op_${ulid()}`,
+    baseVersion: row.updated_at,
+    restoredFromVersion: version.version,
+    summary: `恢复到 ${new Date(version.created_at).toLocaleString('zh-CN')} 的历史版本`,
+  })
+  return { file, restoredVersion: versionListRow(version) }
+}
+
+
 function deptIdsOf(actor: ReturnType<typeof resolveActor>): string[] {
   return actor.subject.deptChain
     .flatMap((item) => item.split('/').filter(Boolean))
     .filter((item) => item.startsWith('d_') || /^d\d+$/.test(item) || item.length > 1)
     .filter((item) => item !== actor.subject.companyId)
+}
+
+/**
+ * GUI 兜底：只允许少量 L1/L2 没有 API 的原生入口。
+ * 服务器不执行任意宏、不按坐标点击、不读写用户桌面；这里只负责白名单、
+ * 用户确认与结果审计，具体点击由用户在 OnlyOffice 界面完成。
+ */
+export type WorkspaceGuiActionId = 'print' | 'macro' | 'export' | 'dialog'
+export type WorkspaceGuiFallbackStatus = 'prepared' | 'confirmed' | 'succeeded' | 'failed' | 'expired'
+
+interface WorkspaceGuiDialogDef {
+  readonly label: string
+  readonly description: string
+  readonly steps: readonly string[]
+}
+
+const WORKSPACE_GUI_DIALOGS: Record<string, WorkspaceGuiDialogDef> = {
+  page_setup: {
+    label: '页面设置',
+    description: '设置纸张、方向、页边距和版式；仅在 docx 预览中开放。',
+    steps: [
+      '在 OnlyOffice 顶部工具栏打开“布局”选项卡，点击“页面设置”。',
+      '在原生对话框中调整纸张、方向、页边距或版式。',
+      '确认后点击“确定”；如果只是查看设置，可以直接取消，不会改动云空间文件。',
+    ],
+  },
+  header_footer: {
+    label: '页眉页脚',
+    description: '编辑页眉、页脚、页码和首页不同；仅在 docx 预览中开放。',
+    steps: [
+      '在 OnlyOffice 顶部工具栏打开“插入”选项卡，选择“页眉/页脚”。',
+      '在原生面板里编辑页眉页脚内容，或设置首页不同、奇偶页不同。',
+      '完成后关闭面板并按需保存；EAB 不会代替你提交这些原生设置。',
+    ],
+  },
+}
+
+const WORKSPACE_GUI_ACTIONS: Record<WorkspaceGuiActionId, {
+  readonly label: string
+  readonly description: string
+  readonly mode: OfficeMode
+}> = {
+  print: {
+    label: '打印 / 打印设置',
+    description: '打开 OnlyOffice 原生打印对话框，确认打印机、纸张、方向和页码范围。',
+    mode: 'view',
+  },
+  macro: {
+    label: '宏管理器',
+    description: '打开 OnlyOffice 宏管理器；EAB 不读取、不保存、不自动执行宏代码。',
+    mode: 'edit',
+  },
+  export: {
+    label: '导出选项',
+    description: '打开 OnlyOffice 原生导出/另存为入口，选择格式和本地保存位置。',
+    mode: 'view',
+  },
+  dialog: {
+    label: 'OnlyOffice 原生对话框',
+    description: '打开页面设置、页眉页脚等没有 API 的原生对话框。',
+    mode: 'edit',
+  },
+}
+
+const WORKSPACE_GUI_EXPORT_FORMATS = new Set(['pdf', 'docx', 'xlsx', 'pptx', 'csv'])
+
+export interface WorkspaceGuiFallbackResult {
+  readonly fallbackId: string
+  readonly fileId: string
+  readonly fileName: string
+  readonly fileVersion: number
+  readonly guiAction: string
+  readonly guiLabel: string
+  readonly guiDescription: string
+  readonly mode: OfficeMode
+  readonly status: WorkspaceGuiFallbackStatus
+  readonly steps: string[]
+  readonly params: Record<string, string>
+  readonly note: string | null
+  readonly attempts: number
+  readonly requiresUserConfirmation: boolean
+  readonly canReport: boolean
+  readonly createdAt: number
+  readonly expiresAt: number
+  readonly confirmedAt: number | null
+  readonly finishedAt: number | null
+}
+
+interface WorkspaceGuiFallbackRow {
+  id: string
+  company_id: string
+  file_id: string
+  user_id: string
+  gui_action: string
+  gui_label: string
+  mode: string
+  params_json: string
+  steps_json: string
+  status: WorkspaceGuiFallbackStatus
+  attempts: number
+  note: string | null
+  detail_json: string | null
+  created_at: number
+  expires_at: number
+  confirmed_at: number | null
+  finished_at: number | null
+}
+
+interface WorkspaceGuiAuditContext {
+  readonly actor: RequestActor
+  readonly traceId?: string
+  readonly ip?: string
+  readonly channel?: 'web' | 'agent'
+}
+
+const WORKSPACE_GUI_FALLBACK_TTL_MS = 10 * 60 * 1000
+
+function guiFallbackSteps(action: WorkspaceGuiActionId, params: Record<string, string>): string[] {
+  if (action === 'print') {
+    return [
+      '在 OnlyOffice 顶部工具栏打开“文件”菜单，选择“打印”。',
+      '在打印对话框里确认打印机、纸张、方向、页边距和页码范围。',
+      '确认无误后点击“打印”；只调整设置时可以直接取消，不会改动云空间文件。',
+    ]
+  }
+  if (action === 'macro') {
+    return [
+      '切换到“视图”选项卡，点击“宏”打开宏管理器。',
+      '选择已有宏或粘贴宏代码；EAB 不会读取、保存或自动执行宏内容。',
+      '确认宏来源可信后手动运行；运行后按需保存文档，并检查结果。',
+    ]
+  }
+  if (action === 'export') {
+    const format = params.format || 'PDF 或原格式'
+    return [
+      '打开“文件”菜单，选择“导出为”或“另存为”。',
+      `选择目标格式（${format}）和导出选项，确认保存位置。`,
+      '导出只生成本地副本，不会覆盖云空间文件；需要云端 PDF 时再使用“导出 PDF”。',
+    ]
+  }
+  const dialog = WORKSPACE_GUI_DIALOGS[params.dialog || '']
+  return dialog ? [...dialog.steps] : ['在 OnlyOffice 原生界面中完成所选操作。']
+}
+
+function guiFallbackView(row: WorkspaceGuiFallbackRow, file: FileRow): WorkspaceGuiFallbackResult {
+  const action = row.gui_action as WorkspaceGuiActionId
+  const def = WORKSPACE_GUI_ACTIONS[action] ?? WORKSPACE_GUI_ACTIONS.print
+  let params: Record<string, string> = {}
+  try {
+    const parsed = JSON.parse(row.params_json) as unknown
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+        if (typeof value === 'string') params[key] = value
+      }
+    }
+  } catch {
+    params = {}
+  }
+  let steps: string[] = []
+  try {
+    const parsed = JSON.parse(row.steps_json) as unknown
+    if (Array.isArray(parsed)) steps = parsed.filter((item): item is string => typeof item === 'string')
+  } catch {
+    steps = []
+  }
+  const status = row.status === 'prepared' && row.expires_at <= Date.now() ? 'expired' : row.status
+  return {
+    fallbackId: row.id,
+    fileId: row.file_id,
+    fileName: file.name,
+    fileVersion: Number(file.updated_at),
+    guiAction: row.gui_action,
+    guiLabel: row.gui_label,
+    guiDescription: def.description,
+    mode: (row.mode === 'edit' ? 'edit' : 'view') as OfficeMode,
+    status,
+    steps,
+    params,
+    note: row.note,
+    attempts: row.attempts,
+    requiresUserConfirmation: status === 'prepared',
+    canReport: status === 'confirmed',
+    createdAt: row.created_at,
+    expiresAt: row.expires_at,
+    confirmedAt: row.confirmed_at,
+    finishedAt: row.finished_at,
+  }
+}
+
+function auditGuiFallback(
+  deps: ServerDeps,
+  ctx: WorkspaceGuiAuditContext,
+  file: FileRow,
+  row: WorkspaceGuiFallbackRow | null,
+  phase: string,
+  result: 'success' | 'failure',
+  detail: Record<string, unknown> = {},
+): void {
+  appendAudit(deps.db, {
+    companyId: ctx.actor.subject.companyId,
+    actorUserId: ctx.actor.subject.userId,
+    action: 'workspace.file.agent_gui',
+    resourceType: 'file',
+    resourceId: file.id,
+    resourceScope: `${file.scope_type}:${file.scope_id}`,
+    result,
+    detail: {
+      phase,
+      guiAction: row?.gui_action ?? detail.guiAction ?? null,
+      guiLabel: row?.gui_label ?? null,
+      mode: row?.mode ?? null,
+      ...(row ? { fallbackId: row.id, attempts: row.attempts, status: row.status } : {}),
+      ...detail,
+    },
+    traceId: ctx.traceId ?? null,
+    ip: ctx.ip ?? null,
+    channel: ctx.channel ?? 'web',
+  })
+}
+
+function resolveGuiFallbackFile(deps: ServerDeps, actor: RequestActor, fileId: string): FileRow {
+  const row = deps.db
+    .prepare(
+      `SELECT * FROM workspace_files
+        WHERE id = ? AND company_id = ? AND owner_user_id = ? AND deleted_at IS NULL LIMIT 1`,
+    )
+    .get(fileId, actor.subject.companyId, actor.subject.userId) as unknown as FileRow | undefined
+  if (!row) throw new EabError(EC.NOT_FOUND, '云空间里没有找到该文件，或你不是文件本人')
+  return row
+}
+
+function resolveGuiFallbackInputFile(
+  deps: ServerDeps,
+  actor: RequestActor,
+  input: { fileId?: string; path?: string },
+): FileRow {
+  const fileId = String(input.fileId ?? '').trim()
+  const relPath = String(input.path ?? '').trim()
+  let row: FileRow | undefined
+  if (fileId) {
+    row = deps.db
+      .prepare(
+        `SELECT * FROM workspace_files
+          WHERE id = ? AND company_id = ? AND owner_user_id = ? AND deleted_at IS NULL LIMIT 1`,
+      )
+      .get(fileId, actor.subject.companyId, actor.subject.userId) as unknown as FileRow | undefined
+  } else if (relPath) {
+    row = deps.db
+      .prepare(
+        `SELECT * FROM workspace_files
+          WHERE company_id = ? AND owner_user_id = ? AND deleted_at IS NULL
+            AND (rel_path = ? OR name = ?)
+          ORDER BY updated_at DESC LIMIT 1`,
+      )
+      .get(actor.subject.companyId, actor.subject.userId, relPath, relPath) as unknown as FileRow | undefined
+  } else {
+    throw new EabError(EC.VALIDATION, 'fileId 和 path 至少提供一个')
+  }
+  if (!row) throw new EabError(EC.NOT_FOUND, '云空间里没有找到该文件')
+  return row
+}
+
+function normalizeGuiAction(value: unknown): WorkspaceGuiActionId {
+  const action = String(value ?? 'print').trim().toLowerCase()
+  if (!Object.prototype.hasOwnProperty.call(WORKSPACE_GUI_ACTIONS, action)) {
+    throw new EabError(EC.VALIDATION, `GUI 兜底动作不在白名单内: ${action || '空'}`, {
+      details: { allowedActions: Object.keys(WORKSPACE_GUI_ACTIONS) },
+      hint: '只支持 print、macro、export、dialog；不要尝试任意宏、坐标点击或未列出的原生按钮',
+    })
+  }
+  return action as WorkspaceGuiActionId
+}
+
+function normalizeGuiParams(file: FileRow, action: WorkspaceGuiActionId, input: {
+  dialog?: string
+  format?: string
+  note?: string
+}): { params: Record<string, string>; note: string | null } {
+  const params: Record<string, string> = {}
+  if (action === 'dialog') {
+    const dialog = String(input.dialog ?? '').trim().toLowerCase()
+    if (!dialog || !Object.prototype.hasOwnProperty.call(WORKSPACE_GUI_DIALOGS, dialog)) {
+      throw new EabError(EC.VALIDATION, `原生对话框不在白名单内: ${dialog || '空'}`, {
+        details: { allowedDialogs: Object.keys(WORKSPACE_GUI_DIALOGS) },
+        hint: 'dialog 只能是 page_setup 或 header_footer，且仅支持 docx',
+      })
+    }
+    if (!/\.docx$/i.test(file.name)) {
+      throw new EabError(EC.VALIDATION, `${file.name} 不支持这个 docx 原生对话框`)
+    }
+    params.dialog = dialog
+  }
+  if (typeof input.format === 'string' && input.format.trim()) {
+    const format = input.format.trim().toLowerCase()
+    if (!WORKSPACE_GUI_EXPORT_FORMATS.has(format)) {
+      throw new EabError(EC.VALIDATION, `导出格式不在白名单内: ${format}`, {
+        details: { allowedFormats: [...WORKSPACE_GUI_EXPORT_FORMATS] },
+      })
+    }
+    params.format = format
+  }
+  const note = typeof input.note === 'string' ? input.note.replace(/[\u0000-\u001f]/g, ' ').trim() : ''
+  if (note.length > 200) throw new EabError(EC.VALIDATION, 'note 最多 200 字')
+  return { params, note: note || null }
+}
+
+export interface PrepareWorkspaceGuiFallbackInput {
+  readonly fileId?: string
+  readonly path?: string
+  readonly action?: string
+  readonly dialog?: string
+  readonly format?: string
+  readonly note?: string
+}
+
+/** 准备一次 GUI 兜底：只落状态和审计，不执行任何桌面操作。 */
+export function prepareWorkspaceGuiFallback(
+  deps: ServerDeps,
+  ctx: WorkspaceGuiAuditContext,
+  input: PrepareWorkspaceGuiFallbackInput,
+): WorkspaceGuiFallbackResult {
+  const actor = ctx.actor
+  requireEnabled(actor)
+  const file = resolveGuiFallbackInputFile(deps, actor, input)
+  if (!officeDocumentType(file.name, file.mime)) {
+    throw new EabError(EC.VALIDATION, `${file.name} 不是 docx/xlsx/pptx，不能使用 Office GUI 兜底`)
+  }
+  const action = normalizeGuiAction(input.action)
+  const { params, note } = normalizeGuiParams(file, action, input)
+  const dialogDef = action === 'dialog' ? WORKSPACE_GUI_DIALOGS[params.dialog] : null
+  const def = WORKSPACE_GUI_ACTIONS[action]
+  const guiLabel = dialogDef ? `OnlyOffice 原生对话框 · ${dialogDef.label}` : def.label
+  const steps = guiFallbackSteps(action, params)
+  const now = Date.now()
+  const expiresAt = now + WORKSPACE_GUI_FALLBACK_TTL_MS
+  const id = `gui_${ulid()}`
+  const mode = action === 'dialog' ? 'edit' : def.mode
+  deps.db
+    .prepare(
+      `INSERT INTO workspace_gui_fallbacks
+        (id, company_id, file_id, user_id, gui_action, gui_label, mode, params_json, steps_json,
+         status, attempts, note, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', 0, ?, ?, ?)`,
+    )
+    .run(
+      id,
+      file.company_id,
+      file.id,
+      actor.subject.userId,
+      action,
+      guiLabel,
+      mode,
+      JSON.stringify(params),
+      JSON.stringify(steps),
+      note,
+      now,
+      expiresAt,
+    )
+  const row = deps.db
+    .prepare('SELECT * FROM workspace_gui_fallbacks WHERE id = ?')
+    .get(id) as unknown as WorkspaceGuiFallbackRow
+  auditGuiFallback(deps, ctx, file, row, 'prepared', 'success', {
+    guiAction: action,
+    guiLabel,
+    mode,
+    stepCount: steps.length,
+    expiresAt,
+    note,
+  })
+  return guiFallbackView(row, file)
+}
+
+function readGuiFallbackRow(
+  deps: ServerDeps,
+  actor: RequestActor,
+  file: FileRow,
+  fallbackId: string,
+): WorkspaceGuiFallbackRow {
+  const id = String(fallbackId ?? '').trim()
+  if (!id) throw new EabError(EC.VALIDATION, 'fallbackId 必填')
+  const row = deps.db
+    .prepare(
+      `SELECT * FROM workspace_gui_fallbacks
+        WHERE id = ? AND company_id = ? AND file_id = ? AND user_id = ? LIMIT 1`,
+    )
+    .get(id, actor.subject.companyId, file.id, actor.subject.userId) as unknown as WorkspaceGuiFallbackRow | undefined
+  if (!row) throw new EabError(EC.NOT_FOUND, 'GUI 兜底记录不存在')
+  return row
+}
+
+function expireGuiFallback(
+  deps: ServerDeps,
+  ctx: WorkspaceGuiAuditContext,
+  file: FileRow,
+  row: WorkspaceGuiFallbackRow,
+): WorkspaceGuiFallbackRow {
+  if (row.status !== 'prepared' && row.status !== 'confirmed') return row
+  deps.db
+    .prepare("UPDATE workspace_gui_fallbacks SET status = 'expired', finished_at = ? WHERE id = ? AND status IN ('prepared','confirmed')")
+    .run(Date.now(), row.id)
+  const expired = deps.db
+    .prepare('SELECT * FROM workspace_gui_fallbacks WHERE id = ?')
+    .get(row.id) as unknown as WorkspaceGuiFallbackRow
+  auditGuiFallback(deps, ctx, file, expired, 'expired', 'failure', { reason: 'confirmation_expired' })
+  return expired
+}
+
+/** 用户确认后才允许执行/上报；Agent 不能自行确认。 */
+export function confirmWorkspaceGuiFallback(
+  deps: ServerDeps,
+  ctx: WorkspaceGuiAuditContext,
+  fileId: string,
+  fallbackId: string,
+): WorkspaceGuiFallbackResult {
+  const actor = ctx.actor
+  requireEnabled(actor)
+  const file = resolveGuiFallbackFile(deps, actor, fileId)
+  let row = readGuiFallbackRow(deps, actor, file, fallbackId)
+  if (row.status === 'prepared' && row.expires_at <= Date.now()) row = expireGuiFallback(deps, ctx, file, row)
+  if (row.status === 'expired') throw new EabError(EC.CONFLICT, 'GUI 兜底确认已过期，请重新发起')
+  if (row.status !== 'prepared') {
+    throw new EabError(EC.CONFLICT, `当前状态是 ${row.status}，不能重复确认`, {
+      details: { status: row.status, fallbackId: row.id },
+    })
+  }
+  const now = Date.now()
+  const changed = deps.db
+    .prepare("UPDATE workspace_gui_fallbacks SET status = 'confirmed', confirmed_at = ? WHERE id = ? AND status = 'prepared'")
+    .run(now, row.id)
+  if (!Number(changed.changes)) throw new EabError(EC.CONFLICT, 'GUI 兜底已被其他请求确认，请刷新状态')
+  row = deps.db
+    .prepare('SELECT * FROM workspace_gui_fallbacks WHERE id = ?')
+    .get(row.id) as unknown as WorkspaceGuiFallbackRow
+  auditGuiFallback(deps, ctx, file, row, 'confirmed', 'success', { confirmedAt: now })
+  return guiFallbackView(row, file)
+}
+
+/** 上报人工结果；失败后同一条记录不得再次确认或上报。 */
+export function reportWorkspaceGuiFallback(
+  deps: ServerDeps,
+  ctx: WorkspaceGuiAuditContext,
+  fileId: string,
+  fallbackId: string,
+  status: 'success' | 'failure',
+  detail?: string,
+): WorkspaceGuiFallbackResult {
+  const actor = ctx.actor
+  requireEnabled(actor)
+  const file = resolveGuiFallbackFile(deps, actor, fileId)
+  let row = readGuiFallbackRow(deps, actor, file, fallbackId)
+  if (row.status === 'prepared') throw new EabError(EC.CONFLICT, '还没有经过用户确认，不能上报结果')
+  if (row.status === 'expired') throw new EabError(EC.CONFLICT, 'GUI 兜底已过期，请重新发起')
+  if (row.status !== 'confirmed') {
+    throw new EabError(EC.CONFLICT, `当前状态是 ${row.status}，结果已结束；失败后不会自动重试，请重新发起`, {
+      details: { status: row.status, attempts: row.attempts, fallbackId: row.id },
+    })
+  }
+  if (status !== 'success' && status !== 'failure') {
+    throw new EabError(EC.VALIDATION, "result 只能是 success 或 failure")
+  }
+  const reason = typeof detail === 'string' ? detail.replace(/[\u0000-\u001f]/g, ' ').trim() : ''
+  if (status === 'failure' && !reason) throw new EabError(EC.VALIDATION, '失败时必须填写原因，失败后不会自动重试')
+  if (reason.length > 500) throw new EabError(EC.VALIDATION, 'detail 最多 500 字')
+  const now = Date.now()
+  const nextStatus: WorkspaceGuiFallbackStatus = status === 'success' ? 'succeeded' : 'failed'
+  const changed = deps.db
+    .prepare(
+      `UPDATE workspace_gui_fallbacks
+          SET status = ?, attempts = attempts + 1, finished_at = ?, detail_json = ?
+        WHERE id = ? AND status = 'confirmed'`,
+    )
+    .run(nextStatus, now, JSON.stringify({ result: status, reason: reason || null }), row.id)
+  if (!Number(changed.changes)) throw new EabError(EC.CONFLICT, '偏底状态已变化，请刷新后重试')
+  row = deps.db
+    .prepare('SELECT * FROM workspace_gui_fallbacks WHERE id = ?')
+    .get(row.id) as unknown as WorkspaceGuiFallbackRow
+  auditGuiFallback(
+    deps,
+    ctx,
+    file,
+    row,
+    status === 'success' ? 'succeeded' : 'failed',
+    status === 'success' ? 'success' : 'failure',
+    { reason: reason || null, attempts: row.attempts },
+  )
+  return guiFallbackView(row, file)
+}
+
+/** 查询状态；过期的准备状态会顺手落为 expired，并写审计。 */
+export function getWorkspaceGuiFallback(
+  deps: ServerDeps,
+  ctx: WorkspaceGuiAuditContext,
+  fileId: string,
+  fallbackId: string,
+): WorkspaceGuiFallbackResult {
+  const actor = ctx.actor
+  requireEnabled(actor)
+  const file = resolveGuiFallbackFile(deps, actor, fileId)
+  let row = readGuiFallbackRow(deps, actor, file, fallbackId)
+  if ((row.status === 'prepared' || row.status === 'confirmed') && row.expires_at <= Date.now()) {
+    row = expireGuiFallback(deps, ctx, file, row)
+  }
+  return guiFallbackView(row, file)
 }
 
 function audit(deps: ServerDeps, req: FastifyRequest, action: string, row: FileRow | null, detail: Record<string, unknown>): void {
@@ -460,6 +1197,7 @@ function issueOfficeToken(
   mode: OfficeMode,
   kind: OfficeTokenPayload['kind'],
   ttlSec = OFFICE_TOKEN_TTL_SEC,
+  sessionId?: string,
 ): string {
   const now = Math.floor(Date.now() / 1000)
   return signOfficeJwt(
@@ -470,6 +1208,7 @@ function issueOfficeToken(
       userId,
       mode,
       version: row.updated_at,
+      ...(sessionId ? { sid: sessionId } : {}),
       iat: now,
       exp: now + ttlSec,
     },
@@ -487,7 +1226,9 @@ function officeContentUrl(deps: ServerDeps, row: FileRow, userId: string, mode: 
 }
 
 function officeCallbackUrl(deps: ServerDeps, row: FileRow, userId: string, mode: OfficeMode): string {
-  const token = issueOfficeToken(deps, row, userId, mode, 'callback')
+  // 每次打开编辑器生成新的会话标识；同一编辑器 status=2 后紧跟 status=6 时仍可保存，
+  // 但另一个停留在旧版本的编辑器会被版本冲突拦截。
+  const token = issueOfficeToken(deps, row, userId, mode, 'callback', OFFICE_TOKEN_TTL_SEC, `os_${ulid()}`)
   return officeInternalUrl(deps, `/api/workspace/office/${encodeURIComponent(row.id)}/callback/${token}`)
 }
 
@@ -574,6 +1315,33 @@ function saveOfficeFileContent(
   if (row.owner_user_id !== payload.userId) {
     throw new EabError(EC.FORBIDDEN, '只有文件本人可以保存编辑内容')
   }
+  if (row.updated_at > payload.version) {
+    const lastSession = officeAcceptedCallbackSessions.get(officeRefreshKey(row.company_id, row.id))
+    // 同一个编辑会话在 status=2 保存后可能继续发 status=6；这是它自己的后续保存，
+    // 不是另一个旧编辑器。没有会话标识的旧 token 一律按冲突拒绝。
+    if (!payload.sid || lastSession !== payload.sid) {
+      appendAudit(deps.db, {
+        companyId: row.company_id,
+        actorUserId: row.owner_user_id,
+        action: 'workspace.file.office_conflict',
+        resourceType: 'file',
+        resourceId: row.id,
+        resourceScope: `${row.scope_type}:${row.scope_id}`,
+        result: 'failure',
+        detail: {
+          relPath: row.rel_path,
+          payloadVersion: payload.version,
+          currentVersion: row.updated_at,
+          sessionId: payload.sid ?? null,
+          reason: 'stale editor callback',
+        },
+        traceId: String(req.id),
+        ip: req.ip,
+        channel: 'web',
+      })
+      throw new EabError(EC.CONFLICT, '云端文件已更新，旧编辑会话的回写被拒绝')
+    }
+  }
   const policy = resolveUserWorkspaceQuota(deps.db, row.company_id, row.owner_user_id)
   if (buffer.length > policy.fileLimitBytes) {
     throw new EabError(EC.VALIDATION, `文件超过单文件上限（${formatQuotaBytes(policy.fileLimitBytes)}）`)
@@ -589,6 +1357,13 @@ function saveOfficeFileContent(
   }
   const path = diskPathOf(deps, row)
   if (!existsSync(path)) throw new EabError(EC.NOT_FOUND, '原文件不在磁盘，无法保存')
+  const operationId = `op_${ulid()}`
+  const snapshot = snapshotWorkspaceVersion(deps, row, {
+    source: 'onlyoffice.save',
+    operationId,
+    summary: 'OnlyOffice 保存前版本',
+    createdBy: row.owner_user_id,
+  })
   writeFileSync(path, buffer)
   const now = Date.now()
   deps.db
@@ -606,11 +1381,23 @@ function saveOfficeFileContent(
     resourceId: row.id,
     resourceScope: `${row.scope_type}:${row.scope_id}`,
     result: 'success',
-    detail: { relPath: row.rel_path, size: buffer.length, source: 'onlyoffice' },
+    detail: {
+      relPath: row.rel_path,
+      size: buffer.length,
+      beforeSize: row.size,
+      afterSize: buffer.length,
+      source: 'onlyoffice',
+      operationId,
+      snapshotId: snapshot.id,
+      snapshotVersion: snapshot.version,
+    },
     traceId: String(req.id),
     ip: req.ip,
     channel: 'web',
   })
+  if (payload.sid) {
+    officeAcceptedCallbackSessions.set(officeRefreshKey(row.company_id, row.id), payload.sid)
+  }
 }
 
 /** 强制保存是异步命令；回调写回后 updated_at 才会前进，轮询给插件一个可确认的结果。 */
@@ -643,6 +1430,7 @@ export interface WorkspaceFileEditResult {
   relPath: string
   size: number
   updatedAt: number
+  snapshot?: { id: string; version: number }
 }
 
 export function editUserWorkspaceFile(
@@ -658,6 +1446,13 @@ export function editUserWorkspaceFile(
     .get(fileId, actor.subject.companyId) as unknown as FileRow | undefined
   if (!row) throw new EabError(EC.NOT_FOUND, '文件不存在')
   if (row.owner_user_id !== actor.subject.userId) throw new EabError(EC.FORBIDDEN, '只能修改自己的文件')
+  const expectedVersion = detail.baseVersion === undefined ? undefined : Number(detail.baseVersion)
+  if (expectedVersion !== undefined && Number.isFinite(expectedVersion) && row.updated_at !== expectedVersion) {
+    throw new EabError(EC.CONFLICT, '文件已被其它操作更新，请重新读取后再写入', {
+      details: { expectedVersion, currentVersion: row.updated_at },
+      hint: '重新拉取文件内容并确认目标片段后再重试；本次没有写入磁盘。',
+    })
+  }
 
   const policy = resolveUserWorkspaceQuota(deps.db, row.company_id, row.owner_user_id)
   if (buffer.length > policy.fileLimitBytes) {
@@ -674,6 +1469,16 @@ export function editUserWorkspaceFile(
   }
   const path = diskPathOf(deps, row)
   if (!existsSync(path)) throw new EabError(EC.NOT_FOUND, '原文件不在磁盘，无法保存')
+  const operationId = typeof detail.operationId === 'string' && detail.operationId
+    ? detail.operationId
+    : `op_${ulid()}`
+  const source = typeof detail.source === 'string' && detail.source ? detail.source : 'workspace.edit'
+  const snapshot = snapshotWorkspaceVersion(deps, row, {
+    source,
+    operationId,
+    summary: typeof detail.summary === 'string' ? detail.summary : undefined,
+    createdBy: actor.subject.userId,
+  })
   writeFileSync(path, buffer)
   const now = Date.now()
   deps.db
@@ -691,7 +1496,16 @@ export function editUserWorkspaceFile(
     resourceId: row.id,
     resourceScope: `${row.scope_type}:${row.scope_id}`,
     result: 'success',
-    detail: { relPath: row.rel_path, size: buffer.length, ...detail },
+    detail: {
+      ...detail,
+      relPath: row.rel_path,
+      size: buffer.length,
+      beforeSize: row.size,
+      afterSize: buffer.length,
+      operationId,
+      snapshotId: snapshot.id,
+      snapshotVersion: snapshot.version,
+    },
     traceId: null,
     ip: null,
     channel: 'agent',
@@ -702,6 +1516,7 @@ export function editUserWorkspaceFile(
     relPath: row.rel_path,
     size: buffer.length,
     updatedAt: now,
+    snapshot: { id: snapshot.id, version: snapshot.version },
   }
 }
 
@@ -803,6 +1618,32 @@ export function saveUserWorkspaceFile(
     mime: input.mime ?? null,
     root: dir,
   }
+}
+
+/** 通过 OnlyOffice 把云空间 Office 文件转成 PDF；只读取，不改文件、不写版本。 */
+export async function exportWorkspaceFileToPdf(
+  deps: ServerDeps,
+  actor: RequestActor,
+  fileId: string,
+): Promise<{ row: FileRow; buffer: Buffer }> {
+  requireEnabled(actor)
+  requireScope(actor.subject, SC.WORKSPACE_READ)
+  if (!onlyOfficeReady(deps)) throw new EabError(EC.VALIDATION, 'OnlyOffice 文档服务未配置')
+  const row = officeRowOf(deps, actor.subject.companyId, fileId)
+  if (!row) throw new EabError(EC.NOT_FOUND, '文件不存在')
+  if (row.owner_user_id !== actor.subject.userId && !isShared(deps, row, actor)) {
+    throw new EabError(EC.FORBIDDEN, '没有该文件的访问权限')
+  }
+  if (!officeDocumentType(row.name, row.mime)) throw new EabError(EC.VALIDATION, '这个文件不是可导出的 Office 文档')
+  const buffer = await convertOfficeDocumentToPdf({
+    url: officeRuntime(deps).url,
+    secret: officeRuntime(deps).jwtSecret,
+    fileUrl: officeContentUrl(deps, row, actor.subject.userId, 'view'),
+    fileType: officeFileType(row.name),
+    title: row.name,
+    key: officeDocumentKey(row.id, row.updated_at),
+  })
+  return { row, buffer }
 }
 
 export function registerWorkspaceRoutes(app: FastifyInstance, deps: ServerDeps): void {
@@ -1121,7 +1962,7 @@ export function registerWorkspaceRoutes(app: FastifyInstance, deps: ServerDeps):
       if (row.owner_user_id !== actor.subject.userId) {
         throw new EabError(EC.FORBIDDEN, '只有文件本人可以刷新编辑版本')
       }
-      officeRefreshCutoffs.set(officeRefreshKey(row.company_id, row.id), row.updated_at)
+      setOfficeRefreshCutoff(deps.db, row.company_id, row.id, row.updated_at)
       reply.header('cache-control', 'no-store')
       return ok({ fileId: row.id, cutoff: row.updated_at })
     },
@@ -1164,7 +2005,7 @@ export function registerWorkspaceRoutes(app: FastifyInstance, deps: ServerDeps):
       const row = officeRowOf(deps, payload.companyId, payload.fileId)
       if (!row) return reply.send({ error: 1 })
       if (row.owner_user_id !== payload.userId) return reply.send({ error: 1 })
-      const cutoff = officeRefreshCutoffs.get(officeRefreshKey(row.company_id, row.id))
+      const cutoff = readOfficeRefreshCutoff(deps.db, row.company_id, row.id)
       if (cutoff !== undefined && Number(payload.version) < cutoff) {
         req.log.info(
           { fileId: row.id, payloadVersion: payload.version, cutoff },
@@ -1197,7 +2038,7 @@ export function registerWorkspaceRoutes(app: FastifyInstance, deps: ServerDeps):
   })
 
   app.post<{
-    Body: { name?: string; path?: string; text?: string; contentBase64?: string; mime?: string }
+    Body: { name?: string; path?: string; text?: string; contentBase64?: string; mime?: string; baseVersion?: number }
   }>('/api/workspace/files', { bodyLimit: 80 * 1024 * 1024 }, async (req) => {
     const actor = resolveActor(deps.db, deps.config, req)
     requireEnabled(actor)
@@ -1236,6 +2077,13 @@ export function registerWorkspaceRoutes(app: FastifyInstance, deps: ServerDeps):
     const existing = deps.db
       .prepare('SELECT * FROM workspace_files WHERE company_id = ? AND scope_type = ? AND scope_id = ? AND rel_path = ? AND deleted_at IS NULL')
       .get(actor.subject.companyId, 'user', actor.subject.userId, relPath) as unknown as FileRow | undefined
+    const expectedVersion = body.baseVersion === undefined ? undefined : Number(body.baseVersion)
+    if (existing && expectedVersion !== undefined && Number.isFinite(expectedVersion) && existing.updated_at !== expectedVersion) {
+      throw new EabError(EC.CONFLICT, '文件已被其它操作更新，请重新读取后再保存', {
+        details: { expectedVersion, currentVersion: existing.updated_at },
+        hint: '刷新预览确认最新内容后再保存；本次没有写入磁盘。',
+      })
+    }
     const dir = scopeDir(deps, actor.subject.companyId, 'user', actor.subject.userId)
     const target = safeJoin(dir, relPath)
     if (!existsSync(dirname(target))) mkdirSync(dirname(target), { recursive: true })
@@ -1245,6 +2093,15 @@ export function registerWorkspaceRoutes(app: FastifyInstance, deps: ServerDeps):
         if (userQuota.used + (buffer.length - oldSize) > userQuota.limit) throw new EabError(EC.VALIDATION, '覆盖后超出个人配额')
       }
     }
+    const operationId = existing ? `op_${ulid()}` : null
+    const snapshot = existing
+      ? snapshotWorkspaceVersion(deps, existing, {
+          source: 'workspace.edit',
+          operationId: operationId!,
+          summary: '网页文本保存前版本',
+          createdBy: actor.subject.userId,
+        })
+      : null
     writeFileSync(target, buffer)
     const now = Date.now()
     const id = existing?.id ?? ulid()
@@ -1266,7 +2123,19 @@ export function registerWorkspaceRoutes(app: FastifyInstance, deps: ServerDeps):
       addUsage(deps, actor.subject.companyId, 'company', actor.subject.companyId, buffer.length)
     }
     const row = deps.db.prepare('SELECT * FROM workspace_files WHERE id = ?').get(id) as unknown as FileRow
-    audit(deps, req, existing ? 'workspace.file.update' : 'workspace.file.upload', row, { relPath, size: buffer.length })
+    audit(deps, req, existing ? 'workspace.file.update' : 'workspace.file.upload', row, {
+      relPath,
+      size: buffer.length,
+      ...(existing
+        ? {
+          beforeSize: oldSize,
+          afterSize: buffer.length,
+          operationId,
+          snapshotId: snapshot?.id ?? null,
+          snapshotVersion: snapshot?.version ?? null,
+        }
+        : {}),
+    })
     return ok(publicFile(row))
   })
 
@@ -1283,6 +2152,224 @@ export function registerWorkspaceRoutes(app: FastifyInstance, deps: ServerDeps):
     }
     return ok(publicFile(row))
   })
+
+  app.get<{ Params: { id: string } }>('/api/workspace/files/:id/versions', async (req) => {
+    const actor = resolveActor(deps.db, deps.config, req)
+    requireScope(actor.subject, SC.WORKSPACE_READ)
+    return ok({ items: listWorkspaceFileVersions(deps, actor, req.params.id) })
+  })
+
+  /** 手动保存当前版本快照；插件/Agent 写入前也会自动写快照。 */
+  app.post<{ Params: { id: string } }>('/api/workspace/files/:id/versions', async (req) => {
+    const actor = resolveActor(deps.db, deps.config, req)
+    requireScope(actor.subject, SC.WORKSPACE_WRITE)
+    const snapshot = createWorkspaceFileSnapshot(deps, actor, req.params.id)
+    appendAudit(deps.db, {
+      companyId: actor.subject.companyId,
+      actorUserId: actor.subject.userId,
+      action: 'workspace.file.snapshot',
+      resourceType: 'file',
+      resourceId: req.params.id,
+      resourceScope: `user:${actor.subject.userId}`,
+      result: 'success',
+      detail: { versionId: snapshot.id, version: snapshot.version, created: snapshot.created },
+      traceId: String(req.id),
+      ip: req.ip,
+      channel: 'web',
+    })
+    return ok(snapshot)
+  })
+
+  app.get<{ Params: { id: string; versionId: string } }>(
+    '/api/workspace/files/:id/versions/:versionId/download',
+    async (req, reply) => {
+      const actor = resolveActor(deps.db, deps.config, req)
+      requireScope(actor.subject, SC.WORKSPACE_READ)
+      const { row, version, buffer } = readWorkspaceFileVersion(deps, actor, req.params.id, req.params.versionId)
+      appendAudit(deps.db, {
+        companyId: actor.subject.companyId,
+        actorUserId: actor.subject.userId,
+        action: 'workspace.file.version_download',
+        resourceType: 'file',
+        resourceId: row.id,
+        resourceScope: `${row.scope_type}:${row.scope_id}`,
+        result: 'success',
+        detail: { versionId: version.id, version: version.version, size: buffer.length },
+        traceId: String(req.id),
+        ip: req.ip,
+        channel: 'web',
+      })
+      const name = `v${version.version}-${row.name}`
+      reply
+        .header('content-type', row.mime || 'application/octet-stream')
+        .header('content-disposition', `attachment; filename*=UTF-8''${encodeURIComponent(name)}`)
+        .header('cache-control', 'no-store')
+      return reply.send(buffer)
+    },
+  )
+
+  app.post<{ Params: { id: string; versionId: string } }>(
+    '/api/workspace/files/:id/versions/:versionId/restore',
+    async (req) => {
+      const actor = resolveActor(deps.db, deps.config, req)
+      requireScope(actor.subject, SC.WORKSPACE_WRITE)
+      const result = restoreWorkspaceFileVersion(deps, actor, req.params.id, req.params.versionId)
+      appendAudit(deps.db, {
+        companyId: actor.subject.companyId,
+        actorUserId: actor.subject.userId,
+        action: 'workspace.file.restore',
+        resourceType: 'file',
+        resourceId: req.params.id,
+        resourceScope: `user:${actor.subject.userId}`,
+        result: 'success',
+        detail: {
+          versionId: result.restoredVersion.id,
+          version: result.restoredVersion.version,
+          restoredAt: result.file.updatedAt,
+          size: result.file.size,
+        },
+        traceId: String(req.id),
+        ip: req.ip,
+        channel: 'web',
+      })
+      return ok(result)
+    },
+  )
+
+  /** 通过 OnlyOffice 转 PDF 后直接下载；不写回文件，不改变版本。 */
+  app.post<{ Params: { id: string }; Body: { format?: string } }>(
+    '/api/workspace/files/:id/export',
+    async (req, reply) => {
+      const actor = resolveActor(deps.db, deps.config, req)
+      requireScope(actor.subject, SC.WORKSPACE_READ)
+      const format = String(req.body?.format || 'pdf').toLowerCase()
+      if (format !== 'pdf') throw new EabError(EC.VALIDATION, '当前只支持导出 PDF')
+      let exported: Awaited<ReturnType<typeof exportWorkspaceFileToPdf>>
+      try {
+        exported = await exportWorkspaceFileToPdf(deps, actor, req.params.id)
+      } catch (error) {
+        appendAudit(deps.db, {
+          companyId: actor.subject.companyId,
+          actorUserId: actor.subject.userId,
+          action: 'workspace.file.export',
+          resourceType: 'file',
+          resourceId: req.params.id,
+          resourceScope: `user:${actor.subject.userId}`,
+          result: 'failure',
+          detail: { format, reason: error instanceof Error ? error.message : String(error) },
+          traceId: String(req.id),
+          ip: req.ip,
+          channel: 'web',
+        })
+        throw error instanceof EabError
+          ? error
+          : new EabError(EC.INTERNAL, `导出 PDF 失败：${error instanceof Error ? error.message : String(error)}`)
+      }
+      const row = exported.row
+      const buffer = exported.buffer
+      appendAudit(deps.db, {
+        companyId: actor.subject.companyId,
+        actorUserId: actor.subject.userId,
+        action: 'workspace.file.export',
+        resourceType: 'file',
+        resourceId: row.id,
+        resourceScope: `${row.scope_type}:${row.scope_id}`,
+        result: 'success',
+        detail: { relPath: row.rel_path, format, size: buffer.length },
+        traceId: String(req.id),
+        ip: req.ip,
+        channel: 'web',
+      })
+      const stem = row.name.replace(/\.[^.]+$/, '')
+      reply
+        .header('content-type', 'application/pdf')
+        .header('content-disposition', `attachment; filename*=UTF-8''${encodeURIComponent(`${stem}.pdf`)}`)
+        .header('cache-control', 'no-store')
+      return reply.send(buffer)
+    },
+  )
+
+  /**
+   * GUI 兜底：只登记白名单动作和步骤，等待前端用户确认。
+   * 这里绝不执行桌面点击、宏或打印；真正按钮由用户在 OnlyOffice 中点击。
+   */
+  app.post<{
+    Params: { id: string }
+    Body: { action?: string; dialog?: string; format?: string; note?: string }
+  }>('/api/workspace/files/:id/gui-fallback', async (req) => {
+    const actor = resolveActor(deps.db, deps.config, req)
+    requireEnabled(actor)
+    requireScope(actor.subject, SC.WORKSPACE_WRITE)
+    const body = req.body ?? {}
+    const result = prepareWorkspaceGuiFallback(deps, {
+      actor,
+      traceId: String(req.id),
+      ip: req.ip,
+      channel: 'web',
+    }, {
+      fileId: req.params.id,
+      action: body.action,
+      dialog: body.dialog,
+      format: body.format,
+      note: body.note,
+    })
+    return ok(result)
+  })
+
+  /** 只能由前端用户点击确认；Agent 工具没有这个动作。 */
+  app.post<{ Params: { id: string; fallbackId: string } }>(
+    '/api/workspace/files/:id/gui-fallback/:fallbackId/confirm',
+    async (req) => {
+      const actor = resolveActor(deps.db, deps.config, req)
+      requireEnabled(actor)
+      requireScope(actor.subject, SC.WORKSPACE_WRITE)
+      const result = confirmWorkspaceGuiFallback(deps, {
+        actor,
+        traceId: String(req.id),
+        ip: req.ip,
+        channel: 'web',
+      }, req.params.id, req.params.fallbackId)
+      return ok(result)
+    },
+  )
+
+  /** 上报人工结果；失败后同一条记录不得再次确认或上报。 */
+  app.post<{
+    Params: { id: string; fallbackId: string }
+    Body: { result?: string; detail?: string }
+  }>('/api/workspace/files/:id/gui-fallback/:fallbackId/report', async (req) => {
+    const actor = resolveActor(deps.db, deps.config, req)
+    requireEnabled(actor)
+    requireScope(actor.subject, SC.WORKSPACE_WRITE)
+    const body = req.body ?? {}
+    const status = String(body.result ?? '').trim().toLowerCase()
+    if (status !== 'success' && status !== 'failure') {
+      throw new EabError(EC.VALIDATION, 'result 只能是 success 或 failure')
+    }
+    const result = reportWorkspaceGuiFallback(deps, {
+      actor,
+      traceId: String(req.id),
+      ip: req.ip,
+      channel: 'web',
+    }, req.params.id, req.params.fallbackId, status, body.detail)
+    return ok(result)
+  })
+
+  app.get<{ Params: { id: string; fallbackId: string } }>(
+    '/api/workspace/files/:id/gui-fallback/:fallbackId',
+    async (req) => {
+      const actor = resolveActor(deps.db, deps.config, req)
+      requireEnabled(actor)
+      requireScope(actor.subject, SC.WORKSPACE_READ)
+      const result = getWorkspaceGuiFallback(deps, {
+        actor,
+        traceId: String(req.id),
+        ip: req.ip,
+        channel: 'web',
+      }, req.params.id, req.params.fallbackId)
+      return ok(result)
+    },
+  )
 
   app.get<{ Params: { id: string } }>('/api/workspace/files/:id/download', async (req, reply) => {
     const actor = resolveActor(deps.db, deps.config, req)

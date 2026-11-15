@@ -116,6 +116,7 @@ const PAGES = {
   org: { title: '成员管理', sub: '成员列表、角色授权与部门筛选', render: () => loadOrg() },
   departments: { title: '部门管理', sub: '部门结构、负责人、下级与成员', render: () => loadDepartments() },
   roles: { title: '角色管理', sub: '角色权限、数据范围与成员配置', render: () => loadRoles() },
+  approvalPolicies: { title: '权限审批', sub: '按权限范围配置多级审批链与可申请角色', render: () => loadPermissionPolicies() },
   access: { title: '权限矩阵', sub: '成员 × 知识库可见性核对', render: () => loadMatrix() },
   kb: { title: '知识库', sub: '知识库、可见范围与文档', render: () => loadKb() },
   models: { title: '模型接入', sub: '供应商端点、模型目录与用途路由', render: () => loadModels() },
@@ -3357,6 +3358,192 @@ async function loadRoles() {
   }
 }
 
+/* ---------------- 权限审批策略 ---------------- */
+
+/**
+ * 管理端按 scope / 角色配置审批链。
+ * 员工端只负责发起与审批；这里决定某类权限点最多几级、多久超时、是否公司管理员兜底。
+ */
+async function loadPermissionPolicies() {
+  const view = $('#view')
+  renderLoading(view)
+  setSide('', true)
+  try {
+    const data = await api('/api/console/permission-policies')
+    const policies = data.policies ?? []
+    const roles = data.roles ?? []
+    const scopes = data.scopes ?? []
+    const roleOptions = roles
+      .filter((role) => !role.management)
+      .map((role) => `<option value="${esc(role.code)}">${esc(role.name)}（${esc(role.code)}）</option>`)
+      .join('')
+    const scopeOptions = scopes
+      .map(
+        (item) =>
+          `<option value="${esc(item.scope)}">${esc(item.group ? `${item.group} · ` : '')}${esc(item.label)}（${esc(
+            item.scope,
+          )}）</option>`,
+      )
+      .join('')
+    const policyRows =
+      policies
+        .map(
+          (item, index) => `<tr>
+            <td><span class="pill">${item.targetType === 'role' ? '角色' : '权限点'}</span></td>
+            <td><strong class="mono">${esc(item.targetKey)}</strong></td>
+            <td>${item.maxLevels} 级</td>
+            <td>${item.timeoutHours} 小时</td>
+            <td>${item.approverStrategy === 'fixed_users' ? '固定审批人' : '部门负责人链'}${
+              item.includeCompanyAdmin ? ' + 公司管理员兜底' : ''
+            }</td>
+            <td><button class="link-btn accent" type="button" data-pp-edit="${index}">编辑</button></td>
+          </tr>`,
+        )
+        .join('') || '<tr><td colspan="6" class="empty">还没有审批策略。未配置时，可申请角色不会出现在员工端。</td></tr>'
+    const roleRows =
+      roles
+        .filter((role) => !role.management)
+        .map(
+          (role) => `<label class="pp-role-row">
+            <input type="checkbox" data-pp-role="${esc(role.code)}" ${role.requestable ? 'checked' : ''} />
+            <span><strong>${esc(role.name)}</strong><small class="mono">${esc(role.code)}</small></span>
+            <span class="muted">${role.builtin ? '内置角色' : '自定义角色'}</span>
+          </label>`,
+        )
+        .join('') || '<div class="empty">没有可申请的角色。</div>'
+    view.innerHTML = `
+      <div class="permission-flow">
+        <div class="flow-step"><span>1</span><strong>可申请</strong><p>只有勾选的角色会出现在员工端申请列表</p></div>
+        <div class="flow-arrow">→</div>
+        <div class="flow-step"><span>2</span><strong>按范围匹配</strong><p>角色展开成权限点，逐个匹配最严格策略</p></div>
+        <div class="flow-arrow">→</div>
+        <div class="flow-step"><span>3</span><strong>逐级审批</strong><p>最后一级同意后授权，并按有效期自动失效</p></div>
+      </div>
+      <section class="panel">
+        <div class="panel-head"><div><h2>可申请角色</h2>${hintBadge(
+          '申请范围',
+          '仅本人可申请；这里勾选的角色会进入员工端。管理角色即使勾选也不会进入自助申请列表。',
+        )}</div></div>
+        <div class="pp-role-grid">${roleRows}</div>
+        <div class="pp-role-note muted">管理角色（公司管理员、部门管理员、平台超管等）不参与自助申请，未在此列出。</div>
+      </section>
+      <section class="panel">
+        <div class="panel-head"><div><h2>审批链策略</h2>${hintBadge(
+          '匹配规则',
+          '角色级策略优先；没有角色级策略时，角色的每个权限点都必须有 scope 策略。多个 scope 冲突时取级数最多、超时最短、要求公司管理员兜底的组合。',
+        )}</div></div>
+        <form class="pp-form" id="pp-form">
+          <label class="field"><span>策略对象</span>
+            <select id="pp-type">
+              <option value="scope">按权限点（scope）</option>
+              <option value="role">按角色（role）</option>
+            </select>
+          </label>
+          <label class="field"><span>权限点 / 角色</span>
+            <select id="pp-key">${scopeOptions}</select>
+          </label>
+          <label class="field"><span>最多级数</span>
+            <input id="pp-levels" type="number" min="1" max="10" value="3" />
+          </label>
+          <label class="field"><span>处理时限（小时）</span>
+            <input id="pp-timeout" type="number" min="1" max="720" value="72" />
+          </label>
+          <label class="field"><span>审批人策略</span>
+            <select id="pp-strategy">
+              <option value="dept_chain">部门负责人链</option>
+              <option value="fixed_users">固定审批人</option>
+            </select>
+          </label>
+          <label class="field pp-check"><span>公司管理员兜底</span>
+            <input id="pp-admin" type="checkbox" checked />
+          </label>
+          <label class="field pp-fixed" hidden><span>固定审批人成员 ID</span>
+            <textarea id="pp-fixed" rows="3" placeholder="多个成员 ID 用换行或逗号分隔"></textarea>
+          </label>
+          <div class="pp-form-actions">
+            <button class="btn primary" type="submit">保存策略</button>
+            <span class="muted">保存后立即生效，员工端刷新即可看到新的审批链。</span>
+          </div>
+        </form>
+        <table class="data">
+          <thead><tr><th>类型</th><th>对象</th><th>级数</th><th>时限</th><th>审批人</th><th>操作</th></tr></thead>
+          <tbody>${policyRows}</tbody>
+        </table>
+      </section>`
+    const typeSelect = $('#pp-type')
+    const keySelect = $('#pp-key')
+    const strategySelect = $('#pp-strategy')
+    const fixedField = view.querySelector('.pp-fixed')
+    const fillKeys = () => {
+      keySelect.innerHTML = typeSelect.value === 'role' ? roleOptions : scopeOptions
+    }
+    const syncFixed = () => {
+      fixedField.hidden = strategySelect.value !== 'fixed_users'
+    }
+    typeSelect.addEventListener('change', fillKeys)
+    strategySelect.addEventListener('change', syncFixed)
+    syncFixed()
+    view.querySelectorAll('[data-pp-edit]').forEach((button) => {
+      button.addEventListener('click', () => {
+        const item = policies[Number(button.dataset.ppEdit)]
+        if (!item) return
+        typeSelect.value = item.targetType
+        fillKeys()
+        keySelect.value = item.targetKey
+        $('#pp-levels').value = String(item.maxLevels)
+        $('#pp-timeout').value = String(item.timeoutHours)
+        strategySelect.value = item.approverStrategy
+        $('#pp-admin').checked = Boolean(item.includeCompanyAdmin)
+        $('#pp-fixed').value = (item.fixedApprovers ?? []).join('\n')
+        syncFixed()
+        view.querySelector('#pp-form')?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+      })
+    })
+    view.querySelectorAll('[data-pp-role]').forEach((checkbox) => {
+      checkbox.addEventListener('change', async () => {
+        const code = checkbox.dataset.ppRole
+        const wanted = checkbox.checked
+        checkbox.disabled = true
+        try {
+          await apiPost(`/api/console/permission-policies/roles/${encodeURIComponent(code)}/requestable`, {
+            requestable: wanted,
+          })
+        } catch (err) {
+          checkbox.checked = !wanted
+          alert(err.message || '保存可申请角色失败')
+        } finally {
+          checkbox.disabled = false
+        }
+      })
+    })
+    $('#pp-form')?.addEventListener('submit', async (event) => {
+      event.preventDefault()
+      const targetType = typeSelect.value
+      const targetKey = keySelect.value
+      const fixedApprovers = $('#pp-fixed')
+        .value.split(/[\s,，]+/)
+        .map((value) => value.trim())
+        .filter(Boolean)
+      try {
+        await apiPost('/api/console/permission-policies', {
+          targetType,
+          targetKey,
+          maxLevels: Number($('#pp-levels').value),
+          timeoutHours: Number($('#pp-timeout').value),
+          approverStrategy: strategySelect.value,
+          includeCompanyAdmin: $('#pp-admin').checked,
+          fixedApprovers,
+        })
+        loadPermissionPolicies()
+      } catch (err) {
+        alert(err.message || '保存审批策略失败')
+      }
+    })
+  } catch (err) {
+    renderDenied(view, err)
+  }
+}
+
 /* ---------------- 模型接入 ---------------- */
 
 const MODEL_CAPABILITY_OPTIONS = [
@@ -3471,6 +3658,20 @@ function modelTypeOf(tags = []) {
   return { label: labels.slice(0, 2).join(' · '), tone: first }
 }
 
+function endpointKindLabel(kind) {
+  const labels = {
+    chat: '对话',
+    systemone: 'SystemOne',
+    embeddings: '向量',
+    rerank: '重排',
+    asr: '语音转写',
+    tts: '语音合成',
+    video: '视频理解',
+    audio: '语音',
+  }
+  return labels[kind] || kind || ''
+}
+
 function modelSupportsRoutePurpose(model, purpose) {
   const capabilities = model?.capabilities?.length ? model.capabilities : model?.tags || []
   const endpointKind = model?.endpointKind || 'chat'
@@ -3484,6 +3685,14 @@ function modelSupportsRoutePurpose(model, purpose) {
         capabilities.includes('reasoning') ||
         capabilities.includes('chat')) &&
       endpointKind === 'chat'
+    )
+  }
+  if (purpose === 'agent.model_choice') {
+    return (
+      (capabilities.includes('decision') ||
+        capabilities.includes('reasoning') ||
+        capabilities.includes('chat')) &&
+      endpointKind === 'systemone'
     )
   }
   if (purpose === 'kb.embed') return capabilities.includes('embedding') || endpointKind === 'embeddings'
@@ -3720,6 +3929,7 @@ async function discoverProviderModels(provider) {
 function openModelImportModal(provider, data) {
   const importTypes = {
     chat: { label: '对话', caps: ['chat'], endpoint: 'chat', api: 'POST /chat/completions' },
+    systemone: { label: '决策 / SystemOne', caps: ['chat', 'reasoning', 'decision'], endpoint: 'systemone', api: 'POST /systemone' },
     decision: { label: '决策 / 推理', caps: ['chat', 'reasoning', 'decision'], endpoint: 'chat', api: 'POST /chat/completions' },
     vision: { label: '多模态', caps: ['chat', 'vision', 'multimodal'], endpoint: 'chat', api: 'POST /chat/completions' },
     embedding: { label: '向量', caps: ['embedding'], endpoint: 'embeddings', api: 'POST /embeddings' },
@@ -3736,9 +3946,11 @@ function openModelImportModal(provider, data) {
         ? 'asr'
         : endpoint === 'tts'
           ? 'tts'
-          : importTypes[suggested.modelType]
-            ? suggested.modelType
-            : endpoint === 'embeddings'
+          : endpoint === 'systemone'
+            ? 'systemone'
+            : importTypes[suggested.modelType]
+              ? suggested.modelType
+              : endpoint === 'embeddings'
               ? 'embedding'
               : endpoint === 'rerank'
                 ? 'rerank'
@@ -3952,8 +4164,9 @@ async function openModelModal(model, providers, roles) {
             <option value="video">视频理解模型</option>
             <option value="custom">自定义能力</option>
           </select></label>
-          <label class="field"><span>端点类型 ${fieldInfo('决定服务端用哪个协议调用；语音要区分 ASR 与 TTS。')}</span><select id="m-endpoint">
+          <label class="field"><span>端点类型 ${fieldInfo('决定服务端用哪个协议调用；SystemOne 只做结构化决策、不生成文本，语音要区分 ASR 与 TTS。')}</span><select id="m-endpoint">
             <option value="chat">对话 / chat completions</option>
+            <option value="systemone">决策 / SystemOne（/v1/systemone）</option>
             <option value="embeddings">向量 / embeddings</option>
             <option value="rerank">重排 / rerank</option>
             <option value="asr">语音转写 / ASR</option>
@@ -4111,7 +4324,7 @@ async function openModelModal(model, providers, roles) {
   }
   const typeHints = {
     chat: '通用文本问答，最基础的接入类型。',
-    decision: '会自动勾选对话、推理、决策；适合路由判定与多步分析。',
+    decision: '会自动勾选对话、推理、决策；普通推理仍用对话端点，只有把端点类型选成 SystemOne，才会参与子 Agent 的模型决策分配。',
     vision: '会自动勾选对话、图片识别、多模态；支持工作台图片输入。',
     embedding: '只做向量化，不参与对话生成；端点类型会自动切到 embeddings。',
     rerank: '重排序模型用于知识库检索后的二次排序；端点类型会自动切到 rerank，请求发往 POST /rerank。',
@@ -4164,7 +4377,9 @@ async function openModelModal(model, providers, roles) {
     note.innerHTML = hasVision
       ? '<strong>图片识别已开启</strong><span>员工工作台可以直接上传或粘贴图片，服务端会按图片内容送入模型。</span>'
       : '<strong>未开启图片识别</strong><span>带图片的消息不会发给这个模型；需要图片能力时请勾选「图片识别 / 多模态」。</span>'
-    const hintText = typeHints[type.value] || typeHints.custom
+    const hintText = endpoint.value === 'systemone'
+      ? 'SystemOne 是结构化决策端点：不生成文本，父 Agent 用它按子任务内容给子 Agent 选模型；Base URL 要能拼出 /v1/systemone。'
+      : typeHints[type.value] || typeHints.custom
     typeHint.dataset.tip = hintText
     typeHint.setAttribute('aria-label', hintText)
     syncCapAll()
@@ -4182,11 +4397,17 @@ async function openModelModal(model, providers, roles) {
     else if (type.value === 'rerank') endpoint.value = 'rerank'
     else if (type.value === 'video') endpoint.value = 'video'
     else if (type.value === 'audio') endpoint.value = endpoint.value === 'tts' ? 'tts' : 'asr'
-    else if (['chat', 'decision', 'vision'].includes(type.value)) endpoint.value = 'chat'
+    else if (type.value === 'decision') {
+      // 决策模型既可能是普通推理，也可能是 SystemOne；切类型时不要粗暴覆盖用户已选的 SystemOne。
+      if (endpoint.value !== 'systemone') endpoint.value = 'chat'
+    } else if (['chat', 'vision'].includes(type.value)) endpoint.value = 'chat'
     syncPreview()
     syncDimField()
   })
-  endpoint.addEventListener('change', syncDimField)
+  endpoint.addEventListener('change', () => {
+    syncPreview()
+    syncDimField()
+  })
   thinkEnabled.addEventListener('change', () => {
     if (thinkEnabled.checked && thinkInputs.every((input) => !input.checked)) {
       const balanced = thinkInputs.find((input) => input.dataset.thinkLevel === 'balanced')
@@ -4973,7 +5194,7 @@ async function loadModels() {
                 (model) =>
                   `<option value="${esc(model.id)}"${item.boundModelId === model.id ? ' selected' : ''}>${esc(
                     model.name,
-                  )}${model.endpointKind ? ` · ${esc(model.endpointKind)}` : ''}</option>`,
+                  )}${model.endpointKind ? ` · ${esc(endpointKindLabel(model.endpointKind))}` : ''}</option>`,
               )
               .join('')
           : `<option value="" selected>${pluginModelCount ? '插件模型只读，未开放用途绑定' : '没有匹配该用途的模型'}</option>`
@@ -5161,7 +5382,11 @@ async function loadModels() {
           <span class="models-provider-pill">${esc(model.providerName)}</span>
           <div class="desc">${readonly ? '插件注入 · 角色可配置' : `${esc(model.providerKind)} · 优先级 ${model.priority}`}</div>
         </td>
-        <td><span class="models-type-badge ${type.tone}">${esc(type.label)}</span></td>
+        <td><span class="models-type-badge ${type.tone}">${esc(type.label)}</span>${
+          model.endpointKind && model.endpointKind !== 'chat'
+            ? `<div class="desc">${esc(endpointKindLabel(model.endpointKind))}端点</div>`
+            : ''
+        }</td>
         <td class="models-limits-cell">
           <span class="mono">${tokenLimitLabel(model.maxContext)}</span>
           <div class="desc">输出 ${model.maxOutputTokens ? tokenLimitLabel(model.maxOutputTokens) : '默认 4K'}</div>
@@ -5532,6 +5757,438 @@ async function loadMatrix() {
 
 /* ---------------- 系统 ---------------- */
 
+const BRAND_FALLBACKS = {
+  console: {
+    logoText: 'EAB',
+    brandName: '企业智能体基座',
+    tabTitle: 'EAB 管理控制台',
+    iconDataUrl: null,
+  },
+  chat: {
+    logoText: 'EAB',
+    brandName: '企业AI智能体基座',
+    tabTitle: 'EAB 工作台',
+    iconDataUrl: null,
+  },
+}
+
+function brandDefaults() {
+  return window.EABBrand?.defaults ?? BRAND_FALLBACKS
+}
+
+function brandMarkHtml(surface) {
+  if (surface.iconDataUrl) return `<img src="${esc(surface.iconDataUrl)}" alt="" aria-hidden="true" />`
+  return esc(surface.logoText || 'EAB')
+}
+
+function brandingSurfaceCard(key, label, meta, surface) {
+  return `<article class="branding-card" data-brand-surface="${key}">
+    <div class="branding-card-head">
+      <div><strong>${esc(label)}</strong><span>${esc(meta)}</span></div>
+      <span class="pill">浏览器标签 + 应用内品牌</span>
+    </div>
+    <div class="branding-preview" aria-hidden="true">
+      <div class="branding-tab-preview">
+        <span class="branding-favicon" data-brand-preview-favicon>${brandMarkHtml(surface)}</span>
+        <span class="branding-tab-title" data-brand-preview-tab>${esc(surface.tabTitle)}</span>
+        <span class="branding-tab-close">×</span>
+      </div>
+      <div class="branding-app-preview">
+        <span class="branding-logo" data-brand-preview-logo>${brandMarkHtml(surface)}</span>
+        <span class="branding-app-copy">
+          <strong data-brand-preview-name>${esc(surface.brandName)}</strong>
+          <small>${key === 'console' ? '管理控制台' : '员工对话'}</small>
+        </span>
+      </div>
+    </div>
+    <div class="branding-fields">
+      <label class="field"><span>浏览器标签文字</span><input data-brand-field="tabTitle" maxlength="80" value="${esc(surface.tabTitle)}" placeholder="显示在浏览器标签页上" /></label>
+      <label class="field"><span>品牌名称</span><input data-brand-field="brandName" maxlength="40" value="${esc(surface.brandName)}" placeholder="图标旁的应用名称" /></label>
+      <label class="field"><span>图标内文字</span><input data-brand-field="logoText" maxlength="8" value="${esc(surface.logoText)}" placeholder="未上传图标时显示" /></label>
+    </div>
+    <div class="branding-icon-row">
+      <div class="branding-icon-actions">
+        <button class="btn sm ghost" type="button" data-brand-upload>上传图标</button>
+        <button class="btn sm ghost" type="button" data-brand-reset>恢复默认</button>
+        <input type="file" hidden data-brand-file accept="image/png,image/jpeg,image/webp,image/svg+xml,image/x-icon,image/vnd.microsoft.icon,.ico,.svg,.png,.jpg,.jpeg,.webp" />
+      </div>
+      <span class="branding-icon-note" data-brand-icon-note>${surface.iconDataUrl ? '已上传自定义图标' : '未上传图标，使用图标内文字生成默认标记'}</span>
+    </div>
+  </article>`
+}
+
+function brandingPanelHtml(branding) {
+  return `<section class="panel branding-panel" data-section-panel="data">
+    <div class="panel-head">
+      <div><h2>品牌与标签页</h2>${hintBadge('品牌说明', '分别设置管理控制台和员工对话的浏览器标签图标、标签文字、应用内品牌名称；图标会同时用于侧栏 Logo。上传图标后，图标内文字作为未上传时的默认标记保留。保存后控制台立即更新，对话页在刷新或切回标签页时更新。')}</div>
+      <span class="pill ok">控制台 + 员工对话</span>
+    </div>
+    <div class="branding-grid">
+      ${brandingSurfaceCard('console', '管理控制台', '8788 / admin', branding.console)}
+      ${brandingSurfaceCard('chat', '员工对话', '8787 / chat', branding.chat)}
+    </div>
+    <div class="panel-actions branding-actions">
+      <button class="btn sm primary" type="button" id="branding-save">保存品牌设置</button>
+      <span class="branding-state" id="branding-state"></span>
+    </div>
+    ${hintNote('图标规范', '支持 PNG / JPEG / WebP / SVG / ICO，单张不超过 256KB；建议使用正方形、透明背景或与主题色接近的图标。保存只改品牌外观，不影响登录、权限或公司信息。')}
+  </section>`
+}
+
+function readBrandFile(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result || ''))
+    reader.onerror = () => reject(new Error('读取图片失败'))
+    reader.readAsDataURL(file)
+  })
+}
+
+const BOOT_MODE_OPTIONS = [
+  { value: 'code', label: '代码高定（推荐，无视频）' },
+  { value: 'film', label: '电影片头（需上传 MP4）' },
+  { value: 'off', label: '关闭这一端' },
+]
+
+const BOOT_PLAY_OPTIONS = [
+  { value: 'login', label: '刚登录跳转时播一次' },
+  { value: 'new-session', label: '每会话首次打开时播' },
+  { value: 'always', label: '每次打开都播' },
+]
+
+function bootOptions(items, value) {
+  return items
+    .map((item) => `<option value="${esc(item.value)}"${item.value === value ? ' selected' : ''}>${esc(item.label)}</option>`)
+    .join('')
+}
+
+function bootAssetOptions(assets, value) {
+  const rows = [
+    `<option value=""${value ? '' : ' selected'}>未选择（回退代码高定版）</option>`,
+    ...(assets || []).map(
+      (asset) =>
+        `<option value="${esc(asset.id)}"${asset.id === value ? ' selected' : ''}>${esc(asset.name)} · ${esc(String(asset.durationSec))}s · ${(Number(asset.bytes) / 1024 / 1024).toFixed(1)}MB</option>`,
+    ),
+  ]
+  if (value && !(assets || []).some((asset) => asset.id === value)) {
+    rows.push(`<option value="${esc(value)}" selected>已选片源不可用（请重新上传）</option>`)
+  }
+  return rows.join('')
+}
+
+function bootSurfaceFields(scope, surface, value, assets, disabled) {
+  const dis = disabled ? ' disabled' : ''
+  return `<div class="boot-config-fields" data-boot-scope="${esc(scope)}" data-boot-surface="${esc(surface)}">
+    <label class="field"><span>模式</span><select data-boot-field="mode"${dis}>${bootOptions(BOOT_MODE_OPTIONS, value.mode)}</select></label>
+    <label class="field"><span>片源</span><select data-boot-field="assetId"${dis}>${bootAssetOptions(assets, value.assetId)}</select></label>
+    <label class="field"><span title="只限制电影片头和后台预览；代码版跟随首屏加载，就绪即退场">片头/预览上限（秒）</span><input type="number" min="0.8" max="8" step="0.1" data-boot-field="durationMax" value="${esc(String(value.durationMax))}"${dis} /></label>
+    <label class="field"><span>播放规则</span><select data-boot-field="playOn"${dis}>${bootOptions(BOOT_PLAY_OPTIONS, value.playOn)}</select></label>
+    <label class="field"><span>标题</span><input maxlength="60" data-boot-field="title" value="${esc(value.title)}" placeholder="EAB"${dis} /></label>
+    <label class="field"><span>副标题</span><input maxlength="60" data-boot-field="subtitle" value="${esc(value.subtitle)}" placeholder="企业智能体基座"${dis} /></label>
+    <label class="boot-check"><input type="checkbox" data-boot-field="allowSound"${value.allowSound ? ' checked' : ''}${dis} /><span>允许点击开启声音（默认静音起播）</span></label>
+    <label class="boot-check"><input type="checkbox" data-boot-field="allowSkip"${value.allowSkip ? ' checked' : ''}${dis} /><span>显示跳过按钮</span></label>
+  </div>`
+}
+
+function bootPanelHtml(boot) {
+  const global = boot?.global ?? {
+    enabled: true,
+    revision: 0,
+    admin: { mode: 'code', assetId: null, durationMax: 2.6, allowSound: false, allowSkip: true, playOn: 'login', title: 'EAB', subtitle: '管理控制台' },
+    chat: { mode: 'code', assetId: null, durationMax: 6.5, allowSound: true, allowSkip: true, playOn: 'login', title: 'EAB', subtitle: '企业智能体基座' },
+  }
+  const company = boot?.company ?? { useGlobal: true, chat: {} }
+  const assets = boot?.assets ?? []
+  const useGlobal = company.useGlobal !== false
+  const companyChat = { ...global.chat, ...(company.chat ?? {}) }
+  const assetRows = assets.length
+    ? assets
+        .map(
+          (asset) =>
+            `<div class="boot-asset-row"><span class="mono">${esc(asset.id)}</span><strong>${esc(asset.name)}</strong><span class="muted">${esc(String(asset.durationSec))}s · ${(Number(asset.bytes) / 1024 / 1024).toFixed(1)}MB</span><button class="btn sm ghost" type="button" data-boot-delete="${esc(asset.id)}">删除</button></div>`,
+        )
+        .join('')
+    : '<div class="muted">还没有上传片源。管理端建议先用代码高定；员工端要电影片头时，先上传 5–6 秒 MP4。</div>'
+  return `<section class="panel boot-config-panel" data-section-panel="boot">
+    <div class="boot-hero boot-panel-hero">
+      <div class="boot-hero-intro">
+        <div class="boot-hero-kicker"><span class="boot-hero-dot" aria-hidden="true"></span>启动体验<span class="pill">登录后播放</span></div>
+        <div class="boot-hero-title-row">
+          <h2>登录后启动动画</h2>
+          ${hintBadge('启动说明', '管理端固定使用全局配置；员工端先读全局默认，公司覆盖开启后按公司自己的片源、文案和规则播放。片源只允许从媒体库选择，不能填任意 URL。')}
+          <span id="boot-global-state" class="boot-surface-badge is-state${global.enabled ? '' : ' is-off'}" data-boot-rev="${esc(String(global.revision))}">${global.enabled ? '已启用' : '已停用'} · rev ${esc(String(global.revision))}</span>
+        </div>
+        <p class="boot-hero-desc">登录成功后作为页面加载过渡播放；首屏就绪即淡出，不固定等待。关闭全局启用后两端都不播，公司覆盖也不能单独打开；管理端固定用全局，员工端按公司覆盖播放。电影片头按片长播放，可配置跳过。</p>
+      </div>
+      <div class="boot-hero-controls">
+        <label class="boot-switch">
+          <span class="boot-switch-copy">
+            <strong>全局启用</strong>
+            <small>关闭后两端都不播</small>
+          </span>
+          <input type="checkbox" id="boot-global-enabled" role="switch"${global.enabled ? ' checked' : ''} />
+          <span class="boot-switch-track" aria-hidden="true"><span></span></span>
+        </label>
+        <div class="boot-hero-preview">
+          <button class="btn sm ghost" type="button" data-boot-preview="admin">预览管理端</button>
+          <button class="btn sm ghost" type="button" data-boot-preview="chat">预览员工端</button>
+        </div>
+      </div>
+    </div>
+    <div class="boot-config-grid">
+      <article class="boot-config-card">
+        <div class="boot-config-head">
+          <div>
+            <div class="boot-config-title-row"><strong>管理控制台</strong><span class="boot-surface-badge is-surface">8788 / admin</span><span class="boot-surface-badge is-state">始终用全局</span></div>
+          </div>
+          <span class="pill">代码高定 · 跟随加载</span>
+        </div>
+        ${bootSurfaceFields('global', 'admin', global.admin, assets, false)}
+      </article>
+      <article class="boot-config-card">
+        <div class="boot-config-head">
+          <div>
+            <div class="boot-config-title-row"><strong>员工工作台 · 全局默认</strong><span class="boot-surface-badge is-surface">8787 / chat</span><span class="boot-surface-badge is-state">公司未覆盖时使用</span></div>
+          </div>
+          <span class="pill">建议电影片头 5–6s</span>
+        </div>
+        ${bootSurfaceFields('global', 'chat', global.chat, assets, false)}
+      </article>
+    </div>
+    <div class="panel-actions boot-config-actions">
+      <button class="btn sm primary" type="button" id="boot-save-global">保存全局配置</button>
+      <span class="boot-config-state" id="boot-state"></span>
+    </div>
+
+    <div class="boot-hero">
+      <div class="boot-hero-intro">
+        <div class="boot-hero-kicker"><span class="boot-hero-dot" aria-hidden="true"></span>公司级配置<span class="pill">仅员工端</span></div>
+        <div class="boot-hero-title-row">
+          <h2>公司覆盖</h2>
+          <span class="boot-surface-badge">当前公司：${esc(boot?.companyId ?? '—')}</span>
+        </div>
+        <p class="boot-hero-desc">为当前公司单独设置员工端片头；管理控制台始终使用上方全局配置。</p>
+      </div>
+      <label class="boot-switch">
+        <span class="boot-switch-copy">
+          <strong>跟随全局默认</strong>
+          <small id="boot-company-mode">${useGlobal ? '当前继承全局配置 · 关闭后可编辑' : '当前使用公司配置'}</small>
+        </span>
+        <input type="checkbox" id="boot-use-global" role="switch"${useGlobal ? ' checked' : ''} />
+        <span class="boot-switch-track" aria-hidden="true"><span></span></span>
+      </label>
+    </div>
+    <div class="boot-config-card boot-company-card" data-boot-company-body${useGlobal ? ' data-disabled="1"' : ''}>
+      <div class="boot-company-notice" data-mode="${useGlobal ? 'inherit' : 'override'}">
+        <span class="boot-company-notice-icon" aria-hidden="true">i</span>
+        <span id="boot-company-note-text">${useGlobal ? '当前完全继承全局默认；关闭开关后才会启用下面的公司字段。' : '当前使用公司自己的配置；保存后只影响员工端。'}</span>
+      </div>
+      ${bootSurfaceFields('company', 'chat', companyChat, assets, useGlobal)}
+    </div>
+    <div class="panel-actions boot-config-actions">
+      <button class="btn sm primary" type="button" id="boot-save-company">${useGlobal ? '保存为跟随全局' : '保存公司覆盖'}</button>
+      <button class="btn sm ghost" type="button" id="boot-upload">上传 MP4 片源</button>
+      <input type="file" id="boot-upload-file" accept="video/mp4,.mp4" hidden />
+      <span class="boot-config-state" id="boot-upload-state"></span>
+      <span class="boot-config-state" id="boot-company-state"></span>
+    </div>
+    <div class="boot-assets">
+      <div class="boot-assets-head"><strong>媒体库</strong><span class="muted">${assets.length} 个片源 · 单个不超过 8MB · 5–6 秒最适合员工端 · 删除需连点两次</span></div>
+      ${assetRows}
+    </div>
+    ${hintNote('降级规则', '片源缺失、格式不支持、浏览器拒绝自动播放或读取失败时，自动回退代码高定版，不会黑屏；电影片头默认静音，点击「开启声音」后才出声。')}
+  </section>`
+}
+
+function bootSurfacePayload(scope, surface) {
+  const root = document.querySelector(`[data-boot-scope="${scope}"][data-boot-surface="${surface}"]`)
+  if (!root) return null
+  const field = (name) => root.querySelector(`[data-boot-field="${name}"]`)
+  return {
+    mode: field('mode')?.value || 'code',
+    assetId: field('assetId')?.value || null,
+    durationMax: Number(field('durationMax')?.value || 0),
+    allowSound: Boolean(field('allowSound')?.checked),
+    allowSkip: Boolean(field('allowSkip')?.checked),
+    playOn: field('playOn')?.value || 'login',
+    title: field('title')?.value || 'EAB',
+    subtitle: field('subtitle')?.value || '企业智能体基座',
+  }
+}
+
+function bootPreviewConfig(scope, surface) {
+  const payload = bootSurfacePayload(scope, surface)
+  if (!payload) return null
+  return {
+    ...payload,
+    assetUrl: payload.assetId ? `/boot/assets/${encodeURIComponent(payload.assetId)}?v=preview` : null,
+    assetDurationSec: null,
+  }
+}
+
+function bindBootConfigPanel() {
+  const globalEnabled = $('#boot-global-enabled')
+  const useGlobal = $('#boot-use-global')
+  const companyBody = document.querySelector('[data-boot-company-body]')
+  if (!globalEnabled && !useGlobal) return
+
+  const syncCompany = () => {
+    if (!useGlobal) return
+    const disabled = useGlobal.checked
+    if (companyBody) {
+      companyBody.dataset.disabled = disabled ? '1' : '0'
+      for (const input of companyBody.querySelectorAll('input, select')) input.disabled = disabled
+    }
+    const mode = $('#boot-company-mode')
+    if (mode) mode.textContent = disabled ? '当前继承全局配置 · 关闭后可编辑' : '当前使用公司配置'
+    const notice = document.querySelector('.boot-company-notice')
+    if (notice) notice.dataset.mode = disabled ? 'inherit' : 'override'
+    const note = $('#boot-company-note-text')
+    if (note) {
+      note.textContent = disabled
+        ? '当前完全继承全局默认；关闭开关后才会启用下面的公司字段。'
+        : '当前使用公司自己的配置；保存后只影响员工端。'
+    }
+    const saveCompany = $('#boot-save-company')
+    if (saveCompany) saveCompany.textContent = disabled ? '保存为跟随全局' : '保存公司覆盖'
+  }
+  useGlobal?.addEventListener('change', syncCompany)
+  syncCompany()
+
+  const setState = (text, bad) => {
+    const node = $('#boot-state')
+    if (!node) return
+    node.textContent = text
+    node.classList.toggle('is-bad', Boolean(bad))
+  }
+
+  const syncGlobalState = () => {
+    const badge = $('#boot-global-state')
+    if (!badge || !globalEnabled) return
+    const on = Boolean(globalEnabled.checked)
+    badge.classList.toggle('is-off', !on)
+    badge.textContent = `${on ? '已启用' : '已停用'} · rev ${badge.dataset.bootRev || ''}`
+  }
+  globalEnabled?.addEventListener('change', syncGlobalState)
+  syncGlobalState()
+
+  const setCompanyState = (text, bad) => {
+    const node = $('#boot-company-state')
+    if (!node) return
+    node.textContent = text
+    node.classList.toggle('is-bad', Boolean(bad))
+  }
+
+  $('#boot-save-global')?.addEventListener('click', async () => {
+    const admin = bootSurfacePayload('global', 'admin')
+    const chat = bootSurfacePayload('global', 'chat')
+    if (!admin || !chat) return
+    setState('保存中…')
+    try {
+      await apiSend('PUT', '/api/console/boot', { enabled: Boolean(globalEnabled?.checked), admin, chat })
+      await loadSys()
+      setState('全局配置已保存，刷新两端后生效。')
+    } catch (err) {
+      setState(err.message || '保存失败', true)
+    }
+  })
+
+  $('#boot-save-company')?.addEventListener('click', async () => {
+    const payload = useGlobal?.checked ? { useGlobal: true } : { useGlobal: false, chat: bootSurfacePayload('company', 'chat') }
+    setCompanyState('保存中…')
+    try {
+      await apiSend('PUT', '/api/console/company/boot', payload)
+      await loadSys()
+      setCompanyState(useGlobal?.checked ? '已切换为跟随全局。' : '公司覆盖已保存。')
+    } catch (err) {
+      setCompanyState(err.message || '保存失败', true)
+    }
+  })
+
+  for (const button of document.querySelectorAll('[data-boot-preview]')) {
+    button.addEventListener('click', () => {
+      const target = button.dataset.bootPreview
+      const scope = target === 'admin' ? 'global' : target === 'chat' ? 'global' : 'company'
+      const preview = bootPreviewConfig(scope, target === 'admin' ? 'admin' : 'chat')
+      if (!preview) return
+      try {
+        window.EABBoot?.preview(preview)
+      } catch {
+        setState('启动层未加载，无法预览', true)
+      }
+    })
+  }
+
+  const upload = $('#boot-upload')
+  const fileInput = $('#boot-upload-file')
+  upload?.addEventListener('click', () => fileInput?.click())
+  fileInput?.addEventListener('change', async () => {
+    const file = fileInput.files?.[0]
+    fileInput.value = ''
+    if (!file) return
+    const uploadState = $('#boot-upload-state')
+    if (uploadState) uploadState.textContent = '上传中…'
+    try {
+      if (file.size > 8 * 1024 * 1024) throw new Error('片源不能超过 8MB')
+      const res = await fetch('/api/console/boot/assets' + qs('/api/console/boot/assets'), {
+        method: 'POST',
+        headers: {
+          accept: 'application/json',
+          'content-type': 'video/mp4',
+          'x-eab-console': '1',
+          'x-file-name': encodeURIComponent(file.name || 'EAB 启动片头'),
+        },
+        body: file,
+      })
+      const data = await parseResponse(res)
+      await loadSys()
+      const uploadedState = $('#boot-upload-state')
+      if (uploadedState) uploadedState.textContent = `已上传 ${data.asset.name}（${data.asset.durationSec}s）`
+    } catch (err) {
+      if (uploadState) uploadState.textContent = err.message || '上传失败'
+    }
+  })
+
+  for (const button of document.querySelectorAll('[data-boot-delete]')) {
+    let armed = false
+    let armTimer = 0
+    button.addEventListener('click', async () => {
+      const assetId = button.dataset.bootDelete
+      if (!assetId) return
+      if (!armed) {
+        armed = true
+        button.textContent = '确认删除'
+        button.classList.add('is-armed')
+        window.clearTimeout(armTimer)
+        armTimer = window.setTimeout(() => {
+          armed = false
+          button.textContent = '删除'
+          button.classList.remove('is-armed')
+        }, 4000)
+        return
+      }
+      window.clearTimeout(armTimer)
+      armed = false
+      button.classList.remove('is-armed')
+      const uploadState = $('#boot-upload-state')
+      if (uploadState) uploadState.textContent = '删除中…'
+      try {
+        const res = await fetch('/api/console/boot/assets/' + encodeURIComponent(assetId), {
+          method: 'DELETE',
+          headers: { accept: 'application/json', 'x-eab-console': '1' },
+        })
+        const data = await parseResponse(res)
+        await loadSys()
+        const deletedState = $('#boot-upload-state')
+        if (deletedState) deletedState.textContent = `已删除 ${data.deleted}`
+      } catch (err) {
+        const failedState = $('#boot-upload-state')
+        if (failedState) failedState.textContent = err.message || '删除失败'
+      }
+    })
+  }
+}
+
 async function loadSys() {
   const view = $('#view')
   renderLoading(view)
@@ -5539,6 +6196,7 @@ async function loadSys() {
   try {
     const health = await api('/api/health')
     const settings = await api('/api/console/settings').catch(() => null)
+    const boot = await api('/api/console/boot').catch(() => null)
     const update = await api('/api/console/update').catch(() => null)
     const concurrency = await api('/api/console/concurrency').catch(() => null)
     const toolMetrics = await api('/api/console/tool-metrics?days=7').catch(() => null)
@@ -5584,13 +6242,20 @@ async function loadSys() {
     const locked = network.envLocked ?? {}
     const retentionDays = settings?.retentionDays ?? 90
     const auditRetentionDays = settings?.auditRetentionDays ?? 180
-    const agentRetentionDays = settings?.agentRetentionDays ?? 0
+    let agentRetentionDays = settings?.agentRetentionDays ?? 0
+    let recordRetentionDays = settings?.recordRetentionDays ?? 0
+    let workspaceRecycleDays = settings?.workspaceRecycleDays ?? 30
     const logs = settings?.logs ?? {}
     const storageRows = settings?.storage?.rows ?? []
     const storagePending = settings?.storage?.pendingMigrations ?? []
     const cleanupText = settings?.lastCleanupAt
       ? new Date(settings.lastCleanupAt).toLocaleString('zh-CN')
       : '还没有清理记录'
+    const brandBase = brandDefaults()
+    const branding = {
+      console: { ...brandBase.console, ...(settings?.branding?.console ?? {}) },
+      chat: { ...brandBase.chat, ...(settings?.branding?.chat ?? {}) },
+    }
     view.innerHTML = `
       ${sectionNavHtml(
         [
@@ -5598,11 +6263,14 @@ async function loadSys() {
           { key: 'concurrency', label: '并发与队列', meta: '对话 · 模型 · 工具 · 插件' },
           { key: 'jobs', label: '后台作业', meta: '排队 · 进度 · 结果' },
           { key: 'agents', label: 'Agent 运行树', meta: '父任务 · 子 Agent · 工具轨迹' },
-          { key: 'data', label: '数据与运维', meta: '目录 · 日志 · 备份' },
+          { key: 'boot', label: '启动动画', meta: '片头 · 片源 · 公司覆盖' },
+          { key: 'data', label: '系统与运维', meta: '目录 · 日志 · 备份 · 系统设置' },
         ],
         state.systemSection === 'company' || !state.systemSection ? 'runtime' : state.systemSection,
       )}
       <div class="section-panels">
+      ${brandingPanelHtml(branding)}
+      ${bootPanelHtml(boot)}
       <section class="panel" data-section-panel="runtime">
         <div class="panel-head"><div><h2>运行状态</h2>${hintBadge('运行说明', '本机服务与版本；网络设置保存后即时生效，监听地址与端口会自动切换，不用重启服务。')}${hintBadge('部署说明', '这是只给部署方看的运行视图；组织成员不会进入控制台。监听地址与端口可在「网络与访问入口」保存，环境变量优先。')}</div></div>
         <div class="kv-grid">
@@ -5863,35 +6531,39 @@ async function loadSys() {
       </section>
       <section class="panel" data-section-panel="data">
         <div class="panel-head">
-          <div><h2>存储位置</h2>${hintBadge('路径规则', '每个分类都可以单独指定绝对路径；没单独配置时跟随总存储位置。保存后重启，启动时先把旧目录复制到新目录并校验，成功后才切换，旧目录保留。目标目录已有数据时不会自动覆盖。')}</div>
-          <span class="pill ${storagePending.length > 0 ? 'warn' : 'ok'}">${storagePending.length > 0 ? '待重启迁移' : '可在控制台调整'}</span>
+          <div><h2>存储位置</h2>${hintBadge('路径规则', '每个分类都可以单独指定绝对路径；没单独配置时跟随总存储位置。点击「选择目录…」选择服务器上的目录，保存后立即复制/切换，不需要重启；旧目录保留。目标目录已有数据时不会自动覆盖。')}</div>
+          <span class="pill ${storagePending.length > 0 ? 'warn' : 'ok'}">${storagePending.length > 0 ? '待重启迁移' : '保存后即时切换'}</span>
         </div>
         <div class="storage-rows" id="storage-rows">
           ${storageRows.map((row) => `
-            <div class="storage-row" data-storage-key="${esc(row.key)}">
+            <div class="storage-row" data-storage-key="${esc(row.key)}" data-current-path="${esc(row.path || '')}">
               <div class="storage-meta">
                 <span class="storage-label">${esc(row.label)}</span>
                 <span class="pill ${row.source === '独立配置' ? 'accent' : ''}">${row.locked ? '由环境变量固定' : esc(row.source)}</span>
               </div>
               <div class="storage-current">
                 <span class="desc">当前</span>
-                <strong class="mono">${esc(row.path || '—')}</strong>
+                <strong class="mono" data-storage-current>${esc(row.path || '—')}</strong>
                 ${row.key === 'database' ? '<span class="desc">eab.db、密钥与管理凭据所在目录</span>' : ''}
-                ${row.key === 'dataDir' && settings?.dbPath ? `<span class="desc">数据库 ${esc(settings.dbPath)}</span>` : ''}
+                ${row.key === 'dataDir' && settings?.dbPath ? `<span class="desc" data-storage-dbpath>数据库 ${esc(settings.dbPath)}</span>` : ''}
               </div>
               <div class="storage-edit">
-                <input id="storage-input-${esc(row.key)}" placeholder="新绝对路径，例如 E:\\EABData\\${esc(row.key === 'dataDir' ? '' : row.key)}" ${row.locked ? 'disabled' : ''} />
+                <button class="btn sm ghost" type="button" data-storage-pick ${row.locked ? 'disabled' : ''}>选择目录…</button>
                 <button class="btn sm primary" type="button" data-storage-save ${row.locked ? 'disabled' : ''}>保存</button>
                 <button class="btn sm ghost" type="button" data-storage-reset ${row.locked ? 'disabled' : ''}>${row.key === 'dataDir' ? '恢复部署默认' : '跟随总位置'}</button>
               </div>
+              <div class="storage-pending" data-storage-pending hidden>
+                <span class="desc">待保存</span>
+                <strong class="mono" data-storage-pending-path></strong>
+              </div>
             </div>`).join('')}
         </div>
-        <div class="inline-note" id="storage-state" style="margin-top:10px">${storagePending.length > 0 ? `待迁移：${storagePending.map((job) => `${esc(job.from)} → ${esc(job.to)}`).join('；')}` : '所有分类当前都按上面的路径生效'}</div>
+        <div class="inline-note" id="storage-state" style="margin-top:10px">${storagePending.length > 0 ? `待迁移：${storagePending.map((job) => `${esc(job.from)} → ${esc(job.to)}`).join('；')}` : '所有分类当前都按上面的路径生效；保存后立即迁移并切换，不需要重启'}</div>
       </section>
       <section class="panel" data-section-panel="data">
         <div class="panel-head">
-          <div><h2>日志与审计保留</h2>${hintBadge('清理说明', '同步记录、渠道事件、登录失败、插件事件按日志保留天数清理；审计按独立天数，只从最老一端连续删除，被删段最后一行会留作链锚点，所以清理本身不会造成断链。后台每 6 小时检查一次。')}</div>
-          <span class="pill">日志 ${retentionDays > 0 ? `${retentionDays} 天` : '永久'} · 审计 ${auditRetentionDays > 0 ? `${auditRetentionDays} 天` : '永久'} · Agent 轨迹 ${agentRetentionDays > 0 ? `${agentRetentionDays} 天` : '永久'}</span>
+          <div><h2>日志、审计与数据保留</h2>${hintBadge('清理说明', '同步记录、渠道事件、登录失败、插件事件按日志保留天数清理；会话与消息、云空间历史版本、工具/技能/团队/计划/异步任务记录按项目记录天数清理（默认永久，设天数后生效）；审计按独立天数，只从最老一端连续删除，被删段最后一行会留作链锚点，所以清理本身不会造成断链。数据连接的外部库内容始终只读，EAB 不自动写删；连接产生的同步记录和查询审计分别随日志/审计清理。回收区到期后物理副本与元数据一并删除。后台每 6 小时检查一次。')}</div>
+          <span class="pill">日志 ${retentionDays > 0 ? `${retentionDays} 天` : '永久'} · 审计 ${auditRetentionDays > 0 ? `${auditRetentionDays} 天` : '永久'} · Agent 轨迹 ${agentRetentionDays > 0 ? `${agentRetentionDays} 天` : '永久'} · 项目记录 ${recordRetentionDays > 0 ? `${recordRetentionDays} 天` : '永久'} · 回收区 ${workspaceRecycleDays > 0 ? `${workspaceRecycleDays} 天` : '永久'}</span>
         </div>
         <div class="kv-grid">
           <div><span>同步记录</span><strong>${fmtNum(logs.syncRuns ?? 0)} 条<span class="desc">差异 ${fmtNum(logs.syncDiffs ?? 0)} 条</span></strong></div>
@@ -5901,6 +6573,9 @@ async function loadSys() {
           <div><span>上次清理</span><strong>${esc(cleanupText)}</strong></div>
           <div><span>审计日志</span><strong>${fmtNum(logs.auditLogs ?? 0)} 条 ${hintBadge('审计保留', auditRetentionDays > 0 ? `超过 ${auditRetentionDays} 天自动清理；只删最老一段，保留链锚点，不会因清理断链。` : '审计日志永久保留，不自动清理。')}</strong></div>
           <div><span>Agent 运行 / 步骤</span><strong>${fmtNum(logs.agentRuns ?? 0)} / ${fmtNum(logs.agentSteps ?? 0)} 条 ${hintBadge('轨迹保留', agentRetentionDays > 0 ? `超过 ${agentRetentionDays} 天自动清理已结束的 run 与步骤；运行中和挂起等后台结果的 run 不删。` : 'Agent 运行轨迹永久保留；设置天数后只清理已结束的 run。')}</strong></div>
+          <div><span>项目记录</span><strong>${fmtNum(logs.chatSessions ?? 0)} 会话 / ${fmtNum(logs.chatMessages ?? 0)} 消息<span class="desc"> · 历史版本 ${fmtNum(logs.workspaceVersions ?? 0)} · 工具 ${fmtNum(logs.toolOperations ?? 0)} · 技能 ${fmtNum(logs.skillEvents ?? 0)} · 团队 ${fmtNum(logs.agentTeamMessages ?? 0)} · 计划 ${fmtNum(logs.scheduleRuns ?? 0)} · 异步 ${fmtNum(logs.asyncJobs ?? 0)}</span></strong></div>
+          <div><span>数据连接查询审计</span><strong>${fmtNum(logs.databaseQueries ?? 0)} 条 ${hintBadge('连接数据', '外部数据库内容始终只读，EAB 不会按保留策略写删；连接产生的查询审计随审计天数清理，连接同步记录随日志天数清理。连接配置本身不自动删除。')}</strong></div>
+          <div><span>回收区</span><strong>${fmtNum(logs.workspaceRecycleFiles ?? 0)} 个 · ${fmtBytes(logs.workspaceRecycleBytes ?? 0)} ${hintBadge('回收区保留', workspaceRecycleDays > 0 ? `删除的文件超过 ${workspaceRecycleDays} 天自动清理：物理副本、历史快照和回收区元数据一并删除；活跃文件不动。` : '回收区永久保留，不自动删除磁盘文件与元数据。')}<span class="desc"> · 已删元数据 ${fmtNum(logs.workspaceDeletedRows ?? 0)} 条</span></strong></div>
         </div>
         <div class="form-grid" style="align-items:end;margin-top:14px">
           <label class="field"><span>日志保留天数（0 = 永久保留）</span>
@@ -5911,6 +6586,12 @@ async function loadSys() {
           </label>
           <label class="field"><span>Agent 轨迹保留天数（0 = 永久保留）</span>
             <input id="agent-retention-input" type="number" min="0" max="3650" value="${agentRetentionDays}" />
+          </label>
+          <label class="field"><span>项目记录保留天数（0 = 永久保留）</span>
+            <input id="record-retention-input" type="number" min="0" max="3650" value="${recordRetentionDays}" />
+          </label>
+          <label class="field"><span>回收区保留天数（0 = 永久保留）</span>
+            <input id="workspace-retention-input" type="number" min="0" max="3650" value="${workspaceRecycleDays}" />
           </label>
           <div class="panel-actions" style="align-self:end">
             <button class="btn sm primary" type="button" id="retention-save">保存策略</button>
@@ -5943,6 +6624,7 @@ async function loadSys() {
     mountSectionNav(view, state.systemSection, 'runtime', (key) => {
       state.systemSection = key
     })
+    bindBootConfigPanel()
     const concurrencyRefresh = $('#concurrency-refresh')
     if (concurrencyRefresh) {
       concurrencyRefresh.addEventListener('click', () => PAGES.system.render())
@@ -6094,6 +6776,114 @@ async function loadSys() {
       }
     }
     refreshBackends()
+    const brandingSave = $('#branding-save')
+    if (brandingSave) {
+      const draft = {
+        console: { ...branding.console },
+        chat: { ...branding.chat },
+      }
+      const note = $('#branding-state')
+      const setBrandNote = (text, bad = false) => {
+        if (!note) return
+        note.textContent = text
+        note.classList.toggle('bad-text', bad)
+      }
+      const paintMark = (target, surface) => {
+        if (!target) return
+        target.replaceChildren()
+        target.classList.toggle('has-image', Boolean(surface.iconDataUrl))
+        if (surface.iconDataUrl) {
+          const image = document.createElement('img')
+          image.src = surface.iconDataUrl
+          image.alt = ''
+          image.setAttribute('aria-hidden', 'true')
+          target.appendChild(image)
+        } else {
+          target.textContent = surface.logoText
+        }
+      }
+      const paintPreview = (key) => {
+        const card = view.querySelector(`[data-brand-surface="${key}"]`)
+        if (!card) return
+        paintMark(card.querySelector('[data-brand-preview-logo]'), draft[key])
+        paintMark(card.querySelector('[data-brand-preview-favicon]'), draft[key])
+        const tab = card.querySelector('[data-brand-preview-tab]')
+        if (tab) tab.textContent = draft[key].tabTitle
+        const name = card.querySelector('[data-brand-preview-name]')
+        if (name) name.textContent = draft[key].brandName
+      }
+      for (const card of view.querySelectorAll('[data-brand-surface]')) {
+        const key = card.dataset.brandSurface
+        const fileInput = card.querySelector('[data-brand-file]')
+        const upload = card.querySelector('[data-brand-upload]')
+        const reset = card.querySelector('[data-brand-reset]')
+        const iconNote = card.querySelector('[data-brand-icon-note]')
+        const setIcon = (icon, text) => {
+          draft[key].iconDataUrl = icon || null
+          if (iconNote) iconNote.textContent = text
+          paintPreview(key)
+        }
+        for (const field of card.querySelectorAll('[data-brand-field]')) {
+          field.addEventListener('input', () => {
+            draft[key][field.dataset.brandField] = field.value
+            paintPreview(key)
+          })
+        }
+        upload?.addEventListener('click', () => fileInput?.click())
+        reset?.addEventListener('click', () => setIcon(null, '未上传图标，使用图标内文字生成默认标记'))
+        fileInput?.addEventListener('change', async () => {
+          const file = fileInput.files?.[0]
+          fileInput.value = ''
+          if (!file) return
+          const allowed = /^(image\/(png|jpeg|webp|svg\+xml|x-icon|vnd\.microsoft\.icon)|image\/svg\+xml)$/i.test(file.type)
+          const extension = /\.(png|jpe?g|webp|svg|ico)$/i.test(file.name)
+          if (!allowed && !extension) return setBrandNote('只支持 PNG、JPEG、WebP、SVG 或 ICO 图标', true)
+          if (file.size > 256 * 1024) return setBrandNote('图标不能超过 256KB', true)
+          try {
+            const dataUrl = await readBrandFile(file)
+            setIcon(dataUrl, `已选择：${file.name} · ${(file.size / 1024).toFixed(1)}KB`)
+            setBrandNote('')
+          } catch (err) {
+            setBrandNote(err.message || '读取图标失败', true)
+          }
+        })
+        paintPreview(key)
+      }
+      brandingSave.addEventListener('click', async () => {
+        for (const key of ['console', 'chat']) {
+          const surface = draft[key]
+          for (const [label, value, max] of [
+            ['图标文字', surface.logoText, 8],
+            ['品牌名称', surface.brandName, 40],
+            ['标签页标题', surface.tabTitle, 80],
+          ]) {
+            const text = String(value ?? '').trim()
+            if (!text) return setBrandNote(`${key === 'console' ? '管理控制台' : '员工对话'}${label}不能为空`, true)
+            if ([...text].length > max) return setBrandNote(`${label}最多 ${max} 个字符`, true)
+          }
+        }
+        for (const key of ['console', 'chat']) {
+          draft[key].logoText = String(draft[key].logoText ?? '').trim()
+          draft[key].brandName = String(draft[key].brandName ?? '').trim()
+          draft[key].tabTitle = String(draft[key].tabTitle ?? '').trim()
+        }
+        brandingSave.disabled = true
+        setBrandNote('保存中…')
+        try {
+          await apiSend('PUT', '/api/console/settings/branding', {
+            console: draft.console,
+            chat: draft.chat,
+          })
+          if (window.EABBrand?.load) await window.EABBrand.load()
+          setBrandNote('已保存。控制台已立即更新；对话页刷新或切回标签页后更新。')
+          showTopToast('品牌设置已保存')
+        } catch (err) {
+          setBrandNote(err.message || '保存失败', true)
+        } finally {
+          brandingSave.disabled = false
+        }
+      })
+    }
     const retentionSave = $('#retention-save')
     if (retentionSave) {
       const note = $('#retention-state')
@@ -6106,10 +6896,14 @@ async function loadSys() {
         const days = Number($('#retention-input')?.value)
         const auditDays = Number($('#audit-retention-input')?.value)
         const agentDays = Number($('#agent-retention-input')?.value)
+        const recordDays = Number($('#record-retention-input')?.value)
+        const workspaceDays = Number($('#workspace-retention-input')?.value)
         for (const [label, value] of [
           ['日志保留天数', days],
           ['审计保留天数', auditDays],
           ['Agent 轨迹保留天数', agentDays],
+          ['项目记录保留天数', recordDays],
+          ['回收区保留天数', workspaceDays],
         ]) {
           if (!Number.isInteger(value) || value < 0 || (value > 0 && value < 7) || value > 3650) {
             return setNote(`${label}只能填 0（永久）或 7–3650`, true)
@@ -6117,11 +6911,17 @@ async function loadSys() {
         }
         retentionSave.disabled = true
         try {
-          await apiSend('PUT', '/api/console/settings/retention', { days, auditDays, agentDays })
+          await apiSend('PUT', '/api/console/settings/retention', { days, auditDays, agentDays, recordDays, workspaceDays })
+          // 保存成功后同步确认框使用的策略值，避免“刚保存 30 天却仍提示永久保留”。
+          agentRetentionDays = agentDays
+          recordRetentionDays = recordDays
+          workspaceRecycleDays = workspaceDays
           const policy = [
             days > 0 ? `日志超过 ${days} 天` : '日志永久保留',
             auditDays > 0 ? `审计超过 ${auditDays} 天` : '审计永久保留',
             agentDays > 0 ? `Agent 轨迹超过 ${agentDays} 天` : 'Agent 轨迹永久保留',
+            recordDays > 0 ? `项目记录超过 ${recordDays} 天` : '项目记录永久保留',
+            workspaceDays > 0 ? `回收区超过 ${workspaceDays} 天` : '回收区永久保留',
           ]
           setNote(`已保存：${policy.join('；')}（后台每 6 小时检查一次）`)
         } catch (err) {
@@ -6135,12 +6935,19 @@ async function loadSys() {
     if (retentionRun) {
       retentionRun.addEventListener('click', async () => {
         const note = $('#retention-state')
+        const recordDays = recordRetentionDays
+        const workspaceDays = workspaceRecycleDays
+        if (!window.confirm(`立即清理一次？\n\n将按已保存的策略删除超过保留期的日志、审计、Agent 轨迹、项目记录和回收区数据。${recordDays > 0 ? `\n项目记录超过 ${recordDays} 天会被删除。` : '\n项目记录当前为永久保留。'}${workspaceDays > 0 ? `\n回收区超过 ${workspaceDays} 天的物理文件和元数据会被删除。` : '\n回收区当前为永久保留。'}`)) return
         retentionRun.disabled = true
         if (note) note.textContent = '清理中…'
         try {
           const result = await apiPost('/api/console/settings/retention/run', {})
-          if (result.skipped) {
-            if (note) note.textContent = '当前日志与审计都设为永久保留（0 天），没有需要清理的记录'
+          const recycle = result.workspaceRecycle
+          const recycleText = recycle && !recycle.skipped && (recycle.files > 0 || recycle.rows > 0)
+            ? `回收区删除 ${recycle.files} 个物理文件（${fmtBytes(recycle.bytes)}），清理 ${recycle.rows} 条元数据`
+            : ''
+          if (result.skipped && !recycleText) {
+            if (note) note.textContent = '当前日志、审计、Agent 轨迹、项目记录与回收区都设为永久保留（0 天），没有需要清理的内容'
           } else {
             const labels = {
               syncDiffs: '同步差异',
@@ -6152,17 +6959,38 @@ async function loadSys() {
               auditLogs: '审计记录',
               agentRuns: 'Agent 运行',
               agentSteps: 'Agent 步骤',
+              chatMessages: '会话消息',
+              chatSessions: '会话',
+              workspaceVersions: '历史版本',
+              toolOperations: '工具操作',
+              skillEvents: '技能事件',
+              agentTeamMessages: '团队消息',
+              agentTasks: '团队任务',
+              agentEvents: '团队事件',
+              scheduleRuns: '计划运行',
+              scheduleEvents: '计划事件',
+              asyncJobs: '异步任务',
+              guiFallbacks: 'GUI 兜底',
+              officeRefreshGuards: 'Office 水位',
+              robotFileSends: '文件回声',
             }
             const detail = Object.entries(result.deleted ?? {})
-              .filter(([, n]) => Number(n) > 0)
+              .filter(([key, n]) => Number(n) > 0 && !key.startsWith('workspaceRecycle'))
               .map(([key, n]) => `${labels[key] || key} ${n}`)
               .join('、')
-            if (note) note.textContent = result.total ? `已清理 ${result.total} 条：${detail}` : '没有超过保留期的记录，无需清理'
+            const parts = [detail, recycleText].filter(Boolean)
+            if (note) note.textContent = parts.length ? `已清理：${parts.join('；')}` : '没有超过保留期的内容，无需清理'
           }
           const input = $('#retention-input')
           if (input && result.days > 0) input.value = result.days
           const auditInput = $('#audit-retention-input')
           if (auditInput && result.audit?.days > 0) auditInput.value = result.audit.days
+          const agentInput = $('#agent-retention-input')
+          if (agentInput && result.agentDays > 0) agentInput.value = result.agentDays
+          const recordInput = $('#record-retention-input')
+          if (recordInput && result.recordDays > 0) recordInput.value = result.recordDays
+          const workspaceInput = $('#workspace-retention-input')
+          if (workspaceInput && result.workspaceRecycle?.days > 0) workspaceInput.value = result.workspaceRecycle.days
         } catch (err) {
           if (note) {
             note.textContent = err.message
@@ -6217,35 +7045,228 @@ async function loadSys() {
         }
       })
     }
+    function openServerDirectoryBrowser(initialPath) {
+      return new Promise((resolve) => {
+        const overlay = modelModal(`
+          <div class="modal-head"><h3>选择服务器上的目录</h3><button class="modal-x" type="button">×</button></div>
+          <div class="storage-browser-body">
+            <div class="storage-browser-lead">当前浏览的是服务器所在电脑的文件系统；选中后会把服务器绝对路径填入当前分类。</div>
+            <div class="storage-browser-bar">
+              <button class="btn sm ghost" type="button" id="sdb-up">上级目录</button>
+              <input id="sdb-path" type="text" spellcheck="false" placeholder="服务器绝对路径，例如 D:\\EABData" />
+              <button class="btn sm ghost" type="button" id="sdb-go">转到</button>
+            </div>
+            <div class="storage-browser-roots" id="sdb-roots"></div>
+            <div class="storage-browser-list" id="sdb-list"><div class="storage-browser-empty">正在读取服务器目录…</div></div>
+            <div class="modal-state" id="sdb-state"></div>
+          </div>
+          <div class="modal-actions">
+            <button class="btn ghost" type="button" id="sdb-cancel">取消</button>
+            <button class="btn primary" type="button" id="sdb-select" disabled>选择此目录</button>
+          </div>
+        `)
+        overlay.classList.add('storage-browser-overlay')
+        const up = overlay.querySelector('#sdb-up')
+        const pathInput = overlay.querySelector('#sdb-path')
+        const go = overlay.querySelector('#sdb-go')
+        const rootsEl = overlay.querySelector('#sdb-roots')
+        const listEl = overlay.querySelector('#sdb-list')
+        const stateEl = overlay.querySelector('#sdb-state')
+        const selectBtn = overlay.querySelector('#sdb-select')
+        let listing = null
+
+        const close = (result) => {
+          overlay.remove()
+          resolve(result)
+        }
+
+        overlay.querySelector('.modal-x').addEventListener('click', () => close(null))
+        overlay.querySelector('#sdb-cancel').addEventListener('click', () => close(null))
+        overlay.addEventListener('click', (event) => {
+          if (event.target === overlay) close(null)
+        })
+
+        const load = async (path) => {
+          listing = null
+          selectBtn.disabled = true
+          stateEl.textContent = ''
+          stateEl.classList.remove('bad-text')
+          listEl.innerHTML = '<div class="storage-browser-empty">正在读取服务器目录…</div>'
+          try {
+            const data = await api(`/api/console/system/directories?path=${encodeURIComponent(path || '')}`)
+            listing = data
+            pathInput.value = data.path || ''
+            up.disabled = !data.parent
+            rootsEl.innerHTML = (data.roots || [])
+              .map((root) => `<button class="btn sm ghost storage-browser-root" type="button" data-sdb-path="${esc(root.path)}">${esc(root.name)}</button>`)
+              .join('')
+            const entries = data.entries || []
+            const rootOnly = data.path === '/' || /^[A-Za-z]:[\\/]?$/.test(data.path || '')
+            if (!entries.length) {
+              listEl.innerHTML = `<div class="storage-browser-empty">${data.path ? '当前目录下没有子目录' : '请选择磁盘，或在上方输入服务器绝对路径'}</div>`
+            } else {
+              listEl.innerHTML = entries
+                .map((entry) => `<button class="storage-browser-entry" type="button" data-sdb-path="${esc(entry.path)}"><span class="storage-browser-folder">目录</span><span>${esc(entry.name)}</span></button>`)
+                .join('')
+            }
+            selectBtn.disabled = !data.path || rootOnly
+            if (rootOnly) {
+              stateEl.textContent = '请进入一个具体目录；盘符根目录不能直接作为存储位置。'
+            } else if (data.truncated) {
+              stateEl.textContent = `目录较大，只显示前 ${entries.length} 个子目录，共 ${data.total} 个。`
+            }
+          } catch (err) {
+            listing = null
+            up.disabled = true
+            selectBtn.disabled = true
+            listEl.innerHTML = '<div class="storage-browser-empty bad-text">目录读取失败，可改用上方路径输入或取消后手动填写。</div>'
+            stateEl.textContent = err.message
+            stateEl.classList.add('bad-text')
+          }
+        }
+
+        rootsEl.addEventListener('click', (event) => {
+          const button = event.target.closest('[data-sdb-path]')
+          if (button) load(button.dataset.sdbPath)
+        })
+        listEl.addEventListener('click', (event) => {
+          const button = event.target.closest('[data-sdb-path]')
+          if (button) load(button.dataset.sdbPath)
+        })
+        up.addEventListener('click', () => {
+          if (listing?.parent) load(listing.parent)
+        })
+        go.addEventListener('click', () => load(pathInput.value.trim()))
+        pathInput.addEventListener('keydown', (event) => {
+          if (event.key === 'Enter') {
+            event.preventDefault()
+            go.click()
+          }
+        })
+        selectBtn.addEventListener('click', () => {
+          if (listing?.path) close(listing.path)
+        })
+
+        load(initialPath)
+      })
+    }
+
     const storageRowsEl = $('#storage-rows')
     if (storageRowsEl) {
+      const waitForNativePick = async (ticket) => {
+        const deadline = Date.now() + 120_000
+        while (Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 300))
+          const result = await api(`/api/console/system/pick-directory/result?ticket=${encodeURIComponent(ticket)}`)
+          if (!result.done) continue
+          if (result.error) throw new Error(result.error)
+          return result.canceled ? null : String(result.path || '')
+        }
+        throw new Error('系统文件夹选择框超时未返回，请重试')
+      }
+
       storageRowsEl.addEventListener('click', async (event) => {
-        const btn = event.target.closest('[data-storage-save], [data-storage-reset]')
+        const pickBtn = event.target.closest('[data-storage-pick]')
+        const actionBtn = event.target.closest('[data-storage-save], [data-storage-reset]')
+        const btn = pickBtn ?? actionBtn
         if (!btn) return
         const row = btn.closest('.storage-row')
         const key = row?.dataset.storageKey
         if (!key) return
-        const input = row.querySelector('input')
-        const reset = btn.hasAttribute('data-storage-reset')
-        const path = reset ? null : String(input?.value ?? '').trim()
-        if (!reset && !path) {
-          const note = $('#storage-state')
+        const pendingEl = row.querySelector('[data-storage-pending]')
+        const pendingPathEl = row.querySelector('[data-storage-pending-path]')
+        const note = $('#storage-state')
+        const buttons = row.querySelectorAll('button')
+        const setPending = (picked) => {
+          if (!pendingEl || !pendingPathEl) return
+          const value = String(picked ?? '').trim()
+          pendingEl.dataset.path = value
+          pendingEl.hidden = !value
+          pendingPathEl.textContent = value
+        }
+
+        if (pickBtn) {
+          const initial = String(row.dataset.currentPath ?? '').trim()
+          const applyPicked = (picked) => {
+            if (!picked) {
+              if (note) note.textContent = '已取消选择，路径没有变化'
+              return
+            }
+            setPending(picked)
+            if (note) note.textContent = `已选择：${picked}。点击「保存」立即迁移并切换，不需要重启。`
+            pickBtn.focus()
+          }
+          buttons.forEach((item) => { item.disabled = true })
           if (note) {
-            note.textContent = '先填写新的绝对路径，例如 E:\\EABData\\workspaces'
+            note.textContent = '正在打开目录选择…'
+            note.classList.remove('bad-text')
+          }
+          try {
+            const result = await apiSend('POST', '/api/console/system/pick-directory', { initial })
+            if (result.mode === 'browse') {
+              if (note && result.hint) note.textContent = result.hint
+              applyPicked(await openServerDirectoryBrowser(initial))
+              return
+            }
+            if (result.mode === 'native' && result.ticket) {
+              // 原生框已经在服务器桌面打开；这里只轮询结果，不再让请求一直挂住。
+              if (note) note.textContent = '已在服务器桌面打开文件夹选择框，请选择目录…'
+              applyPicked(await waitForNativePick(result.ticket))
+              return
+            }
+            if (result.canceled) {
+              applyPicked(null)
+            } else if (result.path) {
+              applyPicked(result.path)
+            }
+          } catch (err) {
+            // 原生框启动失败时不等用户手动切换，直接落到服务器目录浏览。
+            if (note) note.textContent = `${err.message}。正在改用服务器目录浏览…`
+            applyPicked(await openServerDirectoryBrowser(initial))
+          } finally {
+            buttons.forEach((item) => { item.disabled = false })
+          }
+          return
+        }
+
+        const reset = btn.hasAttribute('data-storage-reset')
+        const path = reset ? null : String(pendingEl?.dataset.path ?? '').trim()
+        if (!reset && !path) {
+          if (note) {
+            note.textContent = '先点「选择目录…」选择一个服务器目录'
             note.classList.add('bad-text')
           }
           return
         }
-        const note = $('#storage-state')
-        const buttons = row.querySelectorAll('button, input')
         buttons.forEach((item) => { item.disabled = true })
+        if (note) {
+          note.textContent = reset ? '正在恢复默认路径并立即迁移…' : '正在复制、校验并切换，请稍候…'
+          note.classList.remove('bad-text')
+        }
         try {
           const result = await apiSend('PUT', '/api/console/settings/storage', { key, path, reset })
           if (note) {
             note.textContent = result.changed ? result.hint : '路径没有变化'
             note.classList.toggle('bad-text', false)
           }
-          if (input) input.value = ''
+          setPending(null)
+          const nextRows = result.storage?.rows ?? []
+          for (const nextRow of nextRows) {
+            const rowEl = [...storageRowsEl.querySelectorAll('.storage-row')]
+              .find((item) => item.dataset.storageKey === nextRow.key)
+            if (!rowEl) continue
+            rowEl.dataset.currentPath = nextRow.path || ''
+            const current = rowEl.querySelector('[data-storage-current]')
+            if (current) current.textContent = nextRow.path || '—'
+          }
+          const dbPathEl = storageRowsEl.querySelector('[data-storage-dbpath]')
+          if (dbPathEl && result.storage?.dbPath) dbPathEl.textContent = `数据库 ${result.storage.dbPath}`
+          const badge = $('#storage-state')?.closest('.panel')?.querySelector('.panel-head .pill')
+          if (badge) {
+            badge.textContent = '保存后即时切换'
+            badge.classList.remove('warn')
+            badge.classList.add('ok')
+          }
         } catch (err) {
           if (note) {
             note.textContent = err.message
@@ -7283,6 +8304,13 @@ async function loadUsage(days = 30) {
 /* ---------------- 公司资料 ---------------- */
 
 const fmtNum = (value) => Number(value ?? 0).toLocaleString('zh-CN')
+const fmtBytes = (value) => {
+  const n = Number(value ?? 0)
+  if (n >= 1024 * 1024 * 1024) return `${(n / 1024 / 1024 / 1024).toFixed(1)} GB`
+  if (n >= 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`
+  if (n >= 1024) return `${(n / 1024).toFixed(1)} KB`
+  return `${Math.round(n)} B`
+}
 
 function fmtDateTime(value) {
   if (!value) return '—'
@@ -10806,10 +11834,22 @@ function openPluginUninstall(plugin) {
   const companyName = state.companies?.find((item) => item.id === state.pluginData?.companyId)?.name || state.pluginData?.companyId || '当前公司'
   const overlay = modelModal(`
     <div class="modal-head"><h3>从「${esc(companyName)}」卸载 ${esc(plugin.name)}</h3><button class="modal-x" type="button">×</button></div>
-    <div class="legend" style="margin-top:0">
-      卸载只解除 <strong>当前公司</strong> 的安装与启停记录，不影响其他公司。
-      如果当前公司是最后一家使用它的公司，<span class="mono">plugins/${esc(plugin.id)}</span> 会被
-      <strong>直接删除</strong>（不保留回收站副本）；否则共享目录保留。
+    <div class="plugin-uninstall-note" role="note" aria-label="卸载影响说明">
+      <div class="plugin-uninstall-head">
+        <span class="plugin-uninstall-icon" aria-hidden="true">!</span>
+        <strong>卸载影响</strong>
+        <span class="plugin-uninstall-scope">仅当前公司</span>
+      </div>
+      <div class="plugin-uninstall-grid">
+        <div class="plugin-uninstall-row">
+          <span class="plugin-uninstall-key">公司范围</span>
+          <p class="plugin-uninstall-copy">只解除 <strong>当前公司</strong> 的安装与启停记录，不影响其他公司。</p>
+        </div>
+        <div class="plugin-uninstall-row">
+          <span class="plugin-uninstall-key">共享目录</span>
+          <p class="plugin-uninstall-copy">如果当前公司是最后一家使用它的公司，<code>plugins/${esc(plugin.id)}</code> 会被 <strong class="plugin-uninstall-danger">直接删除</strong>（不保留回收站副本）；否则共享目录保留。</p>
+        </div>
+      </div>
     </div>
     <div class="modal-state" id="pu-state"></div>
     <div class="modal-actions">
@@ -12631,7 +13671,7 @@ async function loadSkillsPage() {
  */
 const DOMAINS = [
   { id: 'overview', label: '概览', kicker: 'OVERVIEW', pages: ['overview'] },
-  { id: 'org', label: '组织与权限', kicker: 'ORGANIZATION & ACCESS', pages: ['org', 'departments', 'roles', 'access'] },
+  { id: 'org', label: '组织与权限', kicker: 'ORGANIZATION & ACCESS', pages: ['org', 'departments', 'roles', 'approvalPolicies', 'access'] },
   { id: 'knowledge', label: '知识与模型', kicker: 'KNOWLEDGE & MODELS', pages: ['kb', 'models', 'tools'] },
   { id: 'platform', label: '连接与平台', kicker: 'PLATFORMS', pages: ['channels', 'databases', 'documents', 'company', 'system'] },
   { id: 'plugins', label: '插件管理', kicker: 'PLUGIN ECOSYSTEM', pages: ['extra'] },
@@ -12698,6 +13738,7 @@ function renderNavRail() {
       ['org', '成员管理', '成员列表与角色授权'],
       ['departments', '部门管理', '部门结构、负责人与下级'],
       ['roles', '角色管理', '角色权限与成员配置'],
+      ['approvalPolicies', '权限审批', '按权限范围配置审批链'],
     ]
     const activePage = state.page === 'access' ? 'roles' : state.page
     rail.classList.add('org-rail-mode')
@@ -12954,6 +13995,11 @@ async function boot() {
     await loadCompanies()
   } catch (err) {
     renderDenied($('#view'), err)
+    try {
+      window.EABBoot?.fail(err?.message || '控制台加载失败')
+    } catch {
+      /* 启动层不可用时不能阻断错误页 */
+    }
     return
   }
 
@@ -13032,8 +14078,20 @@ async function boot() {
   })
 
   flushQueuedTopToast()
-  if (needsFirstCompany) return
+  if (needsFirstCompany) {
+    try {
+      window.EABBoot?.ready('正在进入控制台…')
+    } catch {
+      /* ignore */
+    }
+    return
+  }
   await refresh()
+  try {
+    window.EABBoot?.ready('正在进入控制台…')
+  } catch {
+    /* ignore */
+  }
 }
 
 bindHintTips()
