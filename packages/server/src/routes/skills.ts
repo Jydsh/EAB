@@ -63,6 +63,8 @@ function serializeSkill(skill: SkillRecord, withPath = false) {
     scope: skill.scope,
     checksum: skill.checksum,
     references: skill.references,
+    instructionPreview: skill.instructions.slice(0, 2_400),
+    instructionChars: skill.instructions.length,
     dir: withPath ? skill.dir : undefined,
     install: {
       source: skill.source,

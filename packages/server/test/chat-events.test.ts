@@ -1,5 +1,12 @@
 import { describe, expect, it, vi } from 'vitest'
-import { publishChatEvent, subscribeChatEvents, type ChatLiveDeltaEvent, type ChatLiveEvent } from '../src/chat-events.js'
+import {
+  isChatUserOnline,
+  publishChatEvent,
+  registerChatPresence,
+  subscribeChatEvents,
+  type ChatLiveDeltaEvent,
+  type ChatLiveEvent,
+} from '../src/chat-events.js'
 
 const sample: ChatLiveEvent = {
   type: 'message',
@@ -51,5 +58,23 @@ describe('对话实时事件总线', () => {
     expect(good).toHaveBeenCalledTimes(1)
     offBad()
     offGood()
+  })
+
+  it('多标签页在线计数只在最后一个页面关闭后判定离线', () => {
+    expect(isChatUserOnline('c-presence', 'u1')).toBe(false)
+    const first = registerChatPresence('c-presence', 'u1')
+    const second = registerChatPresence('c-presence', 'u1')
+    expect(isChatUserOnline('c-presence', 'u1')).toBe(true)
+    first()
+    expect(isChatUserOnline('c-presence', 'u1')).toBe(true)
+    second()
+    expect(isChatUserOnline('c-presence', 'u1')).toBe(false)
+  })
+
+  it('重复释放同一个在线登记不会把计数减成负数', () => {
+    const release = registerChatPresence('c-presence-2', 'u2')
+    release()
+    release()
+    expect(isChatUserOnline('c-presence-2', 'u2')).toBe(false)
   })
 })

@@ -28,6 +28,7 @@ describe('可选后端配置', () => {
     expect(config.postgresUrl).toBe('')
     expect(config.auditRead).toBe('sqlite')
     expect(config.chatRead).toBe('sqlite')
+    expect(config.backendsFromEnv).toBe(false)
     expect(config.backendsStrict).toBe(false)
   })
 
@@ -48,6 +49,19 @@ describe('可选后端配置', () => {
     expect(config.chatRead).toBe('postgres')
     expect(config.redisPrefix).toBe('eab-test:')
     expect(config.backendsStrict).toBe(true)
+  })
+
+  it('环境变量后端回退默认关闭，只有显式开关才启用', () => {
+    const config = loadConfig({
+      EAB_CACHE: 'redis',
+      EAB_REDIS_URL: 'redis://127.0.0.1:6379/0',
+    } as NodeJS.ProcessEnv)
+    expect(config.backendsFromEnv).toBe(false)
+
+    const legacy = loadConfig({
+      EAB_BACKENDS_FROM_ENV: '1',
+    } as NodeJS.ProcessEnv)
+    expect(legacy.backendsFromEnv).toBe(true)
   })
 
   it('非法模式直接报人话错误，不猜默认值', () => {

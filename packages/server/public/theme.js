@@ -1,37 +1,42 @@
 /*
- * 主题偏好：cookie + localStorage，先读 cookie。
- * 8787（对话）和 8788（控制台）端口不同，localStorage 不共享，但同主机的 cookie 共享，
- * 所以在后台切深色，刷新对话页也会跟着变。
+ * 主题偏好：按页面表面隔离（工作台 / 管理后台）。
+ * 8787（对话）和 8788（控制台）端口不同，localStorage 天然隔离；
+ * 这里只读写当前表面自己的键，不再使用同主机共享 cookie，避免互相带动。
  */
 (function () {
-  var KEY = 'eab_theme'
+  var surface =
+    (document.currentScript && document.currentScript.getAttribute('data-surface')) ||
+    (location.pathname.indexOf('/admin') === 0 ? 'admin' : 'chat')
+  var KEY = 'eab_theme:' + surface
+  var LEGACY_KEY = 'eab_theme'
   var root = document.documentElement
   var media = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null
 
-  function readCookie() {
+  function readLocal(key) {
     try {
-      var hit = document.cookie.split('; ').filter(function (item) {
-        return item.indexOf(KEY + '=') === 0
-      })[0]
-      if (!hit) return null
-      var value = decodeURIComponent(hit.slice(KEY.length + 1))
+      var value = window.localStorage.getItem(key)
       return value === 'dark' || value === 'light' ? value : null
     } catch {
       return null
     }
   }
 
-  function readLocal() {
-    try {
-      var value = window.localStorage.getItem(KEY)
-      return value === 'dark' || value === 'light' ? value : null
-    } catch {
-      return null
-    }
+  function readLegacy() {
+    // 旧版在同一个 origin 的 localStorage 里也写过主题；只迁移本端口自己的值，
+    // 不读取同主机共享 cookie，避免 8787/8788 首次加载时又被旧 cookie 串起来。
+    return readLocal(LEGACY_KEY)
   }
 
   function explicitTheme() {
-    return readCookie() || readLocal()
+    var own = readLocal(KEY)
+    if (own) return own
+    // 一次性兼容旧版：旧偏好迁到当前表面，之后两个表面各用各的键。
+    var legacy = readLegacy()
+    if (!legacy) return null
+    try {
+      window.localStorage.setItem(KEY, legacy)
+    } catch {}
+    return legacy
   }
 
   function systemTheme() {
@@ -55,9 +60,6 @@
   }
 
   function persist(theme) {
-    try {
-      document.cookie = KEY + '=' + theme + '; path=/; max-age=31536000; SameSite=Lax'
-    } catch {}
     try {
       window.localStorage.setItem(KEY, theme)
     } catch {}
@@ -85,21 +87,11 @@
     bind()
   }
 
-  // 同一页面的另一个标签页改了主题，这里跟着切。
+  // 同一表面、同一浏览器的另一个标签页改了主题，这里跟着切；跨端口不再同步。
   window.addEventListener('storage', function (event) {
     if (event.key !== KEY) return
     if (event.newValue === 'dark' || event.newValue === 'light') apply(event.newValue)
   })
-
-  // 8787 与 8788 端口不同，localStorage 不互通；切回这个标签页时重读 cookie，
-  // 让后台切好的主题在对话页立即可见。
-  function syncFromSharedCookie() {
-    if (document.visibilityState === 'hidden') return
-    var theme = explicitTheme()
-    if (theme && theme !== root.dataset.theme) apply(theme)
-  }
-  window.addEventListener('focus', syncFromSharedCookie)
-  document.addEventListener('visibilitychange', syncFromSharedCookie)
 
   // 用户没有明确选择过时，跟随系统。
   if (media) {

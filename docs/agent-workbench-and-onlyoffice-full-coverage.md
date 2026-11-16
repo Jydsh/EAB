@@ -6,9 +6,9 @@
 |---|---|---|---|
 | P0 设计 | 完成 | 本文档 | 待用户评审 |
 | P1 可观察多 Agent | 完成，已实测 | 后端 `agent` 事件（spawn/assign/content/tool/report/done）、按任务能力自动选模型、子 Agent 完成注销；前端 `agent-dock` 分窗口、父子派发与汇报、模型与步骤展示、无内容时隐藏右栏 | 事件未进 `chat-events` 总线；父子双向消息仍是第二阶段 |
-| P2 预览能力矩阵 | 部分完成，已实测 | 服务端 `GET /api/workspace/files/:id/preview-capability`；前端按 `kind` 决定是否创建预览栏；无预览文件不显示空白面板 | 文本选区/diff、图片区域/OCR、PDF 高亮批注、权限失效自动关闭尚未实现 |
-| P3 OnlyOffice 插件与内容工具 | 插件、读取/替换/插入/删除表格行/列、合并表网格删行删列、矩形合并/整表拆分、格式/批注、单元格插入、定位、高亮、查看态自动刷新、强制保存、插件保存按钮、修订读取/写入与插件接受/拒绝、xlsx `cell` 插件注入、工作表面板、保存同步、工作表追加/删除、列宽/行高、xlsx legacy 单元格批注已实现并验收 | 插件 manifest/页面/脚本、`editorConfig.plugins` 注入、短期 `plugin` token、插件 SDK 握手、只读/编辑模式读取文档结构、`office.read_outline` / `office.find` / `office.replace` / `office.insert` / `office.format` / `office.comment`、合并表 `gridSpan/vMerge` 网格布局、`office.insert action=merge|split`、单元格内插入、插件内定位并选中、编辑模式高亮全部命中、关闭预览保存回调、`POST /api/workspace/office/plugin/force-save`、`saved`/`pending`/`no_changes` 结果、无 token/非法 token/只读 token 拒绝、工具完成后查看态自动重载、插件保存后 `eab:onlyoffice:saved` + `refresh-guard` + 查看态重载、`workspace.file.force_save` 审计、xlsx `EditorsSupport:["cell"]`、`documentType:"cell"`、WORKSHEET 面板、工作表读取、查找选中、编辑态替换与保存、xlsx 工作表增删与列宽/行高、xlsx `comments`/VML 批注 add/list/delete 与最后一条清理 | xlsx threaded comments/persons、批注自定义 VML 位置、数字/公式/合并单元格的替换与保存未验证；pptx 插件注入与幻灯片面板已落地，但仅文本级读取/替换，多页跳转与结构编辑仍未覆盖 |
-| P4 xlsx/pptx 与 GUI 兜底 | 未开始 | — | 表格/幻灯片分支、未覆盖 UI 的受控兜底清单 |
+| P2 预览能力矩阵 | 部分完成，已实测 | 服务端 `GET /api/workspace/files/:id/preview-capability`；前端按 `kind` 决定是否创建预览栏；无预览文件不显示空白面板；预览打开后每 30 秒巡检，403/404/`kind=none` 关闭并恢复布局；文本编辑态“查看差异”支持行级/字符级高亮与未改动行折叠；PDF 自托管 PDF.js 单页渲染、页码/缩放、文本层拖选、本页文本提取/复制/引用、区域框选与本机高亮批注、存储失败提示；PDF.js 路由已有 `app.inject` 自动化测试 | 图片区域/OCR 尚未实现；PDF 批注只存本机 `localStorage`，按 `fileId + updatedAt` 隔离且不改原文件，不跨设备；PDF 不做全文/跨页导出；文本 diff 只覆盖本次编辑，不做历史版本间比较 |
+| P3 OnlyOffice 插件与内容工具 | 插件、读取/替换/插入/删除表格行/列、合并表网格删行删列、矩形合并/整表拆分、格式/批注、单元格插入、定位、高亮、查看态自动刷新、强制保存、插件保存按钮、修订读取/写入与插件接受/拒绝、xlsx `cell` 插件注入、工作表面板、保存同步、工作表追加/删除、列宽/行高、xlsx legacy 单元格批注已实现并验收；S10/S16 版本快照、`baseVersion` 冲突拒绝、历史版本/恢复/PDF 导出与审计已实现并验收 | 插件 manifest/页面/脚本、`editorConfig.plugins` 注入、短期 `plugin` token、插件 SDK 握手、只读/编辑模式读取文档结构、`office.read_outline` / `office.find` / `office.replace` / `office.insert` / `office.format` / `office.comment`、合并表 `gridSpan/vMerge` 网格布局、`office.insert action=merge|split`、单元格内插入、插件内定位并选中、编辑模式高亮全部命中、关闭预览保存回调、`POST /api/workspace/office/plugin/force-save`、`saved`/`pending`/`no_changes` 结果、无 token/非法 token/只读 token 拒绝、工具完成后查看态自动重载、插件保存后 `eab:onlyoffice:saved` + `refresh-guard` + 查看态重载、`workspace.file.force_save` 审计、xlsx `EditorsSupport:["cell"]`、`documentType:"cell"`、WORKSHEET 面板、工作表读取、查找选中、编辑态替换与保存、xlsx 工作表增删与列宽/行高、xlsx `comments`/VML 批注 add/list/delete 与最后一条清理 | xlsx threaded comments/persons、批注自定义 VML 位置、数字/公式/合并单元格的替换与保存未验证；pptx 插件注入与幻灯片面板已落地，但仅文本级读取/替换，多页跳转与结构编辑仍未覆盖 |
+| P4 xlsx/pptx 与 GUI 兜底 | 部分完成，已实测 | xlsx 工作表面板、查找选中、编辑态替换与保存、工作表增删、列宽/行高、legacy 单元格批注；pptx 插件注入与文本级读取/替换；S10/S16 版本快照、恢复、`baseVersion` 冲突、PDF 导出与审计；S15 白名单、人工确认、失败即停与 `workspace.file.agent_gui` 审计；2026-11-15 `refresh-guard` 水位持久化 | pptx 多页跳转、组合形状与结构编辑；xlsx threaded comments；图片导出；Office 文档字符级 diff |
 
 ## 1. 目标
 
@@ -62,7 +62,7 @@ interface PreviewCapability {
 - `kind=text`：文本预览 + 选区引用 + Agent 文本修改 + diff 高亮。
 - `kind=image`：图片预览 + 区域选择 + OCR/描述/标注；不承诺像素级重绘。
 - `kind=pdf`：PDF 预览 + 文本提取/页与区域选择/高亮批注；原 PDF 重排编辑交给 PDF 工具。
-- 文件删除、权限失效、OnlyOffice 不可用且无降级能力时，立即关闭预览栏并恢复对话宽度。
+- 文件删除、权限失效、OnlyOffice 不可用且无降级能力时，立即关闭预览栏并恢复对话宽度；预览打开后每 30 秒轮询一次，页面恢复可见时立即补查，网络抖动不关闭。
 - Agent 产生/修改可预览文件时发 `preview_intent`；前端只有能力可用才自动打开，不能打开时只保留文件操作卡和下载入口。
 
 ## 3. OnlyOffice 全覆盖架构
@@ -124,10 +124,10 @@ editorConfig.plugins = {
 
 仅用于 L1/L2 确实没有 API 的 UI 功能：
 
-- 打开原生对话框、打印设置、部分导出选项、宏管理器等。
-- 必须由用户明确触发或在执行前确认。
-- 使用浏览器页面自动化，不把坐标点击作为默认策略。
-- 失败时不重试到无限循环；返回“该功能未开放 API，需要人工确认”。
+- 白名单只开放打印/打印设置、宏管理器（只打开，不执行宏）、导出选项，以及 docx 的页面设置/页眉页脚两个原生对话框；白名单外动作由服务端返回 400。
+- 必须由文件本人在前端点击确认；Agent 只能 `prepare`/`status`/`report`，不能确认。状态机 `prepared → confirmed → succeeded/failed`，10 分钟过期，失败一次即停，同一条 fallback 不能再次确认或上报。
+- 不做浏览器页面自动化，也不把坐标点击作为默认策略；服务端生成操作步骤，真正的原生按钮由用户自己点。
+- 每次 prepare/confirm/成功/失败/过期都写 `workspace.file.agent_gui`，失败审计 `result='failure'` 并带原因；不承诺稳定全覆盖。
 
 ### 3.4 OnlyOffice 版本与许可证
 
@@ -352,8 +352,11 @@ chat-main
 
 - `previewCapability` 接口。
 - 无预览隐藏、有预览展示。
-- 文本/图片/PDF 的选区、diff、标注基础能力。
+- 文本：预览选区可引用并回填发送区；编辑态“查看差异”以打开时云端原文为基线，行级 LCS 生成统一 diff，相邻删除/新增行再做字符级 LCS 高亮；只显示改动行及前后各 2 行，未改动行折叠；超过 20,000 行不生成，单次渲染最多 5,000 行。
+- PDF：改用自托管 PDF.js 单页渲染，支持页码输入/前后翻页、缩放/适应宽度；文本层可直接拖选并引用，另有本页文本提取/复制/引用面板；切到“框选区域”后拖拽选区，按文本项包围盒提取引文（无文本时记为“图片区域”），填写批注后生成黄色高亮覆盖层和批注列表。批注只写浏览器 `localStorage`，按 `fileId + updatedAt` 隔离，不修改原 PDF，下载仍是原文件；单文件最多 100 条，达到上限拒绝新增并提示先删除旧批注；本机存储配额耗尽时提示“高亮已添加，但本机存储失败，刷新后会丢失”；不跨设备、不做全文/跨页导出。复制按钮已在 CDP `Runtime.evaluate` 带 `userGesture=true` 的用户手势下验证成功，状态变为“已复制本页文本”，未独立读取剪贴板内容。工作台整页预览复用右栏文件面板；`.pdf-stage` 预留滚动槽并按 32px 内边距计算适应宽度，避免横向滚动。静态资源 MIME、缓存和拒绝路径已通过真实 HTTP 验证；新增 `packages/server/test/pdfjs-route.test.ts`，用 `buildApp` + `app.inject` 覆盖四类资源、缓存头与非法/穿越/缺失路径 404。
+- 图片：目前只有整图预览，区域选择、OCR/描述仍未实现。
 - 预览与 Agent 窗口共用右栏，互不挤占。
+- 2026-11-15 真实 `/chat` 验收：文本文件修改 2 行（含一行整行替换）后打开差异，统计“修改 2 行”并显示删除/新增行与字符高亮；无差异显示空状态；从差异视图保存后编辑器和差异面板关闭，预览显示新内容；取消编辑恢复原文和预览，焦点回到“编辑”；预览选区引用可回填发送区。PDF 验收覆盖 3 页翻页、页码输入、缩放/适应、文本层选区回填、本页文本引用、区域框选引文、批注保存后刷新恢复/定位/删除、100 条上限拒绝和本机配额耗尽提示；静态资源 MIME、缓存和拒绝路径通过真实 HTTP，并新增 `pdfjs-route.test.ts` 自动化覆盖。`node --check`、`pnpm typecheck` 通过，全量 `pnpm test` 118 文件 / 682 用例通过。
 
 ### P3 OnlyOffice 插件
 
@@ -415,24 +418,26 @@ chat-main
 - 拆分/合并边界（S7）：对 row1 `gridSpan=9` 整行标题执行 `split` 后，标题会被压进第 1 个窄 grid cell，PDF 出现竖排标题和表格错位；因此真实合并表优先直接删行/删列，`split` 只作为列插入、含 vMerge 行插入或再 merge 的显式归一化，并会改变横向合并版式。矩形 `merge` 只允许整表无合并且除左上角外无文本；3×2→split 3×3→merge 2 cell→split 回 4 cell 已由单测覆盖。
 - 回归（S6/S7）：`pnpm typecheck` exit 0；`pnpm test` 103 个测试文件 / 577 个测试全部通过；`office-content.test.ts` 50 tests、`office-comment-tool.test.ts` 1 test、`office-table-tool.test.ts` 2 tests 通过；8787 热重载后 `/api/health` 为 `ok:true`、`devAuth:false`。
 - 副本清理（S3/S4）：`office-s3-test.docx`（fileId `01M7ATCP2K7WKHWCRMNBMNF6R6`）已 `workspace.delete` 软删，`deleted_at=1794588388132`；主文档 `OnlyOffice测试.docx` 未改动，仍为 version `1794574412139`、size 13869。
-- 已知边界：`refresh-guard` 的 cutoff 存放在进程内 Map，服务重启会丢失；旧编辑器在重启后关闭时，保存回调仍可能覆盖云端。插件 force-save 已校验版本，回调侧的持久化水位留 S16。
+- 已知边界：`refresh-guard` 水位已持久化到 `workspace_office_refresh_guards`，服务重启后旧编辑器回调仍会被拒绝；旧回调的持久化水位与跨设备冲突见 S16。
 - 修订边界（S5）：目标段落已有 `w:ins/w:del` 时拒绝再写；`occurrence=0` 和选中范围含 `<w:br>/<w:tab>` 拒绝；移动/格式修订不识别。编辑态下 Agent L1 写入与旧编辑器保存的覆盖关系未验证，建议先关闭编辑器再写入，冲突治理留 S16。
 - 回归（S1/S2）：`pnpm test` 93 文件 / 504 测试通过；`pnpm typecheck` 通过；`node --check plugin.js` 与 `node --check chat.js` 通过。
 - 回归（S3/S4）：`pnpm test` 95 文件 / 521 测试通过；`pnpm typecheck` 通过；`node --check plugin.js` 与 `node --check chat.js` 通过。
 - 回归（S5）：`pnpm test` 95 文件 / 534 测试通过；`office-content.test.ts` 37 个通过；`pnpm typecheck` 通过；`node --check plugin.js` 通过。
 - 副本清理（S1/S2）：`office-force-save-test.docx`、`office-force-fail-test.docx` 均已 `workspace.delete` 软删；主文档 `OnlyOffice测试.docx` 未改动，仍为 version `1794574412139`、size 13869。
 
+- 回归（S3 水位持久化，2026-11-15）：新增 `0059_workspace_office_refresh_guards.sql`，刷新水位与旧回调校验改走数据库；真实服务重启后读回 `cutoff=1794670187218`，版本低 1 的签名回调返回 `error=0` 并写 `workspace.file.office_stale_callback`；`pnpm typecheck` 通过，全量 `pnpm test` 116 文件 / 669 用例通过。
+
 待落地：
 
-- `editorSync`：查看态已实现“服务端保存后自动重载文件列表和预览”；编辑态已实现持久警告条和“刷新到云端版本”，但不自动刷新。插件自己保存成功后先 `refresh-guard` 再自动切查看态；刷新、插件保存和旧回调都拒绝旧版本，stale callback 防覆盖已落地；跨设备冲突合并仍留在 S16。
+- `editorSync`：查看态已实现“服务端保存后自动重载文件列表和预览”；编辑态已实现持久警告条和“刷新到云端版本”，但不自动刷新。插件自己保存成功后先 `refresh-guard` 再自动切查看态；刷新、插件保存和旧回调都拒绝旧版本，stale callback 防覆盖已落地；刷新水位落 `workspace_office_refresh_guards`，服务重启后仍有效；跨设备冲突合并仍留在 S16。
 - docx 表格结构：行/列插入与删除已落地；合并表删行会迁移 `vMerge` 锚点和内容，删列按 grid 缩减 span 或移除 cell；`action=merge` 只支持无合并表的矩形区域且除左上角外无文本，`action=split` 会把横向 span 展开并改变版式。列插入、含 `vMerge` 的行插入、已合并表再 merge 前仍需 split；xlsx 已支持行/列插入、工作表追加/删除、列宽/行高与 legacy 单元格批注 `add/list/delete`（含 Excel 行列上限、单次行高 20000 行上限、删除表独占关联部件清理与图表/透视公式引用拒绝）；xlsx threaded comments/persons 与批注 VML 自定义位置仍未落地。
 - pptx 文本级插件与内容工具已验收；仍需补多页跳转、组合形状、图片/版式/新增幻灯片等结构编辑样本。xlsx 插件注入、真实浏览器读/替换、保存同步、工作表增删、列宽/行高与 legacy 单元格批注已验收；xlsx 数字/公式/合并单元格的替换与保存仍未验证；xlsx threaded comments/persons 未实现；xlsx 的服务端读取/查找/替换已具备。
 
 ### P4 全覆盖补齐
 
 - xlsx / pptx 分支。
-- 未覆盖 UI 功能的 GUI 兜底清单。
-- 版本快照、撤销、冲突处理、审计完善。
+- 版本快照、冲突处理、恢复、PDF 导出与审计完善：已完成并验收（S10/S16，2026-11-14）；编辑器内部撤销仍由 OnlyOffice 负责，服务端只提供“恢复到上一版本”。
+- 未覆盖 UI 功能的 GUI 兜底已落地（S15，2026-11-14）：`print`/`macro`/`export`/docx `dialog` 白名单、10 分钟状态机、文件本人确认、失败即停和 `workspace.file.agent_gui` 审计；不做自动点击，`mail_merge` 未开放。
 - 分步实施计划、缺口优先级和每步验收口径见 `docs/onlyoffice-agent-workbench-implementation-plan.md`。
 
 ## 10. 验收标准
@@ -452,7 +457,7 @@ chat-main
 - 文本：选中内容可引用修改，修改后可看到 diff 高亮。
 - 图片/PDF：能打开预览，能进行对应的区域/文本操作；不支持的编辑明确提示。
 - Office：OnlyOffice 编辑器打开，Agent 操作可定位、高亮、修订、保存。
-- 删除文件或权限失效时预览自动关闭。
+- 删除文件或权限失效时预览自动关闭：预览巡检每 30 秒请求 `preview-capability`，404/403 关闭并提示，`kind=none` 关闭并提示原因；网络抖动不关闭；删除/撤销后同时刷新文件列表。2026-11-15 已在真实浏览器验证删除、共享撤销、能力失效和网络抖动四条路径，关闭后恢复对话全宽；`node --check`、`pnpm typecheck` 通过，全量 `pnpm test` 116 文件 / 673 用例通过。
 
 ### 10.3 安全与审计
 
@@ -466,5 +471,5 @@ chat-main
 1. OnlyOffice 插件 API 的跨文档类型差异较大；xlsx/pptx 已分别验证基础面板与读取/定位，pptx 的 `GoToSlide` 在当前构建缺失、多页与组合形状仍需补样本。
 2. 插件从 EAB 外链加载时，Document Server 必须能访问 `EAB_PUBLIC_URL`；否则需把插件打入容器卷。
 3. 父子双向消息需要把 `agent.spawn` 从阻塞式改为可异步等待，会影响现有工具契约，放在第二阶段。
-4. GUI 兜底受 Canvas 和布局影响，不能承诺稳定全覆盖。
+4. GUI 兜底是受控人工兜底，不做页面自动化或坐标点击；原生按钮位置和可用性受 OnlyOffice 版本/布局影响，不能承诺稳定全覆盖。
 5. 同一文档用户与 Agent 同时编辑时，必须依赖修订模式/范围锁/版本回滚，不能静默覆盖。

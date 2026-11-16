@@ -21,10 +21,10 @@
       }
       .eab-boot[hidden] { display: none; }
     </style>
-    <script src="/theme.js?v=20261115b"></script>
+    <script src="/theme.js?v=20261117a" data-surface="chat"></script>
     <script src="/brand.js?v=20261115c" defer></script>
-    <link rel="stylesheet" href="/app.css?v=20261115e" />
-    <link rel="stylesheet" href="/chat.css?v=20261116d13" />
+    <link rel="stylesheet" href="/app.css?v=20261117a" />
+    <link rel="stylesheet" href="/chat.css?v=20261117a" />
     <link rel="stylesheet" href="/theme.css?v=20261115b" />
     <link rel="stylesheet" href="/boot-splash.css?v=20261115i" />
   </head>
@@ -136,6 +136,7 @@
           </span>
         </div>
         <input id="ws-input" type="file" multiple hidden />
+        <div id="ws-upload-status" class="ws-upload-status" hidden aria-live="polite"></div>
         <div class="side-sessions" id="ws-list"></div>
       </div>
 
@@ -149,7 +150,6 @@
           <span class="side-settings-icon">⚙</span>
           <span>设置</span>
         </button>
-        <div class="side-foot muted" id="side-foot">EAB 企业智能体基座 · 预览版</div>
       </div>
     </aside>
 
@@ -233,10 +233,12 @@
               <div class="team-head">
                 <div class="team-head-main">
                   <span class="team-kicker">AGENT TEAM</span>
-                  <strong id="team-manager-name">父 Agent · 当前对话</strong>
-                  <p class="team-sub" id="team-manager-sub">父 Agent 在右侧派发和回复，子 Agent 在左侧汇报；需要你拍板时由父 Agent 来问，再把结论回给子 Agent。</p>
+                  <strong id="team-manager-name">主 Agent · 当前对话</strong>
                 </div>
-                <span class="team-summary" id="team-summary">等待派发</span>
+                <div class="team-head-side">
+                  <span class="team-corner-badge" id="team-manager-sub" role="note" title="主 Agent 在右侧派发和回复，子 Agent 在左侧汇报；需要你拍板时由主 Agent 来问，再把结论回给子 Agent。" aria-label="主 Agent 在右侧派发和回复，子 Agent 在左侧汇报；需要你拍板时由主 Agent 来问，再把结论回给子 Agent。">主派发 · 子汇报 · 主转达</span>
+                  <span class="team-summary" id="team-summary">等待派发</span>
+                </div>
               </div>
               <div class="team-split" id="team-split">
                 <div class="team-list" id="team-list" role="list" aria-label="子 Agent 列表"></div>
@@ -245,7 +247,7 @@
               </div>
               <div class="team-empty" id="team-empty">
                 <span class="team-empty-title">还没有子 Agent</span>
-                <p>当任务可以拆开并行做（同时查几份资料、分别改几个文件、多模型各出一版），父 Agent 会在这里注册子 Agent，每个子 Agent 有一个独立的对话窗口。</p>
+                <p>当任务可以拆开并行做（同时查几份资料、分别改几个文件、多模型各出一版），主 Agent 会在这里注册子 Agent，每个子 Agent 有一个独立的对话窗口。</p>
               </div>
             </section>
 
@@ -295,7 +297,7 @@
             <div class="perm-pane-head-main">
               <span class="perm-pane-kicker">PERMISSION APPROVAL</span>
               <h2>权限审批</h2>
-              <p class="perm-pane-sub">本人申请角色，按权限范围走多级审批；最后一级同意后立即授权，到期自动失效。</p>
+              <p class="perm-pane-sub">勾选当前身份缺少的权限点，多选合并成一张审批单；通过后只授予所选权限，不新增角色，到期自动失效。</p>
             </div>
             <button class="icon-btn perm-pane-x" id="perm-pane-close" type="button" title="关闭权限审批" aria-label="关闭权限审批">×</button>
           </div>
@@ -570,6 +572,6 @@
       }
     </script>
     <script src="/boot-splash.js?v=20261116a" data-surface="chat" defer></script>
-    <script src="/chat.js?v=20261116d16" defer></script>
+    <script src="/chat.js?v=20261117a" defer></script>
   </body>
 </html>

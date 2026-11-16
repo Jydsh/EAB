@@ -2106,8 +2106,14 @@ export function buildDingTalkA2UIUpdateMessages(
   pushData('/tools/header', data.tools.header, previousData?.tools.header)
   // UI 字段逐项更新，不整份下发：用户点开后服务端仍以为 thinkingExpanded=false，
   // 整份 /ui 会在下一帧把刚展开的面板重新收起。
-  for (const key of Object.keys(data.ui) as Array<keyof DingTalkRichCardData['ui']>) {
-    pushData(`/ui/${String(key)}`, data.ui[key], previousData?.ui[key])
+  // 没有上一帧时（首次渲染 / resume / 澄清卡收口）整份下发一次即可；
+  // 题组有 3 道题时逐项 /ui 会把消息数推到 100+，被钉钉以 param.invalid 拒绝。
+  if (previousData) {
+    for (const key of Object.keys(data.ui) as Array<keyof DingTalkRichCardData['ui']>) {
+      pushData(`/ui/${String(key)}`, data.ui[key], previousData.ui[key])
+    }
+  } else {
+    messages.push(a2uiMessage({ updateDataModel: { surfaceId, path: '/ui', value: data.ui } }))
   }
   if (!previousData || JSON.stringify(data.attachments) !== JSON.stringify(previousData.attachments)) {
     pushData('/attachments', data.attachments, previousData?.attachments)

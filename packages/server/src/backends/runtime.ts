@@ -2,10 +2,11 @@
  * 后端插件的启动装配。
  *
  * 组合矩阵：
- * - 不配任何外部服务：SQLite + 内存缓存（默认，完整可用）
- * - 只配 Redis：SQLite + Redis/内存兜底
- * - 只配 PostgreSQL：SQLite 主库 + PG 审计镜像
- * - 两个都配：SQLite + PG 审计镜像 + Redis 缓存
+ * - 控制台“数据连接”里没有 Redis/PG：SQLite + 内存缓存（默认，完整可用）
+ * - 数据连接里有 Redis：SQLite + Redis/内存兜底
+ * - 数据连接里有 PostgreSQL：SQLite 主库 + PG 审计镜像/会话镜像
+ * - 两者都有：SQLite + PG 镜像 + Redis 缓存
+ * - 保存/删除数据连接后由 reloadBackends 热切换，不需要重启服务
  * - strict=1：显式要求的外部后端连不上时启动失败，适合生产探针
  */
 import { setAuditMirror } from '@eab/storage'
@@ -122,10 +123,9 @@ async function connectRedis(
   })
 
   if (!redisUrl) {
-    const message = 'EAB_CACHE=redis 但没有配置 EAB_REDIS_URL'
-    if (config.backendsStrict) throw new Error(message)
-    log(`${message}，回退内存缓存`)
-    return failed(message)
+    // 数据连接为空时按“没有配置外部缓存”处理，不把环境变量里的旧 URL 当成待检测连接。
+    log('未配置 Redis 数据连接，使用内存缓存')
+    return { cache: memory }
   }
 
   try {
@@ -227,6 +227,11 @@ async function connectPostgres(
   source?: AutoBackendSource,
 ): Promise<{ mirror?: PostgresAuditMirror; chat?: PostgresChatMirror; failure?: BackendStatus }> {
   if (config.postgresBackend === 'off') return {}
+  if (!postgresUrl) {
+    // 没有数据连接时 PG 就是未启用，不用环境变量里的旧连接串去探测。
+    log('未配置 PostgreSQL 数据连接，跳过审计镜像与会话镜像')
+    return {}
+  }
   const wantsPostgres =
     config.postgresBackend === 'mirror' || (config.postgresBackend === 'auto' && Boolean(postgresUrl))
   if (!wantsPostgres) return {}
@@ -243,13 +248,6 @@ async function connectPostgres(
       capabilities: ['audit-mirror', 'audit-read', 'chat-session-mirror', 'chat-session-read'],
     },
   })
-
-  if (!postgresUrl) {
-    const message = 'EAB_POSTGRES=mirror 但没有配置 EAB_POSTGRES_URL'
-    if (config.backendsStrict) throw new Error(message)
-    log(`${message}，跳过审计镜像与会话镜像`)
-    return failed(message)
-  }
 
   let pool:
     | {
@@ -322,21 +320,30 @@ interface RuntimeState {
 let runtimeState: RuntimeState | undefined
 let reloadChain: Promise<unknown> = Promise.resolve()
 
-function resolveBackendUrls(config: ServerConfig, auto: AutoBackendSelection): {
+/**
+ * 平台后端地址以控制台「数据连接」为准。
+ *
+ * - 数据连接里有启用的 Redis/PG：无论环境变量写什么，都用数据连接；
+ * - 数据连接里没有：默认只用 SQLite + 内存，不探测环境变量里的连接；
+ * - 只有显式 EAB_BACKENDS_FROM_ENV=1 时，才把环境变量作为老部署的兼容回退。
+ */
+export function resolveBackendUrls(config: ServerConfig, auto: AutoBackendSelection): {
   redisUrl: string
   postgresUrl: string
   redisSource?: AutoBackendSource
   postgresSource?: AutoBackendSource
 } {
-  const redisSource =
-    !config.redisUrl && config.cacheBackend !== 'memory' && config.cacheBackend !== 'off'
-      ? auto.redis
-      : undefined
-  const postgresSource =
-    !config.postgresUrl && config.postgresBackend !== 'off' ? auto.postgres : undefined
+  const redisEnabled = config.cacheBackend !== 'memory' && config.cacheBackend !== 'off'
+  const postgresEnabled = config.postgresBackend !== 'off'
+  const redisSource = redisEnabled ? auto.redis : undefined
+  const postgresSource = postgresEnabled ? auto.postgres : undefined
+  const envRedisUrl =
+    !redisSource && config.backendsFromEnv && redisEnabled ? config.redisUrl : ''
+  const envPostgresUrl =
+    !postgresSource && config.backendsFromEnv && postgresEnabled ? config.postgresUrl : ''
   return {
-    redisUrl: config.redisUrl || redisSource?.url || '',
-    postgresUrl: config.postgresUrl || postgresSource?.url || '',
+    redisUrl: redisSource?.url || envRedisUrl || '',
+    postgresUrl: postgresSource?.url || envPostgresUrl || '',
     redisSource,
     postgresSource,
   }
@@ -388,7 +395,7 @@ function statusesOf(state: RuntimeState): BackendStatus[] {
       state: 'disabled',
       detail: state.autoReason
         ? `未启用；${state.autoReason}`
-        : '未启用；配置 EAB_POSTGRES_URL 与 EAB_POSTGRES=auto|mirror 后生效，或在“数据连接”中添加 PostgreSQL',
+        : '未启用；只有控制台“数据连接”中启用 PostgreSQL 后才会探测和接入',
       capabilities: [
         'audit-mirror',
         'audit-read',
@@ -485,8 +492,10 @@ export async function initBackends(config: ServerConfig, db: Db): Promise<Backen
 }
 
 /**
- * 数据连接保存/测试/删除后重连平台后端。
- * 只采纳单公司部署的启用连接；环境变量显式配置时不会切到数据连接。
+ * 数据连接保存/测试/删除后热重连平台后端。
+ *
+ * 只采纳单公司部署的启用连接；控制台有连接时以连接为准，
+ * 没有连接时退回 SQLite + 内存，不会继续沿用环境变量里的外部连接。
  */
 export async function reloadBackends(config: ServerConfig, db: Db): Promise<boolean> {
   const run = async (): Promise<boolean> => {

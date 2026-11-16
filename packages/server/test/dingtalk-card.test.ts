@@ -725,6 +725,67 @@ describe('钉钉 A2UI 卡片可见性与底色', () => {
     })
   })
 
+  it('三道题题组收口时整帧消息不超过钉钉单次上限', () => {
+    const questions = [
+      {
+        id: 'q1',
+        question: '第 1 题：EAB 助手的全称是什么？',
+        kind: 'single' as const,
+        options: [
+          { id: 'a', label: 'Enterprise Agent Base' },
+          { id: 'b', label: 'Enterprise AI Bot' },
+          { id: 'c', label: 'Easy Access Bot' },
+          { id: 'd', label: 'Enterprise Auto Builder' },
+        ],
+      },
+      {
+        id: 'q2',
+        question: '第 2 题：以下哪些是 EAB 可以帮你做的事？',
+        kind: 'multiple' as const,
+        options: [
+          { id: 'a', label: '查询云业务数据' },
+          { id: 'b', label: '编辑 Word/Excel 文档' },
+          { id: 'c', label: '创建定时提醒' },
+          { id: 'd', label: '帮我写代码部署到服务器' },
+        ],
+      },
+      {
+        id: 'q3',
+        question: '第 3 题：检修作业的基本安全原则是先___、再___、后作业。',
+        kind: 'text' as const,
+        options: [],
+      },
+    ]
+    const messages = buildDingTalkA2UIUpdateMessages(
+      's',
+      {
+        answer: '一组共 3 道题，请依次回复每道题的答案。',
+        reasoning: '需要用户先确认题目范围，再逐题作答。',
+        tools: ['clarify'],
+        thinkingDone: true,
+        clarify: {
+          sessionId: 'chat_test',
+          question: questions[0].question,
+          kind: 'single',
+          options: questions[0].options,
+          index: 0,
+          questions,
+        },
+      },
+      false,
+    )
+
+    // 钉钉一次 update 最多接受 100 条；这里留 5 条余量。没有上一帧时 /ui 必须整份下发，
+    // 否则三道题会把逐项 UI 更新推过上限，finish 失败后退回纯文本。
+    expect(messages.length).toBe(11)
+    expect(updateValues(messages)['/ui']).toMatchObject({
+      showClarify: true,
+      showClarifyNav: true,
+      showClarifyPrev: false,
+      showClarifyNext: true,
+    })
+  })
+
   it('带澄清选项的卡片收口后仍保持 PROCESSING，下一次点击才能续用同一张卡', async () => {
     const requests: Array<{ url: string; body: Record<string, any> }> = []
     const realFetch = globalThis.fetch
@@ -965,9 +1026,9 @@ describe('钉钉 A2UI 卡片可见性与底色', () => {
       const messages = parsed(update?.body.a2uiMessages ?? [])
       expect(messages.some((message) => message.updateDataModel?.path === '/clarify')).toBe(true)
       expect(
-        messages.find((message) => message.updateDataModel?.path === '/ui/showClarify')
+        messages.find((message) => message.updateDataModel?.path === '/ui')
           ?.updateDataModel?.value,
-      ).toBe(false)
+      ).toMatchObject({ showClarify: false })
       expect(requests.some((request) => request.url.includes('createAndDeliver'))).toBe(false)
     } finally {
       globalThis.fetch = realFetch

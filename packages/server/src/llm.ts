@@ -156,6 +156,8 @@ export interface ModelCallOptions {
   reasoningEffort?: string
   /** budget 策略下，重试也不得突破的 max_tokens 上限。 */
   maxTokensCap?: number
+  /** 单次上游请求超时；批量分析的大输入需要比普通对话更长的等待。 */
+  timeoutMs?: number
 }
 
 export interface ModelStreamOptions extends ModelCallOptions {
@@ -287,6 +289,7 @@ async function callOpenAi(
   maxTokens: number,
   tools: ToolSpec[] = [],
   reasoningEffort?: string,
+  timeoutMs = 90_000,
 ): Promise<CallResult> {
   const wireEffort = reasoningEffort ? providerReasoningEffort(reasoningEffort) : undefined
   const res = await fetchModelWithRetry(`${trimBase(base)}/chat/completions`, {
@@ -303,7 +306,7 @@ async function callOpenAi(
       ...(wireEffort ? { reasoning_effort: wireEffort } : {}),
       ...(tools.length > 0 ? { tools, tool_choice: 'auto' } : {}),
     }),
-    signal: AbortSignal.timeout(90_000),
+    signal: AbortSignal.timeout(timeoutMs),
   })
   if (!res.ok) {
     throw new EabError(EC.UPSTREAM, `模型返回 HTTP ${res.status}：${await readError(res)}`, {
@@ -702,7 +705,16 @@ export async function callModel(
   if (provider.kind === 'azure_openai') {
     return callAzure(base, key, provider.modelKey, messages, maxTokens, options.reasoningEffort)
   }
-  return callOpenAi(base, key, provider.modelKey, messages, maxTokens, options.tools ?? [], options.reasoningEffort)
+  return callOpenAi(
+    base,
+    key,
+    provider.modelKey,
+    messages,
+    maxTokens,
+    options.tools ?? [],
+    options.reasoningEffort,
+    options.timeoutMs,
+  )
 }
 
 export interface EmbeddingResult {

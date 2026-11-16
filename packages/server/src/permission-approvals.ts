@@ -1,16 +1,18 @@
 /**
- * 多级权限审批：角色申请、审批链、步骤状态、最终授权。
+ * 多级权限审批：权限点申请、审批链、步骤状态、最终授权。
  *
  * 设计约束（已拍板）：
  * - 只有成员本人能发起申请，不允许上级代申请。
- * - 审批链按角色拥有的 scope 配置；管理者角色默认不可申请。
- * - 只授角色，不授 scope；最终通过写 permission_role_grants + user_roles。
- * - 角色到期由 user_roles.expires_at 控制，读侧 roleCodesOf 已过滤过期。
+ * - 员工端按权限点申请；只展示当前身份没有、且由可申请角色提供的权限点。
+ * - 多个权限点合并成一张申请单；审批链取所选权限点中最严格的 scope 策略。
+ * - scope 申请最终只写 permission_scope_grants，不写 user_roles、不新增角色。
+ * - 历史 role 申请继续按原路径审批并授予角色，保证旧单可查看、可处理。
+ * - scope 临时授权到期由读侧过滤，保留授权记录用于审计。
  */
 import { ulid } from '@eab/domain'
-import { EC, EabError, scopeAllows, type Scope } from '@eab/domain'
+import { EC, EabError, SCOPE_REGISTRY, isKnownScope, scopeAllows, type Scope } from '@eab/domain'
 import { withTransaction, type Db } from '@eab/storage'
-import { actorFor, type RequestActor } from './session.js'
+import { actorFor, roleCodesOf, type RequestActor } from './session.js'
 
 const ADMIN_ROLE_CODES = new Set([
   'super_admin',
@@ -60,6 +62,7 @@ interface RequestRow {
   role_code: string
   role_name: string
   scopes_json: string
+  request_type: string
   reason: string
   status: PermissionRequestStatus
   current_step: number
@@ -121,6 +124,25 @@ export interface RequestableRoleView {
   reason: string
 }
 
+/** 员工端可勾选的权限点：只来自可申请角色，并且当前身份尚未拥有。 */
+export interface RequestableScopeView {
+  code: string
+  label: string
+  group: string
+  dangerous: boolean
+  applicable: boolean
+  policy: PermissionPolicyView | null
+  reason: string
+}
+
+/** 当前身份已经拥有的权限点，用于面板上的只读摘要。 */
+export interface CurrentScopeView {
+  code: string
+  label: string
+  group: string
+  dangerous: boolean
+}
+
 export interface PermissionStepView {
   id: string
   stepNo: number
@@ -136,6 +158,7 @@ export interface PermissionStepView {
 
 export interface PermissionRequestView {
   id: string
+  requestType: 'role' | 'scope'
   status: PermissionRequestStatus
   requesterUserId: string
   requesterName: string
@@ -195,24 +218,33 @@ function roleScopesOf(db: Db, roleId: string): string[] {
 }
 
 /**
- * 角色级策略优先；否则角色拥有的每个 scope 都必须有策略，取最严格的一条。
+ * 所选 scope 的审批链：每个 scope 都必须有 scope 策略，取最严格的一条。
  * “最严格”= 级数最多、超时最短、只要有一条要求公司管理员兜底就保留兜底。
  */
-function resolveRolePolicy(
+function resolveScopePolicy(
   policies: PolicyRow[],
-  role: RoleRow,
   scopes: string[],
 ): { policy: PermissionPolicyView; policies: PolicyRow[] } | null {
-  const rolePolicy = policies.find((row) => row.target_type === 'role' && row.target_key === role.code)
-  if (rolePolicy) {
-    return { policy: readPolicy(rolePolicy), policies: [rolePolicy] }
-  }
   if (scopes.length === 0) return null
   const matched = scopes.map((scope) => policies.find((row) => row.target_type === 'scope' && row.target_key === scope))
   if (matched.some((row) => !row)) return null
   const rows = matched as PolicyRow[]
   const strategies = new Set(rows.map((row) => row.approver_strategy === 'fixed_users' ? 'fixed_users' : 'dept_chain'))
   if (strategies.size > 1) return null
+  if (strategies.has('fixed_users')) {
+    // 多个固定审批人策略只有在审批人集合完全一致时才能合并为一张单；
+    // 否则每张策略的审批人不同，用第一条会漏掉其余审批人。
+    const signatures = new Set(rows.map((row) => {
+      try {
+        const parsed = row.fixed_approvers_json ? JSON.parse(row.fixed_approvers_json) as unknown : []
+        const ids = Array.isArray(parsed) ? parsed.map((value) => String(value)).filter(Boolean).sort() : []
+        return ids.join('|')
+      } catch {
+        return ''
+      }
+    }))
+    if (signatures.size > 1) return null
+  }
   const strictest = [...rows].sort((a, b) => {
     const level = Number(b.max_levels) - Number(a.max_levels)
     if (level !== 0) return level
@@ -231,6 +263,21 @@ function resolveRolePolicy(
     },
     policies: rows,
   }
+}
+
+/**
+ * 角色级策略优先；否则角色拥有的每个 scope 都必须有策略，取最严格的一条。
+ */
+function resolveRolePolicy(
+  policies: PolicyRow[],
+  role: RoleRow,
+  scopes: string[],
+): { policy: PermissionPolicyView; policies: PolicyRow[] } | null {
+  const rolePolicy = policies.find((row) => row.target_type === 'role' && row.target_key === role.code)
+  if (rolePolicy) {
+    return { policy: readPolicy(rolePolicy), policies: [rolePolicy] }
+  }
+  return resolveScopePolicy(policies, scopes)
 }
 
 function roleRowOf(db: Db, companyId: string, roleCode: string): RoleRow | null {
@@ -425,6 +472,7 @@ function requesterNameOf(db: Db, userId: string): string {
 function requestViewOf(db: Db, row: RequestRow): PermissionRequestView {
   return {
     id: row.id,
+    requestType: row.request_type === 'scope' ? 'scope' : 'role',
     status: row.status,
     requesterUserId: row.requester_user_id,
     requesterName: requesterNameOf(db, row.requester_user_id),
@@ -482,21 +530,242 @@ export function listRequestableRoles(db: Db, companyId: string): RequestableRole
   })
 }
 
+/**
+ * 员工端可申请的权限点。
+ *
+ * 来源限定为“可申请角色拥有的 scope”，这是管理员的显式开关；
+ * 再过滤掉当前身份已经拥有的权限（含 role/scope grant/override 的隐含能力）。
+ * 只有配置了 scope 审批策略的权限点才会返回，避免提交后才发现无法建审批链。
+ */
+export function listRequestableScopes(db: Db, actor: RequestActor): RequestableScopeView[] {
+  const companyId = actor.person.companyId
+  const policies = policiesOf(db, companyId)
+  const roles = requestableRoleRows(db, companyId).filter((role) => !isAdminRole(role.code))
+  const codes = new Set<string>()
+  for (const role of roles) {
+    for (const scope of roleScopesOf(db, role.id)) {
+      if (isKnownScope(scope) && !actor.subject.scopes.has(scope)) codes.add(scope)
+    }
+  }
+  const views: RequestableScopeView[] = []
+  for (const code of codes) {
+    const meta = SCOPE_REGISTRY[code as Scope]
+    if (!meta) continue
+    const policyRow = policies.find((row) => row.target_type === 'scope' && row.target_key === code)
+    if (!policyRow) continue
+    views.push({
+      code,
+      label: meta.label,
+      group: meta.group,
+      dangerous: Boolean(meta.dangerous),
+      applicable: true,
+      policy: readPolicy(policyRow),
+      reason: '',
+    })
+  }
+  return views.sort((a, b) => a.group.localeCompare(b.group, 'zh-CN') || a.label.localeCompare(b.label, 'zh-CN') || a.code.localeCompare(b.code))
+}
+
+/** 当前身份实际拥有的权限点摘要；只读展示，不参与申请。 */
+export function currentScopeViews(actor: RequestActor): CurrentScopeView[] {
+  return [...actor.subject.scopes]
+    .filter((scope) => Boolean(SCOPE_REGISTRY[scope]))
+    .map((scope) => ({
+      code: scope,
+      label: SCOPE_REGISTRY[scope].label,
+      group: SCOPE_REGISTRY[scope].group,
+      dangerous: Boolean(SCOPE_REGISTRY[scope].dangerous),
+    }))
+    .sort((a, b) => a.group.localeCompare(b.group, 'zh-CN') || a.label.localeCompare(b.label, 'zh-CN') || a.code.localeCompare(b.code))
+}
+
+/**
+ * scope 申请需要一个现有角色作为身份锚点。
+ *
+ * 数据库的 role_id / role_code / role_name 是 NOT NULL；这里写入申请人当前的一个角色，
+ * 只用于满足历史表结构和审计上下文，审批通过不会把这个角色授予申请人。
+ */
+function anchorRoleOf(db: Db, companyId: string, actor: RequestActor): RoleRow {
+  for (const code of roleCodesOf(db, actor.person.id)) {
+    const role = roleRowOf(db, companyId, code)
+    if (role) return role
+  }
+  const fallback = roleRowOf(db, companyId, 'member')
+  if (fallback) return fallback
+  const first = db
+    .prepare(
+      `SELECT id, company_id, code, name, requestable
+         FROM roles
+        WHERE company_id = ? AND deleted_at IS NULL
+        ORDER BY created_at, id
+        LIMIT 1`,
+    )
+    .get(companyId) as RoleRow | undefined
+  if (!first) {
+    throw new EabError(EC.CONFLICT, '当前身份没有可用于权限申请的角色锚点', {
+      hint: '请先给该成员分配一个基础角色，再发起权限申请',
+    })
+  }
+  return first
+}
+
 export interface CreatePermissionRequestInput {
-  readonly roleCode: string
+  /** 新员工端按权限点申请；与 roleCode 二选一。 */
+  readonly scopeCodes?: readonly string[]
+  /** 历史/兼容入口：按角色申请。 */
+  readonly roleCode?: string
   readonly reason?: string
   readonly durationHours?: number
   readonly now?: number
 }
 
-export function createPermissionRequest(
+type ResolvedPolicy = { policy: PermissionPolicyView; policies: PolicyRow[] }
+
+interface PersistPermissionRequestInput {
+  companyId: string
+  actor: RequestActor
+  role: RoleRow
+  requestType: 'role' | 'scope'
+  scopes: string[]
+  reason: string
+  durationHours: number
+  resolved: ResolvedPolicy
+  steps: ManagedPerson[]
+  now: number
+}
+
+function persistPermissionRequest(db: Db, input: PersistPermissionRequestInput): PermissionRequestView {
+  const requestId = `preq_${ulid(input.now)}`
+  const job = withTransaction(db, () => {
+    db.prepare(
+      `INSERT INTO permission_requests
+         (id, company_id, requester_user_id, role_id, role_code, role_name, scopes_json,
+          request_type, reason, status, current_step, total_steps, policy_id, duration_hours,
+          requested_expires_at, request_deadline, decided_at, granted_role_grant_id,
+          created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 1, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)`,
+    ).run(
+      requestId,
+      input.companyId,
+      input.actor.person.id,
+      input.role.id,
+      input.role.code,
+      input.role.name,
+      JSON.stringify(input.scopes),
+      input.requestType,
+      input.reason,
+      input.steps.length,
+      input.resolved.policy.id,
+      input.durationHours,
+      input.now + input.durationHours * 3_600_000,
+      input.now + input.resolved.policy.timeoutHours * 3_600_000,
+      input.now,
+      input.now,
+    )
+    const insertStep = db.prepare(
+      `INSERT INTO permission_approval_steps
+         (id, request_id, company_id, step_no, approver_user_id, approver_name, status,
+          card_out_track_id, card_status, card_error, decided_at, decided_by, comment,
+          created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'none', '', NULL, NULL, '', ?, ?)`,
+    )
+    input.steps.forEach((person, index) => {
+      insertStep.run(
+        `pstep_${ulid(input.now)}`,
+        requestId,
+        input.companyId,
+        index + 1,
+        person.id,
+        person.name,
+        index === 0 ? 'active' : 'pending',
+        input.now,
+        input.now,
+      )
+    })
+    return requestId
+  })
+  const row = requestRowOf(db, input.companyId, job)
+  if (!row) throw new EabError(EC.INTERNAL, '审批申请创建后读取失败')
+  return requestViewOf(db, row)
+}
+
+function createScopePermissionRequest(
   db: Db,
   actor: RequestActor,
-  input: CreatePermissionRequestInput,
+  scopeCodes: readonly string[],
+  reason: string,
+  durationHours: number,
+  now: number,
 ): PermissionRequestView {
-  const now = input.now ?? Date.now()
   const companyId = actor.person.companyId
-  const roleCode = String(input.roleCode ?? '').trim()
+  const scopes = [...new Set(scopeCodes.map((code) => String(code).trim()).filter(Boolean))].sort()
+  if (scopes.length === 0) throw new EabError(EC.VALIDATION, '请至少选择一个要申请的权限')
+  for (const code of scopes) {
+    if (!isKnownScope(code)) throw new EabError(EC.VALIDATION, `未登记的权限点：${code}`)
+    if (actor.subject.scopes.has(code)) {
+      throw new EabError(EC.FORBIDDEN, `当前身份已经拥有权限：${code}`, {
+        hint: '只需勾选当前身份没有的权限',
+        details: { scope: code },
+      })
+    }
+  }
+
+  const requestable = listRequestableScopes(db, actor)
+  const allowed = new Set(requestable.map((item) => item.code))
+  const unavailable = scopes.filter((code) => !allowed.has(code))
+  if (unavailable.length > 0) {
+    throw new EabError(EC.FORBIDDEN, '所选权限当前不可申请', {
+      hint: '只有可申请角色提供的权限点，且管理员已配置 scope 审批策略时才可提交',
+      details: { scopes: unavailable },
+    })
+  }
+
+  const resolved = resolveScopePolicy(policiesOf(db, companyId), scopes)
+  if (!resolved) {
+    throw new EabError(EC.VALIDATION, '所选权限的审批策略不一致或缺失', {
+      hint: '请分开申请审批策略不一致的权限，或让管理员先补齐 scope 审批策略',
+      details: { scopes },
+    })
+  }
+
+  // 同一成员对完全相同的权限集合已有待审批申请时，直接返回原单。
+  const existing = db
+    .prepare(
+      `SELECT * FROM permission_requests
+        WHERE company_id = ? AND requester_user_id = ? AND request_type = 'scope'
+          AND status = 'pending' AND scopes_json = ?
+        ORDER BY created_at DESC
+        LIMIT 1`,
+    )
+    .get(companyId, actor.person.id, JSON.stringify(scopes)) as RequestRow | undefined
+  if (existing) return requestViewOf(db, existing)
+
+  const anchorRole = anchorRoleOf(db, companyId, actor)
+  const steps = planSteps(db, companyId, actor, resolved.policy, resolved.policies)
+  return persistPermissionRequest(db, {
+    companyId,
+    actor,
+    role: anchorRole,
+    requestType: 'scope',
+    scopes,
+    reason,
+    durationHours,
+    resolved,
+    steps,
+    now,
+  })
+}
+
+function createRolePermissionRequest(
+  db: Db,
+  actor: RequestActor,
+  roleCodeInput: string,
+  reason: string,
+  durationHours: number,
+  now: number,
+): PermissionRequestView {
+  const companyId = actor.person.companyId
+  const roleCode = roleCodeInput.trim()
   if (!roleCode) throw new EabError(EC.VALIDATION, '请选择要申请的角色')
   if (isAdminRole(roleCode)) {
     throw new EabError(EC.FORBIDDEN, '管理角色默认不可自助申请', {
@@ -517,75 +786,50 @@ export function createPermissionRequest(
       details: { roleCode, scopes },
     })
   }
-  const durationHours = Math.min(
-    MAX_DURATION_HOURS,
-    Math.max(1, Math.trunc(Number(input.durationHours ?? DEFAULT_DURATION_HOURS) || DEFAULT_DURATION_HOURS)),
-  )
-  const reason = String(input.reason ?? '').trim().slice(0, 500)
-  const steps = planSteps(db, companyId, actor, resolved.policy, resolved.policies)
 
   // 同一成员对同一角色已有待审批申请时，不重复建单，直接返回原单。
   const existing = db
     .prepare(
       `SELECT * FROM permission_requests
-        WHERE company_id = ? AND requester_user_id = ? AND role_id = ? AND status = 'pending'
+        WHERE company_id = ? AND requester_user_id = ? AND role_id = ?
+          AND request_type = 'role' AND status = 'pending'
         ORDER BY created_at DESC
         LIMIT 1`,
     )
     .get(companyId, actor.person.id, role.id) as RequestRow | undefined
   if (existing) return requestViewOf(db, existing)
 
-  const requestId = `preq_${ulid(now)}`
-  const job = withTransaction(db, () => {
-    db.prepare(
-      `INSERT INTO permission_requests
-         (id, company_id, requester_user_id, role_id, role_code, role_name, scopes_json,
-          reason, status, current_step, total_steps, policy_id, duration_hours,
-          requested_expires_at, request_deadline, decided_at, granted_role_grant_id,
-          created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 1, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)`,
-    ).run(
-      requestId,
-      companyId,
-      actor.person.id,
-      role.id,
-      role.code,
-      role.name,
-      JSON.stringify(scopes),
-      reason,
-      steps.length,
-      resolved.policy.id,
-      durationHours,
-      now + durationHours * 3_600_000,
-      now + resolved.policy.timeoutHours * 3_600_000,
-      now,
-      now,
-    )
-    const insertStep = db.prepare(
-      `INSERT INTO permission_approval_steps
-         (id, request_id, company_id, step_no, approver_user_id, approver_name, status,
-          card_out_track_id, card_status, card_error, decided_at, decided_by, comment,
-          created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'none', '', NULL, NULL, '', ?, ?)`,
-    )
-    steps.forEach((person, index) => {
-      insertStep.run(
-        `pstep_${ulid(now)}`,
-        requestId,
-        companyId,
-        index + 1,
-        person.id,
-        person.name,
-        index === 0 ? 'active' : 'pending',
-        now,
-        now,
-      )
-    })
-    return requestId
+  const steps = planSteps(db, companyId, actor, resolved.policy, resolved.policies)
+  return persistPermissionRequest(db, {
+    companyId,
+    actor,
+    role,
+    requestType: 'role',
+    scopes,
+    reason,
+    durationHours,
+    resolved,
+    steps,
+    now,
   })
-  const row = requestRowOf(db, companyId, job)
-  if (!row) throw new EabError(EC.INTERNAL, '审批申请创建后读取失败')
-  return requestViewOf(db, row)
+}
+
+export function createPermissionRequest(
+  db: Db,
+  actor: RequestActor,
+  input: CreatePermissionRequestInput,
+): PermissionRequestView {
+  const now = input.now ?? Date.now()
+  const durationHours = Math.min(
+    MAX_DURATION_HOURS,
+    Math.max(1, Math.trunc(Number(input.durationHours ?? DEFAULT_DURATION_HOURS) || DEFAULT_DURATION_HOURS)),
+  )
+  const reason = String(input.reason ?? '').trim().slice(0, 500)
+  const scopeCodes = Array.isArray(input.scopeCodes) ? input.scopeCodes : []
+  if (scopeCodes.length > 0) {
+    return createScopePermissionRequest(db, actor, scopeCodes, reason, durationHours, now)
+  }
+  return createRolePermissionRequest(db, actor, String(input.roleCode ?? ''), reason, durationHours, now)
 }
 
 export interface DecidePermissionInput {
@@ -654,6 +898,39 @@ function grantRole(
     expiresAt,
   )
   return grantId
+}
+
+function grantScopes(
+  db: Db,
+  request: RequestRow,
+  approverUserId: string,
+  now: number,
+): string[] {
+  const scopes = parseScopes(request.scopes_json)
+  const expiresAt = now + Number(request.duration_hours) * 3_600_000
+  const insert = db.prepare(
+    `INSERT OR IGNORE INTO permission_scope_grants
+       (id, request_id, company_id, user_id, scope, granted_by,
+        granted_at, expires_at, revoked_at, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
+  )
+  const ids: string[] = []
+  for (const scope of scopes) {
+    const grantId = `psg_${ulid(now)}`
+    insert.run(
+      grantId,
+      request.id,
+      request.company_id,
+      request.requester_user_id,
+      scope,
+      approverUserId,
+      now,
+      expiresAt,
+      now,
+    )
+    ids.push(grantId)
+  }
+  return ids
 }
 
 export function decidePermissionRequest(
@@ -742,13 +1019,23 @@ export function decidePermissionRequest(
     }
 
     if (stepNo >= Number(request.total_steps)) {
-      const grantId = grantRole(db, request, actor.person.id, now)
-      db.prepare(
-        `UPDATE permission_requests
-            SET status = 'approved', current_step = total_steps,
-                decided_at = ?, granted_role_grant_id = ?, updated_at = ?
-          WHERE id = ? AND status = 'pending'`,
-      ).run(now, grantId, now, request.id)
+      if (request.request_type === 'scope') {
+        grantScopes(db, request, actor.person.id, now)
+        db.prepare(
+          `UPDATE permission_requests
+              SET status = 'approved', current_step = total_steps,
+                  decided_at = ?, granted_role_grant_id = NULL, updated_at = ?
+            WHERE id = ? AND status = 'pending'`,
+        ).run(now, now, request.id)
+      } else {
+        const grantId = grantRole(db, request, actor.person.id, now)
+        db.prepare(
+          `UPDATE permission_requests
+              SET status = 'approved', current_step = total_steps,
+                  decided_at = ?, granted_role_grant_id = ?, updated_at = ?
+            WHERE id = ? AND status = 'pending'`,
+        ).run(now, grantId, now, request.id)
+      }
       return
     }
 

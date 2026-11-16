@@ -14,7 +14,7 @@
 
 SQLite 仍是当前唯一主库。**PostgreSQL 当前承接审计镜像和会话镜像，不替换主库**，原因见第 4 节。
 
-> 组合通过环境变量选择，**重启服务后生效**；控制台只负责展示当前状态，不提供在线切换，避免运行中换存储造成数据不一致。
+> 组合来源按优先级：**环境变量 > 控制台「数据连接」**。没有环境变量时，单公司部署会自动采用启用中的 PostgreSQL / Redis 数据连接；保存、测试或删除连接后热重连，无需重启。多公司部署不自动跨租户选择，仍用环境变量显式指定。运行中切换只换审计/会话镜像与缓存，不迁移 SQLite 主库数据。
 
 
 ## 2. 插件边界
@@ -23,6 +23,7 @@ SQLite 仍是当前唯一主库。**PostgreSQL 当前承接审计镜像和会话
 
 ```text
 types.ts      后端状态与插件契约（state / capabilities / metrics，不回显连接串）
+auto.ts       从控制台“数据连接”解析单公司部署的平台后端来源
 cache.ts      MemoryCache、RedisCache、HybridCache
 postgres.ts   PostgresAuditMirror（批量审计旁路）
 postgres-chat.ts PostgresChatMirror（会话 outbox 批量镜像）
@@ -60,6 +61,22 @@ runtime.ts    按配置装配、失败降级、状态汇总、退出收尾
 ```text
 环境变量 EAB_CACHE 只能是 auto / memory / redis / off，当前是 xxxx
 ```
+
+### 3.0 推荐：不写环境变量，用“数据连接”自动接入
+
+适用于单公司部署。登录管理端后进入「平台与运维 → 数据连接」，分别新建 PostgreSQL、Redis 连接，填写地址、端口、库名、账号密码，先点“测试连接”，再保存。
+
+规则：
+
+- 只选**启用中**且 `status` 不是 `error` 的连接；同一类型优先 `ok`，其次 `untested`，再按更新时间倒序取第一条；
+- 一个 PostgreSQL 连接同时用于审计镜像和会话镜像，一个 Redis 连接同时用于缓存和跨实例广播；
+- 密码继续按 `secret_ref` 从现有 `secrets.json` 解析，不复制到新文件；
+- 保存、测试、删除连接后自动热重连后端，页面立即刷新，不需要重启；
+- **数据连接是平台后端的实际来源**：连接表里没有启用项时，不探测、不连接 Redis/PG；有连接时才探测并接入；
+- 环境变量 `EAB_REDIS_URL` / `EAB_POSTGRES_URL` 默认不参与平台后端选择；只有显式 `EAB_BACKENDS_FROM_ENV=1` 才作为老部署的兼容回退；
+- 多公司部署不自动选择，避免一个公司的连接被另一个公司使用。
+
+成功时「平台与运维」会显示 Redis、跨实例广播、PostgreSQL 审计镜像、会话镜像均“可用”，detail 末尾带 `由数据连接「名称」自动接入`。
 
 ### 3.1 默认：什么都不配
 

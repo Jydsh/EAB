@@ -33,8 +33,9 @@ import {
 } from './routes/chat.js'
 import { assertChatQuota } from './quota.js'
 import { planChannelModelCommand } from './channel-model-command.js'
+import { SWITCH_CHAT_MODEL_TOOL_SPEC, updateConversationModelPreference, type ModelSwitchContext } from './channel-model-switch.js'
 import { publishChatEvent } from './chat-events.js'
-import { acquireLeaderHold, claimOnce, type LeaderHold } from './backends/coordination.js'
+import { acquireLeaderHold, claimOnce, readLeaderOwner, type LeaderHold, type LeaderOwner } from './backends/coordination.js'
 import { pluginPromptTexts } from './plugin-tools.js'
 import { toolSpecsForAgent } from './routes/tools.js'
 
@@ -260,6 +261,8 @@ export interface FeishuStreamStatus {
   readonly lastEventAt: number | null
   readonly lastReplyAt: number | null
   readonly error: string | null
+  /** 当前领导权持有者；旧版本租约只带 legacy 标记。 */
+  readonly leader: LeaderOwner | null
 }
 
 export function feishuStreamStatus(): FeishuStreamStatus {
@@ -277,6 +280,7 @@ export function feishuStreamStatus(): FeishuStreamStatus {
     lastEventAt: streamState.lastEventAt,
     lastReplyAt: streamState.lastReplyAt,
     error: streamState.error,
+    leader: streamLeaderOwner,
   }
 }
 
@@ -297,21 +301,38 @@ let refreshPromise: Promise<void> | null = null
  */
 let streamLeader: LeaderHold | null = null
 let streamLeaderKey = ''
+let streamLeaderOwner: LeaderOwner | null = null
 
 async function ensureStreamLeadership(appId: string): Promise<boolean> {
   const key = `feishu-stream:${appId}`
-  if (streamLeader && streamLeaderKey === key && streamLeader.isHeld()) return true
+  if (streamLeader && streamLeaderKey === key && streamLeader.isHeld()) {
+    streamLeaderOwner = streamLeader.owner
+    return true
+  }
   streamLeader?.release()
   streamLeader = null
   streamLeaderKey = key
   streamLeader = await acquireLeaderHold(key, { ttlMs: 90_000 })
-  return Boolean(streamLeader?.isHeld())
+  if (streamLeader?.isHeld()) {
+    streamLeaderOwner = streamLeader.owner
+    return true
+  }
+  streamLeaderOwner = await readLeaderOwner(key)
+  return false
 }
 
 function releaseStreamLeadership(): void {
   streamLeader?.release()
   streamLeader = null
   streamLeaderKey = ''
+  streamLeaderOwner = null
+}
+
+function describeLeader(owner: LeaderOwner | null): string {
+  if (!owner) return '未知实例'
+  if (owner.legacy) return '旧版本租约（无实例信息）'
+  if (!owner.host) return owner.instanceId || '未知实例'
+  return `${owner.host} · PID ${owner.pid}`
 }
 
 /** 启动/重建飞书长连接。绑定换应用后调用它即可切换凭证，不必重启整个服务。 */
@@ -343,7 +364,7 @@ async function doRefreshFeishuStream(deps: ServerDeps): Promise<void> {
   // 多实例部署时只让一个实例持有长连接，避免同一条事件被两个实例各处理一次。
   if (!(await ensureStreamLeadership(cfg.app_id))) {
     if (streamState.client) stopFeishuStream()
-    streamState.error = '飞书长连接正由另一实例持有，本实例待命（Redis 领导权）'
+    streamState.error = `飞书长连接正由另一实例持有（${describeLeader(streamLeaderOwner)}），本实例待命（Redis 领导权）`
     return
   }
 
@@ -577,6 +598,7 @@ export async function handleFeishuEvent(
       actor.subject.userId,
     )
     const available = visibleModelsFor(catalog, [...actor.subject.roles])
+    const availableChatModels = available.filter((item) => (item.endpointKind ?? 'chat') === 'chat')
     if (available.length === 0) {
       const text =
         'EAB 当前没有你这个角色可用的模型。请管理员到控制台「模型接入」启用一个模型，并确认模型可见角色包含「普通员工」或「外部访客」。'
@@ -621,7 +643,7 @@ export async function handleFeishuEvent(
     }
 
     const sessionId = ensureChannelSession(deps.db, actor, 'feishu', senderId, rawText)
-    const sessionModelId =
+    let sessionModelId =
       (deps.db
         .prepare('SELECT model_id FROM chat_sessions WHERE id = ? AND deleted_at IS NULL')
         .get(sessionId) as { model_id: string | null } | undefined)?.model_id ?? null
@@ -630,6 +652,7 @@ export async function handleFeishuEvent(
       deps.db
         .prepare('UPDATE chat_sessions SET model_id = NULL, updated_at = ? WHERE id = ?')
         .run(Date.now(), sessionId)
+      sessionModelId = null
     }
     const model = preferredModel ?? available[0]
     if (!model) {
@@ -662,16 +685,15 @@ export async function handleFeishuEvent(
       content: string
     }>
     const chatTools = toolSpecsForAgent(deps.db, actor, { kind: 'none' }, rawText)
+    const channelChatTools = [...chatTools, SWITCH_CHAT_MODEL_TOOL_SPEC]
     const system = buildSystemPrompt({
       actor,
-      chatTools,
+      chatTools: channelChatTools,
       memories,
       hits,
       hasAttachments: false,
       pluginPrompts: pluginPromptTexts(deps.db, actor),
-      availableModels: available
-        .filter((item) => (item.endpointKind ?? 'chat') === 'chat')
-        .map((item) => ({ id: item.id, name: item.name })),
+      availableModels: availableChatModels.map((item) => ({ id: item.id, name: item.name })),
       currentModelId: model.id,
     })
     const messages: LlmMessage[] = [
@@ -700,6 +722,20 @@ export async function handleFeishuEvent(
       )
 
     const turnToken = await acquireTurn(sessionId)
+    const modelSwitchContext: ModelSwitchContext = {
+      models: availableChatModels,
+      currentModelId: sessionModelId,
+      activeModelId: model.id,
+      onChange: (modelId) => {
+        updateConversationModelPreference(deps.db, {
+          companyId: actor.subject.companyId,
+          userId: actor.person.id,
+          sessionId,
+          modelId,
+        })
+        modelSwitchContext.currentModelId = modelId
+      },
+    }
     let agentText = ''
     let agentResult: AgentTurnResult | null = null
     let effectiveModel = model
@@ -714,10 +750,12 @@ export async function handleFeishuEvent(
         onModelFailover: (change) => {
           const next = available.find((item) => item.id === change.toModelId)
           if (next) effectiveModel = next
+          modelSwitchContext.activeModelId = change.toModelId
           failoverNote = `当前模型「${change.fromModelName}」暂时不可用，已自动切换到「${change.toModelName}」。\n\n`
         },
         messages,
         sessionId,
+        modelSwitch: modelSwitchContext,
         space: { kind: 'none' },
         emit: () => undefined,
       })

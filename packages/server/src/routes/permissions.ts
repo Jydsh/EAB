@@ -6,10 +6,12 @@ import type { ServerDeps } from '../deps.js'
 import {
   cancelPermissionRequest,
   createPermissionRequest,
+  currentScopeViews,
   decidePermissionRequest,
   getPermissionRequest,
   listPermissionRequests,
   listRequestableRoles,
+  listRequestableScopes,
   type PermissionRequestView,
 } from '../permission-approvals.js'
 import {
@@ -23,13 +25,18 @@ function canView(actor: RequestActor, view: PermissionRequestView): boolean {
 }
 
 export function registerPermissionRoutes(app: FastifyInstance, deps: ServerDeps): void {
-  /** 可申请角色 + 当前身份能否审批。策略缺失的角色会标 applicable=false。 */
+  /** 可申请权限点、当前已有权限摘要 + 当前身份能否审批。 */
   app.get('/api/permissions/config', async (req) => {
     const actor = resolveActor(deps.db, deps.config, req)
     requireScope(actor.subject, SC.APPROVAL_READ)
     const roles = listRequestableRoles(deps.db, actor.person.companyId)
+    const scopes = listRequestableScopes(deps.db, actor)
+    const currentScopes = currentScopeViews(actor)
     return ok({
+      // roles 保留给旧版面板/兼容调用；员工端新面板只读 scopes。
       roles,
+      scopes,
+      currentScopes,
       canDecide: scopeAllows(actor.subject.scopes, SC.APPROVAL_DECIDE),
       selfOnly: true,
     })
@@ -185,12 +192,16 @@ export function registerPermissionRoutes(app: FastifyInstance, deps: ServerDeps)
 
   /** 只允许本人发起，不接受“代某成员申请”。 */
   app.post<{
-    Body: { roleCode?: string; reason?: string; durationHours?: number }
+    Body: { scopeCodes?: string[]; roleCode?: string; reason?: string; durationHours?: number }
   }>('/api/permissions/requests', async (req) => {
     const actor = resolveActor(deps.db, deps.config, req)
     requireScope(actor.subject, SC.CHAT_USE)
+    const scopeCodes = Array.isArray(req.body?.scopeCodes)
+      ? req.body.scopeCodes.map((scope) => String(scope)).filter(Boolean)
+      : undefined
     const view = createPermissionRequest(deps.db, actor, {
-      roleCode: String(req.body?.roleCode ?? ''),
+      scopeCodes,
+      roleCode: scopeCodes && scopeCodes.length > 0 ? undefined : String(req.body?.roleCode ?? ''),
       reason: String(req.body?.reason ?? ''),
       durationHours: req.body?.durationHours === undefined ? undefined : Number(req.body.durationHours),
     })

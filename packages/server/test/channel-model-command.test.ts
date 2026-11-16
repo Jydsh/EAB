@@ -40,6 +40,44 @@ describe('渠道机器人对话内模型切换', () => {
     expect(useModel?.modelId).toBe('plugin:our-free-model:mimo-v2.6-pro-free')
   })
 
+  it('“换另外一个模型”在多个候选时只列列表，不替用户猜模型', () => {
+    const result = planChannelModelCommand('换另外一个模型', models, 'deepseek-v4-flash')
+    expect(result?.kind).toBe('list')
+    expect(result?.modelId).toBeUndefined()
+    expect(result?.text).toContain('当前模型：Deepseek V4 Flash')
+    expect(result?.text).toContain('可用模型（4）')
+  })
+
+  it('“换另外一个模型”只有一个其他候选时直接切换', () => {
+    const pair: ChannelModelOption[] = [
+      { id: 'deepseek-v4-flash', name: 'Deepseek V4 Flash' },
+      { id: 'plugin:our-free-model:mimo-v2.6-pro-free', name: 'MiMo V2.6 Pro' },
+    ]
+    const result = planChannelModelCommand('换另外一个模型', pair, 'deepseek-v4-flash')
+    expect(result?.kind).toBe('switch')
+    expect(result?.modelId).toBe('plugin:our-free-model:mimo-v2.6-pro-free')
+    expect(result?.text).toContain('MiMo V2.6 Pro')
+  })
+
+  it('“切到”等自然切换说法能命中模型', () => {
+    expect(planChannelModelCommand('切到 Deepseek V4 Flash', models, null)).toMatchObject({
+      kind: 'switch',
+      modelId: 'deepseek-v4-flash',
+    })
+    expect(planChannelModelCommand('模型换成 MiMo V2.6 Pro', models, null)).toMatchObject({
+      kind: 'switch',
+      modelId: 'plugin:our-free-model:mimo-v2.6-pro-free',
+    })
+    expect(planChannelModelCommand('有哪些模型', models, null)).toMatchObject({
+      kind: 'list',
+    })
+  })
+
+  it('普通“改用/换成”句子不会被误判为模型命令', () => {
+    expect(planChannelModelCommand('改用这个方案', models, 'deepseek-v4-flash')).toBeNull()
+    expect(planChannelModelCommand('换成明天的计划', models, 'deepseek-v4-flash')).toBeNull()
+  })
+
   it('匹配到多个时要求补全名称，不直接猜', () => {
     const result = planChannelModelCommand('/model MiMo', models, null)
     expect(result?.kind).toBe('ambiguous')

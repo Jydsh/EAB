@@ -108,7 +108,9 @@
 
 - `planChannelModelCommand(text, models, currentModelId)` 只读取调用方传入的可见模型；
 - 钉钉 `handleDingTalkMessage` 在额度校验前拦截命令，命中后直接返回文本，不建卡片、不调用 `runAgentTurn`；
-- 命中切换命令时更新该员工渠道会话的 `chat_sessions.model_id`；
+- 未命中命令的普通消息进入 Agent 时，钉钉/飞书父 Agent 注入 `switch_chat_model` 工具；网页模型选择器和子 Agent 不注入，避免两边状态不同步；
+- `switch_chat_model` 支持 `list/switch/auto`，只允许操作当前 `sessionId` 和当前身份可见的 chat 模型；切换成功后写入当前会话 `model_id`，本条回复仍由原模型生成，下一条消息生效；
+- 命中切换命令或工具切换时更新该员工渠道会话的 `chat_sessions.model_id`；
 - 普通消息按 `chat_sessions.model_id` 取模型：仍可见则使用，不可见则清空并回退自动；图片消息额外要求视觉能力；
 - 钉钉入站额外校验 `chat:use`、`model:use`，与网页 `POST /api/chat/messages` 保持一致。
 
@@ -140,6 +142,8 @@
 - 选择自动后，会话 `model_id` 为空，回答标记自动选择。
 - 无权模型 ID 直接调用切换接口返回 403，且不写入会话偏好。
 - 渠道机器人发送 `/model` 只返回当前可见模型；发送 `/model <可见模型>` 后，同一渠道会话的 `chat_sessions.model_id` 写入；发送 `/auto` 后清空。
+- 钉钉/飞书普通消息里，用户说“帮我换个模型 / 还有一个模型吗 / 自动选择”等未命中命令的说法时，父 Agent 调用 `switch_chat_model` 完成列表、切换或恢复自动；网页和子 Agent 不出现该工具。
+- `switch_chat_model` 匹配不到或匹配多个模型时不写入 `model_id`，也不返回候选之外的模型；切换成功后的下一条渠道消息使用新模型。
 - 渠道会话已保存模型不可见时，下一轮不调用该模型，并清空 `model_id`。
 - 不可回复的插件模型在健康探测失败后不再出现在 `/api/chat/models`；恢复健康后重新出现。
 - 首选模型真实回复失败时，备用模型接替并返回完整回答；渠道不出现两个模型的半截拼接。

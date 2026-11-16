@@ -32,6 +32,11 @@ function compact(value: string): string {
     .replace(/[\s\u3000·_.\-/／（）()]+/g, '')
 }
 
+/** 没有匹配到可见模型时，判断用户是否确实在说模型，而不是普通“改用/换成”句子。 */
+function looksLikeModelRequest(raw: string, query: string): boolean {
+  return /^\/model(?:\s|$)/i.test(raw) || raw.includes('模型') || /[a-z0-9:_-]/i.test(query)
+}
+
 function modelName(models: readonly ChannelModelOption[], modelId: string | null): string {
   if (!modelId) return '自动选择'
   return models.find((model) => model.id === modelId)?.name || '当前模型不可用'
@@ -80,7 +85,30 @@ export function planChannelModelCommand(
   const raw = String(text || '').trim()
   if (!raw || raw.length > 160) return null
 
-  if (/^\/(model|models|模型)$/i.test(raw) || /^(切换模型|换模型)$/.test(raw)) {
+  // “换另外一个模型”不带具体名称：有且只有一个其他候选时直接切，
+  // 多个候选时返回列表让用户选，避免模型或命令层替用户猜模型。
+  if (/^(换一个模型|换个模型|换另一个模型|换另外一个模型|换别的模型)(?:吧|呢|。|！|!)?$/.test(raw)) {
+    const alternatives = currentModelId ? models.filter((model) => model.id !== currentModelId) : models
+    if (currentModelId && alternatives.length === 1) {
+      return {
+        kind: 'switch',
+        text: `已切换到「${alternatives[0].name}」。接下来的消息会使用它。`,
+        modelId: alternatives[0].id,
+      }
+    }
+    if (currentModelId && alternatives.length === 0) {
+      return {
+        kind: 'list',
+        text: `当前模型：${modelName(models, currentModelId)}\n当前身份没有其他可用模型。`,
+      }
+    }
+    return { kind: 'list', text: availableListText(models, currentModelId) }
+  }
+
+  if (
+    /^\/(model|models|模型)$/i.test(raw) ||
+    /^(切换模型|换模型|有哪些模型|还有哪些模型|还能用哪些模型|能用哪些模型|还有别的模型吗|有什么模型|都有哪些模型)(?:吧|呢|。|！|!)?$/.test(raw)
+  ) {
     return { kind: 'list', text: availableListText(models, currentModelId) }
   }
   if (/^\/(auto|自动)$/i.test(raw)) {
@@ -90,9 +118,16 @@ export function planChannelModelCommand(
   const patterns = [
     /^\/model\s+([\s\S]+)$/i,
     /^切换到\s*([\s\S]+)$/,
+    /^切到\s*([\s\S]+)$/,
+    /^切为\s*([\s\S]+)$/,
     /^切换模型(?:到|为|成)?\s*([\s\S]+)$/,
     /^换成\s*([\s\S]+)$/,
+    /^换为\s*([\s\S]+)$/,
     /^换用\s*([\s\S]+)$/,
+    /^改用\s*([\s\S]+)$/,
+    /^改为\s*([\s\S]+)$/,
+    /^改到\s*([\s\S]+)$/,
+    /^模型(?:换成|换为|改为|改到)\s*([\s\S]+)$/,
     /^使用\s*([\s\S]+?)\s*模型$/,
     /^用\s*([\s\S]+?)\s*模型$/,
   ]
@@ -113,6 +148,9 @@ export function planChannelModelCommand(
 
   const matches = matchChannelModels(models, query)
   if (matches.length === 0) {
+    // “改用这个方案”这类普通句子可能命中“改用”动词，但目标不像模型；
+    // 没有模型名/ID 特征时交回普通对话，避免把正常指令误判成模型命令。
+    if (!looksLikeModelRequest(raw, query)) return null
     return {
       kind: 'not-found',
       text: `没有找到你有权限使用的模型「${query}」。发送 /model 查看当前可用模型。`,

@@ -109,15 +109,15 @@ export interface ServerConfig {
   readonly agentWaitTimeoutMs?: number
   /** 所有请求体同时在内存中的粗略预算（MB）；超过时新的大请求直接 429 */
   readonly maxInflightBodyMb?: number
-  /** 缓存后端：auto（有 URL 用 Redis）、memory、redis、off（仍用内存，只是不尝试外部） */
+  /** 缓存后端：auto（数据连接里有 Redis 才接入）、memory、redis、off（仍用内存，只是不尝试外部） */
   readonly cacheBackend: 'auto' | 'memory' | 'redis' | 'off'
-  /** Redis 连接串；为空时 auto 自动使用内存缓存 */
+  /** Redis 连接串；仅作 EAB_BACKENDS_FROM_ENV=1 时的兼容回退，默认不使用 */
   readonly redisUrl: string
   /** Redis key 前缀，避免与服务器上其它应用冲突 */
   readonly redisPrefix: string
-  /** PostgreSQL 后端：auto（有 URL 用镜像）、off、mirror（审计镜像） */
+  /** PostgreSQL 后端：auto（数据连接里有 PG 才接入）、off、mirror（审计镜像） */
   readonly postgresBackend: 'auto' | 'off' | 'mirror'
-  /** PostgreSQL 连接串；为空时 auto 自动关闭镜像 */
+  /** PostgreSQL 连接串；仅作 EAB_BACKENDS_FROM_ENV=1 时的兼容回退，默认不使用 */
   readonly postgresUrl: string
   /**
    * 审计读取数据源：
@@ -133,6 +133,8 @@ export interface ServerConfig {
    * - auto：PG 会话镜像可用时读 PG，否则读 SQLite。
    */
   readonly chatRead: 'sqlite' | 'postgres' | 'auto'
+  /** 是否允许用环境变量作为平台后端来源；默认关闭，平台后端以控制台“数据连接”为准。 */
+  readonly backendsFromEnv: boolean
   /** 显式要求的外部后端连不上时是否启动失败；默认 false，降级继续跑 */
   readonly backendsStrict: boolean
 }
@@ -253,7 +255,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
       adminPort: env.EAB_ADMIN_PORT !== undefined,
       allowRemoteConsole: env.EAB_CONSOLE_ALLOW_REMOTE !== undefined,
     },
-    logLevel: env.EAB_LOG_LEVEL ?? 'info',
+    // 默认只留警告和错误：不输出逐请求 2xx 日志，避免常驻进程刷屏和日志文件无限增长。
+    // 排查问题时可临时用 EAB_LOG_LEVEL=info 恢复请求日志。
+    logLevel: env.EAB_LOG_LEVEL ?? 'warn',
     chatMaxConcurrent: readInt(env.EAB_CHAT_MAX_CONCURRENT, 8, 'EAB_CHAT_MAX_CONCURRENT'),
     chatQueueLimit: readInt(env.EAB_CHAT_QUEUE_LIMIT, 100, 'EAB_CHAT_QUEUE_LIMIT'),
     chatQueueTimeoutMs: readInt(env.EAB_CHAT_QUEUE_TIMEOUT_MS, 240_000, 'EAB_CHAT_QUEUE_TIMEOUT_MS'),
@@ -300,6 +304,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
       'sqlite',
       'EAB_CHAT_READ',
     ),
+    backendsFromEnv: (env.EAB_BACKENDS_FROM_ENV ?? '0') === '1',
     backendsStrict: (env.EAB_BACKENDS_STRICT ?? '0') === '1',
   }
 }

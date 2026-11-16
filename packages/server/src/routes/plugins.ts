@@ -315,6 +315,34 @@ export function registerPluginRoutes(app: FastifyInstance, deps: ServerDeps): vo
   })
 
   /**
+   * 插件页的版本心跳：只返回本人已安装插件的版本、校验和和页面声明。
+   * `/plugin-kernel.html` 每 2 秒读一次，重装后拿到新的 h 就自行 location.replace，
+   * 这样 Agent 热更新插件时用户不需要手点刷新。
+   */
+  app.get<{ Params: { id: string } }>('/api/my/plugins/:id/runtime', async (req, reply) => {
+    reply.header('cache-control', 'no-store')
+    const { subject } = resolveActor(deps.db, deps.config, req)
+    requireScope(subject, SC.PLUGIN_LIST)
+    const plugin = loadPersonalPluginsForUser(deps.db, subject.companyId, subject.userId).find(
+      (item) => item.id === req.params.id,
+    )
+    if (!plugin) throw new EabError(EC.NOT_FOUND, `你还没有安装插件：${req.params.id}`)
+    const status = pluginHostStatus(plugin.id, subject.companyId, userScope(subject.userId))
+    return ok({
+      plugin: {
+        id: plugin.id,
+        name: plugin.name,
+        version: plugin.version,
+        checksum: plugin.checksum,
+        enabled: plugin.enabled,
+        valid: plugin.valid,
+        pages: plugin.pages.map((page) => ({ id: page.id, title: page.title, file: page.file })),
+      },
+      host: { loaded: status?.loaded ?? false },
+    })
+  })
+
+  /**
    * 个人插件的 DSH client RPC。
    *
    * `/plugin-host.html` 在个人工作台里会带 `scope=user` 打这里，不再要求控制台会话；
@@ -681,6 +709,29 @@ export function registerPluginRoutes(app: FastifyInstance, deps: ServerDeps): vo
         }),
         sessions: pluginSessionsFor(deps.db, subject.companyId),
       },
+    })
+  })
+
+  app.get<{ Params: { id: string } }>('/api/console/plugins/:id/runtime', async (req, reply) => {
+    reply.header('cache-control', 'no-store')
+    ensureConsole(req, deps)
+    const { subject } = resolveActor(deps.db, deps.config, req)
+    const plugin = loadPluginsForUser(deps.db, subject.companyId, subject.userId, true).find(
+      (item) => item.id === req.params.id,
+    )
+    if (!plugin) throw new EabError(EC.NOT_FOUND, `不是已安装的插件：${req.params.id}`)
+    const status = pluginHostStatus(plugin.id, subject.companyId)
+    return ok({
+      plugin: {
+        id: plugin.id,
+        name: plugin.name,
+        version: plugin.version,
+        checksum: plugin.checksum,
+        enabled: plugin.enabled,
+        valid: plugin.valid,
+        pages: plugin.pages.map((page) => ({ id: page.id, title: page.title, file: page.file })),
+      },
+      host: { loaded: status?.loaded ?? false },
     })
   })
 

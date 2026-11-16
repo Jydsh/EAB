@@ -27,7 +27,7 @@ import {
   setChannelTurnProgress,
   type ChannelTurn,
 } from './channel-turns.js'
-import { acquireLeaderHold, claimOnce, hitRate, type LeaderHold } from './backends/coordination.js'
+import { acquireLeaderHold, claimOnce, hitRate, readLeaderOwner, type LeaderHold, type LeaderOwner } from './backends/coordination.js'
 import { publishChatEvent, type ChatLiveToolEventPayload } from './chat-events.js'
 import { findActivePerson, findPerson, actorFor, type RequestActor } from './session.js'
 import type { ServerDeps } from './deps.js'
@@ -58,6 +58,7 @@ import { pluginPromptTexts } from './plugin-tools.js'
 import { skillPromptTexts } from './skills.js'
 import { assertChatQuota } from './quota.js'
 import { planChannelModelCommand } from './channel-model-command.js'
+import { SWITCH_CHAT_MODEL_TOOL_SPEC, updateConversationModelPreference, type ModelSwitchContext } from './channel-model-switch.js'
 import {
   resolveUserWorkspaceQuota,
   workspaceCapacity,
@@ -777,6 +778,7 @@ export async function handleDingTalkMessage(
     actor.subject.userId,
   )
   const available = visibleModelsFor(catalog, [...actor.subject.roles], actor.subject.companyId)
+  const availableChatModels = available.filter((item) => (item.endpointKind ?? 'chat') === 'chat')
 
   /**
    * 渠道里的模型切换必须先于额度校验：它不调用模型，也不消耗额度。
@@ -911,7 +913,7 @@ export async function handleDingTalkMessage(
       ) === 0
 
     let modelFallbackNote = ''
-    const sessionModelId =
+    let sessionModelId =
       (deps.db
         .prepare('SELECT model_id FROM chat_sessions WHERE id = ? AND deleted_at IS NULL')
         .get(sessionId) as { model_id: string | null } | undefined)?.model_id ?? null
@@ -919,6 +921,7 @@ export async function handleDingTalkMessage(
     if (sessionModelId && !preferredModel) {
       // 会话里保存的模型下线或当前角色无权后再回退自动，避免每轮继续拿旧 ID。
       deps.db.prepare('UPDATE chat_sessions SET model_id = NULL, updated_at = ? WHERE id = ?').run(Date.now(), sessionId)
+      sessionModelId = null
       modelFallbackNote = '原会话模型已不可用，已切回自动选择。\n\n'
     }
     if (imageUrls.length > 0 && preferredModel && !modelSupportsVision(preferredModel.tags, preferredModel.capabilities)) {
@@ -1120,19 +1123,18 @@ export async function handleDingTalkMessage(
     // A2UI 卡能展示钉盘 File 组件；建卡失败时退回 sampleFile 文件消息。
     const toolSpace: ActiveSpace = { kind: 'cloud', channel: card ? 'dingtalk-a2ui' : 'dingtalk-file' }
     const chatTools = toolSpecsForAgent(deps.db, actor, toolSpace, promptText)
+    const channelChatTools = [...chatTools, SWITCH_CHAT_MODEL_TOOL_SPEC]
     const pluginPrompts = pluginPromptTexts(deps.db, actor)
     const skillPrompts = skillPromptTexts(deps.db, actor)
     const system = buildSystemPrompt({
       actor,
-      chatTools,
+      chatTools: channelChatTools,
       memories,
       hits,
       hasAttachments: imageUrls.length > 0,
       pluginPrompts,
       skillPrompts,
-      availableModels: available
-        .filter((item) => (item.endpointKind ?? 'chat') === 'chat')
-        .map((item) => ({ id: item.id, name: item.name })),
+      availableModels: availableChatModels.map((item) => ({ id: item.id, name: item.name })),
       currentModelId: model.id,
     })
     const imageSystemNote =
@@ -1285,6 +1287,21 @@ export async function handleDingTalkMessage(
         updatedAt: Date.now(),
       })
     }
+    const modelSwitchContext: ModelSwitchContext = {
+      models: availableChatModels,
+      currentModelId: sessionModelId,
+      activeModelId: model.id,
+      onChange: (modelId) => {
+        updateConversationModelPreference(deps.db, {
+          companyId: actor.subject.companyId,
+          userId: actor.person.id,
+          sessionId,
+          modelId,
+        })
+        // 同一轮里模型可能连续调用 list/switch；同步上下文，避免第二次还看过期值。
+        modelSwitchContext.currentModelId = modelId
+      },
+    }
     try {
       agentResult = await runAgentTurn({
         deps,
@@ -1300,6 +1317,7 @@ export async function handleDingTalkMessage(
         onModelFailover: (change) => {
           const next = available.find((item) => item.id === change.toModelId)
           if (next) effectiveModel = next
+          modelSwitchContext.activeModelId = change.toModelId
           failoverNote = `当前模型「${change.fromModelName}」暂时不可用，已自动切换到「${change.toModelName}」。\n\n`
         },
         onModelFallbackStart: () => {
@@ -1318,6 +1336,7 @@ export async function handleDingTalkMessage(
         },
         messages,
         sessionId,
+        modelSwitch: modelSwitchContext,
         space: toolSpace,
         emit: (event) => {
           if (event.type === 'reasoning') {
@@ -1874,6 +1893,8 @@ export interface DingTalkStreamStatus {
   readonly lastConnectedAt: number | null
   readonly lastAttemptAt: number | null
   readonly error: string | null
+  /** 当前领导权持有者；旧版本租约只带 legacy 标记。 */
+  readonly leader: LeaderOwner | null
 }
 
 function cardCallbackContent(raw: unknown): {
@@ -2569,6 +2590,7 @@ export function dingTalkStreamStatus(): DingTalkStreamStatus {
     lastConnectedAt: streamState.lastConnectedAt,
     lastAttemptAt: streamState.lastAttemptAt,
     error: streamState.error,
+    leader: streamLeaderOwner,
   }
 }
 
@@ -2581,21 +2603,48 @@ let refreshPromise: Promise<void> | null = null
  */
 let streamLeader: LeaderHold | null = null
 let streamLeaderKey = ''
+let streamLeaderOwner: LeaderOwner | null = null
 
 async function ensureStreamLeadership(appId: string): Promise<boolean> {
   const key = `dingtalk-stream:${appId}`
-  if (streamLeader && streamLeaderKey === key && streamLeader.isHeld()) return true
+  if (streamLeader && streamLeaderKey === key && streamLeader.isHeld()) {
+    streamLeaderOwner = streamLeader.owner
+    return true
+  }
   streamLeader?.release()
   streamLeader = null
   streamLeaderKey = key
   streamLeader = await acquireLeaderHold(key, { ttlMs: 90_000 })
-  return Boolean(streamLeader?.isHeld())
+  if (streamLeader?.isHeld()) {
+    streamLeaderOwner = streamLeader.owner
+    return true
+  }
+  // 待命时把真正持有者读出来，控制台能直接看到是主机/PID 还是旧版本租约。
+  streamLeaderOwner = await readLeaderOwner(key)
+  return false
 }
 
 function releaseStreamLeadership(): void {
   streamLeader?.release()
   streamLeader = null
   streamLeaderKey = ''
+  streamLeaderOwner = null
+}
+
+function describeLeader(owner: LeaderOwner | null): string {
+  if (!owner) return '未知实例'
+  if (owner.legacy) return '旧版本租约（无实例信息）'
+  if (!owner.host) return owner.instanceId || '未知实例'
+  return `${owner.host} · PID ${owner.pid}`
+}
+
+/**
+ * 进程退出时显式释放 Stream 领导权。
+ * `stopDingTalkStream` 只断连接，不释放租约；如果重启时不调用本函数，
+ * 新进程会等旧租约的 90 秒 TTL 过期，期间钉钉消息完全收不到。
+ */
+export function releaseDingTalkStreamLeadership(): void {
+  releaseStreamLeadership()
 }
 
 /**
@@ -2633,7 +2682,11 @@ async function doRefreshDingTalkStream(deps: ServerDeps): Promise<void> {
   // 多实例部署时只让一个实例持有这条长连接，避免同一条消息被两个实例各回一次。
   if (!(await ensureStreamLeadership(cfg.app_id))) {
     if (streamState.client) stopDingTalkStream()
-    streamState.error = '钉钉 Stream 正由另一实例持有，本实例待命（Redis 领导权）'
+    const reason = `钉钉 Stream 正由另一实例持有（${describeLeader(streamLeaderOwner)}），本实例待命（Redis 领导权）`
+    // 只在原因变化时打一次，避免 10 秒巡检刷屏；否则线上只看到“已绑定”，
+    // 机器人静默无响应时无从判断是配置、密钥还是领导权。
+    if (streamState.error !== reason) console.warn(`[eab] ${reason}`)
+    streamState.error = reason
     return
   }
   if (streamState.client && streamState.appId === cfg.app_id) {

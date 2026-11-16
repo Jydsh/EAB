@@ -58,6 +58,49 @@ function truncated(message: ChatMessage, maxChars: number): ChatMessage {
   return { ...message, content: `${text.slice(0, Math.max(40, maxChars))}…` }
 }
 
+/**
+ * 工具结果进入模型上下文前的硬保护。
+ *
+ * 插件接口可能一次返回上千行数据（例如“目标与计划”一次 6419 行、约 2MB），
+ * 完整塞进 messages 会直接把上游上下文打爆，而且压缩历史、压工具 Schema 都救不回来。
+ * 这里按字符预算保留首尾片段并显式告知模型结果被截断，避免它误以为已经看到全量数据。
+ */
+export function capToolResultText(
+  text: string,
+  maxChars: number,
+  totalRows?: number | null,
+  batchId?: string | null,
+  totalChars?: number | null,
+): { text: string; truncated: boolean; originalChars: number } {
+  const originalChars = text.length
+  const budget = Math.max(1_000, Math.floor(maxChars))
+  if (originalChars <= budget) return { text, truncated: false, originalChars }
+  const headChars = Math.max(400, Math.floor(budget * 0.8))
+  const tailChars = Math.max(200, budget - headChars)
+  const head = text.slice(0, headChars)
+  const tail = text.slice(-tailChars)
+  const hasRows = typeof totalRows === 'number' && Number.isFinite(totalRows) && totalRows > 0
+  const noun = hasRows ? '记录' : '内容'
+  const rowLabel = hasRows ? `（共 ${totalRows} 条记录）` : ''
+  const charLabel = typeof totalChars === 'number' && Number.isFinite(totalChars) && totalChars > 0
+    ? `，完整内容共 ${totalChars} 字符`
+    : ''
+  const batchNote = batchId?.trim()
+    ? `完整${noun}已保存为批次 ${batchId.trim()}；需要基于全量数据分析时调用 batch_analyze（传 batchId 和用户问题），只看明细可用 batch_read 分页读取。`
+    : ''
+  const note =
+    `\n\n【工具结果已截断】原始结果 ${originalChars} 字符${rowLabel}${charLabel}，超过单次注入上限 ${budget} 字符；` +
+    `以下是开头 ${headChars} 字符与结尾 ${tailChars} 字符，中间内容未发送。` +
+    `你只看到了部分${noun}，回答时必须先说明“数据量过大，只展示了部分${noun}”，不得声称这是全部${noun}。` +
+    batchNote +
+    `需要完整或精确数据时，请缩小查询范围、分批查询，或改用带筛选参数的工具。\n\n`
+  return {
+    text: `${head}${note}${tail}`,
+    truncated: true,
+    originalChars,
+  }
+}
+
 export interface CompressionOptions {
   readonly maxContext: number
   readonly maxOutputTokens: number

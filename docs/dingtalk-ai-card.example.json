@@ -12,15 +12,314 @@
       "surfaceId": "eab-demo-surface",
       "path": "/",
       "value": {
-        "answer": { "text": "" },
-        "thinking": { "text": "正在分析你的问题…", "preview": "" },
-        "tools": { "text": "", "preview": "" },
+        "answer": {
+          "blocks": [
+            {
+              "text": "",
+              "table": {
+                "meta": [],
+                "data": []
+              }
+            },
+            {
+              "text": "",
+              "table": {
+                "meta": [],
+                "data": []
+              }
+            },
+            {
+              "text": "",
+              "table": {
+                "meta": [],
+                "data": []
+              }
+            },
+            {
+              "text": "",
+              "table": {
+                "meta": [],
+                "data": []
+              }
+            },
+            {
+              "text": "",
+              "table": {
+                "meta": [],
+                "data": []
+              }
+            },
+            {
+              "text": "",
+              "table": {
+                "meta": [],
+                "data": []
+              }
+            },
+            {
+              "text": "",
+              "table": {
+                "meta": [],
+                "data": []
+              }
+            },
+            {
+              "text": "",
+              "table": {
+                "meta": [],
+                "data": []
+              }
+            },
+            {
+              "text": "",
+              "table": {
+                "meta": [],
+                "data": []
+              }
+            },
+            {
+              "text": "",
+              "table": {
+                "meta": [],
+                "data": []
+              }
+            },
+            {
+              "text": "",
+              "table": {
+                "meta": [],
+                "data": []
+              }
+            },
+            {
+              "text": "",
+              "table": {
+                "meta": [],
+                "data": []
+              }
+            },
+            {
+              "text": "",
+              "table": {
+                "meta": [],
+                "data": []
+              }
+            },
+            {
+              "text": "",
+              "table": {
+                "meta": [],
+                "data": []
+              }
+            },
+            {
+              "text": "",
+              "table": {
+                "meta": [],
+                "data": []
+              }
+            },
+            {
+              "text": "",
+              "table": {
+                "meta": [],
+                "data": []
+              }
+            },
+            {
+              "text": "",
+              "table": {
+                "meta": [],
+                "data": []
+              }
+            },
+            {
+              "text": "",
+              "table": {
+                "meta": [],
+                "data": []
+              }
+            },
+            {
+              "text": "",
+              "table": {
+                "meta": [],
+                "data": []
+              }
+            },
+            {
+              "text": "",
+              "table": {
+                "meta": [],
+                "data": []
+              }
+            },
+            {
+              "text": "",
+              "table": {
+                "meta": [],
+                "data": []
+              }
+            },
+            {
+              "text": "",
+              "table": {
+                "meta": [],
+                "data": []
+              }
+            },
+            {
+              "text": "",
+              "table": {
+                "meta": [],
+                "data": []
+              }
+            },
+            {
+              "text": "",
+              "table": {
+                "meta": [],
+                "data": []
+              }
+            }
+          ]
+        },
+        "thinking": {
+          "text": "正在分析你的问题…",
+          "preview": "正在分析你的问题…",
+          "header": "思考中 · 正在分析你的问题… ›"
+        },
+        "tools": {
+          "text": "",
+          "preview": "",
+          "header": "工具 ›"
+        },
+        "attachments": [],
+        "clarify": {
+          "sessionId": "",
+          "badge": "",
+          "hint": "",
+          "kind": "single",
+          "question": "",
+          "displayQuestion": "",
+          "blanks": [],
+          "placeholder": "请输入你的答案…",
+          "progress": "",
+          "selected": [],
+          "text": "",
+          "total": 0,
+          "index": 0,
+          "canPrev": false,
+          "canNext": false,
+          "isLast": false,
+          "options": [],
+          "pickerOptions": []
+        },
         "thinkingDone": false,
         "ui": {
           "showThinking": true,
-          "showThinkingPreview": false,
+          "showThinkingPreview": true,
+          "showThinkingHeader": true,
+          "thinkingExpanded": false,
           "showTools": false,
-          "showToolsPreview": false
+          "showToolsPreview": false,
+          "showToolsHeader": false,
+          "toolsExpanded": false,
+          "showAttachments": false,
+          "showAttachment0": false,
+          "showAttachment1": false,
+          "showAttachment2": false,
+          "showClarify": false,
+          "showClarifyProgress": false,
+          "showClarifySingle": false,
+          "showClarifyMultiple": false,
+          "showClarifyText": false,
+          "showClarifyBlanks": false,
+          "showClarifySubmit": false,
+          "showClarifyNav": false,
+          "showClarifyPrev": false,
+          "showClarifyNext": false,
+          "showClarifyCustom": false,
+          "showClarifyOption0": false,
+          "showClarifyOption1": false,
+          "showClarifyOption2": false,
+          "showClarifyOption3": false,
+          "showClarifyDesc0": false,
+          "showClarifyDesc1": false,
+          "showClarifyDesc2": false,
+          "showClarifyDesc3": false,
+          "showAnswerText0": false,
+          "showAnswerTable0": false,
+          "showAnswerUnit0": false,
+          "showAnswerText1": false,
+          "showAnswerTable1": false,
+          "showAnswerUnit1": false,
+          "showAnswerText2": false,
+          "showAnswerTable2": false,
+          "showAnswerUnit2": false,
+          "showAnswerText3": false,
+          "showAnswerTable3": false,
+          "showAnswerUnit3": false,
+          "showAnswerText4": false,
+          "showAnswerTable4": false,
+          "showAnswerUnit4": false,
+          "showAnswerText5": false,
+          "showAnswerTable5": false,
+          "showAnswerUnit5": false,
+          "showAnswerText6": false,
+          "showAnswerTable6": false,
+          "showAnswerUnit6": false,
+          "showAnswerText7": false,
+          "showAnswerTable7": false,
+          "showAnswerUnit7": false,
+          "showAnswerText8": false,
+          "showAnswerTable8": false,
+          "showAnswerUnit8": false,
+          "showAnswerText9": false,
+          "showAnswerTable9": false,
+          "showAnswerUnit9": false,
+          "showAnswerText10": false,
+          "showAnswerTable10": false,
+          "showAnswerUnit10": false,
+          "showAnswerText11": false,
+          "showAnswerTable11": false,
+          "showAnswerUnit11": false,
+          "showAnswerText12": false,
+          "showAnswerTable12": false,
+          "showAnswerUnit12": false,
+          "showAnswerText13": false,
+          "showAnswerTable13": false,
+          "showAnswerUnit13": false,
+          "showAnswerText14": false,
+          "showAnswerTable14": false,
+          "showAnswerUnit14": false,
+          "showAnswerText15": false,
+          "showAnswerTable15": false,
+          "showAnswerUnit15": false,
+          "showAnswerText16": false,
+          "showAnswerTable16": false,
+          "showAnswerUnit16": false,
+          "showAnswerText17": false,
+          "showAnswerTable17": false,
+          "showAnswerUnit17": false,
+          "showAnswerText18": false,
+          "showAnswerTable18": false,
+          "showAnswerUnit18": false,
+          "showAnswerText19": false,
+          "showAnswerTable19": false,
+          "showAnswerUnit19": false,
+          "showAnswerText20": false,
+          "showAnswerTable20": false,
+          "showAnswerUnit20": false,
+          "showAnswerText21": false,
+          "showAnswerTable21": false,
+          "showAnswerUnit21": false,
+          "showAnswerText22": false,
+          "showAnswerTable22": false,
+          "showAnswerUnit22": false,
+          "showAnswerText23": false,
+          "showAnswerTable23": false,
+          "showAnswerUnit23": false
         }
       }
     }
@@ -34,78 +333,1623 @@
           "id": "root",
           "component": "Card",
           "child": "rootColumn",
-          "backgroundColor": "#FFFFFFFF",
-          "padding": 16,
-          "cornerRadius": 12
+          "backgroundColorToken": "common_bg_color",
+          "padding": 18,
+          "cornerRadius": 16
         },
         {
           "id": "rootColumn",
           "component": "Column",
-          "children": ["thinkingBlock", "toolBlock", "answer"],
-          "gap": 10
+          "children": [
+            "thinkingBlock",
+            "toolBlock",
+            "answerRow",
+            "clarifyBlock",
+            "attachmentBlock"
+          ],
+          "gap": 12
         },
         {
           "id": "thinkingBlock",
           "component": "Column",
-          "children": ["thinkingPanel", "thinkingPreview"],
-          "gap": 4,
-          "visible": { "path": "/ui/showThinking" }
+          "children": [
+            "thinkingHeader",
+            "thinkingBody"
+          ],
+          "gap": 2,
+          "visible": {
+            "path": "/ui/showThinking"
+          }
         },
         {
-          "id": "thinkingPanel",
-          "component": "CollapsiblePanel",
-          "title": "✦ 正在思考…",
-          "variant": "reasoning",
-          "defaultExpanded": false,
-          "visible": { "path": "/ui/showThinking" },
-          "children": ["thinkingText"],
-          "fallbackMarkdown": "思考过程",
-          "textEffect": "shimmer"
-        },
-        {
-          "id": "thinkingText",
-          "component": "Markdown",
-          "content": { "path": "/thinking/text" }
-        },
-        {
-          "id": "thinkingPreview",
+          "id": "thinkingHeader",
           "component": "Text",
-          "text": { "path": "/thinking/preview" },
+          "text": {
+            "path": "/thinking/header"
+          },
           "maxLine": 1,
-          "visible": { "path": "/ui/showThinkingPreview" }
+          "variant": "caption",
+          "customLightColor": "#667085",
+          "customDarkColor": "#98A2B3",
+          "textEffect": "shimmer",
+          "onLinkClick": {
+            "event": {
+              "name": "eab_panel_toggle",
+              "context": {
+                "action": "panel_toggle",
+                "panel": "thinking",
+                "sessionId": "chat_demo"
+              }
+            }
+          },
+          "fallbackMarkdown": "思考"
+        },
+        {
+          "id": "thinkingBody",
+          "component": "Markdown",
+          "content": {
+            "path": "/thinking/text"
+          },
+          "visible": {
+            "path": "/ui/thinkingExpanded"
+          }
         },
         {
           "id": "toolBlock",
           "component": "Column",
-          "children": ["toolPanel", "toolsPreview"],
-          "gap": 4,
-          "visible": { "path": "/ui/showTools" }
+          "children": [
+            "toolHeader",
+            "toolBody"
+          ],
+          "gap": 2,
+          "visible": {
+            "path": "/ui/showTools"
+          }
         },
         {
-          "id": "toolPanel",
-          "component": "CollapsiblePanel",
-          "title": "🛠️ 工具调用中…",
-          "defaultExpanded": false,
-          "visible": { "path": "/ui/showTools" },
-          "children": ["toolText"],
-          "fallbackMarkdown": "工具调用记录"
-        },
-        {
-          "id": "toolText",
-          "component": "Markdown",
-          "content": { "path": "/tools/text" }
-        },
-        {
-          "id": "toolsPreview",
+          "id": "toolHeader",
           "component": "Text",
-          "text": { "path": "/tools/preview" },
+          "text": {
+            "path": "/tools/header"
+          },
           "maxLine": 1,
-          "visible": { "path": "/ui/showToolsPreview" }
+          "variant": "caption",
+          "customLightColor": "#667085",
+          "customDarkColor": "#98A2B3",
+          "onLinkClick": {
+            "event": {
+              "name": "eab_panel_toggle",
+              "context": {
+                "action": "panel_toggle",
+                "panel": "tools",
+                "sessionId": "chat_demo"
+              }
+            }
+          },
+          "fallbackMarkdown": "工具"
         },
         {
-          "id": "answer",
+          "id": "toolBody",
           "component": "Markdown",
-          "content": { "path": "/answer/text" }
+          "content": {
+            "path": "/tools/text"
+          },
+          "visible": {
+            "path": "/ui/toolsExpanded"
+          }
+        },
+        {
+          "id": "answerRow",
+          "component": "Row",
+          "align": "end",
+          "gap": 0,
+          "children": [
+            "answerBlocks"
+          ]
+        },
+        {
+          "id": "answerBlocks",
+          "component": "Column",
+          "gap": 8,
+          "weight": 1,
+          "children": [
+            "answerUnit0",
+            "answerUnit1",
+            "answerUnit2",
+            "answerUnit3",
+            "answerUnit4",
+            "answerUnit5",
+            "answerUnit6",
+            "answerUnit7",
+            "answerUnit8",
+            "answerUnit9",
+            "answerUnit10",
+            "answerUnit11",
+            "answerUnit12",
+            "answerUnit13",
+            "answerUnit14",
+            "answerUnit15",
+            "answerUnit16",
+            "answerUnit17",
+            "answerUnit18",
+            "answerUnit19",
+            "answerUnit20",
+            "answerUnit21",
+            "answerUnit22",
+            "answerUnit23"
+          ]
+        },
+        {
+          "id": "answerUnit0",
+          "component": "Column",
+          "gap": 6,
+          "visible": {
+            "path": "/ui/showAnswerUnit0"
+          },
+          "children": [
+            "answerText0",
+            "answerTable0"
+          ]
+        },
+        {
+          "id": "answerText0",
+          "component": "Markdown",
+          "content": {
+            "path": "/answer/blocks/0/text"
+          },
+          "visible": {
+            "path": "/ui/showAnswerText0"
+          }
+        },
+        {
+          "id": "answerTable0",
+          "component": "Table",
+          "data": {
+            "path": "/answer/blocks/0/table"
+          },
+          "scrollAreaWidth": 320,
+          "cellPadding": 6,
+          "maxLine": 3,
+          "zebra": true,
+          "visible": {
+            "path": "/ui/showAnswerTable0"
+          }
+        },
+        {
+          "id": "answerUnit1",
+          "component": "Column",
+          "gap": 6,
+          "visible": {
+            "path": "/ui/showAnswerUnit1"
+          },
+          "children": [
+            "answerText1",
+            "answerTable1"
+          ]
+        },
+        {
+          "id": "answerText1",
+          "component": "Markdown",
+          "content": {
+            "path": "/answer/blocks/1/text"
+          },
+          "visible": {
+            "path": "/ui/showAnswerText1"
+          }
+        },
+        {
+          "id": "answerTable1",
+          "component": "Table",
+          "data": {
+            "path": "/answer/blocks/1/table"
+          },
+          "scrollAreaWidth": 320,
+          "cellPadding": 6,
+          "maxLine": 3,
+          "zebra": true,
+          "visible": {
+            "path": "/ui/showAnswerTable1"
+          }
+        },
+        {
+          "id": "answerUnit2",
+          "component": "Column",
+          "gap": 6,
+          "visible": {
+            "path": "/ui/showAnswerUnit2"
+          },
+          "children": [
+            "answerText2",
+            "answerTable2"
+          ]
+        },
+        {
+          "id": "answerText2",
+          "component": "Markdown",
+          "content": {
+            "path": "/answer/blocks/2/text"
+          },
+          "visible": {
+            "path": "/ui/showAnswerText2"
+          }
+        },
+        {
+          "id": "answerTable2",
+          "component": "Table",
+          "data": {
+            "path": "/answer/blocks/2/table"
+          },
+          "scrollAreaWidth": 320,
+          "cellPadding": 6,
+          "maxLine": 3,
+          "zebra": true,
+          "visible": {
+            "path": "/ui/showAnswerTable2"
+          }
+        },
+        {
+          "id": "answerUnit3",
+          "component": "Column",
+          "gap": 6,
+          "visible": {
+            "path": "/ui/showAnswerUnit3"
+          },
+          "children": [
+            "answerText3",
+            "answerTable3"
+          ]
+        },
+        {
+          "id": "answerText3",
+          "component": "Markdown",
+          "content": {
+            "path": "/answer/blocks/3/text"
+          },
+          "visible": {
+            "path": "/ui/showAnswerText3"
+          }
+        },
+        {
+          "id": "answerTable3",
+          "component": "Table",
+          "data": {
+            "path": "/answer/blocks/3/table"
+          },
+          "scrollAreaWidth": 320,
+          "cellPadding": 6,
+          "maxLine": 3,
+          "zebra": true,
+          "visible": {
+            "path": "/ui/showAnswerTable3"
+          }
+        },
+        {
+          "id": "answerUnit4",
+          "component": "Column",
+          "gap": 6,
+          "visible": {
+            "path": "/ui/showAnswerUnit4"
+          },
+          "children": [
+            "answerText4",
+            "answerTable4"
+          ]
+        },
+        {
+          "id": "answerText4",
+          "component": "Markdown",
+          "content": {
+            "path": "/answer/blocks/4/text"
+          },
+          "visible": {
+            "path": "/ui/showAnswerText4"
+          }
+        },
+        {
+          "id": "answerTable4",
+          "component": "Table",
+          "data": {
+            "path": "/answer/blocks/4/table"
+          },
+          "scrollAreaWidth": 320,
+          "cellPadding": 6,
+          "maxLine": 3,
+          "zebra": true,
+          "visible": {
+            "path": "/ui/showAnswerTable4"
+          }
+        },
+        {
+          "id": "answerUnit5",
+          "component": "Column",
+          "gap": 6,
+          "visible": {
+            "path": "/ui/showAnswerUnit5"
+          },
+          "children": [
+            "answerText5",
+            "answerTable5"
+          ]
+        },
+        {
+          "id": "answerText5",
+          "component": "Markdown",
+          "content": {
+            "path": "/answer/blocks/5/text"
+          },
+          "visible": {
+            "path": "/ui/showAnswerText5"
+          }
+        },
+        {
+          "id": "answerTable5",
+          "component": "Table",
+          "data": {
+            "path": "/answer/blocks/5/table"
+          },
+          "scrollAreaWidth": 320,
+          "cellPadding": 6,
+          "maxLine": 3,
+          "zebra": true,
+          "visible": {
+            "path": "/ui/showAnswerTable5"
+          }
+        },
+        {
+          "id": "answerUnit6",
+          "component": "Column",
+          "gap": 6,
+          "visible": {
+            "path": "/ui/showAnswerUnit6"
+          },
+          "children": [
+            "answerText6",
+            "answerTable6"
+          ]
+        },
+        {
+          "id": "answerText6",
+          "component": "Markdown",
+          "content": {
+            "path": "/answer/blocks/6/text"
+          },
+          "visible": {
+            "path": "/ui/showAnswerText6"
+          }
+        },
+        {
+          "id": "answerTable6",
+          "component": "Table",
+          "data": {
+            "path": "/answer/blocks/6/table"
+          },
+          "scrollAreaWidth": 320,
+          "cellPadding": 6,
+          "maxLine": 3,
+          "zebra": true,
+          "visible": {
+            "path": "/ui/showAnswerTable6"
+          }
+        },
+        {
+          "id": "answerUnit7",
+          "component": "Column",
+          "gap": 6,
+          "visible": {
+            "path": "/ui/showAnswerUnit7"
+          },
+          "children": [
+            "answerText7",
+            "answerTable7"
+          ]
+        },
+        {
+          "id": "answerText7",
+          "component": "Markdown",
+          "content": {
+            "path": "/answer/blocks/7/text"
+          },
+          "visible": {
+            "path": "/ui/showAnswerText7"
+          }
+        },
+        {
+          "id": "answerTable7",
+          "component": "Table",
+          "data": {
+            "path": "/answer/blocks/7/table"
+          },
+          "scrollAreaWidth": 320,
+          "cellPadding": 6,
+          "maxLine": 3,
+          "zebra": true,
+          "visible": {
+            "path": "/ui/showAnswerTable7"
+          }
+        },
+        {
+          "id": "answerUnit8",
+          "component": "Column",
+          "gap": 6,
+          "visible": {
+            "path": "/ui/showAnswerUnit8"
+          },
+          "children": [
+            "answerText8",
+            "answerTable8"
+          ]
+        },
+        {
+          "id": "answerText8",
+          "component": "Markdown",
+          "content": {
+            "path": "/answer/blocks/8/text"
+          },
+          "visible": {
+            "path": "/ui/showAnswerText8"
+          }
+        },
+        {
+          "id": "answerTable8",
+          "component": "Table",
+          "data": {
+            "path": "/answer/blocks/8/table"
+          },
+          "scrollAreaWidth": 320,
+          "cellPadding": 6,
+          "maxLine": 3,
+          "zebra": true,
+          "visible": {
+            "path": "/ui/showAnswerTable8"
+          }
+        },
+        {
+          "id": "answerUnit9",
+          "component": "Column",
+          "gap": 6,
+          "visible": {
+            "path": "/ui/showAnswerUnit9"
+          },
+          "children": [
+            "answerText9",
+            "answerTable9"
+          ]
+        },
+        {
+          "id": "answerText9",
+          "component": "Markdown",
+          "content": {
+            "path": "/answer/blocks/9/text"
+          },
+          "visible": {
+            "path": "/ui/showAnswerText9"
+          }
+        },
+        {
+          "id": "answerTable9",
+          "component": "Table",
+          "data": {
+            "path": "/answer/blocks/9/table"
+          },
+          "scrollAreaWidth": 320,
+          "cellPadding": 6,
+          "maxLine": 3,
+          "zebra": true,
+          "visible": {
+            "path": "/ui/showAnswerTable9"
+          }
+        },
+        {
+          "id": "answerUnit10",
+          "component": "Column",
+          "gap": 6,
+          "visible": {
+            "path": "/ui/showAnswerUnit10"
+          },
+          "children": [
+            "answerText10",
+            "answerTable10"
+          ]
+        },
+        {
+          "id": "answerText10",
+          "component": "Markdown",
+          "content": {
+            "path": "/answer/blocks/10/text"
+          },
+          "visible": {
+            "path": "/ui/showAnswerText10"
+          }
+        },
+        {
+          "id": "answerTable10",
+          "component": "Table",
+          "data": {
+            "path": "/answer/blocks/10/table"
+          },
+          "scrollAreaWidth": 320,
+          "cellPadding": 6,
+          "maxLine": 3,
+          "zebra": true,
+          "visible": {
+            "path": "/ui/showAnswerTable10"
+          }
+        },
+        {
+          "id": "answerUnit11",
+          "component": "Column",
+          "gap": 6,
+          "visible": {
+            "path": "/ui/showAnswerUnit11"
+          },
+          "children": [
+            "answerText11",
+            "answerTable11"
+          ]
+        },
+        {
+          "id": "answerText11",
+          "component": "Markdown",
+          "content": {
+            "path": "/answer/blocks/11/text"
+          },
+          "visible": {
+            "path": "/ui/showAnswerText11"
+          }
+        },
+        {
+          "id": "answerTable11",
+          "component": "Table",
+          "data": {
+            "path": "/answer/blocks/11/table"
+          },
+          "scrollAreaWidth": 320,
+          "cellPadding": 6,
+          "maxLine": 3,
+          "zebra": true,
+          "visible": {
+            "path": "/ui/showAnswerTable11"
+          }
+        },
+        {
+          "id": "answerUnit12",
+          "component": "Column",
+          "gap": 6,
+          "visible": {
+            "path": "/ui/showAnswerUnit12"
+          },
+          "children": [
+            "answerText12",
+            "answerTable12"
+          ]
+        },
+        {
+          "id": "answerText12",
+          "component": "Markdown",
+          "content": {
+            "path": "/answer/blocks/12/text"
+          },
+          "visible": {
+            "path": "/ui/showAnswerText12"
+          }
+        },
+        {
+          "id": "answerTable12",
+          "component": "Table",
+          "data": {
+            "path": "/answer/blocks/12/table"
+          },
+          "scrollAreaWidth": 320,
+          "cellPadding": 6,
+          "maxLine": 3,
+          "zebra": true,
+          "visible": {
+            "path": "/ui/showAnswerTable12"
+          }
+        },
+        {
+          "id": "answerUnit13",
+          "component": "Column",
+          "gap": 6,
+          "visible": {
+            "path": "/ui/showAnswerUnit13"
+          },
+          "children": [
+            "answerText13",
+            "answerTable13"
+          ]
+        },
+        {
+          "id": "answerText13",
+          "component": "Markdown",
+          "content": {
+            "path": "/answer/blocks/13/text"
+          },
+          "visible": {
+            "path": "/ui/showAnswerText13"
+          }
+        },
+        {
+          "id": "answerTable13",
+          "component": "Table",
+          "data": {
+            "path": "/answer/blocks/13/table"
+          },
+          "scrollAreaWidth": 320,
+          "cellPadding": 6,
+          "maxLine": 3,
+          "zebra": true,
+          "visible": {
+            "path": "/ui/showAnswerTable13"
+          }
+        },
+        {
+          "id": "answerUnit14",
+          "component": "Column",
+          "gap": 6,
+          "visible": {
+            "path": "/ui/showAnswerUnit14"
+          },
+          "children": [
+            "answerText14",
+            "answerTable14"
+          ]
+        },
+        {
+          "id": "answerText14",
+          "component": "Markdown",
+          "content": {
+            "path": "/answer/blocks/14/text"
+          },
+          "visible": {
+            "path": "/ui/showAnswerText14"
+          }
+        },
+        {
+          "id": "answerTable14",
+          "component": "Table",
+          "data": {
+            "path": "/answer/blocks/14/table"
+          },
+          "scrollAreaWidth": 320,
+          "cellPadding": 6,
+          "maxLine": 3,
+          "zebra": true,
+          "visible": {
+            "path": "/ui/showAnswerTable14"
+          }
+        },
+        {
+          "id": "answerUnit15",
+          "component": "Column",
+          "gap": 6,
+          "visible": {
+            "path": "/ui/showAnswerUnit15"
+          },
+          "children": [
+            "answerText15",
+            "answerTable15"
+          ]
+        },
+        {
+          "id": "answerText15",
+          "component": "Markdown",
+          "content": {
+            "path": "/answer/blocks/15/text"
+          },
+          "visible": {
+            "path": "/ui/showAnswerText15"
+          }
+        },
+        {
+          "id": "answerTable15",
+          "component": "Table",
+          "data": {
+            "path": "/answer/blocks/15/table"
+          },
+          "scrollAreaWidth": 320,
+          "cellPadding": 6,
+          "maxLine": 3,
+          "zebra": true,
+          "visible": {
+            "path": "/ui/showAnswerTable15"
+          }
+        },
+        {
+          "id": "answerUnit16",
+          "component": "Column",
+          "gap": 6,
+          "visible": {
+            "path": "/ui/showAnswerUnit16"
+          },
+          "children": [
+            "answerText16",
+            "answerTable16"
+          ]
+        },
+        {
+          "id": "answerText16",
+          "component": "Markdown",
+          "content": {
+            "path": "/answer/blocks/16/text"
+          },
+          "visible": {
+            "path": "/ui/showAnswerText16"
+          }
+        },
+        {
+          "id": "answerTable16",
+          "component": "Table",
+          "data": {
+            "path": "/answer/blocks/16/table"
+          },
+          "scrollAreaWidth": 320,
+          "cellPadding": 6,
+          "maxLine": 3,
+          "zebra": true,
+          "visible": {
+            "path": "/ui/showAnswerTable16"
+          }
+        },
+        {
+          "id": "answerUnit17",
+          "component": "Column",
+          "gap": 6,
+          "visible": {
+            "path": "/ui/showAnswerUnit17"
+          },
+          "children": [
+            "answerText17",
+            "answerTable17"
+          ]
+        },
+        {
+          "id": "answerText17",
+          "component": "Markdown",
+          "content": {
+            "path": "/answer/blocks/17/text"
+          },
+          "visible": {
+            "path": "/ui/showAnswerText17"
+          }
+        },
+        {
+          "id": "answerTable17",
+          "component": "Table",
+          "data": {
+            "path": "/answer/blocks/17/table"
+          },
+          "scrollAreaWidth": 320,
+          "cellPadding": 6,
+          "maxLine": 3,
+          "zebra": true,
+          "visible": {
+            "path": "/ui/showAnswerTable17"
+          }
+        },
+        {
+          "id": "answerUnit18",
+          "component": "Column",
+          "gap": 6,
+          "visible": {
+            "path": "/ui/showAnswerUnit18"
+          },
+          "children": [
+            "answerText18",
+            "answerTable18"
+          ]
+        },
+        {
+          "id": "answerText18",
+          "component": "Markdown",
+          "content": {
+            "path": "/answer/blocks/18/text"
+          },
+          "visible": {
+            "path": "/ui/showAnswerText18"
+          }
+        },
+        {
+          "id": "answerTable18",
+          "component": "Table",
+          "data": {
+            "path": "/answer/blocks/18/table"
+          },
+          "scrollAreaWidth": 320,
+          "cellPadding": 6,
+          "maxLine": 3,
+          "zebra": true,
+          "visible": {
+            "path": "/ui/showAnswerTable18"
+          }
+        },
+        {
+          "id": "answerUnit19",
+          "component": "Column",
+          "gap": 6,
+          "visible": {
+            "path": "/ui/showAnswerUnit19"
+          },
+          "children": [
+            "answerText19",
+            "answerTable19"
+          ]
+        },
+        {
+          "id": "answerText19",
+          "component": "Markdown",
+          "content": {
+            "path": "/answer/blocks/19/text"
+          },
+          "visible": {
+            "path": "/ui/showAnswerText19"
+          }
+        },
+        {
+          "id": "answerTable19",
+          "component": "Table",
+          "data": {
+            "path": "/answer/blocks/19/table"
+          },
+          "scrollAreaWidth": 320,
+          "cellPadding": 6,
+          "maxLine": 3,
+          "zebra": true,
+          "visible": {
+            "path": "/ui/showAnswerTable19"
+          }
+        },
+        {
+          "id": "answerUnit20",
+          "component": "Column",
+          "gap": 6,
+          "visible": {
+            "path": "/ui/showAnswerUnit20"
+          },
+          "children": [
+            "answerText20",
+            "answerTable20"
+          ]
+        },
+        {
+          "id": "answerText20",
+          "component": "Markdown",
+          "content": {
+            "path": "/answer/blocks/20/text"
+          },
+          "visible": {
+            "path": "/ui/showAnswerText20"
+          }
+        },
+        {
+          "id": "answerTable20",
+          "component": "Table",
+          "data": {
+            "path": "/answer/blocks/20/table"
+          },
+          "scrollAreaWidth": 320,
+          "cellPadding": 6,
+          "maxLine": 3,
+          "zebra": true,
+          "visible": {
+            "path": "/ui/showAnswerTable20"
+          }
+        },
+        {
+          "id": "answerUnit21",
+          "component": "Column",
+          "gap": 6,
+          "visible": {
+            "path": "/ui/showAnswerUnit21"
+          },
+          "children": [
+            "answerText21",
+            "answerTable21"
+          ]
+        },
+        {
+          "id": "answerText21",
+          "component": "Markdown",
+          "content": {
+            "path": "/answer/blocks/21/text"
+          },
+          "visible": {
+            "path": "/ui/showAnswerText21"
+          }
+        },
+        {
+          "id": "answerTable21",
+          "component": "Table",
+          "data": {
+            "path": "/answer/blocks/21/table"
+          },
+          "scrollAreaWidth": 320,
+          "cellPadding": 6,
+          "maxLine": 3,
+          "zebra": true,
+          "visible": {
+            "path": "/ui/showAnswerTable21"
+          }
+        },
+        {
+          "id": "answerUnit22",
+          "component": "Column",
+          "gap": 6,
+          "visible": {
+            "path": "/ui/showAnswerUnit22"
+          },
+          "children": [
+            "answerText22",
+            "answerTable22"
+          ]
+        },
+        {
+          "id": "answerText22",
+          "component": "Markdown",
+          "content": {
+            "path": "/answer/blocks/22/text"
+          },
+          "visible": {
+            "path": "/ui/showAnswerText22"
+          }
+        },
+        {
+          "id": "answerTable22",
+          "component": "Table",
+          "data": {
+            "path": "/answer/blocks/22/table"
+          },
+          "scrollAreaWidth": 320,
+          "cellPadding": 6,
+          "maxLine": 3,
+          "zebra": true,
+          "visible": {
+            "path": "/ui/showAnswerTable22"
+          }
+        },
+        {
+          "id": "answerUnit23",
+          "component": "Column",
+          "gap": 6,
+          "visible": {
+            "path": "/ui/showAnswerUnit23"
+          },
+          "children": [
+            "answerText23",
+            "answerTable23"
+          ]
+        },
+        {
+          "id": "answerText23",
+          "component": "Markdown",
+          "content": {
+            "path": "/answer/blocks/23/text"
+          },
+          "visible": {
+            "path": "/ui/showAnswerText23"
+          }
+        },
+        {
+          "id": "answerTable23",
+          "component": "Table",
+          "data": {
+            "path": "/answer/blocks/23/table"
+          },
+          "scrollAreaWidth": 320,
+          "cellPadding": 6,
+          "maxLine": 3,
+          "zebra": true,
+          "visible": {
+            "path": "/ui/showAnswerTable23"
+          }
+        },
+        {
+          "id": "clarifyBlock",
+          "component": "Column",
+          "children": [
+            "clarifyProgress",
+            "clarifyBadge",
+            "clarifyQuestion",
+            "clarifyHint",
+            "clarifyOptions",
+            "clarifyPicker",
+            "clarifyBlanks",
+            "clarifyTextField_0_1",
+            "clarifyNav",
+            "clarifySubmit"
+          ],
+          "gap": 8,
+          "visible": {
+            "path": "/ui/showClarify"
+          }
+        },
+        {
+          "id": "clarifyProgress",
+          "component": "Text",
+          "text": {
+            "path": "/clarify/progress"
+          },
+          "variant": "caption",
+          "maxLine": 1,
+          "visible": {
+            "path": "/ui/showClarifyProgress"
+          }
+        },
+        {
+          "id": "clarifyBadge",
+          "component": "Tag",
+          "text": {
+            "path": "/clarify/badge"
+          },
+          "theme": "warning",
+          "variant": "filled",
+          "visible": {
+            "path": "/ui/showClarify"
+          }
+        },
+        {
+          "id": "clarifyQuestion",
+          "component": "Markdown",
+          "content": {
+            "path": "/clarify/displayQuestion"
+          },
+          "visible": {
+            "path": "/ui/showClarify"
+          }
+        },
+        {
+          "id": "clarifyHint",
+          "component": "Markdown",
+          "content": {
+            "path": "/clarify/hint"
+          },
+          "visible": {
+            "path": "/ui/showClarify"
+          }
+        },
+        {
+          "id": "clarifyOptions",
+          "component": "Column",
+          "children": [
+            "clarifyOptionCard0",
+            "clarifyOptionCard1",
+            "clarifyOptionCard2",
+            "clarifyOptionCard3"
+          ],
+          "gap": 8,
+          "visible": {
+            "path": "/ui/showClarifySingle"
+          }
+        },
+        {
+          "id": "clarifyPicker",
+          "component": "ChoicePicker",
+          "variant": "multipleSelection",
+          "displayStyle": "checkbox",
+          "options": [],
+          "value": {
+            "path": "/clarify/selected"
+          },
+          "visible": {
+            "path": "/ui/showClarifyMultiple"
+          }
+        },
+        {
+          "id": "clarifyBlanks",
+          "component": "Column",
+          "children": [],
+          "gap": 8,
+          "visible": {
+            "path": "/ui/showClarifyBlanks"
+          }
+        },
+        {
+          "id": "clarifyTextField_0_1",
+          "component": "TextField",
+          "variant": "shortText",
+          "label": "你的答案",
+          "placeholder": {
+            "path": "/clarify/placeholder"
+          },
+          "value": {
+            "path": "/clarify/text"
+          },
+          "visible": {
+            "path": "/ui/showClarifyText"
+          }
+        },
+        {
+          "id": "clarifyNav",
+          "component": "Row",
+          "children": [
+            "clarifyPrev",
+            "clarifyNext"
+          ],
+          "gap": 8,
+          "visible": {
+            "path": "/ui/showClarifyNav"
+          }
+        },
+        {
+          "id": "clarifyPrev",
+          "component": "Button",
+          "child": "clarifyPrevLabel",
+          "variant": "text",
+          "action": {
+            "event": {
+              "name": "eab_clarify_nav",
+              "context": {
+                "action": "clarify_nav",
+                "direction": "prev",
+                "sessionId": "",
+                "step": 1,
+                "index": 0,
+                "selected": {
+                  "path": "/clarify/selected"
+                },
+                "text": {
+                  "path": "/clarify/text"
+                },
+                "blanks": {
+                  "path": "/clarify/blanks"
+                }
+              }
+            }
+          },
+          "visible": {
+            "path": "/ui/showClarifyPrev"
+          }
+        },
+        {
+          "id": "clarifyPrevLabel",
+          "component": "Text",
+          "text": "上一题",
+          "maxLine": 1
+        },
+        {
+          "id": "clarifyNext",
+          "component": "Button",
+          "child": "clarifyNextLabel",
+          "variant": "text",
+          "action": {
+            "event": {
+              "name": "eab_clarify_nav",
+              "context": {
+                "action": "clarify_nav",
+                "direction": "next",
+                "sessionId": "",
+                "step": 1,
+                "index": 0,
+                "selected": {
+                  "path": "/clarify/selected"
+                },
+                "text": {
+                  "path": "/clarify/text"
+                },
+                "blanks": {
+                  "path": "/clarify/blanks"
+                }
+              }
+            }
+          },
+          "visible": {
+            "path": "/ui/showClarifyNext"
+          }
+        },
+        {
+          "id": "clarifyNextLabel",
+          "component": "Text",
+          "text": "下一题",
+          "maxLine": 1
+        },
+        {
+          "id": "clarifySubmit",
+          "component": "Button",
+          "child": "clarifySubmitLabel",
+          "action": {
+            "event": {
+              "name": "eab_clarify_submit",
+              "context": {
+                "action": "clarify_text",
+                "sessionId": "",
+                "step": 1,
+                "index": 0,
+                "selected": {
+                  "path": "/clarify/selected"
+                },
+                "text": {
+                  "path": "/clarify/text"
+                },
+                "blanks": {
+                  "path": "/clarify/blanks"
+                }
+              }
+            }
+          },
+          "visible": {
+            "path": "/ui/showClarifySubmit"
+          }
+        },
+        {
+          "id": "clarifySubmitLabel",
+          "component": "Text",
+          "text": "提交答案",
+          "maxLine": 1
+        },
+        {
+          "id": "clarifyOptionCard0",
+          "component": "Row",
+          "children": [
+            "clarifyOptionBody0",
+            "clarifyOptionArrow0"
+          ],
+          "gap": 8,
+          "align": "center",
+          "padding": 12,
+          "cornerRadius": 12,
+          "backgroundColor": "#141F7A4D",
+          "borderWidth": 1,
+          "borderColor": "#261F7A4D",
+          "visible": {
+            "path": "/ui/showClarifyOption0"
+          },
+          "action": {
+            "event": {
+              "name": "eab_clarify_select",
+              "context": {
+                "action": "clarify_select",
+                "sessionId": "",
+                "optionId": "",
+                "optionLabel": ""
+              }
+            }
+          }
+        },
+        {
+          "id": "clarifyOptionCard1",
+          "component": "Row",
+          "children": [
+            "clarifyOptionBody1",
+            "clarifyOptionArrow1"
+          ],
+          "gap": 8,
+          "align": "center",
+          "padding": 12,
+          "cornerRadius": 12,
+          "backgroundColor": "#0A1F7A4D",
+          "borderWidth": 1,
+          "borderColor": "#261F7A4D",
+          "visible": {
+            "path": "/ui/showClarifyOption1"
+          },
+          "action": {
+            "event": {
+              "name": "eab_clarify_select",
+              "context": {
+                "action": "clarify_select",
+                "sessionId": "",
+                "optionId": "",
+                "optionLabel": ""
+              }
+            }
+          }
+        },
+        {
+          "id": "clarifyOptionCard2",
+          "component": "Row",
+          "children": [
+            "clarifyOptionBody2",
+            "clarifyOptionArrow2"
+          ],
+          "gap": 8,
+          "align": "center",
+          "padding": 12,
+          "cornerRadius": 12,
+          "backgroundColor": "#0A1F7A4D",
+          "borderWidth": 1,
+          "borderColor": "#261F7A4D",
+          "visible": {
+            "path": "/ui/showClarifyOption2"
+          },
+          "action": {
+            "event": {
+              "name": "eab_clarify_select",
+              "context": {
+                "action": "clarify_select",
+                "sessionId": "",
+                "optionId": "",
+                "optionLabel": ""
+              }
+            }
+          }
+        },
+        {
+          "id": "clarifyOptionCard3",
+          "component": "Row",
+          "children": [
+            "clarifyOptionBody3",
+            "clarifyOptionArrow3"
+          ],
+          "gap": 8,
+          "align": "center",
+          "padding": 12,
+          "cornerRadius": 12,
+          "backgroundColor": "#0A1F7A4D",
+          "borderWidth": 1,
+          "borderColor": "#261F7A4D",
+          "visible": {
+            "path": "/ui/showClarifyOption3"
+          },
+          "action": {
+            "event": {
+              "name": "eab_clarify_select",
+              "context": {
+                "action": "clarify_select",
+                "sessionId": "",
+                "optionId": "",
+                "optionLabel": ""
+              }
+            }
+          }
+        },
+        {
+          "id": "clarifyOptionBody0",
+          "component": "Column",
+          "gap": 3,
+          "weight": 1,
+          "children": [
+            "clarifyOptionLabel0",
+            "clarifyOptionDesc0"
+          ],
+          "visible": {
+            "path": "/ui/showClarifyOption0"
+          }
+        },
+        {
+          "id": "clarifyOptionBody1",
+          "component": "Column",
+          "gap": 3,
+          "weight": 1,
+          "children": [
+            "clarifyOptionLabel1",
+            "clarifyOptionDesc1"
+          ],
+          "visible": {
+            "path": "/ui/showClarifyOption1"
+          }
+        },
+        {
+          "id": "clarifyOptionBody2",
+          "component": "Column",
+          "gap": 3,
+          "weight": 1,
+          "children": [
+            "clarifyOptionLabel2",
+            "clarifyOptionDesc2"
+          ],
+          "visible": {
+            "path": "/ui/showClarifyOption2"
+          }
+        },
+        {
+          "id": "clarifyOptionBody3",
+          "component": "Column",
+          "gap": 3,
+          "weight": 1,
+          "children": [
+            "clarifyOptionLabel3",
+            "clarifyOptionDesc3"
+          ],
+          "visible": {
+            "path": "/ui/showClarifyOption3"
+          }
+        },
+        {
+          "id": "clarifyOptionLabel0",
+          "component": "Text",
+          "text": {
+            "path": "/clarify/options/0/label"
+          },
+          "maxLine": 2
+        },
+        {
+          "id": "clarifyOptionDesc0",
+          "component": "Text",
+          "variant": "caption",
+          "text": {
+            "path": "/clarify/options/0/description"
+          },
+          "maxLine": 2,
+          "visible": {
+            "path": "/ui/showClarifyDesc0"
+          }
+        },
+        {
+          "id": "clarifyOptionArrow0",
+          "component": "Text",
+          "text": "›",
+          "maxLine": 1,
+          "visible": {
+            "path": "/ui/showClarifyOption0"
+          }
+        },
+        {
+          "id": "clarifyOptionLabel1",
+          "component": "Text",
+          "text": {
+            "path": "/clarify/options/1/label"
+          },
+          "maxLine": 2
+        },
+        {
+          "id": "clarifyOptionDesc1",
+          "component": "Text",
+          "variant": "caption",
+          "text": {
+            "path": "/clarify/options/1/description"
+          },
+          "maxLine": 2,
+          "visible": {
+            "path": "/ui/showClarifyDesc1"
+          }
+        },
+        {
+          "id": "clarifyOptionArrow1",
+          "component": "Text",
+          "text": "›",
+          "maxLine": 1,
+          "visible": {
+            "path": "/ui/showClarifyOption1"
+          }
+        },
+        {
+          "id": "clarifyOptionLabel2",
+          "component": "Text",
+          "text": {
+            "path": "/clarify/options/2/label"
+          },
+          "maxLine": 2
+        },
+        {
+          "id": "clarifyOptionDesc2",
+          "component": "Text",
+          "variant": "caption",
+          "text": {
+            "path": "/clarify/options/2/description"
+          },
+          "maxLine": 2,
+          "visible": {
+            "path": "/ui/showClarifyDesc2"
+          }
+        },
+        {
+          "id": "clarifyOptionArrow2",
+          "component": "Text",
+          "text": "›",
+          "maxLine": 1,
+          "visible": {
+            "path": "/ui/showClarifyOption2"
+          }
+        },
+        {
+          "id": "clarifyOptionLabel3",
+          "component": "Text",
+          "text": {
+            "path": "/clarify/options/3/label"
+          },
+          "maxLine": 2
+        },
+        {
+          "id": "clarifyOptionDesc3",
+          "component": "Text",
+          "variant": "caption",
+          "text": {
+            "path": "/clarify/options/3/description"
+          },
+          "maxLine": 2,
+          "visible": {
+            "path": "/ui/showClarifyDesc3"
+          }
+        },
+        {
+          "id": "clarifyOptionArrow3",
+          "component": "Text",
+          "text": "›",
+          "maxLine": 1,
+          "visible": {
+            "path": "/ui/showClarifyOption3"
+          }
+        },
+        {
+          "id": "attachmentBlock",
+          "component": "Column",
+          "children": [
+            "attachment0",
+            "attachment1",
+            "attachment2"
+          ],
+          "gap": 8,
+          "visible": {
+            "path": "/ui/showAttachments"
+          }
+        },
+        {
+          "id": "attachment0",
+          "component": "File",
+          "fileName": {
+            "path": "/attachments/0/fileName"
+          },
+          "url": {
+            "path": "/attachments/0/url"
+          },
+          "previewUrl": {
+            "path": "/attachments/0/previewUrl"
+          },
+          "size": {
+            "path": "/attachments/0/size"
+          },
+          "mimeType": {
+            "path": "/attachments/0/mimeType"
+          },
+          "description": {
+            "path": "/attachments/0/description"
+          },
+          "visible": {
+            "path": "/ui/showAttachment0"
+          },
+          "fallbackMarkdown": "文件"
+        },
+        {
+          "id": "attachment1",
+          "component": "File",
+          "fileName": {
+            "path": "/attachments/1/fileName"
+          },
+          "url": {
+            "path": "/attachments/1/url"
+          },
+          "previewUrl": {
+            "path": "/attachments/1/previewUrl"
+          },
+          "size": {
+            "path": "/attachments/1/size"
+          },
+          "mimeType": {
+            "path": "/attachments/1/mimeType"
+          },
+          "description": {
+            "path": "/attachments/1/description"
+          },
+          "visible": {
+            "path": "/ui/showAttachment1"
+          },
+          "fallbackMarkdown": "文件"
+        },
+        {
+          "id": "attachment2",
+          "component": "File",
+          "fileName": {
+            "path": "/attachments/2/fileName"
+          },
+          "url": {
+            "path": "/attachments/2/url"
+          },
+          "previewUrl": {
+            "path": "/attachments/2/previewUrl"
+          },
+          "size": {
+            "path": "/attachments/2/size"
+          },
+          "mimeType": {
+            "path": "/attachments/2/mimeType"
+          },
+          "description": {
+            "path": "/attachments/2/description"
+          },
+          "visible": {
+            "path": "/ui/showAttachment2"
+          },
+          "fallbackMarkdown": "文件"
         }
       ]
     }
@@ -130,8 +1974,8 @@
     "version": "v1.0",
     "updateDataModel": {
       "surfaceId": "eab-demo-surface",
-      "path": "/ui/showThinkingPreview",
-      "value": true
+      "path": "/thinking/header",
+      "value": "思考中 · 先确认用户身份，再查部门。 ›"
     }
   },
   {
@@ -154,24 +1998,8 @@
     "version": "v1.0",
     "updateDataModel": {
       "surfaceId": "eab-demo-surface",
-      "path": "/thinking/preview",
-      "value": ""
-    }
-  },
-  {
-    "version": "v1.0",
-    "updateDataModel": {
-      "surfaceId": "eab-demo-surface",
-      "path": "/ui/showThinkingPreview",
-      "value": false
-    }
-  },
-  {
-    "version": "v1.0",
-    "updateDataModel": {
-      "surfaceId": "eab-demo-surface",
-      "path": "/ui/showThinking",
-      "value": false
+      "path": "/tools/header",
+      "value": "工具调用中 · org.directory · 执行中 ›"
     }
   },
   {
@@ -192,27 +2020,39 @@
   },
   {
     "version": "v1.0",
+    "updateDataModel": {
+      "surfaceId": "eab-demo-surface",
+      "path": "/ui/showToolsHeader",
+      "value": true
+    }
+  },
+  {
+    "version": "v1.0",
     "updateComponents": {
       "surfaceId": "eab-demo-surface",
       "components": [
         {
-          "id": "thinkingPanel",
-          "component": "CollapsiblePanel",
-          "title": "✦ 已深度思考",
-          "variant": "reasoning",
-          "defaultExpanded": false,
-          "visible": { "path": "/ui/showThinking" },
-          "children": ["thinkingText"],
-          "fallbackMarkdown": "思考过程"
-        },
-        {
-          "id": "toolPanel",
-          "component": "CollapsiblePanel",
-          "title": "🛠️ 工具调用中…",
-          "defaultExpanded": false,
-          "visible": { "path": "/ui/showTools" },
-          "children": ["toolText"],
-          "fallbackMarkdown": "工具调用记录"
+          "id": "toolHeader",
+          "component": "Text",
+          "text": {
+            "path": "/tools/header"
+          },
+          "maxLine": 1,
+          "variant": "caption",
+          "customLightColor": "#667085",
+          "customDarkColor": "#98A2B3",
+          "textEffect": "shimmer",
+          "onLinkClick": {
+            "event": {
+              "name": "eab_panel_toggle",
+              "context": {
+                "action": "panel_toggle",
+                "panel": "tools",
+                "sessionId": "chat_demo"
+              }
+            }
+          },
+          "fallbackMarkdown": "工具"
         }
       ]
     }
@@ -221,8 +2061,187 @@
     "version": "v1.0",
     "updateDataModel": {
       "surfaceId": "eab-demo-surface",
-      "path": "/answer/text",
-      "value": "**最终回答**：当前部门共有 15 人。"
+      "path": "/answer",
+      "value": {
+        "blocks": [
+          {
+            "text": "我主要有以下几方面的能力：\n\n- 文档处理\n- 组织通讯录查询\n- 任务与日程",
+            "table": {
+              "meta": [],
+              "data": []
+            }
+          },
+          {
+            "text": "",
+            "table": {
+              "meta": [],
+              "data": []
+            }
+          },
+          {
+            "text": "",
+            "table": {
+              "meta": [],
+              "data": []
+            }
+          },
+          {
+            "text": "",
+            "table": {
+              "meta": [],
+              "data": []
+            }
+          },
+          {
+            "text": "",
+            "table": {
+              "meta": [],
+              "data": []
+            }
+          },
+          {
+            "text": "",
+            "table": {
+              "meta": [],
+              "data": []
+            }
+          },
+          {
+            "text": "",
+            "table": {
+              "meta": [],
+              "data": []
+            }
+          },
+          {
+            "text": "",
+            "table": {
+              "meta": [],
+              "data": []
+            }
+          },
+          {
+            "text": "",
+            "table": {
+              "meta": [],
+              "data": []
+            }
+          },
+          {
+            "text": "",
+            "table": {
+              "meta": [],
+              "data": []
+            }
+          },
+          {
+            "text": "",
+            "table": {
+              "meta": [],
+              "data": []
+            }
+          },
+          {
+            "text": "",
+            "table": {
+              "meta": [],
+              "data": []
+            }
+          },
+          {
+            "text": "",
+            "table": {
+              "meta": [],
+              "data": []
+            }
+          },
+          {
+            "text": "",
+            "table": {
+              "meta": [],
+              "data": []
+            }
+          },
+          {
+            "text": "",
+            "table": {
+              "meta": [],
+              "data": []
+            }
+          },
+          {
+            "text": "",
+            "table": {
+              "meta": [],
+              "data": []
+            }
+          },
+          {
+            "text": "",
+            "table": {
+              "meta": [],
+              "data": []
+            }
+          },
+          {
+            "text": "",
+            "table": {
+              "meta": [],
+              "data": []
+            }
+          },
+          {
+            "text": "",
+            "table": {
+              "meta": [],
+              "data": []
+            }
+          },
+          {
+            "text": "",
+            "table": {
+              "meta": [],
+              "data": []
+            }
+          },
+          {
+            "text": "",
+            "table": {
+              "meta": [],
+              "data": []
+            }
+          },
+          {
+            "text": "",
+            "table": {
+              "meta": [],
+              "data": []
+            }
+          },
+          {
+            "text": "",
+            "table": {
+              "meta": [],
+              "data": []
+            }
+          },
+          {
+            "text": "",
+            "table": {
+              "meta": [],
+              "data": []
+            }
+          }
+        ]
+      }
+    }
+  },
+  {
+    "version": "v1.0",
+    "updateDataModel": {
+      "surfaceId": "eab-demo-surface",
+      "path": "/thinking/header",
+      "value": "已思考 1.3s · 先确认用户身份，再查部门。 ›"
     }
   },
   {
@@ -230,7 +2249,7 @@
     "updateDataModel": {
       "surfaceId": "eab-demo-surface",
       "path": "/tools/text",
-      "value": "1. **org.directory** · 完成 · 320ms\n   参数：{\"query\":\"部门\"}\n   结果：找到 3 个部门"
+      "value": "1. **org.directory** · 320ms"
     }
   },
   {
@@ -238,22 +2257,22 @@
     "updateDataModel": {
       "surfaceId": "eab-demo-surface",
       "path": "/tools/preview",
-      "value": ""
+      "value": "org.directory · 320ms"
     }
   },
   {
     "version": "v1.0",
     "updateDataModel": {
       "surfaceId": "eab-demo-surface",
-      "path": "/ui/showToolsPreview",
-      "value": false
+      "path": "/tools/header",
+      "value": "工具 · org.directory · 320ms ›"
     }
   },
   {
     "version": "v1.0",
     "updateDataModel": {
       "surfaceId": "eab-demo-surface",
-      "path": "/ui/showThinking",
+      "path": "/ui/showAnswerText0",
       "value": true
     }
   },
@@ -261,7 +2280,7 @@
     "version": "v1.0",
     "updateDataModel": {
       "surfaceId": "eab-demo-surface",
-      "path": "/ui/showTools",
+      "path": "/ui/showAnswerUnit0",
       "value": true
     }
   },
@@ -271,23 +2290,48 @@
       "surfaceId": "eab-demo-surface",
       "components": [
         {
-          "id": "thinkingPanel",
-          "component": "CollapsiblePanel",
-          "title": "✦ 已深度思考",
-          "variant": "reasoning",
-          "defaultExpanded": false,
-          "visible": { "path": "/ui/showThinking" },
-          "children": ["thinkingText"],
-          "fallbackMarkdown": "思考过程"
+          "id": "thinkingHeader",
+          "component": "Text",
+          "text": {
+            "path": "/thinking/header"
+          },
+          "maxLine": 1,
+          "variant": "caption",
+          "customLightColor": "#667085",
+          "customDarkColor": "#98A2B3",
+          "onLinkClick": {
+            "event": {
+              "name": "eab_panel_toggle",
+              "context": {
+                "action": "panel_toggle",
+                "panel": "thinking",
+                "sessionId": "chat_demo"
+              }
+            }
+          },
+          "fallbackMarkdown": "思考"
         },
         {
-          "id": "toolPanel",
-          "component": "CollapsiblePanel",
-          "title": "🛠️ 工具调用记录",
-          "defaultExpanded": false,
-          "visible": { "path": "/ui/showTools" },
-          "children": ["toolText"],
-          "fallbackMarkdown": "工具调用记录"
+          "id": "toolHeader",
+          "component": "Text",
+          "text": {
+            "path": "/tools/header"
+          },
+          "maxLine": 1,
+          "variant": "caption",
+          "customLightColor": "#667085",
+          "customDarkColor": "#98A2B3",
+          "onLinkClick": {
+            "event": {
+              "name": "eab_panel_toggle",
+              "context": {
+                "action": "panel_toggle",
+                "panel": "tools",
+                "sessionId": "chat_demo"
+              }
+            }
+          },
+          "fallbackMarkdown": "工具"
         }
       ]
     }

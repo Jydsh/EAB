@@ -28,6 +28,8 @@ import { normalizeRelativePath, safeJoin, toSlug } from '@eab/workspace'
 import type { ServerDeps } from '../deps.js'
 import { ok, requireScope } from '../http.js'
 import { resolveActor, type RequestActor } from '../session.js'
+import { TEXT_EXTENSIONS, isTextEditableFile } from '../workspace-text.js'
+export { isTextEditableFile }
 import { sendDingTalkFileToUser } from '../dingtalk-outbound.js'
 import {
   buildOfficeEditorConfig,
@@ -1069,23 +1071,88 @@ interface PreviewCapability {
   reason?: string
 }
 
-const TEXT_EXTENSIONS = new Set([
-  '.txt', '.md', '.markdown', '.json', '.jsonl', '.csv', '.tsv', '.log', '.xml',
-  '.yaml', '.yml', '.ini', '.conf', '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
-  '.css', '.html', '.htm', '.sql', '.py', '.sh', '.ps1', '.bat', '.toml',
-])
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg', '.avif'])
-
-/** 局部编辑只允许纯文本类文件；Office 二进制仍走 OnlyOffice。 */
-export function isTextEditableFile(nameOrPath: string): boolean {
-  const ext = extname(String(nameOrPath || '')).toLowerCase()
-  return TEXT_EXTENSIONS.has(ext)
-}
 
 export interface WorkspaceTextEdit {
   find: string
   replace: string
   occurrence?: number
+}
+
+export interface WorkspaceEditDiffLine {
+  type: 'add' | 'del'
+  text: string
+}
+
+export interface WorkspaceEditDiff {
+  lines: WorkspaceEditDiffLine[]
+  added: number
+  removed: number
+  truncated: boolean
+}
+
+const EDIT_DIFF_MAX_LINES = 80
+const EDIT_DIFF_MAX_LINE_CHARS = 240
+
+function splitEditLines(value: string): string[] {
+  const text = String(value ?? '')
+  if (!text) return []
+  const lines = text.split(/\r?\n/)
+  // find/replace 常以换行结尾；最后一个空行不是内容，避免 diff 多出一条空行。
+  if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop()
+  return lines
+}
+
+/**
+ * 工具卡里的文件修改差异：只展示真正变化的行，不把整段 find/replace 原样贴出来。
+ * 不是完整行号 diff，但足以让用户看到“删了什么、加了什么”；前后未变行会被折叠。
+ */
+export function buildWorkspaceEditDiff(edits: readonly WorkspaceTextEdit[]): WorkspaceEditDiff {
+  const lines: WorkspaceEditDiffLine[] = []
+  let added = 0
+  let removed = 0
+  let truncated = false
+  for (const edit of edits) {
+    const oldLines = splitEditLines(edit.find)
+    const newLines = splitEditLines(edit.replace)
+    let prefix = 0
+    while (prefix < oldLines.length && prefix < newLines.length && oldLines[prefix] === newLines[prefix]) {
+      prefix += 1
+    }
+    let oldEnd = oldLines.length
+    let newEnd = newLines.length
+    while (oldEnd > prefix && newEnd > prefix && oldLines[oldEnd - 1] === newLines[newEnd - 1]) {
+      oldEnd -= 1
+      newEnd -= 1
+    }
+    const removedLines = oldLines.slice(prefix, oldEnd)
+    const addedLines = newLines.slice(prefix, newEnd)
+    removed += removedLines.length
+    added += addedLines.length
+    for (const text of removedLines) {
+      if (lines.length >= EDIT_DIFF_MAX_LINES) {
+        truncated = true
+        break
+      }
+      const display = text.length > EDIT_DIFF_MAX_LINE_CHARS
+        ? `${text.slice(0, EDIT_DIFF_MAX_LINE_CHARS)}…`
+        : text
+      if (display !== text) truncated = true
+      lines.push({ type: 'del', text: display })
+    }
+    for (const text of addedLines) {
+      if (lines.length >= EDIT_DIFF_MAX_LINES) {
+        truncated = true
+        break
+      }
+      const display = text.length > EDIT_DIFF_MAX_LINE_CHARS
+        ? `${text.slice(0, EDIT_DIFF_MAX_LINE_CHARS)}…`
+        : text
+      if (display !== text) truncated = true
+      lines.push({ type: 'add', text: display })
+    }
+  }
+  return { lines, added, removed, truncated }
 }
 
 /**

@@ -3,7 +3,8 @@
  *
  * 边界：
  * - 只服务单公司部署；多公司时不替用户做跨租户选择；
- * - 环境变量仍然优先，显式配置永远覆盖数据连接；
+ * - 数据连接是平台后端的实际来源：表里没有启用连接时，不连接、不探测 Redis/PG；
+ *   环境变量只有在显式 EAB_BACKENDS_FROM_ENV=1 时才作为兼容回退；
  * - 密码不落新文件，按 `secret_ref` 从现有 secrets.json 解析；
  * - 状态只回显连接名与能力，不回显连接串。
  */
@@ -117,5 +118,12 @@ export function resolveAutoBackends(db: Db, dbPath: string): AutoBackendSelectio
       }
     }
   }
-  return { postgres, redis }
+  return {
+    postgres,
+    redis,
+    reason:
+      rows.length === 0
+        ? '“数据连接”中没有启用的 Redis / PostgreSQL 连接'
+        : undefined,
+  }
 }

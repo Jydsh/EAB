@@ -271,7 +271,29 @@ export class PostgresChatMirror {
         LIMIT $3`,
       [query.companyId, query.userId, query.limit],
     )
-    return rows.rows as Record<string, unknown>[]
+    const sessions = rows.rows as Record<string, unknown>[]
+    const ids = sessions
+      .map((row) => String(row.id ?? '').trim())
+      .filter((id) => Boolean(id))
+    if (ids.length === 0) return sessions
+
+    /**
+     * PG 镜像可能落后于 SQLite（例如删除后镜像还没收到更新，或 outbox 已经清空
+     * 但镜像里仍留着已不存在的会话）。会话写权威始终是 SQLite，列表返回前按
+     * SQLite 的未删除记录再核对一次，避免前端出现点开就 404 的“幽灵会话”。
+     */
+    const existing = new Set(
+      (
+        this.db
+          .prepare(
+            `SELECT id FROM chat_sessions
+              WHERE company_id = ? AND user_id = ? AND deleted_at IS NULL
+                AND id IN (${ids.map(() => '?').join(', ')})`,
+          )
+          .all(query.companyId, query.userId, ...ids) as Array<{ id: string }>
+      ).map((row) => String(row.id)),
+    )
+    return sessions.filter((row) => existing.has(String(row.id ?? '')))
   }
 
   status(): BackendStatus {

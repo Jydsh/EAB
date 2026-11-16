@@ -54,7 +54,21 @@ export interface ChatLiveToolEvent {
   tool: ChatLiveToolEventPayload
 }
 
-export type ChatLiveEventPayload = ChatLiveEvent | ChatLiveDeltaEvent | ChatLiveToolEvent | ChatModelsChangedEvent
+/** 后台子 Agent 的进度事件：父回合可能已经结束，仍要让已打开页面的团队面板持续更新。 */
+export interface ChatLiveSubAgentEvent {
+  type: 'subagent'
+  companyId: string
+  userId: string
+  sessionId: string
+  data: unknown
+}
+
+export type ChatLiveEventPayload =
+  | ChatLiveEvent
+  | ChatLiveDeltaEvent
+  | ChatLiveToolEvent
+  | ChatLiveSubAgentEvent
+  | ChatModelsChangedEvent
 
 /** 管理后台模型目录发生变化：通知同一公司已打开的网页重新拉取目录。 */
 export interface ChatModelsChangedEvent {
@@ -66,6 +80,33 @@ export interface ChatModelsChangedEvent {
 type ChatEventListener = (event: ChatLiveEventPayload) => void
 
 const listeners = new Set<ChatEventListener>()
+
+/**
+ * 当前有网页 SSE 在线的员工。后台任务完成时用它决定是只写网页，
+ * 还是同时走钉钉主动推送。多个标签页用计数，关闭一个不会误判离线。
+ */
+const onlineCounts = new Map<string, number>()
+
+function presenceKey(companyId: string, userId: string): string {
+  return `${companyId}\u0000${userId}`
+}
+
+export function registerChatPresence(companyId: string, userId: string): () => void {
+  const key = presenceKey(companyId, userId)
+  onlineCounts.set(key, (onlineCounts.get(key) ?? 0) + 1)
+  let released = false
+  return () => {
+    if (released) return
+    released = true
+    const next = (onlineCounts.get(key) ?? 1) - 1
+    if (next > 0) onlineCounts.set(key, next)
+    else onlineCounts.delete(key)
+  }
+}
+
+export function isChatUserOnline(companyId: string, userId: string): boolean {
+  return (onlineCounts.get(presenceKey(companyId, userId)) ?? 0) > 0
+}
 
 /** 跨实例广播通道；没有 Redis 时保持 null，行为与升级前一致。 */
 let bridge: PubSubBackend | null = null
@@ -103,6 +144,7 @@ export function initChatEventBridge(pubsub: PubSubBackend | null): void {
           (event.type === 'message' ||
             event.type === 'delta' ||
             event.type === 'tool' ||
+            event.type === 'subagent' ||
             event.type === 'models')
         ) {
           deliverLocal(event)

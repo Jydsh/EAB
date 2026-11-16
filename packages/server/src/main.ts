@@ -12,7 +12,7 @@ import type { FastifyInstance } from 'fastify'
 import { migrate } from '@eab/storage'
 import { EC, EabError } from '@eab/domain'
 import { buildApp } from './app.js'
-import { recoverInterruptedDingTalkTurns, refreshDingTalkStream, startDingTalkStreamMonitor, stopDingTalkStream } from './dingtalk-bot.js'
+import { recoverInterruptedDingTalkTurns, refreshDingTalkStream, releaseDingTalkStreamLeadership, startDingTalkStreamMonitor, stopDingTalkStream } from './dingtalk-bot.js'
 import { startPermissionApprovalCardRetry } from './permission-approval-dingtalk.js'
 import { refreshFeishuStream, startFeishuStreamMonitor, stopFeishuStream } from './feishu-bot.js'
 import { cleanupTemp } from './routes/workspace.js'
@@ -453,6 +453,21 @@ await Promise.all([
 ])
 console.log('[eab:boot] 监听完成')
 
+/**
+ * 渠道长连接必须在插件宿主加载之前启动。
+ * DSH 插件缺少依赖时会在 reloadPluginHosts 里做在线安装，可能卡住几十秒甚至几分钟；
+ * 如果 Stream 排在其后，这段时间钉钉/飞书完全收不到消息，用户看到的就是“发消息没反应”。
+ * 消息处理用到的插件工具可以随后由 plugin watcher 补上，断线巡检也会自动重建连接。
+ */
+void refreshDingTalkStream(deps).catch((error) => {
+  console.warn('[eab] 钉钉 Stream 启动失败：', (error as Error).message)
+})
+const stopDingTalkStreamMonitor = startDingTalkStreamMonitor(deps, 10_000)
+void refreshFeishuStream(deps).catch((error) => {
+  console.warn('[eab] 飞书长连接启动失败：', (error as Error).message)
+})
+const stopFeishuStreamMonitor = startFeishuStreamMonitor(deps)
+
 /** 插件模型只有在真实回复探测通过后才进入模型目录。 */
 setPluginModelVisibilityResolver((companyId, modelId) => isModelHealthy(companyId, modelId))
 const pluginProbeTimers = new Map<string, ReturnType<typeof setTimeout>>()
@@ -554,15 +569,8 @@ if (config.devAuth) {
 console.log('')
 
 /**
- * 钉钉机器人入站：本地部署没有公网域名时，钉钉回调打不进来，
- * 所以默认走 Stream 长连接由 EAB 主动连钉钉网关；配了公网回调也能同时走 HTTP。
+ * 审批卡失败/半发送状态低频补偿；只补当前 active 步骤，不重复打扰已处理节点。
  */
-void refreshDingTalkStream(deps).catch((error) => {
-  console.warn('[eab] 钉钉 Stream 启动失败：', (error as Error).message)
-})
-/** 每 30 秒巡检一次：密钥缺失、网关断开、客户端卡死都要在控制台可见并自动重建。 */
-const stopDingTalkStreamMonitor = startDingTalkStreamMonitor(deps)
-/** 审批卡失败/半发送状态低频补偿；只补当前 active 步骤，不重复打扰已处理节点。 */
 const stopPermissionApprovalCardRetry = startPermissionApprovalCardRetry(deps)
 
 /**
@@ -578,15 +586,6 @@ const recoverTimer = setTimeout(() => {
 }, 10_000)
 recoverTimer.unref?.()
 
-/**
- * 飞书同理：本地没有公网回调，默认用长连接接收 im.message.receive_v1；
- * 飞书渠道独立巡检，不能因为钉钉正常就跳过飞书。
- */
-void refreshFeishuStream(deps).catch((error) => {
-  console.warn('[eab] 飞书长连接启动失败：', (error as Error).message)
-})
-const stopFeishuStreamMonitor = startFeishuStreamMonitor(deps)
-
 async function shutdown(): Promise<void> {
   stopScheduleWorker()
   stopJobWorker()
@@ -596,6 +595,8 @@ async function shutdown(): Promise<void> {
   stopDingTalkStreamMonitor()
   stopPermissionApprovalCardRetry()
   stopDingTalkStream()
+  // 只断连接不释放租约会让下一次启动等 90 秒；必须在退出时显式释放。
+  releaseDingTalkStreamLeadership()
   stopFeishuStreamMonitor()
   stopFeishuStream()
   await closeApps(apps)

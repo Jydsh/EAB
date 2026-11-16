@@ -309,6 +309,7 @@ export function actorFor(db: Db, person: PersonRow): RequestActor {
   // PERM-05：显式 allow/deny 覆盖，过期自动失效；表不存在时按无覆盖处理（老库兼容）
   let allow: string[] = []
   let deny: string[] = []
+  let grantedScopes: string[] = []
   try {
     const overrides = db
       .prepare(
@@ -323,6 +324,20 @@ export function actorFor(db: Db, person: PersonRow): RequestActor {
     allow = []
     deny = []
   }
+  // 权限点申请通过后的临时授权：与角色权限、显式 allow 一起进入 Subject，
+  // 读侧按 expires_at 过滤，到期后无需后台任务即可自动失效。
+  try {
+    const rows = db
+      .prepare(
+        `SELECT scope FROM permission_scope_grants
+          WHERE user_id = ? AND revoked_at IS NULL
+            AND (expires_at IS NULL OR expires_at > ?)`,
+      )
+      .all(person.id, Date.now()) as unknown as Array<{ scope: string }>
+    grantedScopes = rows.map((row) => row.scope)
+  } catch {
+    grantedScopes = []
+  }
 
   const roleCodes = roleCodesOf(db, person.id)
   const roleLookup = roleLookupOf(db, person.companyId)
@@ -334,7 +349,9 @@ export function actorFor(db: Db, person: PersonRow): RequestActor {
     // 从渠道同步进来的成员还没有分配角色；按“普通员工”兜底，避免整站无权限
     roles: roleCodes.length > 0 ? roleCodes : ['member'],
     channelType: 'web',
-    extraScopes: allow.length > 0 ? (allow as Scope[]) : undefined,
+    extraScopes: allow.length > 0 || grantedScopes.length > 0
+      ? ([...allow, ...grantedScopes] as Scope[])
+      : undefined,
     deniedScopes: deny.length > 0 ? (deny as Scope[]) : undefined,
     roleLookup,
   })

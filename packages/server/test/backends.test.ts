@@ -372,8 +372,33 @@ describe('可选后端插件', () => {
     db.close()
   })
 
-  it('EAB_CHAT_READ=postgres 时优先读 PG，镜像未追平则回退 SQLite', async () => {
+  it('PG 镜像里残留的已删除/不存在会话不会出现在列表', async () => {
     const { migrate, openDatabase } = await import('@eab/storage')
+    const db = openDatabase({ path: ':memory:' })
+    migrate(db)
+    db.exec('PRAGMA foreign_keys = OFF')
+    db.prepare(
+      `INSERT INTO chat_sessions (id, company_id, user_id, title, created_at, updated_at, last_message_at, deleted_at)
+       VALUES ('s_live', 'c1', 'u1', '正常会话', 1000, 1000, 1000, NULL),
+              ('s_deleted', 'c1', 'u1', '已删除会话', 1000, 1000, 1000, 2000)`,
+    ).run()
+
+    const pg = {
+      query: async () => ({
+        rows: [
+          { id: 's_live', title: 'PG 正常会话', source: 'web', created_at: '1000', updated_at: '1000' },
+          { id: 's_deleted', title: 'PG 已删除会话', source: 'web', created_at: '1000', updated_at: '1000' },
+          { id: 's_missing', title: 'PG 幽灵会话', source: 'web', created_at: '1000', updated_at: '1000' },
+        ],
+      }),
+    }
+    const mirror = new PostgresChatMirror(db, pg, { flushIntervalMs: 10_000 })
+    const rows = await mirror.listSessions({ companyId: 'c1', userId: 'u1', limit: 50 })
+    expect(rows.map((row) => row.id)).toEqual(['s_live'])
+    db.close()
+  })
+
+  it('EAB_CHAT_READ=postgres 时优先读 PG，镜像未追平则回退 SQLite', async () => {    const { migrate, openDatabase } = await import('@eab/storage')
     const db = openDatabase({ path: ':memory:' })
     migrate(db)
     db.exec('PRAGMA foreign_keys = OFF')

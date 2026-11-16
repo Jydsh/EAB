@@ -11,6 +11,7 @@
  * 约束：这里只做「加速与协调」，不做账本。配额、审计、消息正文的权威值仍在 SQLite。
  */
 import { randomUUID } from 'node:crypto'
+import { hostname } from 'node:os'
 import { MemoryCache, type CacheBackend } from './cache.js'
 import { getBackendRuntime } from './runtime.js'
 import type { BackendStatus } from './types.js'
@@ -388,11 +389,117 @@ export async function runAsLeader<T = void>(
  * 续租失败（key 已过期被别的实例抢走、或 Redis 抖动）时 `isHeld()` 变为 false，
  * 调用方应在下一轮巡检里主动断开自己的连接，避免两个实例同时收消息。
  */
+export interface LeaderOwner {
+  readonly instanceId: string
+  readonly host: string
+  readonly pid: number
+  readonly startedAt: number
+  /** 旧版本只写随机 token，没有实例信息；只展示，不做同机接管判断。 */
+  readonly legacy?: boolean
+}
+
 export interface LeaderHold {
   /** 是否共享层（false 表示单实例，恒为 true） */
   readonly shared: boolean
+  /** 当前租约的持有者；待命时可用于展示「被谁持有」。 */
+  readonly owner: LeaderOwner
   isHeld(): boolean
   release(): void
+}
+
+interface LeaderLease {
+  readonly v: 1
+  readonly token: string
+  readonly owner: LeaderOwner
+}
+
+const PROCESS_HOST = hostname()
+const PROCESS_STARTED_AT = Date.now() - Math.floor(process.uptime() * 1000)
+const PROCESS_INSTANCE_ID = (process.env.EAB_INSTANCE_ID ?? '').trim() || `${PROCESS_HOST}:${process.pid}`
+
+function currentLeaderOwner(): LeaderOwner {
+  return {
+    instanceId: PROCESS_INSTANCE_ID,
+    host: PROCESS_HOST,
+    pid: process.pid,
+    startedAt: PROCESS_STARTED_AT,
+  }
+}
+
+function parseLeaderLease(raw: unknown): LeaderLease | null {
+  if (typeof raw !== 'string' || raw.length === 0) return null
+  try {
+    const parsed = JSON.parse(raw) as Partial<LeaderLease>
+    if (!parsed || parsed.v !== 1 || typeof parsed.token !== 'string') return null
+    const owner = parsed.owner as Partial<LeaderOwner> | undefined
+    if (!owner || typeof owner.host !== 'string' || typeof owner.pid !== 'number') return null
+    return {
+      v: 1,
+      token: parsed.token,
+      owner: {
+        instanceId: typeof owner.instanceId === 'string' ? owner.instanceId : '',
+        host: owner.host,
+        pid: owner.pid,
+        startedAt: typeof owner.startedAt === 'number' ? owner.startedAt : 0,
+      },
+    }
+  } catch {
+    return null
+  }
+}
+
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    // EPERM 说明进程存在但当前用户无权发信号；ESRCH 才是已经退出。
+    return (error as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
+/**
+ * 只接管「同一台机器上、写锁的进程已经退出」的租约。
+ *
+ * 旧版本/其他主机持有、或同机进程仍存活时一律不接管，避免把正常实例踢掉。
+ * 删除前用 compareAndTouch 比对完整值，防止读到旧值后又误删别人刚抢到的锁。
+ */
+async function takeOverSameHostDeadLeader(cache: CacheBackend, cacheKey: string): Promise<boolean> {
+  try {
+    const raw = await cache.get<string>(cacheKey)
+    const lease = parseLeaderLease(raw)
+    if (!lease) return false
+    if (lease.owner.host !== PROCESS_HOST) return false
+    // 自己进程内的重复调用不当作死锁；正常流程也不会走到这里。
+    if (lease.owner.pid === process.pid) return false
+    if (isProcessAlive(lease.owner.pid)) return false
+    const cleared = await cache.compareAndTouch(cacheKey, raw, 0)
+    if (cleared) {
+      console.warn(
+        `[eab] 接管同机已退出实例的领导权：${lease.owner.instanceId || `${lease.owner.host}:${lease.owner.pid}`}`,
+      )
+    }
+    return cleared
+  } catch {
+    return false
+  }
+}
+
+/** 控制台展示用：读取当前领导权持有者；旧版本租约只返回 legacy 标记。 */
+export async function readLeaderOwner(key: string): Promise<LeaderOwner | null> {
+  if (!coordinationStatus().shared) return currentLeaderOwner()
+  try {
+    const raw = await activeCache().cache.get<string>(`leader:${key}`)
+    const lease = parseLeaderLease(raw)
+    if (lease) return lease.owner
+    if (typeof raw === 'string' && raw.length > 0) {
+      return { instanceId: 'legacy', host: '', pid: 0, startedAt: 0, legacy: true }
+    }
+    return null
+  } catch {
+    return null
+  }
 }
 
 export async function acquireLeaderHold(
@@ -405,8 +512,10 @@ export async function acquireLeaderHold(
   if (!coordinationStatus().shared) {
     // 单实例部署：与升级前一致，直接认为自己是唯一持有者
     let held = true
+    const owner = currentLeaderOwner()
     return {
       shared: false,
+      owner,
       isHeld: () => held,
       release: () => {
         held = false
@@ -414,26 +523,32 @@ export async function acquireLeaderHold(
     }
   }
 
+  const cache = activeCache()
   const cacheKey = `leader:${key}`
   const token = randomUUID()
+  const owner = currentLeaderOwner()
+  // 写入完整持有者信息：新实例可在同机旧进程退出后立即接管，
+  // 旧版本只写 token，新版本会把它当作「未知持有者」，等 TTL 或显式释放。
+  const serialized = JSON.stringify({ v: 1, token, owner } satisfies LeaderLease)
   const ttlSec = Math.ceil(ttlMs / 1000)
   const deadline = Date.now() + waitMs
   while (true) {
     let acquired = false
     try {
-      acquired = await activeCache().cache.setIfAbsent(cacheKey, token, ttlSec)
+      acquired = await cache.cache.setIfAbsent(cacheKey, serialized, ttlSec)
     } catch {
       return null
     }
     if (acquired) break
+    if (await takeOverSameHostDeadLeader(cache.cache, cacheKey)) continue
     if (Date.now() >= deadline) return null
     await delay(250)
   }
 
   let held = true
   const renewTimer = setInterval(() => {
-    void activeCache()
-      .cache.compareAndTouch(cacheKey, token, ttlSec)
+    void cache.cache
+      .compareAndTouch(cacheKey, serialized, ttlSec)
       .then((hit) => {
         if (!hit && held) {
           held = false
@@ -448,12 +563,13 @@ export async function acquireLeaderHold(
 
   return {
     shared: true,
+    owner,
     isHeld: () => held,
     release: () => {
       if (!held) return
       held = false
       clearInterval(renewTimer)
-      void activeCache().cache.compareAndTouch(cacheKey, token, 0).catch(() => undefined)
+      void cache.cache.compareAndTouch(cacheKey, serialized, 0).catch(() => undefined)
     },
   }
 }

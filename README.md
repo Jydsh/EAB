@@ -4,7 +4,8 @@ EAB 是一套面向**单公司本地部署**的企业智能体基座：一个进
 
 - 员工入口：`http://127.0.0.1:8787/chat`
 - 管理控制台：`http://127.0.0.1:8788/admin`
-- 当前版本：`2026.11.16`
+- 当前版本：`2026.11.17`
+- 本版发布说明：[`docs/releases/v2026.11.17.md`](docs/releases/v2026.11.17.md)
 
 > 单公司边界：一个实例只服务一家公司。钉钉、飞书、企业微信、模型供应商、知识库、插件都在控制台里配置。
 
@@ -190,24 +191,26 @@ EAB_HOST=0.0.0.0 EAB_PORT=8787 EAB_ADMIN_PORT=8788 EAB_CONSOLE_ALLOW_REMOTE=1 ea
 
 ### 可选 PostgreSQL / Redis（不接也能用）
 
-EAB 默认是 **SQLite + 进程内缓存**，不安装 PostgreSQL / Redis 也能完整启动。需要时可按任意组合接入：
+EAB 默认是 **SQLite + 进程内缓存**，不安装 PostgreSQL / Redis 也能完整启动。需要时优先在控制台「平台与运维 → 数据连接」里新增连接：
 
 | 组合 | 配置 | 效果 |
 |---|---|---|
-| 默认 | 不配任何变量 | SQLite 主库 + 内存缓存 |
-| 只接 Redis | `EAB_CACHE=redis` + `EAB_REDIS_URL` | Redis 优先缓存，故障自动回退内存 |
-| 只接 PostgreSQL | `EAB_POSTGRES=mirror` + `EAB_POSTGRES_URL` | SQLite 主库 + 审计镜像 + 会话镜像 |
-| 审计读走 PG | 再加 `EAB_AUDIT_READ=postgres` | 审计列表/导出读镜像，失败回退 SQLite |
-| 会话列表走 PG | 再加 `EAB_CHAT_READ=postgres` | 会话列表读镜像；未追平/失败回退 SQLite |
-| 两者都接 | 同时配置 | 缓存共享 + 审计/会话镜像 |
+| 推荐：控制台接入 | 数据连接新增 Redis / PostgreSQL | 保存即热接入；连接表为空时只用 SQLite + 内存 |
+| 默认 | 数据连接为空，不配外部服务 | SQLite 主库 + 内存缓存 |
+| 审计读走 PG | 数据连接有 PG，再加 `EAB_AUDIT_READ=postgres` | 审计列表/导出读镜像，失败回退 SQLite |
+| 会话列表走 PG | 数据连接有 PG，再加 `EAB_CHAT_READ=postgres` | 会话列表读镜像；未追平/失败回退 SQLite |
+| 老部署环境变量兼容 | `EAB_BACKENDS_FROM_ENV=1` + `EAB_REDIS_URL` / `EAB_POSTGRES_URL` | 仅在没有对应数据连接时回退到环境变量 |
 
 ```powershell
+# 推荐：打开 http://127.0.0.1:8788/admin → 平台与运维 → 数据连接 → 新增连接
+# 老部署需要沿用环境变量时，显式开启兼容开关：
+$env:EAB_BACKENDS_FROM_ENV = "1"
 $env:EAB_REDIS_URL = "redis://127.0.0.1:6379/0"
 $env:EAB_POSTGRES_URL = "postgres://eab:密码@127.0.0.1:5432/eab"
 eab start
 ```
 
-外部服务连不上时默认降级继续启动；只有 `EAB_BACKENDS_STRICT=1` 才启动失败。**PostgreSQL 当前承接审计镜像和会话镜像，不替换 SQLite 主库**；审计列表/导出可通过 `EAB_AUDIT_READ` 切到 PG，会话列表可通过 `EAB_CHAT_READ` 切到 PG，镜像未追平或失败会自动回退 SQLite。首次接入 PG 时会自动把 SQLite 已有审计回填到镜像，不会出现“切过去是 0 条”。两条路径切换只需改环境变量并重启服务，不需要改代码或迁移数据。哈希链校验始终读 SQLite 权威链。Redis 当前用于钉钉 accessToken 共享缓存。完整矩阵、写入模型和排障见 [`docs/EAB可选后端插件与部署.md`](docs/EAB可选后端插件与部署.md)。
+数据连接是平台后端的实际读取来源：表中没有启用的 Redis/PG 时，不会因为环境变量里还留着旧连接串就去探测。保存、测试、删除连接后会自动热重连，不需要重启服务。外部服务连不上时默认降级继续启动；只有 `EAB_BACKENDS_STRICT=1` 才启动失败。**PostgreSQL 当前承接审计镜像和会话镜像，不替换 SQLite 主库**；审计列表/导出可通过 `EAB_AUDIT_READ` 切到 PG，会话列表可通过 `EAB_CHAT_READ` 切到 PG，镜像未追平或失败会自动回退 SQLite。首次接入 PG 时会自动把 SQLite 已有审计回填到镜像，不会出现“切过去是 0 条”。哈希链校验始终读 SQLite 权威链。Redis 当前用于钉钉 accessToken 共享缓存。完整矩阵、写入模型和排障见 [`docs/EAB可选后端插件与部署.md`](docs/EAB可选后端插件与部署.md)。
 
 ---
 
@@ -215,8 +218,8 @@ eab start
 
 EAB 的版本来自 GitHub Release：
 
-- Release tag：`v2026.11.16`
-- Release 资产：源码 zip（`EAB-2026.11.16.zip`）。桌面安装包、`latest.yml`、`.blockmap` 已停止发布。
+- Release tag：`v2026.11.17`
+- Release 资产：源码 zip（`EAB-2026.11.17.zip`）。桌面安装包、`latest.yml`、`.blockmap` 已停止发布。
 
 ### 两种更新方式
 
@@ -280,7 +283,7 @@ pnpm dev                  # 等价于 eab start
 
 1. 改根 `package.json` 的 `version`；
 2. 更新 `README.md` 版本与源码包名；
-3. 提交并打 tag：`git tag v2026.11.16 && git push origin v2026.11.16`；
+3. 提交并打 tag：`git tag v2026.11.17 && git push origin v2026.11.17`；
 4. GitHub Actions 只构建源码 zip 并创建/更新 Release，不再生成桌面安装包；
 5. 控制台/CLI 的版本检查读取该 Release。
 

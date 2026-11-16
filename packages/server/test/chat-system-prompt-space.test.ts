@@ -84,6 +84,39 @@ describe('对话系统提示的文件空间边界', () => {
   })
 })
 
+describe('对话系统提示的长附件批次', () => {
+  it('附件超过 12k 已落批次时，要求涉及全文先调用 batch_analyze', () => {
+    const text = buildSystemPrompt({
+      actor,
+      chatTools: cloudTools,
+      memories: [],
+      hits: [],
+      hasAttachments: true,
+      hasBatchAttachments: true,
+      spaceKind: 'cloud',
+      spaceLabel: '云空间',
+    })
+    expect(text).toContain('消息里只放了前 12k 字符')
+    expect(text).toContain('完整正文已经保存为文本批次')
+    expect(text).toContain('先调用 batch_analyze')
+    expect(text).toContain('不要只根据前 12k 下结论')
+  })
+
+  it('普通附件仍按已附正文回答，不误报批次', () => {
+    const text = buildSystemPrompt({
+      actor,
+      chatTools: cloudTools,
+      memories: [],
+      hits: [],
+      hasAttachments: true,
+      spaceKind: 'cloud',
+      spaceLabel: '云空间',
+    })
+    expect(text).toContain('文本附件的正文已经附在用户消息里')
+    expect(text).not.toContain('先调用 batch_analyze')
+  })
+})
+
 describe('对话系统提示的成员可用模型清单', () => {
   it('只注入已按权限过滤的模型，并标出当前使用', () => {
     const text = buildSystemPrompt({

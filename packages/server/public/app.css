@@ -5490,6 +5490,12 @@ table.data tr.clickable { cursor: pointer; }
 .plugin-version-label { display: block; font-size: 11px; color: var(--muted); letter-spacing: .04em; }
 .plugin-version-current strong { font-size: 20px; color: #173b36; }
 .plugin-note { margin-top: 12px; padding: 9px 11px; background: #f7faf9; border: 1px solid #edf2f0; border-radius: 8px; color: #60716d; font-size: 12px; }
+.my-skill-doc {
+  margin: 0; padding: 12px 13px; border: 1px solid #e8eeec; border-radius: 9px; background: #fcfefd;
+  color: #33413d; font: 12px/1.65 ui-monospace, SFMono-Regular, Consolas, monospace;
+  max-height: 420px; overflow: auto; white-space: pre-wrap; word-break: break-word;
+}
+.my-skill-doc-count { font-size: 11px; font-weight: 400; margin-left: 6px; }
 .plugin-permission-note { border-color: #f1e4cc; background: #fdf8ee; color: #8a641f; }
 
 .plugin-setting-row {

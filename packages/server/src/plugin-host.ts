@@ -14,11 +14,11 @@
  * - `ctx.inject(['tools'])` 支持注册，但工具只在插件对该员工安装且启用时进入对话；
  * - host 注册的 HTTP 路由只能通过控制台鉴权的桥接接口访问，不直接挂到公网路径上。
  */
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync } from 'node:fs'
-import { randomUUID } from 'node:crypto'
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, type Dirent } from 'node:fs'
+import { createHash, randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { createRequire } from 'node:module'
-import { dirname, join } from 'node:path'
+import { dirname, join, relative } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { Readable, Writable } from 'node:stream'
 import { finished } from 'node:stream/promises'
@@ -156,6 +156,36 @@ const RESERVED_HOST_PATHS = [
 const instances = new Map<string, HostInstance>()
 let loadedDb: Db | null = null
 let loadedOptions: DshImOptions | null = null
+/** 每次 host 启动都换一个 import token：配置变化但入口文件 mtime 未变时也要重新求值模块。 */
+let hostImportSequence = 0
+/**
+ * DSH_HOME / DSH_PROFILE 是进程级变量，多个实例的模块求值不能交错。
+ * 这里只有一个进程级队列：拿到排队尾后独占这两个变量，宿主启动完成立即还原并放行。
+ */
+let pluginHostEnvQueue: Promise<void> = Promise.resolve()
+
+async function beginPluginHostEnv(dataRoot: string): Promise<() => void> {
+  const previous = pluginHostEnvQueue
+  let releaseQueue!: () => void
+  pluginHostEnvQueue = new Promise<void>((resolve) => {
+    releaseQueue = resolve
+  })
+  await previous
+  const envHome = process.env.DSH_HOME
+  const envProfile = process.env.DSH_PROFILE
+  process.env.DSH_HOME = dataRoot
+  process.env.DSH_PROFILE = 'web'
+  let released = false
+  return () => {
+    if (released) return
+    released = true
+    if (envHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = envHome
+    if (envProfile === undefined) delete process.env.DSH_PROFILE
+    else process.env.DSH_PROFILE = envProfile
+    releaseQueue()
+  }
+}
 
 // 模型查询时按真实安装/启停状态兜底过滤；host 尚未初始化时一律不可见。
 setPluginModelActiveResolver((companyId, pluginId) =>
@@ -2300,16 +2330,15 @@ async function startHostInstance(
     return
   }
   const dataRoot = instance.dataRoot
-  const envHome = process.env.DSH_HOME
-  const envProfile = process.env.DSH_PROFILE
-  // DSH_HOME 是进程级变量；在 import/apply 期间临时指向本实例目录。
-  // 个人实例因此不会读到公司实例的 config.json / secret.key。
-  process.env.DSH_HOME = dataRoot
-  process.env.DSH_PROFILE = 'web'
+  // DSH_HOME 是进程级变量，而公司实例和个人实例会并发启动。模块求值和 apply 期间
+  // 必须独占这个变量，否则后一个实例会把前一个实例的插件带到别人的数据目录里
+  // （例如公司插件读到个人配置，或反过来泄漏 secret.key）。启动完成即还原并放行。
+  const releaseEnv = await beginPluginHostEnv(dataRoot)
   try {
-    // 带 mtime + 实例 scope 的 query：同一物理包被公司/个人安装时各求值一份，
-    // 模块级读取 DSH_HOME 的插件也不会共享第一次导入时捕获的路径。
-    const url = `${pathToFileURL(full).href}?v=${statSync(full).mtimeMs}&scope=${encodeURIComponent(pluginScopeKey(instance.scope))}`
+    // 带 mtime + 实例 scope + 全局 reload token 的 query：同一物理包被公司/个人安装时各求值一份，
+    // 模块级读取 DSH_HOME 的插件也不会共享第一次导入时捕获的路径；仅配置变化触发的
+    // 重载即使 host 文件 mtime 没变，也要拿到一个全新的模块实例。
+    const url = `${pathToFileURL(full).href}?v=${statSync(full).mtimeMs}&scope=${encodeURIComponent(pluginScopeKey(instance.scope))}&reload=${++hostImportSequence}`
     const mod = (await import(url)) as Record<string, unknown>
     const plugin = normalizePluginModule(mod)
     if (!plugin) {
@@ -2348,10 +2377,7 @@ async function startHostInstance(
     clearPluginContributions(instance.instanceKey)
     makeLogger(instance).error(`插件 host 启动失败：${instance.error}`)
   } finally {
-    if (envHome === undefined) delete process.env.DSH_HOME
-    else process.env.DSH_HOME = envHome
-    if (envProfile === undefined) delete process.env.DSH_PROFILE
-    else process.env.DSH_PROFILE = envProfile
+    releaseEnv()
   }
 }
 
@@ -2421,34 +2447,102 @@ function withHostEntry(plugin: NormalizedPlugin, record: PluginRecord): Normaliz
   }
 }
 
-function disposeAll(): void {
-  for (const instance of instances.values()) {
-    // 先同步摘掉模型，避免 root fiber 异步 dispose 期间列表仍读到已停用插件的模型。
-    pluginActiveCache.delete(instance.companyId)
-    removePluginModelsForPlugin(instance.companyId, instance.id, instance.scope)
-    void instance.root?.fiber?.dispose?.()
-    for (const dispose of instance.disposers.reverse()) {
-      try {
-        const result = dispose()
-        if (result && typeof (result as Promise<void>).catch === 'function') {
-          ;(result as Promise<void>).catch(() => undefined)
-        }
-      } catch {
-        // 插件清理失败不阻塞宿主重启
+function disposeInstance(instance: HostInstance): void {
+  // 先同步摘掉模型，避免 root fiber 异步 dispose 期间列表仍读到已停用插件的模型。
+  pluginActiveCache.delete(instance.companyId)
+  removePluginModelsForPlugin(instance.companyId, instance.id, instance.scope)
+  void instance.root?.fiber?.dispose?.()
+  for (const dispose of instance.disposers.reverse()) {
+    try {
+      const result = dispose()
+      if (result && typeof (result as Promise<void>).catch === 'function') {
+        ;(result as Promise<void>).catch(() => undefined)
       }
+    } catch {
+      // 插件清理失败不阻塞宿主重启
     }
-    clearPluginContributions(instance.instanceKey)
-    instance.routes.clear()
-    instance.upgrades.clear()
-    instance.hostGaps.length = 0
   }
+  clearPluginContributions(instance.instanceKey)
+  instance.routes.clear()
+  instance.upgrades.clear()
+  instance.hostGaps.length = 0
+  instances.delete(instance.instanceKey)
+}
+
+function disposeAll(): void {
+  for (const instance of [...instances.values()]) disposeInstance(instance)
   instances.clear()
+}
+
+/**
+ * 单个插件包变化时只重启这个插件的公司/个人实例，不动其他插件。
+ *
+ * 同一物理包可能同时被公司安装和多个成员个人安装；这里按插件 id 一起收口，
+ * 再按数据库里当前启用状态重建，保证两种安装范围看到的是同一份新代码。
+ */
+export async function reloadPluginHost(id: string, db: Db, options?: DshImOptions): Promise<void> {
+  loadedDb = db
+  if (options) loadedOptions = options
+  for (const instance of [...instances.values()]) {
+    if (instance.id === id) disposeInstance(instance)
+  }
+  const record = readPluginDirectory(id)
+  if (!record || !record.valid || record.format !== 'dsh' || !record.dsh?.hasHost) return
+  const targets = enabledInstancesOf(db, record.id).map((enabled) =>
+    createHostInstance(record, loadedOptions, enabled.companyId, enabled.scope),
+  )
+  const dependencyErrors = await preparePluginDependencies(targets)
+  for (const instance of targets) {
+    const dependencyError = dependencyErrors.get(instance.record.dir)
+    if (dependencyError) {
+      instance.error = `依赖安装失败：${dependencyError}`
+      clearPluginContributions(instance.instanceKey)
+      makeLogger(instance).error(instance.error)
+      continue
+    }
+    await startHostInstance(db, instance, loadedOptions)
+  }
+}
+
+/**
+ * 单个实例重载：插件数据目录里的 config.json / settings.json 变化时，
+ * 只重启公司实例或某一个成员的个人实例，不影响同插件的其他安装范围。
+ */
+export async function reloadPluginHostInstance(
+  instanceKey: string,
+  db: Db,
+  options?: DshImOptions,
+): Promise<void> {
+  loadedDb = db
+  if (options) loadedOptions = options
+  const existing = instances.get(instanceKey)
+  if (!existing) return
+  const { id, companyId, scope } = existing
+  disposeInstance(existing)
+  const record = readPluginDirectory(id)
+  if (!record || !record.valid || record.format !== 'dsh' || !record.dsh?.hasHost) return
+  const stillEnabled = enabledInstancesOf(db, id).some(
+    (item) => pluginInstanceKey(item.companyId, id, item.scope) === instanceKey,
+  )
+  if (!stillEnabled) return
+  const instance = createHostInstance(record, loadedOptions, companyId, scope)
+  const dependencyErrors = await preparePluginDependencies([instance])
+  const dependencyError = dependencyErrors.get(instance.record.dir)
+  if (dependencyError) {
+    instance.error = `依赖安装失败：${dependencyError}`
+    clearPluginContributions(instance.instanceKey)
+    makeLogger(instance).error(instance.error)
+    return
+  }
+  await startHostInstance(db, instance, loadedOptions)
 }
 
 /** 启动/重扫 DSH 插件 host：公司装一个实例，每个成员个人安装各跑一个独立 Context */
 export async function reloadPluginHosts(db: Db, options?: DshImOptions): Promise<void> {
   loadedDb = db
   if (options) loadedOptions = options
+  // 全量重扫期间先停轮询，避免安装/启用请求和 timer 同时改插件实例。
+  stopPluginWatcher()
   // 先准备 dsh-im 兼容文件树：公司实例的 DSH_HOME 就是它；个人实例另起子目录。
   if (loadedOptions) prepareDshImCompat(db, loadedOptions)
   disposeAll()
@@ -2474,9 +2568,236 @@ export async function reloadPluginHosts(db: Db, options?: DshImOptions): Promise
     }
     await startHostInstance(db, instance, loadedOptions)
   }
+  startPluginWatcher(db, options ?? loadedOptions ?? undefined)
+}
+
+/**
+ * 插件包实时检测。
+ *
+ * 公司级和个人级插件共用 plugins/<id> 这份物理包，但会各自跑一个 host 实例。
+ * 这里轮询整个插件目录的文件指纹（清单 + host/client 代码，跳过 node_modules、
+ * 数据和日志），发现稳定变化后只重启该插件 id 的所有启用实例，不需要重启 EAB。
+ * 采用轮询而不是 fs.watch：Windows 网络盘/编辑器原子替换下 fs.watch 容易丢事件，
+ * 轮询还能同时覆盖“新增目录 / 删除目录 / 目录里代码被替换”三种情况。
+ */
+const PLUGIN_WATCH_INTERVAL_MS = Math.max(
+  500,
+  Number(process.env.EAB_PLUGIN_WATCH_MS) || 2_000,
+)
+const PLUGIN_WATCH_SETTLE_MS = Math.max(400, Math.min(1_500, PLUGIN_WATCH_INTERVAL_MS / 2))
+const PLUGIN_WATCH_SKIP_DIRS = new Set([
+  'node_modules',
+  'data',
+  'logs',
+  'tmp',
+  'temp',
+  '.cache',
+  'coverage',
+])
+const PLUGIN_WATCH_SKIP_FILES = /\.(?:log|db|db-wal|db-shm|lock|tmp|pid|crdownload)$/i
+const PLUGIN_WATCH_MAX_FILES = 12_000
+/** 插件实例自己的配置入口；按内容哈希判断，插件启动时重写相同内容不会触发循环重载。 */
+const PLUGIN_DATA_CONFIG_FILES = ['config.json', 'settings.json'] as const
+
+interface PluginWatchPending {
+  fingerprint: string
+  at: number
+}
+
+let pluginWatchTimer: NodeJS.Timeout | null = null
+let pluginWatchDb: Db | null = null
+let pluginWatchOptions: DshImOptions | null = null
+let pluginWatchSnapshots = new Map<string, string>()
+let pluginConfigSnapshots = new Map<string, string>()
+const pluginWatchPending = new Map<string, PluginWatchPending>()
+const pluginConfigPending = new Map<string, PluginWatchPending>()
+let pluginReloadChain: Promise<void> = Promise.resolve()
+
+/** 单个插件包的稳定指纹；只读元数据，不读文件内容，避免大包拖慢轮询。 */
+export function pluginPackageFingerprint(dir: string): string {
+  const entries: string[] = []
+  const walk = (current: string, depth: number): void => {
+    if (depth > 8 || entries.length >= PLUGIN_WATCH_MAX_FILES) return
+    let children: Dirent[]
+    try {
+      children = readdirSync(current, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const child of children) {
+      if (entries.length >= PLUGIN_WATCH_MAX_FILES) return
+      const name = child.name
+      if (child.isDirectory()) {
+        if (name.startsWith('.') || PLUGIN_WATCH_SKIP_DIRS.has(name)) continue
+        walk(join(current, name), depth + 1)
+      } else if (child.isFile()) {
+        if (PLUGIN_WATCH_SKIP_FILES.test(name)) continue
+        try {
+          const stat = statSync(join(current, name))
+          entries.push(
+            `${relative(dir, join(current, name)).replace(/\\/g, '/')}:${stat.mtimeMs}:${stat.ctimeMs}:${stat.size}`,
+          )
+        } catch {
+          // 文件在扫描时被替换：下一轮会拿到稳定结果
+        }
+      }
+    }
+  }
+  walk(dir, 0)
+  return createHash('sha256').update(entries.sort().join('|')).digest('hex')
+}
+
+function collectPluginFingerprints(): Map<string, string> {
+  return new Map(
+    listPluginDirectories().map((plugin) => [plugin.id, pluginPackageFingerprint(plugin.dir)]),
+  )
+}
+
+/** 单个实例数据目录里的配置指纹；只认 config.json / settings.json，避开运行态日志和数据库。 */
+export function pluginConfigFingerprint(
+  dataRoot: string,
+  pluginId = '',
+  packageName = '',
+): string {
+  const hash = createHash('sha256')
+  let found = false
+  const roots = [
+    dataRoot,
+    pluginId ? join(dataRoot, pluginId) : '',
+    packageName && packageName !== pluginId ? join(dataRoot, packageName) : '',
+  ].filter(Boolean)
+  for (const dir of new Set(roots)) {
+    for (const name of PLUGIN_DATA_CONFIG_FILES) {
+      try {
+        hash.update(dir)
+        hash.update(name)
+        hash.update(readFileSync(join(dir, name)))
+        found = true
+      } catch {
+        // 文件不存在或正被替换：下一轮再扫描
+      }
+    }
+  }
+  return found ? hash.digest('hex') : ''
+}
+
+function collectPluginConfigFingerprints(): Map<string, string> {
+  return new Map(
+    [...instances.values()].map((instance) => [
+      instance.instanceKey,
+      pluginConfigFingerprint(
+        instance.dataRoot,
+        instance.id,
+        instance.record.dsh?.packageName ?? '',
+      ),
+    ]),
+  )
+}
+
+function schedulePluginReload(id: string): void {
+  pluginReloadChain = pluginReloadChain
+    .then(async () => {
+      const db = pluginWatchDb
+      if (!db) return
+      try {
+        await reloadPluginHost(id, db, pluginWatchOptions ?? undefined)
+      } catch (error) {
+        console.error(`[eab] 插件 ${id} 热重载失败：`, error)
+      }
+    })
+    .catch(() => undefined)
+}
+
+function schedulePluginInstanceReload(instanceKey: string): void {
+  pluginReloadChain = pluginReloadChain
+    .then(async () => {
+      const db = pluginWatchDb
+      if (!db) return
+      try {
+        await reloadPluginHostInstance(instanceKey, db, pluginWatchOptions ?? undefined)
+      } catch (error) {
+        console.error(`[eab] 插件实例 ${instanceKey} 配置热重载失败：`, error)
+      }
+    })
+    .catch(() => undefined)
+}
+
+function pollPluginPackages(): void {
+  const current = collectPluginFingerprints()
+  const now = Date.now()
+  const ids = new Set([...pluginWatchSnapshots.keys(), ...current.keys()])
+  for (const id of ids) {
+    const fingerprint = current.get(id) ?? ''
+    if (pluginWatchSnapshots.get(id) === fingerprint) {
+      pluginWatchPending.delete(id)
+      continue
+    }
+    const pending = pluginWatchPending.get(id)
+    if (!pending || pending.fingerprint !== fingerprint) {
+      pluginWatchPending.set(id, { fingerprint, at: now })
+      continue
+    }
+    if (now - pending.at < PLUGIN_WATCH_SETTLE_MS) continue
+    // 先记基线再重载：包本身有语法错误时只试一次，文件再次变化才会重试，
+    // 不会每轮轮询都反复 import 一个坏包。
+    pluginWatchSnapshots.set(id, fingerprint)
+    pluginWatchPending.delete(id)
+    schedulePluginReload(id)
+  }
+}
+
+function pollPluginConfigs(): void {
+  const current = collectPluginConfigFingerprints()
+  const now = Date.now()
+  const keys = new Set([...pluginConfigSnapshots.keys(), ...current.keys()])
+  for (const key of keys) {
+    const fingerprint = current.get(key) ?? ''
+    if (pluginConfigSnapshots.get(key) === fingerprint) {
+      pluginConfigPending.delete(key)
+      continue
+    }
+    const pending = pluginConfigPending.get(key)
+    if (!pending || pending.fingerprint !== fingerprint) {
+      pluginConfigPending.set(key, { fingerprint, at: now })
+      continue
+    }
+    if (now - pending.at < PLUGIN_WATCH_SETTLE_MS) continue
+    // 已卸载/停用的实例会在队列执行时自行跳过；这里先更新基线，避免反复排队。
+    pluginConfigSnapshots.set(key, fingerprint)
+    pluginConfigPending.delete(key)
+    if (instances.has(key)) schedulePluginInstanceReload(key)
+  }
+}
+
+/** 启动插件包和插件配置轮询；重复调用只刷新基线，不叠加定时器。 */
+export function startPluginWatcher(db: Db, options?: DshImOptions): void {
+  pluginWatchDb = db
+  if (options) pluginWatchOptions = options
+  pluginWatchSnapshots = collectPluginFingerprints()
+  pluginConfigSnapshots = collectPluginConfigFingerprints()
+  pluginWatchPending.clear()
+  pluginConfigPending.clear()
+  if (pluginWatchTimer) return
+  pluginWatchTimer = setInterval(() => {
+    pollPluginPackages()
+    pollPluginConfigs()
+  }, PLUGIN_WATCH_INTERVAL_MS)
+  pluginWatchTimer.unref?.()
+}
+
+export function stopPluginWatcher(): void {
+  if (pluginWatchTimer) clearInterval(pluginWatchTimer)
+  pluginWatchTimer = null
+  pluginWatchDb = null
+  pluginWatchSnapshots.clear()
+  pluginConfigSnapshots.clear()
+  pluginWatchPending.clear()
+  pluginConfigPending.clear()
+  pluginReloadChain = Promise.resolve()
 }
 
 export function stopPluginHosts(): void {
+  stopPluginWatcher()
   disposeAll()
 }
 

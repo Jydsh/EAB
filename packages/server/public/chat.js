@@ -1,4 +1,4 @@
-﻿/*
+/*
  * 员工工作台（对话页）。
  *
  * 产品口径（12.7）：员工只对话。身份来自登录（开发期用 ?as= 预览），模型只列有权用的。
@@ -360,6 +360,9 @@ const state = {
   liveEventSource: null,
   sessionRefreshTimer: 0,
   files: [],
+  /** 云空间上传队列：每个文件有独立进度、状态和错误，刷新页面后清空。 */
+  wsUploads: [],
+  wsUploadHideTimer: 0,
   spaceKind: 'cloud',
   spaceLabel: '云空间',
   plugins: [],
@@ -383,6 +386,10 @@ const state = {
   agentParentRunId: '',
   /** 团队列表里被选中、详情窗口正在展示的子 Agent */
   agentSelectedId: '',
+  /** 团队详情里用户手动展开过的 CoT 面板；key = childId:kind:块序号 */
+  agentPanelOpen: new Map(),
+  /** 每个子 Agent 窗口的滚动位置；和主对话一样：贴底时跟随新内容，上滑后停在历史 */
+  agentScroll: new Map(),
   /** 右侧工作台当前面板：team / file */
   workbenchTab: 'team',
   /** 团队与文件是否并排显示 */
@@ -392,7 +399,8 @@ const state = {
   /** 权限审批面板是否被用户主动打开；它不是常驻栏，避免每次对话都占右栏 */
   permOpen: false,
   permView: 'apply',
-  permRoleCode: '',
+  /** 申请权限时勾选的 scope 集合；只保留当前接口返回的可申请权限。 */
+  permScopeCodes: [],
   permConfig: null,
   permRequests: { mine: [], todo: [] },
   permSelected: '',
@@ -990,6 +998,13 @@ function setupChatEvents() {
     }
     if (!payload?.sessionId) return
 
+    // 后台子 Agent 的进度：父回合已经结束，团队面板仍按同一套事件实时更新。
+    if (payload.type === 'subagent') {
+      if (payload.sessionId !== state.sessionId) return
+      updateAgentEvent(payload.data)
+      return
+    }
+
     // 模型正在生成：先把增量记到该消息的快照，再决定是否渲染。
     if (payload.type === 'delta') {
       if (payload.sessionId === state.sessionId) {
@@ -1354,6 +1369,58 @@ function fillHistoryIfNeeded() {
   if (thread.scrollHeight <= thread.clientHeight + 4) loadOlderMessages()
 }
 
+/** 从任务历史还原父子对话：每条任务先显示父 Agent 的派发，再显示子 Agent 的回报。 */
+function rebuildAgentThreadFromTasks(worker, tasks) {
+  const ordered = (Array.isArray(tasks) ? tasks : [])
+    .slice()
+    .sort((a, b) => (Number(a.startedAt) || Number(a.finishedAt) || 0) - (Number(b.startedAt) || Number(b.finishedAt) || 0))
+  const thread = []
+  for (const task of ordered) {
+    const taskAt = Number(task.startedAt) || Number(task.finishedAt) || 0
+    const prompt = String(task.prompt || '').trim()
+    if (prompt) thread.push({ kind: 'assign', text: prompt, at: taskAt })
+    const result = String(task.result || '').trim()
+    if (result) {
+      thread.push({
+        kind: 'content',
+        text: result,
+        at: Number(task.finishedAt) || taskAt,
+        final: true,
+      })
+      continue
+    }
+    if (task.status === 'failed' || task.status === 'cancelled') {
+      thread.push({
+        kind: 'done',
+        text: String(task.error || (task.status === 'failed' ? '执行失败' : '已取消')),
+        status: task.status,
+        at: Number(task.finishedAt) || taskAt,
+      })
+    }
+  }
+  const lastText = String(worker?.lastText || '').trim()
+  if (thread.length === 0) {
+    if (lastText) {
+      thread.push({
+        kind: worker?.status === 'waiting' ? 'question' : 'content',
+        text: lastText,
+        at: Number(worker?.lastTaskAt) || Date.now(),
+        final: worker?.status !== 'waiting',
+      })
+    }
+  } else if (worker?.status === 'waiting' && lastText) {
+    const last = thread[thread.length - 1]
+    if (!last || last.kind !== 'question') {
+      thread.push({
+        kind: 'question',
+        text: lastText,
+        at: Number(worker?.lastTaskAt) || Date.now(),
+      })
+    }
+  }
+  return thread
+}
+
 async function loadPersistedAgentTeam(sessionId, seq) {
   if (!sessionId) return
   try {
@@ -1365,24 +1432,40 @@ async function loadPersistedAgentTeam(sessionId, seq) {
       renderAgentDock()
       return
     }
-    const taskByKey = new Map()
+    const tasksByKey = new Map()
     for (const task of tasks) {
-      if (task && task.key && !taskByKey.has(task.key)) taskByKey.set(task.key, task)
+      if (!task || !task.key) continue
+      const list = tasksByKey.get(task.key) || []
+      list.push(task)
+      tasksByKey.set(task.key, list)
     }
     for (const worker of workers) {
       const previous = state.agentRuns.get(`${sessionId}:k:${worker.key}`) || {}
-      const latestTask = taskByKey.get(worker.key)
+      const workerTasks = tasksByKey.get(worker.key) || []
+      const latestTask = workerTasks[0]
       const status = worker.status === 'waiting'
         ? 'waiting'
         : worker.status === 'idle'
           ? (latestTask?.status === 'failed' ? 'failed' : latestTask?.status === 'cancelled' ? 'cancelled' : 'done')
           : 'running'
       const lastText = String(worker.lastText || '')
-      const thread = Array.isArray(previous.thread) && previous.thread.length > 0
-        ? previous.thread
-        : lastText
-          ? [{ kind: status === 'done' ? 'report' : 'content', text: lastText, at: Number(worker.lastTaskAt) || Date.now() }]
-          : []
+      let thread = Array.isArray(previous.thread) ? previous.thread.slice() : []
+      if (thread.length === 0) {
+        // 刷新/切换会话后，SSE 已经断开，只能靠任务历史重建完整的父—子对话。
+        thread = rebuildAgentThreadFromTasks(worker, workerTasks)
+      } else if (!thread.some((entry) => entry.kind === 'assign' || entry.kind === 'answer') && workerTasks.length > 0) {
+        // 实时 thread 只收到了子 Agent 的过程/正文：把父 Agent 的派发补到最前面。
+        const parentEntries = workerTasks
+          .slice()
+          .sort((a, b) => (Number(a.startedAt) || Number(a.finishedAt) || 0) - (Number(b.startedAt) || Number(b.finishedAt) || 0))
+          .flatMap((task) => {
+            const text = String(task.prompt || '').trim()
+            return text
+              ? [{ kind: 'assign', text, at: Number(task.startedAt) || Number(task.finishedAt) || Date.now() }]
+              : []
+          })
+        if (parentEntries.length > 0) thread = [...parentEntries, ...thread]
+      }
       state.agentRuns.set(`${sessionId}:k:${worker.key}`, {
         ...previous,
         childId: `${sessionId}:k:${worker.key}`,
@@ -1487,6 +1570,15 @@ async function openSession(sessionId) {
     })
   } catch (err) {
     resetHistoryState()
+    if (err.code === 'EAB_NOT_FOUND') {
+      // 列表可能是上一次加载留下的旧数据：会话已经删除时，顺手从侧边栏移除，
+      // 不再把“会话不存在”渲染成一条假的 AI 回复。
+      const before = state.sessions.length
+      state.sessions = state.sessions.filter((session) => session.id !== sessionId)
+      if (state.sessions.length !== before) renderSessions()
+      banner('该对话已不存在，已从列表中移除', 'warn')
+      return
+    }
     appendMessage('ai', `${err.message}${err.code ? `（${err.code}）` : ''}`)
   }
 }
@@ -2200,7 +2292,7 @@ async function sendWorkspaceFileToDingTalk(file) {
 /* ---------------- 多 Agent 运行台 ---------------- */
 
 function agentStatusText(status) {
-  if (status === 'waiting') return '等待父 Agent 回答'
+  if (status === 'waiting') return '等待主 Agent 回答'
   if (status === 'done') return '已完成 · 待命'
   if (status === 'failed') return '失败'
   if (status === 'cancelled') return '已取消'
@@ -2304,6 +2396,7 @@ function syncWorkbenchLayout() {
   }
 
   if (inChat) main.classList.toggle('is-split-preview', !rail.hidden)
+  else main.classList.remove('is-split-preview')
   // 右栏（团队或文件）出现时就是可拖拽分栏，鼠标拖分界线即可改两边宽度。
   main.classList.toggle('is-workbench-open', !rail.hidden)
   main.classList.toggle('is-workbench-collapsed', collapsed)
@@ -2312,6 +2405,13 @@ function syncWorkbenchLayout() {
   main.classList.toggle('is-perm-only', !rail.hidden && hasPerm && !hasTeam && !hasFile)
   const resizer = $('#file-split-resizer')
   if (resizer) resizer.hidden = !(inChat && !rail.hidden && !collapsed)
+  // 从文件 / 权限页切回团队，或展开右栏后，容器尺寸才真正可用；
+  // 这时再还原一次滚动位置，避免隐藏期间 clientHeight=0 把贴底状态算丢。
+  if (showTeam && state.agentSelectedId) {
+    requestAnimationFrame(() => {
+      if (state.agentSelectedId) restoreAgentThreadScroll(state.agentSelectedId)
+    })
+  }
 }
 
 function setWorkbenchCollapsed(collapsed, options = {}) {
@@ -2358,44 +2458,76 @@ function permStatusHtml(status) {
   return `<span class="perm-status is-${esc(key)}">${esc(PERM_STATUS_TEXT[key] || key)}</span>`
 }
 
-function permRoleOf(code) {
-  return (state.permConfig?.roles || []).find((role) => role.code === code) || null
+function permScopeOf(code) {
+  return (state.permConfig?.scopes || []).find((scope) => scope.code === code)
+    || (state.permConfig?.currentScopes || []).find((scope) => scope.code === code)
+    || null
+}
+
+function permScopeLabel(code) {
+  return permScopeOf(code)?.label || code
+}
+
+function permPolicyText(policy) {
+  if (!policy) return '暂不可申请'
+  return `审批链：最多 ${policy.maxLevels} 级，${policy.includeCompanyAdmin ? '公司管理员兜底' : '不兜底'}，${policy.timeoutHours} 小时内处理`
 }
 
 function permApplyHtml() {
-  const roles = state.permConfig?.roles || []
-  if (!roles.length) {
-    return `<div class="perm-empty"><span class="perm-empty-title">暂无可申请角色</span>需要管理员先把角色标记为可申请，并配置按权限范围的审批策略。</div>`
-  }
-  const selectedCode = state.permRoleCode || roles.find((role) => role.applicable)?.code || ''
-  const cards = roles.map((role) => {
-    const selected = role.code === selectedCode
-    const disabled = !role.applicable
-    const scopes = (role.scopes || []).map((scope) => esc(scope)).join('、') || '—'
-    const policy = role.policy
-      ? `审批链：最多 ${role.policy.maxLevels} 级，${role.policy.includeCompanyAdmin ? '公司管理员兜底' : '不兜底'}，${role.policy.timeoutHours} 小时内处理`
-      : role.reason || '暂不可申请'
+  const scopes = state.permConfig?.scopes || []
+  const current = state.permConfig?.currentScopes || []
+  const currentChips = current.map((scope) => `<span class="perm-chip${scope.dangerous ? ' is-dangerous' : ''}">${esc(scope.label)}</span>`).join('')
+  if (!scopes.length) {
     return `
-      <label class="perm-role${selected ? ' is-selected' : ''}${disabled ? ' is-disabled' : ''}">
-        <input type="radio" name="perm-role" value="${esc(role.code)}"${selected ? ' checked' : ''}${disabled ? ' disabled' : ''}>
-        <span class="perm-role-radio" aria-hidden="true"></span>
-        <span class="perm-role-main">
-          <span class="perm-role-title">${esc(role.name)} <span class="perm-role-code">${esc(role.code)}</span></span>
-          <span class="perm-role-scopes">${scopes}</span>
-          <span class="perm-role-note">${esc(policy)}</span>
-        </span>
-      </label>`
-  }).join('')
+      <div class="perm-empty">
+        <span class="perm-empty-title">当前没有可申请的新权限</span>
+        你已拥有可申请角色的全部权限，或管理员还没有开放新的权限点。
+        ${current.length ? `<div class="perm-current-scopes perm-current-scopes-empty">${currentChips}</div>` : ''}
+      </div>`
+  }
+  const selected = new Set(state.permScopeCodes || [])
+  const groups = new Map()
+  for (const scope of scopes) {
+    const key = scope.group || '其他'
+    if (!groups.has(key)) groups.set(key, [])
+    groups.get(key).push(scope)
+  }
+  const groupHtml = [...groups.entries()].map(([group, items]) => `
+    <section class="perm-scope-group">
+      <div class="perm-scope-group-title">${esc(group)}</div>
+      <div class="perm-scope-grid">
+        ${items.map((scope) => `
+          <label class="perm-scope${selected.has(scope.code) ? ' is-selected' : ''}${scope.dangerous ? ' is-dangerous' : ''}">
+            <input type="checkbox" name="perm-scope" value="${esc(scope.code)}"${selected.has(scope.code) ? ' checked' : ''}>
+            <span class="perm-scope-check" aria-hidden="true"></span>
+            <span class="perm-scope-main">
+              <span class="perm-scope-title">${esc(scope.label)} <span class="perm-scope-code">${esc(scope.code)}</span>${scope.dangerous ? '<span class="perm-danger">高危</span>' : ''}</span>
+              <span class="perm-scope-note">${esc(permPolicyText(scope.policy))}</span>
+            </span>
+          </label>`).join('')}
+      </div>
+    </section>`).join('')
   return `
     <form class="perm-form" id="perm-apply-form">
       <div class="perm-field">
-        <span class="perm-field-label">申请角色</span>
-        <div class="perm-role-list" id="perm-role-list">${cards}</div>
-        <span class="perm-field-hint">只能本人申请；管理角色不走自助申请。</span>
+        <div class="perm-apply-head">
+          <span class="perm-field-label">当前身份已有权限</span>
+          <span class="perm-selected-count">${current.length} 项</span>
+        </div>
+        <div class="perm-current-scopes">${currentChips || '<span class="perm-field-hint">暂无可用权限</span>'}</div>
+        <span class="perm-field-hint">下面只列出当前身份没有、且管理员已开放申请的权限点。</span>
+      </div>
+      <div class="perm-field">
+        <div class="perm-apply-head">
+          <span class="perm-field-label">可申请权限</span>
+          <span class="perm-selected-count" id="perm-selected-count">已选 ${selected.size} 项</span>
+        </div>
+        <div class="perm-scope-list">${groupHtml}</div>
+        <span class="perm-field-hint">可多选；审批链取所选权限中最严格的一条，通过后只授予勾选权限，不新增角色。</span>
       </div>
       <div class="perm-field">
         <label class="perm-field-label" for="perm-reason">申请原因</label>
-        <textarea class="perm-textarea" id="perm-reason" maxlength="500" placeholder="说明你要用这个角色做什么，审批人会看到"></textarea>
+        <textarea class="perm-textarea" id="perm-reason" maxlength="500" placeholder="说明你要用这些权限做什么，审批人会看到"></textarea>
         <span class="perm-field-hint">选填，最多 500 字。</span>
       </div>
       <div class="perm-field">
@@ -2410,9 +2542,18 @@ function permApplyHtml() {
       ${state.permError ? `<div class="perm-error">${esc(state.permError)}</div>` : ''}
       ${state.permSuccess ? `<div class="perm-success">${esc(state.permSuccess)}</div>` : ''}
       <div class="perm-form-actions">
-        <button class="btn primary" type="submit" id="perm-submit">提交申请</button>
+        <button class="btn primary" type="submit" id="perm-submit">${selected.size > 0 ? `提交 ${selected.size} 项申请` : '提交申请'}</button>
       </div>
     </form>`
+}
+
+function permRequestTitle(request) {
+  if (request?.requestType === 'scope') {
+    const labels = (request.scopes || []).map((scope) => permScopeLabel(scope))
+    if (!labels.length) return '申请权限'
+    return `申请权限：${labels.slice(0, 2).join('、')}${labels.length > 2 ? ` 等 ${labels.length} 项` : ''}`
+  }
+  return request?.roleName || request?.roleCode || '角色申请'
 }
 
 function permRequestCardHtml(request, activeId) {
@@ -2422,7 +2563,7 @@ function permRequestCardHtml(request, activeId) {
   return `
     <button class="perm-card${request.id === activeId ? ' is-active' : ''}" type="button" data-perm-request="${esc(request.id)}">
       <span class="perm-card-top">
-        <span class="perm-card-role">${esc(request.roleName)}</span>
+        <span class="perm-card-role">${esc(permRequestTitle(request))}</span>
         ${permStatusHtml(request.status)}
       </span>
       <span class="perm-card-meta">${esc(request.requesterName)} · ${esc(permTime(request.createdAt))} · ${Number(request.durationHours) / 24 || 1} 天</span>
@@ -2466,17 +2607,22 @@ function permDetailHtml(request) {
       : canResend
         ? `<div class="perm-detail-actions"><button class="btn ghost" type="button" data-perm-resend="1">重发钉钉审批卡</button></div>`
         : ''
+  const scopeLabels = (request.scopes || []).map((scope) => esc(permScopeLabel(scope))).join('、') || '—'
+  const requestTypeText = request.requestType === 'scope'
+    ? '权限点（通过后只授予所选权限，不新增角色）'
+    : '角色'
   return `
     <div class="perm-detail" data-perm-detail="${esc(request.id)}">
       <div class="perm-detail-head">
         <div class="perm-detail-title">
-          <strong>${esc(request.roleName)}</strong>
+          <strong>${esc(permRequestTitle(request))}</strong>
           ${permStatusHtml(request.status)}
           <button class="icon-btn" type="button" data-perm-back="1" title="返回列表" aria-label="返回列表">←</button>
         </div>
         <dl class="perm-detail-facts">
           <dt>申请人</dt><dd>${esc(request.requesterName)}</dd>
-          <dt>权限范围</dt><dd>${(request.scopes || []).map((scope) => esc(scope)).join('、') || '—'}</dd>
+          <dt>申请类型</dt><dd>${esc(requestTypeText)}</dd>
+          <dt>申请权限</dt><dd>${scopeLabels}</dd>
           <dt>审批进度</dt><dd>第 ${Number(request.currentStep)} / ${Number(request.totalSteps)} 级</dd>
           <dt>有效期</dt><dd>${Number(request.durationHours) / 24 || 1} 天</dd>
           <dt>申请原因</dt><dd>${esc(request.reason || '未填写')}</dd>
@@ -2530,7 +2676,7 @@ function renderPermissionPane() {
   if (!list.length) {
     body.innerHTML = state.permView === 'todo'
       ? '<div class="perm-empty"><span class="perm-empty-title">没有待你审批的申请</span>当前步骤轮到你时，钉钉会收到审批卡，也会出现在这里。</div>'
-      : '<div class="perm-empty"><span class="perm-empty-title">还没有发起过申请</span>切到「申请权限」，选一个可申请角色提交即可。</div>'
+      : '<div class="perm-empty"><span class="perm-empty-title">还没有发起过申请</span>切到「申请权限」，勾选当前缺少的权限点提交即可。</div>'
     return
   }
   body.innerHTML = `<div class="perm-list">${list.map((request) => permRequestCardHtml(request, state.permSelected)).join('')}</div>`
@@ -2547,6 +2693,8 @@ async function loadPermissionData(options = {}) {
       api('/api/permissions/requests?mode=todo'),
     ])
     state.permConfig = config
+    const requestable = new Set((config.scopes || []).map((scope) => scope.code))
+    state.permScopeCodes = (state.permScopeCodes || []).filter((code) => requestable.has(code))
     state.permRequests = { mine: mine.requests || [], todo: todo.requests || [] }
     state.permError = ''
     if (state.permSelected && ![...state.permRequests.mine, ...state.permRequests.todo].some((item) => item.id === state.permSelected)) {
@@ -2594,10 +2742,9 @@ function closePermissionPane() {
 
 async function submitPermissionApply(event) {
   event.preventDefault()
-  const form = event.currentTarget
-  const role = form?.querySelector('input[name="perm-role"]:checked')?.value || ''
-  if (!role) {
-    state.permError = '请先选择一个可申请角色'
+  const scopeCodes = [...(state.permScopeCodes || [])]
+  if (!scopeCodes.length) {
+    state.permError = '请先勾选至少一个要申请的权限'
     renderPermissionPane()
     return
   }
@@ -2613,11 +2760,12 @@ async function submitPermissionApply(event) {
     const result = await api('/api/permissions/requests', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ roleCode: role, reason, durationHours }),
+      body: JSON.stringify({ scopeCodes, reason, durationHours }),
     })
     state.permSuccess = result.cardPending
-      ? '申请已提交，正在给第一级审批人发钉钉审批卡。'
-      : '申请已提交。'
+      ? '权限申请已提交，正在给第一级审批人发钉钉审批卡。'
+      : '权限申请已提交。'
+    state.permScopeCodes = []
     state.permSelected = result.request?.id || ''
     state.permView = 'mine'
     await loadPermissionData()
@@ -2698,13 +2846,18 @@ function bindPermissionPane() {
     renderPermissionPane()
   })
   $('#perm-body')?.addEventListener('change', (event) => {
-    const input = event.target.closest('input[name="perm-role"]')
+    const input = event.target.closest('input[name="perm-scope"]')
     if (!input) return
-    state.permRoleCode = input.value
-    document.querySelectorAll('.perm-role').forEach((card) => {
-      const radio = card.querySelector('input[name="perm-role"]')
-      card.classList.toggle('is-selected', Boolean(radio?.checked))
-    })
+    const code = input.value
+    const selected = new Set(state.permScopeCodes || [])
+    if (input.checked) selected.add(code)
+    else selected.delete(code)
+    state.permScopeCodes = [...selected]
+    input.closest('.perm-scope')?.classList.toggle('is-selected', input.checked)
+    const count = document.querySelector('#perm-selected-count')
+    if (count) count.textContent = `已选 ${selected.size} 项`
+    const submit = document.querySelector('#perm-submit')
+    if (submit) submit.textContent = selected.size > 0 ? `提交 ${selected.size} 项申请` : '提交申请'
   })
   $('#perm-body')?.addEventListener('submit', (event) => {
     if (event.target?.id !== 'perm-apply-form') return
@@ -2761,6 +2914,12 @@ function scheduleAgentRetire(childId, updatedAt) {
     const current = state.agentRuns.get(childId)
     if (!current) return
     if ((current.status || 'running') === 'running') return
+    // 用户正在这个子 Agent 的窗口里看历史时不能把窗口撤掉；
+    // 否则上滑查看旧消息会被“自动注销”打断。切走后再按空闲期收尾。
+    if (childId === state.agentSelectedId) {
+      current.retireTimer = null
+      return
+    }
     if (Date.now() - (current.updatedAt || 0) < AGENT_TEAM_IDLE_MS - 1000) {
       scheduleAgentRetire(childId, current.updatedAt || Date.now())
       return
@@ -2774,6 +2933,11 @@ function pushThreadEntry(thread, entry) {
   const last = thread[thread.length - 1]
   // 流式输出碎片合并成一条，避免每几个字一个气泡。
   if (entry.kind === 'content' && last && last.kind === 'content') {
+    last.text = `${last.text}${entry.text}`
+    return
+  }
+  // 思考增量同样合并成一条，避免每个 token 建一个面板。
+  if (entry.kind === 'reasoning' && last && last.kind === 'reasoning') {
     last.text = `${last.text}${entry.text}`
     return
   }
@@ -2799,7 +2963,7 @@ function updateAgentEvent(data) {
     modelName: data.modelName || previous.modelName || '',
     modelReason: data.modelReason || previous.modelReason || '',
     status: data.status === 'unregistered' ? 'done' : (data.status || previous.status || 'running'),
-    assign: data.action === 'assign' ? String(data.text || '').slice(0, 600) : previous.assign || '',
+    assign: data.action === 'assign' ? String(data.text || '').slice(0, 1200) : previous.assign || '',
     text: previous.text || '',
     steps: Array.isArray(previous.steps) ? previous.steps.slice() : [],
     thread,
@@ -2818,7 +2982,7 @@ function updateAgentEvent(data) {
     const kind = previous.status === 'waiting' ? 'answer' : 'assign'
     pushThreadEntry(thread, {
       kind,
-      text: String(data.text || (kind === 'answer' ? '（父 Agent 答复）' : '（派发任务）')),
+      text: String(data.text || (kind === 'answer' ? '（主 Agent 答复）' : '（派发任务）')),
       at: Date.now(),
     })
     // 新任务派下来 → 取消上一次的注销计划，并把窗口展开看过程。
@@ -2827,6 +2991,8 @@ function updateAgentEvent(data) {
       next.retireTimer = null
     }
     next.status = 'running'
+  } else if (data.action === 'reasoning') {
+    pushThreadEntry(thread, { kind: 'reasoning', text: String(data.text || ''), at: Date.now() })
   } else if (data.action === 'content') {
     next.text = `${next.text}${data.text || ''}`.slice(-4000)
     pushThreadEntry(thread, { kind: 'content', text: String(data.text || ''), at: Date.now() })
@@ -2838,7 +3004,7 @@ function updateAgentEvent(data) {
     // 子 Agent 主动向父 Agent 提问：本轮暂停，等父 Agent 回复后继续。
     next.status = 'waiting'
     next.text = String(data.text || '').slice(0, 2400)
-    pushThreadEntry(thread, { kind: 'question', text: next.text || '（需要父 Agent 回答）', at: Date.now() })
+    pushThreadEntry(thread, { kind: 'question', text: next.text || '（需要主 Agent 回答）', at: Date.now() })
     if (next.retireTimer) {
       clearTimeout(next.retireTimer)
       next.retireTimer = null
@@ -2869,6 +3035,7 @@ function updateAgentEvent(data) {
         id: stepId,
         name: data.tool.name || data.tool.toolId || '工具调用',
         toolId: data.tool.toolId || '',
+        args: data.tool.args && typeof data.tool.args === 'object' ? data.tool.args : {},
         status: 'running',
         summary: '',
         durationMs: 0,
@@ -2877,6 +3044,7 @@ function updateAgentEvent(data) {
         kind: 'tool',
         id: stepId,
         text: data.tool.name || data.tool.toolId || '工具调用',
+        args: data.tool.args && typeof data.tool.args === 'object' ? data.tool.args : {},
         at: Date.now(),
         status: 'running',
       })
@@ -2942,19 +3110,19 @@ function agentThreadEntryHtml(entry) {
   if (entry.kind === 'assign') {
     return `<div class="agent-chat-row is-parent">
       <div class="agent-chat-main">
-        <div class="agent-chat-meta"><span>父 Agent · 派发</span>${time ? `<time>${esc(time)}</time>` : ''}</div>
+        <div class="agent-chat-meta"><span>主 Agent · 派发</span>${time ? `<time>${esc(time)}</time>` : ''}</div>
         <div class="agent-chat-bubble is-parent is-markdown">${agentBubbleContent(entry.text)}</div>
       </div>
-      <span class="agent-chat-avatar is-parent" aria-hidden="true">父</span>
+      <span class="agent-chat-avatar is-parent" aria-hidden="true">主</span>
     </div>`
   }
   if (entry.kind === 'answer') {
     return `<div class="agent-chat-row is-parent">
       <div class="agent-chat-main">
-        <div class="agent-chat-meta"><span>父 Agent · 回答</span>${time ? `<time>${esc(time)}</time>` : ''}</div>
+        <div class="agent-chat-meta"><span>主 Agent · 回答</span>${time ? `<time>${esc(time)}</time>` : ''}</div>
         <div class="agent-chat-bubble is-parent is-answer is-markdown">${agentBubbleContent(entry.text)}</div>
       </div>
-      <span class="agent-chat-avatar is-parent" aria-hidden="true">父</span>
+      <span class="agent-chat-avatar is-parent" aria-hidden="true">主</span>
     </div>`
   }
   if (entry.kind === 'question') {
@@ -3023,24 +3191,251 @@ function agentListRowHtml(run, selected) {
   const time = run.durationMs ? formatElapsed(run.durationMs) : ''
   const meta = [run.key, `${run.toolCount || 0} 次工具`, time].filter(Boolean).join(' · ')
   const latest = [...(run.thread || [])].reverse().find((entry) => entry.kind === 'content' || entry.kind === 'report')
-  const preview = oneLinePreview(latest?.text || run.text || '').slice(0, 42)
+  const preview = firstLinePreview(latest?.text || run.text || '', 56).slice(0, 48)
   return `<button class="agent-row ${agentStatusClass(status)}${selected ? ' is-selected' : ''}" type="button" role="listitem" data-agent-select="${esc(run.childId)}" aria-current="${selected ? 'true' : 'false'}" title="${esc(run.title)}">
     <span class="agent-row-index">${String(run.index || 1).padStart(2, '0')}</span>
     <span class="agent-row-body">
       <span class="agent-row-line">
         <strong class="agent-row-title">${esc(run.title)}</strong>
-        <span class="agent-row-state"><span class="agent-status-dot" aria-hidden="true"></span>${agentStatusShort(status)}</span>
       </span>
-      <span class="agent-row-meta">${esc(meta)}</span>
+      <span class="agent-row-meta">
+        <span class="agent-row-state"><span class="agent-status-dot" aria-hidden="true"></span>${agentStatusShort(status)}</span>
+        <span class="agent-row-meta-text">${esc(meta)}</span>
+      </span>
       ${preview ? `<span class="agent-row-preview">${esc(preview)}</span>` : ''}
     </span>
   </button>`
 }
 
+/**
+ * 子 Agent 的思考/工具也按父对话同一套 CoT 设计展示：
+ * 默认单行入口（✦ 思考 / 工具 · 摘要），点开后才显示完整思维链、参数和结果。
+ * 面板展开状态存在 state.agentPanelOpen，流式重渲染不会把用户展开的面板又收回去。
+ */
+function agentCotPanelKey(run, kind, index) {
+  return `${run.childId}:${kind}:${index}`
+}
+
+function agentReasoningPanelHtml(run, entries, index, isLastBlock) {
+  const text = entries.map((entry) => String(entry.text || '')).join('')
+  const key = agentCotPanelKey(run, 'think', index)
+  const expanded = state.agentPanelOpen.get(key) === true
+  const active = run.status === 'running' && isLastBlock
+  const preview = firstLinePreview(text, 96)
+  return `<div class="agent-cot-block" data-agent-panel-key="${esc(key)}">
+    <div class="think-panel${active ? ' is-active' : ''}${expanded ? '' : ' is-collapsed'}">
+      <button class="think-head" type="button" data-agent-cot-toggle="${esc(key)}" aria-expanded="${expanded ? 'true' : 'false'}" aria-label="展开思考过程">
+        <span class="think-icon" aria-hidden="true">✦</span>
+        <span class="think-title">${active ? '思考中' : '思考'}</span>
+        <span class="think-divider"${preview ? '' : ' hidden'}>·</span>
+        <span class="think-preview">${esc(preview)}</span>
+        <span class="think-chevron" aria-hidden="true">⌄</span>
+      </button>
+      <div class="think-body">${esc(text)}</div>
+    </div>
+  </div>`
+}
+
+function agentToolPanelHtml(run, entries, index) {
+  const key = agentCotPanelKey(run, 'tool', index)
+  const expanded = state.agentPanelOpen.get(key) === true
+  const traces = entries.map((entry) => ({
+    id: String(entry.id || ''),
+    name: entry.text || '工具调用',
+    toolId: '',
+    args: entry.args && typeof entry.args === 'object' ? entry.args : {},
+    status: entry.status === 'error' ? 'error' : entry.status === 'running' ? 'running' : 'done',
+    summary: entry.summary || '',
+    durationMs: Number(entry.durationMs) || 0,
+  }))
+  const active = traces.some((trace) => trace.status === 'running') && run.status === 'running'
+  return `<div class="agent-cot-block" data-agent-panel-key="${esc(key)}">${toolPanelHtml(traces, { active, expanded })}</div>`
+}
+
+/** 空正文/空思考是流式起始事件留下的占位，不能渲染成空气泡。 */
+function agentEntryHasVisibleText(entry) {
+  if (!entry) return false
+  const text = String(entry.text ?? '').replace(/[\s\u200b\ufeff]/g, '')
+  if (entry.kind === 'tool') return Boolean(text || String(entry.summary ?? '').replace(/[\s\u200b\ufeff]/g, ''))
+  if (entry.kind === 'done') return true
+  return Boolean(text)
+}
+
+/** 把连续思考、连续工具调用各自合并成一块；其余消息仍按父子对话气泡展示。 */
+function agentChatThreadHtml(run) {
+  const thread = (Array.isArray(run.thread) ? run.thread : []).filter(agentEntryHasVisibleText)
+  const blocks = []
+  for (const entry of thread) {
+    const kind = entry.kind === 'reasoning' ? 'reasoning' : entry.kind === 'tool' ? 'tool' : ''
+    const last = blocks[blocks.length - 1]
+    if (kind && last && last.kind === kind) {
+      last.entries.push(entry)
+      continue
+    }
+    if (kind) blocks.push({ kind, entries: [entry] })
+    else blocks.push({ kind: entry.kind, entry })
+  }
+  // 最终回报是这轮工作的结论，先于它前面的思考/工具链展示；
+  // 过程记录落在“子 Agent · 回报”下方，避免结论被一长串 CoT 推到很下面。
+  let finalIndex = -1
+  for (let i = blocks.length - 1; i >= 0; i -= 1) {
+    const block = blocks[i]
+    if (block.kind === 'content' && block.entry?.final) {
+      finalIndex = i
+      break
+    }
+  }
+  if (finalIndex > 0) {
+    let chainStart = finalIndex - 1
+    while (chainStart >= 0 && (blocks[chainStart].kind === 'reasoning' || blocks[chainStart].kind === 'tool')) {
+      chainStart -= 1
+    }
+    chainStart += 1
+    if (chainStart < finalIndex) {
+      const report = blocks[finalIndex]
+      const chain = blocks.slice(chainStart, finalIndex)
+      blocks.splice(chainStart, chain.length + 1, report, ...chain)
+    }
+  }
+  return blocks.map((block, index) => {
+    if (block.kind === 'reasoning') {
+      return agentReasoningPanelHtml(run, block.entries, index, index === blocks.length - 1)
+    }
+    if (block.kind === 'tool') return agentToolPanelHtml(run, block.entries, index)
+    return agentThreadEntryHtml(block.entry)
+  }).join('')
+}
+
+/**
+ * 子 Agent 窗口的滚动状态。和主对话一致：
+ * - 贴底（pinned）时，新来的思考/工具/正文继续跟随到底部；
+ * - 用户上滑看历史后停止跟随，只标“下方有新内容”；
+ * - 点“回到最新消息”恢复贴底。
+ * 状态按 childId 保存，流式重渲染（每 40ms 一次）不会把用户的位置冲掉。
+ */
+function agentThreadState(childId) {
+  let scroll = state.agentScroll.get(childId)
+  if (!scroll) {
+    scroll = { pinned: true, top: 0, hasNew: false, scrollHeight: 0 }
+    state.agentScroll.set(childId, scroll)
+  }
+  return scroll
+}
+
+function currentAgentPanel() {
+  return document.querySelector('#team-detail .agent-chat-panel')
+}
+
+function currentAgentThread() {
+  return currentAgentPanel()?.querySelector('.agent-chat-thread') || null
+}
+
+function agentThreadDistanceToBottom(thread) {
+  if (!thread) return 0
+  return thread.scrollHeight - thread.scrollTop - thread.clientHeight
+}
+
+function updateAgentScrollBottomButton(childId = state.agentSelectedId) {
+  const button = currentAgentPanel()?.querySelector('[data-agent-scroll-bottom]')
+  if (!button || !childId) return
+  const scroll = agentThreadState(childId)
+  button.hidden = scroll.pinned
+  button.classList.toggle('has-new', scroll.hasNew)
+  const label = scroll.hasNew ? '有新内容，回到最新消息' : '回到最新消息'
+  button.title = label
+  button.setAttribute('aria-label', label)
+}
+
+/** 重渲染前先记下旧容器的真实位置，渲染后才知道内容是不是变高了。 */
+function captureAgentThreadScroll(childId) {
+  const thread = currentAgentThread()
+  if (!thread || !childId) return
+  const scroll = agentThreadState(childId)
+  // 不能在这里按“距底距离”重算 pinned：流式内容会让距离短暂变大，
+  // 但用户并没有上滑；pinned 只由真实 scroll 事件改变。
+  scroll.top = thread.scrollTop
+  scroll.scrollHeight = thread.scrollHeight
+}
+
+/** 渲染完成后恢复位置。forceBottom 用于首次展示或切换到另一个子 Agent。 */
+function restoreAgentThreadScroll(childId, forceBottom = false) {
+  const thread = currentAgentThread()
+  if (!thread || !childId) return
+  const scroll = agentThreadState(childId)
+  const grew = thread.scrollHeight > scroll.scrollHeight + 1
+  if (forceBottom) {
+    scroll.pinned = true
+    scroll.hasNew = false
+    scroll.top = 0
+  }
+  if (scroll.pinned) {
+    const previous = thread.style.scrollBehavior
+    thread.style.scrollBehavior = 'auto'
+    thread.scrollTop = thread.scrollHeight
+    if (previous) thread.style.scrollBehavior = previous
+    else thread.style.removeProperty('scroll-behavior')
+    scroll.top = thread.scrollTop
+  } else {
+    const maxTop = Math.max(0, thread.scrollHeight - thread.clientHeight)
+    thread.scrollTop = Math.min(Math.max(0, scroll.top), maxTop)
+    scroll.top = thread.scrollTop
+    if (grew) scroll.hasNew = true
+  }
+  scroll.scrollHeight = thread.scrollHeight
+  updateAgentScrollBottomButton(childId)
+  if (scroll.pinned) {
+    requestAnimationFrame(() => {
+      const current = currentAgentThread()
+      if (!current) return
+      current.scrollTop = current.scrollHeight
+      scroll.top = current.scrollTop
+      scroll.scrollHeight = current.scrollHeight
+      updateAgentScrollBottomButton(childId)
+    })
+  }
+}
+
+function scrollAgentThreadToBottom(childId = state.agentSelectedId, smooth = false) {
+  const thread = currentAgentThread()
+  if (!thread || !childId) return
+  const scroll = agentThreadState(childId)
+  scroll.pinned = true
+  scroll.hasNew = false
+  updateAgentScrollBottomButton(childId)
+  thread.scrollTo({ top: thread.scrollHeight, behavior: smooth ? 'smooth' : 'auto' })
+  requestAnimationFrame(() => {
+    const current = currentAgentThread()
+    if (!current) return
+    scroll.top = current.scrollTop
+    scroll.scrollHeight = current.scrollHeight
+    updateAgentScrollBottomButton(childId)
+  })
+}
+
+/** 用户真实滚动：上滑立即停止跟随；滑回底部恢复跟随。 */
+function onAgentThreadScroll(event) {
+  const thread = event.target
+  if (!thread || !thread.classList || !thread.classList.contains('agent-chat-thread')) return
+  const childId = state.agentSelectedId
+  if (!childId) return
+  const scroll = agentThreadState(childId)
+  const top = thread.scrollTop
+  const distance = agentThreadDistanceToBottom(thread)
+  if (top < scroll.top - 1) {
+    scroll.pinned = false
+  } else if (top > scroll.top + 1 && distance <= SCROLL_STICK_THRESHOLD) {
+    scroll.pinned = true
+    scroll.hasNew = false
+  }
+  scroll.top = top
+  scroll.scrollHeight = thread.scrollHeight
+  updateAgentScrollBottomButton(childId)
+}
+
 /** 右侧预览：一个子 Agent 与父 Agent 的对话流，父右子左。 */
 function agentDetailHtml(run) {
   const status = run.status || 'running'
-  const thread = (run.thread || []).map(agentThreadEntryHtml).join('')
+  const thread = agentChatThreadHtml(run)
   const model = run.modelName || run.modelId || '自动分配'
   const key = run.key || ''
   const facts = [
@@ -3049,7 +3444,7 @@ function agentDetailHtml(run) {
     run.durationMs ? `<span class="agent-chat-fact">${formatElapsed(run.durationMs)}</span>` : '',
   ].filter(Boolean).join('')
   const hint = status === 'waiting'
-    ? '子 Agent 正在等父 Agent 回答'
+    ? '子 Agent 正在等主 Agent 回答'
     : status === 'running'
       ? '子 Agent 正在工作，过程会实时出现在这里'
       : '本轮结束；继续对话会复用这个子 Agent 的上下文'
@@ -3058,7 +3453,7 @@ function agentDetailHtml(run) {
       <div class="agent-chat-head-main">
         <span class="agent-chat-index">AGENT ${String(run.index || 1).padStart(2, '0')}</span>
         <strong class="agent-chat-title" title="${esc(run.title)}">${esc(run.title)}</strong>
-        ${key ? `<span class="agent-chat-key" title="父 Agent 用这个 key 继续对话">${esc(key)}</span>` : ''}
+        ${key ? `<span class="agent-chat-key" title="主 Agent 用这个 key 继续对话">${esc(key)}</span>` : ''}
       </div>
       <span class="agent-chat-state"><span class="agent-status-dot" aria-hidden="true"></span>${agentStatusText(status)}</span>
     </header>
@@ -3068,8 +3463,14 @@ function agentDetailHtml(run) {
     </div>
     <footer class="agent-chat-foot">
       <span class="agent-chat-hint">${esc(hint)}</span>
+      <span class="agent-scroll-slot">
+        <button class="agent-scroll-bottom" type="button" data-agent-scroll-bottom title="回到最新消息" aria-label="回到最新消息" hidden>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <i class="agent-scroll-dot" aria-hidden="true"></i>
+        </button>
+      </span>
       ${run.error ? `<span class="agent-chat-error" title="${esc(run.error)}">${esc(run.error)}</span>` : ''}
-      ${status === 'running' || status === 'waiting' ? '' : `<button class="agent-chat-continue" type="button" data-agent-continue="${esc(key)}" title="让父 Agent 继续和这个子 Agent 对话">继续对话</button>`}
+      ${status === 'running' || status === 'waiting' ? '' : `<button class="agent-chat-continue" type="button" data-agent-continue="${esc(key)}" title="让主 Agent 继续和这个子 Agent 对话">继续对话</button>`}
     </footer>
   </article>`
 }
@@ -3095,7 +3496,10 @@ function renderAgentDock() {
   const empty = $('#team-empty')
   if (empty) empty.hidden = runs.length > 0
   if (split) split.hidden = runs.length === 0
+  let selectedChildId = ''
+  let selectionChanged = false
   if (runs.length === 0) {
+    if (state.agentSelectedId) state.agentScroll.delete(state.agentSelectedId)
     state.agentSelectedId = ''
     list.innerHTML = ''
     detail.innerHTML = ''
@@ -3111,7 +3515,7 @@ function renderAgentDock() {
           : `${runs.length} 个子 Agent · 已全部完成`
     }
     const parent = $('#team-manager-name')
-    if (parent) parent.textContent = `父 Agent · ${state.agentParentName || '当前对话'}`
+    if (parent) parent.textContent = `主 Agent · ${state.agentParentName || '当前对话'}`
     // 选中项失效（被注销）时回落到运行中的第一个，否则第一个
     const previousSelectedId = state.agentSelectedId
     let selected = runs.find((run) => run.childId === state.agentSelectedId)
@@ -3121,13 +3525,30 @@ function renderAgentDock() {
         || runs[0]
       state.agentSelectedId = selected.childId
     }
-    // 切到别的 Agent 时从顶部读，避免沿用上一个窗口的滚动位置
-    const scrollTop = selected.childId === previousSelectedId ? detail.scrollTop : 0
+    selectedChildId = selected.childId
+    selectionChanged = selected.childId !== previousSelectedId
+    if (selectionChanged) {
+      // 已完成的窗口被用户切走后，才按空闲期收尾；当前选中窗口一直保留，
+      // 这样用户还能上滑看父子对话历史，不会被 2 分钟自动注销打断。
+      const previous = state.agentRuns.get(previousSelectedId)
+      if (previous && (previous.status || 'running') !== 'running' && previous.status !== 'waiting') {
+        scheduleAgentRetire(previousSelectedId, previous.updatedAt || Date.now())
+      }
+      // 和主对话切换会话一致：切到另一个子 Agent 时从最新消息开始看。
+      const scroll = agentThreadState(selected.childId)
+      scroll.pinned = true
+      scroll.hasNew = false
+      scroll.top = 0
+      scroll.scrollHeight = 0
+    } else {
+      // 流式重渲染前先保住用户当前的位置，渲染后按同一状态还原。
+      captureAgentThreadScroll(selected.childId)
+    }
     list.innerHTML = runs.map((run) => agentListRowHtml(run, run.childId === selected.childId)).join('')
     detail.innerHTML = agentDetailHtml(selected)
-    detail.scrollTop = scrollTop
   }
   syncWorkbenchLayout()
+  if (selectedChildId) restoreAgentThreadScroll(selectedChildId, selectionChanged)
 }
 
 function resetAgentRuns() {
@@ -3135,6 +3556,7 @@ function resetAgentRuns() {
     if (run.retireTimer) clearTimeout(run.retireTimer)
   }
   state.agentRuns.clear()
+  state.agentScroll.clear()
   state.agentSelectedId = ''
   state.agentParentRunId = ''
   state.agentParentName = ''
@@ -5458,6 +5880,25 @@ function bindWorkbenchTabs() {
     state.agentSelectedId = childId
     renderAgentDock()
   })
+  // 子 Agent 的思考/工具入口：和主对话一样单行折叠，点一下展开完整内容。
+  $('#team-detail')?.addEventListener('click', (event) => {
+    const block = event.target.closest('[data-agent-cot-toggle], .agent-cot-block .tool-head')?.closest('.agent-cot-block')
+    if (!block) return
+    const key = block.getAttribute('data-agent-panel-key') || ''
+    const panel = block.querySelector('.think-panel, .tool-panel')
+    if (!panel) return
+    const collapsed = panel.classList.toggle('is-collapsed')
+    const button = panel.querySelector('.think-head, .tool-head')
+    if (button) button.setAttribute('aria-expanded', String(!collapsed))
+    if (key) state.agentPanelOpen.set(key, !collapsed)
+  })
+  // 子 Agent 窗口的滚动和主对话同一套规则：上滑看历史时停止跟随，滑回底部恢复。
+  $('#team-detail')?.addEventListener('scroll', onAgentThreadScroll, true)
+  $('#team-detail')?.addEventListener('click', (event) => {
+    const scrollButton = event.target.closest('[data-agent-scroll-bottom]')
+    if (!scrollButton) return
+    scrollAgentThreadToBottom(state.agentSelectedId, true)
+  })
   // 「继续派活」：把这个子 Agent 的 key 写进输入框，父 Agent 拿到后就会用 agent_task 复用它
   $('#team-detail')?.addEventListener('click', (event) => {
     const button = event.target.closest('[data-agent-continue]')
@@ -5605,33 +6046,180 @@ function safeFileName(file) {
   return `粘贴文件-${Date.now()}.${ext}`
 }
 
+const MAX_TEXT_ATTACHMENT_BYTES = 4_800_000
+
 async function readTextAttachment(file) {
-  const slice = file.size > 1024 * 1024 ? file.slice(0, 1024 * 1024) : file
-  const text = await slice.text()
-  return text.slice(0, 12000)
+  // 完整正文交给服务端落批次；超过单文件读取上限时明确拒绝，避免静默只读前一段。
+  if (file.size > MAX_TEXT_ATTACHMENT_BYTES) {
+    throw new Error(`文本附件超过 ${MAX_TEXT_ATTACHMENT_BYTES / 1_000_000}MB 读取上限`)
+  }
+  return file.text()
+}
+
+/* 云空间上传进度 */
+function wsUploadStateText(item) {
+  if (item.status === 'pending') return '等待上传'
+  if (item.status === 'preparing') return '读取中'
+  if (item.status === 'uploading') return item.progress > 0 ? `${Math.max(0, Math.min(99, Math.round(item.progress)))}%` : '处理中'
+  if (item.status === 'done') return '已上传'
+  if (item.status === 'error') return '失败'
+  return ''
+}
+
+function wsUploadSummary(items) {
+  const total = items.length
+  const done = items.filter((item) => item.status === 'done').length
+  const failed = items.filter((item) => item.status === 'error').length
+  if (items.some((item) => item.status === 'uploading' || item.status === 'preparing' || item.status === 'pending')) {
+    return `正在上传 ${Math.min(total, done + failed + 1)} / ${total}`
+  }
+  if (failed) return `${done} 个成功 · ${failed} 个失败`
+  return `已上传 ${done} 个文件到云空间`
+}
+
+function renderWorkspaceUploads() {
+  const box = $('#ws-upload-status')
+  if (!box) return
+  const items = state.wsUploads || []
+  if (!items.length) {
+    box.hidden = true
+    box.innerHTML = ''
+    return
+  }
+  box.hidden = false
+  const allDone = items.every((item) => item.status === 'done')
+  const hasError = items.some((item) => item.status === 'error')
+  box.classList.toggle('has-error', hasError)
+  box.innerHTML = `
+    <div class="ws-upload-head">
+      <span class="ws-upload-title">${esc(wsUploadSummary(items))}</span>
+      <button class="ws-upload-close" type="button" data-ws-upload-close aria-label="关闭上传进度">×</button>
+    </div>
+    <div class="ws-upload-list">
+      ${items.map((item) => {
+        const percent = Math.max(0, Math.min(100, Number(item.progress) || 0))
+        const active = item.status === 'uploading' || item.status === 'preparing'
+        const visualPercent = item.status === 'preparing' ? 35 : item.status === 'uploading' && percent <= 0 ? 22 : percent
+        const barClass = item.status === 'done' ? ' is-done' : item.status === 'error' ? ' is-error' : ''
+        const fillClass = item.status === 'done' ? ' is-done' : item.status === 'error' ? ' is-error' : active ? ' is-active' : ''
+        return `
+          <div class="ws-upload-item" data-ws-upload-key="${esc(item.id)}">
+            <div class="ws-upload-row">
+              <span class="ws-upload-name" title="${esc(item.name)}">${esc(item.name)}</span>
+              <span class="ws-upload-state">${esc(wsUploadStateText(item))}</span>
+            </div>
+            <div class="ws-upload-bar${barClass}" role="progressbar" aria-label="${esc(item.name)} 上传进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(percent)}" aria-valuetext="${esc(wsUploadStateText(item))}">
+              <span class="ws-upload-fill${fillClass}" style="width:${visualPercent}%"></span>
+            </div>
+            ${item.error ? `<div class="ws-upload-error">${esc(item.error)}</div>` : ''}
+          </div>`
+      }).join('')}
+    </div>`
+  if (!allDone && !hasError) return
+  window.clearTimeout(state.wsUploadHideTimer)
+  if (allDone) {
+    state.wsUploadHideTimer = window.setTimeout(() => {
+      state.wsUploads = []
+      renderWorkspaceUploads()
+    }, 5000)
+  }
+}
+
+function setWorkspaceUploadItem(id, patch) {
+  const item = (state.wsUploads || []).find((entry) => entry.id === id)
+  if (!item) return
+  Object.assign(item, patch)
+  renderWorkspaceUploads()
+}
+
+function uploadWorkspaceFileWithProgress(file, contentBase64, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', `/api/workspace/files${qs()}`, true)
+    xhr.setRequestHeader('content-type', 'application/json')
+    xhr.setRequestHeader('accept', 'application/json')
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable && event.total > 0) onProgress(Math.min(99, (event.loaded / event.total) * 100))
+    }
+    xhr.onload = () => {
+      let payload = null
+      try { payload = JSON.parse(xhr.responseText || 'null') } catch { payload = null }
+      if (xhr.status >= 200 && xhr.status < 300 && (!payload || payload.ok !== false)) {
+        resolve(payload?.data)
+        return
+      }
+      const error = new Error(
+        payload?.error?.message || payload?.message || `上传失败（HTTP ${xhr.status || 0}）`,
+      )
+      error.code = payload?.error?.code || payload?.code
+      error.hint = payload?.error?.hint || payload?.hint
+      error.status = xhr.status
+      if (xhr.status === 401 && !isLoginSurface()) redirectToLogin()
+      reject(error)
+    }
+    xhr.onerror = () => reject(new Error('网络中断，文件未上传'))
+    xhr.onabort = () => reject(new Error('上传已取消'))
+    xhr.send(JSON.stringify({
+      name: file.name,
+      mime: file.type || undefined,
+      contentBase64,
+    }))
+  })
 }
 
 async function uploadWorkspaceFiles(fileList) {
-  for (const file of fileList) {
-    if (file.size > 50 * 1024 * 1024) {
-      alert(`${file.name} 超过 50 MB，已跳过`)
-      continue
+  const files = Array.from(fileList || [])
+  if (!files.length) return
+  const uploadButton = $('#ws-upload')
+  if (uploadButton?.disabled) return
+  window.clearTimeout(state.wsUploadHideTimer)
+  const stamp = Date.now()
+  state.wsUploads = files.map((file, index) => ({
+    id: `${stamp}-${index}`,
+    name: file.name || `未命名文件 ${index + 1}`,
+    size: file.size,
+    progress: 0,
+    status: 'pending',
+    error: '',
+  }))
+  if (uploadButton) {
+    uploadButton.disabled = true
+    uploadButton.setAttribute('aria-busy', 'true')
+  }
+  renderWorkspaceUploads()
+
+  try {
+    for (let index = 0; index < files.length; index += 1) {
+      const file = files[index]
+      const item = state.wsUploads[index]
+      if (!item) continue
+      if (file.size > 50 * 1024 * 1024) {
+        setWorkspaceUploadItem(item.id, { status: 'error', error: '超过 50 MB，未上传' })
+        continue
+      }
+      try {
+        setWorkspaceUploadItem(item.id, { status: 'preparing', progress: 0 })
+        const base64 = await readAsBase64(file)
+        setWorkspaceUploadItem(item.id, { status: 'uploading', progress: 0 })
+        await uploadWorkspaceFileWithProgress(file, base64, (progress) => {
+          setWorkspaceUploadItem(item.id, { status: 'uploading', progress })
+        })
+        setWorkspaceUploadItem(item.id, { status: 'done', progress: 100 })
+      } catch (err) {
+        setWorkspaceUploadItem(item.id, {
+          status: 'error',
+          progress: 0,
+          error: `${err.message || '上传失败'}${err.hint ? `；${err.hint}` : ''}`,
+        })
+      }
     }
-    try {
-      await api(`/api/workspace/files${qs()}`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          name: file.name,
-          mime: file.type || undefined,
-          contentBase64: await readAsBase64(file),
-        }),
-      })
-    } catch (err) {
-      alert(`${file.name} 上传失败：${err.message}`)
+    await loadWorkspaceFiles()
+  } finally {
+    if (uploadButton) {
+      uploadButton.disabled = false
+      uploadButton.removeAttribute('aria-busy')
     }
   }
-  await loadWorkspaceFiles()
 }
 
 /* ---------------- 左侧账号信息 ---------------- */
@@ -5938,6 +6526,7 @@ function setChatMode(mode) {
   $('#thread').hidden = next !== 'chat'
   $('.composer').hidden = next !== 'chat'
   $('#workspace-pane').hidden = next !== 'workspace'
+  syncWorkbenchLayout()
   for (const button of $('#mode-switch').querySelectorAll('[data-mode]')) {
     const active = button.dataset.mode === next
     button.classList.toggle('is-active', active)
@@ -6405,30 +6994,100 @@ function openMyPluginUninstall(plugin) {
     <div class="plugin-danger-zone" style="margin-top:4px">
       <div><strong>确认从个人工作台卸载？</strong><span>插件文件不会被删除，公司级安装和别人的工作台不受影响；之后可以重新安装。</span></div>
     </div>
+    <div class="install-progress" id="mu-progress" hidden aria-live="polite">
+      <div class="install-progress-track"><span class="install-progress-bar"></span></div>
+      <div class="install-progress-meta">
+        <span id="mu-progress-text">正在卸载…</span>
+        <span id="mu-progress-time" class="mono">0s</span>
+      </div>
+    </div>
+    <div class="modal-state" id="mu-state"></div>
     <div class="modal-actions">
       <button class="btn ghost" type="button" data-my-uninstall-cancel>取消</button>
       <button class="btn danger" type="button" data-my-uninstall-confirm>卸载</button>
     </div>
   </div>`
   document.body.appendChild(overlay)
-  const close = () => overlay.remove()
+  const progressEl = overlay.querySelector('#mu-progress')
+  const progressText = overlay.querySelector('#mu-progress-text')
+  const progressTime = overlay.querySelector('#mu-progress-time')
+  const stateEl = overlay.querySelector('#mu-state')
+  const confirmButton = overlay.querySelector('[data-my-uninstall-confirm]')
+  const cancelButton = overlay.querySelector('[data-my-uninstall-cancel]')
+  const closeButton = overlay.querySelector('.modal-x')
+  let progressTimer = null
+  let progressStartedAt = 0
+  let busy = false
+
+  const stopProgressClock = () => {
+    if (progressTimer) clearInterval(progressTimer)
+    progressTimer = null
+  }
+  const setBusy = (next) => {
+    busy = next
+    confirmButton.disabled = next
+    cancelButton.disabled = next
+    closeButton.disabled = next
+    confirmButton.textContent = next ? '卸载中…' : '卸载'
+  }
+  const startProgress = (text) => {
+    stopProgressClock()
+    progressStartedAt = Date.now()
+    progressEl.hidden = false
+    progressEl.classList.remove('is-done')
+    progressText.textContent = text
+    progressTime.textContent = '0s'
+    stateEl.className = 'modal-state'
+    stateEl.textContent = ''
+    setBusy(true)
+    progressTimer = setInterval(() => {
+      const seconds = Math.max(0, Math.floor((Date.now() - progressStartedAt) / 1000))
+      progressTime.textContent = `${seconds}s`
+    }, 500)
+  }
+  const completeProgress = (text) => {
+    stopProgressClock()
+    progressEl.hidden = false
+    progressEl.classList.add('is-done')
+    progressText.textContent = text
+    progressTime.textContent = '完成'
+  }
+  const failProgress = () => {
+    stopProgressClock()
+    progressEl.hidden = true
+    setBusy(false)
+  }
+  const close = (force = false) => {
+    if (busy && !force) return
+    stopProgressClock()
+    overlay.remove()
+  }
   overlay.addEventListener('click', (event) => {
     if (event.target === overlay || event.target.closest('[data-my-uninstall-cancel]') || event.target.closest('.modal-x')) close()
   })
-  overlay.querySelector('[data-my-uninstall-confirm]').addEventListener('click', async (event) => {
-    const button = event.currentTarget
-    button.disabled = true
+  confirmButton.addEventListener('click', async () => {
+    if (busy) return
+    startProgress('正在解除你的个人安装…')
     try {
       await api(`/api/my/plugins/${encodeURIComponent(plugin.id)}/uninstall${qs()}`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: '{}',
       })
-      close()
-      await loadMyPlugins()
+      completeProgress('卸载完成，正在刷新个人工作台…')
+      try {
+        await loadMyPlugins()
+      } catch {
+        // 卸载已经成功；列表刷新失败不改变结果，也不阻止自动关闭。
+      }
+      await new Promise((resolve) => setTimeout(resolve, 900))
+      busy = false
+      close(true)
       banner('已卸载个人插件', 'ok')
     } catch (err) {
-      button.disabled = false
+      failProgress()
+      stateEl.className = 'modal-state bad'
+      stateEl.textContent = `${err.message}${err.code ? `（${err.code}）` : ''}`
       banner(`卸载失败：${err.message}`, 'bad')
     }
   })
@@ -6624,6 +7283,7 @@ function mySkillDetailHtml(data, skill) {
   const triggers = skill.triggers || []
   const references = skill.references || []
   const install = skill.install || {}
+  const instructionPreview = String(skill.instructionPreview || '').trim()
   const blocked = !skill.valid
   return `<section class="panel plugin-detail">
     <div class="plugin-detail-head">
@@ -6650,10 +7310,20 @@ function mySkillDetailHtml(data, skill) {
         <div><span>安装范围</span><strong>个人安装（只影响我）</strong></div>
         <div><span>安装方式</span><strong>${esc(install.source === 'browser-dir' ? '本机文件夹' : install.source || '个人安装')}</strong></div>
         <div><span>安装时间</span><strong>${esc(workspaceFileDate(install.installedAt))}</strong></div>
+        <div><span>最近更新</span><strong>${esc(workspaceFileDate(install.updatedAt))}</strong></div>
         <div><span>校验和</span><span class="mono">${esc(skill.checksum || '—')}</span></div>
       </div>
       <div class="plugin-note">${esc(skill.description || '没有技能说明')}</div>
     </div>
+    ${
+      instructionPreview
+        ? `<div class="plugin-block">
+      <h3>技能说明 <span class="muted my-skill-doc-count">${esc(formatCount(Number(skill.instructionChars) || instructionPreview.length))} 字符</span></h3>
+      <pre class="my-skill-doc">${esc(instructionPreview)}</pre>
+      <div class="plugin-note">这是安装后的实际 SKILL.md 内容；改完文件再 install，刷新或稍等即可看到新版本。</div>
+    </div>`
+        : ''
+    }
     <div class="plugin-block">
       <h3>安全与隔离</h3>
       ${blocked ? `<div class="plugin-page-blocked"><strong>技能已被拦截</strong><span>${esc(skill.error || '技能包没有通过安全扫描')}。检查 .quarantine 中的记录，修复后重新安装。</span></div>` : ''}
@@ -6716,6 +7386,35 @@ function renderMySkillWorkspace() {
   bindMySkillWorkspace()
 }
 
+function mySkillSignature(data) {
+  return JSON.stringify((data?.skills || []).map((item) => [item.id, item.checksum, item.enabled, item.valid]))
+}
+
+let mySkillWatchTimer = 0
+
+/** 技能工作台只读轮询：Agent 热安装后，已打开的详情页自动刷新校验和与 SKILL.md。 */
+function scheduleMySkillWatch() {
+  window.clearTimeout(mySkillWatchTimer)
+  if (state.mode !== 'workspace' || state.workspaceKind !== 'skills') return
+  mySkillWatchTimer = window.setTimeout(async () => {
+    if (state.mode !== 'workspace' || state.workspaceKind !== 'skills') return
+    try {
+      const next = await api(`/api/my/skills${qs()}`)
+      if (mySkillSignature(next) !== mySkillSignature(state.skillData)) {
+        state.skillData = next
+        state.skills = Array.isArray(next.skills) ? next.skills : []
+        if (!state.skillSelected || !state.skills.some((item) => item.id === state.skillSelected)) {
+          state.skillSelected = state.skills[0]?.id ?? null
+        }
+        renderMySkillWorkspace()
+      }
+    } catch {
+      /* 轮询失败不覆盖当前详情；下一轮继续 */
+    }
+    scheduleMySkillWatch()
+  }, 5_000)
+}
+
 async function loadMySkills() {
   const rail = $('#my-plugin-rail')
   const detail = $('#my-plugin-detail')
@@ -6730,6 +7429,7 @@ async function loadMySkills() {
       state.skillSelected = state.skills[0]?.id ?? null
     }
     renderMySkillWorkspace()
+    scheduleMySkillWatch()
   } catch (err) {
     rail.innerHTML = `<div class="plugin-empty bad">读取技能失败：${esc(err.message)}</div>`
     detail.innerHTML = `<div class="plugin-empty bad">读取技能失败：${esc(err.message)}</div>`
@@ -7088,6 +7788,19 @@ function bindWorkspaceKindSwitch() {
   for (const button of document.querySelectorAll('#workspace-kind-switch [data-workspace-kind]')) {
     button.onclick = () => setWorkspaceKind(button.dataset.workspaceKind)
   }
+}
+
+/** 技能工具卡的 previewPath 用 ?workspace=skills&skill=<id> 直达技能工作台详情。 */
+function applyWorkspaceDeepLink() {
+  const params = new URLSearchParams(location.search)
+  if (params.get('workspace') !== 'skills') return false
+  const skillId = String(params.get('skill') || '').trim()
+  const settingsStage = $('#settings-stage')
+  if (settingsStage && !settingsStage.hidden) hideSettings()
+  state.skillSelected = skillId || null
+  setWorkspaceKind('skills')
+  setChatMode('workspace')
+  return true
 }
 
 function ensureHintTip() {
@@ -7838,13 +8551,51 @@ function renderSuggestions() {
   }
 }
 
+function formatCount(value) {
+  const number = Math.max(0, Number(value) || 0)
+  return number.toLocaleString('zh-CN')
+}
+
+/** 批次数据接管卡：只说明“数据在哪、多大、能保留多久”，正文不塞进消息。 */
+function batchCardHtml(batch, options = {}) {
+  const id = String(batch?.id || batch?.batchId || '').trim()
+  if (!id) return ''
+  const rows = Math.max(0, Number(batch?.totalRows) || 0)
+  const chars = Math.max(0, Number(batch?.chars ?? batch?.batchChars) || 0)
+  const isText = batch?.kind === 'text' || rows === 0
+  const kind = isText ? '文本批次' : '记录批次'
+  const size = isText
+    ? `${formatCount(chars)} 字符`
+    : `${formatCount(rows)} 行 · ${formatCount(chars)} 字符`
+  const source = String(options.name || '').trim()
+  return `<div class="batch-card" data-batch-id="${esc(id)}" role="group" aria-label="批次数据接管：${esc(kind)} ${esc(size)}">
+    <div class="batch-card-head">
+      <span class="batch-card-pill">数据接管</span>
+      <span class="batch-card-kind">${esc(kind)} · ${esc(size)}</span>
+    </div>
+    ${source ? `<div class="batch-card-source">${esc(source)}</div>` : ''}
+    <div class="batch-card-id"><span>批次</span><code>${esc(id)}</code></div>
+    <div class="batch-card-foot"><span>保留 24 小时</span><span>完整数据留在本地，不进入消息上下文</span><span>模型可按需 batch_read / batch_analyze</span></div>
+  </div>`
+}
+
 function attachmentChips(list) {
-  return list
+  const chips = list
     .map(
       (file) =>
-        `<span>${esc(file.name)} · ${esc(fmtSize(file.size))}</span>`,
+        `<span>${esc(file.name)} · ${esc(fmtSize(file.size))}${file.batchId ? ' · 已接管' : ''}</span>`,
     )
     .join('')
+  const batches = list
+    .filter((file) => file.batchId)
+    .map((file) =>
+      batchCardHtml(
+        { id: file.batchId, kind: 'text', totalRows: 0, chars: file.batchChars ?? file.chars },
+        { name: file.name },
+      ),
+    )
+    .join('')
+  return chips + batches
 }
 
 function formatElapsed(ms) {
@@ -7882,18 +8633,309 @@ function toolStatusText(trace) {
   return `完成 · ${formatElapsed(trace.durationMs)}`
 }
 
-function toolDetailHtml(trace) {
-  return `<div class="tool-detail ${trace.status === 'error' ? 'is-error' : ''}" data-tool-detail="${esc(trace.id)}">
-    <div class="tool-detail-head">
-      <strong>${esc(trace.name)}</strong>
-      <span class="tool-detail-status">${esc(toolStatusText(trace))}</span>
+function toolDisplayName(name) {
+  const raw = String(name || '')
+  if (raw === 'batch_analyze') return '全量分批分析'
+  if (raw === 'batch_read') return '分页读取批次'
+  if (raw === 'workspace_search' || raw === 'workspace.search' || raw === '搜索工作区文件') return '检索文件'
+  if (raw === 'workspace_read' || raw === 'workspace.read' || raw === '读取工作区文件') return '按行读取'
+  if (raw === 'workspace_edit' || raw === 'workspace.edit' || raw === '编辑工作区文件') return '局部编辑'
+  if (raw === 'workspace_write' || raw === 'workspace.write' || raw === '写入工作区文件') return '写入文件'
+  if (raw === 'project_exec' || raw === 'project.exec' || raw === '执行项目命令') return '运行命令'
+  if (raw === 'project_job' || raw === 'project.job' || raw === '项目后台任务') return '后台任务'
+  if (raw === 'plugin_dev' || raw === 'plugin.dev' || raw === '自开发插件') return '自开发插件'
+  if (raw === 'skill_dev' || raw === 'skill.dev' || raw === '自开发技能') return '自开发技能'
+  return raw
+}
+
+/** 批次与文件工具只占一行：显示范围、命中或批次数，而不是原始 JSON。 */
+function toolInlineLabel(trace) {
+  if (trace?.view && trace.view.kind === 'plugin') {
+    const title = String(trace.view.title || trace.view.pluginId || '').trim()
+    const version = String(trace.view.version || '').trim()
+    return ['已热安装', title, version ? `v${version}` : ''].filter(Boolean).join(' · ')
+  }
+  if (trace?.view && trace.view.kind === 'skill') {
+    const title = String(trace.view.title || trace.view.skillId || '').trim()
+    const version = String(trace.view.version || '').trim()
+    return ['已热安装技能', title, version ? `v${version}` : ''].filter(Boolean).join(' · ')
+  }
+  const summary = String(trace.summary || '').split('\n')[0]
+  if (!summary) return toolDisplayName(trace.name)
+  if (trace.name === 'batch_analyze') {
+    const parts = summary.split('｜')
+    return ['全量分析', parts[1], parts[2]].filter(Boolean).join(' · ')
+  }
+  if (trace.name === 'batch_read') {
+    const detail = summary.replace(/^批次 [^｜]+｜/, '')
+    return `读取批次 · ${detail}`
+  }
+  if (trace.toolId === 'workspace.read' || trace.name === '读取工作区文件') {
+    const view = trace.view && trace.view.kind === 'read' ? trace.view : null
+    const result = view || parseToolSummaryObject(trace) || {}
+    const path = String(view?.path || result.path || trace.args?.path || '').trim()
+    if (!path) return toolDisplayName(trace.name)
+    const takeover = trace.batch
+      ? ` · 已接管 ${trace.batch.kind === 'text' ? `${formatCount(trace.batch.chars)} 字符` : `${formatCount(trace.batch.totalRows)} 行`}`
+      : ''
+    const startLine = Math.max(1, Number(result.startLine) || 1)
+    const endLine = Math.max(0, Number(result.endLine) || 0)
+    const totalLines = Math.max(0, Number(result.totalLines) || 0)
+    if (!totalLines) return `读取 ${path}${takeover}`
+    if (startLine === 1 && endLine >= totalLines && !result.truncatedByBytes && !result.truncated) {
+      return `读取 ${path} · 全文 ${totalLines} 行${takeover}`
+    }
+    if (endLine < startLine) return `读取 ${path}${takeover}`
+    const remaining = Math.max(0, totalLines - endLine)
+    return `读取 ${path} · 第 ${startLine}–${endLine} 行 / 共 ${totalLines} 行${remaining > 0 ? `（剩余 ${remaining}）` : ''}${takeover}`
+  }
+  if (trace.toolId === 'workspace.edit' || trace.name === '编辑工作区文件') {
+    const result = parseToolSummaryObject(trace) || {}
+    const path = String(result.path || trace.args?.path || '').trim()
+    if (!path) return toolDisplayName(trace.name)
+    const changes = Math.max(0, Number(result.changes) || 0)
+    const added = Math.max(0, Number(trace.diff?.added) || 0)
+    const removed = Math.max(0, Number(trace.diff?.removed) || 0)
+    const diffStat = trace.diff ? ` · +${added} −${removed}` : ''
+    return `编辑 ${path}${changes > 0 ? ` · ${changes} 处变更` : ''}${diffStat}`
+  }
+  if (trace.toolId === 'project.exec' || trace.name === '执行项目命令') {
+    const result = parseToolSummaryObject(trace) || {}
+    const command = String(trace.args?.command || result.command || '').replace(/\s+/g, ' ').trim()
+    const exitCode = Number(result.exitCode)
+    const shortCommand = command.length > 48 ? `${command.slice(0, 48)}…` : command
+    const status = result.timedOut ? '超时' : result.status === 'failed' || (!Number.isNaN(exitCode) && exitCode !== 0) ? `exit ${result.exitCode ?? '失败'}` : '成功'
+    return `运行 ${shortCommand || '命令'} · ${status}`
+  }
+  if (trace.toolId === 'project.job' || trace.name === '项目后台任务') {
+    const result = parseToolSummaryObject(trace) || {}
+    const action = String(trace.args?.action || 'output')
+    const job = result.job && typeof result.job === 'object' ? result.job : result
+    const status = String(job.status || '')
+    return ['后台任务', action, status].filter(Boolean).join(' · ')
+  }
+  if (summary.startsWith('搜索“')) {
+    const view = trace.view && trace.view.kind === 'search' ? trace.view : null
+    if (view) {
+      const first = view.matches[0]
+      const countText = view.total > view.count
+        ? `显示 ${formatCount(view.count)} / 共 ${formatCount(view.total)} 处命中`
+        : `${formatCount(view.total)} 处命中`
+      return [
+        `搜索“${view.query}”`,
+        `${countText}${view.truncated ? '（已截断）' : ''}`,
+        first ? `${first.path}:${first.line}` : '',
+      ].filter(Boolean).join(' · ')
+    }
+    const parts = summary.split('｜')
+    const first = String(parts[3] || '').replace(/^首个 /, '')
+    return [parts[0], parts[1], first].filter(Boolean).join(' · ')
+  }
+  if (summary.startsWith('读取 ')) return summary.replace('｜', ' · ')
+  if (trace.batch) {
+    const rows = Math.max(0, Number(trace.batch.totalRows) || 0)
+    const chars = Math.max(0, Number(trace.batch.chars) || 0)
+    const size = trace.batch.kind === 'text' || rows === 0
+      ? `${formatCount(chars)} 字符`
+      : `${formatCount(rows)} 行`
+    return `${toolDisplayName(trace.name)} · 已接管 ${size}`
+  }
+  return toolDisplayName(trace.name)
+}
+
+function toolDiffHtml(diff) {
+  const lines = Array.isArray(diff?.lines) ? diff.lines : []
+  if (lines.length === 0) return ''
+  const added = Math.max(0, Number(diff.added) || 0)
+  const removed = Math.max(0, Number(diff.removed) || 0)
+  const body = lines
+    .map((line) => {
+      const isAdd = line?.type === 'add'
+      return `<div class="tool-diff-line ${isAdd ? 'is-add' : 'is-del'}"><span class="tool-diff-sign" aria-hidden="true">${isAdd ? '+' : '-'}</span><span class="tool-diff-text">${esc(String(line?.text ?? ' ') || ' ')}</span></div>`
+    })
+    .join('')
+  return `<div class="tool-diff" role="group" aria-label="文件修改差异">
+    <div class="tool-diff-head">
+      <span>修改差异</span>
+      <span class="tool-diff-stat"><span class="tool-diff-add">+${added}</span><span class="tool-diff-del">−${removed}</span>${diff.truncated ? '<span class="tool-diff-more">已截断</span>' : ''}</span>
     </div>
-    <div class="tool-row"><span>参数</span><pre>${esc(prettyPayload(trace.args))}</pre></div>
+    <div class="tool-diff-body">${body}</div>
+  </div>`
+}
+
+function toolReadCardHtml(trace) {
+  const view = trace?.view && trace.view.kind === 'read' ? trace.view : null
+  if (!view) return ''
+  const source = String(view.previewText || '').replace(/\r\n/g, '\n').split('\n')
+  if (source.length > 1 && source[source.length - 1] === '') source.pop()
+  const startLine = Math.max(1, Number(view.startLine) || 1)
+  const endLine = Math.max(0, Number(view.endLine) || 0)
+  const totalLines = Math.max(0, Number(view.totalLines) || 0)
+  const remaining = Math.max(0, totalLines - endLine)
+  const rangeText = totalLines === 0
+    ? '空文件'
+    : `第 ${startLine}–${endLine} 行 / 共 ${formatCount(totalLines)} 行${remaining > 0 ? `（剩余 ${formatCount(remaining)}）` : ''}`
+  const rows = source
+    .map((line, index) => `<div class="tool-read-line"><span class="tool-read-no" aria-hidden="true">${startLine + index}</span><span class="tool-read-text">${esc(line || ' ')}</span></div>`)
+    .join('')
+  const notes = [
+    view.truncatedByBytes ? '达到 50 KB 输出上限' : '',
+    view.longLines > 0 ? `${formatCount(view.longLines)} 行超长已截断` : '',
+    view.previewLines >= 20 && endLine - startLine + 1 > 20 ? '仅显示前 20 行' : '',
+  ].filter(Boolean)
+  const next = view.nextOffset ? `<span class="tool-read-next">继续读取：offset=${formatCount(view.nextOffset)}</span>` : ''
+  return `<div class="tool-read" role="group" aria-label="按行读取：${esc(view.path)} ${esc(rangeText)}">
+    <div class="tool-read-head">
+      <span class="tool-read-kicker">按行读取</span>
+      <strong class="tool-read-path">${esc(view.path)}</strong>
+      <span class="tool-read-range">${esc(rangeText)}</span>
+    </div>
+    ${rows ? `<div class="tool-read-body">${rows}</div>` : '<div class="tool-read-empty">文件为空</div>'}
+    <div class="tool-read-foot">
+      <span>${esc(fmtSize(view.size))}</span>
+      ${notes.length > 0 ? `<span>${esc(notes.join('，'))}</span>` : ''}
+      ${next}
+    </div>
+  </div>`
+}
+
+function toolSearchCardHtml(trace) {
+  const view = trace?.view && trace.view.kind === 'search' ? trace.view : null
+  if (!view) return ''
+  const matches = Array.isArray(view.matches) ? view.matches : []
+  const groups = []
+  for (const match of matches) {
+    const path = String(match.path || '')
+    let group = groups.at(-1)
+    if (!group || group.path !== path) {
+      group = { path, matches: [] }
+      groups.push(group)
+    }
+    group.matches.push(match)
+  }
+  const rows = groups.map((group) => `<div class="tool-search-file">
+    <div class="tool-search-filehead">
+      <span class="tool-search-path">${esc(group.path)}</span>
+      <em class="tool-search-filecount">${formatCount(group.matches.length)} 处</em>
+    </div>
+    ${group.matches.map((match) => `<div class="tool-search-line">
+      <span class="tool-search-loc">${formatCount(match.line)}:${formatCount(match.column)}</span>
+      <span class="tool-search-text">${esc(match.text || ' ')}</span>
+    </div>`).join('')}
+  </div>`).join('')
+  const countText = view.total > view.count
+    ? `显示 ${formatCount(view.count)} 条 / 共 ${formatCount(view.total)} 处命中`
+    : `${formatCount(view.total)} 处命中`
+  const notes = [
+    view.path ? `范围 ${view.path}` : '整个工作区',
+    `扫描 ${formatCount(view.filesScanned)} 个文件`,
+    view.timeLimitHit ? '达到 30 秒搜索预算' : '',
+  ].filter(Boolean)
+  return `<div class="tool-search" role="group" aria-label="搜索：${esc(view.query)} ${esc(countText)}">
+    <div class="tool-search-head">
+      <span class="tool-search-kicker">搜索</span>
+      <strong class="tool-search-query">“${esc(view.query)}”</strong>
+      <span class="tool-search-count">${esc(countText)}${view.truncated ? '（已截断）' : ''}</span>
+    </div>
+    ${rows ? `<div class="tool-search-body">${rows}</div>` : '<div class="tool-search-empty">没有命中</div>'}
+    <div class="tool-search-foot">${esc(notes.join(' · '))}${view.total > matches.length ? ` · 仅展示前 ${matches.length} 条` : ''}</div>
+  </div>`
+}
+
+function toolPluginCardHtml(trace) {
+  const view = trace?.view && trace.view.kind === 'plugin' ? trace.view : null
+  if (!view || !view.previewPath) return ''
+  let preview = String(view.previewPath)
+  if (currentAs()) {
+    const url = new URL(preview, location.origin)
+    url.searchParams.set('as', currentAs())
+    preview = url.pathname + url.search
+  }
+  const meta = [
+    view.pluginId,
+    view.version ? `v${view.version}` : '',
+    view.checksum ? `指纹 ${view.checksum}` : '',
+    view.pageCount > 0 ? `${formatCount(view.pageCount)} 个页面` : '',
+  ].filter(Boolean).join(' · ')
+  return `<div class="tool-plugin" role="group" aria-label="自开发插件 ${esc(view.title || view.pluginId)}">
+    <div class="tool-plugin-head">
+      <span class="tool-plugin-badge">自开发插件 · 已热安装</span>
+      <strong class="tool-plugin-title">${esc(view.title || view.pluginId)}</strong>
+      <span class="tool-plugin-meta">${esc(meta)}</span>
+    </div>
+    ${view.directory ? `<div class="tool-plugin-src">源码 ${esc(view.directory)}</div>` : ''}
+    <iframe class="tool-plugin-frame" src="${esc(preview)}" title="${esc(view.title || view.pluginId)} 预览" loading="lazy"></iframe>
+    <div class="tool-plugin-foot">
+      <span>改完 client.js 再 install，页面会在 2 秒内自动刷新。</span>
+      <a href="${esc(preview)}" target="_blank" rel="noopener">新窗口打开</a>
+    </div>
+  </div>`
+}
+
+function toolSkillCardHtml(trace) {
+  const view = trace?.view && trace.view.kind === 'skill' ? trace.view : null
+  if (!view || !view.previewPath) return ''
+  let preview = String(view.previewPath)
+  if (currentAs()) {
+    const url = new URL(preview, location.origin)
+    url.searchParams.set('as', currentAs())
+    preview = url.pathname + url.search
+  }
+  const meta = [
+    view.skillId,
+    view.version ? `v${view.version}` : '',
+    view.checksum ? `指纹 ${view.checksum}` : '',
+    view.level ? view.level : '',
+    view.risk ? SKILL_RISK_LABEL[view.risk] || view.risk : '',
+    view.triggerCount > 0 ? `${formatCount(view.triggerCount)} 个触发词` : '',
+  ].filter(Boolean).join(' · ')
+  const instructions = String(view.instructionPreview || '').trim()
+  return `<div class="tool-skill" role="group" aria-label="自开发技能 ${esc(view.title || view.skillId)}">
+    <div class="tool-skill-head">
+      <span class="tool-skill-badge">自开发技能 · 已热安装</span>
+      <strong class="tool-skill-title">${esc(view.title || view.skillId)}</strong>
+      <span class="tool-skill-meta">${esc(meta)}</span>
+    </div>
+    ${view.directory ? `<div class="tool-skill-src">源码 ${esc(view.directory)}</div>` : ''}
+    ${
+      instructions
+        ? `<div class="tool-skill-body"><div class="tool-skill-body-head">SKILL.md 预览</div><pre class="tool-skill-doc">${esc(instructions)}</pre></div>`
+        : ''
+    }
+    <div class="tool-skill-foot">
+      <span>改完 SKILL.md 再 install，下一轮对话立即加载新版本。</span>
+      <a href="${esc(preview)}" target="_blank" rel="noopener">打开技能工作台</a>
+    </div>
+  </div>`
+}
+
+function toolDetailHtml(trace) {
+  const diffHtml = toolDiffHtml(trace.diff)
+  const result = parseToolSummaryObject(trace) || {}
+  const batchSource =
+    String(result.path || trace.args?.path || result.query || result.batchId || '').trim() ||
+    toolDisplayName(trace.name)
+  const batchHtml = batchCardHtml(trace.batch, { name: batchSource })
+  const readHtml = trace.status === 'error' ? '' : toolReadCardHtml(trace)
+  const searchHtml = trace.status === 'error' ? '' : toolSearchCardHtml(trace)
+  const fileOpHtml = trace.status === 'error' ? '' : (!readHtml && !searchHtml ? fileOperationCardHtml(trace) : '')
+  const pluginHtml = trace.status === 'error' ? '' : toolPluginCardHtml(trace)
+  const skillHtml = trace.status === 'error' ? '' : toolSkillCardHtml(trace)
+  const rawHtml = `<div class="tool-row"><span>参数</span><pre>${esc(prettyPayload(trace.args))}</pre></div>
     ${
       trace.summary
         ? `<div class="tool-row"><span>${trace.status === 'error' ? '错误' : '结果'}</span><pre>${esc(prettyPayload(trace.summary))}</pre></div>`
         : ''
-    }
+    }`
+  const structuredHtml = readHtml || searchHtml || fileOpHtml
+  const primaryHtml = diffHtml || pluginHtml || skillHtml || structuredHtml || batchHtml || rawHtml
+  return `<div class="tool-detail ${trace.status === 'error' ? 'is-error' : ''}" data-tool-detail="${esc(trace.id)}">
+    <div class="tool-detail-head">
+      <strong>${esc(toolDisplayName(trace.name))}</strong>
+      <span class="tool-detail-status">${esc(toolStatusText(trace))}</span>
+    </div>
+    ${primaryHtml}
+    ${(diffHtml || structuredHtml) && batchHtml ? batchHtml : ''}
   </div>`
 }
 
@@ -7903,15 +8945,21 @@ function toolPanelPreview(tools, active) {
   const running = tools.find((tool) => tool.status === 'running')
   if (active) {
     const current = running || tools.at(-1)
-    return current ? `${current.name} · 执行中` : ''
+    return current ? `${toolDisplayName(current.name)} · 执行中` : ''
   }
   const failed = tools.filter((tool) => tool.status === 'error').length
   if (tools.length === 1) {
     const only = tools[0]
-    return `${only.name}${only.status === 'error' ? ' · 失败' : ''}${only.durationMs > 0 ? ` · ${formatElapsed(only.durationMs)}` : ''}`
+    const label = toolInlineLabel(only)
+    return `${label}${only.status === 'error' ? ' · 失败' : ''}${only.durationMs > 0 ? ` · ${formatElapsed(only.durationMs)}` : ''}`
   }
   const totalMs = tools.reduce((sum, tool) => sum + (Number(tool.durationMs) || 0), 0)
-  return `${tools.length} 个${failed > 0 ? ` · ${failed} 个失败` : ''}${totalMs > 0 ? ` · ${formatElapsed(totalMs)}` : ''}`
+  const labels = tools.map((tool) => toolInlineLabel(tool)).filter(Boolean)
+  const sequence =
+    labels.length <= 2
+      ? labels.join(' → ')
+      : `${labels[0]} → … → ${labels[labels.length - 1]}`
+  return `${sequence}${tools.length > 2 ? ` · ${tools.length} 个` : ''}${failed > 0 ? ` · ${failed} 个失败` : ''}${totalMs > 0 ? ` · ${formatElapsed(totalMs)}` : ''}`
 }
 
 /* ---------------- Agent 文件操作预览 ---------------- */
@@ -8314,6 +9362,7 @@ function fileOperationInfo(trace) {
   if (!copy) return null
   const args = trace.args && typeof trace.args === 'object' ? trace.args : {}
   const summary = parseToolSummaryObject(trace) || {}
+  const view = trace.view && typeof trace.view === 'object' ? trace.view : null
   const rawPath = String(args.path || '').trim()
   const summaryPath = String(summary.path || summary.relPath || '').trim()
   const targetPath = kind === 'rename'
@@ -8325,7 +9374,7 @@ function fileOperationInfo(trace) {
   const fileId = kind === 'send' ? '' : String(summary.fileId || args.fileId || '').trim()
   const text = kind === 'write'
     ? String(args.text ?? '')
-    : (kind === 'read' ? String(summary.text ?? '') : (
+    : (kind === 'read' ? String(view?.previewText ?? summary.text ?? '') : (
       kind === 'edit' ? String(args.newText ?? summary.nextText ?? '') : (
         kind === 'insert' ? String(args.text ?? (Array.isArray(summary.insertedValues) ? summary.insertedValues.join(' ') : '') ?? '') : ''
       )
@@ -8352,6 +9401,11 @@ function fileOperationInfo(trace) {
     created,
     from,
     to,
+    startLine: view?.kind === 'read' ? Math.max(1, Number(view.startLine) || 1) : 0,
+    endLine: view?.kind === 'read' ? Math.max(0, Number(view.endLine) || 0) : 0,
+    totalLines: view?.kind === 'read' ? Math.max(0, Number(view.totalLines) || 0) : 0,
+    truncatedByBytes: view?.kind === 'read' && view.truncatedByBytes === true,
+    nextOffset: view?.kind === 'read' && view.nextOffset ? Math.max(1, Number(view.nextOffset) || 1) : 0,
     status: trace.status === 'running' ? 'running' : trace.status === 'error' ? 'error' : 'done',
     statusLabel: trace.status === 'running'
       ? copy.running
@@ -8406,10 +9460,16 @@ function fileOperationPreviewHtml(op) {
     const officeWarning = op.kind === 'write' && isOfficeFileName(op.name)
       ? '<div class="file-op-note is-warning">Agent 当前只能写入文本内容；Word / Excel / PPT 的内容级编辑请在右侧用 OnlyOffice 完成。</div>'
       : ''
+    const rangeText = op.kind === 'read' && op.totalLines
+      ? `第 ${op.startLine}–${op.endLine} 行 / 共 ${op.totalLines} 行`
+      : `${lines.length} 行`
+    const omittedText = op.kind === 'read' && op.truncatedByBytes
+      ? ' · 达到 50 KB 输出上限'
+      : omitted ? ' · 仅显示开头' : ''
     return `${officeWarning}<div class="file-op-preview">
       <div class="file-op-preview-head">
         <span>${op.kind === 'write' ? 'Agent 写入内容' : '读取内容'}</span>
-        <span>${lines.length} 行 · ${esc(fmtSize(size))}${omitted ? ' · 仅显示开头' : ''}</span>
+        <span>${rangeText} · ${esc(fmtSize(op.totalLines && op.kind === 'read' ? op.size || size : size))}${omittedText}</span>
       </div>
       <pre>${esc(shown)}${omitted ? '\n…' : ''}</pre>
     </div>`
@@ -10059,6 +11119,9 @@ function createAiTurn(options = {}) {
       trace.status = event.status
       trace.summary = event.summary
       trace.durationMs = event.durationMs
+      if (event.diff) trace.diff = event.diff
+      if (event.batch) trace.batch = event.batch
+      if (event.view) trace.view = event.view
       setStatus('')
       updateFileActivity(trace)
       renderToolPanel(toolTraces.some((item) => item.status === 'running'))
@@ -10266,6 +11329,10 @@ async function addFiles(fileList) {
     }
     const name = safeFileName(file)
     const type = file.type || 'application/octet-stream'
+    if (isTextLike(file) && file.size > MAX_TEXT_ATTACHMENT_BYTES) {
+      alert(`「${name}」超过单文件 4.8MB 的文本读取上限，无法保证完整读取；请拆分后再上传。`)
+      continue
+    }
     const entry = {
       name,
       size: file.size,
@@ -10280,7 +11347,8 @@ async function addFiles(fileList) {
         entry.text = await readTextAttachment(file)
         entry.readable = entry.text ? 'text' : 'none'
       } catch {
-        entry.readable = 'none'
+        alert(`「${name}」文本正文读取失败，请确认文件编码或拆分后重试。`)
+        continue
       }
     } else if (type.startsWith('image/')) {
       entry.readable = 'image'
@@ -10717,6 +11785,10 @@ async function drainQueue(runtime = currentRuntime()) {
               state.sessionId = data.sessionId
               persistChatLocation()
             }
+          }
+          if (data.attachments && item.node) {
+            const files = item.node.querySelector('.bubble-files')
+            if (files) files.innerHTML = attachmentChips(data.attachments)
           }
           turn.finish(data)
           syncMessageActionAvailability()
@@ -12140,9 +13212,16 @@ async function boot() {
   // 个人工作区
   $('#ws-upload').addEventListener('click', () => $('#ws-input').click())
   $('#ws-input').addEventListener('change', async (event) => {
-    const files = event.target.files || []
+    // FileList 是实时集合：先复制再清空 input，否则 next files.length 会变成 0。
+    const files = Array.from(event.target.files || [])
     event.target.value = ''
     if (files.length) await uploadWorkspaceFiles(files)
+  })
+  $('#ws-upload-status').addEventListener('click', (event) => {
+    if (!event.target.closest('[data-ws-upload-close]')) return
+    window.clearTimeout(state.wsUploadHideTimer)
+    state.wsUploads = []
+    renderWorkspaceUploads()
   })
 
   // 设置入口与设置页
@@ -12152,6 +13231,7 @@ async function boot() {
   })
 
   $('#input').focus()
+  applyWorkspaceDeepLink()
   endBoot('正在进入工作台…')
 }
 

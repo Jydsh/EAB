@@ -508,6 +508,18 @@ error -> 绑定失败/凭证失效
 
 验收：dsh-im host 启动后 `routes` 保持 20 条；`/api/dsh-im/delivery/messages` 这类路由能注册；停用插件后路由消失、定时器/订阅清理。
 
+#### P0-1.1 插件包与配置热更新
+
+文件：`packages/server/src/plugin-host.ts`
+
+1. 插件宿主启动后启动统一轮询：`EAB_PLUGIN_WATCH_MS` 默认 2000ms；插件包指纹覆盖清单、host/client 代码，跳过 `node_modules`、数据、日志；连续两次稳定后重载。
+2. 包变化按插件 id 重载**所有启用实例**（公司级 + 各成员个人级），不重启整个 EAB；删除目录会注销对应实例。
+3. 数据目录里的 `config.json` / `settings.json`（`<dataRoot>/`、`<dataRoot>/<pluginId>/`、`<dataRoot>/<packageName>/`）按内容哈希检测；只重载发生变化的那个实例，公司配置变化不会带走个人实例。
+4. 每次启动 host 使用新的 import token，保证“入口文件未变、只有配置变了”时模块级配置也会重新求值；插件工具注册/注销继续走 `clearPluginToolSpecsCache()` 刷新工具目录。
+5. 全量重扫（安装/启停/卸载）期间暂停轮询，避免与安装请求并发改实例。
+
+验收：`plugin-hot-reload.test.ts` 覆盖公司+个人实例同时感知插件包更新、公司/个人配置分别只重载自身；`plugin-host-inject.test.ts` 等插件回归通过；`pnpm typecheck` 通过。
+
 ### P0-2 Client 协议补齐
 
 文件：`packages/server/public/dsh-runtime.js`、`packages/server/public/plugin-host.html`、`packages/server/public/chat.css`

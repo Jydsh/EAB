@@ -1,14 +1,17 @@
 import { beforeEach, describe, expect, it } from 'vitest'
+import { hostname } from 'node:os'
 import { MemoryCache } from '../src/backends/cache.js'
 import {
   acquireCoordinationLock,
   acquireCoordinationSlot,
+  acquireLeaderHold,
   claimOnce,
   clearRunAlive,
   coordinationStatus,
   hitRate,
   isRunAlive,
   markRunAlive,
+  readLeaderOwner,
   resetCoordinationForTest,
   runAsLeader,
 } from '../src/backends/coordination.js'
@@ -201,5 +204,55 @@ describe('协作层 run 心跳', () => {  it('写入后可见，清理后不可�
     expect(await isRunAlive(runId)).toBe(true)
     await clearRunAlive(runId)
     expect(await isRunAlive(runId)).toBe(false)
+  })
+})
+
+describe('长连接领导权', () => {
+  it('写入实例元数据，并可按 key 读回持有者', async () => {
+    setBackendRuntimeForTest({ cache: new MemoryCache(10_000) } as never)
+    const key = `stream-meta-${Math.random()}`
+    const hold = await acquireLeaderHold(key, { ttlMs: 5_000 })
+    expect(hold).not.toBeNull()
+    expect(hold?.owner.host).toBe(hostname())
+    expect(hold?.owner.pid).toBe(process.pid)
+    expect((await readLeaderOwner(key))?.instanceId).toBe(hold?.owner.instanceId)
+    hold?.release()
+  })
+
+  it('同机旧进程已退出时立即接管，不等 90 秒 TTL', async () => {
+    setBackendRuntimeForTest({ cache: new MemoryCache(10_000) } as never)
+    const key = `stream-dead-${Math.random()}`
+    const stale = JSON.stringify({
+      v: 1,
+      token: 'stale-token',
+      owner: { instanceId: 'stale', host: hostname(), pid: 2_147_483_646, startedAt: 1 },
+    })
+    // 用同一个缓存实例，确保读到上面预置的 key。
+    const cache = new MemoryCache(10_000)
+    setBackendRuntimeForTest({ cache } as never)
+    await cache.setIfAbsent(`leader:${key}`, stale, 60)
+    const hold = await acquireLeaderHold(key, { ttlMs: 5_000, waitMs: 0 })
+    expect(hold).not.toBeNull()
+    expect(hold?.owner.pid).toBe(process.pid)
+    expect(await cache.get(`leader:${key}`)).not.toBe(stale)
+    hold?.release()
+  })
+
+  it('同机进程仍存活或旧版本租约时不接管', async () => {
+    setBackendRuntimeForTest({ cache: new MemoryCache(10_000) } as never)
+    const cache = new MemoryCache(10_000)
+    setBackendRuntimeForTest({ cache } as never)
+    const liveKey = `stream-live-${Math.random()}`
+    const live = JSON.stringify({
+      v: 1,
+      token: 'live-token',
+      owner: { instanceId: 'live', host: hostname(), pid: process.pid, startedAt: 1 },
+    })
+    await cache.setIfAbsent(`leader:${liveKey}`, live, 60)
+    expect(await acquireLeaderHold(liveKey, { ttlMs: 5_000, waitMs: 0 })).toBeNull()
+
+    const legacyKey = `stream-legacy-${Math.random()}`
+    await cache.setIfAbsent(`leader:${legacyKey}`, 'legacy-token', 60)
+    expect(await acquireLeaderHold(legacyKey, { ttlMs: 5_000, waitMs: 0 })).toBeNull()
   })
 })

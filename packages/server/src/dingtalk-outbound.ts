@@ -11,7 +11,7 @@
 import { EC, EabError } from '@eab/domain'
 import type { ServerDeps } from './deps.js'
 import { resolveSecret } from './secrets.js'
-import { dingTalkAccessToken } from './dingtalk-card.js'
+import { DingTalkAICardStream, dingTalkAccessToken, type DingTalkRichCardState } from './dingtalk-card.js'
 
 /** 钉钉媒体上传官方上限 20 MB；个人云空间单文件上限 50 MB，出站时按钉钉侧收窄。 */
 export const DINGTALK_OUTBOUND_FILE_LIMIT_BYTES = 20 * 1024 * 1024
@@ -181,8 +181,8 @@ async function batchSendMessage(
 /**
  * 把一段纯文本主动推到当前员工的钉钉单聊。
  *
- * 和被动回复不同：这条出口不经过 webhook，不需要用户先发消息；
- * 定时任务、审批提醒这类“到点主动通知”走这里。
+ * 定时任务、子 Agent 完成汇报等面向用户的主动通知请用 `sendDingTalkRichTextToUser`，
+ * 它会优先走 A2UI 卡片；这里仅保留为纯文本兜底/兼容出口。
  */
 export async function sendDingTalkTextToUser(
   deps: ServerDeps,
@@ -200,6 +200,69 @@ export async function sendDingTalkTextToUser(
     msgParam: { content: text },
   })
   return { externalUserId }
+}
+
+export interface DingTalkRichTextSendResult {
+  readonly externalUserId: string
+  /** a2ui=已用 AI 卡片；markdown=卡片不可用，退回钉钉 Markdown 消息；text=最后退回纯文本。 */
+  readonly mode: 'a2ui' | 'markdown' | 'text'
+  readonly cardId?: string
+  readonly finished?: boolean
+}
+
+/**
+ * 主动推送到当前员工的钉钉单聊，优先复用聊天回复的 A2UI 卡片，
+ * 让子 Agent 完成汇报、定时任务通知也有标题、分段和表格排版。
+ *
+ * A2UI 创建失败（例如应用没有 AICard.Instance.Write 权限）时退回
+ * sampleMarkdown；连 Markdown 也不可用时才退回原来的纯文本。
+ */
+export async function sendDingTalkRichTextToUser(
+  deps: ServerDeps,
+  input: { companyId: string; userId: string; title?: string; text: string },
+): Promise<DingTalkRichTextSendResult> {
+  const text = String(input.text ?? '').trim()
+  if (!text) throw new EabError(EC.VALIDATION, '消息内容不能为空')
+  const title = String(input.title ?? '').trim() || 'EAB 通知'
+  const config = outboundConfig(deps, input.companyId)
+  const externalUserId = externalUserIdOf(deps, input.companyId, input.userId)
+
+  const state: DingTalkRichCardState = {
+    answer: text,
+    reasoning: '',
+    tools: [],
+    thinkingDone: true,
+  }
+  const card = new DingTalkAICardStream(config.appId, config.secret, externalUserId, config.robotCode)
+  if (await card.start(state, title)) {
+    const finished = await card.finish(state, title)
+    return {
+      externalUserId,
+      mode: 'a2ui',
+      cardId: card.providerMessageIds[0],
+      finished,
+    }
+  }
+
+  const token = await dingTalkAccessToken(config.appId, config.secret)
+  try {
+    await batchSendMessage(token, {
+      robotCode: config.robotCode,
+      externalUserId,
+      msgKey: 'sampleMarkdown',
+      msgParam: { title, text },
+    })
+    return { externalUserId, mode: 'markdown' }
+  } catch {
+    // 部分老机器人没有 sampleMarkdown 权限；最后退回纯文本，至少保证消息送达。
+    await batchSendMessage(token, {
+      robotCode: config.robotCode,
+      externalUserId,
+      msgKey: 'sampleText',
+      msgParam: { content: text },
+    })
+    return { externalUserId, mode: 'text' }
+  }
 }
 
 /** 供定时任务创建时预检：当前员工有没有可用的钉钉接收人。 */

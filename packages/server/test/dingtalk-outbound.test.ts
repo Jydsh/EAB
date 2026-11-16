@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { openDatabase, migrate } from '@eab/storage'
 import type { ServerConfig } from '../src/config.js'
 import type { ServerDeps } from '../src/deps.js'
-import { sendDingTalkFileToUser } from '../src/dingtalk-outbound.js'
+import { sendDingTalkFileToUser, sendDingTalkRichTextToUser } from '../src/dingtalk-outbound.js'
 
 const dirs: string[] = []
 
@@ -56,6 +56,86 @@ function mockDingTalk() {
   vi.stubGlobal('fetch', fetchMock)
   return calls
 }
+
+describe('钉钉主动富文本通知', () => {
+  function mockDingTalkRichCard(createStatus = 200) {
+    const calls: Array<{ url: string; init?: RequestInit }> = []
+    const fetchMock = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const text = String(url)
+      calls.push({ url: text, init })
+      if (text.includes('/v1.0/oauth2/accessToken')) {
+        return new Response(JSON.stringify({ accessToken: 'token_rich', expireIn: 7200 }), { status: 200 })
+      }
+      if (text.includes('/v1.0/card/ai/instances/createAndDeliver')) {
+        return new Response(
+          JSON.stringify({
+            success: createStatus === 200,
+            result: { deliverResults: [{ success: true }] },
+          }),
+          { status: createStatus },
+        )
+      }
+      if (text.includes('/v1.0/card/ai/instances/update')) {
+        return new Response(JSON.stringify({ success: true }), { status: 200 })
+      }
+      if (text.includes('/oToMessages/batchSend')) {
+        return new Response(JSON.stringify({ invalidStaffIdList: [], flowControlledStaffIdList: [] }), {
+          status: 200,
+        })
+      }
+      return new Response('not found', { status: 404 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    return calls
+  }
+
+  it('子 Agent 完成通知优先创建 A2UI 卡片，不再用 sampleText', async () => {
+    process.env.EAB_TEST_DING_SECRET = 'secret_test'
+    const { deps } = testDeps('ding_test_rich_card')
+    const calls = mockDingTalkRichCard()
+
+    const sent = await sendDingTalkRichTextToUser(deps, {
+      companyId: 'c1',
+      userId: 'u_test',
+      title: '【EAB任务完成】',
+      text: '**【EAB任务完成】**\n\n- **ping2**：pong\n- **offline-check**：正常',
+    })
+
+    expect(sent).toMatchObject({ externalUserId: 'staff_test', mode: 'a2ui', finished: true })
+    const create = calls.find((call) => call.url.includes('/v1.0/card/ai/instances/createAndDeliver'))
+    expect(create).toBeTruthy()
+    const body = JSON.parse(String(create?.init?.body)) as Record<string, any>
+    expect(body).toMatchObject({
+      outTrackId: expect.stringContaining('eab_a2ui_'),
+      openSpaceId: 'dtv1.card//im_robot.staff_test',
+      imRobotOpenDeliverModel: { robotCode: 'robot_test' },
+    })
+    expect(body.a2uiMessages.some((message: string) => message.includes('EAB任务完成'))).toBe(true)
+    expect(calls.some((call) => call.url.includes('/oToMessages/batchSend'))).toBe(false)
+  })
+
+  it('A2UI 创建失败时退回 sampleMarkdown，保留标题和正文排版', async () => {
+    process.env.EAB_TEST_DING_SECRET = 'secret_test'
+    const { deps } = testDeps('ding_test_rich_fallback')
+    const calls = mockDingTalkRichCard(400)
+
+    const sent = await sendDingTalkRichTextToUser(deps, {
+      companyId: 'c1',
+      userId: 'u_test',
+      title: '⏰ 测试定时任务',
+      text: '⏰ **测试定时任务**\n\n- 第一项\n- 第二项',
+    })
+
+    expect(sent).toMatchObject({ externalUserId: 'staff_test', mode: 'markdown' })
+    const send = calls.find((call) => call.url.includes('/oToMessages/batchSend'))
+    const body = JSON.parse(String(send?.init?.body)) as Record<string, any>
+    expect(body.msgKey).toBe('sampleMarkdown')
+    expect(JSON.parse(String(body.msgParam))).toEqual({
+      title: '⏰ 测试定时任务',
+      text: '⏰ **测试定时任务**\n\n- 第一项\n- 第二项',
+    })
+  })
+})
 
 describe('钉钉出站文件', () => {
   it('先上传媒体，再用 sampleFile 发到当前员工的钉钉单聊', async () => {

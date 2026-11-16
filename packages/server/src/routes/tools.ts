@@ -7,7 +7,7 @@
  */
 import type { FastifyInstance, FastifyRequest } from 'fastify'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { basename, dirname } from 'node:path'
+import { basename, dirname, isAbsolute, relative } from 'node:path'
 import { EC, EabError, SC, ulid, type Scope } from '@eab/domain'
 import { appendAudit } from '@eab/storage'
 import { assertScoped, buildScopeFilter, predicateToSql } from '@eab/authz'
@@ -28,7 +28,17 @@ import {
   resolveToolOperationKey,
 } from '../tool-idempotency.js'
 import { retrieveExternalKb } from '../kb-external.js'
-import { executePluginTool, pluginToolCatalogFor, pluginToolSpecsFor, prefersPersonalPluginTools, resolvePluginToolByCatalogId } from '../plugin-tools.js'
+import { executePluginTool, pluginToolCatalogFor, pluginToolSpecsFor, prefersPersonalPluginTools, resolvePluginToolByCatalogId, invalidatePluginToolSpecsEverywhere } from '../plugin-tools.js'
+import { refreshPluginHosts } from '../plugin-host.js'
+import { createPluginDevScaffold, installPluginDevBundle, normalizePluginDevId, pluginDevIdFromDir, pluginPreviewLink, PLUGIN_DEV_DIR } from '../plugin-dev.js'
+import { createSkillDevScaffold, installSkillDevBundle, normalizeSkillDevId, skillDevIdFromDir, skillPreviewLink, SKILL_DEV_DIR } from '../skill-dev.js'
+import {
+  companySkillPolicy,
+  ensureSkillInstallApproval,
+  loadPersonalSkills,
+  previewSkillInstall,
+} from '../skills.js'
+import { loadPersonalPluginsForUser } from '../plugins.js'
 import {
   readToolRoleAccessMap,
   toolAllowedForActor,
@@ -49,6 +59,7 @@ import {
 } from '../dingtalk-file-echo.js'
 import {
   applyWorkspaceTextEdits,
+  buildWorkspaceEditDiff,
   createWorkspaceFileSnapshot,
   deleteUserWorkspaceFile,
   exportWorkspaceFileToPdf,
@@ -65,6 +76,17 @@ import {
   userScopeDir,
   type WorkspaceTextEdit,
 } from './workspace.js'
+import { readTextFileRange, searchWorkspaceText, type TextRangeResult, type TextSearchResult } from '../workspace-text.js'
+import { saveTextBatch } from '../batch-results.js'
+import {
+  assertProjectExecEnabled,
+  killProjectJob,
+  listProjectJobs,
+  readProjectJob,
+  resolveProjectExecMode,
+  runProjectCommand,
+  startProjectJob,
+} from '../project-runner.js'
 import { createSchedule, deleteSchedule, listSchedules } from '../schedule.js'
 import {
   addDocxComment,
@@ -334,7 +356,7 @@ export const TOOLS: readonly ToolDef[] = [
     id: 'agent.spawn',
     name: '并行子 Agent',
     description:
-      '把一个复杂任务拆成多个互不依赖的子任务，并行交给多个子 Agent 执行。适合“同时查三份资料”“分别分析几个文件”“多模型各给一版方案”这类可以并行的任务。每个子 Agent 有独立运行记录和会话锁；一个子任务失败不会取消其他子任务。tasks 必须是 JSON 数组字符串，每项形如 {"key":"research-a","title":"资料A","prompt":"完整子任务指令","modelId":"可选模型 id","retries":1}。key 是团队内的稳定标识（建议英文短名），后续可用 agent_task 凭 key 继续给它派活，复用同一个子 Agent 窗口与会话；子 Agent 完成一次任务后若没有新任务，会在空闲一段时间后自动注销，需要再工作时重新 agent_spawn。不要让子任务互相依赖，不要用子 Agent 代替普通的一次工具调用。除非任务明确需要视觉/多模态等专用模型，否则不要给多个子任务填同一个 modelId，留空由系统按能力和并发负载分散分配。',
+      '把一个复杂任务拆成多个互不依赖的子任务，并行交给多个子 Agent 执行。适合“同时查三份资料”“分别分析几个文件”“多模型各给一版方案”这类可以并行的任务。每个子 Agent 有独立运行记录和会话锁；一个子任务失败不会取消其他子任务。tasks 必须是 JSON 数组字符串，每项形如 {"key":"research-a","title":"资料A","prompt":"子任务指令（150 字以内）","modelId":"可选模型 id","retries":1}。key 是团队内的稳定标识（建议英文短名），后续可用 agent_task 凭 key 继续给它派活，复用同一个子 Agent 窗口与会话；子 Agent 完成一次任务后若没有新任务，会在空闲一段时间后自动注销；只要这个 key 仍有历史任务，后续用 agent_task 会按同一 key 自动恢复窗口和会话，不需要重新 agent_spawn。prompt 控制在 150 字以内，只写目标、输入范围、关键约束和验收标准，具体步骤由子 Agent 自己规划，不要写长篇执行清单。不要让子任务互相依赖，不要用子 Agent 代替普通的一次工具调用。除非任务明确需要视觉/多模态等专用模型，否则不要给多个子任务填同一个 modelId，留空由系统按能力和并发负载分散分配。前台对话里的实质任务应优先使用 background:true，避免阻塞用户继续提问。',
     scope: SC.AGENT_TOOL_INVOKE,
     dangerous: false,
     concurrency: 'read',
@@ -346,7 +368,7 @@ export const TOOLS: readonly ToolDef[] = [
       },
       background: {
         type: 'boolean',
-        description: '可选：true 表示后台执行，立即返回 taskId，父 Agent 可用 agent_wait 取事件；默认 false 同步等待',
+        description: '可选：true 表示后台执行，立即返回 taskId，父 Agent 可以结束本回合、让用户继续提问；默认 false 同步等待。前台对话中的实质任务应传 true',
       },
     },
   },
@@ -354,7 +376,7 @@ export const TOOLS: readonly ToolDef[] = [
     id: 'agent.task',
     name: '继续派活给子 Agent',
     description:
-      '给团队里已经存在的子 Agent 继续派一个新任务，复用同一个子 Agent 会话与同一个可视窗口，不需要重新创建。仅在本轮已经用 agent_spawn 创建过子 Agent 后可用；agent 必须填 agent.spawn 返回或此前事件里给出的 key。子 Agent 完成任务后如果没有再派新任务，会在空闲一段时间后自动注销，那时必须重新 agent_spawn。',
+      '给团队里已经存在的子 Agent 继续派一个新任务，复用同一个子 Agent 会话与同一个可视窗口，不需要重新创建。agent 必须填 agent.spawn 返回或此前事件里给出的 key。子 Agent 完成任务后如果没有再派新任务，会在空闲一段时间后自动注销；只要这个 key 仍有历史任务，系统会按同一个 key 自动恢复窗口和会话，不需要改用 agent_spawn。',
     scope: SC.AGENT_TOOL_INVOKE,
     dangerous: false,
     concurrency: 'read',
@@ -371,7 +393,7 @@ export const TOOLS: readonly ToolDef[] = [
     id: 'agent.wait',
     name: '等待子 Agent 事件',
     description:
-      '父 Agent 专用。后台子 Agent 完成任务、提出问题或失败时会产生事件；调用本工具等待下一个事件，而不是用 Promise.all 等整批结束。返回 event=null 表示超时，可继续用 agent_wait 等，或先处理别的事情。事件里的 key 可直接用于 agent_task 继续派活。',
+      '父 Agent 专用。后台子 Agent 完成任务、提出问题或失败时会产生事件；调用本工具等待下一个事件。网页前台对话不要使用：等待会占住当前会话，用户无法继续提问；后台完成会自动唤醒父 Agent。仅在没有自动唤醒的同步管理场景下使用。返回 event=null 表示超时。事件里的 key 可直接用于 agent_task 继续派活。',
     scope: SC.AGENT_TOOL_INVOKE,
     dangerous: false,
     concurrency: 'read',
@@ -598,11 +620,130 @@ export const TOOLS: readonly ToolDef[] = [
   {
     id: 'workspace.read',
     name: '读取工作区文件',
-    description: '读取云空间里一个文本文件的正文（最大 5 MB）',
+    description:
+      '按行读取云空间里的文本文件，和 DSH 的 read 一样始终有界：默认/单次最多 2000 行、单次输出 50 KB、单行最多 2000 字符。offset 从 1 开始，limit 可缩小读取行数。返回 text、startLine、endLine、totalLines、truncated、truncatedByBytes、longLines 和 nextOffset；有 nextOffset 时用它继续读，不要把大文件整段硬读。代码或长日志先 workspace.search 定位 path:line，再读取命中行附近。',
     scope: SC.WORKSPACE_READ,
     dangerous: false,
     input: {
       path: { type: 'string', description: '相对路径，例如 notes/todo.md', required: true },
+      offset: { type: 'number', description: '可选：从第几行开始读取，1 表示第一行；默认 1' },
+      limit: { type: 'number', description: '可选：读取多少行，默认 2000，最大 2000；输出超过 50 KB 会在字节上限处提前结束' },
+    },
+  },
+  {
+    id: 'workspace.search',
+    name: '搜索工作区文件',
+    description:
+      '在云空间文本文件里按关键词或正则搜索，像 DSH 的 grep 一样返回 path、line、column、命中行片段，并给出总命中数 total。默认最多返回 30 条，单次最多 100 条；命中更多时 truncated=true，可用更精确的 query 或 path 缩小范围。默认递归搜索，30 秒搜索预算，最多扫描 2000 个文件、单文件 2 MB，跳过 node_modules、.git、dist 等目录。先定位 path:line，再用 workspace.read 的 offset/limit 读取上下文。',
+    scope: SC.WORKSPACE_READ,
+    dangerous: false,
+    input: {
+      query: { type: 'string', description: '要搜索的文本或正则表达式', required: true },
+      path: { type: 'string', description: '可选：相对路径的文件或目录，默认搜索整个工作区' },
+      maxResults: { type: 'number', description: '最多返回多少条命中，默认 30，最大 100' },
+      regex: { type: 'boolean', description: '是否把 query 当正则表达式，默认 false' },
+      caseSensitive: { type: 'boolean', description: '是否区分大小写，默认 false' },
+    },
+  },
+  {
+    id: 'project.exec',
+    name: '执行项目命令',
+    description:
+      '在项目工作区执行一条 shell 命令，和 DSH 的 bash 工具一样每次调用都是全新 shell，不保留 cd 或环境变量。cwd 是相对项目工作区的目录，不能跳出工作区；默认 120 秒、最多 600 秒，超时会杀整个进程树。返回 stdout、stderr、exitCode、timedOut、durationMs；非零退出是结果而不是工具错误。输出各保留 64 KB 尾部，超出时完整输出保存为文本批次并返回 batchId。npm install、构建、测试、启动 dev server 等长命令用 runInBackground=true，然后 project.job 查看或终止。Windows 走 PowerShell，Linux/macOS 走 bash。',
+    scope: SC.WORKSPACE_WRITE,
+    dangerous: false,
+    input: {
+      description: {
+        type: 'string',
+        description: '5-10 个词说明这条命令要做什么，鼠标悬停/审计用，例如“安装依赖”',
+        required: true,
+      },
+      command: { type: 'string', description: '要执行的命令；Windows 是 PowerShell 语法，Linux/macOS 是 bash 语法', required: true },
+      cwd: { type: 'string', description: '可选：相对项目工作区的子目录，默认工作区根；不能使用 .. 跳出工作区' },
+      timeoutMs: { type: 'number', description: '可选：前台命令超时毫秒，默认 120000，最大 600000' },
+      runInBackground: { type: 'boolean', description: '可选：true 时立即返回 jobId，长命令用 project.job 查看输出/终止' },
+    },
+  },
+  {
+    id: 'project.job',
+    name: '项目后台任务',
+    description:
+      '管理 project.exec 用 runInBackground=true 启动的后台任务。action=list 列出当前用户的任务；output 读取某个任务的 stdout/stderr/状态；kill 终止任务树。任务只在内存保留 30 分钟，服务重启后不会恢复。前台命令不要用它，直接看 project.exec 的返回。',
+    scope: SC.WORKSPACE_WRITE,
+    dangerous: false,
+    input: {
+      action: {
+        type: 'string',
+        description: 'list / output / kill，默认 output',
+        enum: ['list', 'output', 'kill'],
+      },
+      jobId: { type: 'string', description: 'action=output 或 kill 时必填' },
+    },
+  },
+  {
+    id: 'plugin.dev',
+    name: '自开发插件',
+    description:
+      'Agent 给自己开发并热安装 DSH UI 插件的闭环。action=create：在云空间 `.eab-plugins/<pluginId>` 生成可编辑的 DSH bundle 骨架（package.json / cordis.patch.yml / index.js / client.js / icon / locale）；然后必须用 workspace.read 读 client.js，再用 workspace.edit 改成用户要的页面。action=install：把该目录直接安装/更新成当前员工的个人插件，安装立即刷新插件宿主和工具目录，不需要浏览器上传目录，也不需要重启服务；返回 previewPath，可直接打开 /plugin-kernel.html 看真实 UI。改完 client.js 后再次 install 即为热更新，插件页会按版本指纹自动刷新。action=list：列出本人已安装插件及其预览地址。插件页优先用 `main` slot，用 `ctx.slots.register({name:"main",key:"home"}, Component)`，不要在 document.body 挂第二棵应用；Host 侧 index.js 可以只导出空的 apply()。',
+    scope: SC.PLUGIN_INSTALL,
+    dangerous: false,
+    input: {
+      action: {
+        type: 'string',
+        description: 'create 生成插件骨架；install 安装/热更新；list 列出本人插件',
+        enum: ['create', 'install', 'list'],
+        required: true,
+      },
+      pluginId: {
+        type: 'string',
+        description: '插件 id，小写字母开头、只含 a-z 0-9 -，例如 eab-self-card；install 时可从 package.json 推断',
+      },
+      title: { type: 'string', description: 'create 时的页面标题；默认用 pluginId' },
+      description: { type: 'string', description: 'create 时的页面说明，会写进模板正文' },
+      accent: { type: 'string', description: 'create 时的主色，六位十六进制，例如 #2563eb' },
+      dir: {
+        type: 'string',
+        description: `插件源码目录，相对云空间根目录；默认 ${PLUGIN_DEV_DIR}/<pluginId>。install 时用它定位要安装的包`,
+      },
+      overwrite: {
+        type: 'boolean',
+        description: 'create 时目录已存在是否重置为模板，默认 false；重置会覆盖已写好的页面，非必要不要用',
+      },
+    },
+  },
+  {
+    id: 'skill.dev',
+    name: '自开发技能',
+    description:
+      'Agent 给自己开发并热安装个人技能的闭环。action=create：在云空间 `.eab-skills/<skillId>` 生成可编辑的技能骨架（skill.json + SKILL.md + README.md）；然后必须用 workspace.read 读 SKILL.md，再用 workspace.edit 改成用户要的技能说明。action=install：把该目录直接安装/更新成当前员工的个人技能，写库和写盘后下一轮对话立即加载，不需要浏览器上传目录，也不需要重启服务；返回 previewPath，可直接打开 `/chat?workspace=skills&skill=<id>` 看技能工作台里的真实详情和启用状态。改完 SKILL.md 后再次 install 即为热更新，checksum 和详情同步刷新。action=list：列出本人已安装技能及其工作台地址。骨架默认是 L0 纯提示词技能，只允许 chat:use / skill:list / skill:use，tools 为空；不要硬塞脚本或可执行文件，安装仍会走静态安全扫描和公司个人安装审批策略。',
+    scope: SC.SKILL_INSTALL,
+    dangerous: false,
+    input: {
+      action: {
+        type: 'string',
+        description: 'create 生成技能骨架；install 安装/热更新；list 列出本人技能',
+        enum: ['create', 'install', 'list'],
+        required: true,
+      },
+      skillId: {
+        type: 'string',
+        description: '技能 id，小写字母开头、只含 a-z 0-9 -，例如 eab-meeting-notes；install 时可从 skill.json 推断',
+      },
+      title: { type: 'string', description: 'create 时的技能名称；默认用 skillId' },
+      description: { type: 'string', description: 'create 时的技能说明，会写进 skill.json 和 SKILL.md' },
+      triggers: {
+        type: 'array',
+        description: 'create 时的触发词列表，最多 20 个；默认用 skillId 和整理类触发词',
+        items: { type: 'string' },
+      },
+      dir: {
+        type: 'string',
+        description: `技能源码目录，相对云空间根目录；默认 ${SKILL_DEV_DIR}/<skillId>。install 时用它定位要安装的包`,
+      },
+      overwrite: {
+        type: 'boolean',
+        description: 'create 时目录已存在是否重置为模板，默认 false；重置会覆盖已写好的说明，非必要不要用',
+      },
     },
   },
   {
@@ -1184,7 +1325,13 @@ export const AGENT_CORE_TOOL_IDS: readonly string[] = [
   'schedule.create',
   'workspace.list',
   'workspace.read',
+  'workspace.search',
+  'workspace.write',
   'workspace.edit',
+  'project.exec',
+  'project.job',
+  'plugin.dev',
+  'skill.dev',
   'office.read_outline',
   'office.read_range',
   'office.find',
@@ -1248,6 +1395,8 @@ const TOOL_SEARCH_ALIASES: Record<string, string> = {
   'workspace.capacity': '容量 空间 剩余 配额 满了吗 capacity quota space',
   'workspace.write': '写文件 保存 新建文件 文本 整篇 write file save',
   'workspace.edit': '局部修改 局部编辑 只改一段 改字段 替换片段 修订 patch edit replace',
+  'plugin.dev': '插件 自开发插件 给自己开发插件 开发插件 插件包 热安装 热更新 安装插件 预览插件 UI 挂件 小组件 卡片 页面 bundle dsh cordis slot plugin install hot reload preview widget',
+  'skill.dev': '技能 自开发技能 给自己开发技能 开发技能 技能包 热安装 热更新 安装技能 预览技能 技能说明 提示词技能 SKILL.md skill install hot reload preview prompt skill',
   'workspace.read': '读文件 查看文件 打开文件 内容 read file',
   'office.read_outline': '读取文档结构 文档大纲 段落 表格 单元格 工作表 幻灯片 docx xlsx Excel pptx PowerPoint Office 文档结构 read outline document structure paragraph table sheet slide',
   'office.read_range': '读取文档范围 读全文 读段落全文 读表格 读单元格 读整行 读整列 文本区间 格式摘要 range read full text paragraph table cell row column runs font format docx',
@@ -1375,8 +1524,37 @@ export function toolSpecsForAgent(
 }
 
 /** 云空间是唯一可用的文件空间；none 不暴露文件工具。 */
+function resolvePluginDevDir(root: string, raw: unknown): string {
+  const value = String(raw ?? '').trim()
+  if (value === '') return ''
+  if (isAbsolute(value)) {
+    const rel = relative(root, value)
+    if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) {
+      throw new EabError(EC.VALIDATION, `插件目录必须位于当前云空间内：${value}`)
+    }
+    return value
+  }
+  return safeJoin(root, value.replace(/\\/g, '/'))
+}
+
+function resolveSkillDevDir(root: string, raw: unknown): string {
+  const value = String(raw ?? '').trim()
+  if (value === '') return ''
+  if (isAbsolute(value)) {
+    const rel = relative(root, value)
+    if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) {
+      throw new EabError(EC.VALIDATION, `技能目录必须位于当前云空间内：${value}`)
+    }
+    return value
+  }
+  return safeJoin(root, value.replace(/\\/g, '/'))
+}
+
 function toolAllowedInSpace(toolId: string, space: ActiveSpace): boolean {
+  if (toolId === 'plugin.dev') return space.kind === 'cloud'
+  if (toolId === 'skill.dev') return space.kind === 'cloud'
   if (toolId.startsWith('workspace.') || toolId.startsWith('office.')) return space.kind === 'cloud'
+  if (toolId.startsWith('project.') && resolveProjectExecMode() === 'off') return false
   return true
 }
 
@@ -1768,16 +1946,388 @@ export async function executeTool(
       const path = String(args.path ?? '')
       const root = userScopeDir(deps, actor.subject.companyId, actor.subject.userId)
       const target = safeJoin(root, path)
-      let content: Buffer
+      let range: TextRangeResult
       try {
-        content = readFileSync(target)
-      } catch {
+        range = readTextFileRange(target, {
+          offset: args.offset === undefined ? undefined : Number(args.offset),
+          limit: args.limit === undefined ? undefined : Number(args.limit),
+        })
+      } catch (error) {
+        if (error instanceof EabError) throw error
         throw new EabError(EC.NOT_FOUND, `云空间文件不存在: ${path}`)
       }
-      if (content.byteLength > 5 * 1024 * 1024) {
-        throw new EabError(EC.VALIDATION, '文件超过 5 MB，请下载后查看')
+      result = {
+        path,
+        size: range.size,
+        text: range.text,
+        startLine: range.startLine,
+        endLine: range.endLine,
+        totalLines: range.totalLines,
+        truncated: range.truncated,
+        truncatedByBytes: range.truncatedByBytes,
+        longLines: range.longLines,
+        nextOffset: range.nextOffset,
+        mode: 'lines',
       }
-      result = { path, size: content.byteLength, text: content.toString('utf8'), truncated: false }
+      break
+    }
+    case 'workspace.search': {
+      const root = userScopeDir(deps, actor.subject.companyId, actor.subject.userId)
+      const rawPath = String(args.path ?? '').trim()
+      const target =
+        rawPath === '' || rawPath === '.' || rawPath === './' || rawPath === '.\\' || rawPath === '/' || rawPath === '\\'
+          ? root
+          : safeJoin(root, rawPath)
+      let search: TextSearchResult
+      try {
+        search = searchWorkspaceText(root, target, {
+          query: String(args.query ?? ''),
+          maxResults: args.maxResults === undefined ? undefined : Number(args.maxResults),
+          regex: Boolean(args.regex),
+          caseSensitive: Boolean(args.caseSensitive),
+        })
+      } catch (error) {
+        if (error instanceof EabError) throw error
+        throw new EabError(EC.NOT_FOUND, `云空间路径不存在: ${String(args.path ?? '')}`)
+      }
+      result = {
+        query: String(args.query ?? ''),
+        path: String(args.path ?? ''),
+        count: search.matches.length,
+        total: search.total,
+        filesScanned: search.filesScanned,
+        truncated: search.truncated,
+        timeLimitHit: search.timeLimitHit,
+        matches: search.matches,
+      }
+      break
+    }
+    case 'project.exec': {
+      assertProjectExecEnabled()
+      const root = userScopeDir(deps, actor.subject.companyId, actor.subject.userId)
+      const command = String(args.command ?? '')
+      const cwd = args.cwd === undefined || args.cwd === null ? undefined : String(args.cwd)
+      const timeoutMs = args.timeoutMs === undefined || args.timeoutMs === null ? undefined : Number(args.timeoutMs)
+      const background = Boolean(args.runInBackground)
+
+      if (background) {
+        const view = startProjectJob(
+          { companyId: actor.subject.companyId, userId: actor.subject.userId },
+          { root, command, cwd, timeoutMs },
+        )
+        result = {
+          ...view,
+          mode: 'background',
+          note: `命令已在后台运行，jobId=${view.jobId}。用 project.job action=output 查看输出，action=kill 终止。`,
+        }
+        break
+      }
+
+      const run = await runProjectCommand({ root, command, cwd, timeoutMs })
+      const { fullOutput, ...publicResult } = run
+      const payload: Record<string, unknown> = { ...publicResult }
+      if (run.truncated && fullOutput && fullOutput.length > 0 && deps.config.dataDir) {
+        const saved = saveTextBatch({
+          dataDir: deps.config.dataDir,
+          companyId: actor.subject.companyId,
+          userId: actor.subject.userId,
+          toolId: 'project.exec',
+          text: fullOutput,
+          minChars: 4_000,
+        })
+        if (saved) {
+          payload.batch = saved
+          payload.note = `stdout/stderr 超过 64 KB，模型只看到尾部；完整输出已保存为文本批次 ${saved.id}，需要全量日志时用 batch_read / batch_analyze。`
+        }
+      }
+      if (run.status !== 'completed' && payload.note === undefined) {
+        payload.note = run.timedOut
+          ? `命令超过 ${timeoutMs ?? 120_000}ms 被终止；进程树已 kill。`
+          : run.aborted
+            ? '命令被调用方取消。'
+            : `命令以 ${run.exitCode ?? 'signal'} 结束；非零退出是结果，不是工具错误，可以读 stderr 后继续修。`
+      }
+      result = payload
+      break
+    }
+    case 'project.job': {
+      assertProjectExecEnabled()
+      const owner = { companyId: actor.subject.companyId, userId: actor.subject.userId }
+      const action = String(args.action ?? 'output').trim().toLowerCase()
+      if (action === 'list') {
+        result = {
+          jobs: listProjectJobs(owner),
+          note: '后台任务只在内存保留 30 分钟；服务重启后不会恢复。',
+        }
+        break
+      }
+      const jobId = String(args.jobId ?? '').trim()
+      if (jobId === '') throw new EabError(EC.VALIDATION, `action=${action} 需要 jobId`)
+      if (action === 'output') {
+        const view = readProjectJob(owner, jobId)
+        result = {
+          ...view,
+          note:
+            view.status === 'running'
+              ? '任务仍在运行；等一会儿再 output。'
+              : view.status === 'completed'
+                ? '任务已完成。'
+                : '任务已结束；读 stdout/stderr 判断结果。',
+        }
+        break
+      }
+      if (action === 'kill') {
+        const view = killProjectJob(owner, jobId)
+        result = { ...view, note: '已发送终止；进程树会被 kill。' }
+        break
+      }
+      throw new EabError(EC.VALIDATION, `action 只能是 list/output/kill，收到: ${action}`)
+    }
+    case 'plugin.dev': {
+      const root = userScopeDir(deps, actor.subject.companyId, actor.subject.userId)
+      const action = String(args.action ?? '').trim().toLowerCase()
+      if (action !== 'create' && action !== 'install' && action !== 'list') {
+        throw new EabError(EC.VALIDATION, `action 只能是 create/install/list，收到: ${action || '空'}`)
+      }
+      if (action === 'list') {
+        const plugins = loadPersonalPluginsForUser(deps.db, actor.subject.companyId, actor.subject.userId)
+        result = {
+          action: 'list',
+          plugins: plugins.map((plugin) => {
+            const preview = pluginPreviewLink(plugin, actor.subject.companyId)
+            return {
+              id: plugin.id,
+              name: plugin.name,
+              version: plugin.version,
+              enabled: plugin.enabled,
+              checksum: plugin.checksum,
+              pageCount: plugin.pages.length,
+              previewPath: preview.previewPath,
+              source: plugin.install?.source ?? null,
+            }
+          }),
+          note: '这里只列本人安装的插件；previewPath 可直接打开真实插件页。',
+        }
+        break
+      }
+
+      const requestedId = String(args.pluginId ?? '').trim()
+      const pluginId = requestedId ? normalizePluginDevId(requestedId) : ''
+      const rawDir = String(args.dir ?? '').trim() || (pluginId ? `${PLUGIN_DEV_DIR}/${pluginId}` : '')
+      if (!rawDir) {
+        throw new EabError(EC.VALIDATION, '需要 pluginId 或 dir 指定插件源码目录')
+      }
+      const dir = resolvePluginDevDir(root, rawDir)
+      const dirRel = relative(root, dir).replace(/\\/g, '/')
+
+      if (action === 'create') {
+        if (!pluginId) throw new EabError(EC.VALIDATION, 'create 需要 pluginId')
+        const scaffold = createPluginDevScaffold({
+          dir,
+          pluginId,
+          title: String(args.title ?? '').trim() || pluginId,
+          description: args.description === undefined ? undefined : String(args.description),
+          accent: args.accent === undefined ? undefined : String(args.accent),
+          overwrite: Boolean(args.overwrite),
+        })
+        result = {
+          action: 'create',
+          application: 'created',
+          pluginId: scaffold.pluginId,
+          dir: dirRel,
+          files: scaffold.files,
+          next: `用 workspace.read 读 ${dirRel}/client.js，再用 workspace.edit 改成目标页面；改完调用 plugin.dev action=install 热安装并拿 previewPath。`,
+          note: 'create 只生成模板；第一次 install 之后插件页才会真实出现。',
+        }
+        break
+      }
+
+      const actualId = pluginId || pluginDevIdFromDir(dir)
+      const installed = installPluginDevBundle(deps.db, {
+        companyId: actor.subject.companyId,
+        userId: actor.subject.userId,
+        installedBy: actor.subject.userId,
+        dir,
+        sourceRef: dirRel || actualId,
+      })
+      await refreshPluginHosts(deps.db, {
+        dbPath: deps.config.dbPath,
+        dshHomeDir: deps.config.dshHomeDir,
+        companyId: actor.subject.companyId,
+      })
+      invalidatePluginToolSpecsEverywhere()
+      const preview = pluginPreviewLink(installed.plugin, actor.subject.companyId)
+      const warnings = installed.plugin.pages.length === 0
+        ? ['插件没有声明 dsh.ui.pages，安装成功但没有可打开的 UI 页面']
+        : []
+      result = {
+        action: 'install',
+        application: warnings.length === 0 ? 'applied' : 'applied_with_warnings',
+        replaced: installed.replaced,
+        plugin: {
+          id: installed.plugin.id,
+          name: installed.plugin.name,
+          version: installed.plugin.version,
+          checksum: installed.plugin.checksum,
+          enabled: installed.plugin.enabled,
+          pageCount: installed.plugin.pages.length,
+          pages: installed.plugin.pages.map((page) => ({ id: page.id, title: page.title, file: page.file })),
+        },
+        dir: dirRel,
+        previewPath: preview.previewPath,
+        warnings,
+        note: '安装已在当前进程热生效，无需重启服务；打开 previewPath 就是真实插件 UI。改完 client.js 再 install 一次，插件页会按 version+h 自动刷新。',
+      }
+      break
+    }
+    case 'skill.dev': {
+      const root = userScopeDir(deps, actor.subject.companyId, actor.subject.userId)
+      const action = String(args.action ?? '').trim().toLowerCase()
+      if (action !== 'create' && action !== 'install' && action !== 'list') {
+        throw new EabError(EC.VALIDATION, `action 只能是 create/install/list，收到: ${action || '空'}`)
+      }
+      if (action === 'list') {
+        const skills = loadPersonalSkills(deps.db, actor.subject.companyId, actor.subject.userId)
+        result = {
+          action: 'list',
+          skills: skills.map((skill) => {
+            const preview = skillPreviewLink(skill, actor.subject.companyId)
+            return {
+              id: skill.id,
+              name: skill.name,
+              version: skill.version,
+              level: skill.level,
+              risk: skill.risk,
+              enabled: skill.enabled,
+              valid: skill.valid,
+              checksum: skill.checksum,
+              triggerCount: skill.triggers.length,
+              previewPath: preview.previewPath,
+              source: skill.source,
+            }
+          }),
+          note: '这里只列本人安装的技能；previewPath 可直接打开技能工作台并选中该技能。',
+        }
+        break
+      }
+
+      const requestedId = String(args.skillId ?? '').trim()
+      const skillId = requestedId ? normalizeSkillDevId(requestedId) : ''
+      const rawDir = String(args.dir ?? '').trim() || (skillId ? `${SKILL_DEV_DIR}/${skillId}` : '')
+      if (!rawDir) {
+        throw new EabError(EC.VALIDATION, '需要 skillId 或 dir 指定技能源码目录')
+      }
+      const dir = resolveSkillDevDir(root, rawDir)
+      const dirRel = relative(root, dir).replace(/\\/g, '/')
+
+      if (action === 'create') {
+        if (!skillId) throw new EabError(EC.VALIDATION, 'create 需要 skillId')
+        const scaffold = createSkillDevScaffold({
+          dir,
+          skillId,
+          title: String(args.title ?? '').trim() || skillId,
+          description: args.description === undefined ? undefined : String(args.description),
+          triggers: Array.isArray(args.triggers) ? args.triggers.map((item) => String(item)) : undefined,
+          overwrite: Boolean(args.overwrite),
+        })
+        result = {
+          action: 'create',
+          application: 'created',
+          skillId: scaffold.skillId,
+          dir: dirRel,
+          files: scaffold.files,
+          next: `用 workspace.read 读 ${dirRel}/SKILL.md，再用 workspace.edit 改成目标技能说明；改完调用 skill.dev action=install 热安装并拿 previewPath。`,
+          note: 'create 只生成模板；第一次 install 之后技能才会进入对话的技能目录。',
+        }
+        break
+      }
+
+      const actualId = skillId || skillDevIdFromDir(dir)
+      const baseOptions = {
+        companyId: actor.subject.companyId,
+        installedBy: actor.subject.userId,
+        scope: 'user' as const,
+        userId: actor.subject.userId,
+        overwrite: true,
+        source: 'workspace-dev',
+        sourceRef: dirRel || actualId,
+      }
+      let approvalId: string | undefined
+      let expectedChecksum: string | undefined
+      const policy = companySkillPolicy(deps.db, actor.subject.companyId)
+      if (policy.requirePersonalInstallApproval) {
+        const preview = previewSkillInstall(deps.db, dir, baseOptions)
+        const approval = ensureSkillInstallApproval(deps.db, {
+          companyId: actor.subject.companyId,
+          requesterUserId: actor.subject.userId,
+          scope: 'user',
+          skillId: preview.skillId,
+          skillName: preview.name,
+          version: preview.version,
+          checksum: preview.checksum,
+          overwrite: true,
+          sourceRef: baseOptions.sourceRef,
+        })
+        if (approval.status !== 'approved') {
+          throw new EabError(
+            EC.APPROVAL_REQUIRED,
+            `个人技能安装按公司策略需要管理员审批（审批单 ${approval.approvalId}）。管理员在控制台「审批」页通过后，再次调用 skill.dev action=install 即可继续。`,
+            {
+              details: {
+                approvalId: approval.approvalId,
+                skillId: preview.skillId,
+                checksum: preview.checksum,
+                scope: 'user',
+              },
+            },
+          )
+        }
+        approvalId = approval.approvalId
+        expectedChecksum = preview.checksum
+      }
+
+      const installed = installSkillDevBundle(deps.db, {
+        companyId: actor.subject.companyId,
+        userId: actor.subject.userId,
+        installedBy: actor.subject.userId,
+        dir,
+        sourceRef: baseOptions.sourceRef,
+        expectedChecksum,
+        approvalId,
+      })
+      const preview = skillPreviewLink(installed.skill, actor.subject.companyId)
+      const warnings: string[] = []
+      if (!policy.enabled) warnings.push('公司技能总开关已关闭，安装已落库但当前不会注入对话')
+      if (!installed.skill.valid) warnings.push(`技能未通过安装后校验：${installed.skill.error || '未知原因'}`)
+      if (installed.skill.risk !== 'low') warnings.push(`技能风险级别为 ${installed.skill.risk}，请检查扫描结论`)
+      const instructionPreview = installed.skill.instructions
+        .split(/\r?\n/)
+        .slice(0, 12)
+        .join('\n')
+        .slice(0, 900)
+      result = {
+        action: 'install',
+        application: warnings.length === 0 ? 'applied' : 'applied_with_warnings',
+        replaced: installed.replaced,
+        skill: {
+          id: installed.skill.id,
+          name: installed.skill.name,
+          version: installed.skill.version,
+          checksum: installed.skill.checksum,
+          level: installed.skill.level,
+          risk: installed.skill.risk,
+          enabled: installed.skill.enabled,
+          valid: installed.skill.valid,
+          scope: installed.skill.scope,
+          triggers: installed.skill.triggers,
+          tools: installed.skill.tools,
+        },
+        dir: dirRel,
+        previewPath: preview.previewPath,
+        instructionPreview,
+        warnings,
+        note: '安装已写库并复制到 skills 目录；下一轮对话会重新扫描并加载技能，无需重启服务。改完 SKILL.md 再 install 一次即热更新。',
+      }
       break
     }
     case 'office.read_outline': {
@@ -3484,6 +4034,7 @@ export async function executeTool(
         changes: applied.changes,
         matchedEdits: applied.matchedEdits,
         edited: true,
+        diff: buildWorkspaceEditDiff(edits),
       }
       break
     }

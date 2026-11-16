@@ -1,6 +1,6 @@
 # EAB 企业智能体基座 · 使用说明
 
-> 版本：v2026.11.14　适用：Windows 10/11 + Node.js 22+ + pnpm 10+
+> 版本：v2026.11.17　适用：Windows 10/11 + Node.js 22+ + pnpm 10+
 >
 > 面向两类人：**平台管理员**（在 `/admin` 配置全公司）和**普通员工**（在 `/chat` 登录对话）。
 > 后台是配置台，不要求组织成员登录后台；组织成员只在员工工作台或钉钉/飞书/企微机器人里使用。
@@ -611,6 +611,13 @@ foreach ($port in $ports) {
 }
 Start-Sleep -Milliseconds 700
 Start-Process pwsh -ArgumentList "-NoProfile","-Command","cd 'D:\AI kaifa\EAB'; pnpm dev *> `"$env:TEMP\eab-dev.log`"" -WindowStyle Hidden
+```
+
+日志默认级别为 `warn`：正常 2xx 请求不输出 `request completed`，4xx/5xx 和启动、后端异常仍保留。排查具体请求时可临时恢复 info：
+
+```powershell
+$env:EAB_LOG_LEVEL = 'info'
+pnpm dev
 ```
 
 只改 `packages\server\public\*` 时刷新浏览器即可，不用重启。

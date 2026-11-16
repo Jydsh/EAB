@@ -116,7 +116,7 @@ const PAGES = {
   org: { title: '成员管理', sub: '成员列表、角色授权与部门筛选', render: () => loadOrg() },
   departments: { title: '部门管理', sub: '部门结构、负责人、下级与成员', render: () => loadDepartments() },
   roles: { title: '角色管理', sub: '角色权限、数据范围与成员配置', render: () => loadRoles() },
-  approvalPolicies: { title: '权限审批', sub: '按权限范围配置多级审批链与可申请角色', render: () => loadPermissionPolicies() },
+  approvalPolicies: { title: '权限审批', sub: '按权限点配置多级审批链，并控制哪些角色开放权限申请', render: () => loadPermissionPolicies() },
   access: { title: '权限矩阵', sub: '成员 × 知识库可见性核对', render: () => loadMatrix() },
   kb: { title: '知识库', sub: '知识库、可见范围与文档', render: () => loadKb() },
   models: { title: '模型接入', sub: '供应商端点、模型目录与用途路由', render: () => loadModels() },
@@ -3399,7 +3399,7 @@ async function loadPermissionPolicies() {
             <td><button class="link-btn accent" type="button" data-pp-edit="${index}">编辑</button></td>
           </tr>`,
         )
-        .join('') || '<tr><td colspan="6" class="empty">还没有审批策略。未配置时，可申请角色不会出现在员工端。</td></tr>'
+        .join('') || '<tr><td colspan="6" class="empty">还没有审批策略。未配置时，对应的权限点不会出现在员工端申请面板。</td></tr>'
     const roleRows =
       roles
         .filter((role) => !role.management)
@@ -3413,16 +3413,16 @@ async function loadPermissionPolicies() {
         .join('') || '<div class="empty">没有可申请的角色。</div>'
     view.innerHTML = `
       <div class="permission-flow">
-        <div class="flow-step"><span>1</span><strong>可申请</strong><p>只有勾选的角色会出现在员工端申请列表</p></div>
+        <div class="flow-step"><span>1</span><strong>开放权限来源</strong><p>勾选的角色决定哪些权限点可以被员工申请</p></div>
         <div class="flow-arrow">→</div>
-        <div class="flow-step"><span>2</span><strong>按范围匹配</strong><p>角色展开成权限点，逐个匹配最严格策略</p></div>
+        <div class="flow-step"><span>2</span><strong>按权限点匹配</strong><p>只展示当前身份缺少的权限，逐个匹配最严格策略</p></div>
         <div class="flow-arrow">→</div>
-        <div class="flow-step"><span>3</span><strong>逐级审批</strong><p>最后一级同意后授权，并按有效期自动失效</p></div>
+        <div class="flow-step"><span>3</span><strong>逐级审批</strong><p>通过后只授予所选权限，不新增角色，按有效期自动失效</p></div>
       </div>
       <section class="panel">
-        <div class="panel-head"><div><h2>可申请角色</h2>${hintBadge(
+        <div class="panel-head"><div><h2>开放申请的角色</h2>${hintBadge(
           '申请范围',
-          '仅本人可申请；这里勾选的角色会进入员工端。管理角色即使勾选也不会进入自助申请列表。',
+          '仅本人可申请；这里勾选的角色会决定员工端可申请的权限点范围，不会把整个角色作为申请单位。管理角色即使勾选也不会进入自助申请列表。',
         )}</div></div>
         <div class="pp-role-grid">${roleRows}</div>
         <div class="pp-role-note muted">管理角色（公司管理员、部门管理员、平台超管等）不参与自助申请，未在此列出。</div>
@@ -4378,7 +4378,7 @@ async function openModelModal(model, providers, roles) {
       ? '<strong>图片识别已开启</strong><span>员工工作台可以直接上传或粘贴图片，服务端会按图片内容送入模型。</span>'
       : '<strong>未开启图片识别</strong><span>带图片的消息不会发给这个模型；需要图片能力时请勾选「图片识别 / 多模态」。</span>'
     const hintText = endpoint.value === 'systemone'
-      ? 'SystemOne 是结构化决策端点：不生成文本，父 Agent 用它按子任务内容给子 Agent 选模型；Base URL 要能拼出 /v1/systemone。'
+      ? 'SystemOne 是结构化决策端点：不生成文本，主 Agent 用它按子任务内容给子 Agent 选模型；Base URL 要能拼出 /v1/systemone。'
       : typeHints[type.value] || typeHints.custom
     typeHint.dataset.tip = hintText
     typeHint.setAttribute('aria-label', hintText)

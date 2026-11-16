@@ -5,6 +5,7 @@ coverage/
 .eab-dev/
 .EAB_HOME/
 plugins/
+skills/
 plans/
 *.db
 *.db-wal

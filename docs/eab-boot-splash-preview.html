@@ -1,0 +1,939 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light" data-context="chat">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>EAB 登录后启动动画 · 预览</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230f6b5c'/%3E%3Ctext x='32' y='41' text-anchor='middle' font-family='Segoe UI' font-size='19' font-weight='700' fill='white'%3EEAB%3C/text%3E%3C/svg%3E"
+    />
+    <style>
+      @property --boot-arc {
+        syntax: "<angle>";
+        inherits: false;
+        initial-value: 72deg;
+      }
+
+      :root {
+        --bg: #f4f7f6;
+        --surface: #ffffff;
+        --surface-2: #f2f6f5;
+        --text: #14201d;
+        --muted: #75837e;
+        --line: #e2e9e7;
+        --brand: #0f6b5c;
+        --brand-ink: #ffffff;
+        --brand-soft: #e7f2ef;
+        --splash-bg: #f4f7f6;
+        --splash-glow: rgba(15, 107, 92, 0.08);
+        --ring-track: rgba(20, 32, 29, 0.12);
+        --shadow: 0 12px 32px rgba(17, 34, 30, 0.08);
+        --radius: 10px;
+      }
+
+      html[data-theme="dark"] {
+        --bg: #0a0e14;
+        --surface: #121821;
+        --surface-2: #0e141c;
+        --text: #e7eef7;
+        --muted: #8b98a9;
+        --line: #24303c;
+        --brand: #5ee0c6;
+        --brand-ink: #04231d;
+        --brand-soft: #12332f;
+        --splash-bg: #070b11;
+        --splash-glow: rgba(94, 224, 198, 0.1);
+        --ring-track: rgba(255, 255, 255, 0.12);
+        --shadow: 0 12px 32px rgba(0, 0, 0, 0.34);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        min-height: 100%;
+        margin: 0;
+      }
+
+      body {
+        background: var(--bg);
+        color: var(--text);
+        font-family: "Segoe UI", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      button {
+        font: inherit;
+      }
+
+      /* ---------------- 被启动层遮住的应用首屏 ---------------- */
+
+      .app-shell {
+        min-height: 100vh;
+        background: var(--bg);
+        transition: background 180ms ease;
+      }
+
+      [data-context="admin"] .chat-shell,
+      [data-context="chat"] .admin-shell {
+        display: none;
+      }
+
+      /* 管理控制台：只用于展示“启动后出现什么”，不冒充完整后台 */
+      .admin-shell {
+        min-height: 100vh;
+      }
+
+      .admin-topbar {
+        height: 58px;
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        padding: 0 22px;
+        background: var(--surface);
+        border-bottom: 1px solid var(--line);
+      }
+
+      .admin-brand {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        min-width: 190px;
+      }
+
+      .admin-brand .mark {
+        width: 30px;
+        height: 30px;
+        border-radius: 8px;
+        background: var(--brand);
+        color: var(--brand-ink);
+        display: grid;
+        place-items: center;
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.04em;
+      }
+
+      .admin-brand strong {
+        display: block;
+        font-size: 14px;
+        line-height: 1.2;
+      }
+
+      .admin-brand span {
+        display: block;
+        margin-top: 2px;
+        font-size: 11px;
+        color: var(--muted);
+      }
+
+      .admin-status {
+        margin-left: auto;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 12px;
+        color: var(--muted);
+      }
+
+      .admin-status .dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: var(--brand);
+        box-shadow: 0 0 0 3px var(--brand-soft);
+      }
+
+      .admin-nav {
+        height: 42px;
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        padding: 0 22px;
+        background: var(--surface);
+        border-bottom: 1px solid var(--line);
+        overflow: hidden;
+        white-space: nowrap;
+      }
+
+      .admin-nav .nav-item {
+        padding: 6px 10px;
+        border-radius: 6px;
+        font-size: 12px;
+        color: var(--muted);
+      }
+
+      .admin-nav .nav-item.is-active {
+        background: var(--brand-soft);
+        color: var(--brand);
+        font-weight: 600;
+      }
+
+      .admin-workspace {
+        display: grid;
+        grid-template-columns: 196px minmax(0, 1fr);
+        min-height: calc(100vh - 100px);
+      }
+
+      .admin-rail {
+        padding: 18px 14px;
+        border-right: 1px solid var(--line);
+        background: var(--surface-2);
+      }
+
+      .rail-label {
+        margin: 0 8px 10px;
+        font-size: 10px;
+        letter-spacing: 0.1em;
+        color: var(--muted);
+      }
+
+      .rail-item {
+        padding: 8px 10px;
+        border-radius: 7px;
+        font-size: 12px;
+        color: var(--muted);
+      }
+
+      .rail-item.is-active {
+        background: var(--surface);
+        color: var(--text);
+        box-shadow: inset 2px 0 0 var(--brand);
+      }
+
+      .admin-page {
+        padding: 28px 32px;
+      }
+
+      .admin-page .eyebrow {
+        font-size: 10px;
+        letter-spacing: 0.12em;
+        color: var(--muted);
+      }
+
+      .admin-page h2 {
+        margin: 8px 0 4px;
+        font-size: 22px;
+        line-height: 1.2;
+      }
+
+      .admin-page p {
+        margin: 0;
+        font-size: 12px;
+        color: var(--muted);
+      }
+
+      .admin-cards {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 12px;
+        margin-top: 24px;
+        max-width: 760px;
+      }
+
+      .admin-card {
+        min-height: 104px;
+        padding: 16px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        background: var(--surface);
+      }
+
+      .admin-card span {
+        display: block;
+        font-size: 11px;
+        color: var(--muted);
+      }
+
+      .admin-card strong {
+        display: block;
+        margin-top: 12px;
+        font-size: 18px;
+        font-weight: 600;
+      }
+
+      .admin-card small {
+        display: block;
+        margin-top: 4px;
+        font-size: 11px;
+        color: var(--muted);
+      }
+
+      /* 员工工作台：对应现有 chat.html 的左侧栏 + 对话空状态 */
+      .chat-shell {
+        display: flex;
+        min-height: 100vh;
+        overflow: hidden;
+      }
+
+      .chat-side {
+        width: 236px;
+        flex: none;
+        display: flex;
+        flex-direction: column;
+        gap: 18px;
+        padding: 18px 14px;
+        border-right: 1px solid var(--line);
+        background: var(--surface);
+      }
+
+      .chat-side .brand {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        padding: 0 6px;
+      }
+
+      .chat-side .brand .mark {
+        width: 30px;
+        height: 30px;
+        border-radius: 8px;
+        background: var(--brand);
+        color: var(--brand-ink);
+        display: grid;
+        place-items: center;
+        font-size: 10px;
+        font-weight: 700;
+      }
+
+      .chat-side .brand span {
+        font-size: 11px;
+        color: var(--muted);
+        line-height: 1.35;
+      }
+
+      .fake-user {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 10px;
+        border-radius: 9px;
+        background: var(--surface-2);
+      }
+
+      .fake-avatar {
+        width: 30px;
+        height: 30px;
+        border-radius: 50%;
+        display: grid;
+        place-items: center;
+        background: var(--brand);
+        color: var(--brand-ink);
+        font-size: 12px;
+        font-weight: 700;
+      }
+
+      .fake-user strong {
+        display: block;
+        font-size: 12px;
+      }
+
+      .fake-user span {
+        display: block;
+        margin-top: 2px;
+        font-size: 10px;
+        color: var(--muted);
+      }
+
+      .fake-section {
+        padding: 0 6px;
+      }
+
+      .fake-section-title {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 8px;
+        font-size: 11px;
+        color: var(--muted);
+      }
+
+      .fake-new {
+        border: 0;
+        padding: 2px 6px;
+        border-radius: 5px;
+        background: transparent;
+        color: var(--muted);
+        font-size: 10px;
+      }
+
+      .fake-session {
+        padding: 8px;
+        border-radius: 7px;
+        font-size: 11px;
+        color: var(--muted);
+      }
+
+      .fake-session.is-active {
+        background: var(--brand-soft);
+        color: var(--text);
+      }
+
+      .chat-main {
+        position: relative;
+        flex: 1;
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+        background: var(--bg);
+      }
+
+      .chat-head {
+        height: 56px;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 0 18px;
+        border-bottom: 1px solid var(--line);
+        background: var(--surface);
+      }
+
+      .chat-head strong {
+        font-size: 13px;
+        font-weight: 600;
+      }
+
+      .chat-empty {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+        text-align: center;
+      }
+
+      .chat-empty .big-logo {
+        width: 48px;
+        height: 48px;
+        border-radius: 12px;
+        display: grid;
+        place-items: center;
+        background: var(--brand);
+        color: var(--brand-ink);
+        font-size: 13px;
+        font-weight: 700;
+        letter-spacing: 0.04em;
+      }
+
+      .chat-empty h2 {
+        margin: 18px 0 6px;
+        font-size: 24px;
+        letter-spacing: -0.02em;
+      }
+
+      .chat-empty p {
+        margin: 0;
+        max-width: 350px;
+        font-size: 12px;
+        line-height: 1.7;
+        color: var(--muted);
+      }
+
+      .fake-suggest {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: center;
+        gap: 8px;
+        margin-top: 20px;
+      }
+
+      .fake-suggest span {
+        padding: 7px 10px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--surface);
+        font-size: 11px;
+        color: var(--muted);
+      }
+
+      .fake-composer {
+        margin: 0 auto 78px;
+        width: min(680px, calc(100% - 32px));
+        padding: 10px 12px;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: var(--surface);
+        color: var(--muted);
+        font-size: 11px;
+      }
+
+      /* ---------------- 启动层 ---------------- */
+
+      .splash {
+        position: fixed;
+        inset: 0;
+        z-index: 10;
+        display: grid;
+        place-items: center;
+        background:
+          radial-gradient(circle at 50% 46%, var(--splash-glow) 0%, transparent 37%),
+          var(--splash-bg);
+        opacity: 1;
+        transition: opacity 240ms ease;
+      }
+
+      .splash[hidden] {
+        display: none;
+      }
+
+      .splash.is-leaving {
+        opacity: 0;
+      }
+
+      .splash-inner {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        text-align: center;
+        animation: splash-in 180ms ease both;
+        transition: transform 240ms ease;
+      }
+
+      .splash.is-leaving .splash-inner {
+        transform: translateY(-2px);
+      }
+
+      .splash-mark {
+        width: 42px;
+        height: 42px;
+        border-radius: 11px;
+        display: grid;
+        place-items: center;
+        background: var(--brand);
+        color: var(--brand-ink);
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.04em;
+      }
+
+      .splash-product {
+        margin-top: 14px;
+        font-size: 12px;
+        line-height: 1.4;
+        letter-spacing: 0.14em;
+        font-weight: 500;
+        color: var(--muted);
+      }
+
+      .boot-ring {
+        position: relative;
+        width: 22px;
+        height: 22px;
+        margin-top: 26px;
+        border-radius: 50%;
+        border: 2px solid var(--ring-track);
+        animation: ring-spin 900ms linear infinite;
+      }
+
+      .boot-ring::after {
+        content: "";
+        position: absolute;
+        inset: -2px;
+        border-radius: inherit;
+        background: conic-gradient(var(--brand) var(--boot-arc, 72deg), transparent 0);
+        -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 0);
+        mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 0);
+        transition: --boot-arc 380ms ease;
+      }
+
+      .boot-status {
+        min-height: 18px;
+        margin-top: 14px;
+        font-size: 12px;
+        line-height: 18px;
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+        transition: color 180ms ease;
+      }
+
+      .splash.is-failed .boot-status {
+        color: #b42318;
+      }
+
+      html[data-theme="dark"] .splash.is-failed .boot-status {
+        color: #ff8a7a;
+      }
+
+      html.reduce-motion .boot-ring,
+      body.reduce-motion .boot-ring {
+        animation: none;
+      }
+
+      html.reduce-motion .boot-ring::after,
+      body.reduce-motion .boot-ring::after {
+        transition: none;
+      }
+
+      html.reduce-motion .splash-inner,
+      body.reduce-motion .splash-inner {
+        animation: none;
+      }
+
+      html.reduce-motion .splash,
+      body.reduce-motion .splash {
+        transition-duration: 100ms;
+      }
+
+      @keyframes ring-spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+
+      @keyframes splash-in {
+        from {
+          opacity: 0;
+          transform: translateY(4px);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0);
+        }
+      }
+
+      /* ---------------- 预览控制条 ---------------- */
+
+      .preview-bar {
+        position: fixed;
+        left: 50%;
+        bottom: 16px;
+        z-index: 9;
+        transform: translateX(-50%);
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        max-width: calc(100vw - 24px);
+        padding: 7px;
+        border: 1px solid var(--line);
+        border-radius: 11px;
+        background: var(--surface);
+        box-shadow: var(--shadow);
+        color: var(--text);
+      }
+
+      .preview-bar .seg {
+        display: flex;
+        gap: 2px;
+        padding: 2px;
+        border-radius: 7px;
+        background: var(--surface-2);
+      }
+
+      .preview-bar button {
+        min-height: 30px;
+        padding: 5px 9px;
+        border: 0;
+        border-radius: 6px;
+        background: transparent;
+        color: var(--muted);
+        font-size: 11px;
+        cursor: pointer;
+        white-space: nowrap;
+      }
+
+      .preview-bar button:hover {
+        background: var(--brand-soft);
+        color: var(--text);
+      }
+
+      .preview-bar button:focus-visible {
+        outline: 2px solid var(--brand);
+        outline-offset: 2px;
+      }
+
+      .preview-bar button.is-active {
+        background: var(--surface);
+        color: var(--text);
+        box-shadow: 0 1px 2px rgba(17, 34, 30, 0.07);
+      }
+
+      .preview-bar .replay {
+        border: 1px solid var(--line);
+        color: var(--text);
+      }
+
+      .preview-bar .replay:hover {
+        border-color: var(--brand);
+        color: var(--brand);
+      }
+
+      .preview-bar .note {
+        padding: 0 4px;
+        font-size: 10px;
+        color: var(--muted);
+        white-space: nowrap;
+      }
+
+      @media (max-width: 580px) {
+        .preview-bar {
+          flex-wrap: wrap;
+          justify-content: center;
+          bottom: 10px;
+        }
+
+        .preview-bar .note {
+          width: 100%;
+          text-align: center;
+        }
+
+        .admin-workspace {
+          grid-template-columns: 1fr;
+        }
+
+        .admin-rail {
+          display: none;
+        }
+
+        .chat-side {
+          display: none;
+        }
+
+        .admin-page {
+          padding: 24px 18px;
+        }
+
+        .admin-cards {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .boot-ring {
+          animation: none;
+        }
+
+        .boot-ring::after,
+        .splash-inner,
+        .splash {
+          transition: none;
+          animation: none;
+        }
+      }
+
+      /* 预览页需要能手动恢复动效，覆盖系统 reduced-motion 的静态效果 */
+      html.force-motion .boot-ring {
+        animation: ring-spin 900ms linear infinite;
+      }
+
+      html.force-motion .boot-ring::after {
+        transition: --boot-arc 380ms ease;
+      }
+
+      html.force-motion .splash-inner {
+        animation: splash-in 180ms ease both;
+      }
+
+      html.force-motion .splash {
+        transition: opacity 240ms ease;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="admin-shell" aria-label="管理控制台首屏预览">
+        <header class="admin-topbar">
+          <div class="admin-brand">
+            <span class="mark">EAB</span>
+            <div>
+              <strong>企业智能体基座</strong>
+              <span>管理控制台</span>
+            </div>
+          </div>
+          <div class="admin-status"><span class="dot"></span><span>服务正常 · v2026.11.15</span></div>
+        </header>
+        <nav class="admin-nav" aria-label="业务域导航">
+          <span class="nav-item is-active">概览</span>
+          <span class="nav-item">组织与权限</span>
+          <span class="nav-item">知识与模型</span>
+          <span class="nav-item">连接与平台</span>
+          <span class="nav-item">插件管理</span>
+        </nav>
+        <div class="admin-workspace">
+          <aside class="admin-rail" aria-label="二级导航">
+            <div class="rail-label">CONFIG</div>
+            <div class="rail-item is-active">系统概览</div>
+            <div class="rail-item">服务设置</div>
+            <div class="rail-item">运行状态</div>
+            <div class="rail-item">数据维护</div>
+          </aside>
+          <section class="admin-page">
+            <div class="eyebrow">EAB CONFIG</div>
+            <h2>概览</h2>
+            <p>服务状态与配置入口</p>
+            <div class="admin-cards">
+              <div class="admin-card"><span>服务状态</span><strong>运行中</strong><small>8787 / 8788</small></div>
+              <div class="admin-card"><span>当前公司</span><strong>1 家</strong><small>默认公司</small></div>
+              <div class="admin-card"><span>可用模型</span><strong>6 个</strong><small>含自动路由</small></div>
+              <div class="admin-card"><span>已启用插件</span><strong>12 个</strong><small>个人与公司范围</small></div>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section class="chat-shell" aria-label="员工工作台首屏预览">
+        <aside class="chat-side">
+          <div class="brand"><span class="mark">EAB</span><span>企业AI智能体基座</span></div>
+          <div class="fake-user">
+            <span class="fake-avatar">何</span>
+            <div><strong>何工</strong><span>信息智能科技</span></div>
+          </div>
+          <div class="fake-section">
+            <div class="fake-section-title"><span>对话</span><button class="fake-new" type="button">新建</button></div>
+            <div class="fake-session is-active">早上好呀</div>
+            <div class="fake-session">钉钉 · 晚上好</div>
+            <div class="fake-session">现在我们能干嘛</div>
+          </div>
+        </aside>
+        <section class="chat-main">
+          <header class="chat-head"><strong>新对话</strong></header>
+          <div class="chat-empty">
+            <div class="big-logo">EAB</div>
+            <h2>你好</h2>
+            <p>问点什么开始。你的身份、能用的模型都由组织与权限决定。</p>
+            <div class="fake-suggest"><span>帮我梳理今天的工作</span><span>查一下公司通讯录</span><span>把这份文档改成汇报稿</span></div>
+          </div>
+          <div class="fake-composer">输入消息，Enter 发送，Shift + Enter 换行</div>
+        </section>
+      </section>
+    </main>
+
+    <!-- 静态启动层：预览页从第一帧就显示，模拟真实页面“解析即覆盖” -->
+    <div class="splash" id="splash" role="status" aria-live="polite" aria-label="系统启动">
+      <div class="splash-inner">
+        <div class="splash-mark">EAB</div>
+        <div class="splash-product">企业智能体基座</div>
+        <div class="boot-ring" aria-hidden="true"></div>
+        <div class="boot-status" id="boot-status">正在启动工作台…</div>
+      </div>
+    </div>
+
+    <div class="preview-bar" aria-label="启动动画预览控制">
+      <div class="seg" role="tablist" aria-label="页面类型">
+        <button type="button" data-context="chat" class="is-active" role="tab" aria-selected="true">员工工作台</button>
+        <button type="button" data-context="admin" role="tab" aria-selected="false">管理控制台</button>
+      </div>
+      <button type="button" id="theme-toggle" aria-label="切换深浅色">深色</button>
+      <button type="button" id="motion-toggle" role="switch" aria-checked="false" aria-label="降低动效">降低动效</button>
+      <button type="button" class="replay" id="replay">重播启动</button>
+      <span class="note">预览节奏已放慢，便于观察</span>
+    </div>
+
+    <script>
+      (function () {
+        var root = document.documentElement
+        var splash = document.getElementById('splash')
+        var statusEl = document.getElementById('boot-status')
+        var ring = document.querySelector('.boot-ring')
+        var replay = document.getElementById('replay')
+        var themeToggle = document.getElementById('theme-toggle')
+        var motionToggle = document.getElementById('motion-toggle')
+        var contextButtons = Array.from(document.querySelectorAll('.preview-bar [data-context]'))
+        var timers = []
+        var reduceMotion = false
+
+        function setMotion(value) {
+          reduceMotion = Boolean(value)
+          root.classList.toggle('reduce-motion', reduceMotion)
+          root.classList.toggle('force-motion', !reduceMotion)
+          motionToggle.setAttribute('aria-checked', reduceMotion ? 'true' : 'false')
+          motionToggle.textContent = reduceMotion ? '恢复动效' : '降低动效'
+        }
+
+        function clearTimers() {
+          for (var i = 0; i < timers.length; i++) clearTimeout(timers[i])
+          timers = []
+        }
+
+        function setStage(text, arc) {
+          statusEl.textContent = text
+          ring.style.setProperty('--boot-arc', String(arc) + 'deg')
+        }
+
+        function finish() {
+          setStage('准备就绪', 288)
+          var wait = reduceMotion ? 120 : 380
+          timers.push(
+            setTimeout(function () {
+              splash.classList.add('is-leaving')
+              timers.push(
+                setTimeout(function () {
+                  splash.hidden = true
+                  splash.classList.remove('is-leaving')
+                }, reduceMotion ? 100 : 260),
+              )
+            }, wait),
+          )
+        }
+
+        function play() {
+          clearTimers()
+          splash.hidden = false
+          splash.classList.remove('is-leaving', 'is-failed')
+          root.classList.add('is-booting')
+          setStage(root.dataset.context === 'admin' ? '正在进入管理控制台…' : '正在启动工作台…', 72)
+
+          var context = root.dataset.context
+          var slow = reduceMotion ? 0.75 : 1.75
+          var steps =
+            context === 'admin'
+              ? [
+                  [0, '正在进入管理控制台…', 72],
+                  [520, '正在校验管理会话…', 118],
+                  [980, '正在加载控制台配置…', 174],
+                  [1450, '正在准备控制台…', 246],
+                ]
+              : [
+                  [0, '正在启动工作台…', 72],
+                  [470, '正在验证登录状态…', 108],
+                  [980, '正在加载你的工作台…', 168],
+                  [1540, '正在恢复会话…', 238],
+                ]
+
+          for (var i = 0; i < steps.length; i++) {
+            (function (step) {
+              timers.push(setTimeout(function () { setStage(step[1], step[2]) }, step[0] * slow))
+            })(steps[i])
+          }
+
+          timers.push(setTimeout(finish, (context === 'admin' ? 2080 : 2360) * slow))
+        }
+
+        replay.addEventListener('click', function () {
+          play()
+        })
+
+        themeToggle.addEventListener('click', function () {
+          var next = root.dataset.theme === 'dark' ? 'light' : 'dark'
+          root.dataset.theme = next
+          themeToggle.textContent = next === 'dark' ? '浅色' : '深色'
+        })
+
+        motionToggle.addEventListener('click', function () {
+          setMotion(!reduceMotion)
+          play()
+        })
+
+        for (var i = 0; i < contextButtons.length; i++) {
+          contextButtons[i].addEventListener('click', function (event) {
+            var next = event.currentTarget.dataset.context
+            if (next === root.dataset.context) return
+            root.dataset.context = next
+            for (var j = 0; j < contextButtons.length; j++) {
+              var active = contextButtons[j].dataset.context === next
+              contextButtons[j].classList.toggle('is-active', active)
+              contextButtons[j].setAttribute('aria-selected', active ? 'true' : 'false')
+            }
+            play()
+          })
+        }
+
+        setMotion(reduceMotion)
+        play()
+      })()
+    </script>
+  </body>
+</html>

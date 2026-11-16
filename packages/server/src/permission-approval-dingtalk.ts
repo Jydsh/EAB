@@ -33,6 +33,7 @@ interface RequestRow {
   role_code: string
   role_name: string
   scopes_json: string
+  request_type: string
   reason: string
   status: string
   current_step: number
@@ -130,11 +131,20 @@ function approvalState(
   mode: 'pending' | 'approved-wait' | 'approved-final' | 'rejected' | 'cancelled' | 'expired',
 ): DingTalkRichCardState {
   const progress = `第 ${step.step_no} / ${request.total_steps} 级`
+  const requestedScopes = scopesText(request.scopes_json) || '—'
+  const isScopeRequest = request.request_type === 'scope'
   const header = [
     '### 权限审批',
     `**申请人**：${requesterNameOf(db, request.requester_user_id)}`,
-    `**申请角色**：${request.role_name}（${request.role_code}）`,
-    `**权限范围**：${scopesText(request.scopes_json) || '—'}`,
+    ...(isScopeRequest
+      ? [
+          `**申请权限**：${requestedScopes}`,
+          '**授权方式**：只授予所选权限，不新增角色',
+        ]
+      : [
+          `**申请角色**：${request.role_name}（${request.role_code}）`,
+          `**权限范围**：${requestedScopes}`,
+        ]),
     `**有效期**：${daysText(request.duration_hours)}`,
     `**审批进度**：${progress}`,
     request.reason ? `**申请原因**：${request.reason}` : '',
@@ -155,7 +165,7 @@ function approvalState(
           {
             id: 'approve',
             label: '同意',
-            description: step.step_no < request.total_steps ? '通过后进入下一级审批' : '最后一级通过后立即授予角色',
+            description: step.step_no < request.total_steps ? '通过后进入下一级审批' : (isScopeRequest ? '最后一级通过后授予所选权限' : '最后一级通过后立即授予角色'),
           },
           {
             id: 'reject',
@@ -174,7 +184,9 @@ function approvalState(
     mode === 'approved-wait'
       ? '本级已同意，正在等待下一级审批。'
       : mode === 'approved-final'
-        ? `审批已通过，角色 **${request.role_name}** 已授予，到期后自动失效。`
+        ? (isScopeRequest
+            ? `审批已通过，所选权限 **${requestedScopes}** 已授予，到期后自动失效。`
+            : `审批已通过，角色 **${request.role_name}** 已授予，到期后自动失效。`)
         : mode === 'rejected'
           ? '审批已拒绝，未授予任何权限。'
           : mode === 'cancelled'
@@ -255,7 +267,10 @@ export async function sendPermissionApprovalCard(
 
   const outTrackId = existingId || `${OUT_TRACK_PREFIX}${randomUUID().replace(/-/g, '')}`
   markCard(deps.db, step, { outTrackId, status: 'sending', error: '' })
-  const created = await stream.start(state, `权限审批：${request.role_name}`, { outTrackId })
+  const title = request.request_type === 'scope'
+    ? `权限审批：${scopesText(request.scopes_json) || '权限申请'}`
+    : `权限审批：${request.role_name}`
+  const created = await stream.start(state, title, { outTrackId })
   if (!created) {
     markCard(deps.db, step, { outTrackId, status: 'failed', error: '钉钉 A2UI 卡片投递失败' })
     return false

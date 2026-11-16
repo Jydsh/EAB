@@ -619,6 +619,54 @@
     try { return ctx.slots.entries('main').length } catch (_) { return 0 }
   }
 
+  /**
+   * 插件页自己的版本心跳：Agent 重新 install 后 plugins/<id> 的 version/checksum 会变，
+   * 这里拿到新值就重建整个 iframe 文档。warm=1 只是首屏预热，不轮询。
+   */
+  let runtimeTimer = 0
+  let runtimeBusy = false
+  async function pollPluginRuntime() {
+    if (warmOnly || runtimeBusy || document.visibilityState === 'hidden') return
+    runtimeBusy = true
+    try {
+      const base = scope === 'user'
+        ? '/api/my/plugins/' + encodeURIComponent(pluginId) + '/runtime'
+        : '/api/console/plugins/' + encodeURIComponent(pluginId) + '/runtime'
+      const url = base + (asUser ? '?as=' + encodeURIComponent(asUser) : '')
+      const response = await fetch(url, { credentials: 'include', cache: 'no-store' })
+      if (!response.ok) return
+      const payload = await response.json()
+      const runtime = payload && payload.data && payload.data.plugin
+      if (!runtime) return
+      const nextChecksum = String(runtime.checksum || '')
+      const nextVersion = String(runtime.version || '')
+      const changedChecksum = nextChecksum && checksum && nextChecksum !== checksum
+      const changedVersion = nextVersion && version && nextVersion !== version
+      if (!changedChecksum && !changedVersion) return
+      const next = new URLSearchParams(location.search)
+      if (nextVersion) next.set('version', nextVersion)
+      if (nextChecksum) next.set('h', nextChecksum)
+      const firstPage = Array.isArray(runtime.pages) ? runtime.pages[0] : null
+      if (firstPage && firstPage.file) next.set('entry', String(firstPage.file))
+      if (typeof firstPage?.title === 'string' && firstPage.title) next.set('title', firstPage.title)
+      statusEl.textContent = '检测到新版本，正在刷新…'
+      location.replace('/plugin-kernel.html?' + next.toString())
+    } catch (_) {
+      // 网络抖动或服务重启时静默重试，不把错误盖到插件页上。
+    } finally {
+      runtimeBusy = false
+    }
+  }
+  if (!warmOnly) {
+    runtimeTimer = setInterval(pollPluginRuntime, 2500)
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') pollPluginRuntime()
+    })
+    window.addEventListener('pagehide', () => {
+      clearInterval(runtimeTimer)
+    })
+  }
+
   boot().catch((error) => {
     statusEl.textContent = '内核启动失败'
     statusEl.classList.add('warn')

@@ -25,7 +25,7 @@ import type { ServerDeps } from './deps.js'
 import { actorFor, findActivePerson, type RequestActor } from './session.js'
 import { resolveModelForPurpose } from './model-registry.js'
 import { publishChatEvent } from './chat-events.js'
-import { dingTalkRecipientOf, sendDingTalkTextToUser } from './dingtalk-outbound.js'
+import { dingTalkRecipientOf, sendDingTalkRichTextToUser } from './dingtalk-outbound.js'
 
 export type ScheduleMode = 'once' | 'daily' | 'weekly' | 'interval'
 export type ScheduleChannel = 'dingtalk' | 'web'
@@ -829,10 +829,11 @@ async function runSchedule(deps: ServerDeps, row: ScheduleRow, runId: string): P
   let deliveryError: string | undefined
   if (row.channel === 'dingtalk') {
     try {
-      await sendDingTalkTextToUser(deps, {
+      await sendDingTalkRichTextToUser(deps, {
         companyId: row.company_id,
         userId: row.user_id,
-        text: `⏰ ${row.title}\n\n${resultText}`,
+        title: `⏰ ${row.title}`,
+        text: `⏰ **${row.title}**\n\n${resultText}`,
       })
       delivered = true
     } catch (error) {

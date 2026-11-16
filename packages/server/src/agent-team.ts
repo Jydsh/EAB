@@ -573,6 +573,13 @@ export class AgentTeamStore {
     ).all(this.teamId, cutoff) as unknown as Array<{ key: string }>
     if (rows.length === 0) return []
     for (const row of rows) {
+      // 注销 worker 时一并关闭它遗留的排队/执行中任务，避免任务表里长期挂着
+      // 一个没有 worker 的 running 任务，让父 Agent 误以为子 Agent 还在执行。
+      this.db.prepare(
+        `UPDATE agent_tasks
+            SET status = 'cancelled', error = ?, finished_at = ?, updated_at = ?
+          WHERE team_id = ? AND worker_key = ? AND status IN ('queued', 'running')`,
+      ).run('子 Agent 空闲超时已注销，任务未继续', now, now, this.teamId, row.key)
       this.db.prepare('DELETE FROM agent_workers WHERE team_id = ? AND key = ?').run(this.teamId, row.key)
       this.db.prepare('DELETE FROM agent_team_messages WHERE team_id = ? AND worker_key = ?').run(this.teamId, row.key)
     }

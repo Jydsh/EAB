@@ -82,7 +82,7 @@ agent_spawn(key=research-a)
      工作（子 run 独立 session / 独立 runId，事件只进自己的窗口）
         │  done
         ▼
-   idle（保留身份，页脚提示空闲 2 分钟后注销）
+   idle（保留身份，空闲 2 分钟后服务端注销；当前打开的预览窗口会保留给用户看历史，切走后回收）
         │  agent_task(key, prompt)  ← 父 Agent 再派活（复用窗口）
         │  ── 有任务就回到 running
         ▼
@@ -95,8 +95,8 @@ agent_spawn(key=research-a)
 - **团队挂会话，不挂单次 run**：登记表的 key 是 `session:<sessionId>`，所以**下一轮用户消息里父 Agent 仍能凭同一个 key 给同一个子 Agent 派活**，窗口也接着用（`childId = session:k:key` 稳定）。没有 sessionId 的入口（定时任务等）退回按 run 隔离，回合结束即注销。
 - **下一轮的“团队记忆”**：`teamRoster(sessionId)` 会把仍存活的子 Agent（key、名称、空闲/工作中、上次回报摘要）写进本轮系统提示，父 Agent 知道自己手上还有谁、谁在忙。
 - **资源释放**：子 run 结束即释放会话锁与运行资源；注销只是把身份与可视窗口收掉，不额外占内存。
-- **空闲期**：`EAB_AGENT_WORKER_IDLE_MS`，默认 120 秒；服务端在生成清单与派活前都会 `pruneIdleWorkers` 校验，前端按同一时长移除窗口。
-- 会话被删除/服务重启：登记表在内存里，自然清空；不落库。
+- **空闲期**：`EAB_AGENT_WORKER_IDLE_MS`，默认 120 秒；服务端在生成清单与派活前都会 `pruneIdleWorkers` 校验，前端按同一时长回收窗口，但当前正在查看的预览窗口保留到用户切走。
+- **团队已落库**：`agent_workers` / `agent_team_messages` / `agent_tasks` / `agent_events` 四张表（迁移 `0060_agent_team.sql`）。会话被删除时清理对应团队；服务重启不再清空登记表，父 Agent 下一轮仍能凭 key 继续派活。上次进程留下的 running 后台任务在启动时标为 failed 并写一条 error 事件，任务原文与 `agent_runs.resume_state_json` 检查点保留，等待用户或父 Agent 明确重新派活。
 
 ## 四、父子问答协议（子 Agent 暂停，父 Agent 回答）
 
@@ -122,33 +122,60 @@ agent_spawn(key=research-a)
 - 子 Agent 有独立 system prompt：只对父 Agent 负责、不直接面对用户、缺信息先问父 Agent、父 Agent 的答复会接在同一会话里。
 - 父 Agent 的团队清单会显示 `工作中 / 空闲 / 等待父 Agent 回答`，并提示「能直接答就直接答；需要用户补充信息或授权时用 ask_user，拿到答复后必须用 agent_task 回给该子 Agent」。
 
-## 五、模型分散分配
+## 五、后台长任务与父 Agent 唤醒
+
+同步 `agent_spawn` / `agent_task` 仍然保留 `Promise.all` 语义：调用方等本批结束，适合“这一步就要结果”的派活。需要跨回合持续干活时显式加 `background:true`：
+
+```
+父 Agent: agent_spawn { tasks, background: true }
+        │ 写 agent_tasks（queued）后立即返回 taskId
+        ▼
+后台子 Agent 独立跑（最长 12 轮模型→工具，轮间写 checkpoint）
+        │  done / question / error
+        ▼
+写 agent_events（父 Agent 的事件收件箱）
+        │
+        ├─ 父回合还活着：父 Agent 用 agent_wait 取事件，或直接结束本轮
+        └─ 父回合已结束：延迟 400ms 合并，唤醒父 Agent 继续一轮
+```
+
+- `agent_wait`：父 Agent 专用，只等 `question|done|error`，默认 30 秒（`agentWaitTimeoutMs`）；取到事件后把对应任务标记为已唤醒，避免同一结果被自动唤醒重复汇总。
+- `agent_message`：父 Agent 给 **running** 子 Agent 追加约束；子 Agent 每轮开始前消费一次，以 `【父 Agent 追加指示】` 注入。idle/waiting 的子 Agent 不接受，仍走 `agent_task`。
+- 父唤醒：`wakeParentForBackground` 先看父 run 是否仍在 running；在跑就每 5 秒重试一次、最多约 10 分钟，避免打断正在 `agent_wait` 的回合。父 run 已结束时，`acquireTurn` 拿会话锁，插入一条带 `backgroundWake:true` 的 user 消息（有提问就带上提问原文），跑最多 4 轮父 Agent，再写 assistant 消息并广播。`question` 和 `done/error` 都能触发唤醒；同一个任务回答完再结束会重新获得唤醒资格。
+- 父唤醒不是“再开一个用户请求”：它的消息带 `meta.backgroundWake`，前端可以按普通消息渲染，也可以单独标成后台回传。
+- 后台任务复用父请求的 `AbortSignal`：父回合被用户主动取消时，尚未结束的后台子任务会收到取消；父回合正常结束不会取消后台任务。
+- 服务重启：`recoverInterruptedAgentTasks` 把 `queued|running` 任务标为 failed、写 error 事件并清空 `wake_at`，`running` worker 改回 idle；任务原文和检查点保留，启动阶段不做自动重跑，避免在未知身份下重复花模型费用。
+- `agent_resume`：父 Agent 专用的“从检查点继续”。参数 `agent`（团队 key）、可选 `taskId`、可选 `background`（默认 true）。只接受 `failed|cancelled` 且有 `agent_tasks.child_run_id -> agent_runs.resume_state_json` 检查点的任务；`running/queued` 明确拒绝，`succeeded` 要求改用 `agent_task`，queued 阶段中断、没有 child run 的任务明确报“没有可用检查点”。恢复时以检查点消息为基座，补回 system prompt 和原任务，追加“不要重复已完成工作”的提示，并复用检查点的 `turnId` 作为工具幂等键；允许读取 `truncated:true` 但仍有合法消息的精简检查点，也允许消息为空但保留了原任务的检查点，避免极端长度下直接失去续跑资格；后台续跑会创建新 `agent_tasks`，返回 `resumed:true` 与原 `fromTaskId`。
+
+## 六、模型分散分配
 
 - `chooseSubAgentModel` 新增本轮已用模型负载 `load`：评分 = 能力命中 × 4 + 父模型连续性 + 模型 priority - 已用次数 × 6。
 - `spawnSubAgents` 在并行执行前先按任务顺序把模型分完，维护 `modelLoad`；后一个子任务能看到前一个已经占用的模型，同能力时自动换一个，避免多个子 Agent 挤在同一个模型上放大并发压力。
 - 显式 `modelId` 仍然最优先、不做覆盖，并继续用成员可见模型 `allowedModels` 校验。
 - 模型理由会写进子 Agent 事件，前端事实区可以看到「本轮第 N 个使用」或「按可见模型优先级与并发负载分散」。
 
-## 六、后端落点
+## 七、后端落点
 
 | 文件 | 内容 |
 |---|---|
-| `src/agent-team.ts` | 团队登记表（内存）：`registerWorker` / `markWorkerRun` / `markWorkerIdle` / `markWorkerWaiting` / `pruneIdleWorkers` / `findWorker` / `listWorkers` / `clearTeam`；`TeamWorker.messages` 保存多轮上下文，`appendWorkerMessage` 追加、`workerMessages` 取快照（最多 20 条 / 约 16k 字符） |
-| `src/routes/chat.ts` | `SUB_AGENT_SYSTEM_PROMPT`；`spawnSubAgents`：key 化 `childId`（`runId:k:key`）、注册与 idle 标记、事件带 `key`、`waiting` 分支发 `action=question`；`agent_ask_parent` 拦截与 `pendingParentQuestion` 立即结束本轮；模型负载 `modelLoad` 预计算；`agent_task` 自动带 worker history |
-| `src/routes/tools.ts` | `agent.task`（继续派活给子 Agent）与 `agent.ask_parent`（子 Agent 向父 Agent 提问），都加入核心工具列表；父 Agent 运行时过滤掉 `ask_parent` |
-| `src/config.ts` | `agentWorkerIdleMs`（`EAB_AGENT_WORKER_IDLE_MS`，默认 120000） |
+| `src/agent-team.ts` | 两套实现：内存自由函数保留给轻量调用/测试；生产用 `AgentTeamStore`（`registerWorker` / `markWorkerRun` / `markWorkerIdle` / `markWorkerWaiting` / `pruneIdleWorkers` / `findWorker` / `listWorkers` / `clearTeam` / `roster`）。消息、任务和事件都走 DB；`TeamWorker.messages` 仍然最多 20 条 / 约 16k 字符 |
+| `src/routes/chat.ts` | `SUB_AGENT_SYSTEM_PROMPT`；`spawnSubAgents`：key 化 `childId`（`runId:k:key`）、注册与 idle 标记、事件带 `key`、`waiting` 分支发 `action=question`；`agent_ask_parent` 拦截与 `pendingParentQuestion` 立即结束本轮；模型负载 `modelLoad` 预计算；`agent_task` 自动带 worker history；新增 `startBackgroundSubAgents`、`agent_wait`、`agent_message`、`agent_resume`、父 Agent 后台唤醒；`loadAgentResumeCheckpoint` / `resumeMessagesForSubAgent` 负责检查点读取与消息补齐；新增只读接口 `GET /api/chat/agents?sessionId=...` 返回 roster / workers / tasks / events，供前端轮询进度 |
+| `src/routes/tools.ts` | `agent.task`（继续派活给子 Agent）、`agent.ask_parent`（子 Agent 向父 Agent 提问）、`agent.wait`（父 Agent 等下一个事件）、`agent.message`（给运行中的子 Agent 追加指示）、`agent.resume`（从检查点继续失败/中断任务），均已加入核心工具列表 |
+| `src/config.ts` | `agentWorkerIdleMs`（`EAB_AGENT_WORKER_IDLE_MS`，默认 120000）、`agentChildMaxRounds`（默认 12）、`agentWaitTimeoutMs`（默认 30000） |
+| `src/agent-runtime.ts` | `checkpointAgentRun`：子 Agent 每轮把轮次、`turnId`、system、原任务、最近 12 条消息（保留 `tool_calls` / `tool_call_id`）写进 `resume_state_json`；超长时逐条丢弃最早消息，仍超长才写一条合法的精简检查点（`truncated:true`，保留 `round`/`turnId`/`system`/`prompt`/`text` 并重建最小消息），绝不落半截 JSON；恢复侧接受这种精简检查点，必要时从 `prompt` 重建“system + 原任务” |
+| `storage/migrations/0060_agent_team.sql` | 团队、消息、任务、事件四张表；`agent_tasks` 的 `wake_at` 标记父 Agent 是否已因该任务被唤醒 |
 | `public/chat.html` | 右栏 `workbench-tabs` + `workbench-body`；团队面板内新增 `#team-list-resizer` 分界线 |
 | `public/chat.js` | 团队渲染：父右子左对话流、`question` / `waiting`、完成去重、列表/预览拖拽宽度、key 稳定复用；切换 / 并排逻辑 |
 | `public/chat.css` | Agent 预览 v3：父子气泡、等待态、可拖拽分界线、移动端堆叠 |
 
-## 七、模型侧怎么用
+## 八、模型侧怎么用
 
 - `agent.spawn` 的 `tasks` 每项可带 `key`（建议英文短名）与 `title`；返回值里每个子 Agent 会回传 `key` 与 `index`。
 - 需要它做第二件事时：`agent_task { agent: "research-a", prompt: "把结论整理成三条要点" }`。
 - 子 Agent 在工具结果里返回 `status:"waiting"` 和 `question` 时：父 Agent 能直接答就 `agent_task` 回答；需要用户拍板就先 `ask_user`，拿到答复后必须 `agent_task` 回给该子 Agent。
 - key 已注销 → 明确报错「已注销或不存在：请先 agent_spawn 重新注册」，不让父 Agent 空转。
 
-## 八、验收
+## 九、验收
 
 1. 右栏在团队与文件之间可切换、可并排；团队不再出现在文件预览内部。
 2. 有子 Agent 时左边列表、右边预览；点列表任意一项，预览切到该 Agent，父 Agent 消息在右、子 Agent 消息在左。
@@ -156,11 +183,21 @@ agent_spawn(key=research-a)
 4. 子 Agent 缺信息时出现琥珀色提问气泡，父 Agent 可直接答复，或先问用户再用 `agent_task` 回给子 Agent；子 Agent 接着完成。
 5. 同一 key 二次派活复用同一窗口与同一段历史，消息接着追加。
 6. 多个子 Agent 同批派发时，同能力模型按本轮负载分散，不全部挤在父模型上。
-7. 子 Agent 完成后窗口显示完成态，2 分钟后自动从团队栏消失；没有右栏内容时右栏隐藏，对话宽度恢复。
+7. 子 Agent 完成后窗口显示完成态；服务端仍按 2 分钟空闲期注销，但当前打开的预览窗口会保留，方便用户上滑查看父子对话，切到别的子 Agent 或新派发后再回收；没有右栏内容时右栏隐藏，对话宽度恢复。
+8. `agent_spawn { background:true }` 立即返回 `taskId`；父 Agent 不退出时可用 `agent_wait` 取下一个完成/提问事件，父回合已结束时由后台唤醒补一条汇总。
+9. 刷新页面或服务重启后，团队栏仍能从 `GET /api/chat/agents?sessionId=...` 恢复上一次的 worker、任务状态和最近一次回报。
+10. 后台任务被服务重启标为 failed 后，父 Agent 调 `agent_resume` 能读取检查点继续，不再从头重做；没有检查点或任务已成功时给出可执行的拒绝原因。`agent_resume` 的后台路径同样会写新任务并触发父唤醒。
 
-## 九、边界与后续
+### 自动化验证
 
-- 团队身份**按会话保留**：同一会话里空闲期内的子 Agent 可跨轮次继续派活；会话长期空闲后由空闲期自动注销，服务重启则内存登记表清空。
+- `agent-background.test.ts`：`background:true` 立即返回、父 Agent 用 `agent_wait` 拿到 `done` 事件；父回合结束后后台完成事件唤醒父 Agent 并写出 `backgroundWake` 汇总。
+- `agent-resume.test.ts`：读取失败任务的 `child_run` 检查点续跑、保留 worker 会话与进度；无检查点、已成功任务的拒绝路径。
+- `agent-runtime-checkpoint.test.ts`：超长检查点仍写入合法 JSON，能直接 `JSON.parse`；单条消息本身超长时降级为保留 system 和原任务的精简检查点。
+- `agent-agents-route.test.ts`：真实 `GET /api/chat/agents` 返回持久化 worker/task/event；缺 `sessionId` 返回 400、会话不存在返回 404。
+
+## 十、边界与后续
+
+- 团队身份**按会话保留并落库**：同一会话里空闲期内的子 Agent 可跨轮次继续派活；会话长期空闲后由空闲期自动注销；服务重启后登记表还在，父 Agent 仍能看到 key、上次回报和未处理事件。如果父 Agent 在注销后才用 `agent_task` 续派，系统会按同一个 key 和该 key 的历史任务自动恢复窗口与会话，不需要改用 `agent_spawn` 重新注册。
 - 子 Agent 不能直接改用户右侧预览的文件（预览文件上下文只给父 Agent 的工具兜底）。
-- 团队不落库：`agent_runs` 已有父子关系与步骤记录，审计从那里看；可视窗口只是运行时视图。
-- 尚未做：团队并行度面板（正在跑的子 Agent 数、排队数）、按角色预置子 Agent 模板（如「检索员 / 审稿员 / 表格手」）。
+- `agent_runs` 仍保存父子关系、步骤和 `resume_state_json` 检查点；团队表只保存可视窗口需要的身份、任务和事件，不重复存完整轨迹。
+- 尚未做：服务启动阶段的身份可信自动续跑（当前只在父 Agent 或用户明确调用 `agent_resume` 时继续）、团队并行度面板（正在跑的子 Agent 数、排队数）、按角色预置子 Agent 模板（如「检索员 / 审稿员 / 表格手」）。

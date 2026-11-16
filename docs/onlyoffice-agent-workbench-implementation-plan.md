@@ -14,7 +14,7 @@
 3. xlsx：插件注入、服务端内容工具、保存同步。
 4. pptx：插件注入、结构读取/文本替换，结构性编辑不足时走受控 GUI 兜底。
 5. P4 治理：版本快照/撤销/冲突、GUI 兜底白名单、审计与回归。
-6. P2 降级预览补齐：文本 diff、PDF 标注、图片 OCR/区域、权限失效自动关闭。
+6. P2 降级预览补齐：文本 diff、权限失效自动关闭、PDF 标注已完成；图片 OCR/区域待补。
 7. P1 工作台遗留：事件进 `chat-events` 总线、父子双向消息、会话级父 Agent 记录。
 
 不在本轮承诺：任意宏、打印设置、OnlyOffice 全部原生按钮、像素级图片重绘、PDF 重排编辑。这些只做“明确提示 + 受控 GUI 兜底”。
@@ -36,25 +36,25 @@
 |---|---|---|---|---|---|
 | S1 | 强制保存 | 已实现并验收：`forcesave` 命令服务、`saved`/`pending`/`no_changes`、`workspace.file.force_save` 审计 | 旧回调持久化水位与跨设备冲突留 S16 | 已完成 | — |
 | S2 | 插件保存按钮 | 已实现并验收：编辑启用、只读禁用、保存中禁用、成功/无修改/失败日志 | 失败自动重试未做；当前由用户手动再点一次 | 已完成 | S1 |
-| S3 | 编辑态版本同步 | 已实现并验收：持久警告条、二次确认、`refresh-guard` 抬水位、刷新列表并重开；审计 `workspace.file.office_stale_callback` | cutoff 仍是进程内 Map，服务重启会丢；跨设备冲突留 S16 | 已完成 | S1 |
+| S3 | 编辑态版本同步 | 已实现并验收：持久警告条、二次确认、`refresh-guard` 抬水位、刷新列表并重开；审计 `workspace.file.office_stale_callback` | 水位已持久化到 `workspace_office_refresh_guards`，服务重启后仍能拒绝旧回调；跨设备冲突留 S16 | 已完成 | S1 |
 | S4 | 插件 token 过期恢复 | 已实现并验收：403/409 分支、`reopen` 消息校验、重开前 `refresh-guard`、force-save 按 `payload.version` 校验旧编辑器 | 真实 10 分钟 JWT 过期未等待，由单测覆盖；跨文件/跨用户拒绝已验 | 已完成 | S2 |
 | S5 | docx 修订 track changes | 已实现并验收：L1 `office.revisions` + `office.replace(trackChanges)`，L2 开启/关闭、读取、接受/拒绝 | 目标段落已有修订、`occurrence=0`、含换行/制表符的范围拒绝；移动/格式修订不识别；编辑态并发覆盖留 S16 | 已完成 | S1 |
 | S6 | 批注生命周期 | 已实现并验收：`office.comment` 支持 `add/list/reply/resolve/delete`，短语级 `oldText/occurrence` 或 `start/end`，回复线程与 resolved 状态基于 `commentsExtended`/`commentsIds` | 同一段落多批注重叠、跨 run 复杂范围未逐一验证；删除后 `comments*.xml` 保留空部件；xlsx 单元格批注已由 S12-L6 单独实现，不复用 docx 线程模型 | 已完成 | S5 |
 | S7 | 表格结构 | 已实现 docx `tN-rN`/`tN-cN` 行/列插入和删除；行删除支持 `gridSpan/vMerge/hMerge`，删纵向合并锚点行时把内容和 `restart` 迁到下一行；列删除按表格 grid 缩减 `gridSpan` 或移除覆盖该列的 cell；新增 `action=merge` 矩形合并和 `action=split` 整表拆分 | 列插入、含纵向合并的行插入和已合并表再 `merge` 仍需先 `split`；`merge` 不支持合并多单元格文本；xlsx 删除和 pptx 结构变更未做 | 已完成 docx 合并表结构变更 | — |
 | S8 | 格式扩展 | 已实现字体、字号、颜色、加粗、斜体、下划线、高亮、字体族、段落对齐、行距、段前段后 | 缺表格边框/底纹 | P2 | — |
 | S9 | 范围读取 | 已实现 docx `pN`/`tN`/`tN-rN`/`tN-cN`/`tN-rN-cN` 完整文本、run 格式与表格结构读取；`start/end` 仅用于段落/单元格 | xlsx/pptx 明确返回未覆盖 | P2 | — |
-| S10 | 保存/版本/导出 | 保存只更新当前文件 | 缺 `office.save` 快照、版本列表/恢复、`office.export` PDF/图片 | P2 | S1 |
+| S10 | 保存/版本/导出 | 已实现并验收：写入前自动快照、`office.versions` 列表/手动快照/恢复、REST 版本下载与恢复、`office.export` 与前端“导出 PDF”，真实 OnlyOffice 转 PDF 260 KB | 图片导出未做；前端历史面板只给文件本人，共享只读用户看不到旧版本 | 已完成当前约定范围（PDF） | S1 |
 | S11 | xlsx 插件注入 | 已实现并验收：xlsx 注入插件，config 返回 `EditorsSupport:["cell"]`，上下文 `documentType:"cell"`；插件面板分流 WORKSHEET，支持只读读取工作表、查找并选中，编辑模式可替换选中单元格 | 数字/公式/合并单元格的 `SetValue` 行为未验证；保存与查看态重载见 S12b | 已完成 | S1 |
 | S12 | xlsx 内容工具 | 已实现读取/查找/替换、插入行列、单元格格式、工作表追加/删除、列宽/行高、单元格批注 `add/list/delete` | 缺 threaded comments/persons 部件兼容、批注 VML 自定义位置/尺寸、Excel 桌面端人工打开验证；未做 xlsx 图片/图表结构编辑 | 已完成当前约定范围 | — |
 | S12b | xlsx 保存同步 | 已实现并验收：插件保存按钮、保存后自动切查看态、`refresh-guard` 丢弃旧编辑器关闭回调；补 900ms 同步等待与 `no_changes` 重试 | 数字/公式/合并单元格保存未验证；同会话连续二次保存改为重新进入编辑；pptx 未做 | 已完成 | S1、S12 |
 | S13 | pptx 插件注入 | 已实现并验收：pptx 注入 `pluginConfigUrl`，config `documentType:"slide"`、`EditorsSupport:["slide"]`；插件页新增 `PRESENTATION` 面板，`readPresentation()` 读取页数/形状/文本，`locateSlideText()` 逐页逐形状匹配并用 `ApiSlide.Select()` 跳转 + `shape.Select(true)` 选中 | 当前 OnlyOffice 构建没有 `Api.GoToSlide`/`presentation.GoToSlide`，已回退 `ApiSlide.Select()`；真实浏览器只测 1 页，分页跳转、多形状和组合形状未逐一验证 | 已完成 | S1 |
 | S14 | pptx 内容工具 | 已实现并验收：`office.read_outline` 返回 `kind:"pptx"`、`slideCount`、`slides[].paragraphs[]`（`sN-pM`）；`office.find` 返回 pptx 命中、区间和上下文；`office.replace` 支持跨 run 文本替换并保留未改 run 与 `a:rPr`；`occurrence=0`、段落内换行、非法段落 ID 明确 400 | 仅文本级读取/替换，不做新增幻灯片、复制版式、插入图片；`read_range` 仍不支持 pptx；只测 1 页样例 | 已完成当前约定范围 | — |
-| S15 | GUI 兜底 | 无 | 缺白名单动作、用户确认、失败即停、审计 | P3 | S13 |
-| S16 | 版本/撤销/冲突/审计 | 只有 `workspace.file.agent_edit` | 缺保存前版本快照、冲突检测、撤销入口、操作前后摘要 | P3 | S10 |
-| P2-1 | 文本 diff | 有文本选区，无 diff | 缺修改前后行/字符 diff 高亮和引用回填 | P2 | — |
-| P2-2 | PDF 标注 | 只有 PDF iframe 预览 | 缺页/区域选择、文本提取、高亮批注 | P2 | — |
+| S15 | GUI 兜底 | 已实现并验收：白名单 `print`/`macro`/`export`/`dialog`（仅 `page_setup`/`header_footer` 且 docx），`prepare → confirmed → succeeded/failed` 状态机、文件本人校验、10 分钟 TTL、失败同 ID 不可再确认/上报；REST 4 条接口与 `office.gui` 工具，前端动作选择、步骤引导、二次确认、完成/失败上报 | 不自动点击、不执行宏、Agent 不能确认；失败后需新发起；`mail_merge` 未开放；仅覆盖两个 docx 原生对话框 | 已完成 | S13 |
+| S16 | 版本/撤销/冲突/审计 | 已实现并验收：保存前快照、`baseVersion` 冲突 409、恢复前再快照、版本/恢复/导出/snapshot 审计、`office.versions` 恢复与前端“恢复到上一版本”快捷入口 | 编辑器撤销仍由 OnlyOffice 自己处理；操作前后仅有大小与 summary，未做字符级 diff；跨设备冲突只按单字段版本拒绝 | 已完成当前约定范围 | S10 |
+| P2-1 | 文本 diff | 已实现并验收：文本编辑态“查看差异”，基线为打开时云端原文；行级 LCS + 相邻替换行字符级高亮，2 行上下文并折叠未改动行；超过 20,000 行明确提示不生成，超长单行退化为整行高亮 | 仅比较本次打开后的编辑内容，保存后以新内容为新基线；没有历史版本间 diff；超 20,000 行不支持 | 已完成当前约定范围 | — |
+| P2-2 | PDF 标注 | 已实现并验收：自托管 PDF.js 单页渲染、页码输入/前后翻页、缩放/适应宽度、文本层拖选、本页文本提取/复制/引用回填、区域框选与引文提取、本机高亮覆盖层和批注列表 | 批注只存 `localStorage`，按 `fileId + updatedAt` 隔离且不修改原 PDF，跨设备不可见；单文件最多 100 条，达到上限拒绝新增；本机存储失败时提示“刷新后会丢失”；单页渲染，不做全文导出；扫描件无文本时记录“图片区域” | 已完成当前约定范围 | — |
 | P2-3 | 图片 OCR/区域 | 只有图片预览 | 缺区域选择、OCR/描述、标注建议 | P2 | — |
-| P2-4 | 权限失效自动关闭 | 删除文件会关闭预览 | 缺权限撤销、跨设备删除、OnlyOffice 失效时的轮询/事件关闭 | P2 | — |
+| P2-4 | 权限失效自动关闭 | 已实现并验收：预览打开后每 30 秒轮询 `preview-capability`；403/404 关闭右栏并提示，`kind=none` 关闭并提示，页面恢复可见立即检查；网络抖动不关闭 | OnlyOffice 真实停服未复现，`kind=none` 分支用受控能力返回验证；跨设备删除按 404 处理 | 已完成当前约定范围 | — |
 | P1-1 | Agent 事件总线 | `agent` 事件未进 `chat-events` | 缺事件持久化/回放和跨端恢复 | P3 | — |
 | P1-2 | 父子双向消息 | 只有阻塞式派发 | 缺子 Agent 反问父 Agent、父 Agent 继续派发的异步通道 | P3 | P1-1 |
 | P1-3 | 会话级父 Agent | 当前按回合根 run | 缺会话级父 Agent 记录、模型/身份稳定绑定 | P3 | P1-1 |
@@ -95,7 +95,8 @@
   - 编辑态云端更新后只出现持久警告条，文案含云端更新时间和大小；取消二次确认后警告条保留、编辑器不重开；确认后警告条消失，预览头和编辑器都切到新版本。
   - 无守卫刷新会复现旧编辑器关闭回调覆盖新版本，因此新增 `POST /api/workspace/office/:id/refresh-guard` 水位。旧会话带 `STALE-OLD-004` 未保存修改、云端为 `...004` 时刷新，旧回调 `payloadVersion=1794587015091` 小于 `cutoff=1794587163242`，被服务端丢弃并写审计 `workspace.file.office_stale_callback`；刷新后云端仍为 `...004`，新编辑器全文含 `...004`、不含 `STALE-OLD-004`。
   - 同时给插件“保存到云空间”加版本保护：旧编辑器对云端新版本调用 force-save 返回 409，不写回；实测云端保持 `...008`，插件显示“保存失败：云端已有新版本”并提供重新打开入口。
-  - 已知边界：`refresh-guard` 水位目前是进程内 `Map`，服务重启会丢失；若旧编辑器在重启后关闭，回调仍有覆盖风险。force-save 已有版本校验，回调侧的持久化或版本校验留 S16。
+  - 已知边界：刷新水位已落 `workspace_office_refresh_guards(company_id,file_id,cutoff,updated_at)`，服务重启后仍能拒绝旧回调；force-save 的版本校验继续按插件 token 的 `version` 执行。
+  - 持久化补口（2026-11-15）：新增迁移 `0059_workspace_office_refresh_guards.sql`；`refresh-guard` 写水位、回调读水位都改为数据库读写，删除进程内 `Map`。新增 `office-refresh-guard.test.ts` 2 用例，覆盖同文件覆盖更新、关闭数据库重开仍能读回、按公司/文件隔离；真实服务重启后读回 `cutoff=1794670187218`，用版本低 1 的签名回调请求返回 `error=0`，审计为 `workspace.file.office_stale_callback`，未进入 `office_conflict` 分支。`pnpm typecheck` 通过；全量 `pnpm test` 116 文件 / 669 用例通过。
 
 **S4 插件 token 过期恢复**
 
@@ -263,11 +264,20 @@ S7 表格结构回归：`pnpm typecheck` exit 0；`office-content.test.ts` 50 te
 
 ### M4：兜底与治理
 
-**S15 GUI 兜底白名单**
+**S15 GUI 兜底白名单（已完成并验收 2026-11-14）**
 
-- 只列 L1/L2 无法完成且用户明确确认的动作：打印设置、宏管理器、部分导出选项、OnlyOffice 原生对话框。
-- 每次动作前确认；失败一次即停；记录 `workspace.file.agent_gui` 审计；不承诺稳定。
-- 验收：白名单外的 GUI 动作被拒绝；确认后动作有审计；失败不无限重试。
+- 方案定位：受控人工兜底，不做任意坐标点击、不伪造桌面自动化。OnlyOffice 编辑器在跨域 iframe 内，父页面读不到内部 DOM；`DocsAPI.DocEditor` 只有 `downloadAs`，没有打印、宏管理器或原生对话框方法。服务端负责白名单、文件归属、一次性确认状态机、步骤生成和审计；前端负责确认与引导；真正的原生按钮由用户点击。
+- 白名单：`print`（打印/打印设置）、`macro`（只打开宏管理器，不读取/保存/执行宏代码）、`export`（导出选项，格式提示 `pdf/docx/xlsx/pptx/csv`）、`dialog`（仅 `page_setup`/`header_footer`，且仅 docx）。白名单外 action 返回 `EC.VALIDATION` 并带 `allowedActions`；非法 dialog 带 `allowedDialogs`；xlsx/pptx 上传 dialog 明确返回不支持。
+- 存储：`0058_workspace_gui_fallbacks.sql` 新增 `workspace_gui_fallbacks(id, company_id, file_id, user_id, gui_action, gui_label, mode, params_json, steps_json, status, attempts, note, detail_json, created_at, expires_at, confirmed_at, finished_at)` 与文件/用户索引；TTL 10 分钟。`prepare` 只读 `workspace_files` 元数据，校验本人、未删除、Office 扩展名，不读取文件内容、不改磁盘文件。
+- 状态机：`prepared → confirmed → succeeded / failed`，超时由 `get`/`confirm` 自动落 `expired`。`confirm`/`report` 用条件 UPDATE 防重复；失败原因必填；`failed` 后同 ID 的 confirm/report 均返回 `EC.CONFLICT`，必须重新发起；`confirm` 只能由前端用户点击，Agent 工具没有 confirm 分支。状态机保证同一 fallback 只允许一次尝试，失败一次即停。
+- 接口：`POST /api/workspace/files/:id/gui-fallback`（`{action,dialog?,format?,note?}`）、`POST .../:fallbackId/confirm`、`POST .../:fallbackId/report`（`{result:'success'|'failure',detail?}`）、`GET .../:fallbackId`；prepare/confirm/report 用 `SC.WORKSPACE_WRITE`，status 用 `SC.WORKSPACE_READ`，都先 `requireEnabled`。`POST /confirm` 需要 JSON 内容类型（空对象也可），前端已显式发送 `{}`。
+- Agent 工具：`office.gui` 只开放 `prepare`/`status`/`report`；`prepare` 返回 `agentCanConfirm:false`、`wrote:false` 与提示；`action=confirm` 返回 400；确认前 report 返回 409；`status` 支持只传 `fallbackId`。执行层没有导入 `confirmWorkspaceGuiFallback`，从代码层阻止 Agent 自行确认。
+- 前端：预览头新增“GUI 兜底”，仅文件本人且 `capability.kind==='office'` 可见。弹窗提供四个动作；`macro`/`dialog` 要求编辑态；dialog 下拉 `page_setup`/`header_footer`，export 下拉格式。流程为“生成操作步骤 → 我确认，开始操作 → 我已完成 / 遇到问题填原因上报”；成功后提示审计已写入，失败后提示已停止、不会自动重试；关闭后恢复触发按钮焦点（触发元素不可用时回退输入框），支持 Esc/遮罩关闭。重复打开会先移除旧弹窗，上报完成后“完成/关闭”按钮保持可用。
+- 审计：统一 `workspace.file.agent_gui`，detail 含 `phase`、`guiAction`、`guiLabel`、`mode`、`fallbackId`、`attempts`、`status`、`note`/`reason`；失败审计 `result='failure'`。
+- 测试：`office-gui-fallback.test.ts` 5 用例通过，覆盖白名单 prepare 只落记录/审计且文件字节不变、白名单外与非法 dialog/xlsx dialog 拒绝且 0 记录 0 审计、确认前 report 拒绝/确认后成功/成功后不可再确认、失败原因为空拒绝/失败后 confirm 与 report 均拒绝、Agent 工具 `agentCanConfirm:false` 且 confirm 被拒、只传 fallbackId 查 status；`pnpm typecheck` 通过；全量 `pnpm test` 115 文件 / 667 用例通过。
+- 真实验收：真实员工会话（李鹏）对 docx `01M7DA4AW72GE3QP5R082YF53K` 完成 prepare=`prepared`（3 步、`requiresUserConfirmation:true`）→ confirm=`confirmed` → report=`succeeded`（`attempts=1`）；另一条 export 记录 confirm 后 report failure 成功落 `failed`，随后同 ID confirm 返回 409；`action=run_macro_now` 返回 400。`office.gui` 真实工具入口 prepare 返回 `agentCanConfirm:false`、`wrote:false`，confirm 返回 400、确认前 report 返回 409、只传 fallbackId 的 status 返回 `prepared`。审计按 `seq` 核对到 `prepared/confirmed/succeeded` 顺序与失败 `result=failure` + 原因。`/chat` 页面真实打开 docx 后“GUI 兜底”可见，打印与导出两条流程分别走通完成/失败提示；失败原因正确落审计，关闭弹窗后无残留浮层。
+- 修复：真实浏览器验收发现并修复 `confirm` 未带 JSON 体导致 415、失败原因输入框选择器与 `data-*` 不匹配导致原因永远为空、上报成功后“完成/关闭”仍被禁用、重复打开会叠加旧浮层四个前端问题。
+- 已知边界：不承诺原生按钮位置稳定，也不做自动点击；失败后需关闭重开并新建一次，不在同 ID 上重试；`mail_merge` 未开放；dialog 只支持 docx 的页面设置/页眉页脚；真实浏览器只验证打印与导出，宏管理器和两个 docx 对话框未逐个点开。
 
 **S16 版本/撤销/冲突/审计**
 
@@ -276,12 +286,25 @@ S7 表格结构回归：`pnpm typecheck` exit 0；`office-content.test.ts` 50 te
 - 审计补 `operationId`、目标、修改前后摘要、保存结果。
 - 验收：并发写入一方冲突被拒且文件未变；版本恢复读回旧内容；审计字段完整。
 
+**S10/S16 实现与验收（2026-11-14）**
+
+- 存储：新增 `0056_workspace_versions.sql`，表 `workspace_file_versions(id, company_id, file_id, version, size, storage_path, operation_id, source, summary, created_by, created_at)`，唯一索引 `(file_id, version)`；快照落在 `<scopeDir>/_versions/<toSlug(fileId)>/`，每文件保留最近 20 条，当前不计入个人/公司配额。
+- 写入闭环：`editUserWorkspaceFile` 在写盘前调用 `snapshotWorkspaceVersion`，写入后把 `beforeSize/afterSize/operationId/snapshotId/snapshotVersion` 写入 `workspace.file.agent_edit` 审计；网页文本保存 `POST /api/workspace/files` 也接受 `baseVersion`，覆盖前比较 `updated_at`，不一致返回 `EC.CONFLICT`（“文件已被其它操作更新，请重新读取后再保存”），写入前同样自动快照。
+- 版本接口：`GET /api/workspace/files/:id/versions`、`POST .../versions`（手动快照，幂等返回 `created=false`）、`GET .../versions/:versionId/download`、`POST .../versions/:versionId/restore`、`POST /api/workspace/files/:id/export`（`{format:'pdf'}`）；列表/下载/恢复/手动快照仅文件本人，导出允许共享只读。
+- Agent 工具：新增 `office.versions`（`list`/`snapshot`/`restore`）与 `office.export`（当前只支持 PDF，生成同名 PDF 新文件，不覆盖源文件）；所有 Office 写工具仍自动快照，因此没有额外增加只做“保存”的 `office.save` 工具，计划中 `snapshot:true` 的语义由自动快照 + `office.versions action=snapshot` 承担。
+- 冲突：OnlyOffice 回调按 `payload.version` 与同会话水位放行；显式 `baseVersion` 过期返回 409，`details.expectedVersion/currentVersion` 明确；拒绝路径不写文件、不增加版本，并写 `workspace.file.office_conflict`。
+- 审计：`workspace.file.snapshot`（`created`/`version`/`versionId`）、`workspace.file.version_download`、`workspace.file.restore`、`workspace.file.export`（`success` 带 size，失败带 reason）、`workspace.file.office_conflict`；保存类审计补 `operationId`/快照/前后大小。
+- 前端：预览头新增“历史版本”“导出 PDF”；历史弹窗显示当前标记、大小、来源、时间、摘要、下载/恢复和“恢复到上一版本”，恢复走二次确认卡；保存当前版本对重复版本复用快照；导出走 `fetch` + blob 下载。
+- 真实验收：何益文本文件完成 v1→v2 保存、版本列表 1 条、下载旧内容、恢复、过期 `baseVersion` 409 且文件与版本数不变、手动快照 `created=true/false`；真实 PDF 导出 260809 字节、文件头 `%PDF-2.0`。李鹏 docx 在 `/chat` 页面打开历史弹窗、手动快照、导出 PDF（浏览器下载 260806 字节）、恢复确认与“已恢复到所选历史版本”提示均走通；`office.versions` 真实列出 2 条、快照 `created=true`、恢复返回 `wrote=true`，`office.export` 生成 `界面验收-231703.pdf` 260806 字节并在云空间列表可见。
+- 测试：`workspace-file-save.test.ts` 7 用例、`office-version-tool.test.ts` 2 用例、`onlyoffice.test.ts` 14 用例通过；`pnpm typecheck` 通过；全量 `pnpm test` 114 文件 / 661 用例通过。
+- 已知边界：图片导出未实现；历史面板不向共享只读用户暴露旧版本；恢复后如果当前内容没有对应快照，列表不会出现“当前”标记；“恢复到上一版本”取最近一条非当前快照；Office 文档字符级 diff 与编辑器撤销联动仍未做，文本预览的编辑态 diff 已在 P2-1 补齐。
+
 ### P2/P1 后续（不阻塞 OnlyOffice 主线）
 
-- P2-1 文本 diff：保存原文，按行/字符 diff 高亮，发送区回填选区。
-- P2-2 PDF：页/区域选择、文本提取、批注覆盖层；重排编辑仍交给 PDF 工具。
+- P2-1 文本 diff：已在文本编辑态落地“查看差异”。打开文本预览时保存云端原文作为基线；点击“查看差异”后按行级 LCS 生成统一 diff，并对相邻删除/新增行做字符级 LCS 高亮；只显示改动行及前后各 2 行上下文，其余未改动行折叠；无差异、超过 20,000 行和单次渲染超过 5,000 行都有明确状态，超长单行退化为整行高亮。保存后重新打开文件，以新内容作为下一次编辑的基线；选区引用回填沿用现有实现并已复验。2026-11-15 已在真实 `/chat` 页面验证修改行、新增行、无差异、从差异视图保存、取消恢复和选区回填；`node --check`、`pnpm typecheck` 通过，全量 `pnpm test` 116 文件 / 673 用例通过。
+- P2-2 PDF：已在 `public/chat.js` / `chat.css` / `src/app.ts` 落地自托管 PDF.js 预览，不再依赖外网 CDN 或浏览器原生 iframe。服务端只放行 `build/pdf.min.mjs`、`build/pdf.worker.min.mjs`、`cmaps/*.bcmap`、`standard_fonts/*.pfb|ttf|otf`、`wasm/*.wasm|js`、`iccs/*.icc`，其余路径 404。前端按页渲染 canvas 与文本层，支持页码输入/前后翻页、缩放与适应宽度；文本层可拖选并复用“引用选中内容并修改”，另有“提取文本”面板支持复制按钮和按页引用到对话。复制按钮已在 CDP `Runtime.evaluate` 带 `userGesture=true` 的用户手势下验证成功，状态变为“已复制本页文本”，未独立读取剪贴板内容。切到“框选区域”后可拖拽框选，按 PDF 文本项包围盒提取引文（无文本时记为“图片区域”），填写批注后生成黄色高亮覆盖层和批注列表；批注只保存在浏览器 `localStorage`，按 `fileId + updatedAt` 隔离，不修改原 PDF，下载仍是原文件；单文件最多 100 条，达到上限时拒绝新增并提示先删除旧批注，不静默淘汰。工作台整页预览通过 `syncWorkbenchLayout` 复用右栏文件面板，不再被对话模式判断隐藏；`.pdf-stage` 预留滚动槽并按左右各 16px 内边距计算适应宽度，避免 4px 横向滚动。2026-11-15 已在真实 `/chat` 页面验证 3 页翻页、页码输入、缩放/适应、文本层选区回填、本页文本引用、区域框选与引文、批注保存/刷新后恢复/定位/删除；另验证键盘翻页、页码越界/非法输入、缩放 70%–220% 边界、100 条上限拒绝、`fileId + updatedAt` 版本键隔离、500 字批注截断和 CDP 用户手势复制。静态路由的 MIME、缓存和拒绝路径已通过真实 HTTP 验证；2026-11-15 新增 `packages/server/test/pdfjs-route.test.ts`，用 `buildApp` + `app.inject` 覆盖构建文件、worker/CMap/WASM/字体 MIME、缓存头，以及未白名单、目录穿越、不存在资源的 404。批注保存的 `localStorage` 配额耗尽分支也已实测：状态显示“高亮已添加，但本机存储失败，刷新后会丢失”，存储保留旧数据，测试填充键已清理。已知边界：批注不跨设备、不写入服务端；单页渲染，不做全文/跨页导出；后台标签页用 print 意图完成一次性绘制，避免 rAF 暂停导致一直加载；CDP 设备尺寸模拟下验证了工具栏换行、页面几何、无横向滚动和“适应宽度”重算，但截图仍因页面不可见不可用，ResizeObserver 在隐藏标签页内未触发，可见窗口下仍以显式“适应宽度”作为确定性兜底。
 - P2-3 图片：区域选择 + OCR/描述 + 标注建议；不做像素级生成式重绘。
-- P2-4 权限失效：预览打开时轮询 `preview-capability`，403/404 或文件被删除时关闭右栏、恢复全宽。
+- P2-4 权限失效：已在 `public/chat.js` 落地预览巡检。打开预览后每 30 秒请求一次 `preview-capability`；403/404 关闭右栏并提示“访问权限已失效”或“已被删除”，`kind=none` 关闭并提示具体原因；页面从后台恢复可见时立即检查；网络抖动或 5xx 不关闭，等下一轮继续确认。关闭复用 `closeWorkspaceFile()`，同时恢复对话宽度和工作台布局。2026-11-15 已在真实浏览器验证文件删除、共享撤销、`kind=none` 和网络抖动四种路径；`node --check`、`pnpm typecheck` 通过，全量 `pnpm test` 116 文件 / 673 用例通过。
 - P1-1/2/3：`agent` 事件进 `chat-events`、父子双向通道、会话级父 Agent 记录；需要单独设计，不与 OnlyOffice 写工具混在一起。
 
 ## 5. 每步完成定义
@@ -308,11 +331,11 @@ S7 表格结构回归：`pnpm typecheck` exit 0；`office-content.test.ts` 50 te
 3. xlsx 批注按 legacy comments + VML 实现，支持 add/list/delete；threaded comments/persons 与自定义批注框位置仍未做，公式、共享字符串、合并单元格仍不能按纯文本替换处理。
 4. pptx 形状/版式差异大，先做文本级读取/替换；结构性编辑不足时明确走 GUI 兜底。
 5. 编辑态“是否有未保存修改”没有可靠 API，S3 只做显式刷新确认，不自动覆盖。
-6. 版本快照的存储位置、保留周期、配额计入方式尚未决定；S16 开始前需用户确认。
+6. 版本快照当前落在 `<scopeDir>/_versions/`，每文件保留 20 条且不计配额；这是本轮默认口径，若产品要求计入配额、延长保留或集中存储，需要再确认后调整。
 7. 插件 token 过期后的恢复方式：重新打开预览，还是在插件内换取新 token，需在 S4 前定。
 
 ## 8. 建议的下一步
 
-S1–S14 已完成各自当前约定范围；S13/S14 已补齐 pptx 插件注入、幻灯片面板、文本级读取/查找/替换，并通过真实 HTTP、XML、OnlyOffice 编辑器和 PDF 验收。下一步建议进入 S15（GUI 兜底白名单）和 S16（版本快照/撤销/冲突/审计）；pptx 多页跳转、组合形状、结构编辑仍缺样本；threaded comments/persons 兼容、批注 VML 自定义位置、S10 版本快照、S16 并发覆盖策略仍需先确认范围与存储口径。
+S1–S16 均已完成各自当前约定范围；S10/S16 的版本快照、冲突拒绝、恢复、PDF 导出与审计已在 2026-11-14 完成并走通真实接口和 `/chat` 页面，S15 GUI 兜底已在 2026-11-14 完成并验收，刷新水位已在 2026-11-15 持久化到 `workspace_office_refresh_guards`，P2-4 权限失效自动关闭、P2-1 文本 diff 与 P2-2 PDF 标注已在 2026-11-15 完成并通过真实浏览器验收；下一步建议补 P2-3 图片 OCR/区域；pptx 多页跳转、组合形状、结构编辑仍缺样本；threaded comments/persons 兼容、批注 VML 自定义位置、图片导出、Office 字符级 diff 仍未覆盖。
 
 技能体系（与插件同级的后台、前端、权限、安全扫描、隔离与多层冗余）不在本 Office 计划内，另行维护在 `docs/skill-system-implementation-plan.md`；Office 的 S5/S6 已于 2026-11-14 完成，不重复实施。
