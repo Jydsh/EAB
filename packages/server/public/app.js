@@ -6501,7 +6501,7 @@ async function loadSys() {
       </section>
       <section class="panel" data-section-panel="data">
         <div class="panel-head">
-          <div><h2>版本更新</h2>${hintBadge('更新说明', '从 GitHub Release 检测新版本；确认后由更新器替换代码并重启。命令行方式：eab update（检测） / eab update --apply（确认更新）。更新会先备份当前代码；数据目录 .eab-dev 不会被替换。')}</div>
+          <div><h2>版本更新</h2>${hintBadge('更新说明', '从 GitHub Release 检测新版本；确认后校验源码包版本与 sha256，备份代码和数据库，再由更新器替换并重启；新版本健康检查失败会自动回滚。命令行方式：eab update（检测） / eab update --apply（确认更新）。数据目录 .eab-dev 不会被整体替换。')}</div>
           <span class="pill ${update?.hasUpdate ? 'warn' : 'ok'}">${update?.hasUpdate ? '发现新版本' : update?.latest ? '已是最新' : '尚未检查'}</span>
         </div>
         <div class="kv-grid kv-2">
@@ -7434,8 +7434,8 @@ async function loadSys() {
         if (!updateNow?.hasUpdate) return
         const confirmed = await confirmCard({
           title: `更新到 v${updateNow.latest}？`,
-          message: '更新会下载 GitHub Release 源码包、备份当前代码并替换；服务随后自动重启。',
-          detail: '数据目录 .eab-dev 不会被替换。更新期间页面会短暂断开。',
+          message: '更新会下载 GitHub Release 源码包并校验版本/摘要，备份当前代码和数据库后替换；服务随后自动重启。',
+          detail: '数据目录不会整体替换，但会先备份 eab.db 与相关配置文件。更新期间页面会短暂断开。',
           confirmText: '开始更新',
           tone: 'warning',
         })
@@ -7444,7 +7444,30 @@ async function loadSys() {
         setUpdateNote('正在启动更新器，服务即将重启…')
         try {
           await apiPost('/api/console/update/apply', {})
-          setUpdateNote('更新器已启动，服务正在重启；稍后刷新页面查看新版本。')
+          setUpdateNote('更新器已启动，正在等待服务恢复…')
+          const targetVersion = String(updateNow.latest || '').replace(/^v/i, '')
+          const deadline = Date.now() + 120000
+          const poll = async () => {
+            try {
+              const res = await fetch('/api/health', { cache: 'no-store' })
+              const body = await res.json().catch(() => null)
+              const running = String(body?.data?.version || '').replace(/^v/i, '')
+              if (res.ok && running && running === targetVersion) {
+                setUpdateNote('更新完成，新版本已恢复健康；正在刷新页面…')
+                setTimeout(() => location.reload(), 1200)
+                return
+              }
+            } catch {
+              /* 服务重启期间连接失败，继续等 */
+            }
+            if (Date.now() >= deadline) {
+              setUpdateNote('更新未在 2 分钟内确认完成，请检查 .eab-dev/updates/last-update.log', true)
+              updateApply.disabled = false
+              return
+            }
+            setTimeout(poll, 2000)
+          }
+          setTimeout(poll, 1500)
         } catch (err) {
           setUpdateNote(err.message, true)
           updateApply.disabled = false
@@ -9442,7 +9465,7 @@ async function loadDatabases(status = state.databaseStatus || 'all') {
         <div class="panel-head">
           <div>
             <h2>数据连接 <span class="muted">${shown}</span></h2>
-            ${hintBadge('连接说明', '这里管理外部数据连接：关系型数据库、文件数据库与键值缓存，统一做配置、真实连通性测试和停用/删除。连接按公司隔离；密码只写入 secrets.json 或环境变量，页面不回显。PostgreSQL、MySQL / SQLite 支持只读查询，Redis 只做 PING 连通性测试。')}
+            ${hintBadge('连接说明', '这里管理外部数据连接：关系型数据库、文件数据库与键值缓存，统一做配置、真实连通性测试和停用/删除。连接按公司隔离；密码只写入 secrets.json 或环境变量，页面不回显。PostgreSQL、MySQL / SQLite 支持只读查询，Redis 只做 PING 连通性测试。单公司部署下，已启用的 PostgreSQL / Redis 会自动接入平台后端（审计/会话镜像、缓存），环境变量优先，不需要手动配置。')}
           </div>
           <div class="panel-actions">
             <div class="segmented">${filters}</div>
@@ -14095,4 +14118,12 @@ async function boot() {
 }
 
 bindHintTips()
-boot()
+boot().catch((err) => {
+  // 控制台初始化异常时不能让登录后的启动层一直盖住页面。
+  console.error('[eab-console] 初始化失败', err)
+  try {
+    window.EABBoot?.fail(err?.message || '控制台加载失败')
+  } catch {
+    /* 启动层不可用时仍要让错误页可见 */
+  }
+})

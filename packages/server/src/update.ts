@@ -19,6 +19,7 @@ export interface ReleaseAsset {
   name: string
   url: string
   size: number
+  digest: string | null
 }
 
 export interface UpdateStatus {
@@ -30,6 +31,7 @@ export interface UpdateStatus {
   publishedAt: string | null
   notes: string
   sourceUrl: string | null
+  sourceDigest: string | null
   installerUrl: string | null
   assets: ReleaseAsset[]
   error: string | null
@@ -41,6 +43,29 @@ let inflight: Promise<UpdateStatus> | null = null
 
 export function normalizeVersion(value: string): string {
   return String(value ?? '').trim().replace(/^v/i, '')
+}
+
+function isInstallerAsset(name: string): boolean {
+  return /(installer|setup|portable|desktop|windows|win32|win64|mac|darwin|linux|appimage|msi|exe)/i.test(name)
+}
+
+function sourceAssetScore(name: string): number {
+  const lower = String(name ?? '').toLowerCase()
+  let score = /\.zip$/i.test(lower) ? 1 : 0
+  if (/source|src/.test(lower)) score += 50
+  if (/eab/.test(lower)) score += 20
+  if (/blockmap|checksum|sha256|digest/.test(lower)) score -= 100
+  if (isInstallerAsset(lower)) score -= 100
+  return score
+}
+
+/** 从 Release 资产中选源码包，避免把桌面安装包/校验文件误当成源码。 */
+export function chooseSourceAsset(assets: ReleaseAsset[]): ReleaseAsset | null {
+  return [...assets]
+    .filter((item) => /\.zip$/i.test(item.name)
+      && !/blockmap|checksum|sha256|digest/i.test(item.name)
+      && !isInstallerAsset(item.name))
+    .sort((a, b) => sourceAssetScore(b.name) - sourceAssetScore(a.name))[0] ?? null
 }
 
 /** 年月日版本号按数字段比较；非数字段按字符串兜底，避免抛错。 */
@@ -82,6 +107,7 @@ function emptyStatus(error: string | null = null): UpdateStatus {
     publishedAt: null,
     notes: '',
     sourceUrl: null,
+    sourceDigest: null,
     installerUrl: null,
     assets: [],
     error,
@@ -112,7 +138,7 @@ async function requestRelease(): Promise<UpdateStatus> {
     published_at?: string
     body?: string
     zipball_url?: string
-    assets?: Array<{ name?: string; browser_download_url?: string; size?: number }>
+    assets?: Array<{ name?: string; browser_download_url?: string; size?: number; digest?: string }>
   }
   const tag = String(body.tag_name ?? '').trim()
   const latest = normalizeVersion(tag)
@@ -124,11 +150,13 @@ async function requestRelease(): Promise<UpdateStatus> {
       name: String(item.name),
       url: String(item.browser_download_url),
       size: Number(item.size ?? 0),
+      digest: item.digest ? String(item.digest) : null,
     }))
 
   // 优先用 Release 附带的源码 zip；GitHub 自动生成的 zipball 作为兜底。
-  const sourceAsset = assets.find((item) => /\.zip$/i.test(item.name) && !/blockmap/i.test(item.name))
+  const sourceAsset = chooseSourceAsset(assets)
   const sourceUrl = sourceAsset?.url ?? body.zipball_url ?? null
+  const sourceDigest = sourceAsset?.digest ?? null
   const installerAsset = assets.find((item) => /\.(exe|msi|dmg|appimage)$/i.test(item.name))
   const current = readVersion()
 
@@ -141,6 +169,7 @@ async function requestRelease(): Promise<UpdateStatus> {
     publishedAt: body.published_at ?? null,
     notes: String(body.body ?? '').slice(0, 4000),
     sourceUrl,
+    sourceDigest,
     installerUrl: installerAsset?.url ?? null,
     assets,
     error: null,
@@ -176,14 +205,23 @@ export function getCachedUpdateStatus(): UpdateStatus {
  * 启动更新器。更新器独立于当前服务进程运行，等服务退出后再替换文件。
  * 返回后调用方应在几百毫秒内关闭服务，避免 Windows 上文件被占用。
  */
-export function startUpdate(version: string, sourceUrl: string): { started: boolean; command: string } {
+export function startUpdate(version: string, sourceUrl: string, sourceDigest?: string | null): { started: boolean; command: string } {
   if (process.env.EAB_DESKTOP === '1') {
     throw new Error('桌面版请使用菜单「EAB → 检查桌面更新」安装新版本，不要在控制台替换内嵌服务')
   }
   const root = repoRoot()
   const script = join(root, 'scripts', 'eab-update.mjs')
   if (!existsSync(script)) throw new Error('缺少 scripts/eab-update.mjs，当前部署不能执行一键更新')
-  const args = [script, '--apply', `--url=${sourceUrl}`, `--version=${version}`, `--root=${root}`, '--restart=1']
+  const digestArg = sourceDigest ? ` --sha256=${sourceDigest}` : ''
+  const args = [
+    script,
+    '--apply',
+    `--url=${sourceUrl}`,
+    `--version=${version}`,
+    `--root=${root}`,
+    '--restart=1',
+    ...(sourceDigest ? [`--sha256=${sourceDigest}`] : []),
+  ]
   const child = spawn(process.execPath, args, {
     cwd: root,
     env: { ...process.env },
@@ -192,5 +230,5 @@ export function startUpdate(version: string, sourceUrl: string): { started: bool
     windowsHide: true,
   })
   child.unref()
-  return { started: true, command: `node scripts/eab-update.mjs --apply --version=${version} --restart` }
+  return { started: true, command: `node scripts/eab-update.mjs --apply --version=${version} --restart${digestArg}` }
 }

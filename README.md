@@ -4,7 +4,7 @@ EAB 是一套面向**单公司本地部署**的企业智能体基座：一个进
 
 - 员工入口：`http://127.0.0.1:8787/chat`
 - 管理控制台：`http://127.0.0.1:8788/admin`
-- 当前版本：`2026.11.15`
+- 当前版本：`2026.11.16`
 
 > 单公司边界：一个实例只服务一家公司。钉钉、飞书、企业微信、模型供应商、知识库、插件都在控制台里配置。
 
@@ -215,8 +215,8 @@ eab start
 
 EAB 的版本来自 GitHub Release：
 
-- Release tag：`v2026.11.15`
-- Release 资产：源码 zip（`EAB-2026.11.15.zip`）。桌面安装包、`latest.yml`、`.blockmap` 已停止发布。
+- Release tag：`v2026.11.16`
+- Release 资产：源码 zip（`EAB-2026.11.16.zip`）。桌面安装包、`latest.yml`、`.blockmap` 已停止发布。
 
 ### 两种更新方式
 
@@ -226,7 +226,7 @@ EAB 的版本来自 GitHub Release：
 
 1. 点「检查更新」，读取 GitHub 最新 Release；
 2. 有新版本时「一键更新」按钮可用；
-3. 确认后服务调用更新器：下载源码包 → 校验版本 → 备份代码 → 替换 → `pnpm install` → 重启；
+3. 确认后服务调用更新器：下载源码包 → 校验版本与 SHA-256 → 备份代码和数据库/配置 → 替换 → `pnpm install --frozen-lockfile` → 重启 → 健康检查；新版本健康失败会自动回滚；
 4. 页面短暂断开，刷新后查看新版本。
 
 **命令更新**
@@ -280,7 +280,7 @@ pnpm dev                  # 等价于 eab start
 
 1. 改根 `package.json` 的 `version`；
 2. 更新 `README.md` 版本与源码包名；
-3. 提交并打 tag：`git tag v2026.11.15 && git push origin v2026.11.15`；
+3. 提交并打 tag：`git tag v2026.11.16 && git push origin v2026.11.16`；
 4. GitHub Actions 只构建源码 zip 并创建/更新 Release，不再生成桌面安装包；
 5. 控制台/CLI 的版本检查读取该 Release。
 

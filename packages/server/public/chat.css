@@ -2823,6 +2823,7 @@
   background: #fff; border: 1px solid var(--line); border-radius: 9px;
   box-shadow: 0 10px 28px rgba(16, 24, 40, 0.16);
 }
+body.is-side-peek .session-menu { z-index: 2147483500; }
 .session-menu-title {
   max-width: 190px; padding: 5px 9px 6px; overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap; font-size: 11px; color: var(--muted); border-bottom: 1px solid var(--line);
@@ -3147,36 +3148,65 @@
   overflow: auto;
 }
 
+/* 思考过程：贴近正文的单行 CoT 入口，折叠时显示首句预览，展开后显示完整内容。 */
 .think-panel {
-  border: 1px solid #dbe5e1;
-  border-radius: 10px;
-  background: #f5f9f7;
-  overflow: hidden;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  overflow: visible;
+  margin: 2px 0 9px;
 }
 
 .think-head {
   width: 100%;
   display: flex;
   align-items: center;
-  gap: 7px;
-  padding: 8px 11px;
+  gap: 6px;
+  padding: 2px 0;
   border: 0;
   background: transparent;
-  color: #5d6b66;
+  color: #66736e;
   font: inherit;
-  font-size: 12px;
+  font-size: 12.5px;
   text-align: left;
   cursor: pointer;
 }
 
-.think-head:hover { background: #edf4f1; }
+.think-head:hover { background: transparent; color: #0f6b5c; }
 
-.think-icon { color: #0f6b5c; font-size: 12px; }
-.think-title { font-weight: 600; }
+.think-icon {
+  flex: 0 0 auto;
+  color: #0f6b5c;
+  font-size: 12px;
+  line-height: 1;
+}
+.think-title {
+  flex: 0 0 auto;
+  color: #52615b;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+.think-divider {
+  flex: 0 0 auto;
+  color: #a2ada8;
+  font-size: 12px;
+}
+.think-preview {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: #8b9691;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.5;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .think-chevron {
-  margin-left: auto;
-  color: #899690;
-  font-size: 11px;
+  flex: 0 0 auto;
+  margin-left: 2px;
+  color: #a2ada8;
+  font-size: 10px;
   transition: transform 0.15s ease;
 }
 
@@ -3186,11 +3216,9 @@
 
 .think-panel.is-collapsed .think-body { display: none; }
 
-.think-panel:not(.is-collapsed) .think-peek { display: none; }
-
-.think-peek,
-.tool-peek {
-  padding: 0 12px 8px;
+.tool-preview {
+  flex: 1 1 auto;
+  min-width: 0;
   color: #7a8782;
   font-size: 12px;
   line-height: 1.5;
@@ -3199,47 +3227,68 @@
   text-overflow: ellipsis;
 }
 
+.think-panel.is-active .think-icon {
+  color: #0f6b5c;
+  animation: think-breathe 1.8s ease-in-out infinite;
+}
 .think-panel.is-active .think-title { color: #0f6b5c; }
 
+@keyframes think-breathe {
+  0%, 100% { opacity: 0.62; transform: scale(0.92); }
+  50% { opacity: 1; transform: scale(1.08); }
+}
+
 .think-body {
-  max-height: 240px;
+  max-height: 320px;
   overflow: auto;
-  padding: 0 12px 10px;
-  border-top: 1px dashed #dfe8e4;
-  color: #6a7772;
+  margin: 5px 0 2px 6px;
+  padding: 7px 0 2px 14px;
+  border-left: 1px solid #dfe8e4;
+  color: #68756f;
   font-size: 12.5px;
   line-height: 1.75;
   white-space: pre-wrap;
   word-break: break-word;
 }
 
+@media (prefers-reduced-motion: reduce) {
+  .think-panel.is-active .think-icon { animation: none; }
+  .tool-panel.is-active .tool-dot { animation: none; }
+}
+
 .tool-list { display: flex; flex-direction: column; gap: 6px; }
 
 .tool-panel {
-  border: 1px solid #dbe3e0;
-  border-radius: 9px;
-  background: #fff;
-  overflow: hidden;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  overflow: visible;
+  margin: 2px 0 9px;
 }
 
-.tool-panel.is-error { border-color: #f0c7c4; background: #fff8f7; }
+.tool-panel.is-error .tool-title,
+.tool-panel.is-error .tool-preview,
+.tool-panel.is-error .tool-divider { color: #b42318; }
+.tool-panel.is-error .tool-dot { background: #b42318; }
 .tool-panel.is-active .tool-dot { animation: tool-pulse 1s ease-in-out infinite; }
 .tool-panel.is-collapsed .tool-body { display: none; }
-.tool-panel.is-collapsed .tool-peek { display: block; }
-.tool-panel:not(.is-collapsed) .tool-peek { display: none; }
 
 .tool-panel .tool-body {
   display: grid;
   gap: 0;
-  padding: 0;
-  border-top: 1px dashed #dfe8e4;
-  background: #fbfdfc;
+  max-height: 320px;
+  overflow: auto;
+  margin: 5px 0 2px 6px;
+  padding: 7px 0 2px 14px;
+  border-top: 0;
+  border-left: 1px solid #dfe8e4;
+  background: transparent;
 }
 
 .tool-detail {
   display: grid;
   gap: 6px;
-  padding: 8px 10px 9px;
+  padding: 8px 0 9px;
 }
 
 .tool-detail + .tool-detail { border-top: 1px dashed #dfe8e4; }
@@ -6160,37 +6209,70 @@
   background: #f6faf8;
 }
 
-/* 思考 / 工具 / 等待：统一为低饱和绿色辅助面板 */
+/* 思考 / 工具 / 等待：思考保持行内，工具卡沿用低饱和绿色辅助面板 */
 .think-panel {
-  border-color: #dce9e3;
-  border-radius: 12px;
-  background: linear-gradient(135deg, #f6fbf8 0%, #f2f9f5 100%);
+  border: 0;
+  border-radius: 0;
+  background: transparent;
 }
 
 .think-head {
-  padding: 8px 12px;
-  transition: background 160ms var(--eab-ease);
+  padding: 2px 0;
+  transition: color 160ms var(--eab-ease);
 }
 
 .think-head:hover {
-  background: rgba(218, 239, 230, 0.34);
+  background: transparent;
+  color: #0f6b5c;
 }
 
-.tool-panel,
+.tool-panel {
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  background: transparent;
+}
+
 .tool-card {
   border-color: #dfe9e4;
   border-radius: 12px;
   box-shadow: 0 2px 8px rgba(16, 48, 37, 0.025);
 }
 
-.tool-head {
-  padding: 8px 11px;
-  transition: background 160ms var(--eab-ease);
+.tool-panel .tool-head {
+  padding: 2px 0;
+  gap: 6px;
+  font-size: 12.5px;
+  color: #66736e;
+  transition: color 160ms var(--eab-ease);
 }
 
-.tool-head:hover {
-  background: #f4faf7;
+.tool-panel .tool-head:hover {
+  background: transparent;
+  color: #0f6b5c;
 }
+
+.tool-panel .tool-title {
+  flex: 0 0 auto;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: #52615b;
+}
+
+.tool-panel .tool-divider {
+  flex: 0 0 auto;
+  color: #a2ada8;
+  font-size: 11px;
+}
+
+.tool-panel .tool-chevron {
+  flex: 0 0 auto;
+  margin-left: 2px;
+  font-size: 10px;
+}
+
+.tool-panel .tool-detail { padding: 8px 0 9px; }
+.tool-panel .tool-detail + .tool-detail { border-top: 1px dashed #dfe8e4; }
 
 /* ---------- Agent 文件操作：对话里的文档编辑预览 ---------- */
 
@@ -6701,11 +6783,6 @@
 
 /* ---------------- 侧边栏折叠 + 对话内分屏拖拽 ---------------- */
 
-.chat-side {
-  overflow: hidden;
-  transition: width .22s ease, flex-basis .22s ease, padding .22s ease, opacity .16s ease, border-color .22s ease;
-}
-
 .chat-head-left {
   display: flex;
   align-items: center;
@@ -6752,6 +6829,12 @@
   transition: transform .2s ease;
 }
 
+/* 原始固定侧栏的折叠动效：展开时占位，收起时宽度归零。 */
+.chat-side {
+  overflow: hidden;
+  transition: width .22s ease, flex-basis .22s ease, padding .22s ease, opacity .16s ease, border-color .22s ease;
+}
+
 body.is-side-collapsed .chat-side {
   flex: 0 0 0;
   width: 0;
@@ -6764,6 +6847,69 @@ body.is-side-collapsed .chat-side {
 
 body.is-side-collapsed .side-toggle-arrow {
   transform: scaleX(-1);
+}
+
+/*
+ * 收起后，鼠标移到顶部侧栏图标上时，用同一个侧栏节点以浮层形式预览。
+ * 不改动 is-side-collapsed（点击图标仍然恢复原来的固定侧栏），
+ * 只在桌面端临时把侧栏和舞台叠在同一个 grid 单元里。
+ * 这里用 order 控制绘制顺序：舞台先画，侧栏后画，浮层才不会被舞台盖住。
+ */
+@media (min-width: 861px) {
+  body.is-side-collapsed.is-side-peek {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
+  }
+
+  body.is-side-collapsed.is-side-peek .chat-stage {
+    grid-area: 1 / 1;
+    order: 1;
+    width: 100%;
+    min-width: 0;
+  }
+
+  body.is-side-collapsed.is-side-peek .chat-side {
+    position: fixed;
+    top: 70px;
+    left: 14px;
+    bottom: var(--eab-side-peek-bottom, 150px);
+    z-index: 2147483000;
+    width: 288px;
+    height: auto;
+    margin: 0;
+    padding: 18px 14px 14px;
+    border: 1px solid rgba(210, 224, 218, 0.9);
+    border-radius: 18px;
+    background: linear-gradient(180deg, #ffffff 0%, #fbfdfc 100%);
+    box-shadow:
+      0 20px 48px rgba(16, 48, 37, 0.14),
+      0 2px 8px rgba(16, 48, 37, 0.06),
+      inset 0 1px 0 rgba(255, 255, 255, 0.9);
+    opacity: 1;
+    visibility: visible;
+    pointer-events: auto;
+    transform: translateX(0) scale(1);
+    animation: eab-side-peek-in 180ms var(--eab-ease);
+  }
+}
+
+@keyframes eab-side-peek-in {
+  from {
+    opacity: 0;
+    transform: translateX(-12px) scale(0.99);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+  }
+}
+
+/* 窄屏沿用原来的顶部侧栏，折叠时直接收起，不做浮层。 */
+@media (max-width: 860px) {
+  body.is-side-collapsed .chat-side {
+    display: none;
+  }
 }
 
 .chat-head-title {
@@ -6987,6 +7133,10 @@ body.is-file-preview-fullscreen .file-pane {
   .chat-side-toggle .side-toggle-arrow,
   .file-split-resizer::before {
     transition: none !important;
+  }
+
+  .chat-side {
+    animation: none !important;
   }
 }
 

@@ -276,6 +276,10 @@ function waitForLoginRedirect() {
   return new Promise(() => {})
 }
 
+function isLoginSurface() {
+  return new URLSearchParams(location.search).get('login') === '1'
+}
+
 function withTimeout(promise, ms, message) {
   return new Promise((resolve, reject) => {
     const timer = window.setTimeout(() => reject(new Error(message)), ms)
@@ -303,6 +307,9 @@ async function api(path, options) {
     err.traceId = payload && (payload.error?.traceId || payload.traceId)
     err.status = response.status
     if (response.status === 401 && !isAuthProbePath(path)) {
+      // 登录页本身不再通过 401 触发跳转：后台请求（如权限角标）失败只当错误处理，
+      // 否则每次请求都会 location.replace 回同一个登录页，形成无限重载。
+      if (isLoginSurface()) throw err
       redirectToLogin()
       return waitForLoginRedirect()
     }
@@ -2555,6 +2562,7 @@ async function loadPermissionData(options = {}) {
 }
 
 async function refreshPermissionBadge() {
+  if (!state.me) return
   try {
     const todo = await api('/api/permissions/requests?mode=todo')
     state.permRequests.todo = todo.requests || []
@@ -7856,6 +7864,18 @@ function oneLinePreview(text, maxLength = 120) {
   return normalized.length > maxLength ? `…${normalized.slice(-maxLength)}` : normalized
 }
 
+/** CoT 单行摘要取思考内容的第一句，和 DSH 的 “Think · …” 预览一致。 */
+function firstLinePreview(text, maxLength = 96) {
+  const lines = String(text || '')
+    .split(/\r?\n/)
+    .map((line) => line.replace(/\*\*/g, '').replace(/^\s*[#>*\-]+\s*/, '').replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+  if (lines.length === 0) return ''
+  let first = lines[0]
+  if (first.length < 24 && lines[1]) first = `${first} ${lines[1]}`
+  return first.length > maxLength ? `${first.slice(0, maxLength).trimEnd()}…` : first
+}
+
 function toolStatusText(trace) {
   if (trace.status === 'running') return '执行中'
   if (trace.status === 'error') return '失败'
@@ -7877,12 +7897,21 @@ function toolDetailHtml(trace) {
   </div>`
 }
 
-function latestToolPreview(tools) {
+/** 工具面板和思考入口一样只占一行：优先给当前工具，完成后给数量/总耗时/失败数。 */
+function toolPanelPreview(tools, active) {
+  if (!Array.isArray(tools) || tools.length === 0) return ''
   const running = tools.find((tool) => tool.status === 'running')
-  if (running) return `${running.name} · 执行中`
-  const latest = tools.at(-1)
-  if (!latest) return ''
-  return `${latest.name}${latest.status === 'error' ? ' · 失败' : ''} · ${formatElapsed(latest.durationMs)}`
+  if (active) {
+    const current = running || tools.at(-1)
+    return current ? `${current.name} · 执行中` : ''
+  }
+  const failed = tools.filter((tool) => tool.status === 'error').length
+  if (tools.length === 1) {
+    const only = tools[0]
+    return `${only.name}${only.status === 'error' ? ' · 失败' : ''}${only.durationMs > 0 ? ` · ${formatElapsed(only.durationMs)}` : ''}`
+  }
+  const totalMs = tools.reduce((sum, tool) => sum + (Number(tool.durationMs) || 0), 0)
+  return `${tools.length} 个${failed > 0 ? ` · ${failed} 个失败` : ''}${totalMs > 0 ? ` · ${formatElapsed(totalMs)}` : ''}`
 }
 
 /* ---------------- Agent 文件操作预览 ---------------- */
@@ -8712,37 +8741,34 @@ document.addEventListener('click', (event) => {
   quotePreviewSelection()
 })
 
-/** 工具调用收成一张可折叠面板：默认只留标题，执行中再加一行当前工具。 */
+/** 工具调用收成和思考一样的单行入口：默认只留 `工具 · 摘要`，展开了再看完整工具明细。 */
 function toolPanelHtml(tools, { active = false, expanded = false } = {}) {
   if (!Array.isArray(tools) || tools.length === 0) return ''
-  const preview = active
-    ? latestToolPreview(tools)
-    : tools
-        .map((tool) =>
-          tool.durationMs > 0 ? `${tool.name} ${formatElapsed(tool.durationMs)}` : tool.name,
-        )
-        .join(' · ')
-  const totalMs = tools.reduce((sum, tool) => sum + (Number(tool.durationMs) || 0), 0)
-  const statusText = `${tools.length} 个${totalMs > 0 ? ` · ${formatElapsed(totalMs)}` : ''}`
-  return `<div class="tool-panel${active ? ' is-active' : ''}${expanded ? '' : ' is-collapsed'}" data-tool-panel>
-    <button class="tool-head" type="button" aria-expanded="${expanded ? 'true' : 'false'}">
+  const preview = toolPanelPreview(tools, active)
+  const hasError = tools.some((tool) => tool.status === 'error')
+  const title = active ? '工具调用中' : '工具'
+  return `<div class="tool-panel${active ? ' is-active' : ''}${hasError ? ' is-error' : ''}${expanded ? '' : ' is-collapsed'}" data-tool-panel>
+    <button class="tool-head" type="button" aria-expanded="${expanded ? 'true' : 'false'}" aria-label="展开工具调用明细">
       <span class="tool-dot"></span>
-      <strong class="tool-title">${active ? '工具调用中…' : '工具调用记录'}</strong>
-      <span class="tool-status">${esc(statusText)}</span>
+      <span class="tool-title">${title}</span>
+      <span class="tool-divider"${preview ? '' : ' hidden'}>·</span>
+      <span class="tool-preview">${esc(preview)}</span>
       <span class="tool-chevron">⌄</span>
     </button>
-    ${preview ? `<div class="tool-peek">${esc(preview)}</div>` : ''}
     <div class="tool-body">${tools.map((trace) => toolDetailHtml(trace)).join('')}</div>
   </div>`
 }
 
-/** 历史里的思考过程默认收起，只保留标题和可展开的完整内容。 */
+/** 历史里的思考过程默认收起：DSH 风格单行摘要 + 可展开的完整思维链。 */
 function thinkPanelHtml(reasoning) {
+  const preview = firstLinePreview(reasoning, 96)
   return `<div class="think-panel is-collapsed">
-    <button class="think-head" type="button" aria-expanded="false">
-      <span class="think-icon">✦</span>
-      <span class="think-title">已深度思考</span>
-      <span class="think-chevron">⌄</span>
+    <button class="think-head" type="button" aria-expanded="false" aria-label="展开思考过程">
+      <span class="think-icon" aria-hidden="true">✦</span>
+      <span class="think-title">思考</span>
+      <span class="think-divider"${preview ? '' : ' hidden'}>·</span>
+      <span class="think-preview">${esc(preview)}</span>
+      <span class="think-chevron" aria-hidden="true">⌄</span>
     </button>
     <div class="think-body">${esc(reasoning)}</div>
   </div>`
@@ -9499,6 +9525,9 @@ function bindToolToggles(node) {
       if (!panel) return
       const collapsed = panel.classList.toggle('is-collapsed')
       button.setAttribute('aria-expanded', collapsed ? 'false' : 'true')
+      if (panel.classList.contains('think-panel')) {
+        panel.dataset.userToggled = collapsed ? '0' : '1'
+      }
     })
   }
 }
@@ -9638,10 +9667,9 @@ function createAiTurn(options = {}) {
   node.className = 'msg ai'
   node.innerHTML = `${aiWhoMarkup()}<div class="msg-body"><div class="bubble ai-turn">
     <div class="think-panel is-collapsed" hidden>
-      <button class="think-head" type="button" aria-expanded="false">
-        <span class="think-icon">✦</span><span class="think-title">正在思考…</span><span class="think-chevron">⌄</span>
+      <button class="think-head" type="button" aria-expanded="false" aria-label="展开思考过程">
+        <span class="think-icon" aria-hidden="true">✦</span><span class="think-title">思考中</span><span class="think-divider" hidden>·</span><span class="think-preview"></span><span class="think-chevron" aria-hidden="true">⌄</span>
       </button>
-      <div class="think-peek" hidden></div>
       <div class="think-body"></div>
     </div>
     <div class="tool-slot" hidden></div>
@@ -9660,7 +9688,8 @@ function createAiTurn(options = {}) {
   }
   const think = node.querySelector('.think-panel')
   const thinkTitle = node.querySelector('.think-title')
-  const thinkPeek = node.querySelector('.think-peek')
+  const thinkPreview = node.querySelector('.think-preview')
+  const thinkDivider = node.querySelector('.think-divider')
   const thinkBody = node.querySelector('.think-body')
   const toolPanel = node.querySelector('.tool-slot')
   const status = node.querySelector('.ai-status')
@@ -9671,6 +9700,7 @@ function createAiTurn(options = {}) {
   const waiting = node.querySelector('.ai-waiting')
   const waitingText = node.querySelector('.ai-waiting-text')
   let startedAt = Date.now()
+  let reasoningStartedAt = 0
   let firstAnswerAt = 0
   let rawAnswer = ''
   let answerRenderQueued = false
@@ -9719,16 +9749,23 @@ function createAiTurn(options = {}) {
     status.hidden = false
     statusText.textContent = text
   }
+  const setThinkPreview = (text) => {
+    const preview = firstLinePreview(text, 96)
+    thinkPreview.textContent = preview
+    thinkDivider.hidden = !preview
+  }
   const collapseThink = (done) => {
     if (think.hidden) return
-    think.classList.add('is-collapsed')
-    think.classList.remove('is-active')
-    thinkPeek.hidden = true
-    think.querySelector('.think-head').setAttribute('aria-expanded', 'false')
     if (done) {
-      const thinkingMs = (firstAnswerAt || Date.now()) - startedAt
-      thinkTitle.textContent = `已深度思考 · ${formatElapsed(thinkingMs)}`
+      const thinkingMs = (firstAnswerAt || Date.now()) - (reasoningStartedAt || startedAt)
+      thinkTitle.textContent = `已思考 ${formatElapsed(thinkingMs)}`
+      setThinkPreview(thinkBody.textContent)
     }
+    think.classList.remove('is-active')
+    // 用户主动展开后，后续自动收起不覆盖这次选择。
+    if (think.dataset.userToggled === '1' && !think.classList.contains('is-collapsed')) return
+    think.classList.add('is-collapsed')
+    think.querySelector('.think-head').setAttribute('aria-expanded', 'false')
   }
   const renderToolPanel = (active) => {
     if (toolTraces.length === 0) {
@@ -9752,8 +9789,10 @@ function createAiTurn(options = {}) {
     if (doneReasoning && think.hidden) {
       think.hidden = false
       think.classList.add('is-active')
+      if (!reasoningStartedAt) reasoningStartedAt = startedAt
       thinkBody.textContent = doneReasoning
-      thinkTitle.textContent = '正在思考中…'
+      thinkTitle.textContent = '思考中'
+      setThinkPreview(doneReasoning)
     }
     const calls = Array.isArray(data?.toolCalls) ? data.toolCalls : []
     for (const item of calls) {
@@ -9874,6 +9913,7 @@ function createAiTurn(options = {}) {
       }
       answerRenderQueued = false
       startedAt = Date.now()
+      reasoningStartedAt = 0
       firstAnswerAt = 0
       rawAnswer = ''
       answer.innerHTML = ''
@@ -9882,8 +9922,10 @@ function createAiTurn(options = {}) {
       think.hidden = true
       think.classList.remove('is-active')
       think.classList.add('is-collapsed')
-      thinkTitle.textContent = '正在思考中…'
-      thinkPeek.hidden = true
+      delete think.dataset.userToggled
+      thinkTitle.textContent = '思考中'
+      thinkPreview.textContent = ''
+      thinkDivider.hidden = true
       thinkBody.textContent = ''
       toolTraces.length = 0
       streamToolDrafts.clear()
@@ -9928,16 +9970,13 @@ function createAiTurn(options = {}) {
     },
     reasoning(text) {
       if (!text) return
+      if (!reasoningStartedAt) reasoningStartedAt = Date.now()
       think.hidden = false
       think.classList.add('is-active')
       thinkBody.textContent += text
-      thinkTitle.textContent = '正在思考中…'
+      thinkTitle.textContent = '思考中'
+      setThinkPreview(thinkBody.textContent)
       setStatus('')
-      if (think.classList.contains('is-collapsed')) {
-        const peek = oneLinePreview(thinkBody.textContent)
-        thinkPeek.textContent = peek
-        thinkPeek.hidden = !peek
-      }
       thinkBody.scrollTop = thinkBody.scrollHeight
       scroll()
     },
@@ -10066,7 +10105,7 @@ function createAiTurn(options = {}) {
         else if (!answer.textContent) answer.textContent = '（没有返回内容）'
       }
       const citations = data.citations && data.citations.length ? ` · 引用 ${data.citations.length} 条` : ''
-      const thinking = think.hidden ? '' : ` · 思考 ${formatElapsed((firstAnswerAt || Date.now()) - startedAt)}`
+      const thinking = think.hidden ? '' : ` · 思考 ${formatElapsed((firstAnswerAt || Date.now()) - (reasoningStartedAt || startedAt))}`
       metaLine.hidden = false
       metaLine.innerHTML = `${channelTag(data.channel)}${esc(`${data.modelName || ''}${data.autoSelected ? ' · 自动选择' : ''}${thinking}${citations}`)}`
       // 固定模型的会话发生故障转移时，后端已写回接替模型；气泡同步为实际接替模型。
@@ -11170,9 +11209,139 @@ async function setupLoginSso() {
   })
 }
 
+let sidePeekCloseTimer = 0
+let sidePeekWatchTimer = 0
+let sidePeekPinnedByFocus = false
+let sidePeekFocusGuard = false
+let sidePeekLastX = -10000
+let sidePeekLastY = -10000
+
+function startSidePeekWatch() {
+  if (sidePeekWatchTimer) return
+  sidePeekWatchTimer = window.setInterval(() => {
+    if (!document.body.classList.contains('is-side-peek')) {
+      stopSidePeekWatch()
+      return
+    }
+    const side = $('#chat-side')
+    const button = $('#side-toggle')
+    if (sidePeekPinnedByFocus || side?.contains(document.activeElement)) return
+    if (sidePeekPointerInZone(sidePeekLastX, sidePeekLastY)) return
+    if (button?.matches(':hover') || side?.matches(':hover')) return
+    setSidePeek(false)
+  }, 300)
+}
+
+function stopSidePeekWatch() {
+  if (!sidePeekWatchTimer) return
+  window.clearInterval(sidePeekWatchTimer)
+  sidePeekWatchTimer = 0
+}
+
+function focusSideToggle() {
+  sidePeekFocusGuard = true
+  $('#side-toggle')?.focus()
+  sidePeekFocusGuard = false
+}
+
+function canSidePeek() {
+  return window.matchMedia('(min-width: 861px)').matches
+}
+
+function syncSidePeekInsets() {
+  const side = $('#chat-side')
+  if (!side) return
+  const composer = document.querySelector('.composer')
+  const top = composer ? composer.getBoundingClientRect().top : 0
+  const bottom = top > 0 ? Math.max(14, Math.round(window.innerHeight - top + 10)) : 14
+  side.style.setProperty('--eab-side-peek-bottom', `${bottom}px`)
+}
+
+function setSidePeek(peek) {
+  const side = $('#chat-side')
+  const isCollapsed = document.body.classList.contains('is-side-collapsed')
+  const want = Boolean(peek && isCollapsed && canSidePeek())
+  document.body.classList.toggle('is-side-peek', want)
+  if (!side) return
+  if (want) {
+    syncSidePeekInsets()
+    side.inert = false
+    side.setAttribute('aria-hidden', 'false')
+    startSidePeekWatch()
+    return
+  }
+  stopSidePeekWatch()
+  sidePeekPinnedByFocus = false
+  if (isCollapsed) {
+    if (side.contains(document.activeElement)) focusSideToggle()
+    side.inert = true
+    side.setAttribute('aria-hidden', 'true')
+  }
+}
+
+function cancelSidePeekClose() {
+  if (!sidePeekCloseTimer) return
+  window.clearTimeout(sidePeekCloseTimer)
+  sidePeekCloseTimer = 0
+}
+
+function scheduleSidePeekClose() {
+  cancelSidePeekClose()
+  sidePeekCloseTimer = window.setTimeout(() => {
+    sidePeekCloseTimer = 0
+    if (!document.body.classList.contains('is-side-peek')) return
+    const side = $('#chat-side')
+    const button = $('#side-toggle')
+    if (button === document.activeElement) return
+    if (sidePeekPointerInZone(sidePeekLastX, sidePeekLastY)) return
+    if (button?.matches(':hover') || side?.matches(':hover') || side?.contains(document.activeElement)) return
+    setSidePeek(false)
+  }, 240)
+}
+
+function sidePeekPointerInZone(x, y) {
+  const side = $('#chat-side')
+  const button = $('#side-toggle')
+  if (!side || !button) return false
+  const sideRect = side.getBoundingClientRect()
+  const buttonRect = button.getBoundingClientRect()
+  const sideVisible = sideRect.width > 20 && sideRect.height > 20
+  const inSide = sideVisible && x >= sideRect.left - 8 && x <= sideRect.right + 8 && y >= sideRect.top - 8 && y <= sideRect.bottom + 8
+  const inButton = x >= buttonRect.left - 8 && x <= buttonRect.right + 8 && y >= buttonRect.top - 8 && y <= buttonRect.bottom + 8
+  return inSide || inButton
+}
+
+function trackSidePeekPointer(event) {
+  if (event.pointerType === 'touch') return
+  if (!document.body.classList.contains('is-side-collapsed')) return
+  const x = event.clientX
+  const y = event.clientY
+  sidePeekLastX = x
+  sidePeekLastY = y
+  const inZone = sidePeekPointerInZone(x, y)
+  if (inZone) sidePeekPinnedByFocus = false
+  if (!document.body.classList.contains('is-side-peek')) {
+    if (inZone) setSidePeek(true)
+    return
+  }
+  if (inZone) cancelSidePeekClose()
+  else scheduleSidePeekClose()
+}
+
 function setSidebarCollapsed(collapsed, options = {}) {
   const isCollapsed = Boolean(collapsed)
   document.body.classList.toggle('is-side-collapsed', isCollapsed)
+  if (!isCollapsed) {
+    document.body.classList.remove('is-side-peek')
+    stopSidePeekWatch()
+    sidePeekPinnedByFocus = false
+  }
+  const side = $('#chat-side')
+  if (side) {
+    side.setAttribute('aria-hidden', String(isCollapsed))
+    // 收起时从键盘 Tab 顺序和点击命中中移除，避免焦点落进屏幕外的浮层。
+    side.inert = isCollapsed
+  }
   const button = $('#side-toggle')
   if (button) {
     button.setAttribute('aria-expanded', String(!isCollapsed))
@@ -11198,11 +11367,65 @@ function initSidebarToggle() {
   }
   setSidebarCollapsed(collapsed, { persist: false })
   const button = $('#side-toggle')
-  if (!button || button.dataset.bound === '1') return
-  button.dataset.bound = '1'
-  button.addEventListener('click', () => {
-    setSidebarCollapsed(!document.body.classList.contains('is-side-collapsed'))
-  })
+  const side = $('#chat-side')
+  if (button && button.dataset.bound !== '1') {
+    button.dataset.bound = '1'
+    button.addEventListener('click', () => {
+      setSidebarCollapsed(!document.body.classList.contains('is-side-collapsed'))
+    })
+    button.addEventListener('pointerenter', (event) => {
+      if (event.pointerType === 'touch') return
+      sidePeekLastX = event.clientX
+      sidePeekLastY = event.clientY
+      cancelSidePeekClose()
+      if (document.body.classList.contains('is-side-collapsed')) setSidePeek(true)
+    })
+    button.addEventListener('pointerleave', scheduleSidePeekClose)
+    button.addEventListener('focus', () => {
+      if (sidePeekFocusGuard) return
+      if (document.body.classList.contains('is-side-collapsed')) {
+        sidePeekPinnedByFocus = true
+        setSidePeek(true)
+      }
+    })
+    button.addEventListener('blur', scheduleSidePeekClose)
+  }
+  if (side && side.dataset.peekBound !== '1') {
+    side.dataset.peekBound = '1'
+    side.addEventListener('pointerenter', (event) => {
+      sidePeekLastX = event.clientX
+      sidePeekLastY = event.clientY
+      cancelSidePeekClose()
+      if (document.body.classList.contains('is-side-collapsed')) setSidePeek(true)
+    })
+    side.addEventListener('pointerleave', scheduleSidePeekClose)
+    side.addEventListener('focusin', cancelSidePeekClose)
+    side.addEventListener('focusout', scheduleSidePeekClose)
+  }
+  if (document.body.dataset.sidePeekMoveBound !== '1') {
+    document.body.dataset.sidePeekMoveBound = '1'
+    document.addEventListener('pointermove', trackSidePeekPointer, { passive: true })
+    document.addEventListener('mousemove', trackSidePeekPointer, { passive: true })
+    window.addEventListener('resize', () => {
+      if (!canSidePeek()) setSidePeek(false)
+      else if (document.body.classList.contains('is-side-peek')) syncSidePeekInsets()
+    }, { passive: true })
+  }
+  if (document.body.dataset.sidebarEscBound !== '1') {
+    document.body.dataset.sidebarEscBound = '1'
+    document.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape') return
+      if (document.body.classList.contains('is-side-peek')) {
+        setSidePeek(false)
+        focusSideToggle()
+        return
+      }
+      if (document.body.classList.contains('is-side-collapsed')) return
+      if (!$('#chat-side')?.contains(document.activeElement) && document.activeElement?.id !== 'side-toggle') return
+      setSidebarCollapsed(true)
+      focusSideToggle()
+    })
+  }
 }
 
 function readSideSectionRatio() {
@@ -11238,7 +11461,9 @@ function syncSideSectionSplit() {
   const files = $('#side-files')
   const resizer = $('#side-split-resizer')
   if (!side || !sessions || !files || !resizer) return
-  const show = !side.hidden && !sessions.hidden && !files.hidden && !document.body.classList.contains('is-side-collapsed')
+  const collapsed = document.body.classList.contains('is-side-collapsed')
+  const peek = document.body.classList.contains('is-side-peek')
+  const show = !side.hidden && !sessions.hidden && !files.hidden && (!collapsed || peek)
   side.classList.toggle('is-side-sections-resizable', show)
   resizer.hidden = !show
   if (show) applySideSectionRatio(readSideSectionRatio(), { persist: false })
@@ -11261,7 +11486,9 @@ function bindSideSectionResizer() {
   }
 
   resizer.addEventListener('pointerdown', (event) => {
-    if (resizer.hidden || document.body.classList.contains('is-side-collapsed')) return
+    if (resizer.hidden || document.body.classList.contains('is-side-collapsed')) {
+      if (!document.body.classList.contains('is-side-peek')) return
+    }
     if (event.pointerType === 'mouse' && event.button !== 0) return
     const sessions = $('#side-sessions')
     const files = $('#side-files')
@@ -11297,7 +11524,7 @@ function bindSideSectionResizer() {
   resizer.addEventListener('lostpointercapture', (event) => finishDrag(event.pointerId))
 
   resizer.addEventListener('keydown', (event) => {
-    if (resizer.hidden || document.body.classList.contains('is-side-collapsed')) return
+    if (resizer.hidden || (document.body.classList.contains('is-side-collapsed') && !document.body.classList.contains('is-side-peek'))) return
     let next = readSideSectionRatio()
     if (event.key === 'ArrowUp') next -= 0.02
     else if (event.key === 'ArrowDown') next += 0.02
@@ -11628,6 +11855,8 @@ async function boot() {
 
   renderSideUser(me)
   $('#side-files').hidden = false
+  // 权限角标依赖登录态；登录成功后再拉取，避免登录页发出 401 请求。
+  void refreshPermissionBadge()
 
   try {
     const models = await api(`/api/chat/models${qs()}`)

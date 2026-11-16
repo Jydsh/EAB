@@ -654,8 +654,15 @@ export function buildSystemPrompt(opts: {
   activeFile?: { name: string; fileId: string; relPath?: string }
   /** 会话里仍存活的子 Agent 清单；由 agent-team 生成，没有团队时为空 */
   teamRoster?: string
+  /**
+   * 当前身份实际可见、可选的对话模型（已按角色与数据权限过滤）。
+   * 用于回答“有哪些模型/当前用的哪个模型”，避免模型凭历史或工具名编造。
+   */
+  availableModels?: readonly { id: string; name: string }[]
+  /** 本轮实际使用的模型；用于在清单里标出“当前使用” */
+  currentModelId?: string | null
 }): string {
-  const { actor, chatTools, memories, hits, hasAttachments, pluginPrompts = [], skillPrompts = [], spaceLabel, spaceKind, intentHint = '', activeFile, teamRoster = '' } = opts
+  const { actor, chatTools, memories, hits, hasAttachments, pluginPrompts = [], skillPrompts = [], spaceLabel, spaceKind, intentHint = '', activeFile, teamRoster = '', availableModels = [], currentModelId = null } = opts
   const nowLabel = new Intl.DateTimeFormat('zh-CN', {
     timeZone: 'Asia/Shanghai',
     year: 'numeric',
@@ -683,6 +690,16 @@ export function buildSystemPrompt(opts: {
   return [
     `你是「${actor.person.companyName}」的企业智能助手 EAB（Enterprise Agent Base），当前用户是 ${actor.person.name}（${actor.person.deptName}）。`,
     `当前时间：${nowLabel}（Asia/Shanghai）。用户说“今天/现在/本周”时以此为准；需要精确到秒、换算日程或时区时再调用 time_now，不要靠心算日期和星期。`,
+    availableModels.length > 0
+      ? [
+          `当前身份可用模型（共 ${availableModels.length} 个，已按当前成员的角色与权限过滤）：`,
+          ...availableModels.map(
+            (model) =>
+              `- ${model.name}${model.id === currentModelId ? '（当前使用）' : ''}`,
+          ),
+          '用户问“有哪些模型 / 还能用哪些模型 / 我现在用的是哪个模型”时，只能依据这份清单回答，并说明这是当前身份有权限使用的模型；不要根据工具名、插件名、历史对话或自身猜测编造模型名称和数量。清单里没有的模型，明确说当前身份没有权限使用。',
+        ].join('\n')
+      : '',
     '回答要简洁、可执行。涉及公司制度、流程、资料时，只能依据下面提供的知识库片段；片段不足以回答就直说“现有资料里没有”，不要编造。',
     spaceRule,
     teamRoster,
@@ -4768,6 +4785,11 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
       activeFile,
       // 会话里还可能留着上一轮注册的子 Agent：列出它们，父 Agent 可以直接继续派活。
       teamRoster: chatTeam.roster(),
+      // 模型相关问题只按当前成员有权限的对话模型回答，不能让模型凭历史猜。
+      availableModels: available
+        .filter((item) => (item.endpointKind ?? 'chat') === 'chat')
+        .map((item) => ({ id: item.id, name: item.name })),
+      currentModelId: model.id,
     })
 
     const messages: LlmMessage[] = [

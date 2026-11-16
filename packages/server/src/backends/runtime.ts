@@ -18,6 +18,11 @@ import { RedisPubSub, type PubSubBackend, type PubSubClientLike } from './pubsub
 import { PostgresAuditMirror } from './postgres.js'
 import { PostgresChatMirror } from './postgres-chat.js'
 import type { BackendStatus } from './types.js'
+import {
+  resolveAutoBackends,
+  type AutoBackendSelection,
+  type AutoBackendSource,
+} from './auto.js'
 
 export interface BackendRuntime {
   readonly cache: CacheBackend
@@ -69,15 +74,39 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): P
   }
 }
 
+interface BackendSourceMeta {
+  readonly source?: 'env' | 'data-connection'
+  readonly connectionId?: string
+  readonly connectionName?: string
+}
+
+function sourceMeta(source: AutoBackendSource | undefined): BackendSourceMeta {
+  return source
+    ? { source: 'data-connection', connectionId: source.id, connectionName: source.name }
+    : { source: 'env' }
+}
+
+function withSource(status: BackendStatus, meta: BackendSourceMeta): BackendStatus {
+  if (!meta.connectionName) return status
+  return {
+    ...status,
+    ...meta,
+    detail: `${status.detail} · 由数据连接「${meta.connectionName}」自动接入`,
+  }
+}
+
 async function connectRedis(
   config: ServerConfig,
+  redisUrl = config.redisUrl,
+  source?: AutoBackendSource,
 ): Promise<{ cache: CacheBackend; pubsub?: PubSubBackend; failure?: BackendStatus }> {
   const memory = new MemoryCache()
   if (config.cacheBackend === 'off') {
     return { cache: memory }
   }
-  const wantsRedis = config.cacheBackend === 'redis' || (config.cacheBackend === 'auto' && Boolean(config.redisUrl))
+  const wantsRedis = config.cacheBackend === 'redis' || (config.cacheBackend === 'auto' && Boolean(redisUrl))
   if (!wantsRedis) return { cache: memory }
+  const sourceText = source ? `（数据连接「${source.name}」）` : ''
 
   const failed = (message: string): { cache: CacheBackend; failure: BackendStatus } => ({
     cache: memory,
@@ -87,12 +116,12 @@ async function connectRedis(
       label: 'Redis',
       mode: 'external',
       state: 'failed',
-      detail: `未接入，已回退内存缓存：${message}`,
+      detail: `未接入，已回退内存缓存：${message}${sourceText}`,
       capabilities: ['kv', 'ttl', 'counter', 'shared'],
     },
   })
 
-  if (!config.redisUrl) {
+  if (!redisUrl) {
     const message = 'EAB_CACHE=redis 但没有配置 EAB_REDIS_URL'
     if (config.backendsStrict) throw new Error(message)
     log(`${message}，回退内存缓存`)
@@ -119,7 +148,7 @@ async function connectRedis(
       return Math.min(500 * 2 ** Math.min(Math.max(retries, 0), 4), 5_000)
     }
     const client = redis.createClient({
-      url: config.redisUrl,
+      url: redisUrl,
       socket: { connectTimeout: 1500, reconnectStrategy: cacheReconnectStrategy, keepAlive: true, keepAliveInitialDelay: 30_000 },
       // 断开时不要排队等待，让业务立刻走内存兜底，避免请求被拖住。
       disableOfflineQueue: true,
@@ -129,7 +158,7 @@ async function connectRedis(
     client.on('error', (error: unknown) => {
       // 连接层错误可能发生在任何命令之前；先标降级，避免控制台显示假 ready。
       redisCache.markFailure(error)
-      log(`Redis 错误：${safeMessage(error, config.redisUrl)}`)
+      log(`Redis 错误：${safeMessage(error, redisUrl)}`)
     })
     client.on('ready', () => {
       if (!cacheReadyOnce) {
@@ -155,13 +184,13 @@ async function connectRedis(
         return Math.min(500 * 2 ** Math.min(Math.max(retries, 0), 4), 5_000)
       }
       const subscriber = redis.createClient({
-        url: config.redisUrl,
+        url: redisUrl,
         socket: { connectTimeout: 1500, reconnectStrategy: subscriberReconnectStrategy, keepAlive: true, keepAliveInitialDelay: 30_000 },
         disableOfflineQueue: true,
       })
       subscriber.on('error', (error: unknown) => {
         pubsub?.markError?.(error)
-        log(`Redis 订阅连接错误：${safeMessage(error, config.redisUrl)}`)
+        log(`Redis 订阅连接错误：${safeMessage(error, redisUrl)}`)
       })
       subscriber.on('ready', () => {
         if (!subscriberReadyOnce) {
@@ -171,7 +200,7 @@ async function connectRedis(
         if (!subscriberReconnectEnabled) return
         log('Redis 订阅连接已恢复，重新订阅频道')
         void pubsub?.resubscribe?.().catch((error: unknown) => {
-          log(`Redis 重新订阅失败：${safeMessage(error, config.redisUrl)}`)
+          log(`Redis 重新订阅失败：${safeMessage(error, redisUrl)}`)
         })
       })
       await withTimeout(Promise.resolve(subscriber.connect()), 2500, 'Redis 订阅')
@@ -179,12 +208,12 @@ async function connectRedis(
       pubsub = new RedisPubSub(subscriber as unknown as PubSubClientLike, `${config.redisPrefix}rt`)
       log('Redis 跨实例广播已接入')
     } catch (error) {
-      log(`Redis 跨实例广播不可用（只影响 SSE 跨实例推送）：${safeMessage(error, config.redisUrl)}`)
+      log(`Redis 跨实例广播不可用（只影响 SSE 跨实例推送）：${safeMessage(error, redisUrl)}`)
     }
 
     return { cache: hybridCache, pubsub }
   } catch (error) {
-    const message = safeMessage(error, config.redisUrl)
+    const message = safeMessage(error, redisUrl)
     if (config.backendsStrict) throw new Error(`Redis 接入失败：${message}`)
     log(`Redis 不可用，回退内存缓存：${message}`)
     return failed(message)
@@ -194,11 +223,14 @@ async function connectRedis(
 async function connectPostgres(
   config: ServerConfig,
   db: Db,
+  postgresUrl = config.postgresUrl,
+  source?: AutoBackendSource,
 ): Promise<{ mirror?: PostgresAuditMirror; chat?: PostgresChatMirror; failure?: BackendStatus }> {
   if (config.postgresBackend === 'off') return {}
   const wantsPostgres =
-    config.postgresBackend === 'mirror' || (config.postgresBackend === 'auto' && Boolean(config.postgresUrl))
+    config.postgresBackend === 'mirror' || (config.postgresBackend === 'auto' && Boolean(postgresUrl))
   if (!wantsPostgres) return {}
+  const sourceText = source ? `（数据连接「${source.name}」）` : ''
 
   const failed = (message: string): { failure: BackendStatus } => ({
     failure: {
@@ -207,12 +239,12 @@ async function connectPostgres(
       label: 'PostgreSQL 外部存储',
       mode: 'external',
       state: 'failed',
-      detail: `未接入，审计镜像与会话镜像都跳过：${message}`,
+      detail: `未接入，审计镜像与会话镜像都跳过：${message}${sourceText}`,
       capabilities: ['audit-mirror', 'audit-read', 'chat-session-mirror', 'chat-session-read'],
     },
   })
 
-  if (!config.postgresUrl) {
+  if (!postgresUrl) {
     const message = 'EAB_POSTGRES=mirror 但没有配置 EAB_POSTGRES_URL'
     if (config.backendsStrict) throw new Error(message)
     log(`${message}，跳过审计镜像与会话镜像`)
@@ -235,7 +267,7 @@ async function connectPostgres(
       }
     }
     pool = new pg.Pool({
-      connectionString: config.postgresUrl,
+      connectionString: postgresUrl,
       max: 2,
       connectionTimeoutMillis: 1500,
       query_timeout: 3000,
@@ -258,26 +290,139 @@ async function connectPostgres(
       flushIntervalMs: 250,
     })
     await chat.init()
-    log('PostgreSQL 审计镜像与会话镜像已接入')
+    log(`PostgreSQL 审计镜像与会话镜像已接入${sourceText}`)
     return { mirror, chat }
   } catch (error) {
     // 审计镜像已启动但会话镜像初始化失败时，先停审计定时器，避免它继续碰已关闭的连接池。
     await mirror?.close().catch(() => undefined)
     if (pool) await pool.end().catch(() => undefined)
-    const message = safeMessage(error, config.postgresUrl)
+    const message = safeMessage(error, postgresUrl)
     if (config.backendsStrict) throw new Error(`PostgreSQL 接入失败：${message}`)
     log(`PostgreSQL 不可用，跳过审计镜像与会话镜像：${message}`)
     return failed(message)
   }
 }
 
+interface RuntimeState {
+  cache: CacheBackend
+  pubsub?: PubSubBackend
+  postgres?: PostgresAuditMirror
+  chatMirror?: PostgresChatMirror
+  auditRead: AuditReadSource
+  chatRead: ChatReadSource
+  cacheFailure?: BackendStatus
+  postgresFailure?: BackendStatus
+  redisUrl: string
+  postgresUrl: string
+  redisSource?: AutoBackendSource
+  postgresSource?: AutoBackendSource
+  autoReason?: string
+}
+
+let runtimeState: RuntimeState | undefined
+let reloadChain: Promise<unknown> = Promise.resolve()
+
+function resolveBackendUrls(config: ServerConfig, auto: AutoBackendSelection): {
+  redisUrl: string
+  postgresUrl: string
+  redisSource?: AutoBackendSource
+  postgresSource?: AutoBackendSource
+} {
+  const redisSource =
+    !config.redisUrl && config.cacheBackend !== 'memory' && config.cacheBackend !== 'off'
+      ? auto.redis
+      : undefined
+  const postgresSource =
+    !config.postgresUrl && config.postgresBackend !== 'off' ? auto.postgres : undefined
+  return {
+    redisUrl: config.redisUrl || redisSource?.url || '',
+    postgresUrl: config.postgresUrl || postgresSource?.url || '',
+    redisSource,
+    postgresSource,
+  }
+}
+
+function statusesOf(state: RuntimeState): BackendStatus[] {
+  const statuses: BackendStatus[] = [
+    {
+      id: 'sqlite',
+      kind: 'storage',
+      label: 'SQLite 主库',
+      mode: 'builtin',
+      state: 'ready',
+      detail: '默认主存储；无需外部数据库即可完整运行',
+      capabilities: ['transactional', 'single-writer', 'wal'],
+    },
+    state.redisSource
+      ? withSource(state.cache.status(), sourceMeta(state.redisSource))
+      : state.cache.status(),
+  ]
+  if (state.cacheFailure) statuses.push(state.cacheFailure)
+  const pubsubStatus = state.pubsub?.status?.()
+  if (pubsubStatus) {
+    statuses.push(
+      state.redisSource ? withSource(pubsubStatus, sourceMeta(state.redisSource)) : pubsubStatus,
+    )
+  }
+  if (state.postgres) {
+    statuses.push(
+      state.postgresSource
+        ? withSource(state.postgres.status(), sourceMeta(state.postgresSource))
+        : state.postgres.status(),
+    )
+  }
+  if (state.chatMirror) {
+    statuses.push(
+      state.postgresSource
+        ? withSource(state.chatMirror.status(), sourceMeta(state.postgresSource))
+        : state.chatMirror.status(),
+    )
+  }
+  if (state.postgresFailure) statuses.push(state.postgresFailure)
+  if (!state.postgres && !state.postgresFailure) {
+    statuses.push({
+      id: 'postgres-audit',
+      kind: 'storage',
+      label: 'PostgreSQL 外部存储',
+      mode: 'external',
+      state: 'disabled',
+      detail: state.autoReason
+        ? `未启用；${state.autoReason}`
+        : '未启用；配置 EAB_POSTGRES_URL 与 EAB_POSTGRES=auto|mirror 后生效，或在“数据连接”中添加 PostgreSQL',
+      capabilities: [
+        'audit-mirror',
+        'audit-read',
+        'chat-session-mirror',
+        'chat-session-read',
+        'batch-write',
+        'analytics',
+      ],
+    })
+  }
+  return statuses
+}
+
+async function closeState(state: RuntimeState): Promise<void> {
+  await state.cache.close().catch(() => undefined)
+  await state.pubsub?.close?.().catch(() => undefined)
+  // 先关闭会话镜像，再由审计镜像关闭共享连接池。
+  await state.chatMirror?.close().catch(() => undefined)
+  await state.postgres?.close().catch(() => undefined)
+}
+
 export async function initBackends(config: ServerConfig, db: Db): Promise<BackendRuntime> {
-  const { cache, pubsub, failure: cacheFailure } = await connectRedis(config)
+  const auto = resolveAutoBackends(db, config.dbPath)
+  const urls = resolveBackendUrls(config, auto)
+  const { cache, pubsub, failure: cacheFailure } = await connectRedis(
+    config,
+    urls.redisUrl,
+    urls.redisSource,
+  )
   const {
     mirror: postgres,
     chat: chatMirror,
     failure: postgresFailure,
-  } = await connectPostgres(config, db)
+  } = await connectPostgres(config, db, urls.postgresUrl, urls.postgresSource)
   if (postgres) {
     setAuditMirror({
       append: (record) => postgres.append(record),
@@ -285,62 +430,48 @@ export async function initBackends(config: ServerConfig, db: Db): Promise<Backen
   } else {
     setAuditMirror(null)
   }
-  const auditRead = createAuditReader(db, config.auditRead, postgres)
-  const chatRead = createChatReader(db, config.chatRead, chatMirror)
-
-  const instance: BackendRuntime = {
+  const state: RuntimeState = {
     cache,
     pubsub,
     postgres,
     chatMirror,
-    auditRead,
-    chatRead,
-    statuses: () => {
-      const statuses: BackendStatus[] = [
-        {
-          id: 'sqlite',
-          kind: 'storage',
-          label: 'SQLite 主库',
-          mode: 'builtin',
-          state: 'ready',
-          detail: '默认主存储；无需外部数据库即可完整运行',
-          capabilities: ['transactional', 'single-writer', 'wal'],
-        },
-        cache.status(),
-      ]
-      if (cacheFailure) statuses.push(cacheFailure)
-      const pubsubStatus = pubsub?.status?.()
-      if (pubsubStatus) statuses.push(pubsubStatus)
-      if (postgres) statuses.push(postgres.status())
-      if (chatMirror) statuses.push(chatMirror.status())
-      if (postgresFailure) statuses.push(postgresFailure)
-      if (!postgres && !postgresFailure) {
-        statuses.push({
-          id: 'postgres-audit',
-          kind: 'storage',
-          label: 'PostgreSQL 外部存储',
-          mode: 'external',
-          state: 'disabled',
-          detail: '未启用；配置 EAB_POSTGRES_URL 与 EAB_POSTGRES=auto|mirror 后生效',
-          capabilities: [
-            'audit-mirror',
-            'audit-read',
-            'chat-session-mirror',
-            'chat-session-read',
-            'batch-write',
-            'analytics',
-          ],
-        })
-      }
-      return statuses
+    auditRead: createAuditReader(db, config.auditRead, postgres),
+    chatRead: createChatReader(db, config.chatRead, chatMirror),
+    cacheFailure,
+    postgresFailure,
+    redisUrl: urls.redisUrl,
+    postgresUrl: urls.postgresUrl,
+    redisSource: urls.redisSource,
+    postgresSource: urls.postgresSource,
+    autoReason: auto.reason,
+  }
+  runtimeState = state
+
+  const instance: BackendRuntime = {
+    get cache() {
+      return runtimeState?.cache ?? cache
     },
+    get pubsub() {
+      return runtimeState?.pubsub
+    },
+    get postgres() {
+      return runtimeState?.postgres
+    },
+    get chatMirror() {
+      return runtimeState?.chatMirror
+    },
+    get auditRead() {
+      return runtimeState?.auditRead ?? state.auditRead
+    },
+    get chatRead() {
+      return runtimeState?.chatRead ?? state.chatRead
+    },
+    statuses: () => statusesOf(runtimeState ?? state),
     close: async () => {
       setAuditMirror(null)
-      await cache.close()
-      await pubsub?.close?.().catch(() => undefined)
-      // 先关闭会话镜像，再由审计镜像关闭共享连接池。
-      await chatMirror?.close()
-      await postgres?.close()
+      const current = runtimeState
+      runtimeState = undefined
+      if (current) await closeState(current)
     },
   }
   runtime = instance
@@ -351,6 +482,97 @@ export async function initBackends(config: ServerConfig, db: Db): Promise<Backen
       .join('，')}`,
   )
   return instance
+}
+
+/**
+ * 数据连接保存/测试/删除后重连平台后端。
+ * 只采纳单公司部署的启用连接；环境变量显式配置时不会切到数据连接。
+ */
+export async function reloadBackends(config: ServerConfig, db: Db): Promise<boolean> {
+  const run = async (): Promise<boolean> => {
+    if (!runtimeState) return false
+    const auto = resolveAutoBackends(db, config.dbPath)
+    const urls = resolveBackendUrls(config, auto)
+    const current = runtimeState
+    const redisChanged =
+      current.redisUrl !== urls.redisUrl ||
+      current.redisSource?.id !== urls.redisSource?.id ||
+      current.redisSource?.name !== urls.redisSource?.name
+    const postgresChanged =
+      current.postgresUrl !== urls.postgresUrl ||
+      current.postgresSource?.id !== urls.postgresSource?.id ||
+      current.postgresSource?.name !== urls.postgresSource?.name
+    if (!redisChanged && !postgresChanged) {
+      current.autoReason = auto.reason
+      return false
+    }
+
+    try {
+      let { cache, pubsub, cacheFailure } = current
+      if (redisChanged) {
+        const connected = await connectRedis(config, urls.redisUrl, urls.redisSource)
+        cache = connected.cache
+        pubsub = connected.pubsub
+        cacheFailure = connected.failure
+      }
+
+      let { postgres, chatMirror, postgresFailure } = current
+      if (postgresChanged) {
+        const connected = await connectPostgres(config, db, urls.postgresUrl, urls.postgresSource)
+        postgres = connected.mirror
+        chatMirror = connected.chat
+        postgresFailure = connected.failure
+      }
+
+      const next: RuntimeState = {
+        cache,
+        pubsub,
+        postgres,
+        chatMirror,
+        auditRead: createAuditReader(db, config.auditRead, postgres),
+        chatRead: createChatReader(db, config.chatRead, chatMirror),
+        cacheFailure,
+        postgresFailure,
+        redisUrl: urls.redisUrl,
+        postgresUrl: urls.postgresUrl,
+        redisSource: urls.redisSource,
+        postgresSource: urls.postgresSource,
+        autoReason: auto.reason,
+      }
+      if (postgresChanged) {
+        setAuditMirror(
+          postgres
+            ? {
+                append: (record) => postgres.append(record),
+              }
+            : null,
+        )
+      }
+      runtimeState = next
+      log(
+        `平台后端已按数据连接切换：Redis=${urls.redisSource?.name ?? (urls.redisUrl ? '环境变量' : '内存')}，` +
+          `PostgreSQL=${urls.postgresSource?.name ?? (urls.postgresUrl ? '环境变量' : '未启用')}`,
+      )
+      // 只关闭本次真正被替换的连接，给在途读取留出收尾时间。
+      const timer = setTimeout(() => {
+        if (redisChanged) {
+          void current.cache.close().catch(() => undefined)
+          void current.pubsub?.close?.().catch(() => undefined)
+        }
+        if (postgresChanged) {
+          void current.chatMirror?.close().catch(() => undefined)
+          void current.postgres?.close().catch(() => undefined)
+        }
+      }, 5_000)
+      timer.unref?.()
+      return true
+    } catch (error) {
+      log(`平台后端自动接入失败，保留原连接：${safeMessage(error, urls.postgresUrl || urls.redisUrl)}`)
+      return false
+    }
+  }
+  reloadChain = reloadChain.then(run, run)
+  return reloadChain as Promise<boolean>
 }
 
 export async function closeBackends(): Promise<void> {

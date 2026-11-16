@@ -297,14 +297,51 @@ export interface DingTalkCardProgress {
 }
 
 function previewLine(text: string, maxLength = 120): string {
-  const normalized = text.replace(/\s+/g, ' ').trim()
-  if (!normalized) return ''
-  return normalized.length > maxLength ? `…${normalized.slice(-maxLength)}` : normalized
+  const lines = String(text ?? '')
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+  const first = lines[0] ?? ''
+  if (!first) return ''
+  // 首行已经是完整句子就不再并下一行；只有短碎片才并上下一句。
+  const completeSentence = /[。！？!?]$/.test(first)
+  const normalized = !completeSentence && first.length < 24 && lines[1] ? `${first} ${lines[1]}` : first
+  return normalized.length > maxLength ? `${normalized.slice(0, maxLength)}…` : normalized
+}
+
+function thinkingDuration(ms: number | undefined): string {
+  const seconds = Math.max(0.1, (Number(ms) || 0) / 1000)
+  return `${seconds.toFixed(1)}s`
+}
+
+function compactDuration(ms: number | undefined): string {
+  if (!ms || ms < 0) return ''
+  return ms < 1000 ? `${Math.max(1, Math.round(ms))}ms` : `${(ms / 1000).toFixed(1)}s`
 }
 
 function formatDuration(ms: number | undefined): string {
-  if (!ms || ms < 0) return ''
-  return ms < 1000 ? ` · ${Math.max(1, Math.round(ms))}ms` : ` · ${(ms / 1000).toFixed(1)}s`
+  const value = compactDuration(ms)
+  return value ? ` · ${value}` : ''
+}
+
+function richThinkingTitle(thinkingDone: boolean, thinkingMs?: number): string {
+  // 与网页端保持一致：思考入口带 ✦，工具入口带圆点；图标必须进入数据字符串，
+  // 否则真机上又变成没有前缀的纯文字。
+  if (!thinkingDone) return '✦ 思考中'
+  return thinkingMs && thinkingMs > 0 ? `✦ 已思考 ${thinkingDuration(thinkingMs)}` : '✦ 思考'
+}
+
+function richToolTitle(toolRunning: boolean): string {
+  return toolRunning ? '• 工具调用中' : '• 工具'
+}
+
+/**
+ * 收起态只允许一行：图标、标题和首句摘要进入同一个 Text 的数据。
+ * 右侧箭头由独立的 Text 组件承载，避免 maxLine=1 省略预览时把箭头一起吃掉。
+ */
+function richPanelHeader(title: string, preview: string): string {
+  return `${title}${preview ? ` · ${preview}` : ''}`
 }
 
 function compactValue(value: unknown, maxLength = 360): string {
@@ -332,28 +369,38 @@ function richToolsMarkdown(details: DingTalkToolRecord[], tools: string[]): stri
     .join('\n\n')
 }
 
-function richToolsPreview(details: DingTalkToolRecord[], tools: string[]): string {
+function richToolsPreview(
+  details: DingTalkToolRecord[],
+  tools: string[],
+  active: boolean,
+): string {
   const running = details.find((tool) => tool.status === 'running')
   if (running) return `${running.name} · 执行中`
-  // 工具详情还没到时，至少把最近一个工具名显示出来，避免工具面板只有标题。
-  const latest = details.at(-1)
-  if (latest) return `${latest.name}${latest.status === 'error' ? ' · 失败' : ''}${formatDuration(latest.durationMs)}`
-  const last = tools.at(-1)
-  return last ? `${last} · 执行中` : ''
+  if (!details.length) {
+    if (!tools.length) return ''
+    return active ? `${tools.at(-1)} · 执行中` : `${tools.length} 个`
+  }
+  const failed = details.filter((tool) => tool.status === 'error').length
+  if (details.length === 1) {
+    const only = details[0]
+    return `${only.name}${only.status === 'error' ? ' · 失败' : ''}${formatDuration(only.durationMs)}`
+  }
+  const totalMs = details.reduce((sum, tool) => sum + (Number(tool.durationMs) || 0), 0)
+  return `${details.length} 个${failed > 0 ? ` · ${failed} 个失败` : ''}${totalMs > 0 ? ` · ${compactDuration(totalMs)}` : ''}`
 }
 
 function richHasTools(state: DingTalkRichCardState): boolean {
   return (state.tools ?? []).length > 0 || (state.toolDetails ?? []).length > 0
 }
 
-/** 只有真的有工具在跑时才显示“工具调用中…”并保留流光；工具结束后切回“记录”。 */
+/** 只有真的有工具在跑时才显示“工具调用中”并保留流光；工具结束后切回“工具”。 */
 function richToolRunning(state: DingTalkRichCardState): boolean {
   return (state.toolDetails ?? []).some((tool) => tool.status === 'running')
 }
 
 /**
- * “思考结束”只由正文开始或收口决定，不能因为出现工具就提前切成“已深度思考”。
- * 工具执行期间仍要显示“正在思考中”标题和下方一行推理摘要。
+ * “思考结束”只由正文开始或收口决定，不能因为出现工具就提前切成“已思考”。
+ * 工具执行期间仍要显示“思考中”标题和下方一行推理摘要。
  */
 function richThinkingDone(state: DingTalkRichCardState): boolean {
   return Boolean(state.thinkingDone)
@@ -708,6 +755,9 @@ const A2UI_STATUS = {
   failed: 'FAILED',
 } as const
 
+// 钉钉一次 A2UI update 最多接受 100 条 a2uiMessages，超过统一报 param.invalid。
+const A2UI_MAX_MESSAGES = 95
+
 /**
  * 澄清按钮的卡片归属。按钮事件里的 context 可能因客户端实现差异丢失，
  * 回调时用 outTrackId 反查会话和选项作为兜底；只保留最近少量卡片。
@@ -916,7 +966,11 @@ export interface DingTalkRichCardState {
   answer: string
   reasoning: string
   tools: string[]
+  /** 卡片所属 EAB 会话；仅用于 A2UI 点击回调切换思考/工具面板，不参与渲染。 */
+  sessionId?: string
   thinkingDone?: boolean
+  /** 思考阶段的实际耗时；历史卡没有持久化时只显示“思考”。 */
+  thinkingMs?: number
   toolDetails?: DingTalkToolRecord[]
   /** 钉盘落盘后由 File 组件展示；最多三个，避免卡片过重。 */
   attachments?: DingTalkCardAttachment[]
@@ -929,7 +983,9 @@ function cloneRichState(state: DingTalkRichCardState): DingTalkRichCardState {
     answer: String(state.answer ?? ''),
     reasoning: String(state.reasoning ?? ''),
     tools: (state.tools ?? []).filter((tool) => typeof tool === 'string' && tool.trim()).map((tool) => tool.trim()),
+    sessionId: String(state.sessionId ?? ''),
     thinkingDone: Boolean(state.thinkingDone),
+    thinkingMs: Math.max(0, Math.trunc(Number(state.thinkingMs) || 0)),
     toolDetails: (state.toolDetails ?? []).map((tool) => ({
       ...tool,
       args: tool.args ? { ...tool.args } : undefined,
@@ -954,6 +1010,8 @@ function richStateChanged(current: DingTalkRichCardState, previous: DingTalkRich
     current.answer !== previous.answer ||
     current.reasoning !== previous.reasoning ||
     Boolean(current.thinkingDone) !== Boolean(previous.thinkingDone) ||
+    Math.max(0, Math.trunc(Number(current.thinkingMs) || 0)) !==
+      Math.max(0, Math.trunc(Number(previous.thinkingMs) || 0)) ||
     (current.tools ?? []).length !== (previous.tools ?? []).length ||
     JSON.stringify(current.toolDetails ?? []) !== JSON.stringify(previous.toolDetails ?? []) ||
     JSON.stringify(current.attachments ?? []) !== JSON.stringify(previous.attachments ?? []) ||
@@ -964,6 +1022,8 @@ function richStateChanged(current: DingTalkRichCardState, previous: DingTalkRich
 function richStructureChanged(current: DingTalkRichCardState, previous: DingTalkRichCardState): boolean {
   return (
     Boolean(current.thinkingDone) !== Boolean(previous.thinkingDone) ||
+    Math.max(0, Math.trunc(Number(current.thinkingMs) || 0)) !==
+      Math.max(0, Math.trunc(Number(previous.thinkingMs) || 0)) ||
     (current.tools ?? []).length !== (previous.tools ?? []).length ||
     JSON.stringify(current.toolDetails ?? []) !== JSON.stringify(previous.toolDetails ?? []) ||
     Boolean(current.clarify) !== Boolean(previous.clarify)
@@ -980,8 +1040,8 @@ interface DingTalkRichCardData {
       }
     }>
   }
-  thinking: { text: string; preview: string }
-  tools: { text: string; preview: string }
+  thinking: { text: string; preview: string; header: string }
+  tools: { text: string; preview: string; header: string }
   attachments: Array<{
     fileName: string
     url: string
@@ -1021,8 +1081,12 @@ interface DingTalkRichCardData {
   ui: {
     showThinking: boolean
     showThinkingPreview: boolean
+    showThinkingHeader: boolean
+    thinkingExpanded: boolean
     showTools: boolean
     showToolsPreview: boolean
+    showToolsHeader: boolean
+    toolsExpanded: boolean
     showAttachments: boolean
     showAttachment0: boolean
     showAttachment1: boolean
@@ -1275,7 +1339,15 @@ function richCardData(
   const details = state.toolDetails ?? []
   const hasTools = richHasTools(state)
   const thinkingDone = richThinkingDone(state)
+  const toolRunning = richToolRunning(state)
   const thinkingPreviewText = reasoning || (active && !thinkingDone ? '正在分析你的问题…' : '')
+  const thinkingPreview = previewLine(thinkingPreviewText, 96)
+  const toolsPreview = hasTools ? richToolsPreview(details, tools, active) : ''
+  const thinkingHeader = richPanelHeader(richThinkingTitle(thinkingDone, state.thinkingMs), thinkingPreview)
+  // 工具事件可能先到 tools 名称、后到 toolDetails；预览已经显示“执行中”时，
+  // 头部也要同步切成“工具调用中”，不能只剩一个“工具”。
+  const toolRunningForHeader = toolRunning || toolsPreview.endsWith('执行中')
+  const toolsHeader = richPanelHeader(richToolTitle(toolRunningForHeader), toolsPreview)
   const answerText = state.answer.trim()
   const answerBlocks = parseAnswerBlocks(answerText)  // 不在正文里拼光标或 loading 图标：流式刷新本身已经能表达“还在生成”。
   // 光标既会破坏 Markdown（表格/代码块尾部尤其明显），也容易在收口失败时残留。
@@ -1365,12 +1437,16 @@ function richCardData(
     answer: { blocks: visibleAnswerBlocks },
     thinking: {
       text: flattenMarkdownTables(thinkingPreviewText),
-      // 工具执行中仍保留思考摘要；正文开始或收口后再隐藏。
-      preview: active && !thinkingDone ? previewLine(thinkingPreviewText) : '',
+      // 和网页 CoT 一样保留首句摘要：收起时标题 + 首句，展开后仍能看完整思维链。
+      preview: thinkingPreview,
+      // 单行入口由同一个 Text 承载标题、首句和箭头，避免 A2UI 客户端拆成两行。
+      header: thinkingHeader,
     },
     tools: {
       text: flattenMarkdownTables(richToolsMarkdown(details, tools)),
-      preview: active && hasTools ? richToolsPreview(details, tools) : '',
+      // 工具结束后仍保留数量/总耗时，避免收起后只剩一个“工具”标题。
+      preview: toolsPreview,
+      header: toolsHeader,
     },
     attachments,
     clarify: {
@@ -1420,9 +1496,13 @@ function richCardData(
       // 思考面板不因工具出现而隐藏：工具阶段仍保留“正在思考中”，
       // 工具面板在它下面单独占一行标题 + 一行当前工具信息。
       showThinking: active || Boolean(reasoning) || hasTools,
-      showThinkingPreview: active && !thinkingDone && Boolean(previewLine(thinkingPreviewText)),
+      showThinkingPreview: Boolean(thinkingPreview),
+      showThinkingHeader: active || Boolean(reasoning) || hasTools,
+      thinkingExpanded: false,
       showTools: hasTools,
-      showToolsPreview: active && hasTools && Boolean(richToolsPreview(details, tools)),
+      showToolsPreview: Boolean(toolsPreview),
+      showToolsHeader: hasTools,
+      toolsExpanded: false,
       showAttachments: attachments.length > 0,
       showAttachment0: attachments.length > 0,
       showAttachment1: attachments.length > 1,
@@ -1461,9 +1541,9 @@ function richCardComponents(
   thinkingDone = false,
   clarify?: DingTalkClarifyState | null,
   toolRunning = false,
+  _thinkingMs?: number,
+  sessionId = '',
 ): Array<Record<string, unknown>> {
-  const thinkingTitle = thinkingDone ? '✦ 已深度思考' : '✦ 正在思考中…'
-  const toolTitle = toolRunning ? '🛠️ 工具调用中…' : '🛠️ 工具调用记录'
   const clarifyQuestions = clarify?.questions ?? []
   const clarifyTotal = clarifyQuestions.length
   const clarifyIndex = Math.min(
@@ -1511,63 +1591,131 @@ function richCardComponents(
     {
       id: 'thinkingBlock',
       component: 'Column',
-      children: ['thinkingPanel', 'thinkingPreview'],
-      gap: 4,
+      children: ['thinkingHeaderRow', 'thinkingBody'],
+      gap: 2,
       visible: { path: '/ui/showThinking' },
     },
     {
-      id: 'thinkingPanel',
-      component: 'CollapsiblePanel',
-      title: thinkingTitle,
+      // 入口是 Row + Text(weight=1) + 独立箭头：手机宽度不足时只有预览被省略，
+      // 箭头永远留在行尾，不会像单个 Text 那样被省略号一起挤掉。
+      id: 'thinkingHeaderRow',
+      component: 'Row',
+      align: 'center',
+      gap: 2,
+      children: ['thinkingHeader', 'thinkingChevron'],
+      visible: { path: '/ui/showThinkingHeader' },
+    },
+    {
+      // 字号用 body，贴近网页端 12–13px 的入口，不使用更小的 caption。
+      id: 'thinkingHeader',
+      component: 'Text',
+      text: { path: '/thinking/header' },
+      maxLine: 1,
+      weight: 1,
+      variant: 'body',
+      customLightColor: '#667085',
+      customDarkColor: '#98A2B3',
       ...(thinkingShimmer ? { textEffect: 'shimmer' } : {}),
-      variant: 'reasoning',
-      defaultExpanded: false,
-      visible: { path: '/ui/showThinking' },
-      children: ['thinkingText'],
-      fallbackMarkdown: '思考过程',
+      onLinkClick: {
+        event: {
+          name: 'eab_panel_toggle',
+          context: {
+            action: 'panel_toggle',
+            panel: 'thinking',
+            sessionId,
+          },
+        },
+      },
+      fallbackMarkdown: '思考',
     },
     {
-      id: 'thinkingText',
+      id: 'thinkingChevron',
+      component: 'Text',
+      text: '›',
+      maxLine: 1,
+      variant: 'body',
+      customLightColor: '#667085',
+      customDarkColor: '#98A2B3',
+      visible: { path: '/ui/showThinkingHeader' },
+      onLinkClick: {
+        event: {
+          name: 'eab_panel_toggle',
+          context: {
+            action: 'panel_toggle',
+            panel: 'thinking',
+            sessionId,
+          },
+        },
+      },
+    },
+    {
+      id: 'thinkingBody',
       component: 'Markdown',
       content: { path: '/thinking/text' },
-    },
-    {
-      // CollapsiblePanel 收起时 children 不渲染，所以预览行必须是面板外的独立组件。
-      // Markdown 没有 maxLine；用 Text + maxLine:1 在数据层截断成一行。
-      id: 'thinkingPreview',
-      component: 'Text',
-      text: { path: '/thinking/preview' },
-      maxLine: 1,
-      visible: { path: '/ui/showThinkingPreview' },
+      visible: { path: '/ui/thinkingExpanded' },
     },
     {
       id: 'toolBlock',
       component: 'Column',
-      children: ['toolPanel', 'toolsPreview'],
-      gap: 4,
+      children: ['toolHeaderRow', 'toolBody'],
+      gap: 2,
       visible: { path: '/ui/showTools' },
     },
     {
-      id: 'toolPanel',
-      component: 'CollapsiblePanel',
-      title: toolTitle,
+      id: 'toolHeaderRow',
+      component: 'Row',
+      align: 'center',
+      gap: 2,
+      children: ['toolHeader', 'toolChevron'],
+      visible: { path: '/ui/showToolsHeader' },
+    },
+    {
+      id: 'toolHeader',
+      component: 'Text',
+      text: { path: '/tools/header' },
+      maxLine: 1,
+      weight: 1,
+      variant: 'body',
+      customLightColor: '#667085',
+      customDarkColor: '#98A2B3',
       ...(toolRunning ? { textEffect: 'shimmer' } : {}),
-      defaultExpanded: false,
-      visible: { path: '/ui/showTools' },
-      children: ['toolText'],
-      fallbackMarkdown: '工具调用记录',
+      onLinkClick: {
+        event: {
+          name: 'eab_panel_toggle',
+          context: {
+            action: 'panel_toggle',
+            panel: 'tools',
+            sessionId,
+          },
+        },
+      },
+      fallbackMarkdown: '工具',
     },
     {
-      id: 'toolText',
+      id: 'toolChevron',
+      component: 'Text',
+      text: '›',
+      maxLine: 1,
+      variant: 'body',
+      customLightColor: '#667085',
+      customDarkColor: '#98A2B3',
+      visible: { path: '/ui/showToolsHeader' },
+      onLinkClick: {
+        event: {
+          name: 'eab_panel_toggle',
+          context: {
+            action: 'panel_toggle',
+            panel: 'tools',
+            sessionId,
+          },
+        },
+      },
+    },
+    {
+      id: 'toolBody',
       component: 'Markdown',
       content: { path: '/tools/text' },
-    },
-    {
-      id: 'toolsPreview',
-      component: 'Text',
-      text: { path: '/tools/preview' },
-      maxLine: 1,
-      visible: { path: '/ui/showToolsPreview' },
+      visible: { path: '/ui/toolsExpanded' },
     },
     {
       // 正文是唯一渲染主体；保持纯 Markdown，不加光标或 loading 图标。
@@ -1920,7 +2068,14 @@ export function buildDingTalkA2UICreateMessages(
     a2uiMessage({
       updateComponents: {
         surfaceId,
-        components: richCardComponents(true, richThinkingDone(state), undefined, richToolRunning(state)),
+        components: richCardComponents(
+          true,
+          richThinkingDone(state),
+          undefined,
+          richToolRunning(state),
+          state.thinkingMs,
+          state.sessionId,
+        ),
       },
     }),
   ]
@@ -1945,10 +2100,14 @@ export function buildDingTalkA2UIUpdateMessages(
   }
   pushData('/thinking/text', data.thinking.text, previousData?.thinking.text)
   pushData('/thinking/preview', data.thinking.preview, previousData?.thinking.preview)
+  pushData('/thinking/header', data.thinking.header, previousData?.thinking.header)
   pushData('/tools/text', data.tools.text, previousData?.tools.text)
   pushData('/tools/preview', data.tools.preview, previousData?.tools.preview)
-  if (!previousData || JSON.stringify(data.ui) !== JSON.stringify(previousData.ui)) {
-    messages.push(a2uiMessage({ updateDataModel: { surfaceId, path: '/ui', value: data.ui } }))
+  pushData('/tools/header', data.tools.header, previousData?.tools.header)
+  // UI 字段逐项更新，不整份下发：用户点开后服务端仍以为 thinkingExpanded=false，
+  // 整份 /ui 会在下一帧把刚展开的面板重新收起。
+  for (const key of Object.keys(data.ui) as Array<keyof DingTalkRichCardData['ui']>) {
+    pushData(`/ui/${String(key)}`, data.ui[key], previousData?.ui[key])
   }
   if (!previousData || JSON.stringify(data.attachments) !== JSON.stringify(previousData.attachments)) {
     pushData('/attachments', data.attachments, previousData?.attachments)
@@ -1959,28 +2118,36 @@ export function buildDingTalkA2UIUpdateMessages(
 
   // 只在“某个面板的结构/标题真的变了”时重发对应组件；纯流式阶段只更新数据。
   // 工具开始/结束不再顺带重发思考面板，避免把正在播放的标题流光打断。
+  // 思考/工具标题和首句都在数据路径里，纯流式只更新数据即可；
+  // 但标题流光（textEffect）是组件静态属性，进入/离开“进行中”时必须重发头部组件。
+  // 澄清区会换组件 ID（输入框按页重建），也需要重发对应组件。
   const finalFrame = !active
   const thinkingChanged =
-    finalFrame || !previous || Boolean(state.thinkingDone) !== Boolean(previous.thinkingDone)
+    !previous ||
+    Boolean(state.thinkingDone) !== Boolean(previous.thinkingDone) ||
+    Math.max(0, Math.trunc(Number(state.thinkingMs) || 0)) !==
+      Math.max(0, Math.trunc(Number(previous.thinkingMs) || 0))
   const toolsChanged =
-    finalFrame ||
     !previous ||
     (state.tools ?? []).length !== (previous.tools ?? []).length ||
     JSON.stringify(state.toolDetails ?? []) !== JSON.stringify(previous.toolDetails ?? [])
   const clarifyChanged =
-    finalFrame ||
-    !previous ||
-    JSON.stringify(state.clarify ?? null) !== JSON.stringify(previous.clarify ?? null)
+    Boolean(state.clarify || previous?.clarify) &&
+    (finalFrame ||
+      !previous ||
+      JSON.stringify(state.clarify ?? null) !== JSON.stringify(previous.clarify ?? null))
   if (thinkingChanged || toolsChanged || clarifyChanged) {
     const terminal = richCardComponents(
       active,
       Boolean(data.thinkingDone),
       state.clarify,
       richToolRunning(state),
+      state.thinkingMs,
+      state.sessionId,
     )
     const structuralIds = new Set<string>()
-    if (thinkingChanged) structuralIds.add('thinkingPanel')
-    if (toolsChanged) structuralIds.add('toolPanel')
+    if (thinkingChanged) structuralIds.add('thinkingHeader')
+    if (toolsChanged) structuralIds.add('toolHeader')
     if (clarifyChanged) {
       // 输入框 ID 带页序号，不能再靠固定 ID 列表筛选；澄清区变化时整体重发 clarify* 组件。
       for (const component of terminal) {
@@ -2000,6 +2167,27 @@ export function buildDingTalkA2UIUpdateMessages(
     }
   }
   return messages
+}
+
+/**
+ * 终态兜底：把数据压到 9 条以内。钉钉单次 update 超过 100 条会统一报
+ * param.invalid；正文/头部/附件/澄清外，UI 显隐整包下发一次即可。
+ */
+function compactFinalDataMessages(surfaceId: string, state: DingTalkRichCardState): string[] {
+  const data = richCardData(state, false)
+  return [
+    a2uiMessage({ updateDataModel: { surfaceId, path: '/answer', value: data.answer } }),
+    a2uiMessage({ updateDataModel: { surfaceId, path: '/thinking/text', value: data.thinking.text } }),
+    a2uiMessage({ updateDataModel: { surfaceId, path: '/thinking/header', value: data.thinking.header } }),
+    a2uiMessage({ updateDataModel: { surfaceId, path: '/tools/text', value: data.tools.text } }),
+    a2uiMessage({ updateDataModel: { surfaceId, path: '/tools/header', value: data.tools.header } }),
+    a2uiMessage({ updateDataModel: { surfaceId, path: '/ui', value: data.ui } }),
+    a2uiMessage({ updateDataModel: { surfaceId, path: '/attachments', value: data.attachments } }),
+    a2uiMessage({ updateDataModel: { surfaceId, path: '/clarify', value: data.clarify } }),
+    a2uiMessage({
+      updateDataModel: { surfaceId, path: '/ui/thinkingExpanded', value: false },
+    }),
+  ]
 }
 
 /**
@@ -2064,18 +2252,33 @@ export class DingTalkAICardStream {
       A2UI_DELTA_UPDATES && previous ? previous : undefined,
     )
     if (messages.length === 0) return false
-    const token = await this.token()
-    await this.cardRequest('/v1.0/card/ai/instances/update', {
-      method: 'PUT',
-      token,
-      body: {
-        outTrackId: this.cardInstanceId,
-        outUpdateId: randomUUID(),
-        flowStatus,
-        a2uiMessages: messages,
-      },
-    })
+    await this.putUpdateMessages(messages, flowStatus)
     return true
+  }
+
+  private async putUpdateMessages(messages: string[], flowStatus: string): Promise<void> {
+    const token = await this.token()
+    try {
+      await this.cardRequest('/v1.0/card/ai/instances/update', {
+        method: 'PUT',
+        token,
+        body: {
+          outTrackId: this.cardInstanceId,
+          outUpdateId: randomUUID(),
+          flowStatus,
+          a2uiMessages: messages,
+        },
+      })
+    } catch (error) {
+      // 钉钉 A2UI 更新一次最多接受 100 条 a2uiMessages；超过时接口只返回
+      // 笼统的 param.invalid，看起来像 flowStatus 非法，实际是消息条数超限。
+      if (error instanceof DingTalkHttpError && error.status === 400) {
+        this.logger.warn?.(
+          `[eab] 钉钉 A2UI 更新被拒：outTrackId=${this.cardInstanceId} phase=${this.phase} flowStatus=${flowStatus} 消息数=${messages.length} 含组件=${messages.some((message) => message.includes('"updateComponents"'))}`,
+        )
+      }
+      throw error
+    }
   }
 
   /**
@@ -2099,7 +2302,12 @@ export class DingTalkAICardStream {
     console.info('[eab] 钉钉 A2UI 外层摘要已更新：', summary)
   }
 
-  /** flowStatus 枚举名以接口实际校验为准；终态按候选名逐个尝试，避免把卡片停在处理中。 */
+  /**
+   * flowStatus 枚举名以接口实际校验为准。FINISH 本身是合法值（已用真实卡验证 200），
+   * 但在终态帧里同时带 updateComponents 时，钉钉会返回 400 且错误文案仍是
+   * “flowStatus is not valid”。因此整包失败后依次降级：只发数据消息 -> 只推进状态，
+   * 保证已经在流式阶段渲染的正文能被正常收口，不再回退成第二条纯文本。
+   */
   private async putFinalStatus(
     state: DingTalkRichCardState,
     candidates: string[],
@@ -2107,15 +2315,64 @@ export class DingTalkAICardStream {
     let lastError: unknown = null
     for (const status of candidates) {
       try {
-        await this.putUpdate(state, status, false)
+        // 终态必须沿用上一帧做增量：整份 data 有 100+ 条 updateDataModel，
+        // 钉钉会直接返回 param.invalid（错误文案却常被误读成 flowStatus 非法）。
+        await this.putUpdate(state, status, false, this.lastSentState)
         return
       } catch (error) {
         lastError = error
-        // 400 可能是 flowStatus 枚举名不被接受，也可能是消息参数错误；继续试下一个终态名，
-        // 全部失败后仍会把真实错误抛给调用方，由上层回退为文字消息。
         if (!(error instanceof DingTalkHttpError) || error.status !== 400) throw error
+        // FINISH 已经是实测合法的终态名；它失败说明是消息体而不是枚举名，直接降级。
+        if (status === A2UI_STATUS.finished) break
       }
     }
+
+    // 只有完成态才做上面两条降级；失败态仍按原候选名尝试，失败就交给调用方处理。
+    if (!candidates.includes(A2UI_STATUS.finished)) {
+      throw lastError instanceof Error ? lastError : new Error('A2UI 终态更新失败')
+    }
+
+    // 降级 1：去掉 updateComponents，只把数据模型推到终态。
+    // 仍然优先用增量；增量仍超限时退回到 9 条左右的紧凑终态数据。
+    try {
+      let messages = buildDingTalkA2UIUpdateMessages(
+        this.surfaceId,
+        state,
+        false,
+        A2UI_DELTA_UPDATES ? this.lastSentState ?? undefined : undefined,
+      ).filter((message) => !message.includes('"updateComponents"'))
+      if (messages.length > A2UI_MAX_MESSAGES) {
+        messages = compactFinalDataMessages(this.surfaceId, state)
+      }
+      if (messages.length > 0) {
+        await this.putUpdateMessages(messages, A2UI_STATUS.finished)
+        this.lastSentState = cloneRichState(state)
+        return
+      }
+    } catch (error) {
+      lastError = error
+      this.logger.warn?.('[eab] 钉钉 A2UI 终态数据更新失败，继续仅推进状态：', (error as Error).message)
+    }
+
+    // 降级 2：正文已经由流式帧写入时，只切状态即可；这条请求已实测 200。
+    try {
+      await this.putUpdateMessages(
+        [
+          a2uiMessage({
+            updateDataModel: {
+              surfaceId: this.surfaceId,
+              path: '/ui/thinkingExpanded',
+              value: false,
+            },
+          }),
+        ],
+        A2UI_STATUS.finished,
+      )
+      return
+    } catch (error) {
+      lastError = error
+    }
+
     throw lastError instanceof Error ? lastError : new Error('A2UI 终态更新失败')
   }
 
@@ -2183,6 +2440,7 @@ export class DingTalkAICardStream {
       this.lastSentChars = richTextLength(state)
       a2uiDisabledUntil = 0
       this.updateFailures = 0
+      console.info('[eab] 钉钉 A2UI 新卡已创建：', outTrackId, 'initial=PROCESSING')
       return true
     } catch (error) {
       this.phase = 'failed'
@@ -2196,6 +2454,57 @@ export class DingTalkAICardStream {
       this.logger.warn?.('[eab] 钉钉 A2UI 卡片创建失败，回退旧卡片：', (error as Error).message)
       return false
     }
+  }
+
+  /**
+   * 只切换思考/工具正文的显隐，不重建整张卡。
+   * 回调只需要一条 updateDataModel：服务端不持久化展开态，避免用户点开后
+   * 下一次流式更新又把面板收回。
+   */
+  async togglePanel(
+    outTrackId: string,
+    panel: 'thinking' | 'tools',
+    expanded: boolean,
+  ): Promise<boolean> {
+    const id = String(outTrackId ?? '').trim()
+    if (!id.startsWith('eab_a2ui_')) return false
+    if (panel !== 'thinking' && panel !== 'tools') return false
+    this.cardInstanceId = id
+    this.surfaceId = `${A2UI_SURFACE_PREFIX}${id.slice('eab_a2ui_'.length)}`
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const token = await this.token()
+        await this.cardRequest('/v1.0/card/ai/instances/update', {
+          method: 'PUT',
+          token,
+          body: {
+            outTrackId: id,
+            outUpdateId: randomUUID(),
+            flowStatus: A2UI_STATUS.finished,
+            a2uiMessages: [
+              a2uiMessage({
+                updateDataModel: {
+                  surfaceId: this.surfaceId,
+                  path: `/ui/${panel}Expanded`,
+                  value: Boolean(expanded),
+                },
+              }),
+            ],
+          },
+        })
+        return true
+      } catch (error) {
+        // 真机上偶发 system.dependencyUnavailable（500），通常是卡片收口与点击
+        // 同时打到更新接口；退避一次再试，失败才交给回调层提示。
+        if (attempt === 0 && error instanceof DingTalkHttpError && error.status >= 500) {
+          await sleep(300)
+          continue
+        }
+        this.logger.warn?.('[eab] 钉钉 A2UI 面板切换失败：', (error as Error).message)
+        return false
+      }
+    }
+    return false
   }
 
   /**
@@ -2222,6 +2531,7 @@ export class DingTalkAICardStream {
       this.lastSentChars = richTextLength(state)
       this.lastUpdateAt = Date.now()
       this.updateFailures = 0
+      console.info('[eab] 钉钉 A2UI 卡片已续用：', id)
       return true
     } catch (error) {
       this.phase = 'failed'
@@ -2245,12 +2555,7 @@ export class DingTalkAICardStream {
     this.cardInstanceId = id
     this.surfaceId = `${A2UI_SURFACE_PREFIX}${id.slice('eab_a2ui_'.length)}`
     try {
-      await this.putFinalStatus(cloneRichState(state), [
-        A2UI_STATUS.finished,
-        'FINISHED',
-        'COMPLETED',
-        'DONE',
-      ])
+      await this.putFinalStatus(cloneRichState(state), [A2UI_STATUS.finished])
       this.phase = 'finished'
       return true
     } catch (error) {
@@ -2409,12 +2714,7 @@ export class DingTalkAICardStream {
           this.phase = 'finished'
           return true
         }
-        await this.putFinalStatus(cloneRichState(finalState), [
-          A2UI_STATUS.finished,
-          'FINISHED',
-          'COMPLETED',
-          'DONE',
-        ])
+        await this.putFinalStatus(cloneRichState(finalState), [A2UI_STATUS.finished])
         rememberClarifyCard(this.cardInstanceId, finalState.clarify)
         // 外层摘要失败不能让已经收口的卡片回退成文字消息。
         if (summary) {

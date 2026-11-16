@@ -80,4 +80,64 @@ describe('父 Agent 自动分配子 Agent 模型', () => {
     expect(choice.modelId).not.toBe('model_fast')
     expect(choice.reason).toContain('分散')
   })
+
+  it('能力模型已被占用时，后续子任务按负载换模型而不是全部回退父模型', () => {
+    const load = new Map<string, number>([['model_code', 1]])
+    const choice = chooseSubAgentModel({
+      task: { title: '查制度', prompt: '检索知识库里的安全作业规程文档' },
+      available: models,
+      parentModelId: 'model_code',
+      load,
+    })
+    expect(choice.modelId).not.toBe('model_code')
+    expect(choice.reason).toContain('并发负载')
+  })
+
+  it('视觉任务即使父模型已被占用，也不降级到没有视觉能力的模型', () => {
+    const load = new Map<string, number>([['model_vision', 1]])
+    const choice = chooseSubAgentModel({
+      task: { title: '看图', prompt: '识别这张截图里的报错' },
+      available: models,
+      parentModelId: 'model_vision',
+      load,
+    })
+    expect(choice.modelId).toBe('model_vision')
+    expect(choice.reason).toContain('不允许降级')
+  })
+
+  it('重试时排除刚失败的模型，优先换到能处理工具的模型', () => {
+    const choice = chooseSubAgentModel({
+      task: { title: '重试', prompt: '检索知识库文档并汇总' },
+      available: models,
+      parentModelId: 'model_fast',
+      avoidModelId: 'model_fast',
+    })
+    expect(choice.modelId).toBe('model_code')
+    expect(choice.reason).toContain('tool')
+  })
+
+  it('按真实可见模型目录连续分配三个子任务时，三个模型不重复', () => {
+    const realModels = [
+      { id: 'model_qwen8', name: 'Qwen3-8B', capabilities: ['chat'], priority: 99, endpointKind: 'chat' },
+      { id: 'model_qwen35', name: 'Qwen3.5-4B', capabilities: ['chat'], priority: 100, endpointKind: 'chat' },
+      { id: 'model_qwen27', name: 'Qwen3.8-27B-FP8', capabilities: ['chat', 'vision', 'multimodal', 'tool'], priority: 99, endpointKind: 'chat' },
+    ] as any
+    const load = new Map<string, number>()
+    const tasks = [
+      { title: 'A-通讯录', prompt: '查询公司所有部门及其负责人，整理成表格' },
+      { title: 'B-知识库', prompt: '检索知识库里的安全作业规程，整理摘要' },
+      { title: 'C-云空间', prompt: '列出云空间未删除的文件清单' },
+    ]
+    const chosen = tasks.map((task) => {
+      const choice = chooseSubAgentModel({
+        task,
+        available: realModels,
+        parentModelId: 'model_qwen27',
+        load,
+      })
+      load.set(choice.modelId, (load.get(choice.modelId) ?? 0) + 1)
+      return choice.modelId
+    })
+    expect(new Set(chosen).size).toBe(3)
+  })
 })

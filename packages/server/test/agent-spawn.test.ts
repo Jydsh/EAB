@@ -5,6 +5,8 @@ import { SC } from '@eab/domain'
 const state = vi.hoisted(() => ({
   rootCalls: 0,
   childCalls: 0,
+  activeChildren: 0,
+  maxActiveChildren: 0,
 }))
 
 vi.mock('../src/llm.js', async (importOriginal) => {
@@ -25,10 +27,18 @@ vi.mock('../src/llm.js', async (importOriginal) => {
       )
       if (isChild) {
         state.childCalls += 1
-        const content = messages[messages.length - 1]?.content ?? ''
-        if (content.includes('任务B')) throw new Error('子任务 B 模型失败')
-        options.onEvent?.({ type: 'content', text: `完成：${content}` })
-        return { text: `完成：${content}`, reasoning: '', toolCalls: [], promptTokens: 1, completionTokens: 1 }
+        state.activeChildren += 1
+        state.maxActiveChildren = Math.max(state.maxActiveChildren, state.activeChildren)
+        try {
+          // 留出重叠窗口，验证两个子 Agent 是同时在跑，而不是排队串行。
+          await new Promise((resolve) => setTimeout(resolve, 25))
+          const content = messages[messages.length - 1]?.content ?? ''
+          if (content.includes('任务B')) throw new Error('子任务 B 模型失败')
+          options.onEvent?.({ type: 'content', text: `完成：${content}` })
+          return { text: `完成：${content}`, reasoning: '', toolCalls: [], promptTokens: 1, completionTokens: 1 }
+        } finally {
+          state.activeChildren -= 1
+        }
       }
       const content = messages[messages.length - 1]?.content ?? ''
       if (content.includes('并行分析')) {
@@ -102,6 +112,8 @@ describe('多 Agent 并行调度', () => {
   it('父子 run 独立记录；一个子 Agent 失败不影响另一个和父任务', async () => {
     state.rootCalls = 0
     state.childCalls = 0
+    state.activeChildren = 0
+    state.maxActiveChildren = 0
     const { deps, actor } = testEnv()
     const events: any[] = []
     const result = await runAgentTurn({
@@ -116,6 +128,7 @@ describe('多 Agent 并行调度', () => {
     expect(result?.text).toBe('全部完成')
     expect(result?.toolCalls[0]?.toolId).toBe('agent.spawn')
     expect(state.childCalls).toBe(3) // 任务 A 一次，任务 B 失败后按 retries=1 再试一次
+    expect(state.maxActiveChildren).toBeGreaterThanOrEqual(2) // 初始批次确实同时启动
 
     const agentEvents = events.filter((event) => event.type === 'agent')
     expect(agentEvents.filter((event) => event.action === 'assign')).toHaveLength(2)

@@ -669,6 +669,10 @@ export async function handleFeishuEvent(
       hits,
       hasAttachments: false,
       pluginPrompts: pluginPromptTexts(deps.db, actor),
+      availableModels: available
+        .filter((item) => (item.endpointKind ?? 'chat') === 'chat')
+        .map((item) => ({ id: item.id, name: item.name })),
+      currentModelId: model.id,
     })
     const messages: LlmMessage[] = [
       { role: 'system', content: system },

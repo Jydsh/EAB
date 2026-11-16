@@ -82,6 +82,14 @@
     }
   }
 
+  function safeRemove(key) {
+    try {
+      window.sessionStorage.removeItem(key)
+    } catch {
+      /* 隐私模式禁用 sessionStorage 时，只影响去重，不影响启动 */
+    }
+  }
+
   function bootIntent() {
     if (!config.enabled || config.mode === 'off') return 'off'
     const jump = safeGet('eab.boot.next') === surface
@@ -521,13 +529,22 @@
     config,
   }
 
-  const intent = bootIntent()
-  if (intent === 'off') {
+  try {
+    const intent = bootIntent()
+    if (intent === 'off') {
+      overlay.hidden = true
+      overlay.setAttribute('aria-hidden', 'true')
+      document.documentElement.classList.remove('eab-booting')
+      clearBootBackground()
+    } else {
+      start({ refresh: intent === 'refresh' })
+    }
+  } catch (error) {
+    // 启动层自身出错时，宁可少一段动画，也不能让覆盖层把后台页面按住。
+    console.error('[eab-boot] 启动层初始化失败，已直接进入页面', error)
     overlay.hidden = true
     overlay.setAttribute('aria-hidden', 'true')
     document.documentElement.classList.remove('eab-booting')
     clearBootBackground()
-  } else {
-    start({ refresh: intent === 'refresh' })
   }
 })()

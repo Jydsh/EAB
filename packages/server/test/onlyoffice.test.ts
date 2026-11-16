@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   buildOfficeEditorConfig,
   buildOfficePluginConfig,
+  convertOfficeDocumentToPdf,
   forceSaveOfficeDocument,
   officeDocumentKey,
   officeDocumentType,
@@ -204,5 +205,79 @@ describe('OnlyOffice 接入辅助', () => {
       'http://documentserver:8080/coauthoring/CommandService.ashx?shardkey=doc-key-2',
     ])
     expect(result).toMatchObject({ error: 4, noChanges: true, message: '没有需要保存的修改' })
+  })
+
+  it('PDF 转换接受 OnlyOffice 返回的 XML，并解码 FileUrl 实体后下载', async () => {
+    const calls: string[] = []
+    const xml =
+      '<?xml version="1.0" encoding="utf-8"?><FileResult>' +
+      '<FileUrl>http://documentserver:8080/cache/output.pdf?md5=a&amp;expires=1</FileUrl>' +
+      '<FileType>pdf</FileType><Percent>100</Percent><EndConvert>True</EndConvert></FileResult>'
+    const buffer = await convertOfficeDocumentToPdf({
+      url: 'http://documentserver:8080/',
+      secret,
+      fileUrl: 'http://app:8787/content',
+      fileType: 'docx',
+      title: '方案.docx',
+      key: 'doc-key-pdf',
+      fetchImpl: (async (url: string) => {
+        calls.push(url)
+        if (url.endsWith('/ConvertService.ashx')) {
+          return new Response(xml, { status: 200, headers: { 'content-type': 'text/xml' } })
+        }
+        return new Response(Buffer.from('%PDF-1.4 test'), { status: 200 })
+      }) as typeof fetch,
+    })
+    expect(buffer.subarray(0, 5).toString()).toBe('%PDF-')
+    expect(calls).toEqual([
+      'http://documentserver:8080/ConvertService.ashx',
+      'http://documentserver:8080/cache/output.pdf?md5=a&expires=1',
+    ])
+  })
+
+  it('PDF 转换仍接受 JSON 响应', async () => {
+    const buffer = await convertOfficeDocumentToPdf({
+      url: 'http://documentserver:8080',
+      secret,
+      fileUrl: 'http://app:8787/content',
+      fileType: 'xlsx',
+      title: '报表.xlsx',
+      key: 'doc-key-json',
+      fetchImpl: (async (url: string) =>
+        url.endsWith('/ConvertService.ashx')
+          ? new Response(JSON.stringify({ error: 0, endConvert: true, fileUrl: 'http://documentserver/pdf' }), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          })
+          : new Response(Buffer.from('%PDF-1.7 json'), { status: 200 })) as typeof fetch,
+    })
+    expect(buffer.subarray(0, 5).toString()).toBe('%PDF-')
+  })
+
+  it('PDF 转换拒绝 XML 错误码和无法解析的响应', async () => {
+    await expect(
+      convertOfficeDocumentToPdf({
+        url: 'http://documentserver:8080',
+        secret,
+        fileUrl: 'http://app:8787/content',
+        fileType: 'docx',
+        title: '方案.docx',
+        key: 'doc-key-error',
+        fetchImpl: (async () =>
+          new Response('<FileResult><Error>3</Error></FileResult>', { status: 200 })) as typeof fetch,
+      }),
+    ).rejects.toThrow('OnlyOffice 转换失败（错误码 3）')
+
+    await expect(
+      convertOfficeDocumentToPdf({
+        url: 'http://documentserver:8080',
+        secret,
+        fileUrl: 'http://app:8787/content',
+        fileType: 'docx',
+        title: '方案.docx',
+        key: 'doc-key-bad',
+        fetchImpl: (async () => new Response('not xml or json', { status: 200 })) as typeof fetch,
+      }),
+    ).rejects.toThrow('无法解析的响应')
   })
 })

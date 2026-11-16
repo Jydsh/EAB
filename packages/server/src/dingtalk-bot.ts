@@ -1024,6 +1024,7 @@ export async function handleDingTalkMessage(
       tools: [],
       thinkingDone: false,
       toolDetails: [],
+      sessionId,
     }
     // 建卡时回答还没生成，外层摘要先放中性品牌文案；
     // 收口时再把外层摘要替换成回复正文（A2UI 卡片走场域信息更新，旧模板走 sys_lastMessageI18n）。
@@ -1129,6 +1130,10 @@ export async function handleDingTalkMessage(
       hasAttachments: imageUrls.length > 0,
       pluginPrompts,
       skillPrompts,
+      availableModels: available
+        .filter((item) => (item.endpointKind ?? 'chat') === 'chat')
+        .map((item) => ({ id: item.id, name: item.name })),
+      currentModelId: model.id,
     })
     const imageSystemNote =
       imageUrls.length > 0
@@ -1242,6 +1247,9 @@ export async function handleDingTalkMessage(
     const toolsUsed: string[] = []
     const toolDetails: DingTalkToolRecord[] = []
     let thinkingDone = false
+    const turnStartedAt = Date.now()
+    let thinkingStartedAt = 0
+    let thinkingMs = 0
     const pushCard = () => {
       if (card) {
         card.update({
@@ -1249,8 +1257,10 @@ export async function handleDingTalkMessage(
           reasoning: cardState.reasoning,
           tools: toolsUsed,
           thinkingDone,
+          thinkingMs,
           toolDetails,
           attachments: cardAttachments,
+          sessionId,
         })
       } else if (legacyCard) {
         legacyCard.update(
@@ -1301,6 +1311,8 @@ export async function handleDingTalkMessage(
           toolDetails.splice(0, toolDetails.length)
           cardAttachments.splice(0, cardAttachments.length)
           thinkingDone = false
+          thinkingStartedAt = 0
+          thinkingMs = 0
           pushCard()
           noteTurnProgress()
         },
@@ -1309,12 +1321,16 @@ export async function handleDingTalkMessage(
         space: toolSpace,
         emit: (event) => {
           if (event.type === 'reasoning') {
+            if (!thinkingStartedAt) thinkingStartedAt = Date.now()
             cardState.reasoning += event.text
             pushCard()
             publishDelta('reasoning', event.text)
           } else if (event.type === 'content') {
-            // 正文开始即代表思考阶段结束：预览行隐藏、标题切成“已深度思考”。
-            thinkingDone = true
+            // 正文开始即代表思考阶段结束：标题切成“已思考 X”，预览行保留首句。
+            if (!thinkingDone) {
+              thinkingDone = true
+              thinkingMs = Date.now() - (thinkingStartedAt || turnStartedAt)
+            }
             cardState.answer += event.text
             pushCard()
             publishDelta('content', event.text)
@@ -1410,6 +1426,11 @@ export async function handleDingTalkMessage(
     // 卡片成功收口时返回 null，交给调用方跳过 sessionWebhook 纯文本；失败才回退文字。
     let replyText: string | null = answerText
     const finalReasoning = (agentResult?.reasoning || cardState.reasoning || '').trim()
+    const finalThinkingMs = thinkingMs > 0
+      ? thinkingMs
+      : finalReasoning
+        ? Date.now() - (thinkingStartedAt || turnStartedAt)
+        : 0
     const clarifyFlowId = clarifyFlow?.clarifyFlowId ?? (clarify ? `cf_${assistantMessageId}` : '')
     const clarifyStep = clarifyFlow?.clarifyStep ?? 1
     if (card) {
@@ -1419,8 +1440,10 @@ export async function handleDingTalkMessage(
           reasoning: finalReasoning,
           tools: toolsUsed,
           thinkingDone: true,
+          thinkingMs: finalThinkingMs,
           toolDetails,
           attachments: cardAttachments,
+          sessionId,
           clarify: clarify
             ? {
                 sessionId,
@@ -2053,6 +2076,12 @@ function composeClarifyBatchText(
   return `我完成了以下 ${questions.length} 道题：\n${lines.join('\n')}`
 }
 
+/**
+ * A2UI 思考/工具面板的展开态只在进程内保存：卡片本身不持久化展开状态，
+ * 这样用户点开后，后续流式更新不会把面板重新收起。键为 outTrackId + panel。
+ */
+const a2uiPanelOpenState = new Map<string, boolean>()
+
 /** 处理钉钉卡片按钮回调。回调本身必须在 2 秒内 ACK，所以这里只做身份/会话校验，
  * 真正的模型回合由调用方的异步任务继续跑；同一张卡片只接受第一次选择。
  */
@@ -2076,7 +2105,20 @@ export async function handleDingTalkCardCallback(
   const actionIds = content.actionIds
   const params = content.params
   const registered = dingTalkClarifyCardState(outTrackId)
-  let sessionId = cardParamString(params, 'sessionId') || registered?.sessionId || ''
+  // A2UI 思考/工具入口的卡片不一定在进程内有澄清登记；用 outTrackId 反查本轮会话，
+  // 这样点击回调不依赖客户端是否完整回传 sessionId。
+  const cardTurn = deps.db
+    .prepare(
+      `SELECT session_id, external_id, card_kind, status
+         FROM channel_turns
+        WHERE provider = 'dingtalk' AND card_instance_id = ? AND external_id = ?
+        ORDER BY started_at DESC
+        LIMIT 1`,
+    )
+    .get(outTrackId, externalId) as
+    | { session_id: string; external_id: string; card_kind: string | null; status: string }
+    | undefined
+  let sessionId = cardParamString(params, 'sessionId') || registered?.sessionId || cardTurn?.session_id || ''
   const cardAction = cardParamString(params, 'action')
   const batchQuestions = registered?.questions ?? []
   const batchIndex = Math.min(
@@ -2109,6 +2151,55 @@ export async function handleDingTalkCardCallback(
   }
   if (!sessionId) {
     console.warn('[eab] 钉钉卡片回调缺少 sessionId，已忽略')
+    return
+  }
+
+  // 思考/工具单行入口：只切换当前卡的正文显隐，不进入模型回合。
+  // 旧卡片没有登记 channel_turn 时拒绝，避免任意卡片回调切换其他会话的面板。
+  if (cardAction === 'panel_toggle') {
+    const panel = cardParamString(params, 'panel')
+    if (panel !== 'thinking' && panel !== 'tools') {
+      console.warn('[eab] 钉钉面板切换：未知 panel，已忽略')
+      return
+    }
+    if (!cardTurn || cardTurn.card_kind !== 'a2ui' || cardTurn.session_id !== sessionId) {
+      console.warn('[eab] 钉钉面板切换：卡片与会话不匹配，已拒绝')
+      return
+    }
+    const cfg = dingTalkConfig(deps.db, deps.companyId)
+    const channelSecret = cfg?.secret_ref ? resolveSecret(deps.config.dbPath, cfg.secret_ref) : null
+    if (!cfg?.app_id || !channelSecret) {
+      console.warn('[eab] 钉钉面板切换：渠道凭证不完整')
+      return
+    }
+    const key = `${outTrackId}:${panel}`
+    const current = a2uiPanelOpenState.get(key) === true
+    const expanded = !current
+    const stream = new DingTalkAICardStream(
+      cfg.app_id,
+      channelSecret,
+      externalId,
+      cfg.robot_code || cfg.app_id,
+    )
+    // 回调必须在 2 秒内 ACK；卡片更新接口不能在回调栈里同步等待，
+    // 先返回，再异步更新原卡，避免钉钉判定回调超时。
+    void stream
+      .togglePanel(outTrackId, panel, expanded)
+      .then((updated) => {
+        if (!updated) {
+          console.warn('[eab] 钉钉面板切换：更新原卡失败')
+          return
+        }
+        a2uiPanelOpenState.set(key, expanded)
+        // 单进程内只保留少量最近卡片，防止长期运行后 Map 无限增长。
+        if (a2uiPanelOpenState.size > 200) {
+          const oldest = a2uiPanelOpenState.keys().next().value
+          if (oldest) a2uiPanelOpenState.delete(oldest)
+        }
+      })
+      .catch((error) => {
+        console.warn('[eab] 钉钉面板切换：更新原卡异常', error)
+      })
     return
   }
 
@@ -2546,8 +2637,12 @@ async function doRefreshDingTalkStream(deps: ServerDeps): Promise<void> {
     return
   }
   if (streamState.client && streamState.appId === cfg.app_id) {
-    if (streamState.client.connected || streamState.client.registered) return
-    // 客户端还在建连/等待自动重连时不要拆掉它；否则每轮巡检都会打断退避。
+    // SDK 的 registered 在部分网关环境不会置位，不能拿它当“必须重建”的条件；
+    // 心跳断开时 SDK 会自行重连并把 connected 置 false，这里只判断是否掉线。
+    if (streamState.client.connected || streamState.client.registered) {
+      streamState.error = null
+      return
+    }
     if (streamState.client.reconnecting) return
   }
 
@@ -2597,7 +2692,7 @@ async function doRefreshDingTalkStream(deps: ServerDeps): Promise<void> {
     if (client.connected) {
       streamState.lastConnectedAt = Date.now()
       streamState.error = null
-      console.log(`[eab] 钉钉 Stream 已连接：EAB · ${cfg.tenant_name ?? deps.companyId}`)
+      console.log(`[eab] 钉钉 Stream 已连接：EAB · ${cfg.tenant_name ?? deps.companyId}（registered=${client.registered === true}）`)
     } else {
       // 库的 connect() 内部会吞掉网关错误并返回，不能只看它有没有抛异常。
       streamState.error = '钉钉 Stream 连接未建立（网关鉴权或网络失败），正在自动重连'

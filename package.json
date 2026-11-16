@@ -1,6 +1,6 @@
 {
   "name": "eab",
-  "version": "2026.11.15",
+  "version": "2026.11.16",
   "private": true,
   "type": "module",
   "description": "EAB 企业智能体基座（Enterprise Agent Base）",

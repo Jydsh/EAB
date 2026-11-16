@@ -48,4 +48,20 @@ describe('historyOf 按消息来源过滤', () => {
       { role: 'user', content: '网页追问' },
     ])
   })
+
+  it('恢复中断回合时排除已经落库的当前用户消息，避免模型看到两遍', () => {
+    const db = memoryDb()
+    const insert = db.prepare(
+      `INSERT INTO chat_messages (id, session_id, role, text, meta_json, created_at)
+       VALUES (?, 's1', ?, ?, ?, ?)`,
+    )
+    insert.run('m1', 'user', '上一轮问题', JSON.stringify({ channel: 'dingtalk' }), 1)
+    insert.run('m2', 'assistant', '上一轮回答', JSON.stringify({ channel: 'dingtalk' }), 2)
+    insert.run('m3', 'user', '正在恢复的当前问题', JSON.stringify({ channel: 'dingtalk' }), 3)
+
+    expect(historyOf(db, 's1', 10, 'dingtalk', 'm3')).toEqual([
+      { role: 'user', content: '上一轮问题' },
+      { role: 'assistant', content: '上一轮回答' },
+    ])
+  })
 })

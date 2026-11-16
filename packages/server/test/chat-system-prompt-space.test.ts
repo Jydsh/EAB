@@ -83,3 +83,32 @@ describe('对话系统提示的文件空间边界', () => {
     expect(prompt('cloud', '云空间')).not.toContain('用户此刻在右侧预览')
   })
 })
+
+describe('对话系统提示的成员可用模型清单', () => {
+  it('只注入已按权限过滤的模型，并标出当前使用', () => {
+    const text = buildSystemPrompt({
+      actor,
+      chatTools: cloudTools,
+      memories: [],
+      hits: [],
+      hasAttachments: false,
+      spaceKind: 'cloud',
+      spaceLabel: '云空间',
+      availableModels: [
+        { id: 'qwen-4b', name: 'Qwen3.5-4B' },
+        { id: 'qwen-27b', name: 'Qwen3.5-27B' },
+      ],
+      currentModelId: 'qwen-27b',
+    })
+    expect(text).toContain('当前身份可用模型（共 2 个')
+    expect(text).toContain('- Qwen3.5-4B')
+    expect(text).toContain('- Qwen3.5-27B（当前使用）')
+    expect(text).toContain('只能依据这份清单回答')
+    expect(text).toContain('当前身份没有权限使用')
+  })
+
+  it('没有可用模型时不编造模型清单', () => {
+    expect(prompt('cloud', '云空间')).not.toContain('当前身份可用模型')
+    expect(prompt('cloud', '云空间')).not.toContain('（当前使用）')
+  })
+})

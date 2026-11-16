@@ -21,6 +21,7 @@ import {
   updateDatabaseConnection,
   type DatabaseConnectionView,
 } from '../database-connections.js'
+import { reloadBackends } from '../backends/runtime.js'
 
 function consoleCompany(req: FastifyRequest, deps: ServerDeps): string {
   if (!isConsoleRequest(req, deps.config)) {
@@ -78,6 +79,7 @@ export function registerConsoleDatabaseRoutes(app: FastifyInstance, deps: Server
     const companyId = consoleCompany(req, deps)
     const connection = createDatabaseConnection(deps.db, deps.config.dbPath, companyId, bodyOf(req))
     audit(req, deps, companyId, 'database.create', connection.id, 'success', viewDetail(connection))
+    await reloadBackends(deps.config, deps.db)
     return ok({ connection })
   })
 
@@ -92,6 +94,7 @@ export function registerConsoleDatabaseRoutes(app: FastifyInstance, deps: Server
       bodyOf(req),
     )
     audit(req, deps, companyId, 'database.update', id, 'success', viewDetail(connection))
+    await reloadBackends(deps.config, deps.db)
     return ok({ connection })
   })
 
@@ -100,6 +103,7 @@ export function registerConsoleDatabaseRoutes(app: FastifyInstance, deps: Server
     const id = String(req.params.id ?? '')
     const connection = deleteDatabaseConnection(deps.db, deps.config.dbPath, companyId, id)
     audit(req, deps, companyId, 'database.delete', id, 'success', connection)
+    await reloadBackends(deps.config, deps.db)
     return ok({ connection })
   })
 
@@ -155,6 +159,7 @@ export function registerConsoleDatabaseRoutes(app: FastifyInstance, deps: Server
         error: outcome.result.error.slice(0, 200),
       },
     )
+    await reloadBackends(deps.config, deps.db)
     return ok(outcome)
   })
 }

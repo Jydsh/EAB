@@ -18,6 +18,10 @@ export interface BackendStatus {
   readonly state: BackendState
   readonly detail: string
   readonly capabilities: readonly string[]
+  /** 外部后端来源：显式环境变量，或控制台“数据连接”自动接入。 */
+  readonly source?: 'env' | 'data-connection'
+  readonly connectionId?: string
+  readonly connectionName?: string
   readonly metrics?: Readonly<Record<string, number | string>>
 }
 

@@ -55,11 +55,12 @@ export function registerUpdateRoutes(app: FastifyInstance, deps: ServerDeps): vo
     if (!status.hasUpdate) throw new EabError(EC.VALIDATION, `当前已是最新版本 v${status.current}`)
     if (!status.latest) throw new EabError(EC.VALIDATION, 'GitHub Release 没有可识别的版本号')
     if (!status.sourceUrl) throw new EabError(EC.VALIDATION, '该 Release 没有源码压缩包，无法一键更新')
-    const result = startUpdate(status.latest, status.sourceUrl)
+    const result = startUpdate(status.latest, status.sourceUrl, status.sourceDigest)
     audit(deps, req, 'ops.update.apply', {
       from: status.current,
       to: status.latest,
       sourceUrl: status.sourceUrl,
+      sourceDigest: status.sourceDigest,
       command: result.command,
     })
     // 先让接口返回，再关闭服务；更新器会等待端口释放后替换文件并重启。

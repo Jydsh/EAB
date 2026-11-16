@@ -304,8 +304,29 @@ async function latestRelease() {
   const body = await res.json()
   const latest = String(body.tag_name ?? '').replace(/^v/i, '')
   if (!latest) throw new Error('Release 没有版本号')
-  const sourceAsset = (body.assets ?? []).find((item) => /\.zip$/i.test(item.name ?? '') && !/blockmap/i.test(item.name ?? ''))
-  return { latest, sourceUrl: sourceAsset?.browser_download_url ?? body.zipball_url, htmlUrl: body.html_url }
+  const zips = (body.assets ?? []).filter((item) => {
+    const name = String(item.name ?? '').toLowerCase()
+    return /\.zip$/i.test(name)
+      && !/blockmap|checksum|sha256|digest/i.test(name)
+      && !/(installer|setup|portable|desktop|windows|win32|win64|mac|darwin|linux|appimage|msi|exe)/i.test(name)
+  })
+  const sourceAsset = zips.sort((a, b) => {
+    const score = (item) => {
+      const lower = String(item.name ?? '').toLowerCase()
+      let value = 0
+      if (/source|src/.test(lower)) value += 50
+      if (/eab/.test(lower)) value += 20
+      if (/(installer|setup|portable|desktop|windows|win32|win64|mac|darwin|linux|appimage|msi|exe)/.test(lower)) value -= 100
+      return value
+    }
+    return score(b) - score(a)
+  })[0]
+  return {
+    latest,
+    sourceUrl: sourceAsset?.browser_download_url ?? body.zipball_url,
+    sourceDigest: sourceAsset?.digest ? String(sourceAsset.digest) : null,
+    htmlUrl: body.html_url,
+  }
 }
 
 function isNewer(current, latest) {
@@ -333,6 +354,7 @@ async function update(flags) {
   if (!release.sourceUrl) throw new Error('该 Release 没有源码压缩包，无法更新')
   console.log('正在停止服务并执行更新…')
   await stopService()
+  const digestArgs = release.sourceDigest ? [`--sha256=${release.sourceDigest}`] : []
   const code = await new Promise((resolvePromise) => {
     const child = spawn(
       process.execPath,
@@ -343,6 +365,7 @@ async function update(flags) {
         `--version=${release.latest}`,
         `--root=${ROOT}`,
         '--restart=1',
+        ...digestArgs,
       ],
       { cwd: ROOT, stdio: 'inherit', env: { ...process.env } },
     )
