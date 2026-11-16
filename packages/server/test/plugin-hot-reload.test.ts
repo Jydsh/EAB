@@ -145,6 +145,22 @@ function toolNames(db: ReturnType<typeof memoryDb>, scope?: 'company' | 'user'):
   ).map((item) => item.name)
 }
 
+// 插件 host 的 Cordis fiber 会先返回，工具注册可能比 reload 调用晚一拍完成。
+// CI 的冷启动比本机慢，不能假设 reload 返回时工具已经出现在目录里。
+async function waitForTool(
+  db: ReturnType<typeof memoryDb>,
+  name: string,
+  scope?: 'company' | 'user',
+  timeoutMs = 15_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (toolNames(db, scope).includes(name)) return
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  expect(toolNames(db, scope)).toContain(name)
+}
+
 describe('插件包实时热重载', () => {
   it('公司级和个人级实例都感知同一插件包变化并重新注册工具', async () => {
     const db = memoryDb()
@@ -157,7 +173,7 @@ describe('插件包实时热重载', () => {
 
     const options = { dbPath: ':memory:', companyId: 'c1', dshHomeDir: home }
     await reloadPluginHosts(db, options)
-    expect(toolNames(db)).toContain('probe_watch_one')
+    await waitForTool(db, 'probe_watch_one')
     const before = pluginPackageFingerprint(dir)
 
     await new Promise((resolve) => setTimeout(resolve, 30))
@@ -203,8 +219,8 @@ describe('插件包实时热重载', () => {
 
     const options = { dbPath: ':memory:', companyId: 'c1', dshHomeDir: home }
     await reloadPluginHosts(db, options)
-    expect(toolNames(db, 'company')).toContain('probe_config_company_one')
-    expect(toolNames(db, 'user')).toContain('probe_config_personal_one')
+    await waitForTool(db, 'probe_config_company_one', 'company')
+    await waitForTool(db, 'probe_config_personal_one', 'user')
 
     writeConfig(companyData, 'probe_config_company_two')
     await reloadPluginHostInstance(
@@ -212,7 +228,7 @@ describe('插件包实时热重载', () => {
       db,
       options,
     )
-    expect(toolNames(db, 'company')).toContain('probe_config_company_two')
+    await waitForTool(db, 'probe_config_company_two', 'company')
     expect(toolNames(db, 'company')).not.toContain('probe_config_company_one')
     // 个人实例没有被公司配置变化带走。
     expect(toolNames(db, 'user')).toContain('probe_config_personal_one')
@@ -223,7 +239,7 @@ describe('插件包实时热重载', () => {
       db,
       options,
     )
-    expect(toolNames(db, 'user')).toContain('probe_config_personal_two')
+    await waitForTool(db, 'probe_config_personal_two', 'user')
     expect(toolNames(db, 'user')).not.toContain('probe_config_personal_one')
     expect(toolNames(db, 'company')).toContain('probe_config_company_two')
     db.close()
