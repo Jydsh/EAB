@@ -14,7 +14,7 @@
  * - `ctx.inject(['tools'])` 支持注册，但工具只在插件对该员工安装且启用时进入对话；
  * - host 注册的 HTTP 路由只能通过控制台鉴权的桥接接口访问，不直接挂到公网路径上。
  */
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, type Dirent } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, type Dirent } from 'node:fs'
 import { createHash, randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { createRequire } from 'node:module'
@@ -2338,7 +2338,11 @@ async function startHostInstance(
     // 带 mtime + 实例 scope + 全局 reload token 的 query：同一物理包被公司/个人安装时各求值一份，
     // 模块级读取 DSH_HOME 的插件也不会共享第一次导入时捕获的路径；仅配置变化触发的
     // 重载即使 host 文件 mtime 没变，也要拿到一个全新的模块实例。
-    const url = `${pathToFileURL(full).href}?v=${statSync(full).mtimeMs}&scope=${encodeURIComponent(pluginScopeKey(instance.scope))}&reload=${++hostImportSequence}`
+    // Windows 的 TEMP 可能返回 8.3 短路径（CI 上是 C:\Users\RUNNER~1\...），
+    // 动态 import 解析短路径会报 "Does the file exist"。先用真实长路径再做 URL，
+    // 否则插件在短路径工作目录下永远起不来。
+    const realFull = realpathSync.native(full)
+    const url = `${pathToFileURL(realFull).href}?v=${statSync(realFull).mtimeMs}&scope=${encodeURIComponent(pluginScopeKey(instance.scope))}&reload=${++hostImportSequence}`
     const mod = (await import(url)) as Record<string, unknown>
     const plugin = normalizePluginModule(mod)
     if (!plugin) {
