@@ -4499,12 +4499,25 @@ function openPluginModelRoleModal(model, roles) {
       <section class="models-form-section">
         <div class="models-form-section-head">
           <strong>${esc(model.name)}</strong>
-          ${fieldInfo('这个模型由插件注入，能力随插件更新；这里只配置哪些角色能看到并使用它。')}
+          ${fieldInfo('这个模型由插件注入，能力随插件更新；这里配置哪些角色能看到它，以及它的上下文与输出上限。')}
         </div>
         <div class="models-plugin-meta">
           <span class="models-provider-pill">${esc(model.providerName)}</span>
           <span class="mono">${esc(model.modelKey)}</span>
           <span class="muted">插件更新或停用后，模型会自动出现或消失。</span>
+        </div>
+      </section>
+      <section class="models-form-section">
+        <div class="models-form-section-head">
+          <strong>上下文与输出</strong>
+          ${fieldInfo('按插件模型的真实窗口填写；留空沿用插件声明的值。')}
+        </div>
+        <div class="form-cols">
+          <label class="field"><span>上下文上限 <em>tokens</em> ${fieldInfo('模型能接收的最大上下文窗口；会用于对话输入预算与工具结果限制。')}</span><input id="pm-context" type="number" min="1" value="${model.maxContext ?? ''}" placeholder="例如 131072" /></label>
+          <label class="field"><span>输出上限 <em>tokens</em> ${fieldInfo('单次回答最多生成多少 token；必须小于上下文上限；留空沿用插件声明，插件也没有时按 4096 处理。')}</span><input id="pm-output" type="number" min="1" value="${model.maxOutputTokens ?? ''}" placeholder="例如 8192" /></label>
+        </div>
+        <div class="field models-compress-field">
+          <label class="check"><input id="pm-compress" type="checkbox"${model.contextCompression !== false ? ' checked' : ''} /><span>上下文超限时自动压缩较早历史 ${fieldInfo('只在填写上下文上限后生效；较早对话会压成摘要，最近消息保留原文，不会额外调用模型。')}</span></label>
         </div>
       </section>
       <section class="models-form-section">
@@ -4531,7 +4544,7 @@ function openPluginModelRoleModal(model, roles) {
     </div>
     <div class="modal-state" id="pm-state"></div>
     <div class="modal-actions">
-      <button class="btn primary" type="button" id="pm-save">保存角色</button>
+      <button class="btn primary" type="button" id="pm-save">保存设置</button>
       <button class="btn ghost" type="button" id="pm-cancel">取消</button>
     </div>`)
   const close = () => overlay.remove()
@@ -4557,13 +4570,29 @@ function openPluginModelRoleModal(model, roles) {
   overlay.querySelector('#pm-cancel').addEventListener('click', close)
   overlay.querySelector('#pm-save').addEventListener('click', async () => {
     const stateEl = overlay.querySelector('#pm-state')
+    stateEl.className = 'modal-state'
     stateEl.textContent = '保存中…'
     try {
+      const readLimit = (selector, label) => {
+        const raw = overlay.querySelector(selector).value.trim()
+        if (!raw) return null
+        const value = Number(raw)
+        if (!Number.isFinite(value) || value <= 0) throw new Error(`${label}必须是正整数`)
+        return Math.trunc(value)
+      }
+      const maxContext = readLimit('#pm-context', '上下文上限')
+      const maxOutputTokens = readLimit('#pm-output', '输出上限')
+      if (maxContext !== null && maxOutputTokens !== null && maxOutputTokens >= maxContext) {
+        throw new Error('输出上限必须小于上下文上限')
+      }
       await apiSend('PUT', `/api/console/models/${encodeURIComponent(model.id)}/plugin-settings`, {
         roles: [...overlay.querySelectorAll('[data-pmrole]:checked')].map((el) => el.dataset.pmrole),
+        maxContext,
+        maxOutputTokens,
+        contextCompression: overlay.querySelector('#pm-compress').checked,
       })
       close()
-      showTopToast('插件模型可见角色已保存')
+      showTopToast('插件模型设置已保存')
       loadModels()
     } catch (err) {
       stateEl.className = 'modal-state bad'
@@ -5405,7 +5434,7 @@ async function loadModels() {
         <td class="model-actions">
           ${
             readonly
-              ? `<button class="btn sm model-action-btn" type="button" data-edit-plugin-model="${esc(model.id)}" data-tip="配置这个插件模型可见的角色；模型本身随插件启停。" aria-label="配置插件模型角色">${modelActionIcon('edit')}</button>`
+              ? `<button class="btn sm model-action-btn" type="button" data-edit-plugin-model="${esc(model.id)}" data-tip="配置这个插件模型的可见角色、上下文上限、输出上限与自动压缩；模型本身随插件启停。" aria-label="配置插件模型">${modelActionIcon('edit')}</button>`
               : `
           ${
             (model.endpointKind ?? 'chat') === 'chat'

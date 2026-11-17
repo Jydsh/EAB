@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest'
+import { migrate, openDatabase } from '@eab/storage'
 import {
   callPluginModel,
   findPluginModel,
+  findPluginModelEffective,
   listPluginChannels,
   listPluginModels,
   refreshPluginChannel,
@@ -12,6 +14,7 @@ import {
   setPluginModelsChangedListener,
   syncPluginModels,
 } from '../src/plugin-models.js'
+import { savePluginModelSettings } from '../src/plugin-model-settings.js'
 
 const COMPANY = 'c_plugin_models_test'
 
@@ -298,6 +301,51 @@ describe('插件 LLM adapter 注册表', () => {
     } finally {
       registration.dispose()
       setPluginModelsChangedListener(null)
+    }
+  })
+
+  it('管理员保存的上下文与输出覆盖会进入插件模型有效配置', async () => {
+    const company = 'c_plugin_model_limits_test'
+    const adapter = {
+      listModels: async (provider: string) => [
+        {
+          provider,
+          id: 'demo/model',
+          name: '演示模型',
+          context: { contextWindow: 64_000 },
+          defaultMaxTokens: 4_096,
+        },
+      ],
+      prepareCall: async (provider: string, model: string) => ({
+        model: { provider, id: model, name: '演示模型' },
+        stream: () => stream(),
+      }),
+      stream: () => stream(),
+    }
+    const db = openDatabase({ path: ':memory:' })
+    migrate(db)
+    const registration = registerPluginAdapter(company, 'dsh-limits', ['demo-route'], adapter)
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      const id = 'plugin:demo-route:demo%2Fmodel'
+      const before = findPluginModelEffective(db, company, id)
+      expect(before?.maxContext).toBe(64_000)
+      expect(before?.maxOutputTokens).toBe(4_096)
+      // 插件声明默认不压缩；管理员可以在控制台打开。
+      expect(before?.contextCompression).toBe(false)
+
+      savePluginModelSettings(db, company, id, {
+        roles: ['member'],
+        maxContext: 128_000,
+        maxOutputTokens: 8_192,
+        contextCompression: true,
+      })
+      const after = findPluginModelEffective(db, company, id)
+      expect(after?.maxContext).toBe(128_000)
+      expect(after?.maxOutputTokens).toBe(8_192)
+      expect(after?.contextCompression).toBe(true)
+    } finally {
+      registration.dispose()
     }
   })
 })

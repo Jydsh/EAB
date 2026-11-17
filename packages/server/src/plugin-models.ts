@@ -6,9 +6,14 @@
  * 投影成 EAB 模型目录里的虚拟模型，ID 统一加 `plugin:` 前缀；对话调用再按这个
  * ID 找回 adapter，避免插件模型必须落库才能出现在选择器里。
  */
+import type { Db } from '@eab/storage'
 import { EC, EabError } from '@eab/domain'
 import type { CallResult, ChatMessage, ModelStreamOptions } from './llm.js'
-import { DEFAULT_PLUGIN_MODEL_ROLES } from './plugin-model-settings.js'
+import {
+  DEFAULT_PLUGIN_MODEL_ROLES,
+  applyPluginModelSettings,
+  loadPluginModelSettingsMap,
+} from './plugin-model-settings.js'
 import { companyScope, pluginInstanceKey, type PluginScope } from './plugin-scope.js'
 import {
   thinkingConfigFromDeclaredReasoning,
@@ -450,6 +455,21 @@ export function listPluginModels(companyId: string, userId?: string): PluginMode
     if (model.scope === 'company') return true
     return Boolean(userId && model.userId === String(userId))
   })
+}
+
+/**
+ * 取一个插件模型并叠加管理员在控制台保存的上下文/输出覆盖。
+ * 对话调用与模型目录都必须走这里，否则后台改了上限，实际请求仍按插件默认值跑。
+ */
+export function findPluginModelEffective(
+  db: Db,
+  companyId: string,
+  modelId: string,
+  userId?: string,
+): PluginModelDefinition | null {
+  const model = listPluginModels(companyId, userId).find((item) => item.id === modelId)
+  if (!model) return null
+  return applyPluginModelSettings([model], loadPluginModelSettingsMap(db, companyId))[0] ?? null
 }
 
 /**

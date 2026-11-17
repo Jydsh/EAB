@@ -40,9 +40,10 @@ import { TOOLS } from './tools.js'
 import { filterHealthyModels, hydrateModelHealth } from '../model-health.js'
 import { JOB_KINDS, cancelJob, getJob, listJobs, submitJob } from '../job-queue.js'
 import {
-  applyPluginModelRoles,
-  loadPluginModelRoleMap,
-  savePluginModelRoles,
+  DEFAULT_PLUGIN_MODEL_ROLES,
+  applyPluginModelSettings,
+  loadPluginModelSettingsMap,
+  savePluginModelSettings,
 } from '../plugin-model-settings.js'
 import { loadPlugins } from '../plugins.js'
 import { KB_SOURCE_LABEL, listExternalDocs, probeExternalCollection, syncObsidianCollection } from '../kb-external.js'
@@ -2592,11 +2593,11 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
     const pluginChannels = listPluginChannels(companyId)
     const channels = new Map(pluginChannels.map((channel) => [channel.id, channel]))
     const channelPluginIds = new Set(pluginChannels.map((channel) => channel.pluginId))
-    const pluginRoleOverrides = loadPluginModelRoleMap(deps.db, companyId)
+    const pluginSettings = loadPluginModelSettingsMap(deps.db, companyId)
     await hydrateModelHealth(companyId)
-    const pluginModels = applyPluginModelRoles(
+    const pluginModels = applyPluginModelSettings(
       filterHealthyModels(companyId, listPluginModels(companyId)),
-      pluginRoleOverrides,
+      pluginSettings,
     ).map((model) => {
       const channel = channels.get(model.channelId)
       return {
@@ -3004,7 +3005,15 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
     })
   })
 
-  app.put<{ Params: { id: string }; Body: { roles?: string[] } }>(
+  app.put<{
+    Params: { id: string }
+    Body: {
+      roles?: string[]
+      maxContext?: number | null
+      maxOutputTokens?: number | null
+      contextCompression?: boolean | null
+    }
+  }>(
     '/api/console/models/:id/plugin-settings',
     async (req) => {
       requireConsole(req, deps)
@@ -3012,8 +3021,13 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
       const id = String(req.params.id)
       const model = listAllPluginModels(companyId).find((item) => item.id === id)
       if (!model) throw new EabError(EC.NOT_FOUND, '插件模型不存在、插件已停用或尚未完成注册')
-      if (!Array.isArray(req.body?.roles)) throw new EabError(EC.VALIDATION, 'roles 必须是数组')
-      const roles = [...new Set(req.body.roles.map(String).filter(Boolean))]
+      const current = loadPluginModelSettingsMap(deps.db, companyId).get(id)
+      if (req.body?.roles !== undefined && !Array.isArray(req.body.roles)) {
+        throw new EabError(EC.VALIDATION, 'roles 必须是数组')
+      }
+      const roles = req.body?.roles === undefined
+        ? current?.roles ?? [...DEFAULT_PLUGIN_MODEL_ROLES]
+        : [...new Set(req.body.roles.map(String).filter(Boolean))]
       if (roles.length > 0) {
         const known = deps.db
           .prepare('SELECT code FROM roles WHERE company_id = ? AND deleted_at IS NULL')
@@ -3021,9 +3035,35 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
         const unknown = roles.filter((code) => !known.some((item) => item.code === code))
         if (unknown.length > 0) throw new EabError(EC.VALIDATION, `未知角色：${unknown.join('、')}`)
       }
-      savePluginModelRoles(deps.db, companyId, id, roles)
+      const maxContext = req.body?.maxContext === undefined
+        ? current?.maxContext ?? null
+        : optionalIntField(req.body.maxContext, 'maxContext') ?? null
+      const maxOutputTokens = req.body?.maxOutputTokens === undefined
+        ? current?.maxOutputTokens ?? null
+        : optionalIntField(req.body.maxOutputTokens, 'maxOutputTokens') ?? null
+      let contextCompression: boolean | null
+      if (req.body?.contextCompression === undefined) {
+        contextCompression = current?.contextCompression ?? null
+      } else if (req.body.contextCompression === null) {
+        contextCompression = null
+      } else if (typeof req.body.contextCompression === 'boolean') {
+        contextCompression = req.body.contextCompression
+      } else {
+        throw new EabError(EC.VALIDATION, 'contextCompression 必须是布尔值或 null')
+      }
+      if (maxContext !== null && maxOutputTokens !== null && maxOutputTokens >= maxContext) {
+        throw new EabError(EC.VALIDATION, '输出上限必须小于上下文上限', {
+          hint: '上下文上限包含输入与输出；输出留 1/4 左右给回答更安全。',
+        })
+      }
+      savePluginModelSettings(deps.db, companyId, id, {
+        roles,
+        maxContext,
+        maxOutputTokens,
+        contextCompression,
+      })
       await modelCatalogChanged(companyId)
-      return ok({ model: { id, roles } })
+      return ok({ model: { id, roles, maxContext, maxOutputTokens, contextCompression } })
     },
   )
 

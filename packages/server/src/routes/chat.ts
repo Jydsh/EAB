@@ -17,8 +17,8 @@ import { notifyDingTalkClarifyFromWeb } from '../dingtalk-clarify-sync.js'
 import { callModelStream, callEmbeddings, callRerank, callTranscription, callSpeech, type CallResult, type ChatMessage as LlmMessage, type LlmContent, type LlmContentPart, type LlmToolCall, type ModelStreamEvent, type ModelStreamOptions } from '../llm.js'
 import { planSubAgentModelsWithDecision } from '../agent-model-router.js'
 import { hotReadVersioned } from '../hot-cache.js'
-import { callPluginModel, isPluginModelId, listPluginModels } from '../plugin-models.js'
-import { applyPluginModelRoles, loadPluginModelRoleMap } from '../plugin-model-settings.js'
+import { callPluginModel, findPluginModelEffective, isPluginModelId, listPluginModels } from '../plugin-models.js'
+import { applyPluginModelSettings, loadPluginModelSettingsMap } from '../plugin-model-settings.js'
 import {
   filterHealthyModels,
   hydrateModelHealth,
@@ -328,9 +328,9 @@ function composeModelCatalog(
   allowDemoFallback: boolean,
   raw: RawModelCatalog,
 ): ModelDefinition[] {
-  const pluginModels: ModelDefinition[] = applyPluginModelRoles<ModelDefinition>(
+  const pluginModels: ModelDefinition[] = applyPluginModelSettings<ModelDefinition>(
     filterHealthyModels<ModelDefinition>(companyId, raw.pluginModels),
-    loadPluginModelRoleMap(db, companyId),
+    loadPluginModelSettingsMap(db, companyId),
   )
   if (raw.rows.length === 0) {
     return allowDemoFallback ? [...DEMO_CATALOG, ...pluginModels] : pluginModels
@@ -3189,6 +3189,23 @@ function thinkingConfigForModel(db: Db, companyId: string, modelId: string): Thi
 }
 
 /**
+ * 对话预算使用的模型配置。普通模型来自 models 表；插件模型来自插件声明，
+ * 再叠加管理员在控制台保存的上下文/输出覆盖。插件模型不落 models 表，
+ * 不能只靠 findModelById，否则后台配置的上限不会进入调用链。
+ */
+function modelProfileFor(
+  db: Db,
+  companyId: string,
+  modelId: string,
+  userId?: string,
+): { maxContext: number | null; maxOutputTokens: number | null; contextCompression: boolean } | null {
+  const native = findModelById(db, companyId, modelId)
+  if (native) return native
+  if (!isPluginModelId(modelId)) return null
+  return findPluginModelEffective(db, companyId, modelId, userId)
+}
+
+/**
  * 把「员工选的档位 + 模型配置」换算成本次调用的参数。
  *
  * - effort 策略：把档位交给上游原生参数（OpenAI 是 reasoning_effort，
@@ -3419,7 +3436,12 @@ export async function runAgentTurn(opts: {
     // S6.3：只有本回合通过 skill_load 加载过的技能才进入归属集合，
     // 普通工具调用不会因为“公司里有技能声明了它”而被误判为技能来源。
     const activeSkillIds = new Set<string>()
-    const modelProfile = findModelById(deps.db, actor.subject.companyId, modelId)
+    const modelProfile = modelProfileFor(
+      deps.db,
+      actor.subject.companyId,
+      modelId,
+      actor.subject.userId,
+    )
     const baseMaxOutputTokens = opts.maxTokens ?? modelProfile?.maxOutputTokens ?? 4096
     const primaryCallPlan = thinkingCallPlan(
       thinkingConfigForModel(deps.db, actor.subject.companyId, modelId),
@@ -3664,7 +3686,12 @@ export async function runAgentTurn(opts: {
         }
         const candidateProfile = candidateId === activeModelId
           ? modelProfile
-          : findModelById(deps.db, actor.subject.companyId, candidateId)
+          : modelProfileFor(
+              deps.db,
+              actor.subject.companyId,
+              candidateId,
+              actor.subject.userId,
+            )
         const candidateBaseMax = opts.maxTokens ?? candidateProfile?.maxOutputTokens ?? baseMaxOutputTokens
         const callPlan = thinkingCallPlan(
           thinkingConfigForModel(deps.db, actor.subject.companyId, candidateId),
@@ -3836,7 +3863,12 @@ export async function runAgentTurn(opts: {
           }
         }
         try {
-          const repairProfile = findModelById(deps.db, actor.subject.companyId, activeModelId)
+          const repairProfile = modelProfileFor(
+            deps.db,
+            actor.subject.companyId,
+            activeModelId,
+            actor.subject.userId,
+          )
           const repairPlan = thinkingCallPlan(
             thinkingConfigForModel(deps.db, actor.subject.companyId, activeModelId),
             opts.reasoningEffort,
