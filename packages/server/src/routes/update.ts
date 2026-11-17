@@ -50,6 +50,9 @@ export function registerUpdateRoutes(app: FastifyInstance, deps: ServerDeps): vo
 
   app.post('/api/console/update/apply', async (req) => {
     requireConsole(req, deps)
+    // 没有 shutdown 的启动方式（例如被别的进程托管）无法让旧进程退出；
+    // 提前报错，避免更新器在后台等 30 秒端口后静默失败。
+    if (!deps.shutdown) throw new EabError(EC.VALIDATION, '当前启动方式不支持自动重启，请先执行 eab restart')
     const status = await checkForUpdate(true)
     if (status.error) throw new EabError(EC.VALIDATION, status.error)
     if (!status.hasUpdate) throw new EabError(EC.VALIDATION, `当前已是最新版本 v${status.current}`)
@@ -62,9 +65,17 @@ export function registerUpdateRoutes(app: FastifyInstance, deps: ServerDeps): vo
       sourceUrl: status.sourceUrl,
       sourceDigest: status.sourceDigest,
       command: result.command,
+      updaterPid: result.pid,
     })
     // 先让接口返回，再关闭服务；更新器会等待端口释放后替换文件并重启。
-    if (deps.shutdown) setTimeout(() => deps.shutdown?.(), 600)
-    return ok({ accepted: true, version: status.latest, command: result.command, restarting: Boolean(deps.shutdown) })
+    // 等待 1.2 秒，确保浏览器先收到 accepted 响应，而不是被进程退出截断。
+    setTimeout(() => deps.shutdown?.(), 1200)
+    return ok({
+      accepted: true,
+      version: status.latest,
+      command: result.command,
+      updaterPid: result.pid,
+      restarting: true,
+    })
   })
 }

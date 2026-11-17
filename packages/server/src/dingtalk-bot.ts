@@ -991,24 +991,38 @@ export async function handleDingTalkMessage(
       // 网页端把带 clarifyFlowId 的用户消息视为隐藏续跑，不渲染绿色气泡。
       ...(clarifyFlow ?? {}),
     }
-    // 卡片按钮的隐藏续跑沿用同一条 assistant 消息，不单独登记恢复回合。
-    const trackTurn = Boolean(options.resume) || !options.clarifyFlow
-    trackedTurnId = trackTurn ? assistantMessageId : null
-    if (trackTurn && !options.resume) {
-      beginChannelTurn(deps.db, {
-        id: assistantMessageId,
+    // 普通回合用 assistant 消息 id 作为 recovery 主键；卡片按钮的隐藏续跑会复用
+    // 原 assistant 消息，但它是独立的一次处理，必须单独登记一条 channel_turns 才能重启恢复。
+    const clarifyTurnId = options.clarifyFlow ? `turn_${randomUUID()}` : ''
+    const turnRecordId = options.resume?.turnId || clarifyTurnId || assistantMessageId
+    trackedTurnId = turnRecordId
+    if (!options.resume) {
+      const began = beginChannelTurn(deps.db, {
+        id: turnRecordId,
         companyId: actor.subject.companyId,
         provider: 'dingtalk',
         externalId,
         userId: actor.person.id,
         sessionId,
         eventKey,
-        payload,
+        // clarify 续跑需要把“隐藏续跑”的上下文一起持久化，恢复时才能同时带 resume + clarifyFlow。
+        payload: clarifyFlow
+          ? {
+              kind: 'dingtalk_clarify',
+              message: payload,
+              clarifyFlow: {
+                flowId: clarifyFlow.clarifyFlowId,
+                step: clarifyFlow.clarifyStep,
+                suppressNewCard: true,
+              },
+            }
+          : payload,
         userMessageId,
         assistantMessageId,
         agentTurnId,
         startedAt: started,
       })
+      if (!began) trackedTurnId = null
     }
 
     // 先投递一张「正在思考」的 AI 卡片，后续 reasoning/content/tool 事件都在这张卡片里流式刷新。
@@ -1032,7 +1046,12 @@ export async function handleDingTalkMessage(
     // 建卡时回答还没生成，外层摘要先放中性品牌文案；
     // 收口时再把外层摘要替换成回复正文（A2UI 卡片走场域信息更新，旧模板走 sys_lastMessageI18n）。
     const conversationSummary = 'EAB 企业智能助手'
-    if (isPrivateChat && channelSecret && !card && options.clarifyFlow?.suppressNewCard !== true) {
+    if (
+      isPrivateChat &&
+      channelSecret &&
+      !card &&
+      (options.clarifyFlow?.suppressNewCard !== true || Boolean(options.resume?.cardInstanceId))
+    ) {
       // 服务重启恢复时优先复用原卡：不新建机器人消息，直接在旧卡里继续刷新。
       const resumeCardId = String(options.resume?.cardInstanceId ?? '').trim()
       if (resumeCardId) {
@@ -1092,8 +1111,8 @@ export async function handleDingTalkMessage(
         }
       }
       const cardId = card?.providerMessageIds[0] ?? legacyCard?.providerMessageIds[0] ?? ''
-      if (trackTurn && cardId) {
-        setChannelTurnCard(deps.db, assistantMessageId, cardId, card ? 'a2ui' : 'legacy')
+      if (trackedTurnId && cardId) {
+        setChannelTurnCard(deps.db, trackedTurnId, cardId, card ? 'a2ui' : 'legacy')
       }
     }
 
@@ -1277,8 +1296,8 @@ export async function handleDingTalkMessage(
     }
     /** 只在工具状态变化时写一次进度，供进程重启后提示模型哪些工具已经执行过。 */
     const noteTurnProgress = () => {
-      if (!trackTurn) return
-      setChannelTurnProgress(deps.db, assistantMessageId, {
+      if (!trackedTurnId) return
+      setChannelTurnProgress(deps.db, trackedTurnId, {
         tools: toolDetails.map((tool) => ({
           name: tool.name,
           toolId: tool.toolId,
@@ -1799,6 +1818,23 @@ export async function recoverInterruptedDingTalkTurns(
       summary.failed += 1
       continue
     }
+    // 卡片按钮的隐藏续跑在入站时存的是包装对象：真实消息 + clarifyFlow。
+    // 恢复时两者必须一起还原，否则会把续跑当普通文本重发，或者续不上原卡。
+    const clarifyEnvelope = (payload as {
+      kind?: string
+      message?: unknown
+      clarifyFlow?: { flowId?: string; step?: number; suppressNewCard?: boolean }
+    })
+    const isClarifyTurn = clarifyEnvelope.kind === 'dingtalk_clarify'
+    const messagePayload = isClarifyTurn ? clarifyEnvelope.message : payload
+    if (!messagePayload || typeof messagePayload !== 'object') {
+      const message = '服务重启导致这一轮中断，请重新发送一次。'
+      markInterruptedEventFailed(deps, turn, '原始消息缺失')
+      await closeInterruptedCard(deps, turn, message)
+      finishChannelTurn(deps.db, turn.id, 'failed', '原始消息缺失')
+      summary.failed += 1
+      continue
+    }
 
     const session = deps.db
       .prepare('SELECT id FROM chat_sessions WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1')
@@ -1824,7 +1860,7 @@ export async function recoverInterruptedDingTalkTurns(
 
     try {
       console.log(`[eab] 恢复中断回合 ${turn.id}（第 ${turn.attempts + 1} 次，会话 ${turn.sessionId}）`)
-      const result = await runTurn(deps, payload as DingTalkMessage, {
+      const result = await runTurn(deps, messagePayload as DingTalkMessage, {
         dedupe: false,
         sessionId: turn.sessionId,
         resume: {
@@ -1836,6 +1872,16 @@ export async function recoverInterruptedDingTalkTurns(
           agentTurnId: turn.agentTurnId,
           priorTools: priorToolNames(turn),
         },
+        // 恢复 clarify 续跑时允许续用原卡；suppressNewCard 只用于正常回调路径，
+        // 恢复路径没有外部 card，必须靠 resume.cardInstanceId 把旧卡接回来。
+        clarifyFlow: isClarifyTurn
+          ? {
+              flowId: String(clarifyEnvelope.clarifyFlow?.flowId || ''),
+              step: Math.max(1, Math.trunc(Number(clarifyEnvelope.clarifyFlow?.step) || 1)),
+              assistantMessageId: turn.assistantMessageId || turn.id,
+              suppressNewCard: false,
+            }
+          : undefined,
       })
       if (!result.handled) {
         throw new Error(result.text || result.reason || '恢复后未能继续回答')

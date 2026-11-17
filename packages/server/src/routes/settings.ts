@@ -34,6 +34,11 @@ import {
   type StorageSettingKey,
   type ConsoleSettings,
 } from '../settings.js'
+import {
+  agentTeamSettingsView,
+  effectiveAgentTeamSettings,
+  normalizeAgentMaxWorkers,
+} from '../agent-team-settings.js'
 
 function requireConsole(req: FastifyRequest, deps: ServerDeps): void {
   if (!isConsoleRequest(req, deps.config)) {
@@ -420,6 +425,7 @@ export function registerSettingsRoutes(app: FastifyInstance, deps: ServerDeps): 
       retentionDays: settings.logRetentionDays,
       auditRetentionDays: settings.auditRetentionDays,
       agentRetentionDays: settings.agentRetentionDays,
+      agentTeam: agentTeamSettingsView(deps.config),
       recordRetentionDays: settings.recordRetentionDays,
       workspaceRecycleDays: settings.workspaceRecycleDays,
       lastCleanupAt: settings.lastCleanupAt,
@@ -529,6 +535,33 @@ export function registerSettingsRoutes(app: FastifyInstance, deps: ServerDeps): 
       recordRetentionDays: settings.recordRetentionDays,
       workspaceRecycleDays: settings.workspaceRecycleDays,
       applied: true,
+    })
+  })
+
+  app.put<{
+    Body: { maxWorkers?: unknown }
+  }>('/api/console/settings/agent-team', async (req) => {
+    requireConsole(req, deps)
+    const before = effectiveAgentTeamSettings(deps.config)
+    const raw = req.body?.maxWorkers
+    if (raw === undefined) throw new EabError(EC.VALIDATION, '缺少 maxWorkers')
+    const next = raw === null || raw === '' ? null : normalizeAgentMaxWorkers(raw)
+    if (raw !== null && raw !== '' && next === null) {
+      throw new EabError(EC.VALIDATION, '每会话活跃岗位上限只能是 1–32 的整数')
+    }
+    const settings = writeConsoleSettings({
+      agentTeam: { maxWorkers: next },
+    })
+    const after = effectiveAgentTeamSettings(deps.config)
+    audit(deps, req, 'ops.settings.agent-team', {
+      before: { maxWorkers: before.maxWorkers, source: before.source },
+      after: { maxWorkers: after.maxWorkers, source: after.source },
+      configured: settings.agentTeam.maxWorkers,
+    })
+    return ok({
+      agentTeam: agentTeamSettingsView(deps.config),
+      applied: true,
+      scope: 'global',
     })
   })
 

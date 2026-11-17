@@ -103,6 +103,14 @@ export interface ServerConfig {
   readonly agentMaxRetries?: number
   /** 子 Agent 空闲多久没有新任务就自动注销；默认 120 秒 */
   readonly agentWorkerIdleMs?: number
+  /** 每个会话团队最多几个活跃子 Agent；默认 8 */
+  readonly agentMaxWorkers?: number
+  /** 每会话活跃岗位上限是否来自环境变量；控制台显式值始终优先于它 */
+  readonly agentMaxWorkersFromEnv?: boolean
+  /** 子 Agent 等待父 Agent 回答超过多久转为注销；默认 30 分钟 */
+  readonly agentWaitingTtlMs?: number
+  /** 软注销后保留 worker 与消息多久；默认 24 小时，0 表示不保留 */
+  readonly agentWorkerRetentionMs?: number
   /** 子 Agent 单次任务最多几个模型→工具循环；默认 12（父 Agent 仍为 4） */
   readonly agentChildMaxRounds?: number
   /** 父 Agent 等待子 Agent 事件的最长时间；默认 30 秒 */
@@ -279,6 +287,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     agentMaxDepth: readInt(env.EAB_AGENT_MAX_DEPTH, 2, 'EAB_AGENT_MAX_DEPTH'),
     agentMaxRetries: readInt(env.EAB_AGENT_MAX_RETRIES, 1, 'EAB_AGENT_MAX_RETRIES'),
     agentWorkerIdleMs: readInt(env.EAB_AGENT_WORKER_IDLE_MS, 120_000, 'EAB_AGENT_WORKER_IDLE_MS'),
+    agentMaxWorkers: readInt(env.EAB_AGENT_MAX_WORKERS, 8, 'EAB_AGENT_MAX_WORKERS'),
+    agentMaxWorkersFromEnv: env.EAB_AGENT_MAX_WORKERS !== undefined && env.EAB_AGENT_MAX_WORKERS !== '',
+    agentWaitingTtlMs: readInt(env.EAB_AGENT_WAITING_TTL_MS, 30 * 60_000, 'EAB_AGENT_WAITING_TTL_MS'),
+    agentWorkerRetentionMs: readNonNegativeInt(
+      env.EAB_AGENT_WORKER_RETENTION_MS,
+      24 * 60 * 60_000,
+      'EAB_AGENT_WORKER_RETENTION_MS',
+    ),
     agentChildMaxRounds: readInt(env.EAB_AGENT_CHILD_MAX_ROUNDS, 12, 'EAB_AGENT_CHILD_MAX_ROUNDS'),
     agentWaitTimeoutMs: readInt(env.EAB_AGENT_WAIT_TIMEOUT_MS, 30_000, 'EAB_AGENT_WAIT_TIMEOUT_MS'),
     maxInflightBodyMb: readInt(env.EAB_MAX_INFLIGHT_BODY_MB, 256, 'EAB_MAX_INFLIGHT_BODY_MB'),

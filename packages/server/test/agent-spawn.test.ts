@@ -41,6 +41,33 @@ vi.mock('../src/llm.js', async (importOriginal) => {
         }
       }
       const content = messages[messages.length - 1]?.content ?? ''
+      if (content.includes('超并发')) {
+        state.rootCalls += 1
+        return {
+          text: '',
+          reasoning: '',
+          toolCalls: [
+            {
+              id: 'spawn-over-limit',
+              type: 'function',
+              function: {
+                name: 'agent_spawn',
+                arguments: JSON.stringify({
+                  tasks: [
+                    { title: '任务 1', prompt: '任务1：查资料' },
+                    { title: '任务 2', prompt: '任务2：查资料' },
+                    { title: '任务 3', prompt: '任务3：查资料' },
+                    { title: '任务 4', prompt: '任务4：查资料' },
+                    { title: '任务 5', prompt: '任务5：查资料' },
+                  ],
+                }),
+              },
+            },
+          ],
+          promptTokens: 1,
+          completionTokens: 1,
+        }
+      }
       if (content.includes('并行分析')) {
         state.rootCalls += 1
         return {
@@ -153,5 +180,32 @@ describe('多 Agent 并行调度', () => {
     expect(bRuns.every((run) => run.status === 'failed')).toBe(true)
     expect(bRuns.every((run) => run.parentRunId === root?.id)).toBe(true)
     expect(a?.id).not.toBe(bRuns[0]?.id)
+  })
+
+  it('超过 agentMaxParallel 时显式报错，不静默丢弃也不注册残缺团队', async () => {
+    state.rootCalls = 0
+    state.childCalls = 0
+    state.activeChildren = 0
+    state.maxActiveChildren = 0
+    const { deps, actor } = testEnv()
+    const events: any[] = []
+    const result = await runAgentTurn({
+      deps,
+      actor,
+      modelId: 'model_test',
+      messages: [{ role: 'user', content: '请超并发派发五个子任务' }],
+      maxTokens: 16,
+      emit: (event) => events.push(event),
+    })
+
+    expect(result?.text).toBe('全部完成')
+    expect(result?.toolCalls[0]?.toolId).toBe('agent.spawn')
+    expect(result?.toolCalls[0]?.status).toBe('error')
+    expect(result?.toolCalls[0]?.summary).toContain('一次最多并行 4 个子任务')
+    expect(state.childCalls).toBe(0)
+    expect(events.filter((event) => event.type === 'agent' && event.action === 'assign')).toHaveLength(0)
+    expect(events.filter((event) => event.type === 'agent' && event.action === 'spawn')).toHaveLength(0)
+    const toolResult = events.find((event) => event.type === 'tool_result')
+    expect(toolResult?.status).toBe('error')
   })
 })

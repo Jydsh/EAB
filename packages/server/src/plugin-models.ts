@@ -2,18 +2,14 @@
  * DSH 插件模型注册表。
  *
  * 插件通过 `ctx.llm.registerAdapter(routes, adapter)` 注册的是「provider 路由 +
- * adapter」，不是 EAB `models` 表里的行。这里把 adapter 的 `listModels()` 结果
+ * adapter」，不是 EAB `models` 表里的行。这里把 adapter 的 `listModels()` 目录和
+ * `resolveModel()` 的模型自描述（contextWindow / defaultMaxTokens / reasoning）
  * 投影成 EAB 模型目录里的虚拟模型，ID 统一加 `plugin:` 前缀；对话调用再按这个
  * ID 找回 adapter，避免插件模型必须落库才能出现在选择器里。
  */
-import type { Db } from '@eab/storage'
 import { EC, EabError } from '@eab/domain'
 import type { CallResult, ChatMessage, ModelStreamOptions } from './llm.js'
-import {
-  DEFAULT_PLUGIN_MODEL_ROLES,
-  applyPluginModelSettings,
-  loadPluginModelSettingsMap,
-} from './plugin-model-settings.js'
+import { DEFAULT_PLUGIN_MODEL_ROLES } from './plugin-model-settings.js'
 import { companyScope, pluginInstanceKey, type PluginScope } from './plugin-scope.js'
 import {
   thinkingConfigFromDeclaredReasoning,
@@ -64,8 +60,11 @@ export interface PluginModelDefinition {
   provider: string
   providerName: string
   modelKey: string
+  /** 插件 `resolveModel()` 声明的上下文窗口；未声明时为 null。 */
   maxContext: number | null
+  /** 插件 `resolveModel()` 声明的默认输出上限；未声明时为 null。 */
   maxOutputTokens: number | null
+  /** 宿主侧策略：有上下文窗口时默认开启早期历史压缩，插件不再单独声明。 */
   contextCompression: boolean
   inputModalities: string[]
   outputModalities: string[]
@@ -205,12 +204,23 @@ function toDefinition(
   info: Record<string, unknown>,
   pluginId: string,
   channelId: string,
-  reasoning: unknown,
+  resolved: Record<string, unknown>,
   registration: RegisteredAdapter,
 ): PluginModelDefinition {
   const id = String(info.id ?? '')
   if (!id) throw new Error('插件模型缺少 id')
   const context = asRecord(info.context)
+  const resolvedContext = asRecord(resolved.context)
+  const contextWindow = typeof resolvedContext.contextWindow === 'number'
+    ? Number(resolvedContext.contextWindow)
+    : typeof context.contextWindow === 'number'
+      ? Number(context.contextWindow)
+      : null
+  const defaultMaxTokens = typeof resolved.defaultMaxTokens === 'number'
+    ? Number(resolved.defaultMaxTokens)
+    : typeof info.defaultMaxTokens === 'number'
+      ? Number(info.defaultMaxTokens)
+      : null
   const capabilities = asCapabilities(info)
   const tags = [...new Set([...(Array.isArray(info.tags) ? info.tags.map(String) : ['chat']), ...capabilities])]
   return {
@@ -225,12 +235,12 @@ function toDefinition(
     provider: 'plugin',
     providerName: String(info.providerName ?? provider),
     modelKey: id,
-    maxContext: typeof context.contextWindow === 'number' ? Number(context.contextWindow) : null,
-    maxOutputTokens: typeof info.defaultMaxTokens === 'number' ? Number(info.defaultMaxTokens) : null,
-    contextCompression: false,
+    maxContext: contextWindow && contextWindow > 0 ? Math.trunc(contextWindow) : null,
+    maxOutputTokens: defaultMaxTokens && defaultMaxTokens > 0 ? Math.trunc(defaultMaxTokens) : null,
+    contextCompression: true,
     inputModalities: asStringList(info.inputModalities),
     outputModalities: asStringList(info.outputModalities),
-    thinking: thinkingConfigFromDeclaredReasoning(reasoning),
+    thinking: thinkingConfigFromDeclaredReasoning(resolved.reasoning),
     source: 'plugin',
     readonly: true,
     pluginId,
@@ -309,19 +319,18 @@ async function refreshAdapter(
       const info = asRecord(raw)
       const modelId = String(info.id ?? '')
       if (!modelId) continue
-      // 档位菜单是模型级声明：DSH 的 resolveModel 会返回 reasoning.efforts。
-      // 单个模型解析失败不影响目录投影，只是这个模型不显示思考选择器。
-      let reasoning: unknown
+      // DSH 的模型是自描述的：listModels 只给目录，resolveModel 才给这个模型的
+      // 真实上下文窗口、默认输出上限和思考档位。这里一次解析全部取走，不能只留 reasoning。
+      let resolved: Record<string, unknown> = {}
       if (registration.adapter.resolveModel) {
         try {
-          const resolved = asRecord(await registration.adapter.resolveModel(route, modelId))
-          reasoning = resolved.reasoning
+          resolved = asRecord(await registration.adapter.resolveModel(route, modelId))
         } catch {
-          reasoning = undefined
+          resolved = {}
         }
       }
       try {
-        const definition = toDefinition(route, info, registration.pluginId, channelId, reasoning, registration)
+        const definition = toDefinition(route, info, registration.pluginId, channelId, resolved, registration)
         models.set(definition.id, definition)
         targets.set(definition.id, {
           provider: route,
@@ -455,21 +464,6 @@ export function listPluginModels(companyId: string, userId?: string): PluginMode
     if (model.scope === 'company') return true
     return Boolean(userId && model.userId === String(userId))
   })
-}
-
-/**
- * 取一个插件模型并叠加管理员在控制台保存的上下文/输出覆盖。
- * 对话调用与模型目录都必须走这里，否则后台改了上限，实际请求仍按插件默认值跑。
- */
-export function findPluginModelEffective(
-  db: Db,
-  companyId: string,
-  modelId: string,
-  userId?: string,
-): PluginModelDefinition | null {
-  const model = listPluginModels(companyId, userId).find((item) => item.id === modelId)
-  if (!model) return null
-  return applyPluginModelSettings([model], loadPluginModelSettingsMap(db, companyId))[0] ?? null
 }
 
 /**
@@ -672,10 +666,16 @@ export function startPluginModelCatalogSync(
   }
 }
 
-export function findPluginModel(companyId: string, id: string): PluginModelDefinition | null {
-  const model = companyModels(companyId).get(String(id))
-  if (!model || !pluginIsActive(companyId, model.pluginId)) return null
-  return model
+/**
+ * 取一个插件模型。上下文与输出上限来自插件 `resolveModel()` 的自描述，
+ * 宿主不再保存逐模型覆盖，避免同一份参数在后台和插件里各写一遍。
+ */
+export function findPluginModel(
+  companyId: string,
+  id: string,
+  userId?: string,
+): PluginModelDefinition | null {
+  return listPluginModels(companyId, userId).find((item) => item.id === String(id)) ?? null
 }
 
 /**

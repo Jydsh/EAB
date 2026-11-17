@@ -19,6 +19,16 @@ import type { ChatToolSpec } from './routes/tools.js'
 export const BATCH_READ_TOOL_NAME = 'batch_read'
 export const BATCH_ANALYZE_TOOL_NAME = 'batch_analyze'
 
+/**
+ * 批次落盘、分批进度和完成摘要属于调试信息，默认不写启动窗口；
+ * 排查时可用 EAB_LOG_LEVEL=debug 临时恢复。
+ */
+function batchTrace(message: string): void {
+  const level = String(process.env.EAB_LOG_LEVEL ?? '').toLowerCase()
+  if (level !== 'debug' && level !== 'trace') return
+  console.info(`[eab] ${message}`)
+}
+
 const BATCH_TTL_MS = 24 * 60 * 60 * 1_000
 const MAX_BATCH_ROWS = 20_000
 const MAX_BATCH_TEXT_CHARS = 5_000_000
@@ -236,7 +246,7 @@ export function saveToolResultBatch(options: BatchStoreOptions & {
         chars,
       }
       writeBatchFile(options, file)
-      console.warn(`[eab] 大工具结果已保存为批次 ${id}：${rows.length} 行、${chars} 字符`)
+      batchTrace(`大工具结果已保存为批次 ${id}：${rows.length} 行、${chars} 字符`)
       return { id, kind: 'rows', totalRows: rows.length, columns, chars }
     }
     if (rows.length > MAX_BATCH_ROWS) {
@@ -296,7 +306,7 @@ export function saveTextBatch(options: BatchStoreOptions & {
     chars: text.length,
   }
   writeBatchFile(options, file)
-  console.warn(`[eab] 长文本已保存为批次 ${id}：${text.length} 字符`)
+  batchTrace(`长文本已保存为批次 ${id}：${text.length} 字符`)
   return { id, kind: 'text', totalRows: 0, columns: [], chars: text.length }
 }
 
@@ -537,8 +547,8 @@ async function analyzeTextBatch(
   const parts = splitTextChunks(text, chunkChars)
   const concurrency = Math.min(MAX_CONCURRENCY, Math.max(1, Math.floor(Number(options.concurrency ?? 3))))
   const question = options.question.trim()
-  console.warn(
-    `[eab] 文本分批分析开始：批次 ${file.id}，${text.length} 字符，${parts.length} 段，并发 ${concurrency}`,
+  batchTrace(
+    `文本分批分析开始：批次 ${file.id}，${text.length} 字符，${parts.length} 段，并发 ${concurrency}`,
   )
   const results: Array<{ start: number; end: number; text: string; failed: boolean }> = []
   await runPool(parts, concurrency, async (part, index) => {
@@ -576,7 +586,7 @@ async function analyzeTextBatch(
         text: answer ? oneLine(answer, 1_200) : `第 ${index + 1} 段：${part.text.length} 字符，模型未返回摘要。`,
         failed: false,
       })
-      console.warn(`[eab] 文本分析进度：${index + 1}/${parts.length} 段完成`)
+      batchTrace(`文本分析进度：${index + 1}/${parts.length} 段完成`)
     } catch (error) {
       const message = error instanceof EabError ? error.message : (error as Error)?.message ?? '模型调用失败'
       console.warn(`[eab] 文本分析失败：第 ${index + 1}/${parts.length} 段 ${oneLine(message, 300)}`)
@@ -627,7 +637,7 @@ async function analyzeTextBatch(
     const message = error instanceof EabError ? error.message : (error as Error)?.message ?? '汇总失败'
     answer = `文本分批分析完成，但最终汇总失败：${message}\n\n各段摘要：\n${summariesText.slice(0, 6_000)}`
   }
-  console.warn(`[eab] 文本分批分析完成：批次 ${file.id}，${parts.length} 段，失败 ${failedChunks} 段`)
+  batchTrace(`文本分批分析完成：批次 ${file.id}，${parts.length} 段，失败 ${failedChunks} 段`)
   return {
     batchId: file.id,
     kind: 'text',
@@ -672,8 +682,8 @@ export async function analyzeBatch(options: BatchAnalyzeOptions): Promise<{
   const chunks = Math.max(1, Math.ceil(file.totalRows / chunkRows))
   const concurrency = Math.min(MAX_CONCURRENCY, Math.max(1, Math.floor(Number(options.concurrency ?? 3))))
   const question = options.question.trim()
-  console.warn(
-    `[eab] 分批分析开始：批次 ${file.id}，${file.totalRows} 行，${chunks} 批，并发 ${concurrency}，模型 ${modelId}`,
+  batchTrace(
+    `分批分析开始：批次 ${file.id}，${file.totalRows} 行，${chunks} 批，并发 ${concurrency}，模型 ${modelId}`,
   )
 
   const results: Array<{ start: number; end: number; text: string; failed: boolean }> = []
@@ -724,7 +734,7 @@ export async function analyzeBatch(options: BatchAnalyzeOptions): Promise<{
           text: text ? oneLine(text, 1_200) : fallbackChunkSummary(start, end, rows),
           failed: false,
         })
-        console.warn(`[eab] 分批分析进度：${index + 1}/${chunks} 批完成`)
+        batchTrace(`分批分析进度：${index + 1}/${chunks} 批完成`)
       } catch (error) {
         const message = error instanceof EabError ? error.message : (error as Error)?.message ?? '模型调用失败'
         console.warn(`[eab] 分批分析失败：第 ${index + 1}/${chunks} 批 ${oneLine(message, 300)}`)
@@ -779,7 +789,7 @@ export async function analyzeBatch(options: BatchAnalyzeOptions): Promise<{
     const message = error instanceof EabError ? error.message : (error as Error)?.message ?? '汇总失败'
     answer = `分批分析完成，但最终汇总失败：${message}\n\n各批摘要：\n${summariesText.slice(0, 6_000)}`
   }
-  console.warn(`[eab] 分批分析完成：批次 ${file.id}，${chunks} 批，失败 ${failedChunks} 批`)
+  batchTrace(`分批分析完成：批次 ${file.id}，${chunks} 批，失败 ${failedChunks} 批`)
   return {
     batchId: file.id,
     kind: 'rows',

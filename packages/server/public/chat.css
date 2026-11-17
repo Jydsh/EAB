@@ -937,17 +937,208 @@
 .msg .bubble-files {
   display: flex;
   flex-wrap: wrap;
+  align-items: flex-start;
   gap: 6px;
   margin-top: 8px;
 }
 
-.msg .bubble-files span {
+.msg .bubble-files > span {
   font-size: 11.5px;
   padding: 3px 8px;
   border-radius: 6px;
   border: 1px solid var(--line);
   background: var(--surface);
   color: var(--ink-2);
+}
+
+/* 对话附件卡：图片缩略、文件卡、保存中、未保存、已删除五种状态。 */
+.msg .bubble-attach {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  max-width: min(260px, 100%);
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--surface);
+  color: var(--ink-2);
+  text-align: left;
+  font: inherit;
+  white-space: normal;
+  box-shadow: 0 1px 2px rgba(16, 48, 37, 0.04);
+}
+
+button.bubble-attach {
+  cursor: pointer;
+}
+
+.msg .bubble-attach:hover {
+  border-color: color-mix(in srgb, var(--brand) 38%, var(--line));
+  background: color-mix(in srgb, var(--brand) 4%, var(--surface));
+}
+
+.msg .bubble-attach:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+
+.msg .bubble-attach.is-image {
+  width: min(240px, 100%);
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+.msg .bubble-attach.is-image img {
+  display: block;
+  width: 100%;
+  height: 150px;
+  object-fit: cover;
+  background: var(--surface-2);
+}
+
+.bubble-attach-caption {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  padding: 7px 9px 8px;
+  white-space: normal;
+}
+
+.msg .bubble-attach-body {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.msg .bubble-attach-name {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  line-height: 1.35;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.msg .bubble-attach.is-image .bubble-attach-name {
+  font-size: 11.5px;
+}
+
+.msg .bubble-attach-meta {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10.5px;
+  line-height: 1.4;
+  color: var(--muted);
+}
+
+.msg .bubble-attach-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 34px;
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  background: var(--brand-soft);
+  color: var(--brand);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.msg .bubble-attach-icon svg {
+  width: 17px;
+  height: 17px;
+}
+
+.msg .bubble-attach-icon.is-deleted {
+  background: var(--surface-2);
+  color: var(--muted);
+}
+
+.msg .bubble-attach-icon.is-unsaved {
+  background: #fff3e2;
+  color: #9a6422;
+  font-size: 15px;
+}
+
+.msg .bubble-attach-open {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 17px;
+  line-height: 1;
+}
+
+.msg .bubble-attach.is-deleted {
+  border-style: dashed;
+  background: var(--surface-2);
+  color: var(--muted);
+  cursor: default;
+}
+
+.msg .bubble-attach.is-deleted .bubble-attach-name {
+  color: var(--muted);
+  font-weight: 500;
+}
+
+.msg .bubble-attach.is-pending {
+  border-style: dashed;
+  background: color-mix(in srgb, var(--brand) 4%, var(--surface));
+}
+
+.msg .bubble-attach.is-unsaved {
+  border-color: #e2c9a6;
+  background: #fff8ef;
+}
+
+.msg .bubble-attach.is-unsaved .bubble-attach-name {
+  color: #7a5524;
+}
+
+.msg .bubble-attach-spinner {
+  flex: 0 0 16px;
+  width: 16px;
+  height: 16px;
+  border: 2px solid color-mix(in srgb, var(--brand) 22%, var(--line));
+  border-top-color: var(--brand);
+  border-radius: 50%;
+  animation: bubble-attach-spin 0.8s linear infinite;
+}
+
+@keyframes bubble-attach-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (max-width: 640px) {
+  .msg .bubble-attach {
+    max-width: 100%;
+  }
+  .msg .bubble-attach.is-image {
+    width: min(200px, 100%);
+  }
+  .msg .bubble-attach.is-image img {
+    height: 118px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .msg .bubble-attach-spinner {
+    animation: none;
+  }
 }
 
 /* 批次数据接管卡：展示数据体量、批次 id 和保留期，正文留在本地批次里。 */
@@ -4117,6 +4308,19 @@ body.is-side-peek .session-menu { z-index: 2147483500; }
   color: #26312d;
   font-size: 14px;
   line-height: 1.55;
+}
+
+.clarify-intro {
+  max-height: 168px;
+  overflow: auto;
+  padding: 8px 9px;
+  border-left: 2px solid #cfe2d9;
+  border-radius: 0 6px 6px 0;
+  background: #f3f8f5;
+  color: #5e6d67;
+  font-size: 12.5px;
+  line-height: 1.55;
+  white-space: pre-wrap;
 }
 
 .clarify-options {
@@ -9018,6 +9222,60 @@ body.is-file-preview-fullscreen .file-pane {
   white-space: nowrap;
 }
 
+/* 团队树：按 parentKey 展平后，用层级缩进表达归属；评审关系仍由任务链表达。 */
+.agent-row[data-depth="1"] { margin-left: 12px; width: calc(100% - 12px); }
+.agent-row[data-depth="2"] { margin-left: 24px; width: calc(100% - 24px); }
+.agent-row[data-depth="3"] { margin-left: 36px; width: calc(100% - 36px); }
+.agent-row[data-depth="1"]::before,
+.agent-row[data-depth="2"]::before,
+.agent-row[data-depth="3"]::before {
+  content: "";
+  position: absolute;
+  left: -7px;
+  top: 50%;
+  width: 6px;
+  height: 1px;
+  background: rgba(148, 226, 237, .28);
+}
+
+.agent-row {
+  position: relative;
+}
+
+.agent-role-badge {
+  flex: 0 0 auto;
+  padding: 1px 5px;
+  border: 1px solid rgba(148, 226, 237, .22);
+  border-radius: 999px;
+  color: #a9dbe2;
+  background: rgba(95, 214, 207, .08);
+  font-size: 9px;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+.agent-role-badge.is-producer { color: #9fe6cd; border-color: rgba(110, 218, 176, .32); }
+.agent-role-badge.is-critic { color: #f0c98a; border-color: rgba(228, 174, 91, .34); background: rgba(228, 174, 91, .08); }
+.agent-role-badge.is-researcher { color: #a9c9f2; border-color: rgba(126, 168, 226, .32); }
+.agent-role-badge.is-builder { color: #9fd3ef; border-color: rgba(108, 190, 232, .34); }
+.agent-role-badge.is-worker { color: #9bb6bd; border-color: rgba(148, 190, 198, .2); }
+
+.agent-chat-acceptance {
+  margin: 0 0 6px;
+  padding: 5px 8px;
+  border-left: 2px solid rgba(228, 174, 91, .45);
+  border-radius: 4px;
+  color: #c8b088;
+  background: rgba(228, 174, 91, .07);
+  font-size: 10px;
+  line-height: 1.45;
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  white-space: normal;
+}
+
 /* 右详情：一张大卡片，标题 / 事实 / 对话 / 页脚四段 */
 .team-detail {
   display: flex;
@@ -10068,12 +10326,17 @@ body.is-resizing-team-list {
 }
 
 .agent-row-line {
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
 }
 
 .agent-row-title {
   display: -webkit-box;
-  width: 100%;
+  flex: 1 1 auto;
+  min-width: 0;
+  width: auto;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
   color: var(--text);
@@ -11115,4 +11378,63 @@ body.is-resizing-team-list .team-list-resizer {
   .perm-switch-btn { font-size: 10px; }
   .perm-detail-facts { grid-template-columns: 1fr; gap: 1px; }
   .perm-detail-facts dt { margin-top: 3px; }
+}
+
+/* 加号附件菜单：从输入框上沿向上展开 */
+.composer-shell {
+  position: relative;
+}
+.add-trigger[aria-expanded='true'] {
+  background: var(--brand-soft);
+  color: var(--brand);
+}
+.add-menu {
+  position: absolute;
+  left: 2px;
+  bottom: calc(100% + 8px);
+  z-index: 30;
+  width: 184px;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--surface);
+  box-shadow: 0 18px 42px rgba(20, 30, 40, 0.16), 0 3px 10px rgba(20, 30, 40, 0.05);
+}
+.add-menu[hidden] { display: none; }
+.add-menu-title {
+  padding: 7px 10px 4px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+.add-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  height: 38px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+.add-menu-item svg {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  color: var(--muted);
+}
+.add-menu-item:hover,
+.add-menu-item:focus-visible {
+  background: var(--surface-2);
+  outline: none;
+}
+.add-menu-item:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--brand);
 }

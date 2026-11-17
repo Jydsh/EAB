@@ -33,6 +33,7 @@ import { startRetention } from './retention.js'
 import { pruneWorkspaceRecycle, workspaceRootFor } from './workspace-recycle.js'
 import { sweepOrphanAgentRuns, sweepSuspendedRuns } from './agent-runtime.js'
 import { recoverInterruptedAgentTasks } from './agent-team.js'
+import { startRestartTaskWakeRecovery } from './routes/chat.js'
 import { startScheduleWorker } from './schedule.js'
 import { startOrgSyncScheduler } from './org-sync-scheduler.js'
 import { startModelHealthMonitor, isModelHealthy, probeUnverifiedPluginModels, forgetModelHealth, probePluginChannelModels } from './model-health.js'
@@ -467,6 +468,8 @@ void refreshFeishuStream(deps).catch((error) => {
   console.warn('[eab] 飞书长连接启动失败：', (error as Error).message)
 })
 const stopFeishuStreamMonitor = startFeishuStreamMonitor(deps)
+/** 本次重启打断的后台任务：等服务稳定后唤醒父 Agent，由它决定是否从检查点继续。 */
+const stopRestartWakeRecovery = startRestartTaskWakeRecovery(deps, 15_000)
 
 /** 插件模型只有在真实回复探测通过后才进入模型目录。 */
 setPluginModelVisibilityResolver((companyId, modelId) => isModelHealthy(companyId, modelId))
@@ -599,6 +602,7 @@ async function shutdown(): Promise<void> {
   releaseDingTalkStreamLeadership()
   stopFeishuStreamMonitor()
   stopFeishuStream()
+  stopRestartWakeRecovery()
   await closeApps(apps)
   await closeBackends()
   processLock.release()

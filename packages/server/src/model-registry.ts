@@ -10,6 +10,13 @@
 import type { Db } from '@eab/storage'
 import { thinkingConfigOf, type ThinkingConfig } from './thinking.js'
 
+/**
+ * 普通模型未填写上下文 / 输出上限时的默认值，与 DSH 的 32K / 4K 默认口径一致。
+ * 插件模型不走这两个值：它们的窗口由 `resolveModel()` 自描述。
+ */
+export const DEFAULT_MODEL_MAX_CONTEXT = 32_768
+export const DEFAULT_MODEL_MAX_OUTPUT = 4_096
+
 export const MODEL_CAPABILITIES = [
   'chat',
   'reasoning',

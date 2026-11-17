@@ -8241,3 +8241,20 @@ table.data.tools-table td:first-child { padding-left: 18px; }
     white-space: normal;
   }
 }
+
+/* Agent 管理：容量与运行树合并为一个分区 */
+.agent-manage-block {
+  padding-top: 0;
+  margin-top: 0;
+  border-top: 0;
+}
+.agent-manage-block + .agent-manage-block {
+  padding-top: 16px;
+  margin-top: 18px;
+  border-top: 1px solid var(--line);
+}
+.agent-manage-subtitle {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+}

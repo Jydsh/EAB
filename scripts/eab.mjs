@@ -19,6 +19,7 @@
  */
 import { existsSync, readFileSync, mkdirSync, copyFileSync, readdirSync, writeFileSync, cpSync, renameSync, rmSync, statSync } from 'node:fs'
 import { spawn, spawnSync } from 'node:child_process'
+import { createConnection } from 'node:net'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -28,17 +29,32 @@ const SETTINGS_FILE = join(DEV_DIR, 'console-settings.json')
 
 function readNetworkSettings() {
   const defaults = { host: '127.0.0.1', chatPort: 8787, adminPort: 8788 }
+  const envHost = String(process.env.EAB_HOST ?? '').trim()
+  const envChat = Number(process.env.EAB_PORT)
+  const envAdmin = Number(process.env.EAB_ADMIN_PORT)
+  const port = (value, fallback) => (Number.isInteger(Number(value)) && Number(value) > 0 && Number(value) <= 65535 ? Number(value) : fallback)
   try {
-    if (!existsSync(SETTINGS_FILE)) return defaults
+    if (!existsSync(SETTINGS_FILE)) {
+      return {
+        host: envHost || defaults.host,
+        chatPort: port(envChat, defaults.chatPort),
+        adminPort: port(envAdmin, defaults.adminPort),
+      }
+    }
     const raw = JSON.parse(readFileSync(SETTINGS_FILE, 'utf8'))
-    const port = (value, fallback) => (Number.isInteger(Number(value)) && Number(value) > 0 && Number(value) <= 65535 ? Number(value) : fallback)
     return {
-      host: typeof raw.host === 'string' && raw.host.trim() ? raw.host.trim() : defaults.host,
-      chatPort: port(raw.chatPort, defaults.chatPort),
-      adminPort: port(raw.adminPort, defaults.adminPort),
+      // 环境变量优先：服务进程如果是由 EAB_PORT/EAB_ADMIN_PORT 启动的，
+      // stop/restart 必须停同一组端口，否则会去杀默认端口，旧服务永远退不掉。
+      host: envHost || (typeof raw.host === 'string' && raw.host.trim() ? raw.host.trim() : defaults.host),
+      chatPort: port(envChat, port(raw.chatPort, defaults.chatPort)),
+      adminPort: port(envAdmin, port(raw.adminPort, defaults.adminPort)),
     }
   } catch {
-    return defaults
+    return {
+      host: envHost || defaults.host,
+      chatPort: port(envChat, defaults.chatPort),
+      adminPort: port(envAdmin, defaults.adminPort),
+    }
   }
 }
 
@@ -165,8 +181,11 @@ async function backup(full = false) {
   console.log(`备份完成：${result.file}（${(result.size / 1024 / 1024).toFixed(2)} MB）`)
 }
 
-function stopService() {
-  const { chatPort, adminPort } = readNetworkSettings()
+/** 停止服务：显式端口参数优先，否则读控制台保存的网络设置。 */
+function stopService(flags = {}) {
+  const network = readNetworkSettings()
+  const chatPort = flags['chat-port'] !== undefined ? parsePort(flags['chat-port'], '员工对话端口') : network.chatPort
+  const adminPort = flags['admin-port'] !== undefined ? parsePort(flags['admin-port'], '管理控制台端口') : network.adminPort
   const ports = [chatPort, adminPort]
   if (process.platform === 'win32') {
     return new Promise((resolvePromise, reject) => {
@@ -197,6 +216,31 @@ function stopService() {
     }
   }
   return Promise.resolve('STOPPED')
+}
+
+/** 重启前确认端口真的释放；只看 `stop` 的返回码会误以为旧进程已经退出。 */
+function waitPortFree(port, timeoutMs = 15000) {
+  const end = Date.now() + timeoutMs
+  return new Promise((resolvePromise) => {
+    const tryOnce = () => {
+      const socket = createConnection({ host: '127.0.0.1', port })
+      socket.setTimeout(1200)
+      socket.once('connect', () => {
+        socket.destroy()
+        if (Date.now() > end) resolvePromise(false)
+        else setTimeout(tryOnce, 500)
+      })
+      socket.once('timeout', () => {
+        socket.destroy()
+        resolvePromise(Date.now() > end ? false : true)
+      })
+      socket.once('error', () => {
+        socket.destroy()
+        resolvePromise(true)
+      })
+    }
+    tryOnce()
+  })
 }
 
 function parsePort(value, label) {
@@ -242,7 +286,8 @@ async function server(flags) {
   const background = flags.background === true || flags.background === '1'
   if (background) {
     if (process.platform === 'win32') {
-      // `start /b` 让进程脱离当前终端；直接 detached spawn 会被任务/终端退出连带回收。
+      // `start /b` 让进程脱离当前终端；必须用当前 node 的绝对路径，避免控制台/
+      // 工具进程的 PATH 里没有 node 时后台启动静默失败。
       const child = spawn('cmd.exe', ['/c', 'start', '', '/b', process.execPath, script, 'server'], {
         cwd: ROOT,
         env,
@@ -288,7 +333,14 @@ async function server(flags) {
 }
 
 async function restart(flags) {
-  console.log(`服务：${await stopService()}`)
+  console.log(`服务：${await stopService(flags)}`)
+  const network = readNetworkSettings()
+  const chatPort = flags['chat-port'] !== undefined ? parsePort(flags['chat-port'], '员工对话端口') : network.chatPort
+  const adminPort = flags['admin-port'] !== undefined ? parsePort(flags['admin-port'], '管理控制台端口') : network.adminPort
+  const [chatFree, adminFree] = await Promise.all([waitPortFree(chatPort), waitPortFree(adminPort)])
+  if (!chatFree || !adminFree) {
+    throw new Error(`端口未释放：员工端 ${chatPort}${chatFree ? '' : '（占用）'} / 控制台 ${adminPort}${adminFree ? '' : '（占用）'}，已中止重启`)
+  }
   await server(flags)
 }
 
@@ -591,7 +643,7 @@ try {
     await restart(flags)
   } else if (command === 'stop') {
     assertServerSubcommand(sub, 'stop')
-    console.log(`服务：${await stopService()}`)
+    console.log(`服务：${await stopService(flags)}`)
   } else if (command === 'update') {
     await update(flags)
   } else if (command === 'install-cli') {

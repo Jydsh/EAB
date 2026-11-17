@@ -358,8 +358,15 @@ const state = {
   /** 右键“编辑后重发”暂存的消息；下一次发送会先回退并替换它 */
   messageEdit: null,
   liveEventSource: null,
+  /** EventSource 至少成功连过一次；下一次 open 说明是重连，需要和服务端对账。 */
+  liveEventSourceOpenedOnce: false,
   sessionRefreshTimer: 0,
   files: [],
+  /** 云空间列表并发刷新与 300ms 合并；避免 SSE 连续事件打出多组请求。 */
+  workspaceLoadPromise: null,
+  workspaceRefreshTimer: 0,
+  workspaceRefreshPending: false,
+  workspaceVisibilityBound: false,
   /** 云空间上传队列：每个文件有独立进度、状态和错误，刷新页面后清空。 */
   wsUploads: [],
   wsUploadHideTimer: 0,
@@ -382,6 +389,8 @@ const state = {
   agentRuns: new Map(),
   /** 父 Agent 名称，用于团队标题 */
   agentParentName: '',
+  /** 团队容量：{ active, limit, waitingTtlMs, retentionMs }，由 /api/chat/agents 返回 */
+  agentCapacity: null,
   /** 当前回合的根 run */
   agentParentRunId: '',
   /** 团队列表里被选中、详情窗口正在展示的子 Agent */
@@ -916,15 +925,94 @@ function attachLiveTurnForSession(sessionId) {
   if (runtime?.turn) runtime.turn.appendToThread()
 }
 
-async function loadActiveRuns() {
+async function fetchActiveRuns() {
   try {
     const data = await api(`/api/chat/runs/active${qs()}`)
-    for (const run of data.runs || []) {
-      if (!run?.messageId) continue
-      state.activeRunSnapshots.set(run.messageId, run)
-    }
+    return Array.isArray(data.runs) ? data.runs : []
   } catch {
     // 恢复失败不阻塞页面；历史消息仍然可用
+    return null
+  }
+}
+
+async function loadActiveRuns() {
+  const runs = await fetchActiveRuns()
+  if (!runs) return
+  for (const run of runs) {
+    if (!run?.messageId) continue
+    state.activeRunSnapshots.set(run.messageId, run)
+  }
+}
+
+/**
+ * EventSource 重连后和服务端对账：服务端内存里的运行态已经随重启清空，
+ * 本地还标着 running 的气泡必须收口成“已中断”，否则页面会一直显示正在生成。
+ * 先查一次会话历史：如果这一轮其实已经在断线期间落库，就只清理本地运行态，
+ * 不误判成中断；查不到才提示重新发送。
+ */
+async function recentAssistantMessages(sessionId) {
+  try {
+    const data = await api(qsAppend(`/api/chat/sessions/${encodeURIComponent(sessionId)}/messages?limit=20`))
+    return new Map(
+      (data.messages || [])
+        .filter((message) => message?.role === 'assistant' && String(message.id || '').trim())
+        .map((message) => [String(message.id), message]),
+    )
+  } catch {
+    return new Map()
+  }
+}
+
+async function reconcileActiveRunsAfterReconnect() {
+  const previous = new Map(state.activeRunSnapshots)
+  const runs = await fetchActiveRuns()
+  if (!runs) return
+  const activeIds = new Set()
+  for (const run of runs) {
+    if (!run?.messageId) continue
+    activeIds.add(String(run.messageId))
+    state.activeRunSnapshots.set(run.messageId, run)
+  }
+  const assistantsBySession = new Map()
+  for (const [messageId, snapshot] of previous) {
+    if (activeIds.has(messageId)) continue
+    if (snapshot?.status !== 'running') {
+      state.activeRunSnapshots.delete(messageId)
+      continue
+    }
+    state.activeRunSnapshots.delete(messageId)
+    const entry = state.liveTurns.get(messageId)
+    if (!entry) continue
+    state.liveTurns.delete(messageId)
+    const sessionId = String(snapshot.sessionId || entry.sessionId || '')
+    let assistants = assistantsBySession.get(sessionId)
+    if (!assistants && sessionId) {
+      assistants = await recentAssistantMessages(sessionId)
+      assistantsBySession.set(sessionId, assistants)
+    }
+    const persisted = assistants?.get(messageId)
+    if (persisted) {
+      // 断线期间已经落库：用落库正文收尾并保留已渲染的工具/思考记录，不误判成中断。
+      state.historyMessageIds.add(messageId)
+      entry.turn.node.chatMessage = {
+        id: messageId,
+        role: 'assistant',
+        text: String(persisted.text || ''),
+        createdAt: persisted.createdAt || new Date().toISOString(),
+      }
+      entry.turn.finish({
+        text: persisted.text || '',
+        modelId: persisted.modelId || '',
+        modelName: persisted.modelName || '',
+        autoSelected: persisted.meta?.autoSelected === true,
+        citations: persisted.meta?.citations,
+        createdAt: persisted.createdAt,
+        clarify: null,
+      })
+      refreshMessageActions(entry.turn.node)
+      continue
+    }
+    entry.turn.fail('服务已重启，这一轮回复已中断，请重新发送。', '连接已恢复')
   }
 }
 
@@ -979,6 +1067,13 @@ function setupChatEvents() {
   if (state.liveEventSource || typeof EventSource === 'undefined') return
   const source = new EventSource(`/api/chat/events${qs()}`)
   state.liveEventSource = source
+  source.onopen = () => {
+    if (!state.liveEventSourceOpenedOnce) {
+      state.liveEventSourceOpenedOnce = true
+      return
+    }
+    void reconcileActiveRunsAfterReconnect()
+  }
   const remoteLive = $('#remote-live')
   if (remoteLive) {
     remoteLive.addEventListener('click', () => {
@@ -1141,10 +1236,31 @@ function setupChatEvents() {
   source.addEventListener('models', () => {
     void refreshModelCatalog()
   })
-  // SSE 首次连上或断线重连后补一次，覆盖“连接建立前目录已变化”的空档。
+  // 云空间文件变化：列表主动刷新；删除事件同时就地更新消息卡片。
+  source.addEventListener('workspace', (event) => {
+    let payload = null
+    try {
+      payload = JSON.parse(event.data || '{}')
+    } catch {
+      payload = null
+    }
+    handleWorkspaceFilesEvent(payload)
+  })
+  // SSE 首次连上或断线重连后补一次，覆盖“连接建立前目录/文件已变化”的空档。
   source.addEventListener('ready', () => {
     void refreshModelCatalog()
+    scheduleWorkspaceRefresh()
   })
+  if (!state.workspaceVisibilityBound) {
+    state.workspaceVisibilityBound = true
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) return
+      if (state.workspaceRefreshPending) {
+        state.workspaceRefreshPending = false
+        scheduleWorkspaceRefresh()
+      }
+    })
+  }
 
   // EventSource 会自己重连；这里不主动 close，避免服务重启后永久失去推送。
   source.addEventListener('error', () => {
@@ -1428,6 +1544,7 @@ async function loadPersistedAgentTeam(sessionId, seq) {
     if (seq !== agentTeamPollSeq || state.sessionId !== sessionId) return
     const workers = Array.isArray(data.workers) ? data.workers : []
     const tasks = Array.isArray(data.tasks) ? data.tasks : []
+    state.agentCapacity = data.capacity && typeof data.capacity === 'object' ? data.capacity : null
     if (workers.length === 0) {
       renderAgentDock()
       return
@@ -1476,6 +1593,11 @@ async function loadPersistedAgentTeam(sessionId, seq) {
         title: worker.name || previous.title || worker.key,
         modelId: worker.modelId || previous.modelId || '',
         modelName: worker.modelName || previous.modelName || '',
+        role: worker.role || previous.role || 'worker',
+        parentKey: worker.parentKey !== undefined ? worker.parentKey : (previous.parentKey ?? null),
+        depth: Number(worker.depth) || previous.depth || 1,
+        acceptance: worker.acceptance || previous.acceptance || '',
+        pinned: worker.pinned !== undefined ? Boolean(worker.pinned) : Boolean(previous.pinned),
         status,
         text: lastText || previous.text || '',
         thread,
@@ -1903,23 +2025,82 @@ async function deleteSession(sessionId) {
 
 /* ---------------- 个人工作区（上传文件 + 对话写入文件） ---------------- */
 
-async function loadWorkspaceFiles() {
-  try {
-    const [data, quota] = await Promise.all([
-      api(`/api/workspace/files${qs()}`),
-      api(`/api/workspace/quota${qs()}`).catch(() => null),
-    ])
-    state.files = data.items || []
-    if (state.me) $('#side-files').hidden = false
-    renderWorkspaceFiles()
-    if (quota) {
-      renderWorkspaceQuota(quota)
-      maybeWarnWorkspaceQuota(quota)
-    }
-  } catch (err) {
-    state.files = []
-    $('#ws-list').innerHTML = `<div class="muted" style="font-size:12px;padding:4px">${esc(err.message)}</div>`
+async function loadWorkspaceFiles(options = {}) {
+  const silent = options.silent === true
+  if (state.workspaceLoadPromise) {
+    state.workspaceRefreshPending = true
+    return state.workspaceLoadPromise
   }
+  if (silent && document.hidden) {
+    state.workspaceRefreshPending = true
+    return null
+  }
+  const list = $('#ws-list')
+  const scrollTop = silent && list ? list.scrollTop : 0
+  const promise = (async () => {
+    try {
+      const [data, quota] = await Promise.all([
+        api(`/api/workspace/files${qs()}`),
+        api(`/api/workspace/quota${qs()}`).catch(() => null),
+      ])
+      state.files = data.items || []
+      if (state.me) $('#side-files').hidden = false
+      renderWorkspaceFiles()
+      if (silent && list) list.scrollTop = scrollTop
+      if (quota) {
+        renderWorkspaceQuota(quota)
+        maybeWarnWorkspaceQuota(quota)
+      }
+    } catch (err) {
+      // 后台静默刷新失败不能把已有列表清空，否则网络抖动一下界面就空了。
+      if (!silent) {
+        state.files = []
+        const box = $('#ws-list')
+        if (box) box.innerHTML = `<div class="muted" style="font-size:12px;padding:4px">${esc(err.message)}</div>`
+      }
+    }
+  })()
+  state.workspaceLoadPromise = promise
+  try {
+    return await promise
+  } finally {
+    state.workspaceLoadPromise = null
+    if (state.workspaceRefreshPending && !document.hidden) {
+      state.workspaceRefreshPending = false
+      scheduleWorkspaceRefresh()
+    }
+  }
+}
+
+/** SSE 连续事件、重连、页面重新可见都走这里：300ms 合并，一次请求。 */
+function scheduleWorkspaceRefresh() {
+  if (!state.me) return
+  if (document.hidden) {
+    state.workspaceRefreshPending = true
+    return
+  }
+  if (state.workspaceRefreshTimer) return
+  state.workspaceRefreshTimer = window.setTimeout(() => {
+    state.workspaceRefreshTimer = 0
+    void loadWorkspaceFiles({ silent: true })
+  }, 300)
+}
+
+function handleWorkspaceFilesEvent(payload) {
+  const reason = String(payload?.reason || '')
+  const fileIds = Array.isArray(payload?.fileIds) ? payload.fileIds.map(String) : []
+  if (reason === 'deleted' && fileIds.length > 0) {
+    markAttachmentCardsDeleted(fileIds)
+    const deleted = new Set(fileIds)
+    state.files = state.files.filter((file) => !deleted.has(String(file.id)))
+    renderWorkspaceFiles()
+    if (state.filePreview && deleted.has(String(state.filePreview.id))) {
+      stopWorkspacePreviewWatch()
+      closeWorkspaceFile()
+      banner('当前预览的文件已从云空间删除', 'warn')
+    }
+  }
+  scheduleWorkspaceRefresh()
 }
 
 function renderWorkspaceQuota(quota) {
@@ -2015,9 +2196,9 @@ function renderSpaceChip() {
   chip.setAttribute('aria-label', `文件空间：${state.spaceLabel}`)
 }
 
-function applySessionSpace(session) {
-  const saved = session?.space_kind
-  state.spaceKind = saved === 'none' ? 'none' : 'cloud'
+/** 文件空间固定为云空间：输入区不再提供切换入口，历史会话也统一回到默认。 */
+function applySessionSpace(_session) {
+  state.spaceKind = 'cloud'
   renderSpaceChip()
 }
 
@@ -2242,24 +2423,75 @@ function deleteWorkspaceFile(file, fromPreview = false) {
   overlay.innerHTML = `<div class="modal">
     <div class="modal-head"><h3>删除文件</h3><button class="modal-x" type="button">×</button></div>
     <p class="hint">「${esc(file.name)}」会移到回收区并保留元数据，后台按回收区保留天数自动物理清理；设为 0 时永久保留。</p>
+    <div class="install-progress" id="ws-delete-progress" hidden role="progressbar" aria-label="删除进度" aria-live="polite">
+      <div class="install-progress-track"><span class="install-progress-bar"></span></div>
+      <div class="install-progress-meta"><span id="ws-delete-progress-text">正在删除…</span><span id="ws-delete-progress-time" class="mono">0s</span></div>
+    </div>
     <div class="modal-state" id="ws-delete-state"></div>
     <div class="modal-actions"><button class="btn ghost" type="button" id="ws-delete-cancel">取消</button><button class="btn danger" type="button" id="ws-delete-confirm">删除</button></div>
   </div>`
   document.body.appendChild(overlay)
-  const close = () => overlay.remove()
   const stateEl = overlay.querySelector('#ws-delete-state')
-  overlay.querySelector('.modal-x').addEventListener('click', close)
-  overlay.querySelector('#ws-delete-cancel').addEventListener('click', close)
-  overlay.querySelector('#ws-delete-confirm').addEventListener('click', async () => {
+  const progressEl = overlay.querySelector('#ws-delete-progress')
+  const progressText = overlay.querySelector('#ws-delete-progress-text')
+  const progressTime = overlay.querySelector('#ws-delete-progress-time')
+  const confirmBtn = overlay.querySelector('#ws-delete-confirm')
+  const cancelBtn = overlay.querySelector('#ws-delete-cancel')
+  const closeBtn = overlay.querySelector('.modal-x')
+  let progressTimer = null
+  let progressStartedAt = 0
+  const stopProgress = () => {
+    if (progressTimer) clearInterval(progressTimer)
+    progressTimer = null
+  }
+  const close = () => {
+    stopProgress()
+    overlay.remove()
+  }
+  const setBusy = (busy) => {
+    confirmBtn.disabled = busy
+    cancelBtn.disabled = busy
+    closeBtn.disabled = busy
+  }
+  const startProgress = (text) => {
+    progressEl.hidden = false
+    progressEl.classList.remove('is-done')
+    progressText.textContent = text
+    progressTime.textContent = '0s'
+    progressStartedAt = Date.now()
+    stopProgress()
+    progressTimer = setInterval(() => {
+      progressTime.textContent = `${Math.max(0, Math.floor((Date.now() - progressStartedAt) / 1000))}s`
+    }, 1000)
+  }
+  const finishProgress = (text) => {
+    stopProgress()
+    progressEl.hidden = false
+    progressEl.classList.add('is-done')
+    progressText.textContent = text
+    progressTime.textContent = '完成'
+  }
+  closeBtn.addEventListener('click', close)
+  cancelBtn.addEventListener('click', close)
+  confirmBtn.addEventListener('click', async () => {
+    if (confirmBtn.disabled) return
+    setBusy(true)
     stateEl.className = 'modal-state muted'
-    stateEl.textContent = '正在删除…'
+    stateEl.textContent = ''
+    startProgress('正在删除…')
     try {
       await api(`/api/workspace/files/${encodeURIComponent(file.id)}${qs()}`, { method: 'DELETE' })
+      finishProgress('已移入回收区')
+      setBusy(false)
+      await new Promise((resolve) => setTimeout(resolve, 240))
       close()
       if (fromPreview && state.filePreview?.id === file.id) closeWorkspaceFile()
       await loadWorkspaceFiles()
       banner('文件已移到回收区', 'ok')
     } catch (err) {
+      stopProgress()
+      progressEl.hidden = true
+      setBusy(false)
       stateEl.className = 'modal-state bad'
       stateEl.textContent = err.message || '删除失败'
     }
@@ -2962,6 +3194,11 @@ function updateAgentEvent(data) {
     modelId: data.modelId || previous.modelId || '',
     modelName: data.modelName || previous.modelName || '',
     modelReason: data.modelReason || previous.modelReason || '',
+    role: data.role || previous.role || 'worker',
+    parentKey: data.parentKey !== undefined ? data.parentKey : (previous.parentKey ?? null),
+    depth: Number(data.depth) || previous.depth || 1,
+    acceptance: data.acceptance || previous.acceptance || '',
+    pinned: data.pinned !== undefined ? Boolean(data.pinned) : Boolean(previous.pinned),
     status: data.status === 'unregistered' ? 'done' : (data.status || previous.status || 'running'),
     assign: data.action === 'assign' ? String(data.text || '').slice(0, 1200) : previous.assign || '',
     text: previous.text || '',
@@ -3186,17 +3423,63 @@ function agentStatusShort(status) {
 }
 
 /** 团队列表里的一行：左边编号，右边标题 + 进度，状态靠右 */
+function agentRoleLabel(role) {
+  const labels = {
+    producer: '产出',
+    critic: '评审',
+    researcher: '调研',
+    builder: '实现',
+    worker: '执行',
+  }
+  return labels[role] || role || '执行'
+}
+
+/** 按 parentKey 拼出团队树，再展平成列表；孤儿节点当根，避免坏数据丢行。 */
+function sortAgentRunsAsTree(runs) {
+  const keyed = new Map()
+  for (const run of runs) {
+    if (run.key) keyed.set(run.key, run)
+  }
+  const children = new Map()
+  const roots = []
+  const visited = new Set()
+  for (const run of runs) {
+    const parent = run.parentKey ? keyed.get(run.parentKey) : null
+    if (parent && parent !== run && parent.childId !== run.childId) {
+      const list = children.get(parent.childId) || []
+      list.push(run)
+      children.set(parent.childId, list)
+    } else {
+      roots.push(run)
+    }
+  }
+  const byIndex = (a, b) => (Number(a.index) || 0) - (Number(b.index) || 0)
+  const flat = []
+  const walk = (run) => {
+    if (!run || visited.has(run.childId)) return
+    visited.add(run.childId)
+    flat.push(run)
+    ;(children.get(run.childId) || []).sort(byIndex).forEach(walk)
+  }
+  roots.sort(byIndex).forEach(walk)
+  // 环路或父节点缺失时，把没走到的行补在末尾，不能让它们从面板消失。
+  for (const run of runs.slice().sort(byIndex)) walk(run)
+  return flat
+}
+
 function agentListRowHtml(run, selected) {
   const status = run.status || 'running'
   const time = run.durationMs ? formatElapsed(run.durationMs) : ''
   const meta = [run.key, `${run.toolCount || 0} 次工具`, time].filter(Boolean).join(' · ')
   const latest = [...(run.thread || [])].reverse().find((entry) => entry.kind === 'content' || entry.kind === 'report')
   const preview = firstLinePreview(latest?.text || run.text || '', 56).slice(0, 48)
-  return `<button class="agent-row ${agentStatusClass(status)}${selected ? ' is-selected' : ''}" type="button" role="listitem" data-agent-select="${esc(run.childId)}" aria-current="${selected ? 'true' : 'false'}" title="${esc(run.title)}">
+  const depth = Math.max(0, Math.min(3, (Number(run.depth) || 1) - 1))
+  return `<button class="agent-row ${agentStatusClass(status)}${selected ? ' is-selected' : ''}" type="button" role="listitem" data-agent-select="${esc(run.childId)}" data-depth="${depth}" aria-current="${selected ? 'true' : 'false'}" title="${esc(run.title)}">
     <span class="agent-row-index">${String(run.index || 1).padStart(2, '0')}</span>
     <span class="agent-row-body">
       <span class="agent-row-line">
         <strong class="agent-row-title">${esc(run.title)}</strong>
+        <span class="agent-role-badge is-${esc(run.role || 'worker')}">${esc(agentRoleLabel(run.role))}</span>
       </span>
       <span class="agent-row-meta">
         <span class="agent-row-state"><span class="agent-status-dot" aria-hidden="true"></span>${agentStatusShort(status)}</span>
@@ -3439,8 +3722,10 @@ function agentDetailHtml(run) {
   const model = run.modelName || run.modelId || '自动分配'
   const key = run.key || ''
   const facts = [
+    `<span class="agent-role-badge is-${esc(run.role || 'worker')}">${esc(agentRoleLabel(run.role))}</span>`,
     `<span class="agent-chat-fact" title="${esc(run.modelReason || '')}"><b>${esc(model)}</b></span>`,
     `<span class="agent-chat-fact">${Number(run.toolCount) || 0} 次工具</span>`,
+    run.pinned ? '<span class="agent-chat-fact">固定岗位</span>' : '',
     run.durationMs ? `<span class="agent-chat-fact">${formatElapsed(run.durationMs)}</span>` : '',
   ].filter(Boolean).join('')
   const hint = status === 'waiting'
@@ -3458,6 +3743,7 @@ function agentDetailHtml(run) {
       <span class="agent-chat-state"><span class="agent-status-dot" aria-hidden="true"></span>${agentStatusText(status)}</span>
     </header>
     <div class="agent-chat-facts">${facts}</div>
+    ${run.acceptance ? `<div class="agent-chat-acceptance" title="${esc(run.acceptance)}">验收：${esc(run.acceptance)}</div>` : ''}
     <div class="agent-chat-thread" role="log" aria-live="polite">
       ${thread || `<p class="agent-chat-placeholder">${status === 'running' ? '等待子 Agent 的第一条消息…' : '还没有对话记录。'}</p>`}
     </div>
@@ -3492,7 +3778,7 @@ function renderAgentDock() {
   const split = $('#team-split')
   const summary = $('#team-summary')
   if (!pane || !list || !detail) return
-  const runs = [...state.agentRuns.values()].sort((a, b) => (a.index || 0) - (b.index || 0))
+  const runs = sortAgentRunsAsTree([...state.agentRuns.values()])
   const empty = $('#team-empty')
   if (empty) empty.hidden = runs.length > 0
   if (split) split.hidden = runs.length === 0
@@ -3507,12 +3793,15 @@ function renderAgentDock() {
   } else {
     const active = runs.filter((run) => (run.status || 'running') === 'running').length
     const waiting = runs.filter((run) => run.status === 'waiting').length
+    const capacity = state.agentCapacity && Number(state.agentCapacity.limit) > 0
+      ? ` / ${Number(state.agentCapacity.limit)} 岗位`
+      : ''
     if (summary) {
       summary.textContent = waiting > 0
-        ? `${active} 工作中 · ${waiting} 待回答 · 共 ${runs.length} 个`
+        ? `${active} 工作中 · ${waiting} 待回答 · 共 ${runs.length}${capacity}`
         : active > 0
-          ? `${active} 工作中 · 共 ${runs.length} 个子 Agent`
-          : `${runs.length} 个子 Agent · 已全部完成`
+          ? `${active} 工作中 · 共 ${runs.length}${capacity}`
+          : `${runs.length}${capacity} · 已全部完成`
     }
     const parent = $('#team-manager-name')
     if (parent) parent.textContent = `主 Agent · ${state.agentParentName || '当前对话'}`
@@ -5017,9 +5306,20 @@ function activePreviewFilePayload() {
 }
 
 async function openWorkspaceFile(id, options = {}) {
-  const file = state.files.find((item) => item.id === id)
+  let file = state.files.find((item) => item.id === id)
   if (!file) {
-    banner('文件已不存在，列表可能刚被刷新', 'bad')
+    // 消息卡片可能在列表刷新前就被点击；按 ID 拉一次，不把“刚发完的附件”误判成不存在。
+    try {
+      file = await api(`/api/workspace/files/${encodeURIComponent(id)}${qs()}`)
+      if (file?.id && !state.files.some((item) => item.id === file.id)) state.files.unshift(file)
+    } catch {
+      banner('文件已不存在，可能已从云空间删除', 'bad')
+      await loadWorkspaceFiles()
+      return
+    }
+  }
+  if (!file) {
+    banner('文件已不存在，可能已从云空间删除', 'bad')
     await loadWorkspaceFiles()
     return
   }
@@ -8579,14 +8879,103 @@ function batchCardHtml(batch, options = {}) {
   </div>`
 }
 
+function attachmentDisplayName(file) {
+  return String(file?.workspaceName || file?.name || '附件')
+}
+
+function attachmentDisplaySize(file) {
+  const value = file?.workspaceSize ?? file?.size
+  return Number.isFinite(Number(value)) ? fmtSize(Number(value)) : ''
+}
+
+/** 消息卡片只内联栅格图片；SVG/PDF/Office 走文件卡，不生成 img。 */
+function isRasterImageAttachment(file) {
+  const mime = String(file?.workspaceMime || file?.type || '').toLowerCase()
+  if (/^image\/(png|jpeg|jpg|webp|gif|avif|bmp)$/.test(mime)) return true
+  return /\.(png|jpe?g|webp|gif|avif|bmp)$/i.test(attachmentDisplayName(file))
+}
+
+function attachmentPreviewUrl(file) {
+  const id = String(file?.workspaceFileId || '').trim()
+  if (!id) return ''
+  return `/api/workspace/files/${encodeURIComponent(id)}/preview${qs()}`
+}
+
+function attachmentKindLabel(file) {
+  const name = attachmentDisplayName(file)
+  const ext = (name.split('.').pop() || '').toLowerCase()
+  const labels = {
+    pdf: 'PDF', doc: 'DOC', docx: 'DOC', xls: 'XLS', xlsx: 'XLS', xlsm: 'XLS',
+    ppt: 'PPT', pptx: 'PPT', txt: 'TXT', md: 'MD', csv: 'CSV', json: 'JSON',
+    zip: 'ZIP', rar: 'RAR', '7z': '7Z', png: 'IMG', jpg: 'IMG', jpeg: 'IMG',
+    webp: 'IMG', gif: 'GIF', svg: 'SVG', mp4: 'VID', mov: 'VID', mp3: 'AUD', wav: 'AUD',
+  }
+  return labels[ext] || (ext ? ext.slice(0, 4).toUpperCase() : 'FILE')
+}
+
+const ATTACHMENT_TRASH_ICON =
+  '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V5h6v2M7 7l1 12h8l1-12" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M10 10v6M14 10v6" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>'
+
+function deletedAttachmentHtml(file) {
+  const id = String(file?.workspaceFileId || '').trim()
+  const name = attachmentDisplayName(file)
+  const size = attachmentDisplaySize(file)
+  return `<div class="bubble-attach is-deleted" role="img" aria-label="${esc(name)}已从云空间删除"${id ? ` data-attachment-file-id="${esc(id)}"` : ''} data-attachment-name="${esc(name)}" data-attachment-size="${esc(size)}">
+    <span class="bubble-attach-icon is-deleted">${ATTACHMENT_TRASH_ICON}</span>
+    <span class="bubble-attach-body"><span class="bubble-attach-name">已被删除</span><span class="bubble-attach-meta">${esc(name)} · 已从云空间删除</span></span>
+  </div>`
+}
+
+function pendingAttachmentHtml(file) {
+  return `<div class="bubble-attach is-pending" data-attachment-key="${esc(file.clientUploadId || '')}" aria-label="${esc(attachmentDisplayName(file))}正在保存到云空间">
+    <span class="bubble-attach-spinner" aria-hidden="true"></span>
+    <span class="bubble-attach-body"><span class="bubble-attach-name">${esc(attachmentDisplayName(file))}</span><span class="bubble-attach-meta">正在保存到云空间…</span></span>
+  </div>`
+}
+
+function unsavedAttachmentHtml(file) {
+  const reason = String(file?.workspaceError || '').trim()
+  return `<div class="bubble-attach is-unsaved" data-attachment-key="${esc(file.clientUploadId || '')}" role="group" aria-label="${esc(attachmentDisplayName(file))}未保存到云空间">
+    <span class="bubble-attach-icon is-unsaved" aria-hidden="true">!</span>
+    <span class="bubble-attach-body"><span class="bubble-attach-name">${esc(attachmentDisplayName(file))}</span><span class="bubble-attach-meta">${esc(attachmentDisplaySize(file))}${reason ? ` · ${esc(reason)}` : ' · 未保存到云空间'}</span></span>
+  </div>`
+}
+
+function attachmentCardHtml(file) {
+  const status = String(file?.workspaceStatus || '')
+  const id = String(file?.workspaceFileId || '').trim()
+  const name = attachmentDisplayName(file)
+  const size = attachmentDisplaySize(file)
+  if (status === 'deleted' || status === 'missing') return deletedAttachmentHtml(file)
+  if (status === 'forbidden') {
+    return `<div class="bubble-attach is-deleted" role="img" aria-label="${esc(name)}无权访问"${id ? ` data-attachment-file-id="${esc(id)}"` : ''} data-attachment-name="${esc(name)}">
+      <span class="bubble-attach-icon is-deleted" aria-hidden="true">!</span>
+      <span class="bubble-attach-body"><span class="bubble-attach-name">无权访问</span><span class="bubble-attach-meta">${esc(name)}</span></span>
+    </div>`
+  }
+  if (status === 'pending') return pendingAttachmentHtml(file)
+  if (status === 'unsaved') return unsavedAttachmentHtml(file)
+  if (!id) {
+    // 旧消息没有 workspaceFileId，保持原来的文字 chip；不强行补预览。
+    return `<span>${esc(name)} · ${esc(size)}${file.batchId ? ' · 已接管' : ''}</span>`
+  }
+  if (isRasterImageAttachment(file)) {
+    const url = attachmentPreviewUrl(file)
+    return `<button class="bubble-attach is-image" type="button" data-attachment-open="${esc(id)}" data-attachment-file-id="${esc(id)}" data-attachment-name="${esc(name)}" data-attachment-size="${esc(size)}" aria-label="预览图片 ${esc(name)}">
+      <img src="${esc(url)}" alt="${esc(name)}" loading="lazy" decoding="async">
+      <span class="bubble-attach-caption"><span class="bubble-attach-name">${esc(name)}</span><span class="bubble-attach-meta">${esc(size)} · 点击预览</span></span>
+    </button>`
+  }
+  return `<button class="bubble-attach is-file" type="button" data-attachment-open="${esc(id)}" data-attachment-file-id="${esc(id)}" data-attachment-name="${esc(name)}" data-attachment-size="${esc(size)}" aria-label="预览文件 ${esc(name)}">
+    <span class="bubble-attach-icon" data-kind="${esc(attachmentKindLabel(file))}" aria-hidden="true">${esc(attachmentKindLabel(file))}</span>
+    <span class="bubble-attach-body"><span class="bubble-attach-name">${esc(name)}</span><span class="bubble-attach-meta">${esc(size)} · 已保存到云空间</span></span>
+    <span class="bubble-attach-open" aria-hidden="true">›</span>
+  </button>`
+}
+
 function attachmentChips(list) {
-  const chips = list
-    .map(
-      (file) =>
-        `<span>${esc(file.name)} · ${esc(fmtSize(file.size))}${file.batchId ? ' · 已接管' : ''}</span>`,
-    )
-    .join('')
-  const batches = list
+  const cards = (Array.isArray(list) ? list : []).map((file) => attachmentCardHtml(file)).join('')
+  const batches = (Array.isArray(list) ? list : [])
     .filter((file) => file.batchId)
     .map((file) =>
       batchCardHtml(
@@ -8595,7 +8984,48 @@ function attachmentChips(list) {
       ),
     )
     .join('')
-  return chips + batches
+  return cards + batches
+}
+
+/** 消息气泡里的附件卡用事件委托，重绘 innerHTML 后仍可点击。 */
+function bindAttachmentCards(node) {
+  if (!node || node.dataset.attachmentClickBound === '1') return
+  node.dataset.attachmentClickBound = '1'
+  node.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-attachment-open]')
+    if (!button || !node.contains(button)) return
+    event.preventDefault()
+    void openWorkspaceFile(String(button.dataset.attachmentOpen || ''))
+  })
+}
+
+function updateAttachmentCards(node, list) {
+  if (!node) return
+  node.chatAttachments = Array.isArray(list) ? list : []
+  const files = node.querySelector('.bubble-files')
+  if (!files) return
+  files.innerHTML = attachmentChips(node.chatAttachments)
+  bindAttachmentCards(node)
+}
+
+/** 云空间删除事件：消息卡片就地变成“已被删除”，不重新加载整段历史。 */
+function markAttachmentCardsDeleted(fileIds) {
+  const ids = new Set((fileIds || []).map((id) => String(id || '').trim()).filter(Boolean))
+  if (ids.size === 0) return
+  for (const card of document.querySelectorAll('[data-attachment-file-id]')) {
+    const id = String(card.dataset.attachmentFileId || '')
+    if (!ids.has(id)) continue
+    const file = {
+      workspaceFileId: id,
+      workspaceName: card.dataset.attachmentName || '',
+      workspaceSize: card.dataset.attachmentSize || '',
+      workspaceStatus: 'deleted',
+    }
+    const wrapper = document.createElement('div')
+    wrapper.innerHTML = deletedAttachmentHtml(file)
+    const next = wrapper.firstElementChild
+    if (next) card.replaceWith(next)
+  }
 }
 
 function formatElapsed(ms) {
@@ -9880,6 +10310,7 @@ function clarifyPanelHtml(clarify, options = {}) {
   const current = total > 0 ? (questions[index] || {}) : clarify
   const kind = current.kind === 'multiple' || current.kind === 'text' ? current.kind : 'single'
   const question = String(current.question || '').trim()
+  const intro = total > 0 && index > 0 ? '' : String(clarify.intro || '').trim()
   const optionsList = Array.isArray(current.options) ? current.options.slice(0, 4) : []
   if (!question) return ''
   if (kind !== 'text' && optionsList.length < 2) return ''
@@ -9951,6 +10382,7 @@ function clarifyPanelHtml(clarify, options = {}) {
     : ''
   return `<div class="clarify-card${docked ? ' is-docked' : ''}" role="group" aria-label="${esc(head)}" data-clarify-kind="${kind}" data-clarify-total="${total}" data-clarify-index="${index}">
     ${stepLine}
+    ${intro ? `<div class="clarify-intro">${esc(intro)}</div>` : ''}
     <div class="clarify-head"><span class="clarify-mark" aria-hidden="true">?</span><span>${esc(head)}</span></div>
     <div class="clarify-question">${esc(question)}</div>
     ${optionHtml ? `<div class="clarify-options${kind === 'multiple' ? ' is-multi' : ''}">
@@ -10711,6 +11143,8 @@ function appendMessage(role, text, meta, attachments, rich, options = {}) {
   setMessageTime(node, options.createdAt)
   refreshMessageActions(node)
   bindToolToggles(node)
+  node.chatAttachments = Array.isArray(attachments) ? attachments.slice() : []
+  bindAttachmentCards(node)
   if (options.scroll !== false) {
     if (threadScrollPinned) node.scrollIntoView({ block: 'end', behavior: 'smooth' })
     else markThreadNewContent()
@@ -11341,6 +11775,7 @@ async function addFiles(fileList) {
       text: '',
       readable: 'none',
       previewUrl: type.startsWith('image/') ? URL.createObjectURL(file) : '',
+      uploadId: newUploadId(),
     }
     if (isTextLike(file)) {
       try {
@@ -11504,15 +11939,116 @@ async function streamChat(payload, onEvent, signal) {
   if (buffer.trim()) consume(buffer)
 }
 
+function newUploadId() {
+  try {
+    if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID().replace(/-/g, '')
+  } catch {
+    // 老浏览器没有 randomUUID 时退回时间戳 + 随机串
+  }
+  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`
+}
+
+function sanitizeChatUploadName(name) {
+  let clean = String(name || '')
+    .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^\.+/, '')
+    .replace(/\.+$/, '')
+  if (!clean) clean = '附件'
+  if (clean.length <= 120) return clean
+  const dot = clean.lastIndexOf('.')
+  const ext = dot > 0 && clean.length - dot <= 12 ? clean.slice(dot) : ''
+  return `${clean.slice(0, 120 - ext.length).trim()}${ext}`
+}
+
+function chatUploadPath(entry) {
+  const now = new Date()
+  const day = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
+  return `对话附件/${day}/${entry.uploadId}/${sanitizeChatUploadName(entry.name)}`
+}
+
+async function uploadChatAttachment(entry) {
+  const body = {
+    path: chatUploadPath(entry),
+    name: entry.name,
+    mime: entry.type || 'application/octet-stream',
+  }
+  if (entry.readable === 'text' && entry.text) {
+    body.text = entry.text
+  } else if (entry.file) {
+    body.contentBase64 = await readAsBase64(entry.file)
+  } else {
+    throw new Error('附件内容为空，无法保存到云空间')
+  }
+  return api(`/api/workspace/files${qs()}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+}
+
+/** 按顺序逐个上传，避免 4 个并发写同时抢个人配额；失败只影响当前附件。 */
+async function prepareChatAttachments(item) {
+  if (item.spaceKind !== 'cloud') return buildAttachmentPayload(item.pending)
+  for (let index = 0; index < item.pending.length; index += 1) {
+    const entry = item.pending[index]
+    const meta = item.attachmentMeta[index]
+    if (!entry?.file || !meta) continue
+    meta.workspaceStatus = 'pending'
+    meta.clientUploadId = entry.uploadId
+    delete meta.workspaceError
+    updateAttachmentCards(item.node, item.attachmentMeta)
+    try {
+      const uploaded = await uploadChatAttachment(entry)
+      entry.workspaceFileId = uploaded.id
+      Object.assign(meta, {
+        workspaceFileId: uploaded.id,
+        workspaceRelPath: uploaded.relPath,
+        workspaceMime: uploaded.mime || entry.type,
+        workspaceStatus: 'active',
+      })
+      delete meta.workspaceError
+    } catch (err) {
+      meta.workspaceStatus = 'unsaved'
+      meta.workspaceError = String(err?.message || '保存到云空间失败').slice(0, 120)
+    }
+    updateAttachmentCards(item.node, item.attachmentMeta)
+  }
+  return buildAttachmentPayload(item.pending)
+}
+
 async function buildAttachmentPayload(list) {
   return Promise.all(
     list.map(async (item) => {
       const payload = { name: item.name, size: item.size, type: item.type }
+      if (item.workspaceFileId) {
+        // 正文/图片已经在云空间里，消息只传文件 ID，避免把大文件再塞进聊天请求。
+        payload.workspaceFileId = item.workspaceFileId
+        return payload
+      }
       if (item.readable === 'text' && item.text) payload.text = item.text
       if (item.readable === 'image' && item.file) payload.dataUrl = await readAsDataUrl(item.file)
       return payload
     }),
   )
+}
+
+/** 服务端 done 里的附件元数据没有“未保存”状态，合并本地状态后重绘卡片。 */
+function mergeDoneAttachments(local, server) {
+  const serverList = Array.isArray(server) ? server : []
+  const localList = Array.isArray(local) ? local : []
+  return serverList.map((item, index) => {
+    const localItem = localList[index] || {}
+    const merged = { ...item }
+    if (merged.workspaceFileId) {
+      merged.workspaceStatus = 'active'
+    } else if (localItem.workspaceStatus === 'unsaved') {
+      merged.workspaceStatus = 'unsaved'
+      merged.workspaceError = localItem.workspaceError
+    }
+    return merged
+  })
 }
 
 async function send() {
@@ -11569,10 +12105,13 @@ async function send() {
 
   const modelId = state.selected || null
   const pending = state.attachments.slice()
+  const spaceKind = state.spaceKind
   const attachmentMeta = pending.map((file) => ({
     name: file.name,
     size: file.size,
     type: file.type,
+    clientUploadId: file.uploadId,
+    ...(spaceKind === 'cloud' ? { workspaceStatus: 'pending' } : {}),
   }))
 
   const runtime = currentRuntime()
@@ -11582,6 +12121,7 @@ async function send() {
     reasoningEffort: state.reasoningEffort || null,
     pending,
     attachmentMeta,
+    spaceKind,
     sessionId: state.sessionId,
     runtimeKey: runtime.key,
     createdAt: Date.now(),
@@ -11649,7 +12189,7 @@ async function drainQueue(runtime = currentRuntime()) {
   let messageId = ''
 
   try {
-    const attachments = await buildAttachmentPayload(item.pending)
+    const attachments = await prepareChatAttachments(item)
     if (controller.signal.aborted) throw new DOMException('已停止', 'AbortError')
     await streamChat(
       {
@@ -11658,7 +12198,7 @@ async function drainQueue(runtime = currentRuntime()) {
         text: item.text,
         attachments,
         sessionId: item.sessionId,
-        spaceKind: state.spaceKind,
+        spaceKind: item.spaceKind,
         // 右侧正在预览的文件：让模型知道「这个文件」指谁；面板没开就不传。
         activeFile: activePreviewFilePayload(),
       },
@@ -11787,8 +12327,9 @@ async function drainQueue(runtime = currentRuntime()) {
             }
           }
           if (data.attachments && item.node) {
-            const files = item.node.querySelector('.bubble-files')
-            if (files) files.innerHTML = attachmentChips(data.attachments)
+            const merged = mergeDoneAttachments(item.attachmentMeta, data.attachments)
+            item.attachmentMeta = merged
+            updateAttachmentCards(item.node, merged)
           }
           turn.finish(data)
           syncMessageActionAvailability()
@@ -11796,7 +12337,7 @@ async function drainQueue(runtime = currentRuntime()) {
             notifySessionRead(runtime.sessionId)
           }
           loadSessions()
-          void loadWorkspaceFiles()
+          scheduleWorkspaceRefresh()
         } else if (event === 'error') {
           const err = new Error(data.message || '模型调用失败')
           err.code = data.code
@@ -13091,9 +13632,40 @@ async function boot() {
     }
   })
 
-  // 附件
-  $('#pick-image').addEventListener('click', () => $('#file-image').click())
-  $('#pick-file').addEventListener('click', () => $('#file-any').click())
+  // 附件：一个加号入口，菜单向上展开；后续新增能力只需往 add-menu 里加项
+  const addTrigger = $('#pick-add')
+  const addMenu = $('#add-menu')
+  const hideAddMenu = (restoreFocus = false) => {
+    if (!addMenu || addMenu.hidden) return
+    addMenu.hidden = true
+    addTrigger?.setAttribute('aria-expanded', 'false')
+    if (restoreFocus) addTrigger?.focus()
+  }
+  addTrigger?.addEventListener('click', (event) => {
+    event.stopPropagation()
+    const open = addMenu?.hidden
+    if (!addMenu) return
+    addMenu.hidden = !open
+    addTrigger.setAttribute('aria-expanded', open ? 'true' : 'false')
+    if (open) $('#add-menu-image')?.focus()
+  })
+  document.addEventListener('click', (event) => {
+    if (!event.target.closest('#pick-add') && !event.target.closest('#add-menu')) hideAddMenu()
+  })
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && addMenu && !addMenu.hidden) {
+      event.preventDefault()
+      hideAddMenu(true)
+    }
+  })
+  $('#add-menu-image')?.addEventListener('click', () => {
+    hideAddMenu(true)
+    $('#file-image').click()
+  })
+  $('#add-menu-file')?.addEventListener('click', () => {
+    hideAddMenu(true)
+    $('#file-any').click()
+  })
   $('#file-image').addEventListener('change', (event) => {
     addFiles(event.target.files || [])
     event.target.value = ''

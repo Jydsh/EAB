@@ -12,12 +12,13 @@ import { EC, EabError, SC, scopeAllows, resolveVisibleCollections } from '@eab/d
 import { appendAudit, loadKbCollectionAcls, type Db } from '@eab/storage'
 import type { ServerDeps } from '../deps.js'
 import { ok } from '../http.js'
-import { resolveActor, type RequestActor } from '../session.js'
+import { resolveActor, actorFor, findActivePerson, type RequestActor } from '../session.js'
 import { notifyDingTalkClarifyFromWeb } from '../dingtalk-clarify-sync.js'
 import { callModelStream, callEmbeddings, callRerank, callTranscription, callSpeech, type CallResult, type ChatMessage as LlmMessage, type LlmContent, type LlmContentPart, type LlmToolCall, type ModelStreamEvent, type ModelStreamOptions } from '../llm.js'
 import { planSubAgentModelsWithDecision } from '../agent-model-router.js'
 import { hotReadVersioned } from '../hot-cache.js'
-import { callPluginModel, findPluginModelEffective, isPluginModelId, listPluginModels } from '../plugin-models.js'
+import { effectiveAgentTeamSettings } from '../agent-team-settings.js'
+import { callPluginModel, findPluginModel, isPluginModelId, listPluginModels } from '../plugin-models.js'
 import { applyPluginModelSettings, loadPluginModelSettingsMap } from '../plugin-model-settings.js'
 import {
   filterHealthyModels,
@@ -29,7 +30,7 @@ import {
   shouldMarkModelFailure,
   sortModelsForChat,
 } from '../model-health.js'
-import { resolveModelForPurpose, findModelById, capabilitiesOf, normalizeCapability } from '../model-registry.js'
+import { resolveModelForPurpose, findModelById, capabilitiesOf, normalizeCapability, DEFAULT_MODEL_MAX_CONTEXT, DEFAULT_MODEL_MAX_OUTPUT } from '../model-registry.js'
 import { classifyChatIntent, intentHintOf } from '../intent.js'
 import {
   resolveThinkingEffort,
@@ -37,7 +38,7 @@ import {
   thinkingConfigOf,
   type ThinkingConfig,
 } from '../thinking.js'
-import { capToolResultText, compressMessagesForContext, estimateTokens } from '../context-window.js'
+import { capToolResultText, compactMessagesForModelCall, estimateTokens } from '../context-window.js'
 import {
   BATCH_ANALYZE_TOOL_NAME,
   BATCH_ANALYZE_TOOL_SPEC,
@@ -50,11 +51,18 @@ import {
   type SavedBatch,
 } from '../batch-results.js'
 import { getCollectionEmbeddingModel, searchChunkVectors, type EmbedFn } from '../kb-vector.js'
-import { AgentTeamStore } from '../agent-team.js'
+import { AgentTeamStore, listRestartRecoveredTasks } from '../agent-team.js'
 import { dingTalkRecipientOf, sendDingTalkRichTextToUser } from '../dingtalk-outbound.js'
 import { executeTool, resolveToolByFunctionName, toolFunctionName, toolSpecsForActor, toolSpecsForAgent, type ChatToolSpec } from './tools.js'
 import { resolveProjectExecMode } from '../project-runner.js'
-import type { WorkspaceEditDiff } from './workspace.js'
+import {
+  chatAttachmentKindOf,
+  chatImageMimeOf,
+  readChatAttachmentFile,
+  resolveWorkspaceFileStates,
+  type WorkspaceEditDiff,
+  type WorkspaceFileState,
+} from './workspace.js'
 import {
   SWITCH_CHAT_MODEL_TOOL_NAME,
   SWITCH_CHAT_MODEL_TOOL_SPEC,
@@ -798,7 +806,12 @@ export function buildSystemPrompt(opts: {
           '只有快速问答、小范围读写、状态查询、结果汇总和团队调度才在主回合直接处理。不要为了“一次性答完”把长任务留给自己做。',
           '用户前台回合绝对不要调用 agent_wait 等待后台任务：等待会占住会话，用户下一条消息就发不出去。后台任务完成、提问或失败时系统会自动唤醒父 Agent，不需要轮询。',
           '后台任务运行期间用户又提要求时：与正在执行的任务相关且子 Agent 在跑，用 agent_message 把新增约束转给同一个 key，并立即回复“已转给正在执行的子 Agent”；相关但子 Agent 空闲，用 agent_task 派下一步并立即结束；无关的新任务，用 agent_spawn 开新 key 后台执行。不要重复已交代的背景。',
+          '工具选择必须按花名册状态一次选对：执行中只用 agent_message；空闲/等待回答/已注销只用 agent_task。不要对同一个 key 连续尝试两种工具，也不要在 agent_message 返回非运行状态后继续重试同一条指示。',
           '同一个 key 的上下文会保留；不要因为用户追问就重新开一个做同样事情的子 Agent。',
+          '团队岗位要稳定：需要产出用 producer，需要挑刺用 critic，需要调研用 researcher，需要实现用 builder；这些 key 跨轮复用，不要每轮新开一个同类岗位。一次性并行任务才用临时 key。',
+          '你是主持人，不是所有活都自己干：你负责拆任务、定验收标准、整合结果和最终对用户交卷；子 Agent 负责纵向切片。critic 只按你前置的 acceptance 标准判，不按个人喜好挑刺，评审最多 2 轮，超限由你收口。',
+          '团队树是“你 → producer / critic / builder”，critic 与 producer 平级，评审关系由任务链表达，不要让 critic 当 producer 的子 Agent。派活时把 acceptance 写清楚，critic 的验收标准要能逐条核对。',
+          '团队有容量上限（每会话 8 个活跃岗位）。满了系统会先软注销最老的空闲非固定岗位；running、waiting 和 pinned 岗位不会被自动淘汰。仍放不下会明确报错，不要改 key 硬塞。不再需要的岗位主动用 agent_retire 收掉；收掉后在保留期内仍可用 agent_task 复活。',
           '如果后台任务因为服务重启被标成 failed，先看它是否有检查点：有就用 agent_resume 从上次进度继续，不要从头重做；确实没有检查点才用 agent_task 重新派活。',
           '团队工作按“一个 Agent 把完整项目做完”来组织：用户要完整实现一个项目、功能或多文件交付时，你自己拆模块并给子 Agent 派可独立验收的纵向切片（实现 + 自测 + 证据），优先后台并行；不要让子 Agent 只做调研或只写方案就收工。',
           '子 Agent 的思考、工具和中间汇报只进入团队预览，不要逐条转述到用户对话；全部子任务完成、你整合验证后再给用户一条最终汇报。中途可以用一句话告诉用户“已开始/正在并行推进”，但不要写“已完成一部分/请稍等”打断用户的持续对话。',
@@ -819,7 +832,7 @@ export function buildSystemPrompt(opts: {
           : '当前工具列表只是常用工具，不是全部。需要文件发送/重命名/删除、容量、定时任务列表、计算、插件等未直接列出的能力时，先调用 tool_search，query 写用户原话或中文/英文能力词；工具结果返回后，命中的工具会自动加载为可调用工具，直接继续调用即可，不要向用户解释工具加载机制，也不要因为当前列表里没有就直接说做不到。'
       : '',
     chatTools.some((tool) => tool.function.name === 'ask_user')
-      ? '如果用户没有说明目标、方向或范围（例如“帮我看看”“随便给点建议”“我不知道从哪开始”），不要靠猜直接长篇回答；必须先调用 ask_user 提一个简短问题。普通澄清用 kind=single，给出 2–4 个具体方向，并保留用户自己补充的入口；需要用户多选时用 kind=multiple；需要用户直接填写答案时用 kind=text 和 placeholder。用户要求出题、测验、刷题、考试、答题闯关或让用户做题时，也必须调用 ask_user，不能只把题目写成正文；每出一道新题都要重新调用一次，不能上一题用卡片、下一题又退回正文。用户说“出 N 道题/来一套题/我来做/引导模式/引导对话/带我做题”时，默认都把整组题放进 questions 一次下发，卡片会一题一页并带上一题/下一题；“引导模式”不等于“一次只出一题”，不要沿用历史里把引导模式理解成单题的旧说法。只有用户本轮明确说“一次一题、答完即判、不要一次全出”时，才逐题下发。用户要求整组题、可回看、上一题/下一题或最后统一交卷时，把所有题放进同一个 questions 数组一次下发，最后统一提交。用户明确要求“一次一题、答完即判”时，每次只下发当前一题，用户答完后再调用 ask_user 出下一题。只把问题写在正文、没有调用 ask_user，用户就看不到结构化交互，视为没有完成澄清或题目下发。用户已经说明明确任务、且不需要用户作答时直接执行或回答，不要为了问而问；单次回复最多调用一次 ask_user。用户回答后如果仍缺少关键信息，可以继续用 ask_user 递进确认，不要重复已经回答的内容。'
+      ? '如果用户没有说明目标、方向或范围（例如“帮我看看”“随便给点建议”“我不知道从哪开始”），不要靠猜直接长篇回答；必须先调用 ask_user 提一个简短问题。普通澄清用 kind=single，给出 2–4 个具体方向，并保留用户自己补充的入口；需要用户多选时用 kind=multiple；需要用户直接填写答案时用 kind=text 和 placeholder。用户要求出题、测验、刷题、考试、答题闯关或让用户做题时，也必须调用 ask_user，不能只把题目写成正文；每出一道新题都要重新调用一次，不能上一题用卡片、下一题又退回正文。用户说“出 N 道题/来一套题/我来做/引导模式/引导对话/带我做题”时，默认都把整组题放进 questions 一次下发，卡片会一题一页并带上一题/下一题；“引导模式”不等于“一次只出一题”，不要沿用历史里把引导模式理解成单题的旧说法。只有用户本轮明确说“一次一题、答完即判、不要一次全出”时，才逐题下发。用户要求整组题、可回看、上一题/下一题或最后统一交卷时，把所有题放进同一个 questions 数组一次下发，最后统一提交。用户明确要求“一次一题、答完即判”时，每次只下发当前一题，用户答完后再调用 ask_user 出下一题。只把问题写在正文、没有调用 ask_user，用户就看不到结构化交互，视为没有完成澄清或题目下发。任何时候只要你的回复需要用户在多个方案中选择、确认继续/等待/取消/转发、采用哪个方案、是否执行下一步，或需要用户拍板后才能继续，就必须调用 ask_user 把选项做成可点击卡片；即使任务背景已经清楚、你已经能继续执行，也不能只在正文写“选项 A/B/C”“请告诉我您的决定”“您想怎么做”。纯信息性方案对比、总结或不需要用户作答的说明不强制调用。用户已经说明明确任务、且不需要用户作答时直接执行或回答，不要为了问而问；单次回复最多调用一次 ask_user。用户回答后如果仍缺少关键信息，可以继续用 ask_user 递进确认，不要重复已经回答的内容。'
       : '',
     chatTools.some((tool) => tool.function.name === 'memory_propose')
       ? '团队学习：当对话中形成可复用的规则或经验（尤其是用户纠正了你的做法，或用户说了“以后/统一/必须/不要/都按这个”），主动提炼成一条规则并调用 memory_propose 提交为团队学习候选，不必等用户明确说分享；同一规则不要重复提交。只提交提炼后的规则，不要提交原始聊天、密码、手机号、身份证号、客户隐私或一次性任务。提交后告诉用户“已进入待审核，管理员确认后对全公司生效”，不要声称已经全公司生效。'
@@ -1012,6 +1025,15 @@ export interface ChatAttachmentInput {
   type: string
   text?: string
   dataUrl?: string
+  /** 附件已落个人云空间时只记文件 ID；正文/图片按需从云空间读取。 */
+  workspaceFileId?: string
+  workspaceRelPath?: string
+  workspaceMime?: string | null
+  workspaceStatus?: 'active' | 'deleted' | 'forbidden'
+  /** 历史消息卡片用：文件当前名称/大小/更新时间，避免软删或改名后仍显示旧值。 */
+  workspaceName?: string
+  workspaceSize?: number
+  workspaceUpdatedAt?: number
   /** 附件正文超过单次注入上限时，全文保存为批次，供 batch_read / batch_analyze 使用。 */
   batchId?: string
   batchChars?: number
@@ -1021,6 +1043,10 @@ const MAX_ATTACHMENT_TEXT = 12_000
 /** 附件正文的接收上限；超过这个长度直接拒绝，避免单条请求把服务内存打满。 */
 const MAX_ATTACHMENT_INPUT_CHARS = 5_000_000
 const MAX_ATTACHMENT_DATA_URL = 14_000_000
+/** 消息里的图片要送进视觉模型，超过 10 MB 的图片不再自动内联。 */
+const MAX_CHAT_IMAGE_BYTES = 10 * 1024 * 1024
+const MAX_CHAT_ATTACHMENTS = 4
+const CHAT_IMAGE_DATA_URL_RE = /^data:image\/(png|jpeg|jpg|webp|gif);base64,/i
 
 function attachmentMeta(list: ChatAttachmentInput[]): Array<Record<string, unknown>> {
   return list.map((item) => {
@@ -1032,6 +1058,101 @@ function attachmentMeta(list: ChatAttachmentInput[]): Array<Record<string, unkno
       readable: Boolean(text || dataUrl),
     }
   })
+}
+
+/** 历史消息只存 workspaceFileId；打开会话时批量补当前状态，避免每条附件单独打接口。 */
+function enrichAttachmentMetaStates(meta: unknown, states: Map<string, WorkspaceFileState>): unknown {
+  if (!meta || typeof meta !== 'object') return meta
+  const attachments = (meta as { attachments?: unknown }).attachments
+  if (!Array.isArray(attachments)) return meta
+  for (const raw of attachments) {
+    if (!raw || typeof raw !== 'object') continue
+    const item = raw as Record<string, unknown>
+    const fileId = String(item.workspaceFileId ?? '').trim()
+    if (!fileId) continue
+    const state = states.get(fileId)
+    if (!state) continue
+    item.workspaceStatus = state.status
+    if (state.status === 'active') {
+      item.workspaceName = state.name
+      item.workspaceMime = state.mime ?? null
+      item.workspaceSize = state.size
+      item.workspaceUpdatedAt = state.updatedAt
+    }
+  }
+  return meta
+}
+
+/**
+ * 解析消息附件：优先读取个人云空间里的真实文件，客户端传来的 name/size/mime 不再作为事实来源。
+ * 没有 workspaceFileId 时保持旧协议（文本/dataUrl 直接随消息上传）。
+ */
+async function resolveChatAttachments(
+  deps: ServerDeps,
+  actor: RequestActor,
+  rawAttachments: readonly unknown[],
+  spaceKind: 'cloud' | 'none',
+): Promise<ChatAttachmentInput[]> {
+  const list: ChatAttachmentInput[] = []
+  for (const raw of rawAttachments.slice(0, MAX_CHAT_ATTACHMENTS)) {
+    if (!raw || typeof raw !== 'object') throw new EabError(EC.VALIDATION, '附件参数不合法')
+    const item = raw as Record<string, unknown>
+    const workspaceFileId = String(item.workspaceFileId ?? '').trim().slice(0, 120)
+    if (workspaceFileId && spaceKind === 'cloud') {
+      const file = readChatAttachmentFile(deps, actor, workspaceFileId)
+      const kind = chatAttachmentKindOf(file.name, file.mime)
+      let text: string | undefined
+      let dataUrl: string | undefined
+      if (kind === 'text') {
+        if (file.buffer.length > MAX_ATTACHMENT_INPUT_CHARS * 4) {
+          throw new EabError(EC.VALIDATION, `附件「${file.name}」超过消息正文接收上限`)
+        }
+        text = file.buffer.toString('utf8')
+        if (text.length > MAX_ATTACHMENT_INPUT_CHARS) {
+          throw new EabError(EC.VALIDATION, `附件「${file.name}」超过 ${MAX_ATTACHMENT_INPUT_CHARS} 字符上限`)
+        }
+      } else if (kind === 'image') {
+        if (file.buffer.length > MAX_CHAT_IMAGE_BYTES) {
+          throw new EabError(EC.VALIDATION, `图片「${file.name}」超过 10 MB，暂不能作为消息图片读取`)
+        }
+        const mime = chatImageMimeOf(file.name, file.mime) ?? 'image/png'
+        dataUrl = `data:${mime};base64,${file.buffer.toString('base64')}`
+        if (dataUrl.length > MAX_ATTACHMENT_DATA_URL) {
+          throw new EabError(EC.VALIDATION, `图片「${file.name}」编码后超过消息图片上限`)
+        }
+      }
+      list.push({
+        name: file.name,
+        size: file.buffer.length,
+        type: file.mime || 'application/octet-stream',
+        text,
+        dataUrl,
+        workspaceFileId: file.id,
+        workspaceRelPath: file.relPath,
+        workspaceMime: file.mime,
+        workspaceStatus: 'active',
+      })
+      continue
+    }
+
+    const name = String(item.name ?? '').trim().slice(0, 200)
+    if (!name) throw new EabError(EC.VALIDATION, '附件名称不能为空')
+    const size = Number(item.size ?? 0)
+    if (!Number.isFinite(size) || size < 0) throw new EabError(EC.VALIDATION, `附件「${name}」大小不合法`)
+    const type = String(item.type ?? 'application/octet-stream').slice(0, 160)
+    const dataUrl = String(item.dataUrl ?? '')
+    if (dataUrl) {
+      if (!CHAT_IMAGE_DATA_URL_RE.test(dataUrl) || dataUrl.length > MAX_ATTACHMENT_DATA_URL) {
+        throw new EabError(EC.VALIDATION, `附件「${name}」图片格式不支持或图片过大`)
+      }
+    }
+    const text = item.text === undefined ? undefined : String(item.text)
+    if (text !== undefined && text.length > MAX_ATTACHMENT_INPUT_CHARS) {
+      throw new EabError(EC.VALIDATION, `附件「${name}」超过 ${MAX_ATTACHMENT_INPUT_CHARS} 字符上限`)
+    }
+    list.push({ name, size, type, text, dataUrl: dataUrl || undefined })
+  }
+  return list
 }
 
 function attachmentBatchNote(item: ChatAttachmentInput): string {
@@ -1052,6 +1173,8 @@ function buildAttachmentText(text: string, list: ChatAttachmentInput[]): string 
       chunks.push(`【附件：${item.name}】\n${visible}${clipped}${attachmentBatchNote(item)}`)
     } else if (item.dataUrl) {
       chunks.push(`【图片附件：${item.name}】图片已随消息附带，请直接查看图片内容后回答。`)
+    } else if (item.workspaceFileId) {
+      chunks.push(`【附件：${item.name}】已保存到个人云空间。需要正文或解析内容时，请用 workspace 工具按文件 ID 读取，不要假设附件内容。`)
     } else {
       chunks.push(`【附件：${item.name}】这个附件暂时无法读取正文，请明确告诉用户需要转成文本或截图。`)
     }
@@ -1174,6 +1297,8 @@ export interface ClarifyQuestion {
 }
 
 export interface ClarifyRequest extends ClarifyQuestion {
+  /** 卡片上方的背景摘要：保留模型在给选项前已经写好的关键结论，避免转卡后信息丢失。 */
+  intro?: string
   /** 多题模式：一次 ask_user 下发整组题，卡片逐页作答后统一提交。 */
   questions?: ClarifyQuestion[]
 }
@@ -1186,7 +1311,7 @@ const CLARIFY_TOOL_SPEC: ChatToolSpec = {
   function: {
     name: CLARIFY_TOOL_NAME,
     description:
-      '当用户没有说明目标、方向、范围，或用户要求出题、测验、刷题、考试、答题闯关、让用户做题（包括判断题、选择题、填空题、问答题）时，调用本工具向用户提出结构化问题。出题场景绝不要只把题目写在正文；每出一道新题都必须再次调用本工具，不要因为上一题用了卡片就改用普通正文。单题用 question + kind + options；多题用 questions 数组一次下发整组题，卡片会一题一页、支持上一题/下一题，用户答完整组后统一提交，模型只收到一条完整答卷。用户要求“一次一题、答完即判”时，每次只下发当前一题，用户作答后再调用本工具出下一题；用户说“引导模式/引导对话/带我做题”但没有明确说“一次一题”时，默认把所有题放进 questions 一次下发，不要理解成单题；用户要求整组题、可回看、上一题/下一题或最后统一交卷时，把所有题放进 questions 一次下发。kind=single 给出 2–4 个可点击选项；kind=multiple 给出 2–4 个可多选选项；kind=text 不给选项，直接展示输入框。只把问题写成普通正文、不调用本工具，用户看不到结构化交互。用户已经说清楚任务、且不需要用户作答时不要调用，直接执行或回答；每轮最多调用一次。',
+      '当用户没有说明目标、方向、范围，或用户要求出题、测验、刷题、考试、答题闯关、让用户做题（包括判断题、选择题、填空题、问答题）时，调用本工具向用户提出结构化问题。只要你的回复需要用户在多个方案中选择、确认继续/等待/取消/转发、采用哪个方案、是否执行下一步，或需要用户拍板后才能继续，也必须调用本工具，把选项做成可点击卡片；不能只在正文写“选项 A/B/C”“请告诉我您的决定”。纯信息性方案对比、总结或不需要用户作答的说明不强制调用。出题场景绝不要只把题目写在正文；每出一道新题都必须再次调用本工具，不要因为上一题用了卡片就改用普通正文。单题用 question + kind + options；多题用 questions 数组一次下发整组题，卡片会一题一页、支持上一题/下一题，用户答完整组后统一提交，模型只收到一条完整答卷。用户要求“一次一题、答完即判”时，每次只下发当前一题，用户作答后再调用本工具出下一题；用户说“引导模式/引导对话/带我做题”但没有明确说“一次一题”时，默认把所有题放进 questions 一次下发，不要理解成单题；用户要求整组题、可回看、上一题/下一题或最后统一交卷时，把所有题放进 questions 一次下发。kind=single 给出 2–4 个可点击选项；kind=multiple 给出 2–4 个可多选选项；kind=text 不给选项，直接展示输入框。只把问题写成普通正文、不调用本工具，用户看不到结构化交互。用户已经说清楚任务、且不需要用户作答时不要调用，直接执行或回答；每轮最多调用一次。',
     parameters: {
       type: 'object',
       properties: {
@@ -1310,6 +1435,12 @@ export interface AgentChildEvent {
   modelId?: string
   modelName?: string
   modelReason?: string
+  /** 岗位与组织归属，供团队面板显示角色徽章和缩进树 */
+  role?: string
+  parentKey?: string | null
+  depth?: number
+  acceptance?: string
+  pinned?: boolean
   status?: 'running' | 'waiting' | 'succeeded' | 'failed' | 'cancelled' | 'unregistered'
   text?: string
   tool?: { id: string; name: string; toolId: string; args?: Record<string, unknown> }
@@ -1744,6 +1875,259 @@ function looksLikeClarifyQuestion(text: string): boolean {
 }
 
 /**
+ * 长回复里带“请告诉我：是哪个任务？换哪个模型？”这类追问时，
+ * 也是在等用户补充关键信息，应该走可点击/结构化澄清，而不是纯正文。
+ */
+function looksLikeMissingInfoRequest(text: string): boolean {
+  const source = stripFencedCodeBlocks(text).trim()
+  if (!source || source.length > 4000) return false
+  if (!/(?:请(?:你|您)?(?:告诉|补充|确认|回复|提供)|需要(?:你|您)(?:告诉|补充|确认|回复|提供))/.test(source)) return false
+  const tail = source.slice(-800)
+  const questions = (tail.match(/[？?]/g) ?? []).length
+  if (questions === 0) return false
+  const directAsk = /(?:请|需要)[^。！？\n]{0,60}[？?]/.test(tail)
+  const listedAsk = questions >= 2 && /[：:]/.test(tail)
+  return directAsk || listedAsk
+}
+
+/**
+ * “要不要现在转发 / 继续等待 / 稍后再问”这类需要用户拍板的回复，
+ * 模型也常常只写成正文。这里只识别明确邀请选择且带 2–4 个候选的文本，
+ * 纯方案对比、普通长回答不会命中。
+ */
+const CHOICE_INVITE_RE =
+  /(?:请(?:你|您)?(?:选择|选定|决定|确认|明确|回复)|(?:你|您)(?:想|希望|要|准备|打算)(?:怎么|如何|选择|选|决定|处理)|(?:你|您)的(?:选择|决定|意见)|请告诉我(?:你|您)?的?(?:决定|选择|想法)|选(?:哪|什么)(?:个|一种)?|哪(?:个|一种)(?:方案|方式|选项)?|是否(?:继续|需要|执行|确认|取消|转发|重试|等待)|要不要(?:我|继续|现在|马上|先)|需要(?:你|您)(?:确认|决定|选择|拍板|回复)|等(?:你|您)(?:确认|决定|选择|回复)|(?:继续|等待|取消|转发)[^。！？\n]{0,12}(?:还是|或)|(?:还是|或)[^。！？\n]{0,12}(?:继续|等待|取消|转发))/i
+
+/** 只有明确在“选一个/怎么处理”的邀请，编号清单才算选项；普通“请确认以下步骤”不算。 */
+const CHOICE_INTENT_RE =
+  /选择|选定|选哪|哪一个|哪一种|哪种|怎么处理|怎么做|如何处理|如何做|(?:你|您)(?:想|希望|要|准备|打算)(?:怎么|如何|选择|选|决定|处理)|方案|选项|是否继续|是否(?:转发|等待|取消|重试)|继续.{0,8}还是|还是.{0,8}(?:继续|等待|取消|转发)|要不要(?:我|继续|现在|马上)|需要(?:你|您)(?:拍板|决定|选择)/i
+
+function stripFencedCodeBlocks(text: string): string {
+  return String(text || '').replace(/```[\s\S]*?```/g, (block) => {
+    const lines = block.split('\n').length
+    return '\n'.repeat(Math.max(1, lines - 1))
+  })
+}
+
+function lastChoiceInviteIndex(text: string): number {
+  const re = new RegExp(CHOICE_INVITE_RE.source, 'gi')
+  let index = -1
+  let match: RegExpExecArray | null
+  while ((match = re.exec(text))) {
+    index = match.index
+    if (match.index === re.lastIndex) re.lastIndex += 1
+  }
+  return index
+}
+
+/** 只在括号外的冒号/逗号处切开，避免把“（推荐，不占用会话）”拆坏。 */
+function splitChoiceLabel(line: string): { label: string; description: string } {
+  let depth = 0
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index]
+    if (char === '（' || char === '(') depth += 1
+    else if (char === '）' || char === ')') depth = Math.max(0, depth - 1)
+    else if (depth === 0 && (char === '：' || char === ':')) {
+      return { label: line.slice(0, index), description: line.slice(index + 1) }
+    }
+  }
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index]
+    if (char === '（' || char === '(') depth += 1
+    else if (char === '）' || char === ')') depth = Math.max(0, depth - 1)
+    else if (depth === 0 && (char === '，' || char === ',' || char === '。' || char === '；' || char === ';')) {
+      return { label: line.slice(0, index), description: line.slice(index + 1) }
+    }
+  }
+  return { label: line, description: '' }
+}
+
+function parseChoiceOptionLine(rawLine: string): { label: string; description?: string } | null {
+  let line = String(rawLine || '').trim()
+  if (!line || /^#{1,6}\s/.test(line) || /^```/.test(line)) return null
+  const startsLikeOption =
+    /^[-*•]\s+/.test(line) ||
+    /^\*{0,2}\s*选项\s*(?:[A-Da-d]|[一二三四1-4])(?=\s|（|\(|[:：]|$)/.test(line) ||
+    /^\*{0,2}\s*[A-Da-d]\s*[.、:：)）]\s*/.test(line) ||
+    /^\*{0,2}\s*\d+\s*[.、:：)）]\s*/.test(line)
+  if (!startsLikeOption) return null
+
+  line = line
+    .replace(/^[-*•]\s+/, '')
+    .replace(/\*\*/g, '')
+    .replace(/^\*{0,2}\s*选项\s*(?:[A-Da-d]|[一二三四1-4])\s*(?:（[^）]*）)?\s*[:：]\s*/, '')
+    .replace(/^\*{0,2}\s*[A-Da-d]\s*[.、:：)）]\s*/, '')
+    .replace(/^\*{0,2}\s*\d+\s*[.、:：)）]\s*/, '')
+    .trim()
+  if (!line) return null
+
+  let { label, description } = splitChoiceLabel(line)
+  label = label.replace(/^[“"']|[”"']$/g, '').trim()
+  description = description.trim()
+  const parentheticals = [...label.matchAll(/（([^）]{1,80})）/g)].map((match) => match[1].trim()).filter(Boolean)
+  if (parentheticals.length > 0) {
+    label = label.replace(/（[^）]{1,80}）/g, '').trim()
+    description = [parentheticals.join('；'), description].filter(Boolean).join('；')
+  }
+  label = label.replace(/^[：:，,、\s]+/, '').replace(/[。；;]+$/, '').trim()
+  if (!label || label.length > 80) return null
+  return {
+    label: label.slice(0, 60),
+    ...(description ? { description: description.slice(0, 120) } : {}),
+  }
+}
+
+interface ChoiceOptionGroup {
+  start: number
+  end: number
+  options: ClarifyOption[]
+}
+
+function collectChoiceOptionGroups(text: string): ChoiceOptionGroup[] {
+  const groups: ChoiceOptionGroup[] = []
+  const lines = text.split('\n')
+  let offset = 0
+  let current: ChoiceOptionGroup | null = null
+  const close = (): void => {
+    if (current && current.options.length >= 2) groups.push(current)
+    current = null
+  }
+  for (const line of lines) {
+    const lineStart = offset
+    offset += line.length + 1
+    const parsed = parseChoiceOptionLine(line)
+    if (parsed) {
+      if (!current) current = { start: lineStart, end: lineStart + line.length, options: [] }
+      if (!current.options.some((option) => option.label === parsed.label)) {
+        current.options.push({
+          id: `option-${current.options.length + 1}`,
+          label: parsed.label,
+          ...(parsed.description ? { description: parsed.description } : {}),
+        })
+      }
+      current.end = lineStart + line.length
+      continue
+    }
+    // 选项之间允许空行；标题、说明句、邀请句都会结束当前选项组。
+    if (line.trim()) close()
+  }
+  close()
+  return groups
+}
+
+/** 卡片上方的摘要用纯文本展示，去掉 Markdown 记号，避免露出 ### 和 **。 */
+function plainTextForIntro(raw: string): string {
+  return String(raw || '')
+    .replace(/\r/g, '')
+    .replace(/```[^\n]*/g, '')
+    .replace(/^\s*#{1,6}\s*/gm, '')
+    .replace(/^\s*[-*•]\s+/gm, '• ')
+    .replace(/\*\*/g, '')
+    .replace(/`/g, '')
+    .replace(/^\s*---+\s*$/gm, '')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
+function cleanChoiceQuestionLine(rawLine: string): string {
+  return String(rawLine || '')
+    .replace(/^\s*#{1,6}\s*/, '')
+    .replace(/^\s*[-*•]\s+/, '')
+    .replace(/^\s*\d+\s*[.、:：)）]\s+/, '')
+    .replace(/\*\*/g, '')
+    .replace(/`/g, '')
+    .trim()
+}
+
+function extractChoiceQuestion(
+  text: string,
+  groupStart: number,
+  inviteIndex: number,
+): { question: string; start: number } {
+  const before = text.slice(0, groupStart)
+  const lines = before.split('\n')
+  const starts: number[] = []
+  let offset = 0
+  for (const line of lines) {
+    starts.push(offset)
+    offset += line.length + 1
+  }
+  const candidates = lines
+    .map((line, index) => ({ line: cleanChoiceQuestionLine(line), start: starts[index] ?? 0 }))
+    .filter((item) => item.line)
+  for (let index = candidates.length - 1; index >= Math.max(0, candidates.length - 10); index -= 1) {
+    const candidate = candidates[index]
+    const questionMatches = candidate.line.match(/[^。！？\n]{2,120}[？?]/g)
+    if (questionMatches?.length) {
+      return { question: questionMatches[questionMatches.length - 1], start: candidate.start }
+    }
+    if (CHOICE_INVITE_RE.test(candidate.line) && candidate.line.length <= 160) {
+      const question = /[？?]$/.test(candidate.line) ? candidate.line : `${candidate.line}？`
+      return { question, start: candidate.start }
+    }
+  }
+  const inviteLine = text.slice(inviteIndex).split('\n')[0]
+  const inviteQuestion = cleanChoiceQuestionLine(inviteLine)
+  if (inviteQuestion) {
+    return {
+      question: /[？?]$/.test(inviteQuestion) ? inviteQuestion : `${inviteQuestion}？`,
+      start: inviteIndex,
+    }
+  }
+  return { question: '请选择下一步处理方式', start: groupStart }
+}
+
+/**
+ * 把“长汇报 + 选项 A/B/C + 请选择”这种正文转成结构化选择卡。
+ * 只匹配明确邀请用户选择、且末尾有 2–4 个候选的文本；解析失败返回 null，
+ * 由调用方决定是否强制模型重答一次。
+ */
+function parseChoiceTextToClarify(text: string): ClarifyRequest | null {
+  const source = stripFencedCodeBlocks(text).trim()
+  if (source.length < 20 || source.length > 12000) return null
+  const inviteIndex = lastChoiceInviteIndex(source)
+  if (inviteIndex < 0) return null
+
+  const groups = collectChoiceOptionGroups(source)
+  if (groups.length === 0) return null
+  const afterInvite = groups.filter((group) => group.start >= inviteIndex)
+  const group = afterInvite.length > 0
+    ? afterInvite[afterInvite.length - 1]
+    : groups[groups.length - 1]
+  if (!afterInvite.length && Math.abs(group.start - inviteIndex) > 1500) return null
+  if (group.options.length < 2) return null
+
+  const options = group.options.slice(0, 4)
+  if (options.length < 2) return null
+  const { question, start } = extractChoiceQuestion(source, group.start, inviteIndex)
+  // 编号清单也可能是“请确认以下步骤”，不能只凭“请确认”就转成选项。
+  // 显式“选项 A/B/C”、问句里明确要求选一个、或候选本身就是继续/取消这类二选一，
+  // 才认定用户真的需要拍板。
+  const explicitOptionLabels = /选项\s*(?:[A-Da-d]|[一二三四１-４1-4])/.test(source.slice(group.start, group.end))
+  const confirmChoice = options.every((option) =>
+    /^(?:继续|取消|等待|转发|确认|不确认|暂停|重试|是|否|不|先不|暂不)$/.test(option.label.trim()),
+  )
+  if (!explicitOptionLabels && !CHOICE_INTENT_RE.test(question) && !confirmChoice) return null
+  const intro = plainTextForIntro(source.slice(0, start)).slice(0, 1600)
+  return {
+    id: 'q1',
+    question,
+    options,
+    allowCustom: true,
+    kind: 'single',
+    ...(intro ? { intro } : {}),
+  }
+}
+
+function withClarifyIntro(clarify: ClarifyRequest, source: string): ClarifyRequest {
+  if (clarify.intro) return clarify
+  const intro = plainTextForIntro(source).slice(0, 1600)
+  if (!intro || intro === clarify.question) return clarify
+  return { ...clarify, intro }
+}
+
+/**
  * 出题也属于 ask_user 的结构化交互场景：用户说“出 N 道题/做题/刷题/测验”
  * 或历史上已经在答题时，模型把题面写成正文要能识别出来并修复。
  */
@@ -1946,6 +2330,22 @@ function looksLikeVagueRequest(text: string): boolean {
 }
 
 /**
+ * 用户直接点名要“可点击选项/选择卡”时，即使模型擅自决定下一步，
+ * 也要强制走一次 ask_user，而不是把决定藏在正文里。
+ */
+function userWantsChoiceCard(text: string): boolean {
+  const compact = String(text || '').replace(/\s+/g, ' ').trim()
+  if (!compact) return false
+  const asksUi = /(?:可点击|点击|按钮|选项卡|选择卡|交互卡|A2UI)/i.test(compact)
+  const asksOptions = /(?:选项|选择|让我选|让我挑|选一个|挑一个|哪一个)/.test(compact)
+  const directOptionsRequest = /(?:给我|列出|提供|生成|来)[^。！？\n]{0,10}(?:选项|选择)/.test(compact)
+  const alternatives = /(?:还是|或者)/.test(compact)
+  return (asksUi && (asksOptions || alternatives))
+    || directOptionsRequest
+    || (asksOptions && alternatives && /[？?]/.test(compact))
+}
+
+/**
  * 模型只写了澄清问题、没有给出结构化方向时的兜底。问题仍用模型原文，
  * 方向取当前工作台最常用的四类能力，保证用户能点击或手动补充，而不是
  * 停留在一句无法操作的正文问句上。
@@ -1968,6 +2368,8 @@ function fallbackClarify(question: string): ClarifyRequest {
 /** 渠道消息没有可点击卡片时，把澄清问题、选项和“可补充”说明一起发给用户。 */
 export function formatClarifyText(clarify: ClarifyRequest | null | undefined): string {
   if (!clarify) return ''
+  const intro = String(clarify.intro ?? '').trim()
+  const prefix = intro ? `${intro}\n\n` : ''
   const questions = clarify.questions ?? []
   if (questions.length > 1) {
     // 纯文本渠道没有分页卡片，至少把整组题完整列出来，避免只看到第一题。
@@ -1982,10 +2384,10 @@ export function formatClarifyText(clarify: ClarifyRequest | null | undefined): s
       const hint = question.kind === 'multiple' ? '（可多选）' : ''
       return `${stem}${hint}\n${options}`
     })
-    return `一组共 ${questions.length} 道题，请依次回复每道题的答案：\n\n${blocks.join('\n\n')}`
+    return `${prefix}一组共 ${questions.length} 道题，请依次回复每道题的答案：\n\n${blocks.join('\n\n')}`
   }
   if (clarify.kind === 'text') {
-    return `${clarify.question}\n\n${clarify.placeholder || '请直接回复你的答案。'}`
+    return `${prefix}${clarify.question}\n\n${clarify.placeholder || '请直接回复你的答案。'}`
   }
   const options = clarify.options
     .map((option, index) => `${index + 1}. ${option.label}${option.description ? `：${option.description}` : ''}`)
@@ -1995,7 +2397,7 @@ export function formatClarifyText(clarify: ClarifyRequest | null | undefined): s
     : clarify.allowCustom
       ? '也可以直接回复你自己的方向。'
       : ''
-  return `${clarify.question}\n\n${options}${hint ? `\n\n${hint}` : ''}`
+  return `${prefix}${clarify.question}\n\n${options}${hint ? `\n\n${hint}` : ''}`
 }
 
 interface SubAgentTask {
@@ -2007,6 +2409,14 @@ interface SubAgentTask {
   key?: string
   /** 团队内固定展示序号；复用 worker 时沿用旧序号 */
   index?: number
+  /** 岗位：producer / critic / researcher / builder / worker */
+  role?: string
+  /** 组织归属；null 表示主 Agent 直属。评审关系仍由任务链表达，不走这里。 */
+  parentKey?: string | null
+  /** 派活时前置的验收标准，供 critic 和父 Agent 对齐 */
+  acceptance?: string
+  /** true 表示固定岗位，空闲清理不会自动注销 */
+  pinned?: boolean
   /** 从被中断任务的检查点继续；只由 agent_resume 在服务端填充，不暴露给模型参数 */
   resume?: {
     messages: LlmMessage[]
@@ -2187,6 +2597,8 @@ export function chooseSubAgentModel(opts: {
 }
 
 /** agent.spawn 的 tasks 参数；模型有时会直接给数组，这里两种都接受。 */
+const SUB_AGENT_ROLES = ['producer', 'critic', 'researcher', 'builder', 'worker'] as const
+
 function parseSubAgentTasks(raw: unknown): SubAgentTask[] {
   let value: unknown = raw
   if (typeof raw === 'string') {
@@ -2202,6 +2614,16 @@ function parseSubAgentTasks(raw: unknown): SubAgentTask[] {
     const record = item as Record<string, unknown>
     const prompt = String(record.prompt ?? '').trim()
     if (!prompt) throw new EabError(EC.VALIDATION, `第 ${index + 1} 个子任务缺少 prompt`)
+    const roleRaw = String(record.role ?? 'worker').trim().toLowerCase() || 'worker'
+    if (!SUB_AGENT_ROLES.includes(roleRaw as (typeof SUB_AGENT_ROLES)[number])) {
+      throw new EabError(
+        EC.VALIDATION,
+        `第 ${index + 1} 个子任务的 role 只能是 ${SUB_AGENT_ROLES.join(' / ')}，当前是 ${roleRaw}`,
+      )
+    }
+    const parentKey = record.parentKey === undefined || record.parentKey === null
+      ? null
+      : String(record.parentKey).trim().slice(0, 40) || null
     return {
       prompt,
       title: record.title === undefined ? undefined : String(record.title).slice(0, 80),
@@ -2209,6 +2631,10 @@ function parseSubAgentTasks(raw: unknown): SubAgentTask[] {
       retries: record.retries === undefined ? undefined : Number(record.retries),
       key: record.key === undefined ? undefined : String(record.key).trim().slice(0, 40) || undefined,
       index: record.index === undefined ? undefined : Number(record.index) || undefined,
+      role: roleRaw,
+      parentKey,
+      acceptance: record.acceptance === undefined ? '' : String(record.acceptance).slice(0, 1200),
+      pinned: record.pinned === true || record.pinned === 'true',
     }
   })
 }
@@ -2341,9 +2767,26 @@ async function spawnSubAgents(opts: {
     throw new EabError(EC.VALIDATION, `子 Agent 嵌套超过上限（最多 ${maxDepth} 层）`)
   }
   const maxParallel = Math.max(1, Math.min(8, opts.deps.config.agentMaxParallel ?? 4))
-  const tasks = opts.tasks.slice(0, maxParallel)
-  // 先清掉空闲超期的 worker，避免父 Agent 把任务派给一个已经注销的子 Agent。
+  const tasks = opts.tasks
+  if (tasks.length > maxParallel) {
+    throw new EabError(
+      EC.VALIDATION,
+      `一次最多并行 ${maxParallel} 个子任务，当前给了 ${tasks.length} 个；请拆成多轮派发，不要静默丢掉后面的任务`,
+    )
+  }
+  const workerKeys = tasks.map((task, index) => (task.key ?? `t${index + 1}`).trim() || `t${index + 1}`)
+  const seenKeys = new Set<string>()
+  for (const key of workerKeys) {
+    if (seenKeys.has(key)) {
+      throw new EabError(EC.VALIDATION, `同一批子任务里 key「${key}」不能重复；需要并行就用不同 key`)
+    }
+    seenKeys.add(key)
+  }
+  // 先清掉空闲超时和等待超时的岗位，再做容量校验；满了会软注销最老的空闲非固定岗位，
+  // 仍放不下就明确报错，不静默丢任务。
   opts.team.pruneIdleWorkers()
+  opts.team.pruneStaleWaiting()
+  opts.team.ensureCapacity(workerKeys)
   const catalog = await loadModelCatalogCached(
     opts.deps.db,
     opts.actor.subject.companyId,
@@ -2422,6 +2865,11 @@ async function spawnSubAgents(opts: {
         modelId,
         modelName,
         modelReason: choice.reason,
+        role: task.role ?? 'worker',
+        parentKey: task.parentKey ?? null,
+        depth: opts.depth + 1,
+        acceptance: task.acceptance ?? '',
+        pinned: task.pinned ?? false,
       })
 
       const emitDone = (
@@ -2473,6 +2921,11 @@ async function spawnSubAgents(opts: {
         index: task.index ?? index + 1,
         modelId,
         modelName,
+        depth: opts.depth + 1,
+        ...(task.role ? { role: task.role } : {}),
+        ...(task.parentKey !== undefined ? { parentKey: task.parentKey } : {}),
+        ...(task.acceptance !== undefined ? { acceptance: task.acceptance } : {}),
+        ...(task.pinned !== undefined ? { pinned: task.pinned } : {}),
       })
       // 同一 key 的上一轮对话继续带进模型，agent_task 不是“重新开一个任务”，而是接着聊。
       // 从检查点继续时不重复拼接历史：检查点里已经有上一次执行到一半的消息。
@@ -2519,6 +2972,11 @@ async function spawnSubAgents(opts: {
               index: task.index ?? index + 1,
               modelId,
               modelName,
+              depth: opts.depth + 1,
+              ...(task.role ? { role: task.role } : {}),
+              ...(task.parentKey !== undefined ? { parentKey: task.parentKey } : {}),
+              ...(task.acceptance !== undefined ? { acceptance: task.acceptance } : {}),
+              ...(task.pinned !== undefined ? { pinned: task.pinned } : {}),
             })
           }
         }
@@ -2690,8 +3148,14 @@ async function startBackgroundSubAgents(opts: {
   agents: Array<{ taskId: string; key: string; title: string; status: 'queued' }>
 }> {
   const maxParallel = Math.max(1, Math.min(8, opts.deps.config.agentMaxParallel ?? 4))
-  const tasks = opts.tasks.slice(0, maxParallel)
+  const tasks = opts.tasks
   if (tasks.length === 0) throw new EabError(EC.VALIDATION, 'agent_spawn 至少需要一个子任务')
+  if (tasks.length > maxParallel) {
+    throw new EabError(
+      EC.VALIDATION,
+      `一次最多并行 ${maxParallel} 个子任务，当前给了 ${tasks.length} 个；请拆成多轮派发，不要静默丢掉后面的任务`,
+    )
+  }
   const workerKeys = tasks.map((task, index) => (task.key ?? `t${index + 1}`).trim() || `t${index + 1}`)
   const keys = new Set<string>()
   for (const key of workerKeys) {
@@ -2703,6 +3167,10 @@ async function startBackgroundSubAgents(opts: {
     }
     keys.add(key)
   }
+  // 先做容量校验，避免任务行已经建好却因为团队已满留下失败残影。
+  opts.team.pruneIdleWorkers()
+  opts.team.pruneStaleWaiting()
+  opts.team.ensureCapacity(workerKeys)
   const entries = tasks.map((task, index) => {
     const workerKey = workerKeys[index]!
     const title = task.title ?? `子任务 ${index + 1}`
@@ -2864,6 +3332,8 @@ function scheduleParentWake(opts: {
   teamId: string
   team: AgentTeamStore
   modelId: string
+  /** 只唤醒这些任务；启动恢复用它圈定“本次重启打断”的任务，普通后台完成不传。 */
+  wakeTaskIds?: readonly string[]
 }): void {
   if (backgroundWakeTimers.has(opts.teamId)) return
   const timer = setTimeout(() => {
@@ -2887,10 +3357,11 @@ async function wakeParentForBackground(opts: {
   teamId: string
   team: AgentTeamStore
   modelId: string
+  wakeTaskIds?: readonly string[]
 }): Promise<void> {
   const sessionId = opts.teamId.startsWith('session:') ? opts.teamId.slice('session:'.length) : ''
   if (!sessionId) return
-  const tasks = opts.team.listTasksAwaitingWake(10)
+  const tasks = opts.team.listTasksAwaitingWake(10, opts.wakeTaskIds)
   if (tasks.length === 0) {
     backgroundWakeAttempts.delete(opts.teamId)
     return
@@ -2931,7 +3402,7 @@ async function wakeParentForBackground(opts: {
   }
   try {
     // 重新读一次，避免并发唤醒时两个实例都拿到同一批任务。
-    const pending = opts.team.listTasksAwaitingWake(10)
+    const pending = opts.team.listTasksAwaitingWake(10, opts.wakeTaskIds)
     if (pending.length === 0) {
       backgroundWakeAttempts.delete(opts.teamId)
       return
@@ -2953,8 +3424,13 @@ async function wakeParentForBackground(opts: {
         return `- ${task.workerKey}（待回答）：${question.slice(0, 1200)}`
       }
       const result = task.resultText.trim() || task.error.trim() || '（没有文字回报）'
-      const resumeHint = task.status === 'failed' && task.error.includes('服务重启中断')
-        ? '；这条任务保留了检查点，可用 agent_resume 继续'
+      const interrupted = task.status === 'failed' && task.error.includes('服务重启中断')
+      // 只有真的读到检查点时才承诺 agent_resume；否则让父 Agent 重新派活，避免空承诺。
+      const hasCheckpoint = interrupted && loadAgentResumeCheckpoint(opts.deps.db, task.id) !== null
+      const resumeHint = interrupted
+        ? hasCheckpoint
+          ? '；这条任务保留了可用检查点，优先用 agent_resume 从上次进度继续，不要从头重做'
+          : '；这条任务没有可用检查点，需要用 agent_task 重新派活'
         : ''
       return `- ${task.workerKey}（${task.status}）：${result.slice(0, 1200)}${resumeHint}`
     })
@@ -3159,6 +3635,100 @@ async function wakeParentForBackground(opts: {
   }
 }
 
+/**
+ * 服务重启后，本次被收尾的后台任务需要让父 Agent 知道，而不是等用户再发一条消息。
+ *
+ * 只处理 `wake_state='restart'` 的任务：
+ * - 从任务行重建公司/用户/父 run/团队，不依赖进程内缓存；
+ * - 仍然走 `wakeParentForBackground`，由父 Agent 决定 `agent_resume` 还是重新派活，
+ *   启动代码不直接重跑，避免绕过模型决策和重复计费；
+ * - 延迟到渠道连接和插件宿主启动之后再叫醒，避免父回合拿不到工具。
+ */
+export function startRestartTaskWakeRecovery(deps: ServerDeps, delayMs = 15_000): () => void {
+  const timer = setTimeout(() => {
+    void recoverRestartTaskWakes(deps)
+  }, Math.max(0, delayMs))
+  timer.unref?.()
+  return () => clearTimeout(timer)
+}
+
+export async function recoverRestartTaskWakes(deps: ServerDeps): Promise<number> {
+  let tasks: ReturnType<typeof listRestartRecoveredTasks>
+  try {
+    tasks = listRestartRecoveredTasks(deps.db, 50)
+  } catch (error) {
+    console.warn('[eab] 查询重启中断任务失败：', (error as Error)?.message)
+    return 0
+  }
+  if (tasks.length === 0) return 0
+
+  const groups = new Map<string, typeof tasks>()
+  for (const task of tasks) {
+    const list = groups.get(task.teamId) ?? []
+    list.push(task)
+    groups.set(task.teamId, list)
+  }
+
+  let scheduled = 0
+  for (const [teamId, group] of groups) {
+    const first = group[0]
+    const team = new AgentTeamStore({
+      db: deps.db,
+      teamId,
+      companyId: first.companyId,
+      userId: first.userId,
+    })
+    try {
+      const person = findActivePerson(deps.db, first.userId)
+      if (!person) {
+        team.markTasksWakeSkipped(group.map((task) => task.id), 'user_missing')
+        continue
+      }
+      const sessionId = teamId.startsWith('session:') ? teamId.slice('session:'.length) : ''
+      const session = sessionId
+        ? deps.db.prepare(
+            `SELECT id FROM chat_sessions
+              WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
+          ).get(sessionId, first.companyId) as { id: string } | undefined
+        : undefined
+      if (!session) {
+        team.markTasksWakeSkipped(group.map((task) => task.id), 'session_missing')
+        continue
+      }
+
+      const parentRun = deps.db
+        .prepare('SELECT model_id FROM agent_runs WHERE id = ?')
+        .get(first.parentRunId) as { model_id: string | null } | undefined
+      const modelId = parentRun?.model_id
+        || first.modelId
+        || resolveModelForPurpose(deps.db, first.companyId, 'chat.default')?.id
+        || ''
+      if (!modelId) {
+        team.markTasksWakeSkipped(group.map((task) => task.id), 'model_missing')
+        continue
+      }
+
+      scheduleParentWake({
+        deps,
+        actor: actorFor(deps.db, person),
+        parentRunId: first.parentRunId,
+        teamId,
+        team,
+        modelId,
+        wakeTaskIds: group.map((task) => task.id),
+      })
+      scheduled += group.length
+    } catch (error) {
+      console.warn(`[eab] 重建重启中断任务失败 ${teamId}：`, (error as Error)?.message)
+    }
+  }
+
+  if (scheduled > 0) {
+    console.log(`[eab] 已安排唤醒父 Agent：${scheduled} 个服务重启中断的后台任务（检查点保留）`)
+  }
+  return scheduled
+}
+
 
 function toolSearchLoadedNames(payload: unknown): string[] {
   if (!payload || typeof payload !== 'object') return []
@@ -3189,9 +3759,9 @@ function thinkingConfigForModel(db: Db, companyId: string, modelId: string): Thi
 }
 
 /**
- * 对话预算使用的模型配置。普通模型来自 models 表；插件模型来自插件声明，
- * 再叠加管理员在控制台保存的上下文/输出覆盖。插件模型不落 models 表，
- * 不能只靠 findModelById，否则后台配置的上限不会进入调用链。
+ * 对话预算使用的模型配置。普通模型来自 models 表；插件模型来自插件
+ * `resolveModel()` 的自描述。插件模型不落 models 表，也不再有后台逐模型覆盖，
+ * 否则同一份上下文/输出会在插件和宿主各写一遍。
  */
 function modelProfileFor(
   db: Db,
@@ -3202,7 +3772,13 @@ function modelProfileFor(
   const native = findModelById(db, companyId, modelId)
   if (native) return native
   if (!isPluginModelId(modelId)) return null
-  return findPluginModelEffective(db, companyId, modelId, userId)
+  return findPluginModel(companyId, modelId, userId)
+}
+
+/** 单条工具结果可以注入多少字符；输入预算越大，允许的工具结果越大，但硬顶 32K。 */
+function toolResultBudgetFor(maxContext: number, maxOutputTokens: number): number {
+  const inputBudgetTokens = Math.max(0, maxContext - maxOutputTokens)
+  return Math.max(4_000, Math.min(32_000, Math.floor(inputBudgetTokens * 0.8)))
 }
 
 /**
@@ -3339,6 +3915,9 @@ export async function runAgentTurn(opts: {
     companyId: actor.subject.companyId,
     userId: actor.person.id,
     idleMs: deps.config.agentWorkerIdleMs,
+    maxWorkers: effectiveAgentTeamSettings(deps.config).maxWorkers,
+    waitingTtlMs: deps.config.agentWaitingTtlMs,
+    retentionMs: deps.config.agentWorkerRetentionMs,
   })
   let sessionRelease: (() => void) | null = null
   let runStatus: AgentRunStatus = 'succeeded'
@@ -3442,25 +4021,20 @@ export async function runAgentTurn(opts: {
       modelId,
       actor.subject.userId,
     )
-    const baseMaxOutputTokens = opts.maxTokens ?? modelProfile?.maxOutputTokens ?? 4096
+    const baseMaxOutputTokens = opts.maxTokens ?? modelProfile?.maxOutputTokens ?? DEFAULT_MODEL_MAX_OUTPUT
     const primaryCallPlan = thinkingCallPlan(
       thinkingConfigForModel(deps.db, actor.subject.companyId, modelId),
       opts.reasoningEffort,
       baseMaxOutputTokens,
     )
     const maxOutputTokens = primaryCallPlan.maxTokens
-    // 工具结果也要吃输入预算：给单个工具结果设硬上限，避免插件一次返回几千行把上下文打爆。
-    const inputBudgetTokens = Math.max(0, (modelProfile?.maxContext ?? 32_000) - maxOutputTokens)
-    const toolResultCharBudget = Math.max(4_000, Math.min(32_000, Math.floor(inputBudgetTokens * 0.8)))
+    // 普通模型没填上下文/输出时按 DSH 的 32K / 4K 默认值参与预算与压缩；
+    // 插件模型有 resolveModel() 声明，通常不会落到这里。
+    let activeProfile = modelProfile
+    let activeMaxContext = modelProfile?.maxContext ?? DEFAULT_MODEL_MAX_CONTEXT
+    let activeMaxOutputTokens = maxOutputTokens
+    let activeToolResultCharBudget = toolResultBudgetFor(activeMaxContext, activeMaxOutputTokens)
     let messages: LlmMessage[] = [...opts.messages]
-    if (modelProfile?.maxContext && modelProfile.contextCompression !== false) {
-      const compressed = compressMessagesForContext(messages, {
-        maxContext: modelProfile.maxContext,
-        maxOutputTokens,
-        toolTokens: estimateTokens(JSON.stringify(tools)),
-      })
-      messages = compressed.messages
-    }
     // 出题前先钉死本轮模式：用户要翻页题组时，拦住模型从历史里沿用“一次一题”，
     // 也拦住它先写一段题面正文、再等工具调用后才变成卡片。
     const quizRouteMode = depth === 0 ? detectQuizRouteMode(messages) : null
@@ -3483,7 +4057,11 @@ export async function runAgentTurn(opts: {
     const dispatchToolChoice = autoDispatchTask
       ? { type: 'function' as const, function: { name: 'agent_spawn' } }
       : undefined
-    const directToolChoice = quizDirectToolChoice ?? dispatchToolChoice
+    // 用户点名要可点击选项时，本轮第一步只能是 ask_user，避免模型擅自恢复/重派任务。
+    const choiceToolChoice = userWantsChoiceCard(turnUserText)
+      ? { type: 'function' as const, function: { name: CLARIFY_TOOL_NAME } }
+      : undefined
+    const directToolChoice = quizDirectToolChoice ?? choiceToolChoice ?? dispatchToolChoice
     if (quizRouteMode) {
       let lastUserIndex = -1
       for (let index = messages.length - 1; index >= 0; index -= 1) {
@@ -3685,14 +4263,15 @@ export async function runAgentTurn(opts: {
           else emit(event)
         }
         const candidateProfile = candidateId === activeModelId
-          ? modelProfile
+          ? activeProfile
           : modelProfileFor(
               deps.db,
               actor.subject.companyId,
               candidateId,
               actor.subject.userId,
             )
-        const candidateBaseMax = opts.maxTokens ?? candidateProfile?.maxOutputTokens ?? baseMaxOutputTokens
+        const candidateMaxContext = candidateProfile?.maxContext ?? DEFAULT_MODEL_MAX_CONTEXT
+        const candidateBaseMax = opts.maxTokens ?? candidateProfile?.maxOutputTokens ?? DEFAULT_MODEL_MAX_OUTPUT
         const callPlan = thinkingCallPlan(
           thinkingConfigForModel(deps.db, actor.subject.companyId, candidateId),
           // 确定性派发只生成一段短任务描述，用最轻思考档位即可；
@@ -3700,6 +4279,15 @@ export async function runAgentTurn(opts: {
           autoDispatchTask ? 'light' : opts.reasoningEffort,
           candidateBaseMax,
         )
+        // 每轮、每个候选模型都按自己的窗口重新压一次；工具循环新增的旧工具结果
+        // 会被收成摘要，避免只靠首轮压缩把 32K 模型顶爆。
+        const candidateMessages = candidateProfile?.contextCompression === false
+          ? messages
+          : compactMessagesForModelCall(messages, {
+              maxContext: candidateMaxContext,
+              maxOutputTokens: callPlan.maxTokens,
+              toolTokens: estimateTokens(JSON.stringify(tools)),
+            }).messages
         // 备用模型开始流式输出前先通知渠道清空失败模型的半截内容；
         // 如果等成功后再通知，新模型已经吐出的 token 也会被一起清掉。
         if (candidateId !== modelId && lastModelError) {
@@ -3743,7 +4331,7 @@ export async function runAgentTurn(opts: {
             ? await callPluginModel(
                 actor.subject.companyId,
                 candidateId,
-                messages,
+                candidateMessages,
                 streamOptions,
                 callPlan.maxTokens,
               )
@@ -3752,7 +4340,7 @@ export async function runAgentTurn(opts: {
                 deps.config.dbPath,
                 actor.subject.companyId,
                 candidateId,
-                messages,
+                candidateMessages,
                 streamOptions,
                 callPlan.maxTokens,
               )
@@ -3766,6 +4354,10 @@ export async function runAgentTurn(opts: {
           }
           result = candidateResult
           sawModel = true
+          activeProfile = candidateProfile
+          activeMaxContext = candidateMaxContext
+          activeMaxOutputTokens = callPlan.maxTokens
+          activeToolResultCharBudget = toolResultBudgetFor(activeMaxContext, activeMaxOutputTokens)
           markModelHealthy(actor.subject.companyId, candidateId)
           markModelPreferred(actor.subject.companyId, candidateId)
           if (candidateId !== activeModelId) {
@@ -3830,7 +4422,17 @@ export async function runAgentTurn(opts: {
         && (looksLikeQuizBatchText(result.text) || /第\s*[0-9０-９一二三四五六七八九十百]+\s*题/.test(result.text))
       const quizOutput = calls.length === 0
         && ((hasQuizContext(messages) && looksLikeQuizOutput(result.text)) || quizTextOutput)
-      if (calls.length === 0 && !clarifyRepairUsed && (looksLikeClarifyQuestion(result.text) || quizOutput)) {
+      // 需要用户在多个方案/下一步动作中拍板，却只把“选项 A/B/C”“请告诉我您的决定”
+      // 写成正文时，本轮的 ask_user 修复路径也要接住。题组优先，不和普通选择抢。
+      const choiceDecision = !quizOutput && calls.length === 0
+        ? parseChoiceTextToClarify(result.text)
+        : null
+      // 用户已经选了卡片，模型接着追问“是哪个任务/换哪个模型”时，
+      // 同样是在等用户作答，不能只留一段正文问题。
+      const missingInfoDecision = !quizOutput && calls.length === 0
+        ? looksLikeMissingInfoRequest(result.text)
+        : false
+      if (calls.length === 0 && !clarifyRepairUsed && (looksLikeClarifyQuestion(result.text) || quizOutput || choiceDecision || missingInfoDecision)) {
         clarifyRepairUsed = true
         const originalText = result.text
         const originalReasoning = reasoning
@@ -3862,6 +4464,26 @@ export async function runAgentTurn(opts: {
             fallbackFromModelId,
           }
         }
+        // 正文里已经有具体选项时直接出卡，保留选项前的问题和背景摘要；
+        // 不再多调一次模型，避免模型改写用户已经看到的方案。
+        if (choiceDecision) {
+          text = choiceDecision.question
+          reasoning = originalReasoning
+          emit({ type: 'clarify', clarify: choiceDecision })
+          return {
+            runId,
+            text: choiceDecision.question,
+            reasoning,
+            toolCalls: traces,
+            rounds,
+            promptTokens,
+            completionTokens,
+            clarify: choiceDecision,
+            usedModelId: activeModelId,
+            usedModelName: modelDisplayName(deps.db, actor.subject.companyId, activeModelId),
+            fallbackFromModelId,
+          }
+        }
         try {
           const repairProfile = modelProfileFor(
             deps.db,
@@ -3881,11 +4503,19 @@ export async function runAgentTurn(opts: {
             ...(repairPlan.effort ? { reasoningEffort: repairPlan.effort } : {}),
             ...(repairPlan.maxTokensCap ? { maxTokensCap: repairPlan.maxTokensCap } : {}),
           }
+          const repairMaxContext = repairProfile?.maxContext ?? DEFAULT_MODEL_MAX_CONTEXT
+          const repairMessages = repairProfile?.contextCompression === false
+            ? messages
+            : compactMessagesForModelCall(messages, {
+                maxContext: repairMaxContext,
+                maxOutputTokens: repairPlan.maxTokens,
+                toolTokens: estimateTokens(JSON.stringify(tools)),
+              }).messages
           const repaired = isPluginModelId(activeModelId)
             ? await callPluginModel(
                 actor.subject.companyId,
                 activeModelId,
-                messages,
+                repairMessages,
                 repairOptions,
                 repairPlan.maxTokens,
               )
@@ -3894,7 +4524,7 @@ export async function runAgentTurn(opts: {
                 deps.config.dbPath,
                 actor.subject.companyId,
                 activeModelId,
-                messages,
+                repairMessages,
                 repairOptions,
                 repairPlan.maxTokens,
               )
@@ -3905,17 +4535,18 @@ export async function runAgentTurn(opts: {
             const repairClarify = repairCalls.find((call) => call.function.name === CLARIFY_TOOL_NAME)
             const clarify = repairClarify ? parseClarifyRequest(parseToolArgs(repairClarify.function.arguments)) : null
             if (clarify) {
-              text = clarify.question
-              emit({ type: 'clarify', clarify })
+              const clarifyWithIntro = withClarifyIntro(clarify, originalText)
+              text = clarifyWithIntro.question
+              emit({ type: 'clarify', clarify: clarifyWithIntro })
               return {
                 runId,
-                text: clarify.question,
+                text: clarifyWithIntro.question,
                 reasoning: originalReasoning,
                 toolCalls: traces,
                 rounds,
                 promptTokens,
                 completionTokens,
-                clarify,
+                clarify: clarifyWithIntro,
                 usedModelId: activeModelId,
                 usedModelName: modelDisplayName(deps.db, actor.subject.companyId, activeModelId),
                 fallbackFromModelId,
@@ -3960,16 +4591,17 @@ export async function runAgentTurn(opts: {
       if (clarifyCall) {
         const clarify = parseClarifyRequest(parseToolArgs(clarifyCall.function.arguments))
         if (clarify) {
-          emit({ type: 'clarify', clarify })
+          const clarifyWithIntro = withClarifyIntro(clarify, result.text)
+          emit({ type: 'clarify', clarify: clarifyWithIntro })
           return {
             runId,
-            text: clarify.question,
+            text: clarifyWithIntro.question,
             reasoning,
             toolCalls: traces,
             rounds,
             promptTokens,
             completionTokens,
-            clarify,
+            clarify: clarifyWithIntro,
             usedModelId: activeModelId,
             usedModelName: modelDisplayName(deps.db, actor.subject.companyId, activeModelId),
             fallbackFromModelId,
@@ -4163,6 +4795,25 @@ export async function runAgentTurn(opts: {
             abortError.name = 'AbortError'
             throw abortError
           }
+        } else if (functionName === 'agent_retire') {
+          if (depth > 0) throw new EabError(EC.VALIDATION, 'agent.retire 只能由主 Agent 调用')
+          const workerKey = String(args.agent ?? args.key ?? '').trim()
+          if (!workerKey) throw new EabError(EC.VALIDATION, 'agent_retire 需要指定子 Agent 的 agent（团队 key）')
+          const force = args.force === true || args.force === 'true'
+          const reason = String(args.reason ?? '').trim()
+          let retired
+          try {
+            retired = team.retireWorker(workerKey, reason, { force })
+          } catch (error) {
+            throw new EabError(EC.VALIDATION, (error as Error)?.message ?? `无法注销子 Agent「${workerKey}」`)
+          }
+          payload = {
+            ok: true,
+            agent: retired.key,
+            status: retired.status,
+            retiredAt: retired.retiredAt,
+            revival: '保留期内仍可用 agent_task 用同一个 key 复活它；超过保留期才会硬清理上下文',
+          }
         } else if (functionName === 'agent_task') {
           // 经理给已在团队里的子 Agent 继续派活：复用同一个窗口与身份，不重新注册。
           const workerKey = String(args.agent ?? args.key ?? '').trim()
@@ -4178,12 +4829,27 @@ export async function runAgentTurn(opts: {
               `子 Agent「${workerKey}」不存在：团队里没有这个 key，也没有它的任务历史`,
             )
           }
-          if (worker?.status === 'running') {
-            throw new EabError(
-              EC.VALIDATION,
-              `子 Agent「${workerKey}」正在执行上一件事：先用 agent_wait 等它完成或提问；如果只是追加约束，用 agent_message 发指示`,
-            )
-          }
+          const activeTask = team
+            .listTasks(50)
+            .find((task) => task.workerKey === workerKey && (task.status === 'queued' || task.status === 'running'))
+          if (worker?.status === 'running' && activeTask) {
+            // 这是可预期的工具选择冲突，不是系统异常：不抛红色错误，返回结构化提示，
+            // 让父 Agent 立刻改用 agent_message 追加约束，避免重复派活。
+            payload = {
+              ok: false,
+              key: workerKey,
+              status: 'busy',
+              agentStatus: worker.status,
+              error: `子 Agent「${workerKey}」正在执行上一件事，本次没有重复派活。`,
+              hint: '如果只是追加约束、催进度或补充信息，请用 agent_message；要等它完成再用 agent_task 派下一件事。',
+              suggestedTool: 'agent_message',
+              activeTask: {
+                id: activeTask.id,
+                status: activeTask.status,
+                prompt: activeTask.prompt.slice(0, 300),
+              },
+            }
+          } else {
           // 提问或完成时旧任务可能来不及关闭；父 Agent 再派活时先收尾，
           // 否则团队摘要会一直显示“执行中”，而 worker 实际上已经空闲或注销。
           const openTasks = team
@@ -4199,6 +4865,19 @@ export async function runAgentTurn(opts: {
           // 避免父 Agent 因为一次 2 分钟空闲就被迫换 key、丢掉原来的会话上下文。
           const workerName = worker?.name || prompt.replace(/\s+/g, ' ').slice(0, 28) || '续派子 Agent'
           const workerIndex = worker?.index || (Math.max(0, ...team.listWorkers().map((item) => item.index)) + 1)
+          const reviveMetadata = {
+            ...(worker?.role ? { role: worker.role } : {}),
+            ...(worker?.parentKey !== undefined ? { parentKey: worker.parentKey } : {}),
+            ...(worker?.acceptance ? { acceptance: worker.acceptance } : {}),
+            ...(worker?.pinned ? { pinned: true } : {}),
+          }
+          const reviveTask = {
+            prompt,
+            title: workerName,
+            key: workerKey,
+            index: workerIndex,
+            ...reviveMetadata,
+          }
           const background = args.background === true || args.background === 'true'
           if (background) {
             payload = await startBackgroundSubAgents({
@@ -4212,7 +4891,7 @@ export async function runAgentTurn(opts: {
               depth,
               space,
               signal: opts.signal,
-              tasks: [{ prompt, title: workerName, key: workerKey, index: workerIndex }],
+              tasks: [reviveTask],
             })
           } else {
             payload = await spawnSubAgents({
@@ -4226,7 +4905,7 @@ export async function runAgentTurn(opts: {
               depth,
               space,
               signal: opts.signal,
-              tasks: [{ prompt, title: workerName, key: workerKey, index: workerIndex }],
+              tasks: [reviveTask],
               emit: (event) => emit(event),
             })
           }
@@ -4234,6 +4913,7 @@ export async function runAgentTurn(opts: {
             const abortError = new Error('子 Agent 已随父任务取消')
             abortError.name = 'AbortError'
             throw abortError
+          }
           }
         } else if (functionName === 'agent_resume') {
           // 从被服务重启打断的任务检查点继续；没有检查点就明确拒绝，不假装“续跑”。
@@ -4372,20 +5052,45 @@ export async function runAgentTurn(opts: {
           if (!workerKey) throw new EabError(EC.VALIDATION, 'agent.message 需要指定子 Agent 的 agent（团队 key）')
           const worker = team.findWorker(workerKey)
           if (!worker) throw new EabError(EC.VALIDATION, `子 Agent「${workerKey}」不存在或已注销`)
-          if (worker.status !== 'running') {
-            throw new EabError(
-              EC.VALIDATION,
-              `子 Agent「${workerKey}」当前不在运行中（${worker.status}）：需要它继续做事请用 agent_task`,
-            )
-          }
-          const text = String(args.text ?? args.message ?? '').trim()
-          if (!text) throw new EabError(EC.VALIDATION, 'agent.message 需要给出 text')
-          team.sendGuidance(workerKey, text)
-          payload = {
-            ok: true,
-            key: workerKey,
-            status: 'guidance_queued',
-            note: '指示已加入队列，子 Agent 会在下一轮工具循环前读到。',
+          const activeTask = team
+            .listTasks(50)
+            .find((task) => task.workerKey === workerKey && (task.status === 'queued' || task.status === 'running'))
+          const latestTask = team.listTasks(50).find((task) => task.workerKey === workerKey)
+          // 状态与任务双校验：worker 状态可能刚好在任务结束时变成 idle，单看状态会
+          // 把“已经结束”的岗位误判成运行中，导致 guidance 永远没人消费。
+          const effectiveStatus = worker.status === 'running' && !activeTask ? 'idle' : worker.status
+          if (effectiveStatus !== 'running') {
+            // 这是父 Agent 的可预期误选，不是后端异常。返回结构化提示而不是红错，
+            // 同时附带最近一次任务结果，父 Agent 可直接汇报进度，不必再重复派活。
+            payload = {
+              ok: false,
+              key: workerKey,
+              status: effectiveStatus,
+              agentStatus: worker.status,
+              error: `子 Agent「${workerKey}」当前不在运行中（${effectiveStatus}），本次没有发送指示。`,
+              hint: effectiveStatus === 'waiting'
+                ? '它正在等待父 Agent 回答；请用 agent_task 把答复发回去，不要用 agent_message。'
+                : '如果需要它继续做事或汇报进度，请用 agent_task 派新任务；如果只是想知道上次结果，可直接读取下面的 lastTask。',
+              suggestedTool: 'agent_task',
+              lastTask: latestTask
+                ? {
+                    id: latestTask.id,
+                    status: latestTask.status,
+                    prompt: latestTask.prompt.slice(0, 300),
+                    result: latestTask.resultText.slice(0, 400),
+                  }
+                : null,
+            }
+          } else {
+            const text = String(args.text ?? args.message ?? '').trim()
+            if (!text) throw new EabError(EC.VALIDATION, 'agent.message 需要给出 text')
+            team.sendGuidance(workerKey, text)
+            payload = {
+              ok: true,
+              key: workerKey,
+              status: 'guidance_queued',
+              note: '指示已加入队列，子 Agent 会在下一轮工具循环前读到。',
+            }
           }
         } else if (functionName === 'agent_ask_parent') {
           // 子 Agent 的“暂停并提问”协议：本轮立即结束，问题回到父 Agent 的工具结果里。
@@ -4533,7 +5238,7 @@ export async function runAgentTurn(opts: {
             userId: actor.person.id,
             toolId,
             payload,
-            minChars: toolResultCharBudget,
+            minChars: activeToolResultCharBudget,
           })
         : null
       if (savedBatch) {
@@ -4561,8 +5266,8 @@ export async function runAgentTurn(opts: {
         || functionName === 'workspace.read'
         || functionName === 'workspace_search'
         || functionName === 'workspace.search'
-          ? Math.max(toolResultCharBudget, 60_000)
-          : toolResultCharBudget
+          ? Math.max(activeToolResultCharBudget, 60_000)
+          : activeToolResultCharBudget
       const capped = capToolResultText(
         toolResultBody,
         capChars,
@@ -4852,6 +5557,9 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
       companyId: actor.subject.companyId,
       userId: actor.person.id,
       idleMs: deps.config.agentWorkerIdleMs,
+      maxWorkers: effectiveAgentTeamSettings(deps.config).maxWorkers,
+      waitingTtlMs: deps.config.agentWaitingTtlMs,
+      retentionMs: deps.config.agentWorkerRetentionMs,
     })
     // 页面刷新后靠这个只读接口恢复团队面板；顺便清掉超过空闲期的已完成子 Agent。
     team.pruneIdleWorkers()
@@ -4865,6 +5573,13 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
       modelName: worker.modelName,
       lastTaskAt: worker.lastTaskAt,
       lastText: worker.lastText,
+      role: worker.role,
+      parentKey: worker.parentKey,
+      depth: worker.depth,
+      acceptance: worker.acceptance,
+      pinned: worker.pinned,
+      retiredAt: worker.retiredAt,
+      retireReason: worker.retireReason,
     }))
     const tasks = team.listTasks(20).map((task) => ({
       id: task.id,
@@ -4887,7 +5602,19 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
       payload: event.payload,
       createdAt: event.createdAt,
     }))
-    return ok({ roster: team.roster(), workers, tasks, events })
+    return ok({
+      roster: team.roster(),
+      workers,
+      tree: team.teamTree(),
+      capacity: {
+        active: workers.length,
+        limit: team.maxWorkers,
+        waitingTtlMs: team.waitingTtlMs,
+        retentionMs: team.retentionMs,
+      },
+      tasks,
+      events,
+    })
   })
 
   /** 只有用户主动点停止才取消；关页面/刷新/切会话都不会走到这里。 */
@@ -4942,6 +5669,15 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
       if (event.type === 'models') {
         if (event.companyId !== actor.subject.companyId) return
         write(`event: models\ndata: ${JSON.stringify({ revision: event.revision })}\n\n`)
+        return
+      }
+      // 云空间文件变化只发给本人：页面据此刷新列表、就地更新消息卡片。
+      if (event.type === 'workspace') {
+        if (event.companyId !== actor.subject.companyId || event.userId !== actor.person.id) return
+        write(`event: workspace\ndata: ${JSON.stringify({
+          reason: event.reason,
+          fileIds: event.fileIds,
+        })}\n\n`)
         return
       }
       if (event.companyId !== actor.subject.companyId || event.userId !== actor.person.id) return
@@ -5050,19 +5786,34 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
         .prepare('UPDATE chat_sessions SET last_read_at = ? WHERE id = ? AND user_id = ?')
         .run(Date.now(), session.id, actor.person.id)
     }
+    const metas: unknown[] = page.map((row) => (row.meta_json ? JSON.parse(row.meta_json) : null))
+    const workspaceFileIds: string[] = []
+    for (const meta of metas) {
+      if (!meta || typeof meta !== 'object') continue
+      const attachments = (meta as { attachments?: unknown }).attachments
+      if (!Array.isArray(attachments)) continue
+      for (const item of attachments) {
+        if (!item || typeof item !== 'object') continue
+        const fileId = String((item as { workspaceFileId?: unknown }).workspaceFileId ?? '').trim()
+        if (fileId) workspaceFileIds.push(fileId)
+      }
+    }
+    const workspaceStates = workspaceFileIds.length > 0
+      ? resolveWorkspaceFileStates(deps, actor.subject.companyId, actor.person.id, workspaceFileIds)
+      : new Map<string, WorkspaceFileState>()
     return ok({
       session: {
         ...session,
         modelId: session.model_id,
         reasoningEffort: session.reasoning_effort,
       },
-      messages: page.map((row) => ({
+      messages: page.map((row, index) => ({
         id: row.id,
         role: row.role,
         text: row.text,
         modelId: row.model_id,
         modelName: row.model_name,
-        meta: row.meta_json ? JSON.parse(row.meta_json) : null,
+        meta: enrichAttachmentMetaStates(metas[index], workspaceStates),
         createdAt: new Date(Number(row.created_at)).toISOString(),
       })),
       hasMore,
@@ -5385,6 +6136,7 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
         type?: string
         text?: string
         dataUrl?: string
+        workspaceFileId?: string
       }>
       /** true 时以 SSE 返回同样的回答（CHAT-02 流式） */
       stream?: boolean
@@ -5439,29 +6191,21 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
     if (rawAttachments !== undefined && !Array.isArray(rawAttachments)) {
       throw new EabError(EC.VALIDATION, 'attachments 必须是数组')
     }
-    const attachments: ChatAttachmentInput[] = (rawAttachments ?? []).slice(0, 4).map((item) => {
-      const name = String(item?.name ?? '').trim().slice(0, 200)
-      const size = Number(item?.size ?? 0)
-      const type = String(item?.type ?? '').slice(0, 100)
-      const rawText = String(item?.text ?? '')
-      if (rawText.length > MAX_ATTACHMENT_INPUT_CHARS) {
-        throw new EabError(EC.VALIDATION, `附件「${name || '未命名'}」正文超过 500 万字符，请拆分后再上传`)
-      }
-      const attachmentText = rawText
-      const dataUrl = String(item?.dataUrl ?? '')
-      if (!name) throw new EabError(EC.VALIDATION, '附件缺少文件名')
-      if (!Number.isFinite(size) || size < 0) throw new EabError(EC.VALIDATION, '附件大小不合法')
-      if (dataUrl) {
-        if (!/^data:image\/(png|jpe?g|webp|gif);base64,/i.test(dataUrl)) {
-          throw new EabError(EC.VALIDATION, `附件「${name}」不是支持的图片格式`)
-        }
-        if (dataUrl.length > MAX_ATTACHMENT_DATA_URL) {
-          throw new EabError(EC.VALIDATION, `附件「${name}」图片太大，请压缩到 10MB 以内`)
-        }
-      }
-      return { name, size: Math.trunc(size), type, text: attachmentText, dataUrl }
-    })
-    if ((rawAttachments ?? []).length > 4) throw new EabError(EC.VALIDATION, '单条消息最多 4 个附件')
+    if ((rawAttachments ?? []).length > MAX_CHAT_ATTACHMENTS) {
+      throw new EabError(EC.VALIDATION, `单条消息最多 ${MAX_CHAT_ATTACHMENTS} 个附件`)
+    }
+    /**
+     * 空间选择只决定这一轮 Agent 拿哪套文件工具：
+     * - cloud： workspace.*（默认，不选也可用）
+     * - none：  不暴露文件工具
+     * 网页端不提供本地空间。
+     */
+    const rawSpaceKind = req.body?.spaceKind
+    if (rawSpaceKind !== undefined && !['cloud', 'none'].includes(rawSpaceKind)) {
+      throw new EabError(EC.VALIDATION, 'spaceKind 只能是 cloud / none')
+    }
+    const spaceKind: ActiveSpace['kind'] = rawSpaceKind === 'none' ? 'none' : 'cloud'
+    const attachments = await resolveChatAttachments(deps, actor, rawAttachments ?? [], spaceKind)
     // 附件正文超过单次注入上限时，把完整正文保存为文本批次；消息里只放前 12k 和批次提示。
     for (const item of attachments) {
       if (!item.text || item.text.length <= MAX_ATTACHMENT_TEXT) continue
@@ -5480,18 +6224,8 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
     }
     if (!text && attachments.length === 0) throw new EabError(EC.VALIDATION, '消息不能为空')
 
-    /**
-     * 空间选择只决定这一轮 Agent 拿哪套文件工具：
-     * - cloud： workspace.*（默认，不选也可用）
-     * - none：  不暴露文件工具
-     * 网页端不提供本地空间。
-     */
-    const rawSpaceKind = req.body?.spaceKind
-    if (rawSpaceKind !== undefined && !['cloud', 'none'].includes(rawSpaceKind)) {
-      throw new EabError(EC.VALIDATION, 'spaceKind 只能是 cloud / none')
-    }
-    const space: ActiveSpace = { kind: rawSpaceKind === 'none' ? 'none' : 'cloud' }
-    const spaceLabel = rawSpaceKind === 'none' ? '未选择文件空间' : '云空间'
+    const space: ActiveSpace = { kind: spaceKind }
+    const spaceLabel = spaceKind === 'none' ? '未选择文件空间' : '云空间'
     /**
      * 右侧预览文件：只在本轮当上下文用。
      * - 两个字段都齐才生效（id 用来直接操作，name 用来让用户读懂）；
@@ -5641,6 +6375,9 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
       companyId: actor.subject.companyId,
       userId: actor.person.id,
       idleMs: deps.config.agentWorkerIdleMs,
+      maxWorkers: effectiveAgentTeamSettings(deps.config).maxWorkers,
+      waitingTtlMs: deps.config.agentWaitingTtlMs,
+      retentionMs: deps.config.agentWorkerRetentionMs,
     })
     const chatTools = [
       ...toolSpecsForAgent(deps.db, actor, space, text),

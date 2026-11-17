@@ -67,6 +67,7 @@ import {
   isTextEditableFile,
   listWorkspaceFileVersions,
   prepareWorkspaceGuiFallback,
+  publishWorkspaceFilesChanged,
   readUserWorkspaceFile,
   renameUserWorkspaceFile,
   reportWorkspaceGuiFallback,
@@ -356,14 +357,14 @@ export const TOOLS: readonly ToolDef[] = [
     id: 'agent.spawn',
     name: '并行子 Agent',
     description:
-      '把一个复杂任务拆成多个互不依赖的子任务，并行交给多个子 Agent 执行。适合“同时查三份资料”“分别分析几个文件”“多模型各给一版方案”这类可以并行的任务。每个子 Agent 有独立运行记录和会话锁；一个子任务失败不会取消其他子任务。tasks 必须是 JSON 数组字符串，每项形如 {"key":"research-a","title":"资料A","prompt":"子任务指令（150 字以内）","modelId":"可选模型 id","retries":1}。key 是团队内的稳定标识（建议英文短名），后续可用 agent_task 凭 key 继续给它派活，复用同一个子 Agent 窗口与会话；子 Agent 完成一次任务后若没有新任务，会在空闲一段时间后自动注销；只要这个 key 仍有历史任务，后续用 agent_task 会按同一 key 自动恢复窗口和会话，不需要重新 agent_spawn。prompt 控制在 150 字以内，只写目标、输入范围、关键约束和验收标准，具体步骤由子 Agent 自己规划，不要写长篇执行清单。不要让子任务互相依赖，不要用子 Agent 代替普通的一次工具调用。除非任务明确需要视觉/多模态等专用模型，否则不要给多个子任务填同一个 modelId，留空由系统按能力和并发负载分散分配。前台对话里的实质任务应优先使用 background:true，避免阻塞用户继续提问。',
+      '把一个复杂任务拆成多个互不依赖的子任务，并行交给多个子 Agent 执行。适合“同时查三份资料”“分别分析几个文件”“多模型各给一版方案”这类可以并行的任务。每个子 Agent 有独立运行记录和会话锁；一个子任务失败不会取消其他子任务。tasks 必须是 JSON 数组字符串，每项形如 {"key":"producer","role":"producer","title":"产出初稿","acceptance":"必须给出 3 条可核对结论","prompt":"子任务指令（150 字以内）","modelId":"可选模型 id","retries":1}。key 是团队内的稳定标识（建议英文短名），后续可用 agent_task 凭 key 继续给它派活，复用同一个子 Agent 窗口与会话；固定岗位优先复用 producer / critic / researcher / builder 这些 key，不要每轮换新 key。团队每个会话默认最多 8 个活跃岗位；满了会先软注销最老的空闲非固定岗位，仍满会明确报错，不会静默丢任务。超过 agentMaxParallel 的并行任务会直接报错，请拆成多轮。prompt 控制在 150 字以内，只写目标、输入范围、关键约束和验收标准，具体步骤由子 Agent 自己规划，不要写长篇执行清单。不要让子任务互相依赖，不要用子 Agent 代替普通的一次工具调用。除非任务明确需要视觉/多模态等专用模型，否则不要给多个子任务填同一个 modelId，留空由系统按能力和并发负载分散分配。前台对话里的实质任务应优先使用 background:true，避免阻塞用户继续提问。',
     scope: SC.AGENT_TOOL_INVOKE,
     dangerous: false,
     concurrency: 'read',
     input: {
       tasks: {
         type: 'string',
-        description: 'JSON 数组字符串；每项必须包含 prompt，可选 title、modelId、retries',
+        description: 'JSON 数组字符串；每项必须包含 prompt，可选 key、role（producer/critic/researcher/builder/worker）、title、parentKey、acceptance、pinned、modelId、retries',
         required: true,
       },
       background: {
@@ -373,10 +374,27 @@ export const TOOLS: readonly ToolDef[] = [
     },
   },
   {
+    id: 'agent.retire',
+    name: '收掉子 Agent 岗位',
+    description:
+      '父 Agent 专用。把一个不再需要的子 Agent 岗位软注销：它不再出现在活跃花名册、不占团队容量，但 worker 行和上下文消息会保留 24 小时，保留期内仍可用 agent_task 用同一个 key 复活。running 或 pinned 的岗位默认不能收，确实要强收传 force:true；一般只在任务收口、岗位合并、或团队容量已满时使用。评审链里的 critic 不要提前收掉。',
+    scope: SC.AGENT_TOOL_INVOKE,
+    dangerous: false,
+    concurrency: 'write',
+    input: {
+      agent: { type: 'string', description: '要收掉的子 Agent 团队 key', required: true },
+      reason: { type: 'string', description: '可选：为什么收掉这个岗位，例如“评审已收口”“合并到 builder”' },
+      force: {
+        type: 'boolean',
+        description: '可选：true 表示连 running 或 pinned 岗位也强制注销；会取消它当前排队/执行中的任务',
+      },
+    },
+  },
+  {
     id: 'agent.task',
     name: '继续派活给子 Agent',
     description:
-      '给团队里已经存在的子 Agent 继续派一个新任务，复用同一个子 Agent 会话与同一个可视窗口，不需要重新创建。agent 必须填 agent.spawn 返回或此前事件里给出的 key。子 Agent 完成任务后如果没有再派新任务，会在空闲一段时间后自动注销；只要这个 key 仍有历史任务，系统会按同一个 key 自动恢复窗口和会话，不需要改用 agent_spawn。',
+      '给团队里已经存在的子 Agent 继续派一个新任务，复用同一个子 Agent 会话与同一个可视窗口，不需要重新创建。agent 必须填 agent.spawn 返回或此前事件里给出的 key。子 Agent 完成任务后如果没有再派新任务，会在空闲一段时间后自动注销；只要这个 key 仍有历史任务，系统会按同一个 key 自动恢复窗口和会话，不需要改用 agent_spawn。如果 key 已被软注销，保留期内 agent_task 仍可复活它。目标正在执行时，本工具返回 ok:false + suggestedTool=agent_message，不会重复派活；此时只追加约束请改用 agent_message，等它完成后再派下一件事。',
     scope: SC.AGENT_TOOL_INVOKE,
     dangerous: false,
     concurrency: 'read',
@@ -408,7 +426,7 @@ export const TOOLS: readonly ToolDef[] = [
     id: 'agent.message',
     name: '给运行中的子 Agent 发指示',
     description:
-      '父 Agent 专用。子 Agent 正在后台执行、还没有提出问题时，可追加一条方向性指示（例如“优先看 2025 年数据”“不要改原文件”）。子 Agent 会在下一轮工具循环前读到；它已经完成或正在等待回答时不要用本工具，改用 agent_task 继续派活。',
+      '父 Agent 专用。子 Agent 正在后台执行、还没有提出问题时，可追加一条方向性指示（例如“优先看 2025 年数据”“不要改原文件”）。子 Agent 会在下一轮工具循环前读到；它已经完成或正在等待回答时不要用本工具，改用 agent_task 继续派活。目标不是运行中时，本工具返回 ok:false + suggestedTool=agent_task + lastTask，不会抛错；不要重试同一条指示。',
     scope: SC.AGENT_TOOL_INVOKE,
     dangerous: false,
     concurrency: 'read',
@@ -3949,18 +3967,20 @@ export async function executeTool(
         .get(actor.subject.companyId, actor.subject.userId, path) as { id: string } | undefined
       const size = Buffer.byteLength(text, 'utf8')
       const fileId = row?.id ?? ulid()
+      const now = Date.now()
       if (row) {
         deps.db
           .prepare('UPDATE workspace_files SET size = ?, storage_path = ?, updated_at = ? WHERE id = ?')
-          .run(size, target, Date.now(), row.id)
+          .run(size, target, now, row.id)
       } else {
         deps.db
           .prepare(
             `INSERT INTO workspace_files (id, company_id, scope_type, scope_id, owner_user_id, rel_path, name, size, mime, storage_path, created_at, updated_at)
              VALUES (?, ?, 'user', ?, ?, ?, ?, ?, 'text/plain', ?, ?, ?)`,
           )
-          .run(fileId, actor.subject.companyId, actor.subject.userId, actor.subject.userId, path, basename(path), size, target, Date.now(), Date.now())
+          .run(fileId, actor.subject.companyId, actor.subject.userId, actor.subject.userId, path, basename(path), size, target, now, now)
       }
+      publishWorkspaceFilesChanged(actor.subject.companyId, actor.subject.userId, row ? 'updated' : 'created', [fileId])
       result = { fileId, path, size, created: !row }
       break
     }
@@ -4015,18 +4035,20 @@ export async function executeTool(
         .get(actor.subject.companyId, actor.subject.userId, path) as { id: string } | undefined
       const size = Buffer.byteLength(applied.text, 'utf8')
       const fileId = row?.id ?? ulid()
+      const now = Date.now()
       if (row) {
         deps.db
           .prepare('UPDATE workspace_files SET size = ?, storage_path = ?, updated_at = ? WHERE id = ?')
-          .run(size, target, Date.now(), row.id)
+          .run(size, target, now, row.id)
       } else {
         deps.db
           .prepare(
             `INSERT INTO workspace_files (id, company_id, scope_type, scope_id, owner_user_id, rel_path, name, size, mime, storage_path, created_at, updated_at)
              VALUES (?, ?, 'user', ?, ?, ?, ?, ?, 'text/plain', ?, ?, ?)`,
           )
-          .run(fileId, actor.subject.companyId, actor.subject.userId, actor.subject.userId, path, basename(path), size, target, Date.now(), Date.now())
+          .run(fileId, actor.subject.companyId, actor.subject.userId, actor.subject.userId, path, basename(path), size, target, now, now)
       }
+      publishWorkspaceFilesChanged(actor.subject.companyId, actor.subject.userId, row ? 'updated' : 'created', [fileId])
       result = {
         fileId,
         path,

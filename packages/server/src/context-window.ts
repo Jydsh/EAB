@@ -215,3 +215,139 @@ export function compressMessagesForContext(
     removedMessages: history.length - recent.length,
   }
 }
+
+interface ToolCallGroup {
+  readonly start: number
+  readonly end: number
+}
+
+/** 找出连续的「assistant(tool_calls) + tool 结果」组，用于压缩工具循环里的旧轮次。 */
+function toolCallGroups(messages: readonly ChatMessage[]): ToolCallGroup[] {
+  const groups: ToolCallGroup[] = []
+  let index = 0
+  while (index < messages.length) {
+    const message = messages[index]
+    if (message.role === 'assistant' && message.tool_calls && message.tool_calls.length > 0) {
+      let end = index + 1
+      while (end < messages.length && messages[end].role === 'tool') end += 1
+      groups.push({ start: index, end })
+      index = end
+    } else {
+      index += 1
+    }
+  }
+  return groups
+}
+
+function totalMessageTokens(messages: readonly ChatMessage[]): number {
+  return messages.reduce((sum, message) => sum + messageTokens(message), 0)
+}
+
+/** 把旧工具轮次压成一条 system 摘要；保留最近一组工具结果，避免破坏 tool_call_id 配对。 */
+function oldToolGroupDigest(
+  messages: readonly ChatMessage[],
+  groups: readonly ToolCallGroup[],
+  budgetTokens: number,
+): string {
+  const prefix = '【较早工具调用压缩摘要（原文已省略）】'
+  const lines: string[] = []
+  let used = estimateTokens(prefix)
+  for (let groupIndex = groups.length - 1; groupIndex >= 0; groupIndex -= 1) {
+    const group = groups[groupIndex]
+    const groupLines: string[] = []
+    for (let index = group.start; index < group.end; index += 1) {
+      const message = messages[index]
+      if (message.role === 'assistant') {
+        for (const call of message.tool_calls ?? []) {
+          const args = oneLine(call.function.arguments)
+          groupLines.push(
+            `- 助手调用 ${call.function.name}：${args.length > 140 ? `${args.slice(0, 140)}…` : args}`,
+          )
+        }
+      } else {
+        const result = oneLine(contentText(message.content))
+        if (result) {
+          groupLines.push(`- 工具结果：${result.length > 180 ? `${result.slice(0, 180)}…` : result}`)
+        }
+      }
+    }
+    for (const line of groupLines) {
+      const lineTokens = estimateTokens(line)
+      if (used + lineTokens > budgetTokens) continue
+      lines.unshift(line)
+      used += lineTokens
+    }
+  }
+  return lines.length > 0 ? `${prefix}\n${lines.join('\n')}` : ''
+}
+
+/**
+ * 对话循环每轮调用模型前的上下文预算。
+ *
+ * `compressMessagesForContext` 只处理「最后一条 user 之前」的历史；工具循环里最后一条
+ * user 之后会不断追加 assistant(tool_calls) / tool 结果，单靠它压不掉。这里在基础压缩
+ * 之后再把旧工具轮次收成一条 system 摘要，只保留最近一组工具结果；如果最近一组本身
+ * 仍然超预算，再截断其中的工具结果。每次调用都从完整 messages 生成副本，不破坏后续
+ * 轮次仍可用的原始工具结果。
+ */
+export function compactMessagesForModelCall(
+  messages: readonly ChatMessage[],
+  options: CompressionOptions,
+): CompressionResult {
+  const base = compressMessagesForContext(messages, options)
+  const reserveTokens = options.reserveTokens ?? 256
+  const toolTokens = options.toolTokens ?? 0
+  const budget = Math.max(0, options.maxContext - options.maxOutputTokens - toolTokens - reserveTokens)
+  let next = base.messages
+  let removedMessages = base.removedMessages
+  let changed = base.compressed
+  let total = totalMessageTokens(next)
+  if (total <= budget) {
+    return { ...base, messages: next, afterTokens: total }
+  }
+
+  const groups = toolCallGroups(next)
+  if (groups.length > 1) {
+    const oldGroups = groups.slice(0, -1)
+    const removedIndices = new Set<number>()
+    for (const group of oldGroups) {
+      for (let index = group.start; index < group.end; index += 1) removedIndices.add(index)
+    }
+    const systemMessages = next.filter((message) => message.role === 'system')
+    const rest = next.filter((message, index) => message.role !== 'system' && !removedIndices.has(index))
+    const digest = oldToolGroupDigest(next, oldGroups, Math.max(60, Math.floor(budget * 0.25)))
+    next = [
+      ...systemMessages,
+      ...(digest ? [{ role: 'system' as const, content: digest }] : []),
+      ...rest,
+    ]
+    removedMessages += removedIndices.size
+    changed = true
+    total = totalMessageTokens(next)
+  }
+
+  if (total > budget) {
+    const latestGroup = toolCallGroups(next).at(-1)
+    if (latestGroup) {
+      const toolMessages = next.slice(latestGroup.start, latestGroup.end).filter((message) => message.role === 'tool')
+      const nonToolTokens = total - toolMessages.reduce((sum, message) => sum + messageTokens(message), 0)
+      const allowed = Math.max(0, budget - nonToolTokens)
+      const perToolChars = Math.max(400, Math.floor((allowed / Math.max(1, toolMessages.length)) * 2.5))
+      next = next.map((message, index) => {
+        if (index < latestGroup.start || index >= latestGroup.end || message.role !== 'tool') return message
+        const clipped = truncated(message, perToolChars)
+        if (clipped !== message) changed = true
+        return clipped
+      })
+      total = totalMessageTokens(next)
+    }
+  }
+
+  return {
+    messages: next,
+    compressed: changed,
+    beforeTokens: base.beforeTokens,
+    afterTokens: total,
+    removedMessages,
+  }
+}

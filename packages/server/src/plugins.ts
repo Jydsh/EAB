@@ -14,7 +14,7 @@
  */
 import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
-import { pluginDataRoot, userScope } from './plugin-scope.js'
+import { pluginDataRoot, userScope, type PluginScope } from './plugin-scope.js'
 import {
   copyFileSync,
   cpSync,
@@ -162,6 +162,10 @@ export interface PluginEventRecord {
 }
 
 let pluginRootPath = process.env.EAB_PLUGINS_DIR || fileURLToPath(new URL('../../../plugins', import.meta.url))
+/** 个人独立版本包放在共享插件目录下的隐藏子目录，不参与 loadPlugins 的公司包扫描。 */
+const PERSONAL_PACKAGE_ROOT = '.users'
+/** 个人独立包自己的安装来源信息；不写数据库，包目录就是归属事实。 */
+const PERSONAL_PACKAGE_META = '.eab-package.json'
 
 /** 启动时由 main.ts 按「独立配置 > 总存储位置 > 内置默认」解析后注入。 */
 export function setPluginRoot(path: string): void {
@@ -851,15 +855,25 @@ export function loadPluginsForUser(
   const personalOnly = rows
     .filter((row) => row.removed_at === null && !visible.has(row.plugin_id))
     .flatMap((row) => {
-      const dir = join(pluginRootPath, row.plugin_id)
+      const personal = {
+        companyId: row.company_id,
+        userId: row.user_id,
+        pluginId: row.plugin_id,
+        enabled: row.enabled === 1,
+        installedAt: row.installed_at,
+        updatedAt: row.updated_at,
+        removedAt: row.removed_at,
+      } satisfies PluginUserInstallRecord
+      const own = readPersonalPluginDirectory(row.company_id, row.user_id, row.plugin_id)
+      const dir = own?.dir ?? join(pluginRootPath, row.plugin_id)
       if (!existsSync(dir) || !statSync(dir).isDirectory()) return []
-      const { record } = parseManifest(dir, row.plugin_id)
-      const personal = userMap.get(row.plugin_id)
-      if (!personal) return []
+      const { record } = own ? { record: own } : parseManifest(dir, row.plugin_id)
       return [{
         ...record,
         enabled: record.valid && personal.enabled,
-        install: installRecordOf(db, row.plugin_id),
+        install: own
+          ? personalInstallRecordOf(db, row.plugin_id, record, readPersonalPackageMeta(own.dir))
+          : installRecordOf(db, row.plugin_id),
         companyInstall: null,
         userInstall: personal,
       } satisfies PluginRecord]
@@ -869,9 +883,31 @@ export function loadPluginsForUser(
     .flatMap((plugin) => {
       const personal = userMap.get(plugin.id) ?? null
       if (personal && !personal.removedAt) {
+        // 员工视角优先本人独立包；控制台预览（includeAllUsers）仍看公司共享包，
+        // 否则控制台可能把某个成员的个人版本当成公司版本展示。
+        const own = includeAllUsers
+          ? null
+          : readPersonalPluginDirectory(companyId, userId, plugin.id)
+        // 规则是“版本和指纹一致就复用共享包”；若磁盘上残留了同内容的个人副本，
+        // 读取时也回到共享包，不把旧副本当成独立版本。
+        if (own && samePackage(own, plugin)) {
+          return [{
+            ...plugin,
+            enabled: plugin.valid && personal.enabled,
+            userInstall: personal,
+          } satisfies PluginRecord]
+        }
+        if (own) {
+          return [{
+            ...own,
+            enabled: own.valid && personal.enabled,
+            install: personalInstallRecordOf(db, plugin.id, own, readPersonalPackageMeta(own.dir)),
+            userInstall: personal,
+          } satisfies PluginRecord]
+        }
         return [{
           ...plugin,
-          enabled: plugin.valid && personal.enabled,
+          enabled: includeAllUsers ? plugin.enabled : plugin.valid && personal.enabled,
           userInstall: personal,
         }]
       }
@@ -916,32 +952,34 @@ export function loadAdminPersonalPlugins(db: Db, companyId: string): AdminPerson
   }>
 
   const parsed = new Map<string, { record: PluginRecord | null; error: string | null }>()
-  const readRecord = (pluginId: string) => {
-    const cached = parsed.get(pluginId)
+  const readRecord = (companyId: string, userId: string, pluginId: string) => {    const own = readPersonalPluginDirectory(companyId, userId, pluginId)
+    const dir = own?.dir ?? join(pluginRootPath, pluginId)
+    const cacheKey = `${userId}:${pluginId}:${own ? 'own' : 'shared'}`
+    const cached = parsed.get(cacheKey)
     if (cached) return cached
-    const dir = join(pluginRootPath, pluginId)
     if (!existsSync(dir) || !statSync(dir).isDirectory()) {
       const missing = { record: null, error: '插件目录不存在，可能已被移除' }
-      parsed.set(pluginId, missing)
+      parsed.set(cacheKey, missing)
       return missing
     }
     try {
       const { record } = parseManifest(dir, pluginId)
       const value = { record, error: record.error }
-      parsed.set(pluginId, value)
+      parsed.set(cacheKey, value)
       return value
     } catch (err) {
       const failed = {
         record: null,
         error: err instanceof Error ? err.message : '插件清单读取失败',
       }
-      parsed.set(pluginId, failed)
+      parsed.set(cacheKey, failed)
       return failed
     }
   }
 
   return rows.map((row) => {
-    const { record, error } = readRecord(row.plugin_id)
+    const { record, error } = readRecord(companyId, row.user_id, row.plugin_id)
+    const own = readPersonalPluginDirectory(companyId, row.user_id, row.plugin_id)
     const install = installRecordOf(db, row.plugin_id)
     return {
       key: `${row.user_id}:${row.plugin_id}`,
@@ -960,7 +998,7 @@ export function loadAdminPersonalPlugins(db: Db, companyId: string): AdminPerson
       enabled: row.enabled === 1,
       installedAt: Number(row.installed_at),
       updatedAt: Number(row.updated_at),
-      source: install?.source || null,
+      source: (own ? readPersonalPackageMeta(own.dir)?.source : null) || install?.source || null,
     } satisfies AdminPersonalPluginRecord
   })
 }
@@ -1048,6 +1086,9 @@ export function uninstallUserPlugin(
         SET removed_at = ?, updated_at = ?
       WHERE company_id = ? AND user_id = ? AND plugin_id = ? AND removed_at IS NULL`,
   ).run(now, now, companyId, userId, pluginId)
+  // 个人独立版本包只属于这个员工；卸载时直接删除，共享包不动。
+  const personalDir = personalPluginPackageDir(companyId, userId, pluginId)
+  if (existsSync(personalDir)) rmSync(personalDir, { recursive: true, force: true })
   // 个人实例的 DSH_HOME 只属于这个员工；卸载时整棵目录删除。
   // 公司实例的 DSH_HOME（dsh-home 根）和其他员工的 scopes 子目录不在这个路径下。
   let dataRoot: string | null = null
@@ -1228,6 +1269,77 @@ function activeUserOwners(db: Db, pluginId: string): number {
   return Number(row?.total ?? 0)
 }
 
+function activeCompanyOwnersExcept(db: Db, pluginId: string, companyId: string): number {
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS total FROM plugin_company_installs
+        WHERE plugin_id = ? AND removed_at IS NULL AND company_id <> ?`,
+    )
+    .get(pluginId, companyId) as { total: number } | undefined
+  return Number(row?.total ?? 0)
+}
+
+function removePackageDir(dir: string): void {
+  if (existsSync(dir)) rmSync(dir, { recursive: true, force: true })
+}
+
+function replacePackageDir(staging: string, dest: string): string | null {
+  let backup: string | null = null
+  if (existsSync(dest)) {
+    backup = join(dirname(dest), `.backup-${basename(dest)}-${Date.now()}-${randomSuffix()}`)
+    renameSync(dest, backup)
+  }
+  try {
+    renameSync(staging, dest)
+    return backup
+  } catch (err) {
+    if (backup && existsSync(backup) && !existsSync(dest)) renameSync(backup, dest)
+    throw err
+  }
+}
+
+/**
+ * 公司升级共享包前，把仍在使用共享包的成员迁移到“旧版本个人包”。
+ * 这样公司看到新版本，已经装过旧版本的个人继续看到自己的旧版本，不会被公司升级带走。
+ */
+function migrateSharedPersonalPackages(
+  db: Db,
+  pluginId: string,
+  canonicalDir: string,
+  canonicalRecord: PluginRecord,
+): void {
+  const rows = db
+    .prepare(
+      `SELECT company_id, user_id, installed_at FROM plugin_user_installs
+        WHERE plugin_id = ? AND removed_at IS NULL`,
+    )
+    .all(pluginId) as unknown as Array<{ company_id: string; user_id: string; installed_at: number }>
+  for (const row of rows) {
+    const personalDir = personalPluginPackageDir(row.company_id, row.user_id, pluginId)
+    if (existsSync(personalDir)) continue
+    mkdirSync(dirname(personalDir), { recursive: true })
+    const staging = join(dirname(personalDir), `.staging-${pluginId}-${Date.now()}-${randomSuffix()}`)
+    try {
+      copyPackage(canonicalDir, staging, canonicalRecord)
+      const { record: staged } = parseManifest(staging, pluginId)
+      if (!staged.valid) throw new EabError(EC.VALIDATION, `复制个人旧版本失败：${staged.error ?? '未知原因'}`)
+      renameSync(staging, personalDir)
+      writePersonalPackageMeta(personalDir, {
+        version: staged.version,
+        checksum: staged.checksum,
+        source: installRecordOf(db, pluginId)?.source ?? 'shared',
+        sourceRef: installRecordOf(db, pluginId)?.sourceRef ?? null,
+        installedAt: Number(row.installed_at),
+        updatedAt: Date.now(),
+      })
+    } catch (err) {
+      removePackageDir(staging)
+      throw err
+    }
+  }
+}
+
+
 function userInstallOf(
   db: Db,
   companyId: string,
@@ -1342,7 +1454,7 @@ function preparePackage(source: string, logicalId: string): PluginRecord {
   return record
 }
 
-/** 已校验过的来源目录 → plugins/<id>；先暂存、二次校验、旧目录临时备份、成功即删备份 */
+/** 已校验过的来源目录 → 共享包或成员独立包；先暂存、二次校验、旧目录临时备份、成功即删备份 */
 function commitPluginPackage(
   db: Db,
   source: string,
@@ -1350,10 +1462,22 @@ function commitPluginPackage(
   options: InstallPluginOptions,
 ): InstallPluginResult {
   const dirName = prepared.id
-  mkdirSync(pluginRootPath, { recursive: true })
-  const staging = join(pluginRootPath, `.staging-${dirName}-${Date.now()}-${randomSuffix()}`)
-  const dest = join(pluginRootPath, dirName)
+  const isUserScope = options.scope === 'user'
+  if (isUserScope && !options.userId) {
+    throw new EabError(EC.VALIDATION, '个人插件安装缺少员工身份')
+  }
+
+  const canonicalDest = join(pluginRootPath, dirName)
+  const personalDest = isUserScope && options.userId
+    ? personalPluginPackageDir(options.companyId, options.userId, dirName)
+    : null
+  const stagingRoot = personalDest ? dirname(personalDest) : pluginRootPath
+  mkdirSync(stagingRoot, { recursive: true })
+  const staging = join(stagingRoot, `.staging-${dirName}-${Date.now()}-${randomSuffix()}`)
   let backupPath: string | null = null
+  let dest = canonicalDest
+  let installedRecord: PluginRecord | null = null
+  let replaced = false
   const installSource = options.source ?? 'local-dir'
   const sourceRef = options.sourceRef ?? source
 
@@ -1364,90 +1488,142 @@ function commitPluginPackage(
 
     const existingCompany = companyInstallOf(db, options.companyId, dirName)
     const existingGlobal = installRecordOf(db, dirName)
-    const owners = activeCompanyOwners(db, dirName)
-    const isUserScope = options.scope === 'user'
     const existingUser = isUserScope && options.userId
       ? userInstallOf(db, options.companyId, options.userId, dirName)
       : null
-    const userOwners = activeUserOwners(db, dirName)
-    const destExists = existsSync(dest)
-    const currentActive = Boolean(existingCompany && !existingCompany.removedAt)
     const currentUserActive = Boolean(existingUser && !existingUser.removedAt)
-    let replaced = false
-    /** 共享目录没有替换时，返回目录里真实在用的插件，而不是本次上传的暂存副本。 */
-    let installedRecord: PluginRecord | null = null
+    const currentActive = Boolean(existingCompany && !existingCompany.removedAt)
+    const companyOwners = activeCompanyOwners(db, dirName)
+    const userOwners = activeUserOwners(db, dirName)
+    const canonicalExists = existsSync(canonicalDest)
+    const canonicalRecord = canonicalExists ? parseManifest(canonicalDest, dirName).record : null
+    const personalExists = personalDest ? existsSync(personalDest) : false
+    const personalRecord = personalExists && personalDest ? parseManifest(personalDest, dirName).record : null
+    const ownActive = isUserScope ? (currentUserActive ? 1 : 0) : (currentActive ? 1 : 0)
+    const otherOwners = Math.max(0, companyOwners + userOwners - ownActive)
 
-    if (isUserScope && !options.userId) {
-      throw new EabError(EC.VALIDATION, '个人插件安装缺少员工身份')
-    }
-
-    if (destExists) {
-      const { record: onDisk } = parseManifest(dest, dirName)
-      installedRecord = onDisk
-      if (onDisk.checksum !== staged.checksum) {
-        // 包目录是公司安装和个人安装共用的，只能保留一个版本。
-        // 当前安装人自己的旧归属不算“别人”，其他任何活跃归属都会阻止单独覆盖。
-        const ownActive = isUserScope ? (currentUserActive ? 1 : 0) : (currentActive ? 1 : 0)
-        const otherOwners = Math.max(0, owners + userOwners - ownActive)
-        const sameVersion = onDisk.version === staged.version
-        // 公司安装和个人安装共用一份同版本包时，不能因为另一个归属已经装了同版本，
-        // 就把新归属挡在安装入口外；同版本直接复用现有共享包，只登记新归属。
-        const reuseSharedForSameVersion = sameVersion && otherOwners > 0
-        if (otherOwners > 0 && !reuseSharedForSameVersion) {
-          const message = sameVersion
-            ? `插件 ${dirName} 的 ${onDisk.version} 版本已有其他归属在使用，但内容指纹不同，不能覆盖共享包`
-            : `插件 ${dirName} 当前共享版本是 ${onDisk.version}，不能由这次安装单独替换为 ${staged.version}`
-          throw new EabError(EC.CONFLICT, message, {
-            hint: sameVersion
-              ? '同一版本的内容指纹不同，不能直接覆盖共享包；请确认包来源，或先让其他归属卸载后再覆盖。'
-              : '同一个插件包被公司安装和多个个人安装共用；已有其他归属在使用该版本时，请先让其他归属卸载，或按相同版本安装。',
-            details: {
-              onDiskVersion: onDisk.version,
-              requestedVersion: staged.version,
-              owners,
-              userOwners,
-              otherOwners,
-              onDiskChecksum: onDisk.checksum,
-              requestedChecksum: staged.checksum,
-            },
-          })
-        }
-        if (!reuseSharedForSameVersion && !options.overwrite) {
-          throw new EabError(EC.VALIDATION, `插件 ${dirName} 目录已存在；替换为 ${staged.version} 请显式确认覆盖`)
-        }
-        if (!reuseSharedForSameVersion) {
-          // 旧目录只在替换过程中临时保留，用于失败回滚；安装成功后立即删除，不进入回收站。
-          backupPath = join(pluginRootPath, `.backup-${dirName}-${Date.now()}-${randomSuffix()}`)
-          renameSync(dest, backupPath)
-          renameSync(staging, dest)
+    if (!isUserScope) {
+      dest = canonicalDest
+      if (canonicalRecord) {
+        installedRecord = canonicalRecord
+        if (!samePackage(canonicalRecord, staged)) {
+          const otherCompanyOwners = activeCompanyOwnersExcept(db, dirName, options.companyId)
+          const sameVersion = canonicalRecord.version === staged.version
+          if (otherCompanyOwners > 0) {
+            const message = sameVersion
+              ? `插件 ${dirName} 的 ${canonicalRecord.version} 版本已有其他公司在使用，但内容指纹不同，不能覆盖共享包`
+              : `插件 ${dirName} 当前共享版本是 ${canonicalRecord.version}，不能由这次安装单独替换为 ${staged.version}`
+            throw new EabError(EC.CONFLICT, message, {
+              hint: sameVersion
+                ? '同一版本的内容指纹不同，不能直接覆盖共享包；请确认包来源，或先让其他公司卸载后再覆盖。'
+                : '共享包仍被其他公司使用；个人安装可以独立保存自己的版本，公司级安装不能单独替换其他公司在用的版本。',
+              details: {
+                onDiskVersion: canonicalRecord.version,
+                requestedVersion: staged.version,
+                otherCompanyOwners,
+                onDiskChecksum: canonicalRecord.checksum,
+                requestedChecksum: staged.checksum,
+              },
+            })
+          }
+          if (!options.overwrite) {
+            throw new EabError(EC.VALIDATION, `插件 ${dirName} 目录已存在；替换为 ${staged.version} 请显式确认覆盖`)
+          }
+          // 公司要升级共享包：先把仍在使用共享包的成员复制到个人旧版本目录，
+          // 避免公司升级后把成员页面一起带到新版本。
+          migrateSharedPersonalPackages(db, dirName, canonicalDest, canonicalRecord)
+          backupPath = replacePackageDir(staging, canonicalDest)
           replaced = true
           installedRecord = null
         }
+      } else {
+        renameSync(staging, canonicalDest)
+        dest = canonicalDest
+        replaced = false
       }
-      // 指纹相同：只登记当前安装归属，不动物理目录；公司/个人可以共用同一个包。
     } else {
-      renameSync(staging, dest)
-      replaced = false
+      const sharedMatches = canonicalRecord ? samePackage(canonicalRecord, staged) : false
+      let usePersonal = false
+      if (!sharedMatches) {
+        if (!canonicalRecord) usePersonal = Boolean(personalRecord)
+        else if (personalRecord) usePersonal = true
+        else usePersonal = otherOwners > 0
+      }
+
+      if (!usePersonal) {
+        dest = canonicalDest
+        if (canonicalRecord) {
+          installedRecord = canonicalRecord
+          if (!sharedMatches) {
+            if (!options.overwrite) {
+              throw new EabError(EC.VALIDATION, `插件 ${dirName} 目录已存在；替换为 ${staged.version} 请显式确认覆盖`)
+            }
+            backupPath = replacePackageDir(staging, canonicalDest)
+            replaced = true
+            if (personalDest) removePackageDir(personalDest)
+            installedRecord = null
+          } else if (personalDest) {
+            // 个人版本已经和共享包一致：删掉独立副本，回到共享包。
+            removePackageDir(personalDest)
+          }
+        } else {
+          renameSync(staging, canonicalDest)
+          dest = canonicalDest
+          replaced = false
+        }
+      } else if (personalDest) {
+        dest = personalDest
+        mkdirSync(dirname(personalDest), { recursive: true })
+        if (personalRecord) {
+          installedRecord = personalRecord
+          if (!samePackage(personalRecord, staged)) {
+            if (!options.overwrite) {
+              throw new EabError(EC.VALIDATION, `插件 ${dirName} 的个人版本已存在；替换为 ${staged.version} 请显式确认覆盖`)
+            }
+            backupPath = replacePackageDir(staging, personalDest)
+            replaced = true
+            installedRecord = null
+          }
+        } else {
+          renameSync(staging, personalDest)
+          replaced = false
+        }
+        writePersonalPackageMeta(personalDest, {
+          version: staged.version,
+          checksum: staged.checksum,
+          source: installSource,
+          sourceRef,
+          installedBy: options.installedBy,
+          installedAt: existingUser?.installedAt ?? Date.now(),
+          updatedAt: Date.now(),
+        })
+      }
     }
 
     const now = Date.now()
-    // 共享目录没有变化且制品仍有效时，沿用原来的制品记录，避免把别家公司的来源信息改掉
-    const reuseGlobal = Boolean(destExists && !replaced && existingGlobal && !existingGlobal.removedAt)
-    const install: PluginInstallRecord = reuseGlobal && existingGlobal
-      ? existingGlobal
-      : {
-          pluginId: dirName,
-          version: staged.version,
-          source: installSource,
-          sourceRef,
-          checksum: staged.checksum,
-          installedBy: options.installedBy,
-          installedAt: now,
-          updatedAt: now,
-          removedAt: null,
-        }
+    // 共享包没有变化且制品仍有效时，沿用原来的制品记录，避免把别家公司的来源信息改掉。
+    // 个人独立包不写 plugin_installs，公司共享包的制品记录不能被成员版本覆盖。
+    const useSharedDest = dest === canonicalDest
+    const reuseGlobal = Boolean(
+      useSharedDest && canonicalExists && !replaced && existingGlobal && !existingGlobal.removedAt,
+    )
+    const install: PluginInstallRecord = usePersonalDestination(dest, canonicalDest) && installedRecord
+      ? personalInstallRecordOf(db, dirName, installedRecord, readPersonalPackageMeta(dest))
+      : reuseGlobal && existingGlobal
+        ? existingGlobal
+        : {
+            pluginId: dirName,
+            version: staged.version,
+            source: installSource,
+            sourceRef,
+            checksum: staged.checksum,
+            installedBy: options.installedBy,
+            installedAt: now,
+            updatedAt: now,
+            removedAt: null,
+          }
 
-    if (!reuseGlobal) {
+    if (useSharedDest && !reuseGlobal) {
       db.prepare(
         `INSERT INTO plugin_installs
            (plugin_id, version, source, source_ref, checksum, installed_by, installed_at, updated_at, removed_at)
@@ -1491,7 +1667,10 @@ function commitPluginPackage(
         detail: JSON.stringify({
           scope: 'user',
           userId,
-          from: existingUser && !existingUser.removedAt ? existingGlobal?.version ?? null : null,
+          package: usePersonalDestination(dest, canonicalDest) ? 'personal' : 'shared',
+          from: existingUser && !existingUser.removedAt
+            ? (personalRecord?.version ?? existingGlobal?.version ?? null)
+            : null,
           to: install.version,
           source: installSource,
           sourceRef,
@@ -1528,8 +1707,9 @@ function commitPluginPackage(
     if (existsSync(staging)) rmSync(staging, { recursive: true, force: true })
     // 安装已成功：临时备份的旧版本不再需要，直接删除。
     if (backupPath && existsSync(backupPath)) rmSync(backupPath, { recursive: true, force: true })
+    const finalRecord = installedRecord ?? staged
     return {
-      plugin: { ...(installedRecord ?? staged), enabled: true, install },
+      plugin: { ...finalRecord, dir: dest, enabled: true, install },
       replaced,
       sourcePath: sourceRef,
     }
@@ -1541,6 +1721,11 @@ function commitPluginPackage(
     throw err
   }
 }
+
+function usePersonalDestination(dest: string, canonicalDest: string): boolean {
+  return dest !== canonicalDest
+}
+
 
 /**
  * 从服务器本地目录安装一个插件包。
@@ -2086,6 +2271,139 @@ export function readPluginDirectory(id: string): PluginRecord | null {
   const { record } = parseManifest(dir, id)
   return { ...record, enabled: record.valid }
 }
+
+/**
+ * 个人独立版本包目录。
+ *
+ * 版本/指纹与共享包一致时，个人安装继续用 `plugins/<id>`；
+ * 不一致时复制到 `plugins/.users/<company>/<user>/<id>`，只给这个成员使用。
+ * 路径是确定性的，不额外写数据库列；目录是否存在就是“是否使用个人独立包”的事实。
+ */
+export function personalPluginPackageDir(companyId: string, userId: string, pluginId: string): string {
+  const segment = (value: string): string => encodeURIComponent(String(value || 'unknown')).replace(/%/g, '_')
+  return join(pluginRootPath, PERSONAL_PACKAGE_ROOT, segment(companyId), segment(userId), pluginId)
+}
+
+export function personalPluginPackageRel(companyId: string, userId: string, pluginId: string): string {
+  return relative(pluginRootPath, personalPluginPackageDir(companyId, userId, pluginId)).replace(/\\/g, '/')
+}
+
+export function readPersonalPluginDirectory(
+  companyId: string,
+  userId: string,
+  pluginId: string,
+): PluginRecord | null {
+  if (!ID_PATTERN.test(pluginId)) return null
+  const dir = personalPluginPackageDir(companyId, userId, pluginId)
+  if (!existsSync(dir) || !statSync(dir).isDirectory()) return null
+  try {
+    const { record } = parseManifest(dir, pluginId)
+    return { ...record, enabled: record.valid }
+  } catch {
+    return null
+  }
+}
+
+/** host 按实例取包：个人实例优先自己的独立包，否则回退共享包。 */
+export function readPluginForInstance(
+  companyId: string,
+  pluginId: string,
+  scope: PluginScope,
+): PluginRecord | null {
+  if (scope.kind === 'user') {
+    const own = readPersonalPluginDirectory(companyId, scope.userId, pluginId)
+    if (own) {
+      const shared = readPluginDirectory(pluginId)
+      // 版本和指纹一致时，host / 页面资源也复用共享包；个人副本只在版本不一致时生效。
+      if (shared && samePackage(own, shared)) return shared
+      return own
+    }
+  }
+  return readPluginDirectory(pluginId)
+}
+
+interface PersonalPackageMeta {
+  version?: string
+  checksum?: string
+  source?: string
+  sourceRef?: string | null
+  installedBy?: string | null
+  installedAt?: number
+  updatedAt?: number
+}
+
+function readPersonalPackageMeta(dir: string): PersonalPackageMeta | null {
+  try {
+    const raw = JSON.parse(readFileSync(join(dir, PERSONAL_PACKAGE_META), 'utf8')) as PersonalPackageMeta
+    return raw && typeof raw === 'object' ? raw : null
+  } catch {
+    return null
+  }
+}
+
+function writePersonalPackageMeta(dir: string, meta: PersonalPackageMeta): void {
+  try {
+    writeFileSync(join(dir, PERSONAL_PACKAGE_META), JSON.stringify(meta, null, 2), 'utf8')
+  } catch {
+    // 元信息只用于展示来源；写不进去不能影响插件安装本身
+  }
+}
+
+function personalInstallRecordOf(
+  db: Db,
+  pluginId: string,
+  record: PluginRecord,
+  meta?: PersonalPackageMeta | null,
+): PluginInstallRecord {
+  const global = installRecordOf(db, pluginId)
+  const now = Date.now()
+  return {
+    pluginId,
+    version: record.version,
+    source: meta?.source ?? global?.source ?? 'disk',
+    sourceRef: meta?.sourceRef ?? global?.sourceRef ?? record.dir,
+    checksum: record.checksum,
+    installedBy: meta?.installedBy ?? global?.installedBy ?? null,
+    installedAt: Number(meta?.installedAt ?? global?.installedAt ?? now),
+    updatedAt: Number(meta?.updatedAt ?? now),
+    removedAt: null,
+  }
+}
+
+function samePackage(
+  a: Pick<PluginRecord, 'version' | 'checksum'>,
+  b: Pick<PluginRecord, 'version' | 'checksum'>,
+): boolean {
+  return a.version === b.version && a.checksum === b.checksum
+}
+
+/** 共享包列表 + 所有个人独立包，用于 host 指纹监控和热重载。 */
+export function listPluginPackageDirectories(): Array<{ id: string; dir: string }> {
+  const out = listPluginDirectories()
+  const personalRoot = join(pluginRootPath, PERSONAL_PACKAGE_ROOT)
+  if (!existsSync(personalRoot)) return out
+  try {
+    for (const company of readdirSync(personalRoot, { withFileTypes: true })) {
+      if (!company.isDirectory()) continue
+      const companyDir = join(personalRoot, company.name)
+      for (const user of readdirSync(companyDir, { withFileTypes: true })) {
+        if (!user.isDirectory()) continue
+        const userDir = join(companyDir, user.name)
+        for (const plugin of readdirSync(userDir, { withFileTypes: true })) {
+          if (!plugin.isDirectory() || !ID_PATTERN.test(plugin.name)) continue
+          const dir = join(userDir, plugin.name)
+          if (existsSync(join(dir, 'plugin.json')) || existsSync(join(dir, 'package.json'))) {
+            out.push({ id: plugin.name, dir })
+          }
+        }
+      }
+    }
+  } catch {
+    // 目录正在被安装/卸载时下一轮再扫
+  }
+  return out
+}
+
 
 export function relativeToRoot(path: string): string {
   return relative(pluginRootPath, path)

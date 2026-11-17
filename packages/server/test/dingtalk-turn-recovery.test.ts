@@ -88,6 +88,57 @@ describe('钉钉中断回合启动恢复', () => {
     expect(getChannelTurn(db, 'turn-1')?.status).toBe('completed')
   })
 
+  it('卡片隐藏续跑恢复时还原真实消息和 clarifyFlow', async () => {
+    const db = seedDb()
+    beginChannelTurn(db, {
+      id: 'turn-clarify',
+      companyId: 'c1',
+      provider: 'dingtalk',
+      externalId: 'staff-1',
+      userId: 'u1',
+      sessionId: 's1',
+      eventKey: 'card:evt-clarify',
+      payload: {
+        kind: 'dingtalk_clarify',
+        message: {
+          msgId: 'card:evt-clarify',
+          senderStaffId: 'staff-1',
+          conversationType: '1',
+          text: { content: '我选择了「等它跑完自动汇报」' },
+        },
+        clarifyFlow: { flowId: 'cf_1', step: 2, suppressNewCard: true },
+      },
+      userMessageId: 'user-clarify',
+      assistantMessageId: 'assistant-old',
+      agentTurnId: 'agent-clarify',
+      startedAt: Date.now(),
+    })
+
+    let seenPayload: unknown
+    let seenOptions: Record<string, unknown> | undefined
+    const result = await recoverInterruptedDingTalkTurns(depsOf(db), async (_deps, payload, options) => {
+      seenPayload = payload
+      seenOptions = options as Record<string, unknown>
+      finishChannelTurn(db, 'turn-clarify', 'completed')
+      return { handled: true, text: null, sessionId: 's1', reason: 'ok' }
+    })
+
+    expect(result.resumed).toBe(1)
+    expect((seenPayload as { text?: { content?: string } }).text?.content)
+      .toBe('我选择了「等它跑完自动汇报」')
+    expect(seenOptions?.resume).toMatchObject({
+      turnId: 'turn-clarify',
+      userMessageId: 'user-clarify',
+      assistantMessageId: 'assistant-old',
+    })
+    expect(seenOptions?.clarifyFlow).toMatchObject({
+      flowId: 'cf_1',
+      step: 2,
+      assistantMessageId: 'assistant-old',
+      suppressNewCard: false,
+    })
+  })
+
   it('恢复失败时标记 failed，不会无限重复重跑', async () => {
     const db = seedDb()
     addTurn(db)

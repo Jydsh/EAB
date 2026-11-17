@@ -63,12 +63,25 @@ export interface ChatLiveSubAgentEvent {
   data: unknown
 }
 
+/** 云空间文件变化原因；只带原因和 ID，不带文件名/路径/正文。 */
+export type WorkspaceChangeReason = 'created' | 'updated' | 'deleted' | 'renamed' | 'restored'
+
+/** 个人云空间文件变化：通知同一员工的已打开网页刷新列表、更新消息卡片。 */
+export interface ChatWorkspaceFilesEvent {
+  type: 'workspace'
+  companyId: string
+  userId: string
+  reason: WorkspaceChangeReason
+  fileIds: string[]
+}
+
 export type ChatLiveEventPayload =
   | ChatLiveEvent
   | ChatLiveDeltaEvent
   | ChatLiveToolEvent
   | ChatLiveSubAgentEvent
   | ChatModelsChangedEvent
+  | ChatWorkspaceFilesEvent
 
 /** 管理后台模型目录发生变化：通知同一公司已打开的网页重新拉取目录。 */
 export interface ChatModelsChangedEvent {
@@ -145,7 +158,8 @@ export function initChatEventBridge(pubsub: PubSubBackend | null): void {
             event.type === 'delta' ||
             event.type === 'tool' ||
             event.type === 'subagent' ||
-            event.type === 'models')
+            event.type === 'models' ||
+            event.type === 'workspace')
         ) {
           deliverLocal(event)
         }

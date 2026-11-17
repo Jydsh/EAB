@@ -204,8 +204,32 @@ export function getCachedUpdateStatus(): UpdateStatus {
 /**
  * 启动更新器。更新器独立于当前服务进程运行，等服务退出后再替换文件。
  * 返回后调用方应在几百毫秒内关闭服务，避免 Windows 上文件被占用。
+ * 更新器参数固定带 --restart=1；oldPid 用来让更新器确认健康响应来自新进程。
  */
-export function startUpdate(version: string, sourceUrl: string, sourceDigest?: string | null): { started: boolean; command: string } {
+export function buildUpdateArgs(
+  version: string,
+  sourceUrl: string,
+  root: string,
+  sourceDigest?: string | null,
+  oldPid = 0,
+): string[] {
+  return [
+    join(root, 'scripts', 'eab-update.mjs'),
+    '--apply',
+    `--url=${sourceUrl}`,
+    `--version=${version}`,
+    `--root=${root}`,
+    '--restart=1',
+    ...(oldPid > 0 ? [`--old-pid=${oldPid}`] : []),
+    ...(sourceDigest ? [`--sha256=${sourceDigest}`] : []),
+  ]
+}
+
+export function startUpdate(
+  version: string,
+  sourceUrl: string,
+  sourceDigest?: string | null,
+): { started: boolean; command: string; pid: number | null } {
   if (process.env.EAB_DESKTOP === '1') {
     throw new Error('桌面版请使用菜单「EAB → 检查桌面更新」安装新版本，不要在控制台替换内嵌服务')
   }
@@ -213,15 +237,7 @@ export function startUpdate(version: string, sourceUrl: string, sourceDigest?: s
   const script = join(root, 'scripts', 'eab-update.mjs')
   if (!existsSync(script)) throw new Error('缺少 scripts/eab-update.mjs，当前部署不能执行一键更新')
   const digestArg = sourceDigest ? ` --sha256=${sourceDigest}` : ''
-  const args = [
-    script,
-    '--apply',
-    `--url=${sourceUrl}`,
-    `--version=${version}`,
-    `--root=${root}`,
-    '--restart=1',
-    ...(sourceDigest ? [`--sha256=${sourceDigest}`] : []),
-  ]
+  const args = buildUpdateArgs(version, sourceUrl, root, sourceDigest, process.pid)
   const child = spawn(process.execPath, args, {
     cwd: root,
     env: { ...process.env },
@@ -229,6 +245,15 @@ export function startUpdate(version: string, sourceUrl: string, sourceDigest?: s
     stdio: 'ignore',
     windowsHide: true,
   })
+  // spawn 的失败是异步事件；不挂监听会变成未处理异常，接口却已经返回 accepted。
+  child.on('error', (error) => {
+    console.error('[eab] 更新器启动失败：', error.message)
+  })
+  if (!child.pid) throw new Error('更新器进程没有启动，无法执行一键更新')
   child.unref()
-  return { started: true, command: `node scripts/eab-update.mjs --apply --version=${version} --restart${digestArg}` }
+  return {
+    started: true,
+    pid: child.pid,
+    command: `node scripts/eab-update.mjs --apply --version=${version} --restart --old-pid=${process.pid}${digestArg}`,
+  }
 }

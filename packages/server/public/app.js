@@ -18,9 +18,6 @@ const CHANNEL_SOURCE_LABEL = {
   local: '本地',
 }
 
-/** 模型弹窗里上下文 / 输出上限的默认值，新建模型时直接带出来（可改）。 */
-const DEFAULT_MODEL_MAX_CONTEXT = 131072
-const DEFAULT_MODEL_MAX_OUTPUT = 32768
 
 /** 与后端 thinking.ts 对齐的三档；控制台模型弹窗与对话页共用这套文案。 */
 const THINKING_LEVELS = [
@@ -1063,9 +1060,9 @@ async function openKbModal(collection) {
           ${
             depts
               .map(
-                (dept) => `<label class="check"><input type="checkbox" data-kb-dept="${esc(dept.path)}"${
+                (dept) => `<label class="check dept-check"><input type="checkbox" data-kb-dept="${esc(dept.path)}"${
                   selectedDepts.has(dept.path) ? ' checked' : ''
-                } /><span>${'　'.repeat(Math.max(0, Number(dept.depth) - 1))}${esc(dept.name)}</span></label>`,
+                } /><span>${esc(dept.name)}</span></label>`,
               )
               .join('') || '<span class="muted">还没有部门</span>'
           }
@@ -4186,14 +4183,14 @@ async function openModelModal(model, providers, roles) {
       <section class="models-form-section">
         <div class="models-form-section-head">
           <strong>上下文与输出</strong>
-          ${fieldInfo('按模型真实窗口填写；留空不会启用 token 预算压缩。')}
+          ${fieldInfo('按模型真实窗口填写；留空按 32K / 4K 默认值。')}
         </div>
         <div class="form-cols">
-          <label class="field"><span>上下文上限 <em>tokens</em> ${fieldInfo('模型的最大上下文窗口；留空则不启用 token 预算压缩。')}</span><input id="m-context" type="number" min="1" value="${model?.maxContext ?? DEFAULT_MODEL_MAX_CONTEXT}" placeholder="例如 131072" /></label>
-          <label class="field"><span>输出上限 <em>tokens</em> ${fieldInfo('单次回答最多生成多少 token；必须小于上下文上限；留空按 4096 处理。')}</span><input id="m-output" type="number" min="1" value="${model?.maxOutputTokens ?? DEFAULT_MODEL_MAX_OUTPUT}" placeholder="例如 32768" /></label>
+          <label class="field"><span>上下文上限 <em>tokens</em> ${fieldInfo('模型的最大上下文窗口；留空按 32768（32K）处理。')}</span><input id="m-context" type="number" min="1" value="${model?.maxContext ?? ''}" placeholder="留空默认 32768（32K）" /></label>
+          <label class="field"><span>输出上限 <em>tokens</em> ${fieldInfo('单次回答最多生成多少 token；留空按 4096 处理，且必须小于上下文上限。')}</span><input id="m-output" type="number" min="1" value="${model?.maxOutputTokens ?? ''}" placeholder="留空默认 4096" /></label>
         </div>
         <div class="field models-compress-field">
-          <label class="check"><input id="m-compress" type="checkbox"${model ? (model.contextCompression !== false ? ' checked' : '') : ' checked'} /><span>上下文超限时自动压缩较早历史 ${fieldInfo('只在填写上下文上限后生效；较早对话会压成摘要，最近消息保留原文，不会额外调用模型。')}</span></label>
+          <label class="check"><input id="m-compress" type="checkbox"${model ? (model.contextCompression !== false ? ' checked' : '') : ' checked'} /><span>上下文超限时自动压缩较早历史 ${fieldInfo('上下文上限留空时按 32768 生效；较早对话会压成摘要，最近消息保留原文，不会额外调用模型。')}</span></label>
         </div>
       </section>
       <section class="models-form-section">
@@ -4499,25 +4496,12 @@ function openPluginModelRoleModal(model, roles) {
       <section class="models-form-section">
         <div class="models-form-section-head">
           <strong>${esc(model.name)}</strong>
-          ${fieldInfo('这个模型由插件注入，能力随插件更新；这里配置哪些角色能看到它，以及它的上下文与输出上限。')}
+          ${fieldInfo('这个模型由插件注入，能力随插件更新；这里只配置哪些角色能看到它。上下文与输出由插件的 resolveModel() 声明，不再由后台逐模型手填。')}
         </div>
         <div class="models-plugin-meta">
           <span class="models-provider-pill">${esc(model.providerName)}</span>
           <span class="mono">${esc(model.modelKey)}</span>
           <span class="muted">插件更新或停用后，模型会自动出现或消失。</span>
-        </div>
-      </section>
-      <section class="models-form-section">
-        <div class="models-form-section-head">
-          <strong>上下文与输出</strong>
-          ${fieldInfo('按插件模型的真实窗口填写；留空沿用插件声明的值。')}
-        </div>
-        <div class="form-cols">
-          <label class="field"><span>上下文上限 <em>tokens</em> ${fieldInfo('模型能接收的最大上下文窗口；会用于对话输入预算与工具结果限制。')}</span><input id="pm-context" type="number" min="1" value="${model.maxContext ?? ''}" placeholder="例如 131072" /></label>
-          <label class="field"><span>输出上限 <em>tokens</em> ${fieldInfo('单次回答最多生成多少 token；必须小于上下文上限；留空沿用插件声明，插件也没有时按 4096 处理。')}</span><input id="pm-output" type="number" min="1" value="${model.maxOutputTokens ?? ''}" placeholder="例如 8192" /></label>
-        </div>
-        <div class="field models-compress-field">
-          <label class="check"><input id="pm-compress" type="checkbox"${model.contextCompression !== false ? ' checked' : ''} /><span>上下文超限时自动压缩较早历史 ${fieldInfo('只在填写上下文上限后生效；较早对话会压成摘要，最近消息保留原文，不会额外调用模型。')}</span></label>
         </div>
       </section>
       <section class="models-form-section">
@@ -4544,7 +4528,7 @@ function openPluginModelRoleModal(model, roles) {
     </div>
     <div class="modal-state" id="pm-state"></div>
     <div class="modal-actions">
-      <button class="btn primary" type="button" id="pm-save">保存设置</button>
+      <button class="btn primary" type="button" id="pm-save">保存角色</button>
       <button class="btn ghost" type="button" id="pm-cancel">取消</button>
     </div>`)
   const close = () => overlay.remove()
@@ -4573,26 +4557,11 @@ function openPluginModelRoleModal(model, roles) {
     stateEl.className = 'modal-state'
     stateEl.textContent = '保存中…'
     try {
-      const readLimit = (selector, label) => {
-        const raw = overlay.querySelector(selector).value.trim()
-        if (!raw) return null
-        const value = Number(raw)
-        if (!Number.isFinite(value) || value <= 0) throw new Error(`${label}必须是正整数`)
-        return Math.trunc(value)
-      }
-      const maxContext = readLimit('#pm-context', '上下文上限')
-      const maxOutputTokens = readLimit('#pm-output', '输出上限')
-      if (maxContext !== null && maxOutputTokens !== null && maxOutputTokens >= maxContext) {
-        throw new Error('输出上限必须小于上下文上限')
-      }
       await apiSend('PUT', `/api/console/models/${encodeURIComponent(model.id)}/plugin-settings`, {
         roles: [...overlay.querySelectorAll('[data-pmrole]:checked')].map((el) => el.dataset.pmrole),
-        maxContext,
-        maxOutputTokens,
-        contextCompression: overlay.querySelector('#pm-compress').checked,
       })
       close()
-      showTopToast('插件模型设置已保存')
+      showTopToast('插件模型可见角色已保存')
       loadModels()
     } catch (err) {
       stateEl.className = 'modal-state bad'
@@ -5388,6 +5357,17 @@ async function loadModels() {
       const caps = modelCapabilitySummary(model.tags)
       const type = modelTypeOf(model.tags)
       const readonly = model.readonly === true || model.source === 'plugin'
+      const chatLike = model.endpointKind === 'chat' || model.endpointKind === 'systemone'
+      const contextLabel = model.maxContext
+        ? tokenLimitLabel(model.maxContext)
+        : chatLike
+          ? '默认 32K'
+          : '—'
+      const outputLabel = model.maxOutputTokens
+        ? tokenLimitLabel(model.maxOutputTokens)
+        : chatLike
+          ? '默认 4K'
+          : '—'
       const thinkTag = model.thinking?.enabled
         ? `<span class="models-source-tag is-think" title="员工可在对话页切换思考档位">可调思考</span>`
         : ''
@@ -5417,8 +5397,8 @@ async function loadModels() {
             : ''
         }</td>
         <td class="models-limits-cell">
-          <span class="mono">${tokenLimitLabel(model.maxContext)}</span>
-          <div class="desc">输出 ${model.maxOutputTokens ? tokenLimitLabel(model.maxOutputTokens) : '默认 4K'}</div>
+          <span class="mono">${contextLabel}</span>
+          <div class="desc">输出 ${outputLabel}</div>
         </td>
         <td>
           ${
@@ -5434,7 +5414,7 @@ async function loadModels() {
         <td class="model-actions">
           ${
             readonly
-              ? `<button class="btn sm model-action-btn" type="button" data-edit-plugin-model="${esc(model.id)}" data-tip="配置这个插件模型的可见角色、上下文上限、输出上限与自动压缩；模型本身随插件启停。" aria-label="配置插件模型">${modelActionIcon('edit')}</button>`
+              ? `<button class="btn sm model-action-btn" type="button" data-edit-plugin-model="${esc(model.id)}" data-tip="配置这个插件模型可见的角色；上下文与输出由插件声明。" aria-label="配置插件模型可见角色">${modelActionIcon('edit')}</button>`
               : `
           ${
             (model.endpointKind ?? 'chat') === 'chat'
@@ -6271,6 +6251,21 @@ async function loadSys() {
     const locked = network.envLocked ?? {}
     const retentionDays = settings?.retentionDays ?? 90
     const auditRetentionDays = settings?.auditRetentionDays ?? 180
+    const agentTeam = settings?.agentTeam ?? {
+      maxWorkers: 8,
+      source: 'default',
+      configured: null,
+      defaultValue: 8,
+      envValue: 8,
+      envPresent: false,
+      range: { min: 1, max: 32 },
+    }
+    const agentTeamSourceLabel =
+      agentTeam.source === 'console'
+        ? '控制台设置'
+        : agentTeam.source === 'env'
+          ? '环境变量 EAB_AGENT_MAX_WORKERS'
+          : '默认值'
     let agentRetentionDays = settings?.agentRetentionDays ?? 0
     let recordRetentionDays = settings?.recordRetentionDays ?? 0
     let workspaceRecycleDays = settings?.workspaceRecycleDays ?? 30
@@ -6290,12 +6285,16 @@ async function loadSys() {
         [
           { key: 'runtime', label: '运行与准入', meta: '服务状态 · 安全边界' },
           { key: 'concurrency', label: '并发与队列', meta: '对话 · 模型 · 工具 · 插件' },
+          { key: 'agents', label: 'Agent 管理', meta: '容量 · 运行树 · 工具轨迹' },
           { key: 'jobs', label: '后台作业', meta: '排队 · 进度 · 结果' },
-          { key: 'agents', label: 'Agent 运行树', meta: '父任务 · 子 Agent · 工具轨迹' },
           { key: 'boot', label: '启动动画', meta: '片头 · 片源 · 公司覆盖' },
           { key: 'data', label: '系统与运维', meta: '目录 · 日志 · 备份 · 系统设置' },
         ],
-        state.systemSection === 'company' || !state.systemSection ? 'runtime' : state.systemSection,
+        state.systemSection === 'company' || !state.systemSection
+          ? 'runtime'
+          : state.systemSection === 'agentTeam'
+            ? 'agents'
+            : state.systemSection,
       )}
       <div class="section-panels">
       ${brandingPanelHtml(branding)}
@@ -6390,6 +6389,61 @@ async function loadSys() {
         </div>
         <div class="desc" style="margin-top:8px">共 ${fmtNum(toolMetrics?.totalCalls ?? 0)} 次工具调用；出现「p95 集中在少数工具且明显偏大」时，才对那几个工具做两段式改造，不必整体重构回合循环。</div>
       </section>
+      <section class="panel" data-section-panel="agents">
+        <div class="panel-head">
+          <div><h2>Agent 管理</h2>${hintBadge('管理说明', '容量与运行树放在同一页：上限保存后立即生效；运行树展示父任务、子 Agent 和工具轨迹。')}${hintBadge('生效边界', '新回合、新派发、团队状态接口立即生效；正在执行中的单轮保持回合开始时的上限快照。调低上限不会取消 running / waiting / pinned 岗位，团队面板会显示实际活跃数与新上限。')}</div>
+          <div class="panel-actions">
+            <span class="pill ${(agentRuns?.active ?? 0) > 0 ? 'warn' : 'ok'}">${(agentRuns?.active ?? 0) > 0 ? `运行中 ${agentRuns.active}` : '无运行中任务'}</span>
+            <button class="btn sm ghost" type="button" id="agents-refresh">刷新</button>
+          </div>
+        </div>
+        <div class="agent-manage-block">
+          <div class="panel-head">
+            <div><h3 class="agent-manage-subtitle">团队容量</h3>${hintBadge('容量说明', `每个会话同时保留的活跃岗位上限。控制台值优先于环境变量；保存后新回合、新派发和团队状态接口立即使用新上限，不需要重启。已运行的团队不会因调低上限被强制缩容，下一次派发会先回收空闲非固定岗位，仍超限才明确报错。`)}</div>
+            <span class="pill ok">${agentTeam.maxWorkers} 个 / 会话</span>
+          </div>
+          <div class="kv-grid kv-2">
+            <div><span>当前生效上限</span><strong>${agentTeam.maxWorkers} 个<span class="desc" style="display:block;font-weight:400">${esc(agentTeamSourceLabel)}</span></strong></div>
+            <div><span>环境变量默认</span><strong>${agentTeam.envPresent ? `EAB_AGENT_MAX_WORKERS = ${agentTeam.envValue}` : '未设置（默认 8）'}<span class="desc" style="display:block;font-weight:400">${agentTeam.source === 'console' ? '控制台值已覆盖环境变量' : '控制台保存后将覆盖环境变量'}</span></strong></div>
+          </div>
+          <label class="field" style="max-width:420px;margin-top:14px"><span>每会话活跃岗位上限（${agentTeam.range.min}–${agentTeam.range.max}）</span>
+            <input id="agent-team-max-workers" type="number" inputmode="numeric" min="${agentTeam.range.min}" max="${agentTeam.range.max}" step="1" value="${esc(String(agentTeam.configured ?? agentTeam.maxWorkers))}" autocomplete="off" />
+          </label>
+          <div class="panel-actions" style="margin-top:12px">
+            <button class="btn sm primary" type="button" id="agent-team-save">保存并生效</button>
+            <button class="btn sm ghost" type="button" id="agent-team-reset"${agentTeam.configured === null ? ' disabled' : ''}>恢复环境变量默认</button>
+          </div>
+        </div>
+        <div class="agent-manage-block">
+          <div class="panel-head">
+            <div><h3 class="agent-manage-subtitle">运行树</h3>${hintBadge('运行树说明', '父任务和 agent.spawn 派生的子 Agent；点开「步骤」看每个子 Agent 的工具轨迹。')}</div>
+          </div>
+          <div class="table-scroll">
+            <table class="data">
+              <thead><tr><th>任务 / Agent</th><th>模型</th><th>状态</th><th>耗时</th><th>步骤</th><th>工具轨迹</th></tr></thead>
+              <tbody>
+                ${(agentRuns?.runs ?? []).length
+                  ? (agentRuns.runs).map((row) => {
+                    const duration = Math.max(0, Math.round(((row.endedAt ?? Date.now()) - row.startedAt) / 1000))
+                    const statusClass = row.status === 'succeeded' ? 'ok' : row.status === 'failed' ? 'warn' : row.status === 'cancelled' ? 'warn' : 'warn'
+                    const statusText = row.status === 'succeeded' ? '成功' : row.status === 'failed' ? '失败' : row.status === 'cancelled' ? '已取消' : row.status === 'suspended' ? '挂起 · 等后台工具' : '运行中'
+                    const steps = row.steps ?? []
+                    return `<tr>
+                      <td><span style="padding-left:${row.depth * 16}px">${row.depth ? '↳ ' : ''}${esc(row.title ?? row.agentId)}</span><div class="desc">${esc(row.id.slice(0, 8))} · ${esc(row.agentId)}</div></td>
+                      <td class="mono">${esc(row.modelId ?? '—')}</td>
+                      <td><span class="pill ${statusClass}">${statusText}</span></td>
+                      <td>${duration} 秒</td>
+                      <td>${steps.length}</td>
+                      <td>${steps.length ? `<details><summary>${steps.length} 步</summary><div style="margin-top:6px">${steps.map((step) => `<div style="margin-bottom:6px">${step.seq + 1}. ${esc(step.name ?? step.toolId ?? step.kind)} · ${esc(step.status)} · ${step.durationMs} ms${step.resultSummary ? `<div class="desc">${esc(step.resultSummary)}</div>` : ''}</div>`).join('')}</div></details>` : '<span class="muted">暂无步骤</span>'}</td>
+                    </tr>`
+                  }).join('')
+                  : '<tr><td colspan="6" class="muted">还没有 Agent 运行记录；发起一次对话后这里会出现根任务和子 Agent</td></tr>'}
+              </tbody>
+            </table>
+          </div>
+          ${hintNote('隔离说明', '子 Agent 使用独立 runId 和独立会话锁；父任务取消会级联取消子任务。共享云空间文件仍由 P0-1 的资源锁串行化。')}
+        </div>
+      </section>
       <section class="panel" data-section-panel="jobs">
         <div class="panel-head">
           <div><h2>后台作业</h2>${hintBadge('作业说明', '控制台触发的慢操作（插件通道刷新、模型批量探测）提交后在这里排队执行；状态存在库里，多实例下任何一台都能回读。没配 Redis 时 worker 按 1.5 秒轮询，配了 Redis 则提交后即时唤醒。')}</div>
@@ -6431,39 +6485,6 @@ async function loadSys() {
           </table>
         </div>
         ${hintNote('租约说明', '执行中的作业带 5 分钟租约，实例崩溃后租约过期会被放回队列重跑；只有还在排队的作业可以取消。')}
-      </section>
-      <section class="panel" data-section-panel="agents">
-        <div class="panel-head">
-          <div><h2>Agent 运行树</h2>${hintBadge('运行树说明', '父任务和 agent.spawn 派生的子 Agent；点开「步骤」看每个子 Agent 的工具轨迹。')}</div>
-          <div class="panel-actions">
-            <span class="pill ${(agentRuns?.active ?? 0) > 0 ? 'warn' : 'ok'}">${(agentRuns?.active ?? 0) > 0 ? `运行中 ${agentRuns.active}` : '无运行中任务'}</span>
-            <button class="btn sm ghost" type="button" id="agents-refresh">刷新</button>
-          </div>
-        </div>
-        <div class="table-scroll">
-          <table class="data">
-            <thead><tr><th>任务 / Agent</th><th>模型</th><th>状态</th><th>耗时</th><th>步骤</th><th>工具轨迹</th></tr></thead>
-            <tbody>
-              ${(agentRuns?.runs ?? []).length
-                ? (agentRuns.runs).map((row) => {
-                  const duration = Math.max(0, Math.round(((row.endedAt ?? Date.now()) - row.startedAt) / 1000))
-                  const statusClass = row.status === 'succeeded' ? 'ok' : row.status === 'failed' ? 'warn' : row.status === 'cancelled' ? 'warn' : 'warn'
-                  const statusText = row.status === 'succeeded' ? '成功' : row.status === 'failed' ? '失败' : row.status === 'cancelled' ? '已取消' : row.status === 'suspended' ? '挂起 · 等后台工具' : '运行中'
-                  const steps = row.steps ?? []
-                  return `<tr>
-                    <td><span style="padding-left:${row.depth * 16}px">${row.depth ? '↳ ' : ''}${esc(row.title ?? row.agentId)}</span><div class="desc">${esc(row.id.slice(0, 8))} · ${esc(row.agentId)}</div></td>
-                    <td class="mono">${esc(row.modelId ?? '—')}</td>
-                    <td><span class="pill ${statusClass}">${statusText}</span></td>
-                    <td>${duration} 秒</td>
-                    <td>${steps.length}</td>
-                    <td>${steps.length ? `<details><summary>${steps.length} 步</summary><div style="margin-top:6px">${steps.map((step) => `<div style="margin-bottom:6px">${step.seq + 1}. ${esc(step.name ?? step.toolId ?? step.kind)} · ${esc(step.status)} · ${step.durationMs} ms${step.resultSummary ? `<div class="desc">${esc(step.resultSummary)}</div>` : ''}</div>`).join('')}</div></details>` : '<span class="muted">暂无步骤</span>'}</td>
-                  </tr>`
-                }).join('')
-                : '<tr><td colspan="6" class="muted">还没有 Agent 运行记录；发起一次对话后这里会出现根任务和子 Agent</td></tr>'}
-            </tbody>
-          </table>
-        </div>
-        ${hintNote('隔离说明', '子 Agent 使用独立 runId 和独立会话锁；父任务取消会级联取消子任务。共享云空间文件仍由 P0-1 的资源锁串行化。')}
       </section>
       <section class="panel" data-section-panel="runtime">
         <div class="panel-head">
@@ -6911,6 +6932,34 @@ async function loadSys() {
         } finally {
           brandingSave.disabled = false
         }
+      })
+    }
+    const agentTeamSave = $('#agent-team-save')
+    if (agentTeamSave) {
+      const input = $('#agent-team-max-workers')
+      const reset = $('#agent-team-reset')
+      const save = async (value, label) => {
+        agentTeamSave.disabled = true
+        if (reset) reset.disabled = true
+        try {
+          await apiSend('PUT', '/api/console/settings/agent-team', { maxWorkers: value })
+          showTopToast(label)
+          await PAGES.system.render()
+        } catch (err) {
+          showTopToast(err.message || '保存失败', { tone: 'warn' })
+          agentTeamSave.disabled = false
+          if (reset) reset.disabled = agentTeam.configured === null
+        }
+      }
+      agentTeamSave.addEventListener('click', async () => {
+        const value = Number(input?.value)
+        if (!Number.isInteger(value) || value < agentTeam.range.min || value > agentTeam.range.max) {
+          return showTopToast(`每会话活跃岗位上限只能填 ${agentTeam.range.min}–${agentTeam.range.max} 的整数`, { tone: 'warn' })
+        }
+        await save(value, `Agent 管理已更新：每会话上限 ${value} 个，新回合立即生效`)
+      })
+      reset?.addEventListener('click', async () => {
+        await save(null, 'Agent 管理已更新：已恢复环境变量默认；新回合立即生效')
       })
     }
     const retentionSave = $('#retention-save')
@@ -7472,10 +7521,15 @@ async function loadSys() {
         updateApply.disabled = true
         setUpdateNote('正在启动更新器，服务即将重启…')
         try {
-          await apiPost('/api/console/update/apply', {})
+          const applied = await apiPost('/api/console/update/apply', {})
+          if (applied?.restarting === false) {
+            setUpdateNote('更新器已启动，但当前进程不能自动重启；请执行 eab restart', true)
+            updateApply.disabled = false
+            return
+          }
           setUpdateNote('更新器已启动，正在等待服务恢复…')
           const targetVersion = String(updateNow.latest || '').replace(/^v/i, '')
-          const deadline = Date.now() + 120000
+          const deadline = Date.now() + 300000
           const poll = async () => {
             try {
               const res = await fetch('/api/health', { cache: 'no-store' })
@@ -7490,7 +7544,7 @@ async function loadSys() {
               /* 服务重启期间连接失败，继续等 */
             }
             if (Date.now() >= deadline) {
-              setUpdateNote('更新未在 2 分钟内确认完成，请检查 .eab-dev/updates/last-update.log', true)
+              setUpdateNote('更新未在 5 分钟内确认完成，请检查 .eab-dev/updates/last-update.log', true)
               updateApply.disabled = false
               return
             }

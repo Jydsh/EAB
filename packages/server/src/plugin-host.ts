@@ -18,13 +18,18 @@ import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpat
 import { createHash, randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { createRequire } from 'node:module'
-import { dirname, join, relative } from 'node:path'
+import { basename, dirname, join, relative } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { Readable, Writable } from 'node:stream'
 import { finished } from 'node:stream/promises'
 import { Context, type Fiber } from '@deepseek-ai/cordis'
 import type { Db } from '@eab/storage'
-import { listPluginDirectories, loadPlugins, readPluginDirectory, type PluginRecord } from './plugins.js'
+import {
+  listPluginPackageDirectories,
+  loadPlugins,
+  readPluginForInstance,
+  type PluginRecord,
+} from './plugins.js'
 import { dshCompatRoot, dshImCredentials, prepareDshImCompat, type DshImOptions } from './dsh-im-compat.js'
 import { clearPluginContributions, registerPluginPrompt, registerPluginTool, unregisterPluginTool } from './plugin-tools.js'
 import {
@@ -226,7 +231,6 @@ function activePluginIds(db: Db, companyId: string): Set<string> {
   const cached = pluginActiveCache.get(companyId)
   if (cached && cached.db === db && Date.now() - cached.at < 1_000) return cached.ids
   const plugins = loadPlugins(db, companyId)
-  const byId = new Map(plugins.map((plugin) => [plugin.id, plugin]))
   const ids = new Set(
     plugins
       .filter(
@@ -239,16 +243,17 @@ function activePluginIds(db: Db, companyId: string): Set<string> {
   )
   const userRows = db
     .prepare(
-      `SELECT plugin_id FROM plugin_user_installs
+      `SELECT company_id, user_id, plugin_id FROM plugin_user_installs
         WHERE company_id = ? AND removed_at IS NULL AND enabled = 1`,
     )
-    .all(companyId) as unknown as Array<{ plugin_id: string }>
+    .all(companyId) as unknown as Array<{ company_id: string; user_id: string; plugin_id: string }>
   for (const row of userRows) {
-    // 个人-only 插件不会出现在公司级 loadPlugins 结果里；这里单独补读目录，
-    // 避免个人安装的模型/工具插件被误判为“不活跃”。
-    // 同名插件公司级停用时，loadPlugins 里的 enabled 会是 false；
-    // 个人安装自己的 enabled 已在 SQL 中过滤，这里不能再用公司级 enabled 覆盖。
-    const plugin = byId.get(row.plugin_id) ?? readPluginDirectory(row.plugin_id)
+    // 个人独立版本优先；没有独立包才回退共享包，避免老数据被误判为无效。
+    const plugin = readPluginForInstance(
+      row.company_id,
+      row.plugin_id,
+      { kind: 'user', userId: row.user_id },
+    )
     if (plugin?.valid) ids.add(plugin.id)
   }
   pluginActiveCache.set(companyId, { db, at: Date.now(), ids })
@@ -2481,20 +2486,21 @@ function disposeAll(): void {
 /**
  * 单个插件包变化时只重启这个插件的公司/个人实例，不动其他插件。
  *
- * 同一物理包可能同时被公司安装和多个成员个人安装；这里按插件 id 一起收口，
- * 再按数据库里当前启用状态重建，保证两种安装范围看到的是同一份新代码。
+ * 公司实例读共享包，个人实例优先读自己的独立包；按实例分别解析，
+ * 不能再假设同一个 id 的所有实例都看到同一份物理目录。
  */
 export async function reloadPluginHost(id: string, db: Db, options?: DshImOptions): Promise<void> {
   loadedDb = db
   if (options) loadedOptions = options
+  pluginActiveCache.clear()
   for (const instance of [...instances.values()]) {
     if (instance.id === id) disposeInstance(instance)
   }
-  const record = readPluginDirectory(id)
-  if (!record || !record.valid || record.format !== 'dsh' || !record.dsh?.hasHost) return
-  const targets = enabledInstancesOf(db, record.id).map((enabled) =>
-    createHostInstance(record, loadedOptions, enabled.companyId, enabled.scope),
-  )
+  const targets = enabledInstancesOf(db, id).flatMap((enabled) => {
+    const record = readPluginForInstance(enabled.companyId, id, enabled.scope)
+    if (!record || !record.valid || record.format !== 'dsh' || !record.dsh?.hasHost) return []
+    return [createHostInstance(record, loadedOptions, enabled.companyId, enabled.scope)]
+  })
   const dependencyErrors = await preparePluginDependencies(targets)
   for (const instance of targets) {
     const dependencyError = dependencyErrors.get(instance.record.dir)
@@ -2523,7 +2529,7 @@ export async function reloadPluginHostInstance(
   if (!existing) return
   const { id, companyId, scope } = existing
   disposeInstance(existing)
-  const record = readPluginDirectory(id)
+  const record = readPluginForInstance(companyId, id, scope)
   if (!record || !record.valid || record.format !== 'dsh' || !record.dsh?.hasHost) return
   const stillEnabled = enabledInstancesOf(db, id).some(
     (item) => pluginInstanceKey(item.companyId, id, item.scope) === instanceKey,
@@ -2545,18 +2551,17 @@ export async function reloadPluginHostInstance(
 export async function reloadPluginHosts(db: Db, options?: DshImOptions): Promise<void> {
   loadedDb = db
   if (options) loadedOptions = options
+  pluginActiveCache.clear()
   // 全量重扫期间先停轮询，避免安装/启用请求和 timer 同时改插件实例。
   stopPluginWatcher()
   // 先准备 dsh-im 兼容文件树：公司实例的 DSH_HOME 就是它；个人实例另起子目录。
   if (loadedOptions) prepareDshImCompat(db, loadedOptions)
   disposeAll()
   const targets: Array<{ record: PluginRecord; companyId: string; scope: PluginScope }> = []
-  for (const item of listPluginDirectories()) {
-    const record = readPluginDirectory(item.id)
+  for (const enabled of listEnabledPluginInstances(db)) {
+    const record = readPluginForInstance(enabled.companyId, enabled.pluginId, enabled.scope)
     if (!record || !record.valid || record.format !== 'dsh' || !record.dsh?.hasHost) continue
-    for (const enabled of enabledInstancesOf(db, record.id)) {
-      targets.push({ record, companyId: enabled.companyId, scope: enabled.scope })
-    }
+    targets.push({ record, companyId: enabled.companyId, scope: enabled.scope })
   }
   const pending = targets.map((target) =>
     createHostInstance(target.record, loadedOptions, target.companyId, target.scope),
@@ -2653,7 +2658,7 @@ export function pluginPackageFingerprint(dir: string): string {
 
 function collectPluginFingerprints(): Map<string, string> {
   return new Map(
-    listPluginDirectories().map((plugin) => [plugin.id, pluginPackageFingerprint(plugin.dir)]),
+    listPluginPackageDirectories().map((plugin) => [plugin.dir, pluginPackageFingerprint(plugin.dir)]),
   )
 }
 
@@ -2729,24 +2734,25 @@ function schedulePluginInstanceReload(instanceKey: string): void {
 function pollPluginPackages(): void {
   const current = collectPluginFingerprints()
   const now = Date.now()
-  const ids = new Set([...pluginWatchSnapshots.keys(), ...current.keys()])
-  for (const id of ids) {
-    const fingerprint = current.get(id) ?? ''
-    if (pluginWatchSnapshots.get(id) === fingerprint) {
-      pluginWatchPending.delete(id)
+  const dirs = new Set([...pluginWatchSnapshots.keys(), ...current.keys()])
+  for (const dir of dirs) {
+    const fingerprint = current.get(dir) ?? ''
+    if (pluginWatchSnapshots.get(dir) === fingerprint) {
+      pluginWatchPending.delete(dir)
       continue
     }
-    const pending = pluginWatchPending.get(id)
+    const pending = pluginWatchPending.get(dir)
     if (!pending || pending.fingerprint !== fingerprint) {
-      pluginWatchPending.set(id, { fingerprint, at: now })
+      pluginWatchPending.set(dir, { fingerprint, at: now })
       continue
     }
     if (now - pending.at < PLUGIN_WATCH_SETTLE_MS) continue
     // 先记基线再重载：包本身有语法错误时只试一次，文件再次变化才会重试，
     // 不会每轮轮询都反复 import 一个坏包。
-    pluginWatchSnapshots.set(id, fingerprint)
-    pluginWatchPending.delete(id)
-    schedulePluginReload(id)
+    pluginWatchSnapshots.set(dir, fingerprint)
+    pluginWatchPending.delete(dir)
+    // 同一插件可能有共享包和多个个人独立包，目录才是唯一键；重载时按 id 重建全部实例。
+    schedulePluginReload(basename(dir))
   }
 }
 

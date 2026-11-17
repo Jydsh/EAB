@@ -1,10 +1,12 @@
 /**
  * 插件模型的宿主侧配置。
  *
- * 插件模型 ID 是 `plugin:` 前缀的虚拟 ID，不会写进 `models` 表；但“哪些角色能看到
- * 这个插件模型、上下文窗口多大、单次最多输出多少 token、超限时是否压缩较早历史”
- * 必须由管理员可配置并持久化。模型本身仍随插件启停出现/消失，避免把插件模型变成
- * 需要手工维护的普通模型。
+ * 插件模型 ID 是 `plugin:` 前缀的虚拟 ID，不会写进 `models` 表。按 DSH 的设计，
+ * 上下文窗口、默认输出上限和思考档位都由插件在 `resolveModel()` 里自描述，宿主不再
+ * 保存逐模型覆盖；控制台只保留“哪些角色能看到这个模型”这一项宿主职责。
+ *
+ * 0064/0065 迁移留下的 max_context、max_output_tokens、context_compression 列
+ * 不再读写：插件模型参数只有插件声明一个来源，避免同一个值有两套真相。
  */
 import type { Db } from '@eab/storage'
 
@@ -13,12 +15,6 @@ export const DEFAULT_PLUGIN_MODEL_ROLES = ['member']
 
 export interface PluginModelSettings {
   readonly roles: string[]
-  /** NULL 表示沿用插件声明的 contextWindow；非空时覆盖。 */
-  readonly maxContext: number | null
-  /** NULL 表示沿用插件声明的 defaultMaxTokens；非空时覆盖。 */
-  readonly maxOutputTokens: number | null
-  /** NULL 表示沿用插件声明；非空时覆盖是否自动压缩较早历史。 */
-  readonly contextCompression: boolean | null
 }
 
 function readRoles(raw: string | null | undefined): string[] {
@@ -32,52 +28,30 @@ function readRoles(raw: string | null | undefined): string[] {
   }
 }
 
-function readLimit(value: unknown): number | null {
-  const number = Number(value)
-  return Number.isFinite(number) && number > 0 ? Math.trunc(number) : null
-}
-
-function readCompression(value: unknown): boolean | null {
-  if (value === null || value === undefined) return null
-  const number = Number(value)
-  return Number.isFinite(number) ? number !== 0 : null
-}
-
-/** 返回当前公司所有插件模型的配置；没有配置时调用方使用模型默认值。 */
+/** 返回当前公司所有插件模型的角色配置；没有配置时调用方使用默认角色。 */
 export function loadPluginModelSettingsMap(
   db: Db,
   companyId: string,
 ): Map<string, PluginModelSettings> {
   const rows = db
     .prepare(
-      `SELECT model_id, roles_json, max_context, max_output_tokens, context_compression
+      `SELECT model_id, roles_json
          FROM plugin_model_settings
         WHERE company_id = ?`,
     )
     .all(companyId) as unknown as Array<{
       model_id: string
       roles_json: string | null
-      max_context: number | string | null
-      max_output_tokens: number | string | null
-      context_compression: number | string | null
     }>
   return new Map(
     rows.map((row) => [
       row.model_id,
-      {
-        roles: readRoles(row.roles_json),
-        maxContext: readLimit(row.max_context),
-        maxOutputTokens: readLimit(row.max_output_tokens),
-        contextCompression: readCompression(row.context_compression),
-      },
+      { roles: readRoles(row.roles_json) },
     ]),
   )
 }
 
-/**
- * 保存一个插件模型的配置。
- * 空角色数组表示不对任何角色开放；空上限/空压缩表示沿用插件声明。
- */
+/** 保存一个插件模型的可见角色；空数组表示不对任何角色开放。 */
 export function savePluginModelSettings(
   db: Db,
   companyId: string,
@@ -85,46 +59,23 @@ export function savePluginModelSettings(
   settings: PluginModelSettings,
 ): void {
   const roles = [...new Set(settings.roles.map(String).filter(Boolean))]
-  const maxContext = readLimit(settings.maxContext)
-  const maxOutputTokens = readLimit(settings.maxOutputTokens)
-  const contextCompression = settings.contextCompression === null
-    ? null
-    : settings.contextCompression
-      ? 1
-      : 0
   db.prepare(
     `INSERT INTO plugin_model_settings
-       (company_id, model_id, roles_json, max_context, max_output_tokens, context_compression, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
+       (company_id, model_id, roles_json, updated_at)
+     VALUES (?, ?, ?, ?)
      ON CONFLICT (company_id, model_id)
      DO UPDATE SET roles_json = excluded.roles_json,
-                   max_context = excluded.max_context,
-                   max_output_tokens = excluded.max_output_tokens,
-                   context_compression = excluded.context_compression,
                    updated_at = excluded.updated_at`,
-  ).run(companyId, modelId, JSON.stringify(roles), maxContext, maxOutputTokens, contextCompression, Date.now())
+  ).run(companyId, modelId, JSON.stringify(roles), Date.now())
 }
 
-/** 把持久化配置应用到插件模型定义；没有配置的模型保持插件声明值。 */
+/** 把持久化的角色配置应用到插件模型定义；没有配置的模型保持默认角色。 */
 export function applyPluginModelSettings<
-  T extends {
-    id: string
-    roles: readonly string[]
-    maxContext?: number | null
-    maxOutputTokens?: number | null
-    contextCompression?: boolean
-  },
+  T extends { id: string; roles: readonly string[] },
 >(models: readonly T[], overrides: ReadonlyMap<string, PluginModelSettings>): T[] {
   return models.map((model) => {
     const override = overrides.get(model.id)
-    if (!override) return model
-    return {
-      ...model,
-      roles: [...override.roles],
-      maxContext: override.maxContext ?? model.maxContext,
-      maxOutputTokens: override.maxOutputTokens ?? model.maxOutputTokens,
-      contextCompression: override.contextCompression ?? model.contextCompression,
-    } as T
+    return override ? ({ ...model, roles: [...override.roles] } as T) : model
   })
 }
 
@@ -134,19 +85,15 @@ export function loadPluginModelRoleMap(db: Db, companyId: string): Map<string, s
   return new Map([...settings].map(([modelId, value]) => [modelId, value.roles]))
 }
 
-/** 兼容旧调用方：只更新角色，保留已保存的上下文、输出与压缩配置。 */
+/** 兼容旧调用方：只更新角色。 */
 export function savePluginModelRoles(
   db: Db,
   companyId: string,
   modelId: string,
   roles: readonly string[],
 ): void {
-  const current = loadPluginModelSettingsMap(db, companyId).get(modelId)
   savePluginModelSettings(db, companyId, modelId, {
     roles: roles.map(String).filter(Boolean),
-    maxContext: current?.maxContext ?? null,
-    maxOutputTokens: current?.maxOutputTokens ?? null,
-    contextCompression: current?.contextCompression ?? null,
   })
 }
 

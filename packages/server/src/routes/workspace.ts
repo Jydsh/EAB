@@ -21,6 +21,7 @@ import {
   readdirSync,
   rmSync,
 } from 'node:fs'
+import { readFile } from 'node:fs/promises'
 import { basename, dirname, extname, join } from 'node:path'
 import { EC, EabError, ulid, SC } from '@eab/domain'
 import { appendAudit, type Db } from '@eab/storage'
@@ -30,6 +31,7 @@ import { ok, requireScope } from '../http.js'
 import { resolveActor, type RequestActor } from '../session.js'
 import { TEXT_EXTENSIONS, isTextEditableFile } from '../workspace-text.js'
 export { isTextEditableFile }
+import { publishChatEvent, type WorkspaceChangeReason } from '../chat-events.js'
 import { sendDingTalkFileToUser } from '../dingtalk-outbound.js'
 import {
   buildOfficeEditorConfig,
@@ -187,6 +189,7 @@ export function renameUserWorkspaceFile(
     .prepare('UPDATE workspace_files SET rel_path = ?, name = ?, storage_path = ?, updated_at = ? WHERE id = ?')
     .run(next, basename(next), to, Date.now(), row.id)
   const updated = deps.db.prepare('SELECT * FROM workspace_files WHERE id = ?').get(row.id) as unknown as FileRow
+  publishWorkspaceFilesChanged(row.company_id, row.owner_user_id, 'renamed', [row.id])
   return { file: publicFile(updated), row: updated, from: row.rel_path, to: next }
 }
 
@@ -219,6 +222,7 @@ export function deleteUserWorkspaceFile(
   addUsage(deps, row.company_id, 'user', row.owner_user_id, -row.size)
   addUsage(deps, row.company_id, 'company', row.company_id, -row.size)
   const updated = deps.db.prepare('SELECT * FROM workspace_files WHERE id = ?').get(row.id) as unknown as FileRow
+  publishWorkspaceFilesChanged(row.company_id, row.owner_user_id, 'deleted', [row.id])
   return { file: publicFile(updated), row: updated, recycled }
 }
 
@@ -1054,6 +1058,163 @@ export function readUserWorkspaceFile(
 const OFFICE_TOKEN_TTL_SEC = 12 * 60 * 60
 const OFFICE_PLUGIN_TOKEN_TTL_SEC = 10 * 60
 
+/* ---------------- 对话附件：个人云空间文件读取与状态 ---------------- */
+
+export type ChatAttachmentKind = 'text' | 'image' | 'binary'
+
+const CHAT_IMAGE_MIMES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif'])
+const CHAT_IMAGE_EXTENSIONS: Record<string, string> = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
+}
+
+/** 对话附件可内联预览的栅格图片类型；不含 SVG，避免把可执行 XML 当图片返回。 */
+function normalizeChatImageMime(mime: string | null | undefined): string | null {
+  const value = String(mime || '').trim().toLowerCase()
+  if (value === 'image/jpg') return 'image/jpeg'
+  return CHAT_IMAGE_MIMES.has(value) ? value : null
+}
+
+export function chatImageMimeOf(name: string, mime?: string | null): string | null {
+  return normalizeChatImageMime(mime) ?? CHAT_IMAGE_EXTENSIONS[extname(String(name || '')).toLowerCase()] ?? null
+}
+
+export function chatAttachmentKindOf(name: string, mime?: string | null): ChatAttachmentKind {
+  if (chatImageMimeOf(name, mime)) return 'image'
+  if (
+    isTextEditableFile(name) ||
+    /^text\/|application\/(json|xml|x-yaml|yaml|x-ndjson|csv)/i.test(String(mime || ''))
+  ) {
+    return 'text'
+  }
+  return 'binary'
+}
+
+export interface ChatAttachmentFile extends WorkspaceFileContent {
+  kind: ChatAttachmentKind
+}
+
+/**
+ * 读取消息附件对应的个人云空间文件。
+ * 与 readUserWorkspaceFile 的共享语义不同：消息附件只接受本人 user scope，避免共享文件被当成本人附件。
+ */
+export function readChatAttachmentFile(
+  deps: ServerDeps,
+  actor: RequestActor,
+  fileId: string,
+): ChatAttachmentFile {
+  requireEnabled(actor)
+  const row = deps.db
+    .prepare('SELECT * FROM workspace_files WHERE id = ? AND company_id = ? AND deleted_at IS NULL')
+    .get(fileId, actor.subject.companyId) as unknown as FileRow | undefined
+  if (!row) throw new EabError(EC.NOT_FOUND, '附件已从云空间删除')
+  if (
+    row.scope_type !== 'user' ||
+    row.scope_id !== actor.subject.userId ||
+    row.owner_user_id !== actor.subject.userId
+  ) {
+    throw new EabError(EC.FORBIDDEN, '只能引用本人云空间里的附件')
+  }
+  const path = diskPathOf(deps, row)
+  if (!existsSync(path)) throw new EabError(EC.NOT_FOUND, '附件内容已不在磁盘（可能被清理）')
+  return {
+    id: row.id,
+    name: row.name,
+    relPath: row.rel_path,
+    size: row.size,
+    mime: row.mime,
+    ownerUserId: row.owner_user_id,
+    buffer: readFileSync(path),
+    kind: chatAttachmentKindOf(row.name, row.mime),
+  }
+}
+
+export interface WorkspaceFileState {
+  id: string
+  status: 'active' | 'deleted' | 'forbidden'
+  name?: string
+  mime?: string | null
+  size?: number
+  updatedAt?: number
+}
+
+/**
+ * 批量解析文件状态，供历史消息卡片与状态接口共用。
+ * 记录不存在按删除处理（回收站清理后只剩消息里的 ID）；非本人文件只返回 forbidden，不泄露名称。
+ */
+export function resolveWorkspaceFileStates(
+  deps: ServerDeps,
+  companyId: string,
+  userId: string,
+  fileIds: readonly string[],
+  maxIds = 500,
+): Map<string, WorkspaceFileState> {
+  const ids = [...new Set(fileIds.map((id) => String(id || '').trim()).filter(Boolean))].slice(0, maxIds)
+  const result = new Map<string, WorkspaceFileState>()
+  if (ids.length === 0) return result
+  const rows = deps.db
+    .prepare(
+      `SELECT id, name, size, mime, updated_at, deleted_at, owner_user_id, scope_type, scope_id
+         FROM workspace_files
+        WHERE company_id = ? AND id IN (${ids.map(() => '?').join(', ')})`,
+    )
+    .all(companyId, ...ids) as unknown as Array<{
+    id: string
+    name: string
+    size: number
+    mime: string | null
+    updated_at: number
+    deleted_at: number | null
+    owner_user_id: string
+    scope_type: string
+    scope_id: string
+  }>
+  const byId = new Map(rows.map((row) => [row.id, row]))
+  for (const id of ids) {
+    const row = byId.get(id)
+    if (!row) {
+      result.set(id, { id, status: 'deleted' })
+      continue
+    }
+    if (row.scope_type !== 'user' || row.scope_id !== userId || row.owner_user_id !== userId) {
+      result.set(id, { id, status: 'forbidden' })
+      continue
+    }
+    if (row.deleted_at) {
+      result.set(id, { id, status: 'deleted' })
+      continue
+    }
+    result.set(id, {
+      id,
+      status: 'active',
+      name: row.name,
+      mime: row.mime,
+      size: row.size,
+      updatedAt: row.updated_at,
+    })
+  }
+  return result
+}
+
+/** 发布到 SSE：只带文件 ID 和变化原因；发布失败不影响主操作。 */
+export function publishWorkspaceFilesChanged(
+  companyId: string,
+  userId: string,
+  reason: WorkspaceChangeReason,
+  fileIds: readonly string[],
+): void {
+  const ids = [...new Set(fileIds.map((id) => String(id || '').trim()).filter(Boolean))]
+  if (!companyId || !userId || ids.length === 0) return
+  try {
+    publishChatEvent({ type: 'workspace', companyId, userId, reason, fileIds: ids })
+  } catch {
+    // 实时性失败只影响列表推送，主操作已提交，保持静默。
+  }
+}
+
 function officeRuntime(deps: ServerDeps) {
   return resolveOnlyOffice(deps.config, deps.config.dbPath)
 }
@@ -1465,6 +1626,7 @@ function saveOfficeFileContent(
   if (payload.sid) {
     officeAcceptedCallbackSessions.set(officeRefreshKey(row.company_id, row.id), payload.sid)
   }
+  publishWorkspaceFilesChanged(row.company_id, row.owner_user_id, 'updated', [row.id])
 }
 
 /** 强制保存是异步命令；回调写回后 updated_at 才会前进，轮询给插件一个可确认的结果。 */
@@ -1577,6 +1739,7 @@ export function editUserWorkspaceFile(
     ip: null,
     channel: 'agent',
   })
+  publishWorkspaceFilesChanged(row.company_id, row.owner_user_id, 'updated', [row.id])
   return {
     id: row.id,
     name: row.name,
@@ -1677,6 +1840,7 @@ export function saveUserWorkspaceFile(
     ip: null,
     channel: input.channel ?? 'web',
   })
+  publishWorkspaceFilesChanged(actor.subject.companyId, actor.subject.userId, 'created', [id])
   return {
     id,
     name: basename(finalRelPath),
@@ -1766,6 +1930,54 @@ export function registerWorkspaceRoutes(app: FastifyInstance, deps: ServerDeps):
       quotaSource: policy.source,
       roleCodes: policy.roleCodes,
     })
+  })
+
+  /** 批量查询文件状态：消息卡片与云空间列表用于判断“已删除/无权访问/仍在”。 */
+  app.post<{ Body: { ids?: unknown } }>('/api/workspace/files/status', async (req) => {
+    const actor = resolveActor(deps.db, deps.config, req)
+    requireEnabled(actor)
+    requireScope(actor.subject, SC.WORKSPACE_READ)
+    if (!Array.isArray(req.body?.ids)) throw new EabError(EC.VALIDATION, 'ids 必须是数组')
+    const ids = req.body.ids.map((id) => String(id ?? '').trim()).filter(Boolean)
+    if (ids.length > 200) throw new EabError(EC.VALIDATION, '一次最多查询 200 个文件')
+    const states = resolveWorkspaceFileStates(deps, actor.subject.companyId, actor.subject.userId, ids, 200)
+    return ok({ items: [...states.values()] })
+  })
+
+  /**
+   * 消息卡片图片缩略图：只内联栅格图片，SVG/HTML/PDF/Office 一律不返回。
+   * 与下载接口分开，避免每次缩略图都写下载审计、强制 attachment。
+   */
+  app.get<{ Params: { id: string } }>('/api/workspace/files/:id/preview', async (req, reply) => {
+    const actor = resolveActor(deps.db, deps.config, req)
+    requireEnabled(actor)
+    requireScope(actor.subject, SC.WORKSPACE_READ)
+    const row = deps.db
+      .prepare('SELECT * FROM workspace_files WHERE id = ? AND company_id = ? AND deleted_at IS NULL')
+      .get(req.params.id, actor.subject.companyId) as unknown as FileRow | undefined
+    if (!row) throw new EabError(EC.NOT_FOUND, '文件不存在或已被删除')
+    if (row.owner_user_id !== actor.subject.userId && !isShared(deps, row, actor)) {
+      throw new EabError(EC.FORBIDDEN, '没有该文件的访问权限')
+    }
+    const mime = chatImageMimeOf(row.name, row.mime)
+    if (!mime) {
+      return reply.code(415).send({
+        ok: false,
+        error: { code: 'UNSUPPORTED_MEDIA_TYPE', message: '该文件类型不支持缩略图内联预览' },
+      })
+    }
+    const path = diskPathOf(deps, row)
+    if (!existsSync(path)) throw new EabError(EC.NOT_FOUND, '文件内容已不在磁盘（可能被清理）')
+    const etag = `"${row.updated_at}-${row.size}"`
+    reply
+      .header('content-type', mime)
+      .header('content-disposition', `inline; filename*=UTF-8''${encodeURIComponent(row.name)}`)
+      .header('x-content-type-options', 'nosniff')
+      .header('content-security-policy', "default-src 'none'; sandbox")
+      .header('cache-control', 'private, max-age=300')
+      .header('etag', etag)
+    if (String(req.headers['if-none-match'] || '') === etag) return reply.code(304).send()
+    return reply.send(await readFile(path))
   })
 
   /** 预览能力矩阵：前端据此决定是否创建右栏，不再只凭扩展名猜。 */
@@ -2203,6 +2415,7 @@ export function registerWorkspaceRoutes(app: FastifyInstance, deps: ServerDeps):
         }
         : {}),
     })
+    publishWorkspaceFilesChanged(actor.subject.companyId, actor.subject.userId, existing ? 'updated' : 'created', [id])
     return ok(publicFile(row))
   })
 

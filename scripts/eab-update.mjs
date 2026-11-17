@@ -171,19 +171,39 @@ function restoreRuntimeData(dataDir) {
   return copied > 0
 }
 
-async function waitForHealth(port, version, timeoutMs = 45000) {
+/**
+ * 等待新版本健康。
+ * 仅比较 version 不够：旧进程如果还在运行（或热重载后已读新代码），也会返回目标版本，
+ * 更新器会误以为重启成功。这里同时要求 pid 变化；老版本 health 没有 pid 时用 uptime 兜底。
+ */
+async function waitForHealth(port, version, timeoutMs = 45000, oldPid = 0) {
   const end = Date.now() + timeoutMs
+  let last = '无响应'
   while (Date.now() < end) {
     try {
       const res = await fetch(`http://127.0.0.1:${port}/api/health`, { signal: AbortSignal.timeout(2000) })
       const body = await res.json().catch(() => null)
-      if (res.ok && String(body?.data?.version ?? '') === version) return true
+      const data = body?.data ?? {}
+      const running = String(data.version ?? '').replace(/^v/i, '')
+      const pid = Number(data.pid)
+      const uptime = Number(data.uptimeSec)
+      last = `v${running || '?'} pid=${Number.isInteger(pid) ? pid : '?'} uptime=${Number.isFinite(uptime) ? `${uptime}s` : '?'}`
+      if (res.ok && running === version) {
+        if (oldPid > 0 && Number.isInteger(pid) && pid === oldPid) {
+          last = `${last}（仍是旧进程）`
+        } else if (oldPid > 0 && !Number.isInteger(pid) && Number.isFinite(uptime) && uptime > 150) {
+          last = `${last}（没有 pid，且进程已运行超过 150 秒）`
+        } else {
+          return { ok: true, pid: Number.isInteger(pid) ? pid : null, uptime: Number.isFinite(uptime) ? uptime : null, detail: last }
+        }
+      }
     } catch {
       /* 新进程还没起来 */
     }
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 1000))
   }
-  return false
+  log(`健康检查超时：期望 v${version}，最后状态 ${last}`)
+  return { ok: false, pid: null, uptime: null, detail: last }
 }
 
 function extractZip(zipPath, dest) {
@@ -256,16 +276,33 @@ function runPnpm(root) {
   })
 }
 
-function startServer(root) {
+/**
+ * 启动新版本服务。
+ *
+ * 这里不用 `eab server --background`，而用 `eab restart --background`：
+ * - restart 会先按端口强制停掉可能还残留的旧进程，再启动；
+ * - 只有端口真正释放后才继续，避免新进程绑定失败却因为旧服务健康而被误判成功。
+ */
+function startServer(root, version) {
   const script = join(root, 'scripts', 'eab.mjs')
-  const child = spawn(process.execPath, [script, 'server', '--background'], {
+  const env = { ...process.env }
+  // 新版本以刚替换的 package.json 为准；继承旧进程的 EAB_VERSION 会让 /api/health
+  // 永远报旧版本，更新器健康检查失败后又回滚，看起来就像“升级成功但没有重启”。
+  if (env.EAB_VERSION) {
+    log(`忽略旧进程注入的 EAB_VERSION=${env.EAB_VERSION}，重启后按 package.json 读取版本`)
+    delete env.EAB_VERSION
+  }
+  env.EAB_UPDATE_RESTART = new Date().toISOString()
+  const child = spawn(process.execPath, [script, 'restart', '--background'], {
     cwd: root,
-    env: { ...process.env },
+    env,
     detached: true,
     stdio: 'ignore',
     windowsHide: true,
   })
+  child.once('error', (error) => log(`启动新服务失败：${error.message}`))
   child.unref()
+  return child.pid ?? null
 }
 
 function stopServer(root) {
@@ -276,6 +313,7 @@ function stopServer(root) {
     env: { ...process.env },
   })
   if (result.status !== 0) log(`停止新进程失败：${result.stderr || result.status}`)
+  return result.status === 0
 }
 
 async function main() {
@@ -289,6 +327,7 @@ async function main() {
   const version = String(flags.version ?? '').replace(/^v/i, '')
   const url = String(flags.url ?? '')
   const expectedDigest = String(flags.sha256 ?? '')
+  const oldPid = Number(flags['old-pid'] ?? 0)
   const restart = flags.restart === '1' || flags.restart === true
   if (!/^https:\/\/(github\.com|api\.github\.com|codeload\.github\.com)\//i.test(url)) {
     throw new Error('只允许从 GitHub 下载更新包')
@@ -306,7 +345,6 @@ async function main() {
   const backupDir = join(LOG_DIR, `backup-${stamp}`)
   mkdirSync(workDir, { recursive: true })
   let backupReady = false
-  let serviceStopped = false
   let dataBackupDir = null
   let rollbackOk = null
 
@@ -324,9 +362,14 @@ async function main() {
     if (found !== version) throw new Error(`源码包版本是 ${found}，不是 ${version}`)
     log(`源码包校验通过：v${found}`)
     log(`等待旧服务退出（端口 ${chatPort}）`)
-    const free = await waitPortFree(chatPort)
-    if (!free) throw new Error(`旧服务在 30 秒内没有释放端口 ${chatPort}，为避免文件占用已中止更新`)
-    serviceStopped = true
+    let free = await waitPortFree(chatPort)
+    if (!free) {
+      log(`旧服务在 30 秒内没有释放端口 ${chatPort}，尝试强制停止旧进程`)
+      stopServer(root)
+      free = await waitPortFree(chatPort, 10000)
+      if (!free) throw new Error(`旧服务仍未释放端口 ${chatPort}，为避免文件占用已中止更新`)
+      log('旧服务已强制停止')
+    }
     backupCode(root, backupDir)
     backupReady = true
     log(`旧代码已备份：${backupDir}`)
@@ -335,13 +378,22 @@ async function main() {
     log('代码已替换，开始安装依赖')
     await runPnpm(root)
     log('依赖安装完成')
-    let healthOk = restart ? false : null
+    let health = restart ? { ok: false, pid: null, uptime: null, detail: '尚未启动' } : { ok: true, pid: null, uptime: null, detail: '未要求重启' }
     if (restart) {
-      startServer(root)
-      log('已发出重启命令：eab start --background')
-      healthOk = await waitForHealth(chatPort, version)
-      if (!healthOk) {
-        log(`v${version} 未在 45 秒内恢复健康，开始回滚到 v${previousVersion}`)
+      const firstPid = startServer(root, version)
+      log(`已发出重启命令：eab restart --background${firstPid ? `（重启命令 pid ${firstPid}）` : ''}`)
+      health = await waitForHealth(chatPort, version, 45000, oldPid)
+      if (!health.ok) {
+        // 第一次可能是端口/后台进程的瞬时失败；再做一次真正的 restart，避免直接回滚。
+        log(`v${version} 首次重启未恢复健康（${health.detail}），再执行一次重启兜底`)
+        stopServer(root)
+        await waitPortFree(chatPort, 10000)
+        const retryPid = startServer(root, version)
+        log(`已发出重启兜底命令：eab restart --background${retryPid ? `（重启命令 pid ${retryPid}）` : ''}`)
+        health = await waitForHealth(chatPort, version, 20000, oldPid)
+      }
+      if (!health.ok) {
+        log(`v${version} 未恢复健康（${health.detail}），开始回滚到 v${previousVersion}`)
         stopServer(root)
         const rollbackPortFree = await waitPortFree(chatPort)
         if (!rollbackPortFree) {
@@ -351,14 +403,19 @@ async function main() {
           if (backupReady) restoreCode(root, backupDir)
           restoreRuntimeData(dataBackupDir)
           await runPnpm(root)
-          startServer(root)
-          rollbackOk = await waitForHealth(chatPort, previousVersion)
-          log(rollbackOk ? `已回滚并恢复 v${previousVersion}` : '回滚后旧版本仍未恢复健康')
+          startServer(root, previousVersion)
+          const rollbackHealth = await waitForHealth(chatPort, previousVersion, 30000, oldPid)
+          rollbackOk = rollbackHealth.ok
+          log(
+            rollbackOk
+              ? `已回滚并恢复 v${previousVersion}（${rollbackHealth.detail}）`
+              : `回滚后旧版本仍未恢复健康（${rollbackHealth.detail}）`,
+          )
         }
       }
     }
-    const ok = restart ? Boolean(healthOk) : true
-    log(ok ? `更新完成：v${version}` : `更新失败：v${version} 未恢复健康`)
+    const ok = restart ? health.ok : true
+    log(ok ? `更新完成：v${version}（${health.detail}）` : `更新失败：v${version} 未恢复健康（${health.detail}）`)
     writeFileSync(
       join(LOG_DIR, 'last-update.json'),
       `${JSON.stringify({
@@ -366,7 +423,10 @@ async function main() {
         previousVersion,
         at: new Date().toISOString(),
         ok,
-        health: healthOk,
+        health: health.ok,
+        healthDetail: health.detail,
+        pid: health.pid,
+        uptimeSec: health.uptime,
         rolledBack: rollbackOk === true,
         rollbackHealth: rollbackOk,
         root,
@@ -386,9 +446,17 @@ async function main() {
         rollbackOk = true
         log('已回滚代码并恢复依赖')
       }
-      if (serviceStopped && restart) {
-        startServer(root)
-        log('旧服务已重新启动')
+      // 控制台点击更新后旧服务会被先关掉；即使失败发生在下载/校验阶段，
+      // 也必须把上一版本重新拉起来，不能把用户留在“服务已停”的状态。
+      if (restart) {
+        startServer(root, previousVersion)
+        const restartHealth = await waitForHealth(chatPort, previousVersion, 30000, oldPid)
+        rollbackOk = restartHealth.ok
+        log(
+          restartHealth.ok
+            ? `旧服务已重新启动并恢复健康（${restartHealth.detail}）`
+            : `旧服务重新启动后未恢复健康（${restartHealth.detail}）`,
+        )
       }
     } catch (rollbackError) {
       log(`回滚失败：${rollbackError.message}`)
@@ -401,7 +469,8 @@ async function main() {
         at: new Date().toISOString(),
         ok: false,
         health: null,
-        rolledBack: rollbackOk === true,
+        rolledBack: backupReady && rollbackOk === true,
+        restarted: restart ? rollbackOk === true : null,
         rollbackHealth: rollbackOk,
         error: error.message,
         root,

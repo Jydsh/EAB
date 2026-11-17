@@ -7,20 +7,28 @@ import type { ServerConfig } from '../src/config.js'
 import type { ServerDeps } from '../src/deps.js'
 import { buildApp } from '../src/app.js'
 import { AgentTeamStore } from '../src/agent-team.js'
+import { writeConsoleSettings } from '../src/settings.js'
 
 const dirs: string[] = []
 const handles: Db[] = []
 const apps: ReturnType<typeof buildApp>[] = []
+const previousHomes: Array<string | undefined> = []
 
 afterEach(async () => {
   for (const app of apps.splice(0)) await app.close()
   for (const db of handles.splice(0)) db.close()
+  for (const home of previousHomes.splice(0)) {
+    if (home === undefined) delete process.env.EAB_HOME
+    else process.env.EAB_HOME = home
+  }
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
 })
 
 function makeApp() {
   const dir = mkdtempSync(join(tmpdir(), 'eab-agent-team-route-'))
   dirs.push(dir)
+  previousHomes.push(process.env.EAB_HOME)
+  process.env.EAB_HOME = dir
   const db = openDatabase({ path: ':memory:' })
   handles.push(db)
   migrate(db)
@@ -41,7 +49,13 @@ function makeApp() {
     userId: 'u1',
     idleMs: 60_000,
   })
-  team.registerWorker({ key: 'worker', name: '长任务', index: 1 })
+  team.registerWorker({
+    key: 'worker',
+    name: '长任务',
+    index: 1,
+    role: 'producer',
+    acceptance: '必须交回三条可核对结论',
+  })
   const task = team.createTask({ workerKey: 'worker', prompt: '核对 100 条记录', parentRunId: 'parent-1' })
   team.markTaskRunning(task.id, 'child-run-1', now)
   team.recordEvent({ workerKey: 'worker', kind: 'done', taskId: task.id, payload: { text: '完成 60 条' } })
@@ -82,15 +96,32 @@ describe('GET /api/chat/agents', () => {
     const body = response.json() as {
       ok: boolean
       data: {
-        workers: Array<{ key: string; status: string }>
+        workers: Array<{ key: string; status: string; role: string; parentKey: string | null }>
+        tree: Array<{ key: string; role: string; children: unknown[] }>
+        capacity: { active: number; limit: number }
         tasks: Array<{ key: string; status: string; prompt: string }>
         events: Array<{ key: string; kind: string }>
       }
     }
     expect(body.ok).toBe(true)
     expect(body.data.workers.find((worker) => worker.key === 'worker')?.status).toBe('running')
+    expect(body.data.workers.find((worker) => worker.key === 'worker')?.role).toBe('producer')
+    expect(body.data.tree[0]?.key).toBe('worker')
+    expect(body.data.capacity).toMatchObject({ active: 1, limit: 8 })
     expect(body.data.tasks.some((task) => task.key === 'worker' && task.status === 'running')).toBe(true)
     expect(body.data.events.some((event) => event.key === 'worker' && event.kind === 'done')).toBe(true)
+  })
+
+  it('读取控制台保存的团队上限，不依赖启动时的 config', async () => {
+    const app = makeApp()
+    writeConsoleSettings({ agentTeam: { maxWorkers: 6 } })
+    await app.ready()
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/chat/agents?sessionId=s1&as=u1',
+    })
+    const body = response.json() as { data: { capacity: { limit: number } } }
+    expect(body.data.capacity.limit).toBe(6)
   })
 
   it('缺少 sessionId 或会话不属于当前用户时返回明确错误', async () => {

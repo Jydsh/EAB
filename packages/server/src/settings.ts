@@ -296,6 +296,12 @@ export function readCompanyBoot(raw: unknown): CompanyBootSettings {
   }
 }
 
+/** Agent 团队运行策略；目前只开放每会话活跃岗位上限。 */
+export interface AgentTeamSettings {
+  /** 每会话活跃岗位上限；null 表示跟随环境变量/默认值。 */
+  maxWorkers: number | null
+}
+
 export interface ConsoleSettings extends NetworkSettings {
   /** 总存储位置；null 表示就用部署目录下的 .eab-dev */
   dataDir: string | null
@@ -319,6 +325,8 @@ export interface ConsoleSettings extends NetworkSettings {
   branding: BrandingSettings
   /** 登录后启动动画：全局默认 + 公司覆盖 */
   bootAnimation: BootAnimationSettings
+  /** Agent 团队运行策略；控制台显式值优先于环境变量 */
+  agentTeam: AgentTeamSettings
   lastCleanupAt: string | null
   lastCleanupStats: Record<string, number> | null
 }
@@ -339,6 +347,7 @@ const DEFAULTS: ConsoleSettings = {
   onlyOffice: { url: null, internalUrl: null, jwtSecretRef: null },
   branding: BRANDING_DEFAULTS,
   bootAnimation: DEFAULT_BOOT_ANIMATION,
+  agentTeam: { maxWorkers: null },
   lastCleanupAt: null,
   lastCleanupStats: null,
   host: null,
@@ -354,6 +363,22 @@ function defaultSettings(): ConsoleSettings {
     pendingMigrations: [],
     branding: cloneBranding(BRANDING_DEFAULTS),
     bootAnimation: cloneBootAnimation(DEFAULT_BOOT_ANIMATION),
+    agentTeam: { ...DEFAULTS.agentTeam },
+  }
+}
+
+function readAgentTeam(raw: unknown): AgentTeamSettings {
+  const source = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {}
+  const maxWorkers = Number(source.maxWorkers)
+  return {
+    // 监听端口等配置用 0 表示“未配置”，这里也一样：范围外的值一律回落，
+    // 真正的范围校验在保存接口里做，避免坏文件把服务卡死。
+    maxWorkers:
+      source.maxWorkers === null || source.maxWorkers === undefined
+        ? null
+        : Number.isInteger(maxWorkers) && maxWorkers >= 1 && maxWorkers <= 32
+          ? maxWorkers
+          : null,
   }
 }
 
@@ -492,6 +517,7 @@ export function readConsoleSettings(): ConsoleSettings {
       onlyOffice: readOnlyOffice(raw.onlyOffice),
       branding: readBranding(raw.branding),
       bootAnimation: readBootAnimation(raw.bootAnimation),
+      agentTeam: readAgentTeam(raw.agentTeam),
       lastCleanupAt: typeof raw.lastCleanupAt === 'string' ? raw.lastCleanupAt : null,
       lastCleanupStats: raw.lastCleanupStats && typeof raw.lastCleanupStats === 'object' ? raw.lastCleanupStats : null,
       host: readText(raw.host),
@@ -520,6 +546,7 @@ export function writeConsoleSettings(patch: Partial<ConsoleSettings>): ConsoleSe
     })
   }
   if (patch.pendingMigrations) next.pendingMigrations = patch.pendingMigrations
+  if (patch.agentTeam) next.agentTeam = { ...current.agentTeam, ...patch.agentTeam }
   const file = settingsPath()
   mkdirSync(dirname(file), { recursive: true })
   const tmp = `${file}.tmp`

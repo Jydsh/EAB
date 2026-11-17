@@ -44,6 +44,8 @@ export function registerSystemRoutes(app: FastifyInstance, deps: ServerDeps): vo
   app.get('/api/health', async () =>
     ok({
       version: readVersion(),
+      // 更新器用 pid + uptime 确认健康响应来自新进程，而不是还在运行的旧进程。
+      pid: process.pid,
       uptimeSec: Math.round(process.uptime()),
       devAuth: deps.config.devAuth,
       host: deps.config.host,

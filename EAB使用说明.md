@@ -370,6 +370,8 @@ node scripts\eab.mjs doctor
 - 模型在输入框左下方的「自动（模型名）」按钮上切换（只显示你有权限的），默认「自动选择」；侧栏不再单列模型列表；
 - 回答会带知识库引用；资料不足时明确说“现有资料里没有”；
 - 每轮消息都落库，刷新/重启不丢；用户消息右侧显示当前登录人的姓名与头像；
+- 服务重启时，正在跑的后台子 Agent 会被收尾为“服务重启中断”并保留检查点；启动约 15 秒后父 Agent 会自动被唤醒，按检查点决定 `agent_resume` 继续还是重新派活，不再等用户下一条消息才发现断链；
+- 网页回复仍在内存中，服务重启无法续跑；页面会自动重连并清理已不存在的“正在生成”，提示重新发送。钉钉普通回合和卡片按钮续跑会按 `channel_turns` 自动恢复；
 - 会话重命名、删除走侧栏会话菜单（删除需 `chat:history:delete`，软删 + 审计）、导出 JSON/Markdown（需 `chat:export`）。
 
 ### 3.3 对话里的图片与文件
@@ -613,10 +615,10 @@ Start-Sleep -Milliseconds 700
 Start-Process pwsh -ArgumentList "-NoProfile","-Command","cd 'D:\AI kaifa\EAB'; pnpm dev *> `"$env:TEMP\eab-dev.log`"" -WindowStyle Hidden
 ```
 
-日志默认级别为 `warn`：正常 2xx 请求不输出 `request completed`，4xx/5xx 和启动、后端异常仍保留。排查具体请求时可临时恢复 info：
+日志默认级别为 `warn`：正常 2xx 请求不输出 `request completed`，4xx/5xx 和启动、后端异常仍保留。批次落盘、分批分析进度和完成摘要属于调试日志，默认不写控制台；排查具体请求时可临时恢复 info，查看批次细节用 debug：
 
 ```powershell
-$env:EAB_LOG_LEVEL = 'info'
+$env:EAB_LOG_LEVEL = 'debug'
 pnpm dev
 ```
 

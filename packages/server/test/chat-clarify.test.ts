@@ -162,6 +162,329 @@ describe('引导式澄清', () => {
     expect(events.some((event) => event.type === 'clarify')).toBe(true)
   })
 
+  it('长进度汇报只把选项 A/B/C 写成正文时，服务端直接补成可点击选择卡', async () => {
+    const { callModelStream } = await import('../src/llm.js')
+    const mocked = callModelStream as unknown as {
+      mockImplementationOnce: (fn: (...args: any[]) => unknown) => void
+    }
+    state.calls = 0
+    const report = [
+      '李鹏，关于“按人员分类看看每个人有多少条计划”的进度汇报如下：',
+      '',
+      '1. 当前执行状态',
+      '子 Agent 正在后台处理 6458 条目标与计划记录，完成后会自动汇总。',
+      '',
+      '2. 我现在能做什么',
+      '选项 A（推荐）：稍后再询问，我会检查任务是否已完成。',
+      '选项 B：现在就尝试转发进度查询。',
+      '选项 C：不触发后台操作，仅用文字说明当前情况。',
+      '',
+      '3. 您的选择',
+      '您想怎么做？',
+      '- 等我任务完成后自动汇报（推荐，不占用会话）',
+      '- 现在就让我尝试转发进度查询（可能返回半成品数据）',
+      '- 稍后自己再问（可以在接下来的对话里随时问我）',
+      '请告诉我您的决定。',
+    ].join('\n')
+    mocked.mockImplementationOnce(async () => ({
+      text: report,
+      reasoning: '',
+      toolCalls: [],
+      promptTokens: 1,
+      completionTokens: 1,
+    }))
+
+    const { deps, actor } = testEnv()
+    const events: Array<{ type: string; clarify?: any }> = []
+    const result = await runAgentTurn({
+      deps,
+      actor,
+      modelId: 'model_test',
+      messages: [{ role: 'user', content: '按人员分类看看每个人有多少条计划，哪些完成了，哪些未完成' }],
+      maxTokens: 32,
+      emit: (event) => events.push(event),
+    })
+
+    expect(result?.clarify?.question).toBe('您想怎么做？')
+    expect(result?.clarify?.options.map((option) => option.label)).toEqual([
+      '等我任务完成后自动汇报',
+      '现在就让我尝试转发进度查询',
+      '稍后自己再问',
+    ])
+    expect(result?.clarify?.intro).toContain('6458 条目标与计划记录')
+    expect(result?.text).toBe('您想怎么做？')
+    expect(events.filter((event) => event.type === 'clarify')).toHaveLength(1)
+  })
+
+  it('模型先写背景汇报再调用 ask_user 时，卡片保留背景摘要', async () => {
+    const { callModelStream } = await import('../src/llm.js')
+    const mocked = callModelStream as unknown as {
+      mockImplementationOnce: (fn: () => unknown) => void
+    }
+    mocked.mockImplementationOnce(async () => ({
+      text: '后台任务还在处理 6458 条记录，完成后会自动汇总。',
+      reasoning: '',
+      toolCalls: [
+        {
+          id: 'ask-with-intro',
+          type: 'function',
+          function: {
+            name: 'ask_user',
+            arguments: JSON.stringify({
+              question: '您想怎么处理这个后台任务？',
+              options: [
+                { label: '等完成后自动汇报' },
+                { label: '现在转发进度查询' },
+                { label: '取消任务' },
+              ],
+            }),
+          },
+        },
+      ],
+      promptTokens: 1,
+      completionTokens: 1,
+    }))
+
+    const { deps, actor } = testEnv()
+    const result = await runAgentTurn({
+      deps,
+      actor,
+      modelId: 'model_test',
+      messages: [{ role: 'user', content: '任务跑到哪了' }],
+      maxTokens: 16,
+      emit: () => {},
+    })
+
+    expect(result?.clarify?.question).toBe('您想怎么处理这个后台任务？')
+    expect(result?.clarify?.intro).toContain('6458 条记录')
+    expect(result?.text).toBe('您想怎么处理这个后台任务？')
+  })
+
+  it('纯方案对比、没有邀请用户选择的正文不会误判成选择卡', async () => {
+    const { callModelStream } = await import('../src/llm.js')
+    const mocked = callModelStream as unknown as {
+      mockImplementationOnce: (fn: (...args: any[]) => unknown) => void
+    }
+    state.calls = 0
+    const comparison = [
+      '我把两种方案对比一下：',
+      '方案 A：先导入历史数据，再统一补录，优点是口径一致，缺点是耗时较长。',
+      '方案 B：边导入边补录，优点是上线快，缺点是容易出现重复记录。',
+      '综合来看建议采用方案 A。',
+    ].join('\n')
+    mocked.mockImplementationOnce(async () => ({
+      text: comparison,
+      reasoning: '',
+      toolCalls: [],
+      promptTokens: 1,
+      completionTokens: 1,
+    }))
+
+    const { deps, actor } = testEnv()
+    const events: Array<{ type: string; clarify?: any }> = []
+    const result = await runAgentTurn({
+      deps,
+      actor,
+      modelId: 'model_test',
+      messages: [{ role: 'user', content: '帮我分析下这两种导入方案' }],
+      maxTokens: 32,
+      emit: (event) => events.push(event),
+    })
+
+    expect(result?.clarify).toBeUndefined()
+    expect(events.some((event) => event.type === 'clarify')).toBe(false)
+  })
+
+  it('邀请选择后用编号列表给出候选时，也能生成选择卡', async () => {
+    const { callModelStream } = await import('../src/llm.js')
+    const mocked = callModelStream as unknown as {
+      mockImplementationOnce: (fn: (...args: any[]) => unknown) => void
+    }
+    state.calls = 0
+    mocked.mockImplementationOnce(async () => ({
+      text: [
+        '任务还在后台跑，请选择下一步：',
+        '1. 等完成后自动汇报',
+        '2. 现在转发进度查询',
+        '3. 取消这个后台任务',
+      ].join('\n'),
+      reasoning: '',
+      toolCalls: [],
+      promptTokens: 1,
+      completionTokens: 1,
+    }))
+
+    const { deps, actor } = testEnv()
+    const events: Array<{ type: string; clarify?: any }> = []
+    const result = await runAgentTurn({
+      deps,
+      actor,
+      modelId: 'model_test',
+      messages: [{ role: 'user', content: '任务跑到哪了' }],
+      maxTokens: 32,
+      emit: (event) => events.push(event),
+    })
+
+    expect(result?.clarify?.options.map((option) => option.label)).toEqual([
+      '等完成后自动汇报',
+      '现在转发进度查询',
+      '取消这个后台任务',
+    ])
+    expect(result?.clarify?.question).toContain('请选择下一步')
+    expect(events.filter((event) => event.type === 'clarify')).toHaveLength(1)
+  })
+
+  it('模型追问是哪个任务、换哪个模型时，长回复也会强制转成澄清卡', async () => {
+    const { callModelStream } = await import('../src/llm.js')
+    const mocked = callModelStream as unknown as {
+      mockImplementationOnce: (fn: (...args: any[]) => unknown) => void
+    }
+    mocked.mockImplementationOnce(async () => ({
+      text: [
+        '本轮后台任务在 16:46 启动，目标是按人员分类统计 6458 条目标与计划记录，并核对每个人已完成和未完成的数量。',
+        '目前没有收到具体的失败通知，子 Agent 的检查点还在，可能只是模型侧超时。',
+        '如果是刚才按人员分类统计的那个任务，它的检查点还在，可以直接 resume；如果是别的任务，需要先确认任务 id，否则重派会覆盖原来的检查点。',
+        '请告诉我：',
+        '',
+        '是哪个任务失败了？',
+        '换哪个模型重派？',
+      ].join('\n'),
+      reasoning: '',
+      toolCalls: [],
+      promptTokens: 1,
+      completionTokens: 1,
+    }))
+    mocked.mockImplementationOnce(async () => ({
+      text: '',
+      reasoning: '',
+      toolCalls: [
+        {
+          id: 'ask-task-model',
+          type: 'function',
+          function: {
+            name: 'ask_user',
+            arguments: JSON.stringify({
+              question: '请选择要重派的任务和模型',
+              options: [
+                { label: '按人员分类统计任务' },
+                { label: '其他任务' },
+                { label: '先不重派' },
+              ],
+            }),
+          },
+        },
+      ],
+      promptTokens: 1,
+      completionTokens: 1,
+    }))
+
+    const { deps, actor } = testEnv()
+    const events: Array<{ type: string; clarify?: any }> = []
+    const result = await runAgentTurn({
+      deps,
+      actor,
+      modelId: 'model_test',
+      messages: [{ role: 'user', content: '换模型重派' }],
+      maxTokens: 16,
+      emit: (event) => events.push(event),
+    })
+
+    expect(result?.clarify?.question).toBe('请选择要重派的任务和模型')
+    expect(result?.clarify?.options).toHaveLength(3)
+    expect(events.filter((event) => event.type === 'clarify')).toHaveLength(1)
+  })
+
+  it('用户明确要可点击选项时，首轮只允许 ask_user，不再自己恢复任务', async () => {
+    const { callModelStream } = await import('../src/llm.js')
+    const mocked = callModelStream as unknown as {
+      mockImplementationOnce: (fn: (...args: any[]) => unknown) => void
+    }
+    let capturedOptions: any = null
+    mocked.mockImplementationOnce(async (...args: any[]) => {
+      capturedOptions = args[5]
+      return {
+        text: '',
+        reasoning: '',
+        toolCalls: [
+          {
+            id: 'ask-by-user-request',
+            type: 'function',
+            function: {
+              name: 'ask_user',
+              arguments: JSON.stringify({
+                question: '这个后台任务失败了，您想怎么处理？',
+                options: [
+                  { label: '继续重试' },
+                  { label: '换模型重派' },
+                  { label: '先停下' },
+                ],
+              }),
+            },
+          },
+        ],
+        promptTokens: 1,
+        completionTokens: 1,
+      }
+    })
+
+    const { deps, actor } = testEnv()
+    const events: Array<{ type: string; clarify?: any }> = []
+    const result = await runAgentTurn({
+      deps,
+      actor,
+      modelId: 'model_test',
+      messages: [{
+        role: 'user',
+        content: '这个后台任务失败了，你准备继续重试、换模型重派，还是先停下？请给我可点击的选项让我选。',
+      }],
+      maxTokens: 16,
+      emit: (event) => events.push(event),
+    })
+
+    expect(capturedOptions?.toolChoice?.function?.name).toBe('ask_user')
+    expect(result?.clarify?.options.map((option) => option.label)).toEqual([
+      '继续重试',
+      '换模型重派',
+      '先停下',
+    ])
+    expect(events.filter((event) => event.type === 'clarify')).toHaveLength(1)
+  })
+
+  it('“请确认以下步骤”的编号清单不会被误判成选择卡', async () => {
+    const { callModelStream } = await import('../src/llm.js')
+    const mocked = callModelStream as unknown as {
+      mockImplementationOnce: (fn: (...args: any[]) => unknown) => void
+    }
+    state.calls = 0
+    mocked.mockImplementationOnce(async () => ({
+      text: [
+        '开始前请确认以下三步：',
+        '1. 先核对源数据里的 6458 条记录',
+        '2. 再按人员分类统计完成和未完成',
+        '3. 最后把结果写回工作计划表',
+        '确认无误后我就按这个顺序执行。',
+      ].join('\n'),
+      reasoning: '',
+      toolCalls: [],
+      promptTokens: 1,
+      completionTokens: 1,
+    }))
+
+    const { deps, actor } = testEnv()
+    const events: Array<{ type: string; clarify?: unknown }> = []
+    const result = await runAgentTurn({
+      deps,
+      actor,
+      modelId: 'model_test',
+      messages: [{ role: 'user', content: '按这个流程处理工作计划' }],
+      maxTokens: 32,
+      emit: (event) => events.push(event),
+    })
+
+    expect(result?.clarify).toBeUndefined()
+    expect(events.some((event) => event.type === 'clarify')).toBe(false)
+  })
+
   it('模型给出的方向少于两个时退回普通回答，不执行未注册工具', async () => {
     const { callModelStream } = await import('../src/llm.js')
     const mocked = callModelStream as unknown as { mockImplementationOnce: (fn: () => unknown) => void }

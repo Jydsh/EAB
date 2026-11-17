@@ -51,6 +51,8 @@ import {
   MODEL_CAPABILITIES,
   MODEL_ENDPOINT_KINDS,
   MODEL_ROUTE_PURPOSES,
+  DEFAULT_MODEL_MAX_CONTEXT,
+  DEFAULT_MODEL_MAX_OUTPUT,
   capabilitiesOf,
   explainModelRoute,
   findModelById,
@@ -182,6 +184,29 @@ function optionalIntField(value: unknown, field: string): number | null | undefi
   const number = Number(value)
   if (!Number.isFinite(number) || number <= 0) throw new EabError(EC.VALIDATION, `${field} 必须是正整数`)
   return Math.trunc(number)
+}
+
+/**
+ * 对话模型留空时按 32K / 4K 默认值参与预算，因此校验也要按生效值比较；
+ * 非对话端点只在两个值都填写时沿用原来的比较。
+ */
+function assertModelTokenLimits(
+  maxContext: number | null,
+  maxOutputTokens: number | null,
+  endpointKind: string,
+): void {
+  const effectiveMaxContext = maxContext ?? DEFAULT_MODEL_MAX_CONTEXT
+  const effectiveMaxOutput = maxOutputTokens ?? DEFAULT_MODEL_MAX_OUTPUT
+  const bothConfigured = maxContext !== null && maxOutputTokens !== null
+  const chatLike = endpointKind === 'chat' || endpointKind === 'systemone'
+  if (
+    (bothConfigured && maxOutputTokens >= maxContext) ||
+    (chatLike && effectiveMaxOutput >= effectiveMaxContext)
+  ) {
+    throw new EabError(EC.VALIDATION, '输出上限必须小于上下文上限', {
+      hint: '上下文上限包含输入与输出；留空时上下文按 32768、输出按 4096 计算。',
+    })
+  }
 }
 
 function validateEndpointKind(value: unknown): string | undefined {
@@ -2753,11 +2778,7 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
     const outputModalities = stringArrayField(req.body?.outputModalities, 'outputModalities') ?? ['text']
     const maxContext = optionalIntField(req.body?.maxContext, 'maxContext') ?? null
     const maxOutputTokens = optionalIntField(req.body?.maxOutputTokens, 'maxOutputTokens') ?? null
-    if (maxContext !== null && maxOutputTokens !== null && maxOutputTokens >= maxContext) {
-      throw new EabError(EC.VALIDATION, '输出上限必须小于上下文上限', {
-        hint: '上下文上限包含输入与输出；输出留 1/4 左右给回答更安全。',
-      })
-    }
+    assertModelTokenLimits(maxContext, maxOutputTokens, endpointKind)
     const contextCompression = req.body?.contextCompression === false ? 0 : 1
     const embeddingDim = optionalIntField(req.body?.embeddingDim, 'embeddingDim') ?? null
     const config = normalizeModelConfig(
@@ -2929,11 +2950,7 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
       req.body?.maxOutputTokens === undefined
         ? row.max_output_tokens ?? null
         : optionalIntField(req.body.maxOutputTokens, 'maxOutputTokens') ?? null
-    if (maxContext !== null && maxOutputTokens !== null && maxOutputTokens >= maxContext) {
-      throw new EabError(EC.VALIDATION, '输出上限必须小于上下文上限', {
-        hint: '上下文上限包含输入与输出；输出留 1/4 左右给回答更安全。',
-      })
-    }
+    assertModelTokenLimits(maxContext, maxOutputTokens, endpointKind)
     const contextCompression =
       req.body?.contextCompression === undefined
         ? row.context_compression === null || Number(row.context_compression) !== 0
@@ -3009,9 +3026,6 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
     Params: { id: string }
     Body: {
       roles?: string[]
-      maxContext?: number | null
-      maxOutputTokens?: number | null
-      contextCompression?: boolean | null
     }
   }>(
     '/api/console/models/:id/plugin-settings',
@@ -3035,35 +3049,17 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
         const unknown = roles.filter((code) => !known.some((item) => item.code === code))
         if (unknown.length > 0) throw new EabError(EC.VALIDATION, `未知角色：${unknown.join('、')}`)
       }
-      const maxContext = req.body?.maxContext === undefined
-        ? current?.maxContext ?? null
-        : optionalIntField(req.body.maxContext, 'maxContext') ?? null
-      const maxOutputTokens = req.body?.maxOutputTokens === undefined
-        ? current?.maxOutputTokens ?? null
-        : optionalIntField(req.body.maxOutputTokens, 'maxOutputTokens') ?? null
-      let contextCompression: boolean | null
-      if (req.body?.contextCompression === undefined) {
-        contextCompression = current?.contextCompression ?? null
-      } else if (req.body.contextCompression === null) {
-        contextCompression = null
-      } else if (typeof req.body.contextCompression === 'boolean') {
-        contextCompression = req.body.contextCompression
-      } else {
-        throw new EabError(EC.VALIDATION, 'contextCompression 必须是布尔值或 null')
-      }
-      if (maxContext !== null && maxOutputTokens !== null && maxOutputTokens >= maxContext) {
-        throw new EabError(EC.VALIDATION, '输出上限必须小于上下文上限', {
-          hint: '上下文上限包含输入与输出；输出留 1/4 左右给回答更安全。',
-        })
-      }
-      savePluginModelSettings(deps.db, companyId, id, {
-        roles,
-        maxContext,
-        maxOutputTokens,
-        contextCompression,
-      })
+      savePluginModelSettings(deps.db, companyId, id, { roles })
       await modelCatalogChanged(companyId)
-      return ok({ model: { id, roles, maxContext, maxOutputTokens, contextCompression } })
+      return ok({
+        model: {
+          id,
+          roles,
+          maxContext: model.maxContext,
+          maxOutputTokens: model.maxOutputTokens,
+          contextCompression: model.contextCompression,
+        },
+      })
     },
   )
 

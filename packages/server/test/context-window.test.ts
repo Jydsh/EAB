@@ -1,9 +1,21 @@
 import { describe, expect, it } from 'vitest'
 import type { ChatMessage } from '../src/llm.js'
-import { capToolResultText, compressMessagesForContext, estimateTokens } from '../src/context-window.js'
+import { capToolResultText, compactMessagesForModelCall, compressMessagesForContext, estimateTokens } from '../src/context-window.js'
 
 function chat(role: ChatMessage['role'], text: string): ChatMessage {
   return { role, content: text }
+}
+
+function toolCall(id: string, name: string, args: string): ChatMessage {
+  return {
+    role: 'assistant',
+    content: '',
+    tool_calls: [{ id, type: 'function', function: { name, arguments: args } }],
+  }
+}
+
+function toolResult(id: string, text: string): ChatMessage {
+  return { role: 'tool', tool_call_id: id, content: text }
 }
 
 describe('上下文压缩', () => {
@@ -48,6 +60,65 @@ describe('上下文压缩', () => {
     expect(result.compressed).toBe(false)
     expect(result.messages).toEqual(messages)
     expect(result.removedMessages).toBe(0)
+  })
+
+  it('工具循环每轮压缩：旧工具轮次收成摘要，只保留最近一组工具结果', () => {
+    const messages: ChatMessage[] = [
+      chat('system', '你是企业助手。'),
+      chat('user', '读取项目日志并分析异常。'),
+      toolCall('c1', 'workspace.read', '{"path":"a.log"}'),
+      toolResult('c1', `第一轮结果：${'异常日志'.repeat(2_000)}`),
+      toolCall('c2', 'workspace.read', '{"path":"b.log"}'),
+      toolResult('c2', '第二轮结果：发现 3 条异常。'),
+    ]
+
+    const result = compactMessagesForModelCall(messages, {
+      maxContext: 2_500,
+      maxOutputTokens: 200,
+    })
+
+    expect(result.compressed).toBe(true)
+    expect(result.messages.some((message) => message.role === 'system' && String(message.content).includes('较早工具调用压缩摘要'))).toBe(true)
+    expect(result.messages.some((message) => message.role === 'system' && String(message.content).includes('workspace.read'))).toBe(true)
+    expect(result.messages.filter((message) => message.role === 'tool')).toHaveLength(1)
+    expect(result.messages[result.messages.length - 1]?.content).toBe('第二轮结果：发现 3 条异常。')
+    expect(result.afterTokens).toBeLessThanOrEqual(2_500 - 200 - 256)
+  })
+
+  it('工具循环最近一组工具结果仍超预算时按剩余预算截断', () => {
+    const messages: ChatMessage[] = [
+      chat('system', '你是企业助手。'),
+      chat('user', '读取大文件。'),
+      toolCall('c1', 'workspace.read', '{"path":"big.log"}'),
+      toolResult('c1', 'HEAD-' + '记录'.repeat(2_000) + '-TAIL'),
+    ]
+
+    const result = compactMessagesForModelCall(messages, {
+      maxContext: 1_600,
+      maxOutputTokens: 200,
+    })
+
+    expect(result.compressed).toBe(true)
+    expect(result.messages.filter((message) => message.role === 'tool')).toHaveLength(1)
+    expect(String(result.messages[result.messages.length - 1]?.content)).toContain('HEAD-')
+    expect(String(result.messages[result.messages.length - 1]?.content)).not.toContain('-TAIL')
+  })
+
+  it('预算充足时工具循环保持原样', () => {
+    const messages: ChatMessage[] = [
+      chat('system', '你是企业助手。'),
+      chat('user', '读取项目日志。'),
+      toolCall('c1', 'workspace.read', '{"path":"a.log"}'),
+      toolResult('c1', '第一轮结果：没有异常。'),
+    ]
+
+    const result = compactMessagesForModelCall(messages, {
+      maxContext: 32_000,
+      maxOutputTokens: 4_096,
+    })
+
+    expect(result.compressed).toBe(false)
+    expect(result.messages).toEqual(messages)
   })
 
   it('按中日韩字符与普通字符分别估算 token', () => {

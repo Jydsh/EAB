@@ -229,8 +229,8 @@ EAB 的版本来自 GitHub Release：
 
 1. 点「检查更新」，读取 GitHub 最新 Release；
 2. 有新版本时「一键更新」按钮可用；
-3. 确认后服务调用更新器：下载源码包 → 校验版本与 SHA-256 → 备份代码和数据库/配置 → 替换 → `pnpm install --frozen-lockfile` → 重启 → 健康检查；新版本健康失败会自动回滚；
-4. 页面短暂断开，刷新后查看新版本。
+3. 确认后服务调用更新器：下载源码包 → 校验版本与 SHA-256 → 备份代码和数据库/配置 → 替换 → `pnpm install --frozen-lockfile` → `eab restart --background` → 健康检查（版本 + 新进程 pid，确认不是旧进程）→ 失败自动回滚并重新拉起旧版本；
+4. 页面短暂断开，刷新后查看新版本。更新结果和健康状态写入 `.eab-dev/updates/last-update.json` 与 `last-update.log`。
 
 **命令更新**
 

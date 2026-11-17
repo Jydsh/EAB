@@ -1,9 +1,7 @@
 import { describe, expect, it } from 'vitest'
-import { migrate, openDatabase } from '@eab/storage'
 import {
   callPluginModel,
   findPluginModel,
-  findPluginModelEffective,
   listPluginChannels,
   listPluginModels,
   refreshPluginChannel,
@@ -14,7 +12,6 @@ import {
   setPluginModelsChangedListener,
   syncPluginModels,
 } from '../src/plugin-models.js'
-import { savePluginModelSettings } from '../src/plugin-model-settings.js'
 
 const COMPANY = 'c_plugin_models_test'
 
@@ -23,6 +20,13 @@ function makeAdapter() {
     listModels: async (provider: string) => [
       { provider, id: 'demo/model', name: '演示模型', description: '插件模型', inputModalities: ['text', 'image'] },
     ],
+    resolveModel: async (provider: string, model: string) => ({
+      provider,
+      id: model,
+      name: '演示模型',
+      context: { contextWindow: 64_000 },
+      defaultMaxTokens: 4_096,
+    }),
     prepareCall: async (provider: string, model: string) => ({
       model: { provider, id: model, name: '演示模型' },
       stream: () => stream(),
@@ -52,6 +56,10 @@ describe('插件 LLM adapter 注册表', () => {
     expect(models[0]?.pluginId).toBe('dsh-demo')
     // 插件模型默认只给普通员工，不再默认全部角色。
     expect(models[0]?.roles).toEqual(['member'])
+    // 上下文与输出从 resolveModel() 自描述读取，不从 listModels() 目录猜。
+    expect(models[0]?.maxContext).toBe(64_000)
+    expect(models[0]?.maxOutputTokens).toBe(4_096)
+    expect(models[0]?.contextCompression).toBe(true)
 
     const events: string[] = []
     const result = await callPluginModel(
@@ -304,46 +312,34 @@ describe('插件 LLM adapter 注册表', () => {
     }
   })
 
-  it('管理员保存的上下文与输出覆盖会进入插件模型有效配置', async () => {
-    const company = 'c_plugin_model_limits_test'
+  it('按 DSH 方式从 resolveModel() 读取上下文与输出，即使 listModels() 不带这些字段', async () => {
+    const company = 'c_plugin_model_self_describe_test'
     const adapter = {
+      // 真实 dsh-our-free-model 就是这种形状：目录只给 id/name，参数在 resolveModel。
       listModels: async (provider: string) => [
-        {
-          provider,
-          id: 'demo/model',
-          name: '演示模型',
-          context: { contextWindow: 64_000 },
-          defaultMaxTokens: 4_096,
-        },
+        { provider, id: 'demo/model', name: '演示模型' },
       ],
+      resolveModel: async (provider: string, model: string) => ({
+        provider,
+        id: model,
+        name: '演示模型',
+        context: { contextWindow: 128_000 },
+        defaultMaxTokens: 8_192,
+      }),
       prepareCall: async (provider: string, model: string) => ({
         model: { provider, id: model, name: '演示模型' },
         stream: () => stream(),
       }),
       stream: () => stream(),
     }
-    const db = openDatabase({ path: ':memory:' })
-    migrate(db)
-    const registration = registerPluginAdapter(company, 'dsh-limits', ['demo-route'], adapter)
+    const registration = registerPluginAdapter(company, 'dsh-self-describe', ['demo-route'], adapter)
     try {
       await new Promise((resolve) => setTimeout(resolve, 0))
-      const id = 'plugin:demo-route:demo%2Fmodel'
-      const before = findPluginModelEffective(db, company, id)
-      expect(before?.maxContext).toBe(64_000)
-      expect(before?.maxOutputTokens).toBe(4_096)
-      // 插件声明默认不压缩；管理员可以在控制台打开。
-      expect(before?.contextCompression).toBe(false)
-
-      savePluginModelSettings(db, company, id, {
-        roles: ['member'],
-        maxContext: 128_000,
-        maxOutputTokens: 8_192,
-        contextCompression: true,
-      })
-      const after = findPluginModelEffective(db, company, id)
-      expect(after?.maxContext).toBe(128_000)
-      expect(after?.maxOutputTokens).toBe(8_192)
-      expect(after?.contextCompression).toBe(true)
+      const model = findPluginModel(company, 'plugin:demo-route:demo%2Fmodel')
+      expect(model?.maxContext).toBe(128_000)
+      expect(model?.maxOutputTokens).toBe(8_192)
+      // 自动压缩是宿主侧策略，插件不再单独声明，也不在后台逐模型配置。
+      expect(model?.contextCompression).toBe(true)
     } finally {
       registration.dispose()
     }

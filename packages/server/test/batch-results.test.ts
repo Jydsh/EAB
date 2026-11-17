@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { EabError } from '@eab/domain'
 import { readBatchPage, saveTextBatch, saveToolResultBatch } from '../src/batch-results.js'
 
@@ -195,5 +195,31 @@ describe('大工具结果批次', () => {
       limit: 20_000,
     })
     expect(page.text).toContain('蓝鲸-7742')
+  })
+
+  it('默认日志级别不把批次落盘和进度写进控制台', () => {
+    const oldLevel = process.env.EAB_LOG_LEVEL
+    delete process.env.EAB_LOG_LEVEL
+    const info = vi.spyOn(console, 'info').mockImplementation(() => {})
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const dataDir = makeDir()
+      const saved = saveToolResultBatch({
+        dataDir,
+        companyId: 'c1',
+        userId: 'u1',
+        toolId: 'plugin:quiet',
+        payload: { data: rows(500) },
+        minChars: 1_000,
+      })
+      expect(saved?.totalRows).toBe(500)
+      expect(info).not.toHaveBeenCalled()
+      expect(warn).not.toHaveBeenCalled()
+    } finally {
+      info.mockRestore()
+      warn.mockRestore()
+      if (oldLevel === undefined) delete process.env.EAB_LOG_LEVEL
+      else process.env.EAB_LOG_LEVEL = oldLevel
+    }
   })
 })
