@@ -148,6 +148,24 @@ describe('project-runner', () => {
   })
 })
 
-afterAll(() => {
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+afterAll(async () => {
+  for (const root of roots.splice(0)) {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      try {
+        rmSync(root, { recursive: true, force: true })
+        break
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code
+        // Windows 上被杀掉的子进程可能短暂占着工作目录；清不掉不应把整轮测试判失败。
+        if (!['EBUSY', 'EPERM', 'ENOTEMPTY'].includes(code ?? '') || attempt === 4) {
+          if (attempt === 4) {
+            console.warn(`[test] 临时目录清理失败 ${root}: ${code ?? error}`)
+            break
+          }
+          throw error
+        }
+        await new Promise((resolve) => setTimeout(resolve, 250))
+      }
+    }
+  }
 })
