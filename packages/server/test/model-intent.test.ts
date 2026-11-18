@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { migrate, openDatabase } from '@eab/storage'
-import { classifyChatIntent, intentHintOf, keywordIntent } from '../src/intent.js'
+import { classifyChatIntent, intentHintOf, keywordIntent, shouldAutoRetrieveKb } from '../src/intent.js'
 
 function seededDb(options: { route?: boolean } = {}) {
   const db = openDatabase({ path: ':memory:' })
@@ -94,5 +94,49 @@ describe('router.intent 意图判定', () => {
     expect(keywordIntent('我们部门负责人是谁')).toBe('org')
     expect(keywordIntent('请假需要什么审批')).toBe('kb')
     expect(keywordIntent('帮我写一段自我介绍')).toBe('chat')
+  })
+})
+
+describe('知识库自动检索 gating', () => {
+  it('制度、流程、资料类问题才自动检索', () => {
+    expect(shouldAutoRetrieveKb('报销流程要走哪些审批')).toBe(true)
+    expect(shouldAutoRetrieveKb('公司考勤制度是什么')).toBe(true)
+    expect(shouldAutoRetrieveKb('查一下公司考勤制度')).toBe(true)
+    expect(shouldAutoRetrieveKb('知识库里有没有采购制度')).toBe(true)
+  })
+
+  it('闲聊、人员、业务数据和创作任务不自动检索', () => {
+    expect(shouldAutoRetrieveKb('今天天气怎么样')).toBe(false)
+    expect(shouldAutoRetrieveKb('我们部门负责人是谁')).toBe(false)
+    expect(shouldAutoRetrieveKb('查一下东环线检查整治记录')).toBe(false)
+    expect(shouldAutoRetrieveKb('查一下我的报销记录')).toBe(false)
+    expect(shouldAutoRetrieveKb('我的年假还有几天')).toBe(false)
+    expect(shouldAutoRetrieveKb('帮我写一封年假申请邮件')).toBe(false)
+    expect(shouldAutoRetrieveKb('做一个考勤统计表')).toBe(false)
+    expect(shouldAutoRetrieveKb('')).toBe(false)
+  })
+
+  it('创作任务里点名制度依据时仍检索', () => {
+    expect(shouldAutoRetrieveKb('整理一下报销流程')).toBe(true)
+    expect(shouldAutoRetrieveKb('按公司年假制度写一封申请邮件')).toBe(true)
+  })
+
+  it('高置信度 kb 判定可以覆盖创作任务前缀', () => {
+    expect(
+      shouldAutoRetrieveKb('帮我写一封年假申请邮件', {
+        intent: 'kb',
+        confidence: 0.9,
+        modelId: 'm_judge',
+        basis: 'model',
+      }),
+    ).toBe(true)
+    expect(
+      shouldAutoRetrieveKb('帮我写一封年假申请邮件', {
+        intent: 'chat',
+        confidence: 0.9,
+        modelId: 'm_judge',
+        basis: 'model',
+      }),
+    ).toBe(false)
   })
 })

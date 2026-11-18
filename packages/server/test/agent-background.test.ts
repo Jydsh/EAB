@@ -5,7 +5,7 @@ import { SC } from '@eab/domain'
 const state = vi.hoisted(() => ({
   rootCalls: 0,
   childCalls: 0,
-  mode: 'wait' as 'wait' | 'wake',
+  mode: 'wait' as 'wait' | 'wake' | 'progress' | 'timeout' | 'midrun' | 'plain',
 }))
 
 vi.mock('../src/llm.js', async (importOriginal) => {
@@ -25,16 +25,45 @@ vi.mock('../src/llm.js', async (importOriginal) => {
       )
       if (isChild) {
         state.childCalls += 1
+        const prompt = messages[messages.length - 1]?.content ?? ''
+        if (state.mode === 'progress' && prompt.includes('慢任务')) {
+          // 模拟一个卡住的子 Agent：它的任务行保持 running，直到超时看门狗收尾。
+          await new Promise(() => {})
+        }
+        if (state.mode === 'midrun' && prompt.includes('慢任务')) {
+          // 慢任务在父唤醒模型运行期间结束，完成事件还没来得及被本批消费。
+          await new Promise((resolve) => setTimeout(resolve, 550))
+        }
+        if (state.mode === 'timeout') {
+          await new Promise(() => {})
+        }
         options.onEvent?.({ type: 'content', text: '后台完成' })
         return { text: '后台完成', reasoning: '', toolCalls: [], promptTokens: 1, completionTokens: 1 }
       }
       state.rootCalls += 1
       const last = messages[messages.length - 1]?.content ?? ''
+      if (state.mode === 'plain') {
+        options.onEvent?.({ type: 'content', text: '汇总正文' })
+        return { text: '汇总正文', reasoning: '', toolCalls: [], promptTokens: 1, completionTokens: 1 }
+      }
       if (last.includes('【后台子 Agent 完成通知】')) {
+        if (state.mode === 'midrun') {
+          // 模型返回时另一个子 Agent 刚好结束，但完成事件还没进入本批收件箱。
+          await new Promise((resolve) => setTimeout(resolve, 500))
+          const internal = '（内部调度：quick 已回报，slow 仍在执行，等待其完成后统一汇总）'
+          options.onEvent?.({ type: 'content', text: internal })
+          return { text: internal, reasoning: '', toolCalls: [], promptTokens: 1, completionTokens: 1 }
+        }
         options.onEvent?.({ type: 'content', text: '已被后台结果唤醒' })
         return { text: '已被后台结果唤醒', reasoning: '', toolCalls: [], promptTokens: 1, completionTokens: 1 }
       }
       if (state.rootCalls === 1) {
+        const tasks = state.mode === 'progress' || state.mode === 'midrun'
+          ? [
+              { key: 'quick', title: '快任务', prompt: '快任务：整理简报' },
+              { key: 'slow', title: '慢任务', prompt: '慢任务：继续处理几千条数据' },
+            ]
+          : [{ key: 'bg', title: '后台任务', prompt: '后台长任务' }]
         return {
           text: '',
           reasoning: '',
@@ -44,7 +73,7 @@ vi.mock('../src/llm.js', async (importOriginal) => {
             function: {
               name: 'agent_spawn',
               arguments: JSON.stringify({
-                tasks: [{ key: 'bg', title: '后台任务', prompt: '后台长任务' }],
+                tasks,
                 background: true,
               }),
             },
@@ -156,6 +185,133 @@ describe('后台派活与 agent_wait', () => {
     expect(result?.toolCalls.some((call) => call.toolId === 'agent.wait')).toBe(false)
   })
 
+  it('一个子任务完成、另一个仍在运行时，主 Agent 写入可见进展而不是沉默', async () => {
+    state.mode = 'progress'
+    state.rootCalls = 0
+    state.childCalls = 0
+    const { db, deps, actor } = testEnv()
+    deps.config.agentTaskTimeoutMs = 60_000
+    const first = await runAgentTurn({
+      deps,
+      actor,
+      modelId: 'model_test',
+      messages: [{ role: 'user', content: '派两个员工，一个整理简报，一个处理几千条数据' }],
+      maxTokens: 16,
+      sessionId: 's1',
+      emit: () => {},
+    })
+    expect(first?.text).toBe('已派给子 Agent，完成后我会把结果汇总给你。')
+    expect((db.prepare('SELECT COUNT(*) AS n FROM agent_tasks').get() as { n: number }).n).toBe(2)
+
+    const deadline = Date.now() + 4000
+    let progress: { id: string; text: string; created_at: number; meta_json: string } | undefined
+    while (Date.now() < deadline) {
+      progress = db.prepare(
+        `SELECT id, text, created_at, meta_json FROM chat_messages
+          WHERE session_id = 's1' AND role = 'assistant'
+            AND meta_json LIKE '%"progress":true%'
+          ORDER BY created_at DESC LIMIT 1`,
+      ).get() as { id: string; text: string; created_at: number; meta_json: string } | undefined
+      if (progress?.text.includes('还有 1 个')) break
+      await new Promise((resolve) => setTimeout(resolve, 80))
+    }
+    expect(progress?.text).toContain('已完成')
+    expect(progress?.text).toContain('还有 1 个子 Agent 的结果待汇总')
+    // 进度卡在派发时就落库，meta 必须带结构化计数，前端才能画进度条。
+    const progressMeta = JSON.parse(progress?.meta_json ?? '{}') as {
+      teamProgress?: { total: number; completed: number; remaining: number; state: string }
+    }
+    expect(progressMeta.teamProgress).toMatchObject({
+      total: 2,
+      completed: 1,
+      remaining: 1,
+      state: 'running',
+    })
+    // 子 Agent 的回报原文只留在团队预览，不转述到用户对话。
+    expect(progress?.text).not.toContain('quick')
+    // 唤醒轮不允许重新派活：任务数仍为 2，历史任务不会被 resume 拉起。
+    expect((db.prepare('SELECT COUNT(*) AS n FROM agent_tasks').get() as { n: number }).n).toBe(2)
+  })
+
+  it('另一个子任务在唤醒模型运行中结束，也写可见进展而不是内部调度话术', async () => {
+    state.mode = 'midrun'
+    state.rootCalls = 0
+    state.childCalls = 0
+    const { db, deps, actor } = testEnv()
+    deps.config.agentTaskTimeoutMs = 60_000
+    const first = await runAgentTurn({
+      deps,
+      actor,
+      modelId: 'model_test',
+      messages: [{ role: 'user', content: '派两个员工，一个整理简报，一个处理几千条数据' }],
+      maxTokens: 16,
+      sessionId: 's1',
+      emit: () => {},
+    })
+    expect(first?.text).toBe('已派给子 Agent，完成后我会把结果汇总给你。')
+
+    const deadline = Date.now() + 5000
+    let progress: { text: string } | undefined
+    while (Date.now() < deadline) {
+      progress = db.prepare(
+        `SELECT text FROM chat_messages
+          WHERE session_id = 's1' AND role = 'assistant'
+            AND meta_json LIKE '%"progress":true%'
+          ORDER BY created_at DESC LIMIT 1`,
+      ).get() as { text: string } | undefined
+      if (progress?.text.includes('还有 1 个')) break
+      await new Promise((resolve) => setTimeout(resolve, 80))
+    }
+    expect(progress?.text).toContain('已完成')
+    expect(progress?.text).toContain('还有 1 个子 Agent 的结果待汇总')
+    // 子 Agent 的回报原文只留在团队预览，不转述到用户对话。
+    expect(progress?.text).not.toContain('quick')
+
+    // 本轮模型的“内部调度”正文不能被写进用户消息流。
+    await new Promise((resolve) => setTimeout(resolve, 1200))
+    const leaked = db.prepare(
+      `SELECT text FROM chat_messages
+        WHERE session_id = 's1' AND role = 'assistant' AND text LIKE '%内部调度%'`,
+    ).get() as { text: string } | undefined
+    expect(leaked).toBeUndefined()
+    expect((db.prepare('SELECT COUNT(*) AS n FROM agent_tasks').get() as { n: number }).n).toBe(2)
+  }, 12_000)
+
+  it('子 Agent 卡死时由总超时收尾为 failed，并唤醒父 Agent', async () => {
+    state.mode = 'timeout'
+    state.rootCalls = 0
+    state.childCalls = 0
+    const { db, deps, actor } = testEnv()
+    deps.config.agentTaskTimeoutMs = 1_200
+    await runAgentTurn({
+      deps,
+      actor,
+      modelId: 'model_test',
+      messages: [{ role: 'user', content: '派一个员工处理很慢的几千条数据' }],
+      maxTokens: 16,
+      sessionId: 's1',
+      emit: () => {},
+    })
+
+    const deadline = Date.now() + 5000
+    let task: { status: string; error: string } | undefined
+    let wake: { text: string } | undefined
+    while (Date.now() < deadline) {
+      task = db.prepare('SELECT status, error FROM agent_tasks ORDER BY created_at DESC LIMIT 1')
+        .get() as { status: string; error: string } | undefined
+      wake = db.prepare(
+        `SELECT text FROM chat_messages
+          WHERE session_id = 's1' AND role = 'assistant' AND meta_json LIKE '%backgroundWake%'
+          ORDER BY created_at DESC LIMIT 1`,
+      ).get() as { text: string } | undefined
+      if (task?.status === 'failed' && wake?.text === '已被后台结果唤醒') break
+      await new Promise((resolve) => setTimeout(resolve, 80))
+    }
+    expect(task?.status).toBe('failed')
+    expect(task?.error).toContain('没有完成')
+    expect(wake?.text).toBe('已被后台结果唤醒')
+  })
+
   it('父回合结束后，后台任务完成事件会唤醒父 Agent 并写出汇总', async () => {
     state.mode = 'wake'
     state.rootCalls = 0
@@ -180,10 +336,34 @@ describe('后台派活与 agent_wait', () => {
           WHERE session_id = 's1' AND role = 'assistant' AND meta_json LIKE '%backgroundWake%'
           ORDER BY created_at DESC LIMIT 1`,
       ).get() as { text: string } | undefined
-      if (wake) break
+      if (wake?.text === '已被后台结果唤醒') break
       await new Promise((resolve) => setTimeout(resolve, 80))
     }
     expect(wake?.text).toBe('已被后台结果唤醒')
     expect(state.rootCalls).toBeGreaterThanOrEqual(2)
+  })
+
+  it('后台汇报轮不会按出题路由压住正文', async () => {
+    state.mode = 'plain'
+    state.rootCalls = 0
+    state.childCalls = 0
+    const { deps, actor } = testEnv()
+    const events: Array<{ type: string; text?: string }> = []
+    const result = await runAgentTurn({
+      deps,
+      actor,
+      modelId: 'model_test',
+      messages: [
+        // 系统提示词本身就带出题/题组说明，不能因此把普通“继续汇总”判成出题。
+        { role: 'system', content: '用户要求出题、题组、上一题/下一题时，调用 ask_user。' },
+        { role: 'user', content: '请继续汇总刚才两个员工的结果' },
+      ],
+      maxTokens: 16,
+      sessionId: 's1',
+      disableQuizRoute: true,
+      emit: (event) => events.push(event),
+    })
+    expect(result?.text).toBe('汇总正文')
+    expect(events.some((event) => event.type === 'content' && event.text === '正在生成题组卡…')).toBe(false)
   })
 })

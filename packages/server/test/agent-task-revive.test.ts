@@ -141,6 +141,11 @@ describe('agent_task 在 worker 注销后按历史任务自动恢复', () => {
     expect(workers[0]?.key).toBe('worker')
     const old = team.getTask(oldTask.id)
     expect(old?.status).toBe('cancelled')
+    // 前台续派会落一张新的真实任务行；不能用上一轮的 failed 任务代表本次结果，
+    // 否则团队面板会在子 Agent 已成功后仍显示“失败”。
+    const revived = team.listTasks(50).find((task) => task.workerKey === 'worker' && task.id !== oldTask.id)
+    expect(revived?.status).toBe('succeeded')
+    expect(revived?.resultText).toContain('续派完成')
     // 前台续派不会另建 background task 行；关键是同一个 worker key 已被恢复，
     // 子 Agent 会话确实执行了一次，旧 running 任务不再污染团队摘要。
     expect(state.childCalls).toBe(1)

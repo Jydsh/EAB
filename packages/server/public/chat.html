@@ -23,8 +23,8 @@
     </style>
     <script src="/theme.js?v=20261117a" data-surface="chat"></script>
     <script src="/brand.js?v=20261115c" defer></script>
-    <link rel="stylesheet" href="/app.css?v=20261117a" />
-    <link rel="stylesheet" href="/chat.css?v=20261117a" />
+    <link rel="stylesheet" href="/app.css?v=20261118e" />
+    <link rel="stylesheet" href="/chat.css?v=20261118n" />
     <link rel="stylesheet" href="/theme.css?v=20261115b" />
     <link rel="stylesheet" href="/boot-splash.css?v=20261115i" />
   </head>
@@ -132,11 +132,13 @@
               <button class="side-info-badge" id="ws-info" type="button" aria-label="查看云空间使用情况" aria-expanded="false">i</button>
               <div class="side-popover" id="ws-quota-popover" hidden></div>
             </span>
+            <button class="side-mini-btn" id="ws-new-folder" type="button" title="在当前目录新建文件夹">新建文件夹</button>
             <button class="side-mini-btn" id="ws-upload" type="button">上传</button>
           </span>
         </div>
         <input id="ws-input" type="file" multiple hidden />
         <div id="ws-upload-status" class="ws-upload-status" hidden aria-live="polite"></div>
+        <div class="ws-path" id="ws-path" hidden aria-label="当前云空间位置"></div>
         <div class="side-sessions" id="ws-list"></div>
       </div>
 
@@ -197,6 +199,7 @@
             </span>
           </button>
           <span class="chat-demo-pill" id="demo-pill" hidden>演示回声</span>
+          <button class="btn ghost sm" id="console-entry" type="button" hidden>管理后台</button>
           <button class="btn ghost sm" id="login-btn" type="button" hidden>登录</button>
         </div>
       </header>
@@ -255,8 +258,10 @@
           <div class="file-pane-head">
             <div class="file-pane-head-main">
               <span class="file-pane-kicker" id="file-pane-kicker">云空间</span>
-              <h2 id="file-pane-name">未选择文件</h2>
-              <div class="file-pane-meta muted" id="file-pane-meta"></div>
+              <div class="file-pane-title-row">
+                <h2 id="file-pane-name">未选择文件</h2>
+                <div class="file-pane-meta muted" id="file-pane-meta"></div>
+              </div>
             </div>
             <div class="file-pane-actions">
               <button class="btn ghost sm" id="file-pane-versions" type="button" hidden>历史版本</button>
@@ -575,7 +580,7 @@
         if (gate) gate.hidden = false
       }
     </script>
-    <script src="/boot-splash.js?v=20261116a" data-surface="chat" defer></script>
-    <script src="/chat.js?v=20261117c" defer></script>
+    <script src="/boot-splash.js?v=20261118d" data-surface="chat" defer></script>
+    <script src="/chat.js?v=20261118p" defer></script>
   </body>
 </html>

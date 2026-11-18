@@ -154,21 +154,21 @@
 
 [data-theme='dark'] {
   color-scheme: dark;
-  --bg: #0a0e14;
-  --panel: #0f1620;
-  --surface: #111923;
-  --surface-2: #161f2b;
-  --line: #253141;
-  --line-strong: #35465a;
+  --bg: #0b1017;
+  --panel: #101821;
+  --surface: #131b25;
+  --surface-2: #18222e;
+  --line: #283444;
+  --line-strong: #3a4a5d;
   --text: #e7eef7;
   --ink: #e7eef7;
-  --ink-2: #b8c5d4;
-  --muted: #8b98a9;
-  --brand: #5ee0c6;
+  --ink-2: #bcc8d6;
+  --muted: #93a0b0;
+  --brand: #4fd9bd;
   --brand-ink: #04231d;
-  --brand-soft: #12332f;
-  --accent: #5ee0c6;
-  --accent-soft: #12332f;
+  --brand-soft: #11312c;
+  --accent: #4fd9bd;
+  --accent-soft: #11312c;
   --ok: #4ade80;
   --ok-soft: #102a1c;
   --deny: #f87171;
@@ -177,7 +177,7 @@
   --warn-soft: #33260f;
   --info: #60a5fa;
   --info-soft: #12233a;
-  --code-bg: #0c131c;
+  --code-bg: #0d141d;
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.45);
   --shadow-md: 0 12px 34px rgba(0, 0, 0, 0.42);
 }
@@ -205,7 +205,7 @@
 [data-theme='dark'] .subnav,
 [data-theme='dark'] .nav-rail,
 [data-theme='dark'] .page-rail {
-  background: #0d141d;
+  background: var(--panel);
   border-color: var(--line);
 }
 
@@ -779,18 +779,31 @@
 /* ---------------- 深色：对话页 ---------------- */
 
 [data-theme='dark'] .chat-side {
-  background: #0d141d;
+  background: var(--panel);
+  color: var(--text);
   border-color: var(--line);
 }
 
+[data-theme='dark'] .chat-side .side-brand-text,
+[data-theme='dark'] .chat-side .side-user-meta strong,
+[data-theme='dark'] .chat-side .side-user-org .side-org-company {
+  color: var(--text);
+}
+
+[data-theme='dark'] .chat-side .side-user-meta .muted,
+[data-theme='dark'] .chat-side .side-org-dept,
+[data-theme='dark'] .chat-side .side-section-title {
+  color: var(--muted);
+}
+
 [data-theme='dark'] .chat-head {
-  background: rgba(13, 20, 29, 0.82);
+  background: rgba(16, 24, 33, 0.82);
   border-color: var(--line);
   backdrop-filter: blur(10px) saturate(1.1);
 }
 
 [data-theme='dark'] .settings-head {
-  background: rgba(13, 20, 29, 0.86);
+  background: rgba(16, 24, 33, 0.86);
   border-color: var(--line);
   backdrop-filter: blur(10px) saturate(1.1);
 }
@@ -845,8 +858,8 @@
 }
 
 [data-theme='dark'] .msg.ai .bubble {
-  background: #141d28;
-  border-color: #263444;
+  background: var(--surface-2);
+  border-color: var(--line);
   color: var(--text);
 }
 
@@ -912,7 +925,7 @@
 }
 
 [data-theme='dark'] .side-session:hover {
-  background: #141d28;
+  background: var(--surface-2);
 }
 
 [data-theme='dark'] .side-session.active {
@@ -940,6 +953,37 @@
   background: #12332f;
   border-color: #2c6158;
   color: var(--brand);
+}
+
+/* 文件操作卡的类型角标：深色下改为低饱和标签，避免整块高亮。 */
+[data-theme='dark'] .file-op-badge.is-doc {
+  border-color: #2c4d63;
+  background: #122431;
+  color: #8ecbf0;
+}
+
+[data-theme='dark'] .file-op-badge.is-sheet {
+  border-color: #345037;
+  background: #17271a;
+  color: #a7d98e;
+}
+
+[data-theme='dark'] .file-op-badge.is-slide {
+  border-color: #57452d;
+  background: #2a2116;
+  color: #e5bd8e;
+}
+
+[data-theme='dark'] .file-op-badge.is-pdf {
+  border-color: #573534;
+  background: #2a1a1a;
+  color: #e09b94;
+}
+
+[data-theme='dark'] .file-op-badge.is-text {
+  border-color: #37434d;
+  background: #1a2229;
+  color: #aebbc4;
 }
 
 [data-theme='dark'] .space-chip,

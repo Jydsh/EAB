@@ -37,8 +37,16 @@ function esc(value) {
 }
 
 function answerInline(text) {
+  const imageTokens = []
   const codeTokens = []
-  let html = String(text ?? '').replace(/`([^`\n]+)`/g, (_, code) => {
+  let html = String(text ?? '').replace(
+    /!\[([^\]\n]*)\]\(((?:https?:\/\/|\/api\/kb\/assets\/)[^\s)]+)\)/g,
+    (_, alt, url) => {
+      imageTokens.push(`<img class="answer-inline-image" src="${url}" alt="${alt}" loading="lazy">`)
+      return `\u0002${imageTokens.length - 1}\u0002`
+    },
+  )
+  html = html.replace(/`([^`\n]+)`/g, (_, code) => {
     codeTokens.push(`<code>${code}</code>`)
     return `\u0001${codeTokens.length - 1}\u0001`
   })
@@ -48,7 +56,12 @@ function answerInline(text) {
     /\[([^\]\n]+)\]\(((?:https?:\/\/|mailto:)[^\s)]+)\)/g,
     '<a href="$2" target="_blank" rel="noreferrer noopener">$1</a>',
   )
+  html = html.replace(/\u0002(\d+)\u0002/g, (_, index) => imageTokens[Number(index)] ?? '')
   return html.replace(/\u0001(\d+)\u0001/g, (_, index) => codeTokens[Number(index)] ?? '')
+}
+
+function answerImageOnly(line) {
+  return /^\s*!\[([^\]\n]*)\]\(((?:https?:\/\/|\/api\/kb\/assets\/)[^\s)]+)\)\s*$/.exec(line)
 }
 
 function isAnswerTableSeparator(line) {
@@ -65,6 +78,7 @@ function isAnswerBlockStart(lines, index) {
   const line = lines[index]
   if (!line.trim()) return true
   if (/^\u0000CODE\d+\u0000$/.test(line)) return true
+  if (answerImageOnly(line)) return true
   if (/^\s{0,3}(#{1,6})\s+/.test(line)) return true
   if (/^\s{0,3}(?:-{3,}|\*{3,}|_{3,})\s*$/.test(line)) return true
   if (/^\s{0,3}>\s?/.test(line)) return true
@@ -105,7 +119,7 @@ function writtenFileContentBlocks(tools) {
   return blocks
 }
 
-/** Markdown：标题、列表、表格、引用、分隔线、代码块、行内代码、加粗、斜体、链接。 */
+/** Markdown：标题、列表、表格、引用、分隔线、代码块、行内代码、加粗、斜体、链接、图片。 */
 function renderAnswer(text, options = {}) {
   const source = esc(String(text ?? '').replace(/\r\n?/g, '\n'))
   const omitCodeBlocks = options.omitCodeBlocks instanceof Set ? options.omitCodeBlocks : null
@@ -138,6 +152,18 @@ function renderAnswer(text, options = {}) {
         continue
       }
       output.push(`<pre class="answer-code">${code}</pre>`)
+      index += 1
+      continue
+    }
+
+    const image = answerImageOnly(line)
+    if (image) {
+      const alt = image[1] || ''
+      output.push(
+        `<figure class="answer-figure"><img src="${image[2]}" alt="${alt}" loading="lazy">${
+          alt ? `<figcaption>${alt}</figcaption>` : ''
+        }</figure>`,
+      )
       index += 1
       continue
     }
@@ -362,6 +388,8 @@ const state = {
   liveEventSourceOpenedOnce: false,
   sessionRefreshTimer: 0,
   files: [],
+  /** 当前所在的云空间虚拟目录（由文件 relPath 归并出来，空串为根目录）。 */
+  workspacePath: '',
   /** 云空间列表并发刷新与 300ms 合并；避免 SSE 连续事件打出多组请求。 */
   workspaceLoadPromise: null,
   workspaceRefreshTimer: 0,
@@ -393,8 +421,14 @@ const state = {
   agentCapacity: null,
   /** 当前回合的根 run */
   agentParentRunId: '',
+  /** 当前父 Agent 消息气泡；子 Agent 进度事件到达后仍要能更新这条消息里的进度卡 */
+  parentTeamTurn: null,
+  /** 团队进度消息已被合并进父气泡，先暂存给紧接着渲染的父消息 */
+  pendingTeamProgress: null,
   /** 团队列表里被选中、详情窗口正在展示的子 Agent */
   agentSelectedId: '',
+  /** 用户最近一次手动点选团队行的时间；短时间内不让人工选择被新事件抢走 */
+  agentUserSelectedAt: 0,
   /** 团队详情里用户手动展开过的 CoT 面板；key = childId:kind:块序号 */
   agentPanelOpen: new Map(),
   /** 每个子 Agent 窗口的滚动位置；和主对话一样：贴底时跟随新内容，上滑后停在历史 */
@@ -585,6 +619,43 @@ function endBoot(text) {
   }
 }
 
+async function refreshConsoleEntry() {
+  const entry = $('#console-entry')
+  if (!entry) return
+  try {
+    const data = await api('/api/me/console-entry')
+    if (!data?.visible) {
+      entry.hidden = true
+      return
+    }
+    entry.hidden = false
+    const company = new URLSearchParams(location.search).get('company')
+    const targetOf = (href) => (company
+      ? `${href || '/admin'}${String(href || '/admin').includes('?') ? '&' : '?'}company=${encodeURIComponent(company)}`
+      : href || '/admin')
+    entry.onclick = async () => {
+      if (entry.disabled) return
+      entry.disabled = true
+      const label = entry.textContent
+      entry.textContent = '进入中…'
+      try {
+        const session = await api('/api/me/console-entry/session', {
+          method: 'POST',
+          headers: { 'x-eab-console-entry': '1' },
+        })
+        location.href = targetOf(session?.href || data.href)
+      } catch (err) {
+        entry.disabled = false
+        entry.textContent = label
+        alert(err?.message || '进入管理后台失败，请稍后重试')
+        if (err?.status === 403) refreshConsoleEntry()
+      }
+    }
+  } catch {
+    entry.hidden = true
+  }
+}
+
 function showLogin() {
   $('#login-gate').hidden = false
   // 登录页是独占页面：把背后的工作台整体收掉，避免空状态或历史会话从登录卡上方/下方透出来。
@@ -592,7 +663,7 @@ function showLogin() {
   const stage = $('#chat-stage')
   if (side) side.hidden = true
   if (stage) stage.hidden = true
-  for (const id of ['#mode-switch', '#chat-title', '#login-btn', '#side-user', '#side-actions', '#side-sessions', '#side-files', '#attach-strip']) {
+  for (const id of ['#mode-switch', '#chat-title', '#login-btn', '#console-entry', '#side-user', '#side-actions', '#side-sessions', '#side-files', '#attach-strip']) {
     const node = $(id)
     if (node) node.hidden = true
   }
@@ -635,6 +706,8 @@ async function doLogin(event) {
 function resetThread() {
   clearClarifyDock({ abort: true })
   clearFileActivity()
+  state.parentTeamTurn = null
+  state.pendingTeamProgress = null
   const thread = $('#thread')
   for (const child of [...thread.children]) {
     if (child.id !== 'chat-empty') child.remove()
@@ -690,7 +763,7 @@ function renderSessions() {
       const displayTitle =
         session.source === 'dingtalk' ? String(session.title || '').replace(/^钉钉\s*·\s*/, '') : session.title
       const running = sessionIsRunning(session.id)
-      return `<div class="side-session ${session.id === state.sessionId ? 'active' : ''}" data-session="${esc(session.id)}">
+      return `<div class="side-session ${session.id === state.sessionId ? 'active' : ''}" data-session="${esc(session.id)}" draggable="true">
         <button class="side-session-main" type="button" data-open="${esc(session.id)}" title="${esc(session.title)}">${
           running
             ? '<span class="side-session-running" role="status" aria-label="正在回复" title="正在回复"></span>'
@@ -718,6 +791,22 @@ function renderSessions() {
       event.preventDefault()
       showSessionMenu(row.dataset.session, row.getBoundingClientRect())
     })
+    row.addEventListener('dragstart', (event) => {
+      const session = state.sessions.find((item) => item.id === row.dataset.session)
+      if (!session) return
+      const displayTitle =
+        session.source === 'dingtalk' ? String(session.title || '').replace(/^钉钉\s*·\s*/, '') : session.title
+      startConversationDrag(
+        event,
+        {
+          conversationId: session.id,
+          title: String(displayTitle || session.title || '未命名对话').trim(),
+          current: session.id === state.sessionId,
+        },
+        row,
+      )
+    })
+    row.addEventListener('dragend', () => row.classList.remove('is-dragging'))
   }
   syncSideSectionSplit()
 }
@@ -736,6 +825,10 @@ async function loadSessions() {
 function updateKnownMessage(message, sessionId) {
   if (!message || !message.id) return false
   const id = String(message.id)
+  if (isStandaloneTeamProgressMessage(message)) {
+    rememberPendingTeamProgress(message)
+    return true
+  }
   const thread = $('#thread')
   if (!thread) return false
   const node = Array.from(thread.querySelectorAll('.msg')).find((item) => item.dataset.messageId === id)
@@ -788,6 +881,14 @@ function appendLiveMessage(message, sessionId) {
   if (!message || (message.role !== 'user' && message.role !== 'assistant')) return
   const id = String(message.id || '')
   if (!id) return
+  // 独立的进度卡消息不再长成气泡；它的进度直接写进当前父 Agent 消息。
+  if (isStandaloneTeamProgressMessage(message)) {
+    rememberPendingTeamProgress(message)
+    if (state.parentTeamTurn && typeof state.parentTeamTurn.teamProgress === 'function') {
+      state.parentTeamTurn.teamProgress(state.pendingTeamProgress)
+    }
+    return
+  }
   // 引导续跑复用原 assistant 消息 ID：已渲染过就就地替换正文/思考/工具，不再长新气泡。
   if (updateKnownMessage(message, sessionId)) return
   if (state.localLiveMessageIds.has(id)) return
@@ -871,12 +972,16 @@ function liveTurnForSnapshot(snapshot, options = {}) {
     // 同一个会话可能已经由 POST 流创建了气泡；优先复用 runtime.turn，
     // 避免 EventSource 的增量画到一个隐藏节点上，页面一直停在“正在思考…”。
     const runtime = state.runtimes.get(runtimeKey(snapshot.sessionId))
-    const reuseTurn =
-      runtime?.turn && runtime.sending && snapshot.sessionId === runtime.sessionId
+    const reuseSameRuntimeTurn =
+      runtime?.turn &&
+      runtime.sending &&
+      snapshot.sessionId === runtime.sessionId &&
+      String(runtime.messageId || '') === snapshot.messageId
+    const reuseTurn = reuseSameRuntimeTurn
+      ? runtime.turn
+      : runtime?.messageId === snapshot.messageId && runtime.turn
         ? runtime.turn
-        : runtime?.messageId === snapshot.messageId && runtime.turn
-          ? runtime.turn
-          : null
+        : null
     entry = {
       turn: reuseTurn || createAiTurn({ append: false }),
       sessionId: snapshot.sessionId,
@@ -1104,7 +1209,9 @@ function setupChatEvents() {
     if (payload.type === 'delta') {
       if (payload.sessionId === state.sessionId) {
         const runtime = runtimeFor(payload.sessionId)
-        if (runtime.sending && runtime.turn) return
+        // 只跳过“同一个正在 POST 渲染的 messageId”的重复增量；
+        // 后台汇总轮会带新的 messageId，不能被上一轮仍为 sending 的运行时吞掉。
+        if (runtime.sending && runtime.turn && String(runtime.messageId || '') === String(payload.messageId || '')) return
       }
       if (payload.messageId && state.localLiveMessageIds.has(String(payload.messageId))) return
       const wasKnown = state.activeRunSnapshots.has(String(payload.messageId || ''))
@@ -1132,7 +1239,7 @@ function setupChatEvents() {
     if (payload.type === 'tool') {
       if (payload.sessionId === state.sessionId) {
         const runtime = runtimeFor(payload.sessionId)
-        if (runtime.sending && runtime.turn) return
+        if (runtime.sending && runtime.turn && String(runtime.messageId || '') === String(payload.messageId || '')) return
       }
       if (payload.messageId && state.localLiveMessageIds.has(String(payload.messageId))) return
       const wasKnown = state.activeRunSnapshots.has(String(payload.messageId || ''))
@@ -1205,6 +1312,7 @@ function setupChatEvents() {
           channel: meta.channel,
           reasoning: meta.reasoning || '',
           toolCalls: Array.isArray(meta.toolCalls) ? meta.toolCalls : [],
+          teamProgress: meta.teamProgress,
           clarify: meta.clarify,
           createdAt: payload.message.createdAt,
         })
@@ -1427,15 +1535,24 @@ async function loadOlderMessages() {
       const message = newMessages[index]
       // 多页澄清的中间答复/中间问题只用于续跑，不在聊天记录里显示。
       if (isHiddenClarifyStep(message)) continue
+      // 独立进度卡只作为父消息的进度数据源，不再单独占一条气泡。
+      if (isStandaloneTeamProgressMessage(message)) {
+        rememberPendingTeamProgress(message)
+        continue
+      }
+      const teamProgress = teamProgressForMessage(message)
       appendMessage(
         message.role === 'user' ? 'me' : 'ai',
         message.text,
         message.role === 'assistant' && message.modelName ? message.modelName : undefined,
         message.meta && message.meta.attachments,
-        message.role === 'assistant' ? message.meta : undefined,
+        message.role === 'assistant'
+          ? (teamProgress ? { ...message.meta, teamProgress } : message.meta)
+          : undefined,
         { scroll: false, prepend: true, channel: message.meta?.channel, messageId: message.id, createdAt: message.createdAt },
       )
     }
+    state.pendingTeamProgress = null
     thread.scrollTop = previousTop + (thread.scrollHeight - previousHeight)
 
     state.historyBefore = Boolean(data.hasMore) ? data.nextBefore || newMessages[0].id : null
@@ -1637,6 +1754,8 @@ async function openSession(sessionId) {
     state.view = 'chat'
     persistChatLocation()
     applySessionSpace(data.session)
+    // 每个会话有自己的常驻引用；切过来时按服务端快照恢复，不继承上一个会话的输入区。
+    applySessionReferences(data.session.references)
     const sessionModelId = data.session.modelId || data.session.model_id || ''
     const sessionEffort = data.session.reasoningEffort || data.session.reasoning_effort || ''
     if (sessionModelId && state.models.some((model) => model.id === sessionModelId)) {
@@ -1661,15 +1780,24 @@ async function openSession(sessionId) {
         if (message.id) state.historyMessageIds.add(message.id)
         // 多页澄清的中间答复/中间问题只用于续跑，不在聊天记录里显示。
         if (isHiddenClarifyStep(message)) continue
+        // 独立进度卡只作为父消息的进度数据源，不再单独占一条气泡。
+        if (isStandaloneTeamProgressMessage(message)) {
+          rememberPendingTeamProgress(message)
+          continue
+        }
+        const teamProgress = teamProgressForMessage(message)
         appendMessage(
           message.role === 'user' ? 'me' : 'ai',
           message.text,
           message.role === 'assistant' && message.modelName ? message.modelName : undefined,
           message.meta && message.meta.attachments,
-          message.role === 'assistant' ? message.meta : undefined,
+          message.role === 'assistant'
+            ? (teamProgress ? { ...message.meta, teamProgress } : message.meta)
+            : undefined,
           { scroll: false, channel: message.meta?.channel, pendingClarify: pendingClarify === message, messageId: message.id, createdAt: message.createdAt },
         )
       }
+      state.pendingTeamProgress = null
       if (data.messages.length > 0) {
         setEmptyVisible(false)
         scrollThreadToBottomInstant()
@@ -1711,6 +1839,7 @@ function newSession() {
   if (state.messageEdit) cancelMessageEdit({ clearInput: true, silent: true })
   state.openSeq += 1
   state.sessionId = null
+  clearComposerAttachments()
   setSelected('', { persist: false })
   resetAgentRuns()
   resetHistoryState()
@@ -2010,6 +2139,7 @@ async function deleteSession(sessionId) {
   if (!confirmed) return
   try {
     await api(`/api/chat/sessions/${encodeURIComponent(sessionId)}${qs()}`, { method: 'DELETE' })
+    banner('会话已删除', 'ok')
     if (state.sessionId === sessionId) {
       state.sessionId = null
       $('#chat-title').textContent = '新对话'
@@ -2044,6 +2174,7 @@ async function loadWorkspaceFiles(options = {}) {
         api(`/api/workspace/quota${qs()}`).catch(() => null),
       ])
       state.files = data.items || []
+      if (!workspacePathExists(state.files, state.workspacePath)) state.workspacePath = ''
       if (state.me) $('#side-files').hidden = false
       renderWorkspaceFiles()
       if (silent && list) list.scrollTop = scrollTop
@@ -2055,6 +2186,7 @@ async function loadWorkspaceFiles(options = {}) {
       // 后台静默刷新失败不能把已有列表清空，否则网络抖动一下界面就空了。
       if (!silent) {
         state.files = []
+        state.workspacePath = ''
         const box = $('#ws-list')
         if (box) box.innerHTML = `<div class="muted" style="font-size:12px;padding:4px">${esc(err.message)}</div>`
       }
@@ -2122,6 +2254,8 @@ function renderWorkspaceQuota(quota) {
   const sourceLabel =
     source === 'user' ? '个人配置' : source === 'role' ? '角色配置' : '默认配置'
   const roleText = Array.isArray(quota.roleCodes) && quota.roleCodes.length ? ` · ${quota.roleCodes.join(' / ')}` : ''
+  const storageNote = '文件保存在 EAB 服务端，换设备登录仍可见'
+  const quotaBadgeTitle = `${sourceLabel}${roleText}；${storageNote}`
   const badge = $('#ws-info')
   badge?.classList.toggle('is-high', level === 'notice' || level === 'warning')
   badge?.classList.toggle('is-critical', level === 'critical' || level === 'full')
@@ -2135,7 +2269,10 @@ function renderWorkspaceQuota(quota) {
       : ''
   box.innerHTML = `
     <div class="ws-quota-head">
-      <span class="ws-quota-label">云空间</span>
+      <div class="ws-quota-title">
+        <span class="ws-quota-label">云空间</span>
+        <span class="ws-quota-badge" title="${esc(quotaBadgeTitle)}" aria-label="${esc(quotaBadgeTitle)}">?</span>
+      </div>
       <span class="ws-quota-value"><strong>${esc(fmtSize(used))}</strong><span class="ws-quota-sep">/</span>${esc(
         fmtQuota(limit),
       )}</span>
@@ -2148,11 +2285,7 @@ function renderWorkspaceQuota(quota) {
     ${warningHtml}
     <div class="ws-quota-foot">
       <span>剩余 ${esc(fmtSize(remaining))} · 单文件 ≤ ${esc(fmtQuota(fileLimit))}</span>
-      <span class="ws-quota-source" title="容量与单文件上限由管理员在控制台配置">${esc(sourceLabel)}${esc(
-        roleText,
-      )}</span>
-    </div>
-    <div class="ws-quota-note">文件保存在 EAB 服务端，换设备登录仍可见</div>`
+    </div>`
 }
 
 let lastWorkspaceWarningLevel = ''
@@ -2254,6 +2387,165 @@ function renderSpaceMenu() {
     button.addEventListener('click', () => setSpace(button.dataset.spaceKind))
   }
 }
+/* ---------------- 云空间虚拟目录 ---------------- */
+
+/** 云空间路径统一成无首尾斜杠的 `/` 分隔形式。 */
+function workspaceNormalizePath(value) {
+  return String(value || '')
+    .replace(/\\/g, '/')
+    .split('/')
+    .filter((part) => part && part !== '.' && part !== '..')
+    .join('/')
+}
+
+function workspaceFilePath(file) {
+  return workspaceNormalizePath(file?.relPath || file?.name || '')
+}
+
+/** 文件所在的目录；根目录文件返回空串。 */
+function workspaceFileParentPath(fileOrPath) {
+  const rel = workspaceNormalizePath(
+    typeof fileOrPath === 'string' ? fileOrPath : workspaceFilePath(fileOrPath),
+  )
+  const slash = rel.lastIndexOf('/')
+  return slash < 0 ? '' : rel.slice(0, slash)
+}
+
+function workspacePathExists(files, currentPath) {
+  const dir = workspaceNormalizePath(currentPath)
+  if (!dir) return true
+  const prefix = `${dir}/`
+  return (Array.isArray(files) ? files : []).some((file) =>
+    workspaceFilePath(file).startsWith(prefix),
+  )
+}
+
+/** 文件夹名称的前端校验与后端保持一致，提前给出可读提示。 */
+function workspaceFolderNameError(value) {
+  const name = String(value || '').trim()
+  if (!name) return '文件夹名称不能为空'
+  if (name.includes('/') || name.includes('\\')) return '文件夹名称不能包含斜杠'
+  if (name === '.' || name === '..') return '请输入具体的文件夹名称'
+  if (name.startsWith('.') || name.startsWith('_')) return '文件夹名称不能以 . 或 _ 开头'
+  if (/[\u0000-\u001f\u007f<>:"|?*]/.test(name)) return '文件夹名称包含不允许的字符'
+  if (name.endsWith('.') || name.endsWith(' ')) return '文件夹名称不能以点或空格结尾'
+  if (name.length > 120) return '文件夹名称过长，最多 120 个字符'
+  const base = name.split('.')[0].toLowerCase()
+  if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/.test(base)) return '文件夹名称不能使用 Windows 保留名'
+  return ''
+}
+
+function workspaceFolderPathJoin(parentPath, name) {
+  const parent = workspaceNormalizePath(parentPath)
+  const leaf = String(name || '').trim()
+  return parent ? `${parent}/${leaf}` : leaf
+}
+
+/** 当前层文件夹的计数/共享标记；路径来自菜单时也能找到对应元数据。 */
+function workspaceFolderMeta(folderPath) {
+  const path = workspaceNormalizePath(folderPath)
+  if (!path) return { path: '', name: '云空间', fileCount: 0, folderCount: 0, shared: false }
+  const parent = workspaceFileParentPath(path)
+  const view = workspaceDirView(state.files, parent)
+  const found = view.folders.find((folder) => folder.path === path)
+  return found || {
+    path,
+    name: path.split('/').pop() || path,
+    fileCount: 0,
+    folderCount: 0,
+    shared: false,
+  }
+}
+
+/**
+ * 把扁平的云空间文件按 relPath 归并成当前目录视图。
+ * 文件夹本身不落库，同层同名目录合并；文件夹里的共享标记取任一后代文件。
+ */
+function workspaceDirView(files, currentPath) {
+  const dir = workspaceNormalizePath(currentPath)
+  const prefix = dir ? `${dir}/` : ''
+  const folders = new Map()
+  const rows = []
+  for (const file of Array.isArray(files) ? files : []) {
+    const rel = workspaceFilePath(file)
+    if (!rel || !rel.startsWith(prefix)) continue
+    const rest = rel.slice(prefix.length)
+    if (!rest) continue
+    const slash = rest.indexOf('/')
+    const base = rest.slice(rest.lastIndexOf('/') + 1)
+    const placeholder = base === '.gitkeep'
+    if (slash < 0) {
+      if (!placeholder) rows.push(file)
+      continue
+    }
+    const name = rest.slice(0, slash)
+    const path = dir ? `${dir}/${name}` : name
+    const folder = folders.get(name) || {
+      name,
+      path,
+      fileCount: 0,
+      folderCount: 0,
+      shared: false,
+      childNames: new Set(),
+    }
+    const childName =
+      rest.indexOf('/', slash + 1) >= 0 ? rest.slice(slash + 1).split('/')[0] : ''
+    if (childName) folder.childNames.add(childName)
+    if (!placeholder) {
+      folder.fileCount += 1
+      folder.shared = folder.shared || Boolean(file.shared)
+    }
+    folders.set(name, folder)
+  }
+  const folderRows = [...folders.values()]
+    .map(({ childNames, ...folder }) => ({ ...folder, folderCount: childNames.size }))
+    .sort((a, b) => a.name.localeCompare(b.name, 'zh-CN', { numeric: true }))
+  const fileRows = rows.sort((a, b) => {
+    const byTime = (Number(b?.updatedAt) || 0) - (Number(a?.updatedAt) || 0)
+    if (byTime) return byTime
+    return String(a?.name || '').localeCompare(String(b?.name || ''), 'zh-CN', {
+      numeric: true,
+    })
+  })
+  return { path: dir, folders: folderRows, files: fileRows }
+}
+
+function renderWorkspacePath(currentPath) {
+  const box = $('#ws-path')
+  if (!box) return
+  const parts = currentPath ? currentPath.split('/') : []
+  if (!parts.length) {
+    box.hidden = true
+    box.innerHTML = ''
+    return
+  }
+  box.hidden = false
+  const crumbs = [
+    '<button type="button" data-folder-open="" title="返回云空间根目录">云空间</button>',
+  ]
+  let path = ''
+  for (const part of parts) {
+    path = path ? `${path}/${part}` : part
+    crumbs.push(
+      '<span class="ws-path-sep" aria-hidden="true">/</span>',
+      `<button type="button" data-folder-open="${esc(path)}" title="${esc(path)}">${esc(part)}</button>`,
+    )
+  }
+  box.innerHTML = `<span class="ws-path-label">位置</span>${crumbs.join('')}`
+  for (const button of box.querySelectorAll('[data-folder-open]')) {
+    button.addEventListener('click', () => setWorkspacePath(button.dataset.folderOpen))
+  }
+}
+
+function setWorkspacePath(nextPath) {
+  const path = workspaceNormalizePath(nextPath)
+  if (path === state.workspacePath) return
+  state.workspacePath = path
+  renderWorkspaceFiles()
+  const list = $('#ws-list')
+  if (list) list.scrollTop = 0
+}
+
 function workspaceFileUrl(file) {
   return `/api/workspace/files/${encodeURIComponent(file.id)}/download${qs()}`
 }
@@ -2263,16 +2555,70 @@ function workspaceFileDate(value) {
   return Number.isFinite(date.getTime()) ? date.toLocaleString('zh-CN', { hour12: false }) : '—'
 }
 
+/** 侧栏行 -> 输入区引用：自定义 MIME 里带完整对象信息，drop 时可还原。 */
+function startWorkspaceDrag(event, ref, row) {
+  const transfer = event.dataTransfer
+  if (!transfer || !ref) return
+  const path = workspaceNormalizePath(ref.path || ref.relPath || ref.name || '')
+  transfer.effectAllowed = 'copy'
+  transfer.setData(WORKSPACE_DRAG_MIME, JSON.stringify(ref))
+  transfer.setData('text/plain', path || ref.name || '')
+  if (row) {
+    row.classList.add('is-dragging')
+    transfer.setDragImage(row, 18, 18)
+  }
+}
+
+/** 对话行 -> 输入区引用：只带会话 ID 和标题，历史由服务端在发送时取一次。 */
+function startConversationDrag(event, ref, row) {
+  const transfer = event.dataTransfer
+  if (!transfer || !ref?.conversationId) return
+  transfer.effectAllowed = 'copy'
+  transfer.setData(CONVERSATION_DRAG_MIME, JSON.stringify(ref))
+  transfer.setData('text/plain', ref.title || ref.conversationId)
+  if (row) {
+    row.classList.add('is-dragging')
+    transfer.setDragImage(row, 18, 18)
+  }
+}
+
 function renderWorkspaceFiles() {
   const box = $('#ws-list')
   if (!box) return
-  if (state.files.length === 0) {
-    box.innerHTML = '<div class="muted" style="font-size:12px;padding:4px">还没有文件。点「上传」，或让对话把内容写进云空间。</div>'
+  if (!workspacePathExists(state.files, state.workspacePath)) state.workspacePath = ''
+  const view = workspaceDirView(state.files, state.workspacePath)
+  renderWorkspacePath(view.path)
+  if (view.folders.length === 0 && view.files.length === 0) {
+    box.innerHTML = view.path
+      ? '<div class="muted" style="font-size:12px;padding:4px">这个文件夹里还没有文件。点上方「云空间」可返回根目录。</div>'
+      : '<div class="muted" style="font-size:12px;padding:4px">还没有文件。点「上传」，或让对话把内容写进云空间。</div>'
     syncSideSectionSplit()
     return
   }
   const activeId = state.filePreview?.id
-  box.innerHTML = state.files
+  const folderRows = view.folders
+    .map(
+      (folder) => `<div class="side-file side-folder" data-folder-row="${esc(folder.path)}">
+        <button class="side-file-name" type="button" data-folder-open="${esc(folder.path)}" title="进入文件夹 ${esc(folder.path)}">
+          <span class="side-folder-icon" aria-hidden="true"></span>
+          <span class="side-folder-name">${esc(folder.name)}</span>
+          ${folder.shared ? '<span class="side-file-shared">共享</span>' : ''}
+        </button>
+        <span class="side-file-size">${
+          folder.fileCount || folder.folderCount
+            ? [
+                folder.fileCount ? `${folder.fileCount} 个文件` : '',
+                folder.folderCount ? `${folder.folderCount} 个文件夹` : '',
+              ]
+                .filter(Boolean)
+                .join(' · ')
+            : '空文件夹'
+        }</span>
+        <button class="side-file-more" type="button" data-folder-more="${esc(folder.path)}" title="文件夹操作" aria-label="文件夹操作" aria-haspopup="menu">⋯</button>
+      </div>`,
+    )
+    .join('')
+  const fileRows = view.files
     .map(
       (file) => `<div class="side-file${activeId === file.id ? ' is-active' : ''}" data-file-row="${esc(file.id)}">
         <button class="side-file-name" type="button" data-file-open="${esc(file.id)}" title="${esc(file.relPath)}">${esc(file.name)}${file.shared ? ' <span class="side-file-shared">共享</span>' : ''}</button>
@@ -2281,6 +2627,26 @@ function renderWorkspaceFiles() {
       </div>`,
     )
     .join('')
+  box.innerHTML = folderRows + fileRows
+  for (const button of box.querySelectorAll('[data-folder-open]')) {
+    button.addEventListener('click', () => setWorkspacePath(button.dataset.folderOpen))
+  }
+  for (const button of box.querySelectorAll('[data-folder-more]')) {
+    button.addEventListener('click', (event) => {
+      event.stopPropagation()
+      showFolderMenu(button.dataset.folderMore, button.getBoundingClientRect())
+    })
+  }
+  for (const row of box.querySelectorAll('[data-folder-row]')) {
+    row.addEventListener('contextmenu', (event) => {
+      event.preventDefault()
+      showFolderMenu(
+        row.dataset.folderRow,
+        { left: event.clientX, top: event.clientY, right: event.clientX, bottom: event.clientY },
+        true,
+      )
+    })
+  }
   for (const button of box.querySelectorAll('[data-file-open]')) {
     button.addEventListener('click', (event) => {
       if (event.isTrusted) setWorkbenchCollapsed(false)
@@ -2303,6 +2669,48 @@ function renderWorkspaceFiles() {
       )
     })
   }
+  // 文件/文件夹都能整行拖进输入区，只是引用，不会复制文件。
+  for (const row of box.querySelectorAll('[data-folder-row]')) {
+    row.draggable = true
+    row.addEventListener('dragstart', (event) => {
+      const path = row.dataset.folderRow
+      const meta = workspaceFolderMeta(path)
+      startWorkspaceDrag(
+        event,
+        {
+          kind: 'folder',
+          path,
+          name: meta.name,
+          fileCount: meta.fileCount,
+          folderCount: meta.folderCount,
+        },
+        row,
+      )
+    })
+    row.addEventListener('dragend', () => row.classList.remove('is-dragging'))
+  }
+  for (const row of box.querySelectorAll('[data-file-row]')) {
+    row.draggable = true
+    row.addEventListener('dragstart', (event) => {
+      const file = fileById(row.dataset.fileRow)
+      if (!file) return
+      startWorkspaceDrag(
+        event,
+        {
+          kind: 'file',
+          fileId: file.id,
+          path: workspaceFilePath(file),
+          relPath: workspaceFilePath(file),
+          name: file.name,
+          size: file.size,
+          mime: file.mime,
+          shared: Boolean(file.shared),
+        },
+        row,
+      )
+    })
+    row.addEventListener('dragend', () => row.classList.remove('is-dragging'))
+  }
   syncSideSectionSplit()
 }
 
@@ -2315,6 +2723,21 @@ function hideFileMenu() {
   if (!menu) return
   menu.hidden = true
   menu.dataset.file = ''
+  menu.dataset.folder = ''
+}
+
+function placeFileMenu(menu, anchor, atPoint = false) {
+  const menuBox = menu.getBoundingClientRect()
+  const left = atPoint
+    ? Math.min(anchor.left, window.innerWidth - menuBox.width - 8)
+    : Math.min(Math.max(8, anchor.right - menuBox.width), window.innerWidth - menuBox.width - 8)
+  const top = atPoint
+    ? Math.min(anchor.top, window.innerHeight - menuBox.height - 8)
+    : anchor.bottom + 4 + menuBox.height + 8 > window.innerHeight
+      ? Math.max(8, anchor.top - menuBox.height - 4)
+      : anchor.bottom + 4
+  menu.style.left = `${Math.max(8, left)}px`
+  menu.style.top = `${Math.max(8, top)}px`
 }
 
 function showFileMenu(fileId, anchor, atPoint = false) {
@@ -2334,22 +2757,283 @@ function showFileMenu(fileId, anchor, atPoint = false) {
            <button type="button" data-file-act="send-dingtalk">发送到钉钉</button>`
     }`
   menu.dataset.file = fileId
+  menu.dataset.folder = ''
   menu.hidden = false
-  const box = menu.getBoundingClientRect()
-  const left = atPoint
-    ? Math.min(anchor.left, window.innerWidth - box.width - 8)
-    : Math.min(Math.max(8, anchor.right - box.width), window.innerWidth - box.width - 8)
-  const top = atPoint
-    ? Math.min(anchor.top, window.innerHeight - box.height - 8)
-    : anchor.bottom + 4 + box.height + 8 > window.innerHeight
-      ? Math.max(8, anchor.top - box.height - 4)
-      : anchor.bottom + 4
-  menu.style.left = `${Math.max(8, left)}px`
-  menu.style.top = `${Math.max(8, top)}px`
+  placeFileMenu(menu, anchor, atPoint)
 }
 
-async function renameWorkspaceFile(file) {
-  if (!file) return
+function showFolderMenu(folderPath, anchor, atPoint = false) {
+  const menu = $('#file-menu')
+  const folder = workspaceFolderMeta(folderPath)
+  if (!menu || !folder.path) return
+  hideSessionMenu()
+  const locked = Boolean(folder.shared)
+  const lockedHint = locked
+    ? '<div class="session-menu-hint">文件夹里有其他成员共享的文件，暂不支持整体重命名或删除。</div>'
+    : ''
+  menu.innerHTML = `<div class="session-menu-title">${esc(folder.name)}</div>
+    <button type="button" data-folder-act="open">打开</button>
+    <button type="button" data-folder-act="new">新建子文件夹</button>
+    <button type="button" data-folder-act="rename"${locked ? ' disabled title="文件夹含他人共享文件"' : ''}>重命名</button>
+    <button type="button" data-folder-act="delete" class="is-danger"${locked ? ' disabled title="文件夹含他人共享文件"' : ''}>删除</button>
+    ${lockedHint}`
+  menu.dataset.folder = folder.path
+  menu.dataset.file = ''
+  menu.hidden = false
+  placeFileMenu(menu, anchor, atPoint)
+}
+
+function workspaceFolderLocationLabel(path) {
+  const normalized = workspaceNormalizePath(path)
+  return normalized ? `云空间 / ${normalized.split('/').join(' / ')}` : '云空间根目录'
+}
+
+function openWorkspaceFolderNameModal({ title, hint, value, confirmLabel, onSubmit }) {
+  const overlay = document.createElement('div')
+  overlay.className = 'modal-overlay'
+  overlay.innerHTML = `<div class="modal">
+    <div class="modal-head"><h3>${esc(title)}</h3><button class="modal-x" type="button">×</button></div>
+    <p class="hint">${esc(hint)}</p>
+    <div class="form-grid"><label><span>文件夹名称</span><input id="ws-folder-name-input" value="${esc(
+      value || '',
+    )}" /></label></div>
+    <div class="modal-state" id="ws-folder-name-state"></div>
+    <div class="modal-actions"><button class="btn ghost" type="button" id="ws-folder-name-cancel">取消</button><button class="btn primary" type="button" id="ws-folder-name-save">${esc(
+      confirmLabel || '保存',
+    )}</button></div>
+  </div>`
+  document.body.appendChild(overlay)
+  const close = () => overlay.remove()
+  const input = overlay.querySelector('#ws-folder-name-input')
+  const stateEl = overlay.querySelector('#ws-folder-name-state')
+  const saveButton = overlay.querySelector('#ws-folder-name-save')
+  const cancelButton = overlay.querySelector('#ws-folder-name-cancel')
+  const closeButton = overlay.querySelector('.modal-x')
+  let saving = false
+  const setBusy = (busy) => {
+    saving = busy
+    saveButton.disabled = busy
+    cancelButton.disabled = busy
+    closeButton.disabled = busy
+    input.disabled = busy
+  }
+  overlay.querySelector('.modal-x').addEventListener('click', close)
+  cancelButton.addEventListener('click', close)
+  input.focus()
+  input.select()
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') saveButton.click()
+  })
+  saveButton.addEventListener('click', async () => {
+    if (saving) return
+    const name = String(input.value || '').trim()
+    const error = workspaceFolderNameError(name)
+    if (error) {
+      stateEl.className = 'modal-state bad'
+      stateEl.textContent = error
+      input.focus()
+      return
+    }
+    setBusy(true)
+    stateEl.className = 'modal-state muted'
+    stateEl.textContent = '正在保存…'
+    try {
+      await onSubmit(name)
+      close()
+    } catch (err) {
+      setBusy(false)
+      stateEl.className = 'modal-state bad'
+      stateEl.textContent = err.message || '保存失败'
+    }
+  })
+}
+
+function createWorkspaceFolder(parentPath = state.workspacePath) {
+  const parent = workspaceNormalizePath(parentPath)
+  openWorkspaceFolderNameModal({
+    title: '新建文件夹',
+    hint: `创建在「${workspaceFolderLocationLabel(parent)}」。空文件夹会保留在云空间列表里。`,
+    value: '新建文件夹',
+    confirmLabel: '创建',
+    onSubmit: async (name) => {
+      const folderPath = workspaceFolderPathJoin(parent, name)
+      await api(`/api/workspace/folders${qs()}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ path: folderPath }),
+      })
+      await loadWorkspaceFiles()
+      banner(`文件夹「${name}」已创建`, 'ok')
+    },
+  })
+}
+
+function syncWorkspacePreviewAfterFolderRename(oldPath, nextPath) {
+  const preview = state.filePreview
+  if (!preview) return
+  const relPath = workspaceFilePath(preview)
+  if (!relPath.startsWith(`${oldPath}/`)) return
+  const updated = fileById(preview.id)
+  if (!updated) return
+  state.filePreview = { ...preview, ...updated }
+  const meta = [
+    fmtSize(updated.size),
+    `更新于 ${workspaceFileDate(updated.updatedAt)}`,
+    updated.shared ? '共享文件' : '个人文件',
+    updated.relPath,
+  ]
+  const box = $('#file-pane-meta')
+  if (box) box.textContent = meta.filter(Boolean).join(' · ')
+  const suffix = relPath.slice(oldPath.length)
+  const nextRel = `${nextPath}${suffix}`
+  if (state.filePreview.relPath !== nextRel) state.filePreview.relPath = nextRel
+}
+
+function renameWorkspaceFolder(folderPath) {
+  const folder = workspaceFolderMeta(folderPath)
+  if (!folder.path) return
+  if (folder.shared) {
+    banner('文件夹里有其他成员共享的文件，暂不支持整体重命名', 'warn')
+    return
+  }
+  openWorkspaceFolderNameModal({
+    title: '重命名文件夹',
+    hint: `把「${folder.name}」改名，文件夹里的文件和子文件夹会一起移到新名称下。`,
+    value: folder.name,
+    confirmLabel: '保存',
+    onSubmit: async (name) => {
+      if (name === folder.name) return
+      const result = await api(`/api/workspace/folders${qs()}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ path: folder.path, newName: name }),
+      })
+      const nextPath = workspaceNormalizePath(result?.folderPath || result?.to || folder.path)
+      const currentPath = state.workspacePath
+      if (currentPath === folder.path || currentPath.startsWith(`${folder.path}/`)) {
+        state.workspacePath = `${nextPath}${currentPath.slice(folder.path.length)}`
+      }
+      await loadWorkspaceFiles()
+      syncWorkspacePreviewAfterFolderRename(folder.path, nextPath)
+      banner('文件夹已重命名', 'ok')
+    },
+  })
+}
+
+function deleteWorkspaceFolder(folderPath) {
+  const folder = workspaceFolderMeta(folderPath)
+  if (!folder.path) return
+  if (folder.shared) {
+    banner('文件夹里有其他成员共享的文件，暂不支持整体删除', 'warn')
+    return
+  }
+  const count = Math.max(0, Number(folder.fileCount) || 0)
+  const childFolderCount = Math.max(0, Number(folder.folderCount) || 0)
+  const deleteHint = count
+    ? `「${esc(folder.path)}」里的 ${count} 个文件会移到回收区，文件夹本身从云空间列表移除。此操作不可撤销，但回收区会按保留策略保留。`
+    : childFolderCount
+      ? `「${esc(folder.path)}」及其 ${childFolderCount} 个子文件夹会从云空间列表移除，空目录不会保留。`
+      : `「${esc(folder.path)}」是空文件夹，会从云空间列表移除。此操作不可撤销。`
+  const overlay = document.createElement('div')
+  overlay.className = 'modal-overlay'
+  overlay.innerHTML = `<div class="modal">
+    <div class="modal-head"><h3>删除文件夹</h3><button class="modal-x" type="button">×</button></div>
+    <p class="hint">${deleteHint}</p>
+    <div class="install-progress" id="ws-folder-delete-progress" hidden role="progressbar" aria-label="删除文件夹进度" aria-live="polite">
+      <div class="install-progress-track"><span class="install-progress-bar"></span></div>
+      <div class="install-progress-meta"><span id="ws-folder-delete-progress-text">正在删除文件夹…</span><span id="ws-folder-delete-progress-time" class="mono">0s</span></div>
+    </div>
+    <div class="modal-state" id="ws-folder-delete-state"></div>
+    <div class="modal-actions"><button class="btn ghost" type="button" id="ws-folder-delete-cancel">取消</button><button class="btn danger" type="button" id="ws-folder-delete-confirm">删除文件夹</button></div>
+  </div>`
+  document.body.appendChild(overlay)
+  const stateEl = overlay.querySelector('#ws-folder-delete-state')
+  const progressEl = overlay.querySelector('#ws-folder-delete-progress')
+  const progressText = overlay.querySelector('#ws-folder-delete-progress-text')
+  const progressTime = overlay.querySelector('#ws-folder-delete-progress-time')
+  const confirmBtn = overlay.querySelector('#ws-folder-delete-confirm')
+  const cancelBtn = overlay.querySelector('#ws-folder-delete-cancel')
+  const closeBtn = overlay.querySelector('.modal-x')
+  let progressTimer = null
+  let progressStartedAt = 0
+  const stopProgress = () => {
+    if (progressTimer) clearInterval(progressTimer)
+    progressTimer = null
+  }
+  const close = () => {
+    stopProgress()
+    overlay.remove()
+  }
+  const setBusy = (busy) => {
+    confirmBtn.disabled = busy
+    cancelBtn.disabled = busy
+    closeBtn.disabled = busy
+  }
+  const startProgress = () => {
+    progressEl.hidden = false
+    progressEl.classList.remove('is-done')
+    progressText.textContent = '正在删除文件夹…'
+    progressTime.textContent = '0s'
+    progressStartedAt = Date.now()
+    stopProgress()
+    progressTimer = setInterval(() => {
+      progressTime.textContent = `${Math.max(0, Math.floor((Date.now() - progressStartedAt) / 1000))}s`
+    }, 1000)
+  }
+  const finishProgress = (text) => {
+    stopProgress()
+    progressEl.hidden = false
+    progressEl.classList.add('is-done')
+    progressText.textContent = text
+    progressTime.textContent = '完成'
+  }
+  closeBtn.addEventListener('click', close)
+  cancelBtn.addEventListener('click', close)
+  confirmBtn.addEventListener('click', async () => {
+    if (confirmBtn.disabled) return
+    setBusy(true)
+    stateEl.className = 'modal-state muted'
+    stateEl.textContent = ''
+    startProgress()
+    try {
+      const result = await api(`/api/workspace/folders${qs()}`, {
+        method: 'DELETE',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ path: folder.path }),
+      })
+      const deletedCount = Math.max(0, Number(result?.fileCount ?? count) || 0)
+      finishProgress('已移入回收区')
+      if (state.workspacePath === folder.path || state.workspacePath.startsWith(`${folder.path}/`)) {
+        const slash = folder.path.lastIndexOf('/')
+        state.workspacePath = slash < 0 ? '' : folder.path.slice(0, slash)
+      }
+      close()
+      if (
+        state.filePreview &&
+        workspaceFilePath(state.filePreview).startsWith(`${folder.path}/`)
+      ) {
+        closeWorkspaceFile()
+      }
+      await loadWorkspaceFiles()
+      banner(
+        deletedCount
+          ? `文件夹已删除，${deletedCount} 个文件已移到回收区`
+          : childFolderCount
+            ? '文件夹及其空子文件夹已删除'
+            : '空文件夹已删除',
+        'ok',
+      )
+    } catch (err) {
+      stopProgress()
+      progressEl.hidden = true
+      setBusy(false)
+      stateEl.className = 'modal-state bad'
+      stateEl.textContent = err.message || '删除文件夹失败'
+    }
+  })
+}
+
+async function renameWorkspaceFile(file) {  if (!file) return
   const overlay = document.createElement('div')
   overlay.className = 'modal-overlay'
   overlay.innerHTML = `<div class="modal">
@@ -2373,7 +3057,11 @@ async function renameWorkspaceFile(file) {
     if (event.key === 'Enter') overlay.querySelector('#ws-rename-save').click()
   })
   overlay.querySelector('#ws-rename-save').addEventListener('click', async () => {
-    const next = input.value.trim()
+    const next = String(input.value || '')
+      .trim()
+      .split(/[\\/]+/)
+      .filter(Boolean)
+      .pop() || ''
     if (!next) {
       stateEl.className = 'modal-state bad'
       stateEl.textContent = '文件名不能为空'
@@ -2383,13 +3071,15 @@ async function renameWorkspaceFile(file) {
       close()
       return
     }
+    const parent = workspaceFileParentPath(file)
+    const nextRelPath = parent ? `${parent}/${next}` : next
     stateEl.className = 'modal-state muted'
     stateEl.textContent = '正在保存…'
     try {
       await api(`/api/workspace/files/${encodeURIComponent(file.id)}${qs()}`, {
         method: 'PATCH',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ name: next }),
+        body: JSON.stringify({ relPath: nextRelPath }),
       })
       close()
       await loadWorkspaceFiles()
@@ -2539,8 +3229,231 @@ function agentStatusClass(status) {
   return 'is-running'
 }
 
+function clampProgressPercent(value) {
+  const n = Number(value)
+  if (!Number.isFinite(n)) return 0
+  return Math.max(0, Math.min(100, Math.round(n)))
+}
+
+/** 团队整体完成度：只统计已进入终态的子 Agent；运行/等待都算未完成。 */
+function agentTeamProgress(runs) {
+  const list = Array.isArray(runs) ? runs : []
+  const total = list.length
+  const done = list.filter((run) => {
+    const status = run?.status || 'running'
+    return status === 'done' || status === 'failed' || status === 'cancelled'
+  }).length
+  const active = list.filter((run) => (run?.status || 'running') === 'running').length
+  const waiting = list.filter((run) => run?.status === 'waiting').length
+  const failed = list.filter((run) => run?.status === 'failed' || run?.status === 'cancelled').length
+  const remaining = Math.max(0, total - done)
+  return {
+    total,
+    completed: done,
+    remaining,
+    active,
+    waiting,
+    failed,
+    percent: total > 0 ? clampProgressPercent((done / total) * 100) : 0,
+    label: total > 0 ? `已完成 ${done} / ${total}` : '等待派发',
+    detail: failed > 0
+      ? `已完成 ${done} · 失败 ${failed} · 待汇总 ${remaining}`
+      : `已完成 ${done} · 进行中 ${active + waiting} · 待汇总 ${remaining}`,
+    state: total > 0 && done === total ? '已完成' : waiting > 0 ? '等待回复' : '进行中',
+    tone: total > 0 && done === total ? 'is-complete' : failed > 0 ? 'is-failed' : waiting > 0 ? 'is-waiting' : 'is-running',
+  }
+}
+
+/** 后端进度消息带的是计数快照，团队面板带的是实时 run；统一成同一个形状再渲染。 */
+function normalizeTeamProgress(input) {
+  if (!input || typeof input !== 'object') return null
+  const completed = Math.max(0, Number(input.completed) || 0)
+  const failed = Math.max(0, Number(input.failed) || 0)
+  const explicitTotal = Math.max(0, Number(input.total) || 0)
+  const remaining = Math.max(0, Number(input.remaining) || 0)
+  const active = Math.max(0, Number(input.active) || 0)
+  const waiting = Math.max(0, Number(input.waiting) || 0)
+  const total = explicitTotal || completed + remaining
+  if (total <= 0) return null
+  const done = Math.min(total, completed + failed)
+  const left = Math.max(0, total - done)
+  const rawState = String(input.state || '').trim()
+  const stateText = rawState === 'completed'
+    ? '已完成'
+    : rawState === 'waiting'
+      ? '等待回复'
+      : rawState === 'watching'
+        ? '待汇总'
+        : rawState === 'running'
+          ? '进行中'
+          : rawState
+  return {
+    total,
+    completed: Math.min(total, completed),
+    failed: Math.min(total, failed),
+    done,
+    remaining: left,
+    active: Math.max(0, active),
+    waiting: Math.max(0, waiting),
+    percent: clampProgressPercent((done / total) * 100),
+    label: done <= 0
+      ? `已派发 ${total} 个`
+      : failed > 0
+        ? `已结束 ${done} / ${total}`
+        : `已完成 ${done} / ${total}`,
+    detail: failed > 0
+      ? `成功 ${Math.min(total, completed)} · 失败 ${Math.min(total, failed)} · 待汇总 ${left}`
+      : `已完成 ${Math.min(total, completed)} · 进行中 ${active + waiting} · 待汇总 ${left}`,
+    state: stateText || (done >= total ? '已完成' : waiting > 0 ? '等待回复' : '进行中'),
+    tone: done >= total
+      ? (failed > 0 ? 'is-failed' : 'is-complete')
+      : failed > 0
+        ? 'is-failed'
+        : waiting > 0
+          ? 'is-waiting'
+          : 'is-running',
+    note: String(input.note || '').trim(),
+    parentRunId: String(input.parentRunId || input.runId || '').trim(),
+  }
+}
+
+function teamProgressCardHtml(progressInput, note = '') {
+  const progress = normalizeTeamProgress(progressInput)
+  if (!progress) return ''
+  const runKey = esc(progress.parentRunId)
+  let noteText = String(note || progress.note || '').trim()
+  const finished = progress.total > 0 && progress.completed + progress.failed >= progress.total
+  if (finished && noteText && !/最终汇总已生成|汇总已生成/.test(noteText)) noteText = '全部子 Agent 已完成。'
+  return `<div class="team-progress-card ${progress.tone}" data-team-progress data-team-progress-run="${runKey}"
+    data-team-progress-total="${progress.total}" data-team-progress-completed="${progress.completed}"
+    data-team-progress-failed="${progress.failed}" data-team-progress-active="${progress.active}"
+    data-team-progress-waiting="${progress.waiting}" data-team-progress-state="${esc(progress.state)}">
+    <div class="team-progress-head">
+      <span class="team-progress-kicker">子 AGENT 进度</span>
+      <span class="team-progress-count" data-team-progress-count>${esc(progress.label)}</span>
+    </div>
+    <div class="team-progress-track" role="progressbar" aria-label="子 Agent 完成进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progress.percent}" data-team-progress-track>
+      <span class="team-progress-fill" data-team-progress-fill style="width:${progress.percent}%"></span>
+    </div>
+    <div class="team-progress-foot">
+      <span data-team-progress-label>${esc(progress.detail)}</span>
+      <span class="team-progress-state" data-team-progress-state>${esc(progress.state)}</span>
+    </div>
+    ${noteText ? `<div class="team-progress-note" data-team-progress-note>${esc(oneLinePreview(noteText, 180))}</div>` : ''}
+  </div>`
+}
+
+function applyTeamProgressCard(card, progress) {
+  if (!card || !progress) return
+  const tone = ['is-running', 'is-waiting', 'is-complete', 'is-failed', 'is-cancelled'].find((name) => progress.tone === name) || 'is-running'
+  card.classList.remove('is-running', 'is-waiting', 'is-complete', 'is-failed', 'is-cancelled')
+  card.classList.add(tone)
+  card.dataset.teamProgressTotal = String(progress.total)
+  card.dataset.teamProgressCompleted = String(progress.completed)
+  card.dataset.teamProgressFailed = String(progress.failed)
+  card.dataset.teamProgressActive = String(progress.active)
+  card.dataset.teamProgressWaiting = String(progress.waiting)
+  card.dataset.teamProgressState = progress.state
+  if (progress.parentRunId) card.setAttribute('data-team-progress-run', progress.parentRunId)
+  const fill = card.querySelector('[data-team-progress-fill]')
+  const track = card.querySelector('[data-team-progress-track]')
+  const count = card.querySelector('[data-team-progress-count]')
+  const label = card.querySelector('[data-team-progress-label]')
+  const state = card.querySelector('[data-team-progress-state]')
+  const note = card.querySelector('[data-team-progress-note]')
+  if (fill) fill.style.width = `${progress.percent}%`
+  if (track) track.setAttribute('aria-valuenow', String(progress.percent))
+  if (count) count.textContent = progress.label
+  if (label) label.textContent = progress.detail
+  if (state) state.textContent = progress.state
+  if (note) {
+    const fallbackNote = progress.state === '已完成'
+      ? '全部子 Agent 已完成。'
+      : `子 Agent 并行工作中 · ${progress.completed} / ${progress.total} 已完成。`
+    note.textContent = oneLinePreview(progress.note || fallbackNote, 180)
+  }
+}
+
+/** 进度气泡和团队面板共享同一份实时 run；当前父运行中的进度卡随团队状态一起刷新。 */
+function syncTeamProgressBubbles(runs) {
+  const parentRunId = String(state.agentParentRunId || '')
+  if (!parentRunId) return
+  const progress = agentTeamProgress(runs)
+  if (!progress.total) return
+  const cards = document.querySelectorAll('.team-progress-card[data-team-progress-run]')
+  for (const card of cards) {
+    const runKey = String(card.getAttribute('data-team-progress-run') || '')
+    if (runKey && runKey !== parentRunId) continue
+    if (!runKey && cards.length > 1) continue
+    // 已完成的员工到 2 分钟会从团队栏注销，实时 run 的总数会变小；
+    // 进度卡不能因此从 4/4 退回 2/2，必须保留已经写入的累计口径。
+    const cardTotal = Math.max(0, Number(card.dataset.teamProgressTotal) || 0)
+    const cardCompleted = Math.max(0, Number(card.dataset.teamProgressCompleted) || 0)
+    const cardFailed = Math.max(0, Number(card.dataset.teamProgressFailed) || 0)
+    const total = Math.max(cardTotal, progress.total)
+    const completed = Math.min(total, Math.max(cardCompleted, progress.completed))
+    const failed = Math.min(total, Math.max(cardFailed, progress.failed))
+    const done = Math.min(total, completed + failed)
+    const remaining = Math.max(0, total - done)
+    const active = Math.max(0, progress.active)
+    const waiting = Math.max(0, progress.waiting)
+    const state = done >= total && active === 0
+      ? '已完成'
+      : waiting > 0
+        ? '等待回复'
+        : active > 0
+          ? '进行中'
+          : '待汇总'
+    applyTeamProgressCard(card, {
+      total,
+      completed,
+      failed,
+      done,
+      remaining,
+      active,
+      waiting,
+      percent: total > 0 ? clampProgressPercent((done / total) * 100) : 0,
+      label: done <= 0
+        ? `已派发 ${total} 个`
+        : failed > 0
+          ? `已结束 ${done} / ${total}`
+          : `已完成 ${done} / ${total}`,
+      detail: failed > 0
+        ? `成功 ${completed} · 失败 ${failed} · 待汇总 ${remaining}`
+        : `已完成 ${completed} · 进行中 ${active + waiting} · 待汇总 ${remaining}`,
+      state,
+      tone: done >= total
+        ? (failed > 0 ? 'is-failed' : 'is-complete')
+        : failed > 0
+          ? 'is-failed'
+          : waiting > 0
+            ? 'is-waiting'
+            : 'is-running',
+      parentRunId,
+    })
+  }
+}
+
+
 /** 子 Agent 完成、且这么久没有新任务，就从团队栏注销（执行资源早已释放）。 */
 const AGENT_TEAM_IDLE_MS = 120000
+/** 用户刚手动点过员工后，短时间内不让新派发/提问抢走右侧焦点。 */
+const AGENT_USER_SELECTION_HOLD_MS = 5000
+
+let workbenchLayoutSignature = ''
+
+function workbenchLayoutStateSignature() {
+  return [
+    state.mode,
+    state.agentRuns.size,
+    Boolean(state.filePreview),
+    Boolean(state.permOpen),
+    state.workbenchCollapsed ? '1' : '0',
+    state.workbenchSplit ? '1' : '0',
+    state.workbenchTab,
+    state.permRequests.todo.length,
+  ].join('|')
+}
 
 function syncWorkbenchLayout() {
   const rail = $('#workbench-rail')
@@ -2549,6 +3462,9 @@ function syncWorkbenchLayout() {
   const permPane = $('#perm-pane')
   const main = $('.chat-main')
   if (!rail || !teamPane || !filePane || !permPane || !main) return
+  const signature = workbenchLayoutStateSignature()
+  if (signature === workbenchLayoutSignature) return
+  workbenchLayoutSignature = signature
 
   const inChat = state.mode === 'chat'
   const hasTeam = inChat && state.agentRuns.size > 0
@@ -3131,6 +4047,8 @@ function bindPermissionPane() {
 function beginParentAgentTurn(runId) {
   const next = String(runId || '').trim()
   if (next) state.agentParentRunId = next
+  const runtime = currentRuntime()
+  if (runtime?.turn) state.parentTeamTurn = runtime.turn
   const title = $('#chat-title')?.textContent?.trim()
   state.agentParentName = title && title !== '新对话' ? title : '当前对话'
   renderAgentDock()
@@ -3246,6 +4164,13 @@ function updateAgentEvent(data) {
       clearTimeout(next.retireTimer)
       next.retireTimer = null
     }
+  } else if (data.action === 'guidance') {
+    // 子 Agent 还在执行时，主 Agent 追加的约束/改方向，也要作为对话线程留痕。
+    pushThreadEntry(thread, {
+      kind: 'guidance',
+      text: String(data.text || '（主 Agent 追加指示）'),
+      at: Date.now(),
+    })
   } else if (data.action === 'done') {
     if (data.text) next.text = String(data.text).slice(0, 2400)
     next.status = data.status === 'unregistered' ? 'done' : (data.status || 'done')
@@ -3304,12 +4229,21 @@ function updateAgentEvent(data) {
   }
 
   state.agentRuns.set(data.childId, next)
-  // 新派发的子 Agent 直接成为详情窗口的焦点，用户不用再找
+  // 子任务的 parentRunId 才是这一批并行工作的真正父 run；团队头部和父气泡
+  // 都按它过滤，避免上一轮已完成的子 Agent 把新一轮显示成 1/4。
+  if (next.parentRunId) state.agentParentRunId = next.parentRunId
+  // 新派发的子 Agent 成为详情焦点，但用户刚手动点过的员工不能被新事件立刻抢走。
+  const userSelectionHeld = Boolean(state.agentUserSelectedAt)
+    && Date.now() - state.agentUserSelectedAt < AGENT_USER_SELECTION_HOLD_MS
+    && Boolean(state.agentSelectedId)
+    && state.agentRuns.has(state.agentSelectedId)
   if (
-    data.action === 'assign' ||
-    data.action === 'question' ||
-    !state.agentSelectedId ||
-    !state.agentRuns.has(state.agentSelectedId)
+    !userSelectionHeld && (
+      data.action === 'assign' ||
+      data.action === 'question' ||
+      !state.agentSelectedId ||
+      !state.agentRuns.has(state.agentSelectedId)
+    )
   ) {
     state.agentSelectedId = data.childId
   }
@@ -3320,21 +4254,23 @@ function updateAgentEvent(data) {
   if (data.action === 'done') scheduleAgentRetire(data.childId, next.updatedAt)
 }
 
-/** 父气泡在等待子 Agent 时的实时进度；有正文/思考后自动让位。 */
+/** 父消息里的进度卡按当前这一批子 Agent 更新；即使父回合已收尾仍保留。 */
 function updateParentAgentProgress() {
-  const runtime = currentRuntime()
-  if (!runtime?.turn) return
   const parentRunId = String(state.agentParentRunId || '')
-  if (!parentRunId || (runtime.runId && runtime.runId !== parentRunId)) return
-  const runs = Array.from(state.agentRuns.values())
-  if (runs.length === 0) return
-  const done = runs.filter((run) => run.status !== 'running' && run.status !== 'waiting').length
-  const active = runs.filter((run) => run.status === 'running' || run.status === 'waiting').length
-  runtime.turn.agentStatus(
-    active > 0
-      ? `子 Agent 并行工作中 · ${done}/${runs.length} 已完成`
-      : '子 Agent 已全部完成 · 正在汇总…',
+  if (!parentRunId) return
+  const turn = state.parentTeamTurn || currentRuntime()?.turn
+  if (!turn || typeof turn.teamProgress !== 'function') return
+  const runs = Array.from(state.agentRuns.values()).filter(
+    (run) => !run.parentRunId || run.parentRunId === parentRunId,
   )
+  if (runs.length === 0) return
+  const progress = agentTeamProgress(runs)
+  turn.teamProgress({
+    ...progress,
+    note: progress.active + progress.waiting > 0
+      ? `子 Agent 并行工作中 · ${progress.completed}/${progress.total} 已完成`
+      : '全部子 Agent 已完成，主 Agent 正在整理最终汇总。',
+  })
 }
 
 /** 子 Agent 对话里模型返回的正文按 Markdown 排版；工具过程和短状态仍保持纯文本。 */
@@ -3342,7 +4278,15 @@ function agentBubbleContent(text) {
   return `<div class="agent-markdown">${renderAnswer(String(text ?? ''))}</div>`
 }
 
-function agentThreadEntryHtml(entry) {
+/** 事件行里显示子 Agent 的短名字，去掉标题里的岗位说明括号。 */
+function agentDisplayName(run) {
+  const title = String(run?.title || '').trim()
+  if (!title) return '子 Agent'
+  return title.replace(/（[^）]*）/g, '').replace(/\([^)]*\)/g, '').trim() || title
+}
+
+function agentThreadEntryHtml(entry, run) {
+  const name = agentDisplayName(run)
   const time = entry.at ? new Date(entry.at).toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit' }) : ''
   if (entry.kind === 'assign') {
     return `<div class="agent-chat-row is-parent">
@@ -3362,11 +4306,20 @@ function agentThreadEntryHtml(entry) {
       <span class="agent-chat-avatar is-parent" aria-hidden="true">主</span>
     </div>`
   }
+  if (entry.kind === 'guidance') {
+    return `<div class="agent-chat-row is-parent">
+      <div class="agent-chat-main">
+        <div class="agent-chat-meta"><span>主 Agent · 追加指示</span>${time ? `<time>${esc(time)}</time>` : ''}</div>
+        <div class="agent-chat-bubble is-parent is-answer is-markdown">${agentBubbleContent(entry.text)}</div>
+      </div>
+      <span class="agent-chat-avatar is-parent" aria-hidden="true">主</span>
+    </div>`
+  }
   if (entry.kind === 'question') {
     return `<div class="agent-chat-row is-agent">
       <span class="agent-chat-avatar is-agent" aria-hidden="true">子</span>
       <div class="agent-chat-main">
-        <div class="agent-chat-meta"><span>子 Agent · 提问</span>${time ? `<time>${esc(time)}</time>` : ''}</div>
+        <div class="agent-chat-meta"><span>${esc(name)} · 提问</span>${time ? `<time>${esc(time)}</time>` : ''}</div>
         <div class="agent-chat-bubble is-question is-markdown">${agentBubbleContent(entry.text)}</div>
       </div>
     </div>`
@@ -3375,13 +4328,13 @@ function agentThreadEntryHtml(entry) {
     return `<div class="agent-chat-row is-agent">
       <span class="agent-chat-avatar is-agent" aria-hidden="true">子</span>
       <div class="agent-chat-main">
-        <div class="agent-chat-meta"><span>子 Agent · 过程记录</span>${time ? `<time>${esc(time)}</time>` : ''}</div>
+        <div class="agent-chat-meta"><span>${esc(name)} · 过程记录</span>${time ? `<time>${esc(time)}</time>` : ''}</div>
         <div class="agent-chat-bubble is-report${entry.error ? ' is-error' : ''} is-markdown">${agentBubbleContent(entry.text)}</div>
       </div>
     </div>`
   }
   if (entry.kind === 'content') {
-    const label = entry.final ? '子 Agent · 回报' : '子 Agent'
+    const label = entry.final ? `${esc(name)} · 回报` : esc(name)
     return `<div class="agent-chat-row is-agent">
       <span class="agent-chat-avatar is-agent" aria-hidden="true">子</span>
       <div class="agent-chat-main">
@@ -3401,7 +4354,7 @@ function agentThreadEntryHtml(entry) {
     </div>`
   }
   if (entry.kind === 'done') {
-    const label = entry.status === 'failed' ? '子 Agent · 失败' : entry.status === 'cancelled' ? '子 Agent · 已取消' : '子 Agent · 完成'
+    const label = entry.status === 'failed' ? `${esc(name)} · 失败` : entry.status === 'cancelled' ? `${esc(name)} · 已取消` : `${esc(name)} · 完成`
     return `<div class="agent-chat-row is-agent">
       <span class="agent-chat-avatar is-agent${entry.status === 'failed' ? ' is-error' : ''}" aria-hidden="true">子</span>
       <div class="agent-chat-main">
@@ -3420,18 +4373,6 @@ function agentStatusShort(status) {
   if (status === 'failed') return '失败'
   if (status === 'cancelled') return '已取消'
   return '运行中'
-}
-
-/** 团队列表里的一行：左边编号，右边标题 + 进度，状态靠右 */
-function agentRoleLabel(role) {
-  const labels = {
-    producer: '产出',
-    critic: '评审',
-    researcher: '调研',
-    builder: '实现',
-    worker: '执行',
-  }
-  return labels[role] || role || '执行'
 }
 
 /** 按 parentKey 拼出团队树，再展平成列表；孤儿节点当根，避免坏数据丢行。 */
@@ -3467,27 +4408,37 @@ function sortAgentRunsAsTree(runs) {
   return flat
 }
 
-function agentListRowHtml(run, selected) {
+function agentListRowModel(run, selected) {
   const status = run.status || 'running'
   const time = run.durationMs ? formatElapsed(run.durationMs) : ''
   const meta = [run.key, `${run.toolCount || 0} 次工具`, time].filter(Boolean).join(' · ')
   const latest = [...(run.thread || [])].reverse().find((entry) => entry.kind === 'content' || entry.kind === 'report')
   const preview = firstLinePreview(latest?.text || run.text || '', 56).slice(0, 48)
   const depth = Math.max(0, Math.min(3, (Number(run.depth) || 1) - 1))
-  return `<button class="agent-row ${agentStatusClass(status)}${selected ? ' is-selected' : ''}" type="button" role="listitem" data-agent-select="${esc(run.childId)}" data-depth="${depth}" aria-current="${selected ? 'true' : 'false'}" title="${esc(run.title)}">
-    <span class="agent-row-index">${String(run.index || 1).padStart(2, '0')}</span>
+  const className = `agent-row ${agentStatusClass(status)}${selected ? ' is-selected' : ''}`
+  const inner = `<span class="agent-row-index">${String(run.index || 1).padStart(2, '0')}</span>
     <span class="agent-row-body">
       <span class="agent-row-line">
-        <strong class="agent-row-title">${esc(run.title)}</strong>
-        <span class="agent-role-badge is-${esc(run.role || 'worker')}">${esc(agentRoleLabel(run.role))}</span>
+        <strong class="agent-row-title">${esc(agentDisplayName(run))}</strong>
       </span>
       <span class="agent-row-meta">
         <span class="agent-row-state"><span class="agent-status-dot" aria-hidden="true"></span>${agentStatusShort(status)}</span>
         <span class="agent-row-meta-text">${esc(meta)}</span>
       </span>
       ${preview ? `<span class="agent-row-preview">${esc(preview)}</span>` : ''}
-    </span>
-  </button>`
+    </span>`
+  return {
+    className,
+    inner,
+    signature: [run.title, status, meta, preview, depth, selected ? '1' : '0'].join('~'),
+    title: run.title,
+    depth,
+  }
+}
+
+function agentListRowHtml(run, selected) {
+  const model = agentListRowModel(run, selected)
+  return `<button class="${model.className}" type="button" role="listitem" data-agent-select="${esc(run.childId)}" data-depth="${model.depth}" aria-current="${selected ? 'true' : 'false'}" title="${esc(run.title)}">${model.inner}</button>`
 }
 
 /**
@@ -3504,7 +4455,7 @@ function agentReasoningPanelHtml(run, entries, index, isLastBlock) {
   const key = agentCotPanelKey(run, 'think', index)
   const expanded = state.agentPanelOpen.get(key) === true
   const active = run.status === 'running' && isLastBlock
-  const preview = firstLinePreview(text, 96)
+  const preview = active ? livePreview(text, 96) : firstLinePreview(text, 96)
   return `<div class="agent-cot-block" data-agent-panel-key="${esc(key)}">
     <div class="think-panel${active ? ' is-active' : ''}${expanded ? '' : ' is-collapsed'}">
       <button class="think-head" type="button" data-agent-cot-toggle="${esc(key)}" aria-expanded="${expanded ? 'true' : 'false'}" aria-label="展开思考过程">
@@ -3546,7 +4497,12 @@ function agentEntryHasVisibleText(entry) {
 
 /** 把连续思考、连续工具调用各自合并成一块；其余消息仍按父子对话气泡展示。 */
 function agentChatThreadHtml(run) {
-  const thread = (Array.isArray(run.thread) ? run.thread : []).filter(agentEntryHasVisibleText)
+  const rawThread = (Array.isArray(run.thread) ? run.thread : []).filter(agentEntryHasVisibleText)
+  // 子 Agent 自己也会在工具失败后重试；跨工具块统一归一化，避免旧失败在
+  // 另一个工具块里仍显示成红色。
+  const toolEntries = rawThread.filter((entry) => entry.kind === 'tool')
+  const visibleToolIds = new Set(normalizeRecoveredToolCalls(toolEntries).map((entry) => entry.id))
+  const thread = rawThread.filter((entry) => entry.kind !== 'tool' || visibleToolIds.has(entry.id))
   const blocks = []
   for (const entry of thread) {
     const kind = entry.kind === 'reasoning' ? 'reasoning' : entry.kind === 'tool' ? 'tool' : ''
@@ -3558,34 +4514,14 @@ function agentChatThreadHtml(run) {
     if (kind) blocks.push({ kind, entries: [entry] })
     else blocks.push({ kind: entry.kind, entry })
   }
-  // 最终回报是这轮工作的结论，先于它前面的思考/工具链展示；
-  // 过程记录落在“子 Agent · 回报”下方，避免结论被一长串 CoT 推到很下面。
-  let finalIndex = -1
-  for (let i = blocks.length - 1; i >= 0; i -= 1) {
-    const block = blocks[i]
-    if (block.kind === 'content' && block.entry?.final) {
-      finalIndex = i
-      break
-    }
-  }
-  if (finalIndex > 0) {
-    let chainStart = finalIndex - 1
-    while (chainStart >= 0 && (blocks[chainStart].kind === 'reasoning' || blocks[chainStart].kind === 'tool')) {
-      chainStart -= 1
-    }
-    chainStart += 1
-    if (chainStart < finalIndex) {
-      const report = blocks[finalIndex]
-      const chain = blocks.slice(chainStart, finalIndex)
-      blocks.splice(chainStart, chain.length + 1, report, ...chain)
-    }
-  }
+  // 严格按事件到达顺序展示：思考/工具出现在对话中间就留在中间，
+  // 出现在回报之后就留在回报之后，不再把最终回报提前。
   return blocks.map((block, index) => {
     if (block.kind === 'reasoning') {
       return agentReasoningPanelHtml(run, block.entries, index, index === blocks.length - 1)
     }
     if (block.kind === 'tool') return agentToolPanelHtml(run, block.entries, index)
-    return agentThreadEntryHtml(block.entry)
+    return agentThreadEntryHtml(block.entry, run)
   }).join('')
 }
 
@@ -3722,7 +4658,6 @@ function agentDetailHtml(run) {
   const model = run.modelName || run.modelId || '自动分配'
   const key = run.key || ''
   const facts = [
-    `<span class="agent-role-badge is-${esc(run.role || 'worker')}">${esc(agentRoleLabel(run.role))}</span>`,
     `<span class="agent-chat-fact" title="${esc(run.modelReason || '')}"><b>${esc(model)}</b></span>`,
     `<span class="agent-chat-fact">${Number(run.toolCount) || 0} 次工具</span>`,
     run.pinned ? '<span class="agent-chat-fact">固定岗位</span>' : '',
@@ -3743,7 +4678,6 @@ function agentDetailHtml(run) {
       <span class="agent-chat-state"><span class="agent-status-dot" aria-hidden="true"></span>${agentStatusText(status)}</span>
     </header>
     <div class="agent-chat-facts">${facts}</div>
-    ${run.acceptance ? `<div class="agent-chat-acceptance" title="${esc(run.acceptance)}">验收：${esc(run.acceptance)}</div>` : ''}
     <div class="agent-chat-thread" role="log" aria-live="polite">
       ${thread || `<p class="agent-chat-placeholder">${status === 'running' ? '等待子 Agent 的第一条消息…' : '还没有对话记录。'}</p>`}
     </div>
@@ -3763,12 +4697,138 @@ function agentDetailHtml(run) {
 
 /** 合并高频子 Agent 事件，避免每个 token 都整块重建工作台。 */
 let agentDockRenderTimer = 0
+/** 右侧详情比左侧列表更重：列表每 40ms 增量更新，详情最多 ~8fps 重建。 */
+const AGENT_DETAIL_RENDER_MS = 120
+let agentDetailRenderTimer = 0
+let agentDetailRenderedAt = 0
+let agentDetailSignature = ''
+
 function scheduleAgentDockRender(delay = 40) {
   if (agentDockRenderTimer) return
   agentDockRenderTimer = setTimeout(() => {
     agentDockRenderTimer = 0
     renderAgentDock()
   }, delay)
+}
+
+/**
+ * 左侧列表按 childId 复用行节点，只更新变化过的文本和状态。
+ * 不能每次 innerHTML 全替换：流式期间行节点会被销毁，用户按下和抬起之间
+ * 节点被换掉，浏览器就不会把 click 派发到行上，表现就是“点了没反应”。
+ */
+function renderAgentList(runs, selectedChildId) {
+  const list = $('#team-list')
+  if (!list) return
+  const existing = new Map()
+  for (const node of list.querySelectorAll('.agent-row')) {
+    const childId = node.getAttribute('data-agent-select') || ''
+    if (childId) existing.set(childId, node)
+  }
+  const ordered = []
+  const desiredIds = new Set()
+  for (const run of runs) {
+    desiredIds.add(run.childId)
+    let row = existing.get(run.childId)
+    if (!row) {
+      row = document.createElement('button')
+      row.type = 'button'
+      row.className = 'agent-row'
+      row.setAttribute('role', 'listitem')
+      row.setAttribute('data-agent-select', run.childId)
+    }
+    const model = agentListRowModel(run, run.childId === selectedChildId)
+    if (row.className !== model.className) row.className = model.className
+    if (row.getAttribute('data-depth') !== String(model.depth)) {
+      row.setAttribute('data-depth', String(model.depth))
+    }
+    row.setAttribute('aria-current', run.childId === selectedChildId ? 'true' : 'false')
+    if (row.title !== model.title) row.title = model.title
+    // 只有内容真的变了才重写行内部；行节点本身始终保留，点击目标不会被换掉。
+    if (row.dataset.agentRowSig !== model.signature) {
+      row.innerHTML = model.inner
+      row.dataset.agentRowSig = model.signature
+    }
+    ordered.push(row)
+  }
+  for (const [childId, row] of existing) {
+    if (!desiredIds.has(childId)) row.remove()
+  }
+  const current = [...list.querySelectorAll('.agent-row')]
+  const inOrder = current.length === ordered.length && current.every((node, index) => node === ordered[index])
+  if (!inOrder) {
+    const fragment = document.createDocumentFragment()
+    for (const row of ordered) fragment.appendChild(row)
+    list.appendChild(fragment)
+  }
+}
+
+function agentDetailRenderSignature(run) {
+  if (!run) return ''
+  const thread = Array.isArray(run.thread) ? run.thread : []
+  const entries = thread.map((entry) => [
+    entry.kind || '',
+    entry.id || '',
+    entry.final ? '1' : '0',
+    entry.status || '',
+    entry.summary || '',
+    String(entry.text || '').length,
+  ].join(':')).join('|')
+  return [
+    run.childId,
+    run.title || '',
+    run.status || '',
+    run.modelId || '',
+    run.modelName || '',
+    Number(run.toolCount) || 0,
+    Number(run.durationMs) || 0,
+    run.error || '',
+    run.pinned ? '1' : '0',
+    String(run.text || '').length,
+    thread.length,
+    entries,
+  ].join('~')
+}
+
+/** 只有详情内容真的变化才重建；流式 token 合并到 ~8fps，避免主线程一直被全量 Markdown 解析占住。 */
+function renderAgentDetail(run, force = false) {
+  const detail = $('#team-detail')
+  if (!detail) return false
+  if (!run) {
+    if (agentDetailRenderTimer) {
+      clearTimeout(agentDetailRenderTimer)
+      agentDetailRenderTimer = 0
+    }
+    detail.innerHTML = ''
+    agentDetailRenderedAt = 0
+    agentDetailSignature = ''
+    return true
+  }
+  const signature = agentDetailRenderSignature(run)
+  const now = Date.now()
+  if (!force && signature === agentDetailSignature) return false
+  if (!force && agentDetailRenderedAt && now - agentDetailRenderedAt < AGENT_DETAIL_RENDER_MS) {
+    if (!agentDetailRenderTimer) {
+      const wait = AGENT_DETAIL_RENDER_MS - (now - agentDetailRenderedAt)
+      agentDetailRenderTimer = setTimeout(() => {
+        agentDetailRenderTimer = 0
+        const current = state.agentRuns.get(state.agentSelectedId)
+        if (!current) return
+        captureAgentThreadScroll(current.childId)
+        const rendered = renderAgentDetail(current, true)
+        if (rendered) restoreAgentThreadScroll(current.childId)
+      }, wait)
+    }
+    return false
+  }
+  if (agentDetailRenderTimer) {
+    clearTimeout(agentDetailRenderTimer)
+    agentDetailRenderTimer = 0
+  }
+  if (!force) captureAgentThreadScroll(run.childId)
+  detail.innerHTML = agentDetailHtml(run)
+  agentDetailSignature = signature
+  agentDetailRenderedAt = Date.now()
+  return true
 }
 
 function renderAgentDock() {
@@ -3782,73 +4842,87 @@ function renderAgentDock() {
   const empty = $('#team-empty')
   if (empty) empty.hidden = runs.length > 0
   if (split) split.hidden = runs.length === 0
-  let selectedChildId = ''
-  let selectionChanged = false
   if (runs.length === 0) {
     if (state.agentSelectedId) state.agentScroll.delete(state.agentSelectedId)
     state.agentSelectedId = ''
-    list.innerHTML = ''
-    detail.innerHTML = ''
+    renderAgentList([], '')
+    renderAgentDetail(null, true)
     if (summary) summary.textContent = '等待派发'
-  } else {
-    const active = runs.filter((run) => (run.status || 'running') === 'running').length
-    const waiting = runs.filter((run) => run.status === 'waiting').length
-    const capacity = state.agentCapacity && Number(state.agentCapacity.limit) > 0
-      ? ` / ${Number(state.agentCapacity.limit)} 岗位`
-      : ''
-    if (summary) {
-      summary.textContent = waiting > 0
-        ? `${active} 工作中 · ${waiting} 待回答 · 共 ${runs.length}${capacity}`
-        : active > 0
-          ? `${active} 工作中 · 共 ${runs.length}${capacity}`
-          : `${runs.length}${capacity} · 已全部完成`
-    }
-    const parent = $('#team-manager-name')
-    if (parent) parent.textContent = `主 Agent · ${state.agentParentName || '当前对话'}`
-    // 选中项失效（被注销）时回落到运行中的第一个，否则第一个
-    const previousSelectedId = state.agentSelectedId
-    let selected = runs.find((run) => run.childId === state.agentSelectedId)
-    if (!selected) {
-      selected = runs.find((run) => (run.status || 'running') === 'running')
-        || runs.find((run) => run.status === 'waiting')
-        || runs[0]
-      state.agentSelectedId = selected.childId
-    }
-    selectedChildId = selected.childId
-    selectionChanged = selected.childId !== previousSelectedId
-    if (selectionChanged) {
-      // 已完成的窗口被用户切走后，才按空闲期收尾；当前选中窗口一直保留，
-      // 这样用户还能上滑看父子对话历史，不会被 2 分钟自动注销打断。
-      const previous = state.agentRuns.get(previousSelectedId)
-      if (previous && (previous.status || 'running') !== 'running' && previous.status !== 'waiting') {
-        scheduleAgentRetire(previousSelectedId, previous.updatedAt || Date.now())
-      }
-      // 和主对话切换会话一致：切到另一个子 Agent 时从最新消息开始看。
-      const scroll = agentThreadState(selected.childId)
-      scroll.pinned = true
-      scroll.hasNew = false
-      scroll.top = 0
-      scroll.scrollHeight = 0
-    } else {
-      // 流式重渲染前先保住用户当前的位置，渲染后按同一状态还原。
-      captureAgentThreadScroll(selected.childId)
-    }
-    list.innerHTML = runs.map((run) => agentListRowHtml(run, run.childId === selected.childId)).join('')
-    detail.innerHTML = agentDetailHtml(selected)
+    syncWorkbenchLayout()
+    return
   }
+  syncTeamProgressBubbles(runs)
+  const active = runs.filter((run) => (run.status || 'running') === 'running').length
+  const waiting = runs.filter((run) => run.status === 'waiting').length
+  const capacity = state.agentCapacity && Number(state.agentCapacity.limit) > 0
+    ? ` / ${Number(state.agentCapacity.limit)} 岗位`
+    : ''
+  if (summary) {
+    summary.textContent = waiting > 0
+      ? `${active} 工作中 · ${waiting} 待回答 · 共 ${runs.length}${capacity}`
+      : active > 0
+        ? `${active} 工作中 · 共 ${runs.length}${capacity}`
+        : `${runs.length}${capacity} · 已全部完成`
+  }
+  const parent = $('#team-manager-name')
+  if (parent) parent.textContent = `主 Agent · ${state.agentParentName || '当前对话'}`
+  // 选中项失效（被注销）时回落到运行中的第一个，否则第一个
+  const previousSelectedId = state.agentSelectedId
+  let selected = runs.find((run) => run.childId === state.agentSelectedId)
+  if (!selected) {
+    selected = runs.find((run) => (run.status || 'running') === 'running')
+      || runs.find((run) => run.status === 'waiting')
+      || runs[0]
+    state.agentSelectedId = selected.childId
+  }
+  const selectionChanged = selected.childId !== previousSelectedId
+  if (selectionChanged) {
+    // 已完成的窗口被用户切走后，才按空闲期收尾；当前选中窗口一直保留，
+    // 这样用户还能上滑看父子对话历史，不会被 2 分钟自动注销打断。
+    // 这里从“现在”重新计 2 分钟，避免点一下就让上一个员工立刻从列表消失。
+    const previous = state.agentRuns.get(previousSelectedId)
+    if (previous && (previous.status || 'running') !== 'running' && previous.status !== 'waiting') {
+      scheduleAgentRetire(previousSelectedId, Date.now())
+    }
+    // 和主对话切换会话一致：切到另一个子 Agent 时从最新消息开始看。
+    const scroll = agentThreadState(selected.childId)
+    scroll.pinned = true
+    scroll.hasNew = false
+    scroll.top = 0
+    scroll.scrollHeight = 0
+  }
+  renderAgentList(runs, selected.childId)
+  const detailRendered = renderAgentDetail(selected, selectionChanged)
   syncWorkbenchLayout()
-  if (selectedChildId) restoreAgentThreadScroll(selectedChildId, selectionChanged)
+  if (detailRendered) restoreAgentThreadScroll(selected.childId, selectionChanged)
+}
+
+/** 团队行选中：pointerdown 就先切，不等 click；键盘/无障碍仍走 click。 */
+function selectAgentChild(childId) {
+  if (!childId || !state.agentRuns.has(childId)) return false
+  state.agentUserSelectedAt = Date.now()
+  if (state.agentSelectedId === childId) return true
+  state.agentSelectedId = childId
+  renderAgentDock()
+  return true
 }
 
 function resetAgentRuns() {
   for (const run of state.agentRuns.values()) {
     if (run.retireTimer) clearTimeout(run.retireTimer)
   }
+  if (agentDetailRenderTimer) {
+    clearTimeout(agentDetailRenderTimer)
+    agentDetailRenderTimer = 0
+  }
   state.agentRuns.clear()
   state.agentScroll.clear()
   state.agentSelectedId = ''
+  state.agentUserSelectedAt = 0
   state.agentParentRunId = ''
   state.agentParentName = ''
+  agentDetailRenderedAt = 0
+  agentDetailSignature = ''
   renderAgentDock()
 }
 
@@ -5370,7 +6444,10 @@ async function openWorkspaceFile(id, options = {}) {
   $('#file-pane-kicker').textContent = split ? '对话内预览' : '云空间'
   $('#file-pane-name').textContent = file.name
   const meta = [fmtSize(file.size), `更新于 ${workspaceFileDate(file.updatedAt)}`, file.shared ? '共享文件' : '个人文件', file.relPath]
-  $('#file-pane-meta').textContent = meta.filter(Boolean).join(' · ')
+  const metaText = meta.filter(Boolean).join(' · ')
+  const metaBox = $('#file-pane-meta')
+  metaBox.textContent = metaText
+  metaBox.title = metaText
   if (!split) $('#chat-title').textContent = `云空间 · ${file.name}`
   else $('#chat-title').textContent = state.sessionId ? '对话' : '新对话'
   const owner = file.ownerUserId === state.me?.person?.id
@@ -6172,13 +7249,18 @@ function bindWorkbenchTabs() {
     $('#workbench-collapse')?.focus()
   })
   // 子 Agent 列表：点哪一行，右边的详情窗口就切到哪个 Agent 的工作过程。
+  // 用 pointerdown 先选中：流式期间行节点即使被更新，也不会因为 click 跨帧丢失而“点了没反应”。
+  $('#team-list')?.addEventListener('pointerdown', (event) => {
+    if (event.button !== 0) return
+    const row = event.target.closest('[data-agent-select]')
+    if (!row) return
+    selectAgentChild(row.getAttribute('data-agent-select') || '')
+  })
+  // 键盘 Enter/Space 和辅助技术仍通过 click 选中；已经选中时 selectAgentChild 不会重复渲染。
   $('#team-list')?.addEventListener('click', (event) => {
     const row = event.target.closest('[data-agent-select]')
     if (!row) return
-    const childId = row.getAttribute('data-agent-select') || ''
-    if (!state.agentRuns.has(childId)) return
-    state.agentSelectedId = childId
-    renderAgentDock()
+    selectAgentChild(row.getAttribute('data-agent-select') || '')
   })
   // 子 Agent 的思考/工具入口：和主对话一样单行折叠，点一下展开完整内容。
   $('#team-detail')?.addEventListener('click', (event) => {
@@ -6459,7 +7541,9 @@ function uploadWorkspaceFileWithProgress(file, contentBase64, onProgress) {
     }
     xhr.onerror = () => reject(new Error('网络中断，文件未上传'))
     xhr.onabort = () => reject(new Error('上传已取消'))
+    const parent = workspaceNormalizePath(state.workspacePath)
     xhr.send(JSON.stringify({
+      path: parent ? `${parent}/${file.name}` : file.name,
       name: file.name,
       mime: file.type || undefined,
       contentBase64,
@@ -6662,7 +7746,12 @@ async function showMemories() {
     }
     for (const button of overlay.querySelectorAll('[data-mem-del]')) {
       button.addEventListener('click', async () => {
-        await api(`/api/memories/${encodeURIComponent(button.dataset.memDel)}`, { method: 'DELETE' }).catch(() => null)
+        try {
+          await api(`/api/memories/${encodeURIComponent(button.dataset.memDel)}`, { method: 'DELETE' })
+          banner('记忆已删除', 'ok')
+        } catch (err) {
+          banner(err.message || '删除失败', 'bad')
+        }
         await refresh()
       })
     }
@@ -8941,7 +10030,30 @@ function unsavedAttachmentHtml(file) {
   </div>`
 }
 
+function folderAttachmentHtml(file) {
+  const name = attachmentDisplayName(file)
+  const path = String(file?.workspaceRelPath || file?.workspaceFolderPath || '').trim()
+  return `<div class="bubble-attach is-folder" role="group" aria-label="云空间文件夹 ${esc(name)}"${path ? ` data-folder-ref="${esc(path)}"` : ''}>
+    <span class="bubble-attach-icon" aria-hidden="true">${WORKSPACE_FOLDER_ICON}</span>
+    <span class="bubble-attach-body"><span class="bubble-attach-name">${esc(name)}</span><span class="bubble-attach-meta">${path ? `${esc(path)} · ` : ''}云空间文件夹</span></span>
+  </div>`
+}
+
+function conversationAttachmentHtml(file) {
+  const title = attachmentDisplayName(file)
+  const count = Math.max(0, Number(file?.conversationMessageCount) || 0)
+  const meta = count
+    ? `最近 ${formatCount(count)} 条消息${file?.conversationIsCurrent ? ' · 本对话' : ''}`
+    : file?.conversationIsCurrent ? '本对话历史' : '对话历史'
+  return `<div class="bubble-attach is-conversation" role="group" aria-label="对话引用 ${esc(title)}">
+    <span class="bubble-attach-icon" aria-hidden="true">${CONVERSATION_ICON}</span>
+    <span class="bubble-attach-body"><span class="bubble-attach-name">${esc(title)}</span><span class="bubble-attach-meta">${esc(meta)} · 对话引用</span></span>
+  </div>`
+}
+
 function attachmentCardHtml(file) {
+  if (file?.conversationId) return conversationAttachmentHtml(file)
+  if (file?.workspaceKind === 'folder') return folderAttachmentHtml(file)
   const status = String(file?.workspaceStatus || '')
   const id = String(file?.workspaceFileId || '').trim()
   const name = attachmentDisplayName(file)
@@ -8961,7 +10073,7 @@ function attachmentCardHtml(file) {
   }
   if (isRasterImageAttachment(file)) {
     const url = attachmentPreviewUrl(file)
-    return `<button class="bubble-attach is-image" type="button" data-attachment-open="${esc(id)}" data-attachment-file-id="${esc(id)}" data-attachment-name="${esc(name)}" data-attachment-size="${esc(size)}" aria-label="预览图片 ${esc(name)}">
+    return `<button class="bubble-attach is-image" type="button" data-attachment-open="${esc(id)}" data-attachment-file-id="${esc(id)}" data-attachment-name="${esc(name)}" data-attachment-size="${esc(size)}" data-attachment-image-src="${esc(url)}" aria-label="预览图片 ${esc(name)}">
       <img src="${esc(url)}" alt="${esc(name)}" loading="lazy" decoding="async">
       <span class="bubble-attach-caption"><span class="bubble-attach-name">${esc(name)}</span><span class="bubble-attach-meta">${esc(size)} · 点击预览</span></span>
     </button>`
@@ -8987,6 +10099,57 @@ function attachmentChips(list) {
   return cards + batches
 }
 
+let imageLightboxReturnFocus = null
+
+function closeImageLightbox() {
+  const overlay = document.getElementById('image-lightbox')
+  if (!overlay || overlay.hidden) return
+  overlay.hidden = true
+  document.body.classList.remove('is-image-lightbox-open')
+  if (imageLightboxReturnFocus && typeof imageLightboxReturnFocus.focus === 'function') {
+    imageLightboxReturnFocus.focus()
+  }
+  imageLightboxReturnFocus = null
+}
+
+function openImageLightbox(src, name = '图片') {
+  const url = String(src || '').trim()
+  if (!url) return
+  let overlay = document.getElementById('image-lightbox')
+  if (!overlay) {
+    overlay = document.createElement('div')
+    overlay.id = 'image-lightbox'
+    overlay.className = 'image-lightbox'
+    overlay.hidden = true
+    overlay.innerHTML = `<div class="image-lightbox-dialog" role="dialog" aria-modal="true" aria-label="图片预览">
+      <div class="image-lightbox-head">
+        <span class="image-lightbox-name"></span>
+        <button class="image-lightbox-close" type="button" data-image-lightbox-close aria-label="关闭图片预览">×</button>
+      </div>
+      <div class="image-lightbox-body"><img alt=""></div>
+    </div>`
+    overlay.addEventListener('click', (event) => {
+      if (event.target === overlay || event.target.closest('[data-image-lightbox-close]')) closeImageLightbox()
+    })
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape' && !overlay.hidden) closeImageLightbox()
+    })
+    document.body.appendChild(overlay)
+  }
+  const image = overlay.querySelector('img')
+  const title = overlay.querySelector('.image-lightbox-name')
+  if (image) {
+    image.src = url
+    image.alt = name
+  }
+  if (title) title.textContent = name
+  imageLightboxReturnFocus = document.activeElement
+  overlay.hidden = false
+  document.body.classList.add('is-image-lightbox-open')
+  const closeButton = overlay.querySelector('[data-image-lightbox-close]')
+  if (closeButton && typeof closeButton.focus === 'function') closeButton.focus()
+}
+
 /** 消息气泡里的附件卡用事件委托，重绘 innerHTML 后仍可点击。 */
 function bindAttachmentCards(node) {
   if (!node || node.dataset.attachmentClickBound === '1') return
@@ -8995,6 +10158,12 @@ function bindAttachmentCards(node) {
     const button = event.target.closest('[data-attachment-open]')
     if (!button || !node.contains(button)) return
     event.preventDefault()
+    const imageSrc = String(button.dataset.attachmentImageSrc || '').trim()
+    if (imageSrc) {
+      // 图片直接走即时大图，不再等右侧文件预览的能力探测；小图卡片仍停留在消息里。
+      openImageLightbox(imageSrc, String(button.dataset.attachmentName || '图片'))
+      return
+    }
     void openWorkspaceFile(String(button.dataset.attachmentOpen || ''))
   })
 }
@@ -9055,6 +10224,39 @@ function firstLinePreview(text, maxLength = 96) {
   let first = lines[0]
   if (first.length < 24 && lines[1]) first = `${first} ${lines[1]}`
   return first.length > maxLength ? `${first.slice(0, maxLength).trimEnd()}…` : first
+}
+
+/**
+ * 流式思考预览取最新一段：长段落没有换行时，首行摘要会一直停在开头，
+ * 看起来像思考卡住了。结束后仍由 firstLinePreview 收回首行摘要。
+ */
+function livePreview(text, maxLength = 96) {
+  const normalized = String(text || '')
+    .replace(/\*\*/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!normalized) return ''
+  return normalized.length > maxLength ? `…${normalized.slice(-maxLength).trimStart()}` : normalized
+}
+
+/**
+ * 一个回合里工具失败后，Agent 往往马上换参数或换工具重试。中间尝试不参与
+ * 最终状态：后续已有成功或仍在执行的调用时，前面的失败直接隐藏；如果全都
+ * 失败，也只保留最后一次失败作为未恢复的最终错误，避免整轮工具面板变红。
+ */
+function normalizeRecoveredToolCalls(tools) {
+  if (!Array.isArray(tools)) return []
+  let lastLive = -1
+  let lastError = -1
+  tools.forEach((tool, index) => {
+    if (tool?.status === 'done' || tool?.status === 'running') lastLive = index
+    if (tool?.status === 'error') lastError = index
+  })
+  return tools.filter((tool, index) => {
+    if (tool?.status !== 'error') return true
+    if (index < lastLive) return false
+    return index === lastError
+  })
 }
 
 function toolStatusText(trace) {
@@ -10233,9 +11435,10 @@ document.addEventListener('click', (event) => {
 
 /** 工具调用收成和思考一样的单行入口：默认只留 `工具 · 摘要`，展开了再看完整工具明细。 */
 function toolPanelHtml(tools, { active = false, expanded = false } = {}) {
-  if (!Array.isArray(tools) || tools.length === 0) return ''
-  const preview = toolPanelPreview(tools, active)
-  const hasError = tools.some((tool) => tool.status === 'error')
+  const visibleTools = normalizeRecoveredToolCalls(tools)
+  if (visibleTools.length === 0) return ''
+  const preview = toolPanelPreview(visibleTools, active)
+  const hasError = visibleTools.some((tool) => tool.status === 'error')
   const title = active ? '工具调用中' : '工具'
   return `<div class="tool-panel${active ? ' is-active' : ''}${hasError ? ' is-error' : ''}${expanded ? '' : ' is-collapsed'}" data-tool-panel>
     <button class="tool-head" type="button" aria-expanded="${expanded ? 'true' : 'false'}" aria-label="展开工具调用明细">
@@ -10245,7 +11448,7 @@ function toolPanelHtml(tools, { active = false, expanded = false } = {}) {
       <span class="tool-preview">${esc(preview)}</span>
       <span class="tool-chevron">⌄</span>
     </button>
-    <div class="tool-body">${tools.map((trace) => toolDetailHtml(trace)).join('')}</div>
+    <div class="tool-body">${visibleTools.map((trace) => toolDetailHtml(trace)).join('')}</div>
   </div>`
 }
 
@@ -10286,17 +11489,66 @@ function historyMetaText(meta) {
 
 function historyAiBubble(text, meta, rich, options = {}) {
   const reasoning = String(rich?.reasoning || '').trim()
-  const tools = Array.isArray(rich?.toolCalls) ? rich.toolCalls : []
+  const tools = normalizeRecoveredToolCalls(Array.isArray(rich?.toolCalls) ? rich.toolCalls : [])
   const channel = channelTag(rich?.channel)
   const clarify = rich?.clarify && typeof rich.clarify === 'object' ? rich.clarify : null
   const metaText = historyMetaText(meta)
-  const body = clarify && options.pendingClarify
+  const progressValue = rich?.teamProgress && typeof rich.teamProgress === 'object'
+    ? rich.teamProgress
+    : (rich?.progress && typeof rich.progress === 'object' ? rich.progress : null)
+  const progressCard = progressValue ? teamProgressCardHtml(progressValue, progressValue.note || '') : ''
+  const memoryCard = memorySourceHtml(rich?.memoryHits, rich?.memoryScope)
+  const answerBody = clarify && options.pendingClarify
     ? clarifyInlineNote()
     : `<div class="answer-text">${renderAnswer(text, { omitCodeBlocks: writtenFileContentBlocks(tools) })}</div>`
+  // 父消息同时有正文和进度卡时两份都要保留：进度卡紧跟在工具调用
+  // 摘要下方、正文之前，先看子 Agent 进度，再读最终结论。
+  const body = progressCard
+    ? `${progressCard}${String(text || '').trim() ? answerBody : ''}`
+    : answerBody
   return `${reasoning ? thinkPanelHtml(reasoning) : ''}
     ${tools.length > 0 ? toolPanelHtml(tools) : ''}
+    ${memoryCard}
     ${body}
     ${metaText || channel ? `<span class="meta">${channel}${metaText ? esc(metaText) : ''}</span>` : ''}`
+}
+
+function memoryStamp(value) {
+  const date = value ? new Date(value) : null
+  if (!date || Number.isNaN(date.getTime())) return ''
+  const pad = (number) => String(number).padStart(2, '0')
+  return `${date.getMonth() + 1}月${date.getDate()}日 ${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
+/** 助手回复引用到的历史记忆来源；默认折叠，避免抢占正文阅读。 */
+function memorySourceHtml(hitsInput, scopeInput) {
+  const hits = Array.isArray(hitsInput) ? hitsInput.filter((hit) => hit && typeof hit === 'object').slice(0, 5) : []
+  if (hits.length === 0) return ''
+  // 旧消息没有 memoryScope 时按“历史对话”展示；新消息明确 session 时才标为本会话。
+  const scope = scopeInput === 'session' ? 'session' : 'history'
+  const summary = scope === 'session'
+    ? `参考了 ${hits.length} 段本会话记忆`
+    : `参考了 ${hits.length} 段历史对话`
+  const items = hits.map((hit) => {
+    const title = String(hit.sessionTitle || '历史对话').trim() || '历史对话'
+    const stamp = memoryStamp(hit.createdAt)
+    const excerpt = String(hit.excerpt || '').trim()
+    return `<div class="memory-item">
+      <span class="memory-item-title">会话「${esc(title)}」</span>
+      ${stamp ? `<span class="memory-item-time">${esc(stamp)}</span>` : ''}
+      ${excerpt ? `<span class="memory-item-excerpt">${esc(excerpt)}</span>` : ''}
+    </div>`
+  }).join('')
+  return `<div class="memory-panel is-collapsed">
+    <button class="memory-head" type="button" aria-expanded="false" aria-label="展开历史记忆来源">
+      <span class="memory-icon" aria-hidden="true">◈</span>
+      <span class="memory-title">记忆</span>
+      <span class="memory-divider">·</span>
+      <span class="memory-summary">${summary}</span>
+      <span class="memory-chevron" aria-hidden="true">⌄</span>
+    </button>
+    <div class="memory-body">${items}</div>
+  </div>`
 }
 
 /** AI 没有足够方向时给出的结构化问题：单选、多选、填空或多题题组。 */
@@ -10399,6 +11651,45 @@ function isHiddenClarifyStep(message) {
   if (!message?.meta) return false
   if (message.role === 'user') return Boolean(message.meta.clarifyFlowId)
   return message.role === 'assistant' && Boolean(message.meta.clarify)
+}
+
+/**
+ * 团队进度消息不再作为独立 assistant 气泡显示：它的 teamProgress 会合并到
+ * 前面那条真正派发子 Agent 的父消息里。没有工具调用的 assistant 消息就是
+ * 后端为持久化进度单独写的卡片行。
+ */
+function isStandaloneTeamProgressMessage(message) {
+  const meta = message?.meta
+  if (message?.role !== 'assistant' || !meta || !meta.teamProgress || typeof meta.teamProgress !== 'object') {
+    return false
+  }
+  if (meta.backgroundWake !== true && meta.progress !== true) return false
+  return !Array.isArray(meta.toolCalls) || meta.toolCalls.length === 0
+}
+
+function rememberPendingTeamProgress(message) {
+  if (!message?.meta?.teamProgress) return false
+  state.pendingTeamProgress = {
+    ...message.meta.teamProgress,
+    note: message.meta.teamProgress.note || message.text || '',
+  }
+  return true
+}
+
+/**
+ * 父消息自己没带 teamProgress（旧历史或同步续派）时，把紧邻的进度卡补进
+ * 下一条带工具调用的 assistant 消息，保证刷新后进度仍显示在派活消息里。
+ */
+function teamProgressForMessage(message) {
+  if (message?.role !== 'assistant') return null
+  const own = message.meta?.teamProgress
+  if (own && typeof own === 'object') return own
+  const pending = state.pendingTeamProgress
+  if (!pending) return null
+  const tools = Array.isArray(message.meta?.toolCalls) ? message.meta.toolCalls : []
+  if (tools.length === 0) return null
+  state.pendingTeamProgress = null
+  return pending
 }
 
 function newClarifyFlowId() {
@@ -11009,11 +12300,11 @@ async function runClarifyStep(flow, answer, answeredClarify) {
 }
 
 function bindToolToggles(node) {
-  for (const button of node.querySelectorAll('.tool-head, .think-head')) {
+  for (const button of node.querySelectorAll('.tool-head, .think-head, .memory-head')) {
     if (button.dataset.bound === 'true') continue
     button.dataset.bound = 'true'
     button.addEventListener('click', () => {
-      const panel = button.closest('.tool-panel, .tool-card, .think-panel')
+      const panel = button.closest('.tool-panel, .tool-card, .think-panel, .memory-panel')
       if (!panel) return
       const collapsed = panel.classList.toggle('is-collapsed')
       button.setAttribute('aria-expanded', collapsed ? 'false' : 'true')
@@ -11167,6 +12458,8 @@ function createAiTurn(options = {}) {
       <div class="think-body"></div>
     </div>
     <div class="tool-slot" hidden></div>
+    <div class="ai-team-progress" hidden></div>
+    <div class="memory-slot" hidden></div>
     <div class="ai-status"><span class="ai-status-dot"></span><span class="ai-status-text">正在思考中…</span></div>
     <div class="ai-waiting" hidden><span class="ai-waiting-dot"></span><span class="ai-waiting-text">等待回复中…</span></div>
     <div class="clarify-slot" hidden></div>
@@ -11188,6 +12481,8 @@ function createAiTurn(options = {}) {
   const toolPanel = node.querySelector('.tool-slot')
   const status = node.querySelector('.ai-status')
   const statusText = node.querySelector('.ai-status-text')
+  const teamProgress = node.querySelector('.ai-team-progress')
+  const memorySlot = node.querySelector('.memory-slot')
   const answer = node.querySelector('.answer-text')
   const metaLine = node.querySelector('.meta')
   const clarifySlot = node.querySelector('.clarify-slot')
@@ -11235,16 +12530,41 @@ function createAiTurn(options = {}) {
       if (node.isConnected && threadScrollPinned) scrollThreadToBottomInstant()
     }, 120)
   }
-  const setStatus = (text) => {
+  const setParentTeamProgress = (progressInput) => {
+    if (!teamProgress) return
+    const progress = normalizeTeamProgress(progressInput)
+    if (!progress) {
+      teamProgress.hidden = true
+      teamProgress.innerHTML = ''
+      return
+    }
+    // 父消息里显示与团队面板、独立进度卡完全同构的完整卡，而不是另一套简化条。
+    let card = teamProgress.querySelector('.team-progress-card')
+    if (!card) {
+      teamProgress.innerHTML = teamProgressCardHtml(progress)
+      card = teamProgress.querySelector('.team-progress-card')
+    }
+    if (card) applyTeamProgressCard(card, progress)
+    teamProgress.hidden = false
+  }
+  const setMemorySources = (hits, scope) => {
+    if (!memorySlot) return
+    const html = memorySourceHtml(hits, scope)
+    memorySlot.innerHTML = html
+    memorySlot.hidden = !html
+    if (html) bindToolToggles(node)
+  }
+  const setStatus = (text, progressInput) => {
     if (!text) {
       status.hidden = true
       return
     }
     status.hidden = false
     statusText.textContent = text
+    if (progressInput) setParentTeamProgress(progressInput)
   }
-  const setThinkPreview = (text) => {
-    const preview = firstLinePreview(text, 96)
+  const setThinkPreview = (text, streaming = false) => {
+    const preview = streaming ? livePreview(text, 96) : firstLinePreview(text, 96)
     thinkPreview.textContent = preview
     thinkDivider.hidden = !preview
   }
@@ -11469,18 +12789,22 @@ function createAiTurn(options = {}) {
       think.classList.add('is-active')
       thinkBody.textContent += text
       thinkTitle.textContent = '思考中'
-      setThinkPreview(thinkBody.textContent)
+      setThinkPreview(thinkBody.textContent, true)
       setStatus('')
       thinkBody.scrollTop = thinkBody.scrollHeight
       scroll()
     },
     /** 父 Agent 等待子 Agent 时的轻量状态；一旦有思考或正文就让位。 */
-    agentStatus(text) {
+    agentStatus(text, progress) {
       if (!text) return
       if (rawAnswer) return
       // 思考流式展开时不抢状态位；收起后继续显示子 Agent 进度。
       if (!think.hidden && think.classList.contains('is-active')) return
-      setStatus(text)
+      setStatus(text, progress)
+    },
+    /** 团队进度卡独立于状态行存在；正文、思考结束后仍要保留在父消息里。 */
+    teamProgress(progress) {
+      setParentTeamProgress(progress)
     },
     content(text) {
       if (!text) return
@@ -11576,6 +12900,7 @@ function createAiTurn(options = {}) {
     },
     finish(data) {
       setStatus('')
+      if (data?.teamProgress) setParentTeamProgress(data.teamProgress)
       if (data?.createdAt) setMessageTime(node, data.createdAt)
       refreshMessageActions(node)
       mergeDoneDetails(data)
@@ -11592,6 +12917,7 @@ function createAiTurn(options = {}) {
         showClarifyPrompt(data.clarify)
       } else {
         hideWaiting()
+        setMemorySources(data?.memoryHits || [], data?.memoryScope)
         clarifySlot.hidden = true
         clarifySlot.innerHTML = ''
         const finalText = String(data?.text || '').trim()
@@ -11678,6 +13004,257 @@ function renderDenied(err) {
 
 const MAX_FILES = 4
 const MAX_FILE_SIZE = 10 * 1024 * 1024
+const WORKSPACE_DRAG_MIME = 'application/x-eab-workspace-ref'
+const CONVERSATION_DRAG_MIME = 'application/x-eab-conversation-ref'
+const WORKSPACE_FOLDER_ICON =
+  '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 6.5A2 2 0 0 1 5.5 4.5h4l2 2h7A2 2 0 0 1 20.5 8.5v9A2 2 0 0 1 18.5 19.5h-13A2 2 0 0 1 3.5 17.5v-11Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>'
+const CONVERSATION_ICON =
+  '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3h11A2.5 2.5 0 0 1 20 5.5v7A2.5 2.5 0 0 1 17.5 15H10l-4.5 3v-3.5A2.5 2.5 0 0 1 4 12.5v-7Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M8 7.5h8M8 10.2h5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>'
+
+function workspaceFolderSummaryText(file) {
+  const fileCount = Number(file?.workspaceFileCount ?? file?.fileCount) || 0
+  const folderCount = Number(file?.workspaceFolderCount ?? file?.folderCount) || 0
+  return [
+    fileCount ? `${fileCount} 个文件` : '',
+    folderCount ? `${folderCount} 个子文件夹` : '',
+  ]
+    .filter(Boolean)
+    .join(' · ') || '空文件夹'
+}
+
+function workspaceAttachmentKey(file) {
+  if (!file) return ''
+  if (file.workspaceKind === 'folder' || file.workspaceFolderPath) {
+    return `folder:${workspaceNormalizePath(file.workspaceFolderPath || file.workspaceRelPath)}`
+  }
+  const id = String(file.workspaceFileId || '').trim()
+  return id ? `file:${id}` : ''
+}
+
+/** 拖进输入区后按会话保存的引用；本机临时文件不在此列。 */
+function isPersistentAttachment(file) {
+  return file?.persistent === true
+}
+
+function persistentReferencePayload(list = state.attachments) {
+  return (Array.isArray(list) ? list : [])
+    .filter(isPersistentAttachment)
+    .map((file) => {
+      const conversationId = String(file.conversationId || '').trim()
+      if (conversationId) {
+        return {
+          conversationId,
+          conversationTitle: String(file.conversationTitle || file.name || '').trim(),
+        }
+      }
+      if (file.workspaceKind === 'folder' || file.workspaceFolderPath) {
+        return {
+          name: String(file.name || '').trim(),
+          workspaceKind: 'folder',
+          workspaceFolderPath: workspaceNormalizePath(file.workspaceFolderPath || file.workspaceRelPath || ''),
+          workspaceFileCount: Number(file.workspaceFileCount) || 0,
+          workspaceFolderCount: Number(file.workspaceFolderCount) || 0,
+          size: 0,
+          type: 'inode/directory',
+        }
+      }
+      const workspaceFileId = String(file.workspaceFileId || '').trim()
+      if (!workspaceFileId) return null
+      return {
+        name: String(file.name || '').trim(),
+        workspaceKind: 'file',
+        workspaceFileId,
+        workspaceRelPath: String(file.workspaceRelPath || '').trim(),
+        workspaceMime: file.workspaceMime ?? file.type ?? null,
+        size: Number(file.size) || 0,
+        type: String(file.type || 'application/octet-stream'),
+      }
+    })
+    .filter(Boolean)
+}
+
+/** 每个会话的 PUT 串行执行，快速增删时后一次状态不会被前一次覆盖。 */
+const sessionReferenceSync = new Map()
+
+function syncSessionReferences() {
+  const sessionId = state.sessionId
+  if (!sessionId) return Promise.resolve()
+  const references = persistentReferencePayload()
+  const previous = sessionReferenceSync.get(sessionId) || Promise.resolve()
+  const task = previous
+    .catch(() => {})
+    .then(() =>
+      api(`/api/chat/sessions/${encodeURIComponent(sessionId)}/references`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ references }),
+      }),
+    )
+    .then(() => {})
+    .catch((err) => {
+      if (state.sessionId === sessionId) banner(`引用保存失败：${err.message}`, 'warn')
+    })
+  sessionReferenceSync.set(sessionId, task)
+  void task.finally(() => {
+    if (sessionReferenceSync.get(sessionId) === task) sessionReferenceSync.delete(sessionId)
+  })
+  return task
+}
+
+async function waitSessionReferenceSync(sessionId) {
+  const task = sessionReferenceSync.get(sessionId)
+  if (task) await task
+}
+
+function clearComposerAttachments() {
+  for (const file of state.attachments) {
+    if (String(file?.previewUrl || '').startsWith('blob:')) URL.revokeObjectURL(file.previewUrl)
+  }
+  state.attachments = []
+  renderAttachments()
+}
+
+/** 服务端返回的是最小稳定字段；恢复成输入区同一个 chip 结构。 */
+function attachmentFromSessionReference(ref) {
+  if (!ref || typeof ref !== 'object') return null
+  const conversationId = String(ref.conversationId || '').trim()
+  if (conversationId) {
+    const conversationTitle = String(ref.conversationTitle || ref.name || '未命名对话').trim()
+    return {
+      name: conversationTitle,
+      size: 0,
+      type: 'application/x-eab-conversation',
+      source: 'conversation',
+      conversationId,
+      conversationTitle,
+      conversationMessageCount: Number(ref.conversationMessageCount) || 0,
+      conversationIsCurrent: Boolean(ref.conversationIsCurrent || conversationId === state.sessionId),
+      readable: 'conversation',
+      persistent: true,
+      uploadId: newUploadId(),
+    }
+  }
+  const folderPath = workspaceNormalizePath(ref.workspaceFolderPath || ref.workspaceRelPath || '')
+  if (ref.workspaceKind === 'folder' || folderPath) {
+    if (!folderPath) return null
+    return {
+      name: String(ref.name || folderPath.split('/').pop() || '云空间文件夹').trim(),
+      size: 0,
+      type: 'inode/directory',
+      source: 'workspace',
+      workspaceKind: 'folder',
+      workspaceFolderPath: folderPath,
+      workspaceRelPath: folderPath,
+      workspaceMime: null,
+      workspaceFileCount: Number(ref.workspaceFileCount) || 0,
+      workspaceFolderCount: Number(ref.workspaceFolderCount) || 0,
+      readable: 'workspace',
+      persistent: true,
+      uploadId: newUploadId(),
+    }
+  }
+  const workspaceFileId = String(ref.workspaceFileId || '').trim()
+  if (!workspaceFileId) return null
+  const type = String(ref.type || ref.workspaceMime || 'application/octet-stream')
+  const isImage = type.startsWith('image/') ||
+    /\.(png|jpe?g|webp|gif|avif|bmp)$/i.test(String(ref.name || ''))
+  return {
+    name: String(ref.name || '云空间文件').trim(),
+    size: Number(ref.size) || 0,
+    type,
+    source: 'workspace',
+    workspaceKind: 'file',
+    workspaceFileId,
+    workspaceRelPath: String(ref.workspaceRelPath || '').trim(),
+    workspaceFolderPath: '',
+    workspaceMime: ref.workspaceMime ?? type,
+    workspaceFileCount: 0,
+    workspaceFolderCount: 0,
+    readable: 'workspace',
+    persistent: true,
+    uploadId: newUploadId(),
+    previewUrl: isImage ? attachmentPreviewUrl({ workspaceFileId: workspaceFileId }) : '',
+  }
+}
+
+function applySessionReferences(references) {
+  const list = Array.isArray(references) ? references : []
+  for (const file of state.attachments) {
+    if (String(file?.previewUrl || '').startsWith('blob:')) URL.revokeObjectURL(file.previewUrl)
+  }
+  state.attachments = list
+    .slice(0, MAX_FILES)
+    .map(attachmentFromSessionReference)
+    .filter(Boolean)
+  renderAttachments()
+}
+
+/** 从侧栏拖进来的已有云空间对象：只做引用，不再复制/上传一份。 */
+function addWorkspaceReference(ref) {
+  const kind = ref?.kind === 'folder' ? 'folder' : 'file'
+  const path = workspaceNormalizePath(ref?.path || ref?.relPath || '')
+  const fileId = String(ref?.fileId || '').trim()
+  if (kind === 'file' && !fileId) return
+  if (kind === 'folder' && !path) return
+  const key = kind === 'folder' ? `folder:${path}` : `file:${fileId}`
+  if (state.attachments.some((file) => workspaceAttachmentKey(file) === key)) return
+  if (state.attachments.length >= MAX_FILES) {
+    banner(`一次最多引用 ${MAX_FILES} 个文件或文件夹`, 'warn')
+    return
+  }
+  const name = String(ref.name || path.split('/').pop() || '云空间对象').trim()
+  const type = kind === 'folder' ? 'inode/directory' : String(ref.mime || 'application/octet-stream')
+  const isImage = kind === 'file' && (
+    type.startsWith('image/') ||
+    /\.(png|jpe?g|webp|gif|avif|bmp)$/i.test(name)
+  )
+  state.attachments.push({
+    name,
+    size: kind === 'folder' ? 0 : Number(ref.size) || 0,
+    type,
+    source: 'workspace',
+    workspaceKind: kind,
+    workspaceFileId: fileId,
+    workspaceRelPath: path,
+    workspaceFolderPath: kind === 'folder' ? path : '',
+    workspaceMime: kind === 'folder' ? null : type,
+    workspaceFileCount: kind === 'folder' ? Number(ref.fileCount) || 0 : 0,
+    workspaceFolderCount: kind === 'folder' ? Number(ref.folderCount) || 0 : 0,
+    readable: 'workspace',
+    persistent: true,
+    uploadId: newUploadId(),
+    previewUrl: isImage && fileId ? attachmentPreviewUrl({ workspaceFileId: fileId }) : '',
+  })
+  renderAttachments()
+  void syncSessionReferences()
+}
+
+/** 从侧栏拖进来的对话：发送时由服务端取一次历史，模型直接读这段记忆回答。 */
+function addConversationReference(ref) {
+  const conversationId = String(ref?.conversationId || ref?.sessionId || '').trim()
+  if (!conversationId) return
+  if (state.attachments.some((file) => file.conversationId === conversationId)) return
+  if (state.attachments.length >= MAX_FILES) {
+    banner(`一次最多引用 ${MAX_FILES} 个文件、文件夹或对话`, 'warn')
+    return
+  }
+  const conversationTitle = String(ref?.title || ref?.conversationTitle || '未命名对话').trim()
+  state.attachments.push({
+    name: conversationTitle,
+    size: 0,
+    type: 'application/x-eab-conversation',
+    source: 'conversation',
+    conversationId,
+    conversationTitle,
+    conversationMessageCount: 0,
+    conversationIsCurrent: Boolean(ref?.current || conversationId === state.sessionId),
+    readable: 'conversation',
+    persistent: true,
+    uploadId: newUploadId(),
+  })
+  renderAttachments()
+  void syncSessionReferences()
+}
 
 function renderAttachments() {
   const strip = $('#attach-strip')
@@ -11692,25 +13269,47 @@ function renderAttachments() {
   const visionReady = !activeModel || activeModel.supportsVision !== false
   strip.innerHTML = state.attachments
     .map((file, index) => {
-      const isImage = file.type.startsWith('image/')
-      const thumb = isImage
-        ? `<img src="${esc(file.previewUrl || '')}" alt="" />`
-        : `<span class="file-ico">${esc((file.name.split('.').pop() || 'FILE').slice(0, 4).toUpperCase())}</span>`
-      const kind = file.readable === 'text'
-        ? '文本可读'
-        : file.readable === 'image'
-          ? visionReady
-            ? '图片可读'
-            : '当前模型不支持图片'
-          : '仅附件'
-      const kindMuted = file.readable === 'none' || (file.readable === 'image' && !visionReady)
+      const isConversation = file.source === 'conversation' || Boolean(file.conversationId)
+      const isFolder = !isConversation && (file.workspaceKind === 'folder' || Boolean(file.workspaceFolderPath))
+      const isWorkspace = !isConversation && file.source === 'workspace'
+      const type = String(file.type || '')
+      const isImage = !isConversation && !isFolder && type.startsWith('image/')
+      const previewUrl = file.previewUrl || (isImage && file.workspaceFileId ? attachmentPreviewUrl(file) : '')
+      const thumb = isConversation
+        ? `<span class="file-ico is-conversation" aria-hidden="true">${CONVERSATION_ICON}</span>`
+        : isFolder
+          ? `<span class="file-ico is-folder" aria-hidden="true">${WORKSPACE_FOLDER_ICON}</span>`
+          : isImage
+            ? `<img src="${esc(previewUrl)}" alt="" />`
+            : `<span class="file-ico">${esc((file.name.split('.').pop() || 'FILE').slice(0, 4).toUpperCase())}</span>`
+      const kind = isConversation
+        ? '对话引用'
+        : isFolder
+          ? '文件夹引用'
+          : isWorkspace
+            ? '云空间引用'
+            : file.readable === 'text'
+              ? '文本可读'
+              : file.readable === 'image'
+                ? visionReady
+                  ? '图片可读'
+                  : '当前模型不支持图片'
+                : '仅附件'
+      const kindText = isPersistentAttachment(file) ? `${kind} · 常驻` : kind
+      const kindMuted = !isConversation && !isWorkspace && (file.readable === 'none' || (file.readable === 'image' && !visionReady))
+      const sizeText = isConversation
+        ? (Number(file.conversationMessageCount) > 0
+            ? `最近 ${Number(file.conversationMessageCount)} 条消息`
+            : file.conversationIsCurrent ? '本对话历史' : '对话历史')
+        : isFolder ? workspaceFolderSummaryText(file) : (file.sizeLabel || fmtSize(file.size))
+      const removeLabel = isPersistentAttachment(file) ? '移除引用，下一轮不再使用' : '移除'
       return `<div class="attach-chip">
         ${thumb}
         <div class="attach-meta">
           <span class="attach-name" title="${esc(file.name)}">${esc(file.name)}</span>
-          <span class="attach-size">${esc(fmtSize(file.size))}<span class="attach-kind ${kindMuted ? 'is-muted' : ''}">${kind}</span></span>
+          <span class="attach-size">${esc(sizeText)}<span class="attach-kind ${kindMuted ? 'is-muted' : ''}">${esc(kindText)}</span></span>
         </div>
-        <button class="attach-remove" type="button" data-remove="${index}" aria-label="移除">×</button>
+        <button class="attach-remove" type="button" data-remove="${index}" aria-label="${esc(removeLabel)}" title="${esc(removeLabel)}">×</button>
       </div>`
     })
     .join('')
@@ -11718,9 +13317,10 @@ function renderAttachments() {
     button.addEventListener('click', () => {
       const index = Number(button.dataset.remove)
       const removed = state.attachments[index]
-      if (removed && removed.previewUrl) URL.revokeObjectURL(removed.previewUrl)
+      if (removed && String(removed.previewUrl || '').startsWith('blob:')) URL.revokeObjectURL(removed.previewUrl)
       state.attachments.splice(index, 1)
       renderAttachments()
+      if (isPersistentAttachment(removed)) void syncSessionReferences()
     })
   }
   updateSendState()
@@ -11990,11 +13590,12 @@ async function uploadChatAttachment(entry) {
 
 /** 按顺序逐个上传，避免 4 个并发写同时抢个人配额；失败只影响当前附件。 */
 async function prepareChatAttachments(item) {
-  if (item.spaceKind !== 'cloud') return buildAttachmentPayload(item.pending)
+  const messageList = item.pending.filter((entry) => !isPersistentAttachment(entry))
+  if (item.spaceKind !== 'cloud') return buildAttachmentPayload(messageList)
   for (let index = 0; index < item.pending.length; index += 1) {
     const entry = item.pending[index]
     const meta = item.attachmentMeta[index]
-    if (!entry?.file || !meta) continue
+    if (!entry?.file || !meta || isPersistentAttachment(entry)) continue
     meta.workspaceStatus = 'pending'
     meta.clientUploadId = entry.uploadId
     delete meta.workspaceError
@@ -12015,16 +13616,32 @@ async function prepareChatAttachments(item) {
     }
     updateAttachmentCards(item.node, item.attachmentMeta)
   }
-  return buildAttachmentPayload(item.pending)
+  return buildAttachmentPayload(messageList)
 }
 
 async function buildAttachmentPayload(list) {
   return Promise.all(
     list.map(async (item) => {
       const payload = { name: item.name, size: item.size, type: item.type }
+      if (item.source === 'conversation' || item.conversationId) {
+        payload.conversationId = item.conversationId
+        payload.conversationTitle = item.conversationTitle || item.name
+        payload.conversationIsCurrent = Boolean(item.conversationIsCurrent)
+        return payload
+      }
+      if (item.workspaceKind === 'folder' && item.workspaceFolderPath) {
+        payload.workspaceKind = 'folder'
+        payload.workspaceFolderPath = item.workspaceFolderPath
+        payload.workspaceRelPath = item.workspaceFolderPath
+        payload.workspaceFileCount = Number(item.workspaceFileCount) || 0
+        payload.workspaceFolderCount = Number(item.workspaceFolderCount) || 0
+        return payload
+      }
       if (item.workspaceFileId) {
         // 正文/图片已经在云空间里，消息只传文件 ID，避免把大文件再塞进聊天请求。
         payload.workspaceFileId = item.workspaceFileId
+        payload.workspaceKind = 'file'
+        if (item.workspaceRelPath) payload.workspaceRelPath = item.workspaceRelPath
         return payload
       }
       if (item.readable === 'text' && item.text) payload.text = item.text
@@ -12106,13 +13723,47 @@ async function send() {
   const modelId = state.selected || null
   const pending = state.attachments.slice()
   const spaceKind = state.spaceKind
-  const attachmentMeta = pending.map((file) => ({
-    name: file.name,
-    size: file.size,
-    type: file.type,
-    clientUploadId: file.uploadId,
-    ...(spaceKind === 'cloud' ? { workspaceStatus: 'pending' } : {}),
-  }))
+  const attachmentMeta = pending.map((file) => {
+    const base = {
+      name: file.name,
+      size: file.size,
+      type: file.type,
+      clientUploadId: file.uploadId,
+      ...(isPersistentAttachment(file) ? { persistent: true } : {}),
+    }
+    if (file.source === 'conversation') {
+      return {
+        ...base,
+        conversationId: file.conversationId,
+        conversationTitle: file.conversationTitle || file.name,
+        conversationIsCurrent: Boolean(file.conversationIsCurrent),
+      }
+    }
+    if (file.source === 'workspace') {
+      if (file.workspaceKind === 'folder') {
+        return {
+          ...base,
+          workspaceKind: 'folder',
+          workspaceFolderPath: file.workspaceFolderPath,
+          workspaceRelPath: file.workspaceRelPath,
+          workspaceFileCount: Number(file.workspaceFileCount) || 0,
+          workspaceFolderCount: Number(file.workspaceFolderCount) || 0,
+        }
+      }
+      return {
+        ...base,
+        workspaceKind: 'file',
+        workspaceFileId: file.workspaceFileId,
+        workspaceRelPath: file.workspaceRelPath,
+        workspaceMime: file.workspaceMime || file.type,
+        workspaceStatus: 'active',
+      }
+    }
+    return {
+      ...base,
+      ...(spaceKind === 'cloud' ? { workspaceStatus: 'pending' } : {}),
+    }
+  })
 
   const runtime = currentRuntime()
   const item = {
@@ -12135,7 +13786,7 @@ async function send() {
     for (const queued of dropped) {
       queued.node?.remove()
       for (const file of queued.pending) {
-        if (file.previewUrl) URL.revokeObjectURL(file.previewUrl)
+        if (String(file.previewUrl || '').startsWith('blob:')) URL.revokeObjectURL(file.previewUrl)
       }
     }
     stopCurrentReply()
@@ -12147,10 +13798,10 @@ async function send() {
   item.node = appendMessage('me', text, undefined, attachmentMeta, undefined, { createdAt: item.createdAt })
   scrollThreadToBottomInstant()
 
-  state.attachments = []
+  state.attachments = pending.filter(isPersistentAttachment)
   renderAttachments()
   for (const file of pending) {
-    if (file.previewUrl) URL.revokeObjectURL(file.previewUrl)
+    if (!isPersistentAttachment(file) && String(file.previewUrl || '').startsWith('blob:')) URL.revokeObjectURL(file.previewUrl)
   }
 
   renderQueueState()
@@ -12184,12 +13835,17 @@ async function drainQueue(runtime = currentRuntime()) {
   }
   let turn = createAiTurn({ append: visibleAtStart })
   runtime.turn = turn
+  state.parentTeamTurn = turn
   let streamError = null
   let sawDone = false
   let messageId = ''
+  const createdSession = !item.sessionId
 
   try {
+    const references = await buildAttachmentPayload(item.pending.filter(isPersistentAttachment))
     const attachments = await prepareChatAttachments(item)
+    if (controller.signal.aborted) throw new DOMException('已停止', 'AbortError')
+    if (item.sessionId) await waitSessionReferenceSync(item.sessionId)
     if (controller.signal.aborted) throw new DOMException('已停止', 'AbortError')
     await streamChat(
       {
@@ -12197,6 +13853,7 @@ async function drainQueue(runtime = currentRuntime()) {
         reasoningEffort: item.reasoningEffort,
         text: item.text,
         attachments,
+        references,
         sessionId: item.sessionId,
         spaceKind: item.spaceKind,
         // 右侧正在预览的文件：让模型知道「这个文件」指谁；面板没开就不传。
@@ -12230,6 +13887,7 @@ async function drainQueue(runtime = currentRuntime()) {
               if (turn.node.isConnected) turn.node.remove()
               turn = existingLive.turn
               runtime.turn = turn
+              state.parentTeamTurn = turn
               existingLive.hydrated = true
             } else {
               state.liveTurns.set(messageId, {
@@ -12256,6 +13914,8 @@ async function drainQueue(runtime = currentRuntime()) {
             if (state.sessionId === null || state.sessionId === data.sessionId) {
               state.sessionId = data.sessionId
               persistChatLocation()
+              // 新会话首条消息落库后，把输入区当前常驻引用（含发送过程中新增/删除的）同步一次。
+              if (createdSession) void syncSessionReferences()
             }
             if (isCurrentRun && $('#chat-title').textContent === '新对话') {
               $('#chat-title').textContent = (item.text || attachments[0]?.name || '新对话').slice(0, 24)
@@ -13438,6 +15098,12 @@ async function boot() {
   }
 
   $('#login-gate').hidden = true
+  const deniedFromConsole = new URLSearchParams(location.search).get('console_denied') === '1'
+  if (deniedFromConsole) {
+    window.setTimeout(() => {
+      banner('你没有权限进入管理后台，已进入对话页；如需后台权限，请联系平台管理员开通。', 'warn')
+    }, 2600)
+  }
   const sideShell = $('#chat-side')
   const stageShell = $('#chat-stage')
   if (sideShell) sideShell.hidden = false
@@ -13467,6 +15133,7 @@ async function boot() {
   }
 
   renderSideUser(me)
+  void refreshConsoleEntry()
   $('#side-files').hidden = false
   // 权限角标依赖登录态；登录成功后再拉取，避免登录页发出 401 请求。
   void refreshPermissionBadge()
@@ -13495,7 +15162,7 @@ async function boot() {
     await loadSessions()
     setupChatEvents()
     await loadActiveRuns()
-    const savedLocation = readChatLocation()
+    const savedLocation = deniedFromConsole ? null : readChatLocation()
     if (state.sessions.length > 0) {
       const savedSessionId = savedLocation?.sessionId
       if (savedSessionId && state.sessions.some((session) => session.id === savedSessionId)) {
@@ -13578,8 +15245,8 @@ async function boot() {
   quotaBadge?.addEventListener('focus', showQuota)
   quotaBadge?.addEventListener('click', (event) => {
     event.stopPropagation()
-    if (quotaPopover?.hidden) showQuota()
-    else hideQuota()
+    // 鼠标点击前会先触发 mouseenter；这里始终展示，避免点一下反而把浮层关掉。
+    showQuota()
   })
   quotaBadge?.addEventListener('mouseleave', () => {
     if (!quotaBadge.matches(':focus')) hideQuota()
@@ -13687,14 +15354,58 @@ async function boot() {
     addFiles(files)
   })
 
-  // 拖拽文件到输入区同样加入附件
-  $('#composer-box').addEventListener('dragover', (event) => {
-    if (event.dataTransfer?.types?.includes('Files')) event.preventDefault()
+  // 拖拽对象到输入区：对话和云空间对象只做引用，外部文件仍走上传。
+  const composer = $('.composer')
+  const composerBox = $('#composer-box')
+  const clearComposerDrop = () => composerBox?.classList.remove('is-drop-target')
+  const dragRef = (event, mime) => {
+    try {
+      const raw = event.dataTransfer?.getData(mime) || ''
+      return raw ? JSON.parse(raw) : null
+    } catch {
+      return null
+    }
+  }
+  const workspaceDragRef = (event) => dragRef(event, WORKSPACE_DRAG_MIME)
+  const conversationDragRef = (event) => dragRef(event, CONVERSATION_DRAG_MIME)
+  const hasComposerDrag = (types) =>
+    types.includes(CONVERSATION_DRAG_MIME) || types.includes(WORKSPACE_DRAG_MIME) || types.includes('Files')
+  composer?.addEventListener('dragenter', (event) => {
+    const types = Array.from(event.dataTransfer?.types || [])
+    if (hasComposerDrag(types)) composerBox?.classList.add('is-drop-target')
   })
-  $('#composer-box').addEventListener('drop', (event) => {
-    const files = Array.from(event.dataTransfer?.files || [])
-    if (files.length === 0) return
+  composer?.addEventListener('dragover', (event) => {
+    const types = Array.from(event.dataTransfer?.types || [])
+    if (!hasComposerDrag(types)) return
     event.preventDefault()
+    if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy'
+    composerBox?.classList.add('is-drop-target')
+  })
+  composer?.addEventListener('dragleave', (event) => {
+    if (!composer.contains(event.relatedTarget)) clearComposerDrop()
+  })
+  composer?.addEventListener('drop', (event) => {
+    const conversationRef = conversationDragRef(event)
+    if (conversationRef) {
+      event.preventDefault()
+      clearComposerDrop()
+      addConversationReference(conversationRef)
+      return
+    }
+    const ref = workspaceDragRef(event)
+    if (ref) {
+      event.preventDefault()
+      clearComposerDrop()
+      addWorkspaceReference(ref)
+      return
+    }
+    const files = Array.from(event.dataTransfer?.files || [])
+    if (files.length === 0) {
+      clearComposerDrop()
+      return
+    }
+    event.preventDefault()
+    clearComposerDrop()
     addFiles(files)
   })
 
@@ -13710,9 +15421,21 @@ async function boot() {
     else if (action.dataset.act === 'delete') deleteSession(sessionId)
   })
   $('#file-menu').addEventListener('click', (event) => {
+    const menu = $('#file-menu')
+    const folderAction = event.target.closest('[data-folder-act]')
+    if (folderAction) {
+      const folderPath = menu.dataset.folder
+      hideFileMenu()
+      if (!folderPath || folderAction.disabled) return
+      if (folderAction.dataset.folderAct === 'open') setWorkspacePath(folderPath)
+      else if (folderAction.dataset.folderAct === 'new') createWorkspaceFolder(folderPath)
+      else if (folderAction.dataset.folderAct === 'rename') renameWorkspaceFolder(folderPath)
+      else if (folderAction.dataset.folderAct === 'delete') deleteWorkspaceFolder(folderPath)
+      return
+    }
     const action = event.target.closest('[data-file-act]')
     if (!action) return
-    const fileId = $('#file-menu').dataset.file
+    const fileId = menu.dataset.file
     const file = fileById(fileId)
     hideFileMenu()
     if (!file) return
@@ -13782,6 +15505,7 @@ async function boot() {
   })
 
   // 个人工作区
+  $('#ws-new-folder').addEventListener('click', () => createWorkspaceFolder())
   $('#ws-upload').addEventListener('click', () => $('#ws-input').click())
   $('#ws-input').addEventListener('change', async (event) => {
     // FileList 是实时集合：先复制再清空 input，否则 next files.length 会变成 0。

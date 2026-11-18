@@ -54,6 +54,8 @@ export const MODEL_ROUTE_PURPOSES = [
   { purpose: 'router.intent', label: '意图判定', hint: '决定查人、查制度还是普通问答' },
   { purpose: 'agent.model_choice', label: '子 Agent 模型分配', hint: '父 Agent 用 SystemOne 按子任务内容选择模型' },
   { purpose: 'kb.embed', label: '知识库向量化', hint: '切片入库与问题向量化共用' },
+  { purpose: 'kb.clean', label: '知识库文档清洗', hint: '上传文件后去页码、页眉页脚与扫描噪声，保留事实' },
+  { purpose: 'kb.ocr', label: '知识库 OCR', hint: '图片与扫描 PDF 的文字识别，优先使用视觉模型' },
   { purpose: 'kb.rerank', label: '检索重排', hint: '可选，提升混合检索准确率' },
   { purpose: 'asr.default', label: '语音转写', hint: '钉钉/企微语音消息转文本' },
   { purpose: 'tts.default', label: '语音合成', hint: '回答转语音条，可选' },
@@ -413,6 +415,14 @@ function purposeMatches(model: ModelCapabilityRecord, purpose: string): boolean 
       )
     case 'kb.embed':
       return capability.includes('embedding') || model.endpointKind === 'embeddings'
+    case 'kb.clean':
+      return (
+        (capability.includes('chat') || capability.includes('reasoning')) && model.endpointKind === 'chat'
+      )
+    case 'kb.ocr':
+      return (
+        (capability.includes('vision') || capability.includes('multimodal')) && model.endpointKind === 'chat'
+      )
     case 'kb.rerank':
       return model.endpointKind === 'rerank'
     case 'asr.default':

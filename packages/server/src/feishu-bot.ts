@@ -18,6 +18,7 @@ import { actorFor, findActivePerson, type RequestActor } from './session.js'
 import type { ServerDeps } from './deps.js'
 import { resolveSecret } from './secrets.js'
 import type { ChatMessage as LlmMessage } from './llm.js'
+import { shouldAutoRetrieveKb } from './intent.js'
 import {
   acquireTurn,
   buildSystemPrompt,
@@ -33,6 +34,8 @@ import {
 } from './routes/chat.js'
 import { assertChatQuota } from './quota.js'
 import { planChannelModelCommand } from './channel-model-command.js'
+import { memoryQueryForTurn, recentMessageIds, searchChatMemory, shouldRecallPastConversations } from './chat-memory.js'
+import { refreshSessionSummary, sessionSummaryForPrompt } from './chat-summary.js'
 import { SWITCH_CHAT_MODEL_TOOL_SPEC, updateConversationModelPreference, type ModelSwitchContext } from './channel-model-switch.js'
 import { publishChatEvent } from './chat-events.js'
 import { acquireLeaderHold, claimOnce, readLeaderOwner, type LeaderHold, type LeaderOwner } from './backends/coordination.js'
@@ -671,7 +674,9 @@ export async function handleFeishuEvent(
         ).count,
       ) === 0
 
-    const hits = await retrieveKb(deps.db, deps.config.dbPath, actor, rawText)
+    const kbAuto = shouldAutoRetrieveKb(rawText)
+    const hits = kbAuto ? await retrieveKb(deps.db, deps.config.dbPath, actor, rawText) : []
+    const kbMode = hits.length > 0 ? 'retrieved' : kbAuto ? 'miss' : 'skipped'
     const memories = deps.db
       .prepare(
         `SELECT content FROM memories
@@ -686,10 +691,28 @@ export async function handleFeishuEvent(
     }>
     const chatTools = toolSpecsForAgent(deps.db, actor, { kind: 'none' }, rawText)
     const channelChatTools = [...chatTools, SWITCH_CHAT_MODEL_TOOL_SPEC]
+    const channelHistory = historyOf(deps.db, sessionId, 16, 'feishu')
+    const memoryCrossSession = shouldRecallPastConversations(rawText)
+    const memoryHits = searchChatMemory({
+      db: deps.db,
+      companyId: actor.subject.companyId,
+      userId: actor.person.id,
+      sessionId,
+      crossSession: memoryCrossSession,
+      query: memoryQueryForTurn(rawText, channelHistory),
+      excludeMessageIds: recentMessageIds(deps.db, sessionId),
+      limit: 5,
+      maxChars: 1800,
+    })
     const system = buildSystemPrompt({
       actor,
       chatTools: channelChatTools,
       memories,
+      memoryHits,
+      memoryCrossSession,
+      sessionSummary: sessionSummaryForPrompt(deps.db, sessionId),
+      userQuestion: rawText,
+      kbMode,
       hits,
       hasAttachments: false,
       pluginPrompts: pluginPromptTexts(deps.db, actor),
@@ -698,7 +721,7 @@ export async function handleFeishuEvent(
     })
     const messages: LlmMessage[] = [
       { role: 'system', content: system },
-      ...historyOf(deps.db, sessionId, 16, 'feishu'),
+      ...channelHistory,
       { role: 'user', content: rawText },
     ]
 
@@ -845,6 +868,16 @@ export async function handleFeishuEvent(
       detail: { channel: 'feishu', modelId: effectiveModel.id, tools: agentResult?.toolCalls.length ?? 0 },
       channel: 'feishu',
       ip: null,
+    })
+    void refreshSessionSummary({
+      db: deps.db,
+      dbPath: deps.config.dbPath,
+      companyId: actor.subject.companyId,
+      userId: actor.person.id,
+      sessionId,
+      modelId: effectiveModel.id,
+    }).catch((error) => {
+      console.warn('[eab] 飞书会话摘要更新失败：', (error as Error).message)
     })
 
     await sendFeishuReply(deps, message, answerText)

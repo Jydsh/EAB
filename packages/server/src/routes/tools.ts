@@ -6,14 +6,14 @@
  * 不在本地执行任意脚本；工具白名单是代码常量，插件想加工具必须走插件清单。
  */
 import type { FastifyInstance, FastifyRequest } from 'fastify'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import { basename, dirname, isAbsolute, relative } from 'node:path'
 import { EC, EabError, SC, ulid, type Scope } from '@eab/domain'
 import { appendAudit } from '@eab/storage'
 import { assertScoped, buildScopeFilter, predicateToSql } from '@eab/authz'
 import type { Db } from '@eab/storage'
 import type { ToolParameterSchema } from '../llm.js'
-import { safeJoin } from '@eab/workspace'
+import { safeJoin, isWithinRoot } from '@eab/workspace'
 import type { ServerDeps } from '../deps.js'
 import { ok, requireScope } from '../http.js'
 import { resolveActor, type RequestActor } from '../session.js'
@@ -28,6 +28,7 @@ import {
   resolveToolOperationKey,
 } from '../tool-idempotency.js'
 import { retrieveExternalKb } from '../kb-external.js'
+import { getDocAsset } from '../kb-assets.js'
 import { executePluginTool, pluginToolCatalogFor, pluginToolSpecsFor, prefersPersonalPluginTools, resolvePluginToolByCatalogId, invalidatePluginToolSpecsEverywhere } from '../plugin-tools.js'
 import { refreshPluginHosts } from '../plugin-host.js'
 import { createPluginDevScaffold, installPluginDevBundle, normalizePluginDevId, pluginDevIdFromDir, pluginPreviewLink, PLUGIN_DEV_DIR } from '../plugin-dev.js'
@@ -50,7 +51,7 @@ import {
   workspaceCapacity,
   workspaceUsedBytes,
 } from '../workspace-quota.js'
-import { sendDingTalkFileToUser } from '../dingtalk-outbound.js'
+import { DINGTALK_OUTBOUND_FILE_LIMIT_BYTES, sendDingTalkFileToUser } from '../dingtalk-outbound.js'
 import { sendDingTalkFileToConversation, uploadFileToUserDrive } from '../dingtalk-drive.js'
 import {
   createRobotUserFileSend,
@@ -61,7 +62,9 @@ import {
   applyWorkspaceTextEdits,
   buildWorkspaceEditDiff,
   createWorkspaceFileSnapshot,
+  createUserWorkspaceFolder,
   deleteUserWorkspaceFile,
+  deleteUserWorkspaceFolder,
   exportWorkspaceFileToPdf,
   getWorkspaceGuiFallback,
   isTextEditableFile,
@@ -70,11 +73,13 @@ import {
   publishWorkspaceFilesChanged,
   readUserWorkspaceFile,
   renameUserWorkspaceFile,
+  renameUserWorkspaceFolder,
   reportWorkspaceGuiFallback,
   restoreWorkspaceFileVersion,
   saveUserWorkspaceFile,
   editUserWorkspaceFile,
   userScopeDir,
+  workspaceFolderSummaries,
   type WorkspaceTextEdit,
 } from './workspace.js'
 import { readTextFileRange, searchWorkspaceText, type TextRangeResult, type TextSearchResult } from '../workspace-text.js'
@@ -293,6 +298,8 @@ function workspaceFileLockKey(
   const userId = actor.subject.userId
   let path = String(args.path ?? '').trim()
   const fileId = String(args.fileId ?? '').trim()
+  const imageUrl = String(args.url ?? '').trim()
+  if (!path && !fileId && imageUrl) path = imageUrl
   if (!path && fileId) {
     const row = deps.db
       .prepare('SELECT rel_path FROM workspace_files WHERE id = ? AND company_id = ? AND owner_user_id = ? AND deleted_at IS NULL')
@@ -332,12 +339,110 @@ export function adminPasswordLockKey(actor: RequestActor, args: Record<string, u
   return `admin:password:${actor.subject.companyId}:${String(args.userId ?? 'unknown')}`
 }
 
+const DINGTALK_IMAGE_MIME_BY_EXT: Record<string, string> = {
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  gif: 'image/gif',
+  bmp: 'image/bmp',
+  webp: 'image/webp',
+}
+
+function dingTalkImageMimeOf(name: string, mime?: string | null): string | null {
+  const ext = name.toLowerCase().match(/\.([a-z0-9]+)$/)?.[1]
+  const byExt = ext ? DINGTALK_IMAGE_MIME_BY_EXT[ext] : undefined
+  if (!byExt) return null
+  return mime && /^image\//i.test(mime) ? mime : byExt
+}
+
+interface WorkspaceImageFile {
+  readonly name: string
+  readonly relPath: string
+  readonly size: number
+  readonly mime: string
+  readonly buffer: Buffer
+}
+
+/** 知识库图片在对话里是相对地址；钉钉客户端没有 EAB 的登录态和域名，不能直接加载。 */
+function kbAssetRefOf(raw: string): { docId: string; assetId: string } | null {
+  let pathname = raw
+  try {
+    if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(raw)) pathname = new URL(raw).pathname
+  } catch {
+    return null
+  }
+  const clean = pathname.split('?')[0]?.split('#')[0] ?? ''
+  const match =
+    clean.match(/^\/api\/kb\/assets\/([^/]+)\/([^/]+)\/?$/) ??
+    clean.match(/^\/api\/console\/kb\/docs\/([^/]+)\/assets\/([^/]+)\/?$/)
+  if (!match) return null
+  return { docId: decodeURIComponent(match[1]!), assetId: decodeURIComponent(match[2]!) }
+}
+
+/**
+ * 发送图片时允许读取个人云空间里已落盘、但还没登记进 workspace_files 的文件。
+ * `project.exec`、图片导出等工具会直接把 PNG/JPG 写在用户工作区，模型拿到的是
+ * 相对路径；如果只查元数据表，这些图片会被误判成“云空间里没有”。
+ * 只读、只允许图片、限制在用户自己的云空间根目录内，符号链接也做了真实路径校验。
+ */
+function readWorkspaceImageFileByPath(
+  deps: ServerDeps,
+  actor: RequestActor,
+  rawPath: string,
+): WorkspaceImageFile {
+  const root = userScopeDir(deps, actor.subject.companyId, actor.subject.userId)
+  if (!existsSync(root)) {
+    throw new EabError(EC.NOT_FOUND, `云空间里没有找到文件: ${rawPath}`)
+  }
+  const rootReal = realpathSync(root)
+  const normalized = rawPath.replace(/\\/g, '/')
+  let candidate: string
+  if (isAbsolute(rawPath)) {
+    const rel = relative(rootReal, rawPath)
+    if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) {
+      throw new EabError(EC.FORBIDDEN, '图片必须位于当前员工的个人云空间内')
+    }
+    candidate = safeJoin(rootReal, rel)
+  } else {
+    candidate = safeJoin(rootReal, normalized)
+  }
+  if (!existsSync(candidate)) {
+    throw new EabError(EC.NOT_FOUND, `云空间里没有找到文件: ${rawPath}`)
+  }
+  const real = realpathSync(candidate)
+  if (!isWithinRoot(rootReal, real)) {
+    throw new EabError(EC.FORBIDDEN, '图片必须位于当前员工的个人云空间内')
+  }
+  const stat = statSync(real)
+  if (!stat.isFile()) throw new EabError(EC.VALIDATION, `不是文件: ${rawPath}`)
+  const mime = dingTalkImageMimeOf(real)
+  if (!mime) {
+    throw new EabError(EC.VALIDATION, '只有图片可以作为图片消息发送', {
+      details: { path: rawPath },
+      hint: '支持 png、jpg、jpeg、gif、bmp、webp；其它文件请用文件发送能力。',
+    })
+  }
+  if (stat.size > DINGTALK_OUTBOUND_FILE_LIMIT_BYTES) {
+    throw new EabError(EC.VALIDATION, '图片超过钉钉发送上限（20 MB），没有发出去', {
+      details: { size: stat.size, limit: DINGTALK_OUTBOUND_FILE_LIMIT_BYTES },
+      hint: '请压缩图片后再发送。',
+    })
+  }
+  return {
+    name: basename(real),
+    relPath: relative(rootReal, real).replace(/\\/g, '/'),
+    size: stat.size,
+    mime,
+    buffer: readFileSync(real),
+  }
+}
+
 export const TOOLS: readonly ToolDef[] = [
   {
     id: 'tool.search',
     name: '搜索工具目录',
     description:
-      '搜索当前员工可用的工具目录。当前对话只加载了常用工具；当需要文件发送/重命名/删除、容量查询、定时任务管理、计算或插件能力等未直接列出的能力时，先调用本工具。query 用用户原话或中文/英文能力词（例如“发送文件到钉钉”“查看我的定时任务”“计算 (1200+300)/4”“plugin”）；返回匹配工具的名称、用途和参数，下一轮会自动加载这些工具，之后即可直接调用。不要因为工具列表里暂时没有就直接说做不到。',
+      '搜索当前员工可用的工具目录。当前对话只加载了常用工具；当需要文件/图片发送、重命名/删除、容量查询、定时任务管理、计算或插件能力等未直接列出的能力时，先调用本工具。query 用用户原话或中文/英文能力词（例如“发送文件到钉钉”“把图片发给我”“查看我的定时任务”“计算 (1200+300)/4”“plugin”）；返回匹配工具的名称、用途和参数，下一轮会自动加载这些工具，之后即可直接调用。不要因为工具列表里暂时没有就直接说做不到。',
     scope: SC.AGENT_TOOL_INVOKE,
     dangerous: false,
     input: {
@@ -357,14 +462,14 @@ export const TOOLS: readonly ToolDef[] = [
     id: 'agent.spawn',
     name: '并行子 Agent',
     description:
-      '把一个复杂任务拆成多个互不依赖的子任务，并行交给多个子 Agent 执行。适合“同时查三份资料”“分别分析几个文件”“多模型各给一版方案”这类可以并行的任务。每个子 Agent 有独立运行记录和会话锁；一个子任务失败不会取消其他子任务。tasks 必须是 JSON 数组字符串，每项形如 {"key":"producer","role":"producer","title":"产出初稿","acceptance":"必须给出 3 条可核对结论","prompt":"子任务指令（150 字以内）","modelId":"可选模型 id","retries":1}。key 是团队内的稳定标识（建议英文短名），后续可用 agent_task 凭 key 继续给它派活，复用同一个子 Agent 窗口与会话；固定岗位优先复用 producer / critic / researcher / builder 这些 key，不要每轮换新 key。团队每个会话默认最多 8 个活跃岗位；满了会先软注销最老的空闲非固定岗位，仍满会明确报错，不会静默丢任务。超过 agentMaxParallel 的并行任务会直接报错，请拆成多轮。prompt 控制在 150 字以内，只写目标、输入范围、关键约束和验收标准，具体步骤由子 Agent 自己规划，不要写长篇执行清单。不要让子任务互相依赖，不要用子 Agent 代替普通的一次工具调用。除非任务明确需要视觉/多模态等专用模型，否则不要给多个子任务填同一个 modelId，留空由系统按能力和并发负载分散分配。前台对话里的实质任务应优先使用 background:true，避免阻塞用户继续提问。',
+      '把一个复杂任务拆成多个互不依赖的子任务，并行交给多个子 Agent 执行。适合“同时查三份资料”“分别分析几个文件”“多模型各给一版方案”这类可以并行的任务。每个子 Agent 有独立运行记录和会话锁；一个子任务失败不会取消其他子任务。用户不需要说明“用团队模式”，也不需要点名人数或名字：父 Agent 必须自己分析任务、决定编队并直接派发，禁止反问用户“派几个/叫什么/谁负责什么”。能拆分就派 2–4 个独立切片；确实只有一个不可拆主线时派 1 个。复杂工程任务要按互不冲突的文件/模块所有权切片，多个 builder 不能同时改同一文件；拆不出互不冲突的切片时，派 1 个 builder 做完整实现和自测，再派 1 个 critic 独立复跑测试，不要为了凑人数把同一模块拆碎。同一个工程闭环（先创建/实现，再测试/修复）禁止拆成“创建岗 + 测试岗”，否则测试岗会在文件还没创建时先跑。每个 task 的 title 用「名字（职责）」格式，例如“子鼠（资料检索）”“丑牛（接口实现）”“寅虎（回归验收）”，title 是团队面板显示的名字，不要只写“子任务 1”；服务端会按岗位序号统一分配不重名短名（前 12 个用十二生肖，第 13–22 个用十天干，之后自动组合），模型给的名字只用于提取职责。tasks 可以是 JSON 数组，也可以是被 stringify 的 JSON 数组字符串；每项形如 {"key":"research-1","role":"researcher","title":"子鼠（资料检索）","acceptance":"必须给出 3 条可核对结论","prompt":"子任务指令（150 字以内）","modelId":"可选模型 id","retries":1}。key 是团队内的稳定标识（建议英文短名），后续可用 agent_task 凭 key 继续给它派活，复用同一个子 Agent 窗口与会话；固定职责可复用 producer / critic / researcher / builder，同一职责多人并行时用 build-1 / build-2 这类后缀区分。团队每个会话默认最多 8 个活跃岗位；满了会先软注销最老的空闲非固定岗位，仍满会明确报错，不会静默丢任务。超过 agentMaxParallel 的并行任务会直接报错，请拆成多轮。用户明确点名人数时，必须按用户点名的人数拆成对应数量的 task，每人一个独立 key，禁止把所有角色合并成一个 task。不要把整个任务压成一个“总包”子任务来逃避拆分。prompt 控制在 150 字以内，只写目标、输入范围、关键约束和验收标准，具体步骤由子 Agent 自己规划，不要写长篇执行清单。工程类 task 的 acceptance 必须写具体测试/构建命令或可观察结果；子 Agent 需要自己实现、运行测试、失败后修复并复测，系统会校验测试/构建通过证据，没有证据的工程交付会被标为 failed。不要让子任务互相依赖，不要派“等别的子任务产出后再整理 / 汇总 / 写报告”的依赖任务，最终汇总由父 Agent 完成；不要用子 Agent 代替普通的一次工具调用。除非任务明确需要视觉/多模态等专用模型，否则不要给多个子任务填同一个 modelId，留空由系统按能力和并发负载分散分配。前台对话里的实质任务应优先使用 background:true，避免阻塞用户继续提问。派完用一句话写清编队结果，例如“我拆成 3 个角色：子鼠查资料、丑牛做实现、寅虎跑验收；完成后统一汇总”。',
     scope: SC.AGENT_TOOL_INVOKE,
     dangerous: false,
     concurrency: 'read',
     input: {
       tasks: {
         type: 'string',
-        description: 'JSON 数组字符串；每项必须包含 prompt，可选 key、role（producer/critic/researcher/builder/worker）、title、parentKey、acceptance、pinned、modelId、retries',
+        description: 'JSON 数组字符串；每项必须包含 prompt，可选 key、role（producer/critic/researcher/builder/worker）、title（团队面板显示的名字，用「名字（职责）」；服务端会按岗位序号统一分配不重名短名）、parentKey、acceptance、pinned、modelId、retries',
         required: true,
       },
       background: {
@@ -462,7 +567,25 @@ export const TOOLS: readonly ToolDef[] = [
     concurrency: 'read',
     input: {
       question: { type: 'string', description: '要父 Agent 回答或向用户确认的问题', required: true },
-      context: { type: 'string', description: '可选：为什么需要这个信息、你已经做到哪一步' },
+      context: { type: 'string', description: '可选：为什么需要这个信息、你已经做到哪一步、试过什么' },
+      options: { type: 'string', description: '可选：2–3 个备选方向，用 | 分隔，便于父 Agent 拍板' },
+      recommendation: { type: 'string', description: '可选：你建议走哪个方向及理由' },
+    },
+  },
+  {
+    id: 'agent.consult',
+    name: '向团队同事发起协作',
+    description:
+      '只有子 Agent 可用。需要另一个同事已掌握的数据、产出或判断，或需要跨岗位协调时，调用它向主 Agent 提交协作申请，并写清想让谁配合、要什么、你已经做到哪一步。主 Agent 会决定直接答复你，还是先去协调目标同事。它和 agent_ask_parent 一样会让本轮暂停，主 Agent 答复后你在同一个会话里继续；能自己查到的不要用。',
+    scope: SC.AGENT_TOOL_INVOKE,
+    dangerous: false,
+    concurrency: 'read',
+    input: {
+      agent: { type: 'string', description: '希望配合的同事团队 key；不确定时可以写岗位描述', required: true },
+      question: { type: 'string', description: '需要对方提供的信息、判断或产出', required: true },
+      context: { type: 'string', description: '可选：你已经做到哪一步、为什么需要对方' },
+      options: { type: 'string', description: '可选：2–3 个备选方向，用 | 分隔，便于主 Agent 拍板' },
+      recommendation: { type: 'string', description: '可选：你建议走哪个方向及理由' },
     },
   },
   {
@@ -573,8 +696,9 @@ export const TOOLS: readonly ToolDef[] = [
   },
   {
     id: 'workspace.list',
-    name: '列出我的文件',
-    description: '列出个人工作区里未删除的文件',
+    name: '列出我的文件和文件夹',
+    description:
+      '列出个人云空间里未删除的文件和文件夹。返回 folders（完整相对路径、名称、后代文件数）与 files（不含 .gitkeep 占位）；路径用 / 分隔，可直接传给 workspace.read / workspace.folder。',
     scope: SC.WORKSPACE_READ,
     dangerous: false,
     input: {},
@@ -981,24 +1105,32 @@ export const TOOLS: readonly ToolDef[] = [
   },
   {
     id: 'workspace.send_dingtalk',
-    name: '发送云空间文件到钉钉',
+    name: '发送文件或图片到钉钉',
     description:
-      '把个人云空间里的文件作为钉钉文件消息发给当前用户。用户说“把文件发给我/发到钉钉/把这个文件发我”时调用；先用 workspace.list 找到文件名或相对路径，再传 path，或直接传 workspace.list 返回的 fileId。钉钉单聊里会用用户方向的原生文件消息发送（右侧气泡、带预览/未查收/下载/编辑），机器人识别回声后不重复保存；网页会话退回机器人文件消息。只支持当前员工的个人云空间文件，单个文件不超过 20 MB。',
+      '把个人云空间里的文件或工作区里的图片作为钉钉消息发给当前用户。用户说“把文件发给我/发到钉钉/把这张图片发我/图片发我”时调用；先用 workspace.list 找到文件名或相对路径，再传 path，或直接传 workspace.list 返回的 fileId。图片支持个人云空间里已登记的文件，也支持 project.exec、导出等工具刚写到工作区但还没登记进 workspace_files 的 png/jpg/jpeg/gif/bmp/webp；图片会走钉钉原生图片消息，直接显示为图片气泡。非图片走文件消息；只支持当前员工的个人云空间和工作区，单个文件不超过 20 MB。',
     scope: SC.WORKSPACE_READ,
     dangerous: false,
     concurrency: 'write',
     lockKey: (deps, actor, args) => workspaceFileLockKey(deps, actor, args),
     idempotent: true,
     input: {
-      fileId: { type: 'string', description: 'workspace.list 返回的文件 id；和 path 二选一' },
-      path: { type: 'string', description: '文件相对路径或文件名，例如 suale.txt；和 fileId 二选一' },
+      fileId: { type: 'string', description: 'workspace.list 返回的文件 id；和 path、url 三选一' },
+      path: {
+        type: 'string',
+        description: '文件/图片的相对路径或文件名，例如 suale.txt、charts/sales.png；和 fileId、url 三选一',
+      },
+      url: {
+        type: 'string',
+        description:
+          '知识库图片地址，例如 /api/kb/assets/<docId>/<assetId> 或 /api/console/kb/docs/<docId>/assets/<assetId>；和 fileId、path 三选一。只接受这两种 EAB 知识库图片地址，不接受任意外部 URL。',
+      },
     },
   },
   {
     id: 'workspace.rename',
     name: '重命名云空间文件',
     description:
-      '修改个人云空间里一个文件的名字。用户说“重命名/改名/把文件名改成…”时调用；先用 workspace.list 找到文件，再传 fileId 或 path，并提供 newName。只改文件名，不移动文件。',
+      '修改个人云空间里一个文件的名字。用户说“重命名/改名/把文件名改成…”时调用；先用 workspace.list 找到文件，再传 fileId 或 path，并提供 newName。只改文件名，不移动文件；文件夹重命名请用 workspace.folder action=rename。',
     scope: SC.WORKSPACE_WRITE,
     dangerous: false,
     concurrency: 'write',
@@ -1014,7 +1146,7 @@ export const TOOLS: readonly ToolDef[] = [
     id: 'workspace.delete',
     name: '删除云空间文件',
     description:
-      '删除个人云空间里的一个文件。用户明确说“删掉/删除/清理某个文件”时调用；先用 workspace.list 找到 fileId 或 path。只能删自己的文件；删除是软删，文件会移到回收目录，列表里不再显示，但保留可审计。不要用它删除目录或非个人云空间文件。',
+      '删除个人云空间里的一个文件。用户明确说“删掉/删除/清理某个文件”时调用；先用 workspace.list 找到 fileId 或 path。只能删自己的文件；删除是软删，文件会移到回收目录，列表里不再显示，但保留可审计。不要用它删除目录；文件夹删除请用 workspace.folder action=delete。',
     scope: SC.WORKSPACE_WRITE,
     dangerous: false,
     concurrency: 'write',
@@ -1023,6 +1155,33 @@ export const TOOLS: readonly ToolDef[] = [
     input: {
       fileId: { type: 'string', description: 'workspace.list 返回的文件 id；和 path 二选一' },
       path: { type: 'string', description: '文件相对路径或文件名，例如 安全防护记录表.docx；和 fileId 二选一' },
+    },
+  },
+  {
+    id: 'workspace.folder',
+    name: '管理云空间文件夹',
+    description:
+      '创建、重命名或删除个人云空间的文件夹。先用 workspace.list 查看 folders 的完整路径。action=create：传 path 表示要新建的完整文件夹路径（如 docs/工作计划），会生成可见的空文件夹；action=rename：传 path 现有文件夹路径，再传 newName 新名称（只改最后一级，不会移动层级）；action=delete：传 path，递归软删该文件夹内所有本人文件到回收区，并清理空目录。只操作自己的文件夹；如果文件夹里包含其他成员共享来的文件，会拒绝整体改名/删除，避免误动他人文件。',
+    scope: SC.WORKSPACE_WRITE,
+    dangerous: false,
+    concurrency: 'write',
+    lockKey: (_deps, actor) => `workspace:folder:${actor.subject.companyId}:${actor.subject.userId}`,
+    idempotent: true,
+    input: {
+      action: {
+        type: 'string',
+        description: 'create（新建）、rename（重命名）或 delete（删除）',
+        required: true,
+      },
+      path: {
+        type: 'string',
+        description: '文件夹完整相对路径，例如 docs 或 docs/工作计划',
+        required: true,
+      },
+      newName: {
+        type: 'string',
+        description: 'action=rename 时必填：新文件夹名称，例如 资料；不能包含斜杠',
+      },
     },
   },
   {
@@ -1346,6 +1505,7 @@ export const AGENT_CORE_TOOL_IDS: readonly string[] = [
   'workspace.search',
   'workspace.write',
   'workspace.edit',
+  'workspace.folder',
   'project.exec',
   'project.job',
   'plugin.dev',
@@ -1427,9 +1587,10 @@ const TOOL_SEARCH_ALIASES: Record<string, string> = {
   'office.versions': '历史版本 版本列表 版本快照 手动快照 恢复到历史版本 回退 撤销 旧版本 version versions snapshot restore rollback history',
   'office.export': '导出PDF 转PDF 文档转PDF 导出图片 export pdf convert print',
   'office.gui': '打印 打印设置 宏 宏管理器 导出选项 页面设置 页眉页脚 原生对话框 GUI兜底 人工兜底 print macro export dialog fallback',
-  'workspace.send_dingtalk': '发送文件 发文件 发给我 钉钉 send file dingtalk attachment',
+  'workspace.send_dingtalk': '发送文件 发文件 发给我 钉钉 发图片 图片发我 发送图片 发图 send file image picture dingtalk attachment',
   'workspace.rename': '重命名 改名 文件名 rename file',
   'workspace.delete': '删除文件 删掉 清理文件 delete file remove',
+  'workspace.folder': '文件夹 目录 新建文件夹 创建文件夹 建目录 重命名文件夹 改名文件夹 删除文件夹 移除目录 folder directory mkdir rmdir rename folder delete folder',
   'admin.password.reset': '重置密码 改密码 成员密码 password reset',
 }
 
@@ -1937,9 +2098,20 @@ export async function executeTool(
     }
     case 'workspace.list': {
       const rows = deps.db
-        .prepare('SELECT id, name, rel_path, size, updated_at FROM workspace_files WHERE company_id = ? AND owner_user_id = ? AND deleted_at IS NULL ORDER BY updated_at DESC')
-        .all(actor.subject.companyId, actor.subject.userId)
-      result = { files: rows }
+        .prepare(
+          'SELECT id, name, rel_path, size, updated_at FROM workspace_files WHERE company_id = ? AND owner_user_id = ? AND deleted_at IS NULL ORDER BY updated_at DESC',
+        )
+        .all(actor.subject.companyId, actor.subject.userId) as unknown as Array<{
+        id: string
+        name: string
+        rel_path: string
+        size: number
+        updated_at: number
+      }>
+      result = {
+        folders: workspaceFolderSummaries(rows),
+        files: rows.filter((row) => row.name !== '.gitkeep'),
+      }
       break
     }
     case 'workspace.capacity': {
@@ -3729,7 +3901,55 @@ export async function executeTool(
     case 'workspace.send_dingtalk': {
       const fileIdArg = String(args.fileId ?? '').trim()
       const pathArg = String(args.path ?? '').trim()
+      const urlArg = String(args.url ?? '').trim()
+      if (urlArg) {
+        const ref = kbAssetRefOf(urlArg)
+        if (!ref) {
+          throw new EabError(EC.VALIDATION, '只支持发送 EAB 知识库图片地址', {
+            details: { url: urlArg },
+            hint: 'url 只接受 /api/kb/assets/<docId>/<assetId> 或 /api/console/kb/docs/<docId>/assets/<assetId>。',
+          })
+        }
+        requireScope(actor.subject, SC.KB_READ)
+        const { row, buffer } = getDocAsset(
+          deps.db,
+          deps.config,
+          actor.subject.companyId,
+          ref.docId,
+          ref.assetId,
+        )
+        const fileName = row.source_name || `${row.id}.png`
+        const mime = dingTalkImageMimeOf(fileName, row.mime)
+        if (!mime) {
+          throw new EabError(EC.VALIDATION, '知识库资产不是支持的图片格式', {
+            details: { docId: ref.docId, assetId: ref.assetId, mime: row.mime },
+          })
+        }
+        const sent = await sendDingTalkFileToUser(deps, {
+          companyId: actor.subject.companyId,
+          userId: actor.subject.userId,
+          fileName,
+          mime,
+          buffer,
+        })
+        result = {
+          sent: true,
+          delivery: 'image',
+          source: 'kb-asset',
+          to: '钉钉机器人私聊',
+          fileName,
+          size: buffer.length,
+          docId: ref.docId,
+          assetId: ref.assetId,
+          mime,
+          fileType: sent.fileType,
+          mediaType: sent.mediaType,
+          mediaId: sent.mediaId,
+        }
+        break
+      }
       let targetId = fileIdArg
+      let diskImage: WorkspaceImageFile | null = null
       if (!targetId) {
         if (!pathArg) throw new EabError(EC.VALIDATION, 'fileId 和 path 至少提供一个')
         const row = deps.db
@@ -3740,14 +3960,49 @@ export async function executeTool(
               ORDER BY updated_at DESC LIMIT 1`,
           )
           .get(actor.subject.companyId, actor.subject.userId, pathArg, pathArg) as { id: string } | undefined
-        if (!row) {
-          throw new EabError(EC.NOT_FOUND, `云空间里没有找到文件: ${pathArg}`, {
-            hint: '先调用 workspace.list 查看文件名和相对路径，再用 path 或 fileId 发送。',
-          })
+        if (row) {
+          targetId = row.id
+        } else {
+          // 图片可能刚由 project.exec/导出工具写到磁盘，还没进 workspace_files；
+          // 只在这类文件确实是用户工作区内的图片时放行。
+          try {
+            diskImage = readWorkspaceImageFileByPath(deps, actor, pathArg)
+          } catch (error) {
+            if (error instanceof EabError && error.code === EC.NOT_FOUND) {
+              throw new EabError(EC.NOT_FOUND, `云空间里没有找到文件: ${pathArg}`, {
+                hint: '先调用 workspace.list 查看文件名和相对路径，再用 path 或 fileId 发送；图片也可以是工作区里刚生成的相对路径。',
+              })
+            }
+            throw error
+          }
         }
-        targetId = row.id
       }
-      const file = readUserWorkspaceFile(deps, actor, targetId)
+      const file = targetId ? readUserWorkspaceFile(deps, actor, targetId) : diskImage!
+      const imageMime = dingTalkImageMimeOf(file.name, file.mime)
+      if (imageMime) {
+        // 图片走机器人原生图片消息，直接在钉钉里显示为图片气泡；不再走
+        // convFile 用户方向文件消息，否则客户端只会把它当普通文件附件。
+        const sent = await sendDingTalkFileToUser(deps, {
+          companyId: actor.subject.companyId,
+          userId: actor.subject.userId,
+          fileName: file.name,
+          mime: imageMime,
+          buffer: file.buffer,
+        })
+        result = {
+          sent: true,
+          delivery: 'image',
+          to: '钉钉机器人私聊',
+          fileName: file.name,
+          size: file.size,
+          relPath: file.relPath,
+          mime: imageMime,
+          fileType: sent.fileType,
+          mediaType: sent.mediaType,
+          mediaId: sent.mediaId,
+        }
+        break
+      }
       if (space.kind === 'cloud') {
         // 钉钉会话里优先用「用户方向」发文件：convFile/conversations/files/send 会以
         // 操作人 unionId 发出，文件落在机器人私聊右侧，客户端原生带预览/未查收/下载/编辑。
@@ -3900,6 +4155,49 @@ export async function executeTool(
         recycled: true,
       }
       break
+    }
+    case 'workspace.folder': {
+      const action = String(args.action ?? '').trim().toLowerCase()
+      const pathArg = String(args.path ?? '').trim()
+      if (!action) throw new EabError(EC.VALIDATION, 'action 不能为空；可选 create、rename、delete')
+      if (!pathArg) throw new EabError(EC.VALIDATION, 'path 不能为空')
+      if (action === 'create') {
+        const created = createUserWorkspaceFolder(deps, actor, pathArg)
+        result = {
+          created: true,
+          folderPath: created.folderPath,
+          name: created.folderPath.split('/').pop(),
+          note: '文件夹已创建；空文件夹会保留在云空间列表和 workspace.list 的 folders 里。',
+        }
+        break
+      }
+      if (action === 'rename') {
+        const newName = String(args.newName ?? args.name ?? '').trim()
+        if (!newName) throw new EabError(EC.VALIDATION, 'action=rename 时 newName 不能为空')
+        const renamed = renameUserWorkspaceFolder(deps, actor, pathArg, newName)
+        result = {
+          renamed: true,
+          from: renamed.from,
+          to: renamed.to,
+          folderPath: renamed.to,
+          fileCount: renamed.fileCount,
+        }
+        break
+      }
+      if (action === 'delete') {
+        const deleted = deleteUserWorkspaceFolder(deps, actor, pathArg)
+        result = {
+          deleted: true,
+          folderPath: deleted.folderPath,
+          fileCount: deleted.fileCount,
+          recycled: true,
+          note: '文件夹内的本人文件已移到回收区；其他成员共享来的文件不会被删除。',
+        }
+        break
+      }
+      throw new EabError(EC.VALIDATION, `不支持的 action: ${action}`, {
+        hint: 'action 只能是 create、rename 或 delete。',
+      })
     }
     case 'memory.propose': {
       const content = String(args.content ?? '').trim()

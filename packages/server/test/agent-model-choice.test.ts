@@ -49,6 +49,16 @@ describe('父 Agent 自动分配子 Agent 模型', () => {
     expect(choice.reason).toContain('显式')
   })
 
+  it('显式指定的模型不在本轮可用列表时，不能硬派，回退到可用模型', () => {
+    const choice = chooseSubAgentModel({
+      task: { title: '指定失效模型', prompt: '修复登录接口的 bug', modelId: 'model_gone' },
+      available: models,
+      parentModelId: 'model_fast',
+    })
+    expect(choice.modelId).not.toBe('model_gone')
+    expect(models.map((model: any) => model.id)).toContain(choice.modelId)
+  })
+
   it('没有可见模型时回退父模型', () => {
     const choice = chooseSubAgentModel({
       task: { title: '默认', prompt: '随便做点什么' },

@@ -174,7 +174,8 @@ async function indexOneDoc(
 
   db.exec('BEGIN')
   try {
-    db.prepare('DELETE FROM kb_chunk_embeddings WHERE doc_id = ?').run(doc.id)
+    // 只替换当前模型的向量：同一 chunk 可能保留对比模型的向量，不能整篇删掉。
+    db.prepare('DELETE FROM kb_chunk_embeddings WHERE doc_id = ? AND model_id = ?').run(doc.id, model.id)
     const insert = db.prepare(
       `INSERT INTO kb_chunk_embeddings
          (chunk_id, company_id, collection_id, doc_id, model_id, dim, vector, norm, created_at)

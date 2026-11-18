@@ -24,7 +24,7 @@
 
 ## 2. 页面行为
 
-左侧二级导航位于「连接与平台」下，顺序为：渠道 → **数据库** → 公司资料 → 系统。
+「连接与平台」下的二级导航顺序为：渠道 → **数据连接** → 在线文档 → 公司设置 → 系统。
 
 页面由四块组成：
 
@@ -181,3 +181,18 @@ database_connections(
 5. 版本号已随本次发布更新为 `2026.11.14`，并随发布提交推送。
 6. SSL / TLS 目前只支持 PostgreSQL / MySQL 勾选启用，使用 `rejectUnauthorized: false`，即加密但不校验证书；未提供 CA、客户端证书，Redis TLS 也未在页面开放。
 7. 查询弹窗已写窄屏媒体规则，但本轮只在 1440×1000 桌面视口完成截图验收；未单独复验手机宽度下的表格横向滚动与键盘遮挡。
+
+## 8. 向量数据库连接（方案已定稿，待实施）
+
+> 2026-11-18 新增知识库全流程升级方案：Qdrant 作为新的数据连接类型；pgvector 复用 PostgreSQL 连接并检测 `vector` 扩展。本节是规划口径，当前代码尚未落地，实际能力仍以上文第 1–7 节为准。
+
+- 新迁移 `0073_database_connections_vector.sql` 扩展 `kind` 到 `postgres / mysql / sqlite / redis / qdrant`，新增 `options_json` 与 `vector_capability`；SQLite 因 CHECK 约束需重建 `database_connections` 表并保留原行与 `secret_ref`。
+- Qdrant 字段：名称、主机、端口（默认 6333）、TLS、API Key、Collection 前缀、启用；API Key 仍只写 `secrets.json`，页面只显示“已配置”。
+- Qdrant 探针：`GET /readyz` 与 `GET /collections`，不开放任意命令；测试结果写 `status_detail`，例如 `Qdrant 1.12 · 12 collections`。
+- pgvector 不新增连接类型：PostgreSQL 探测在原有 `SELECT version(), current_database()` 之后追加 `SELECT extversion FROM pg_extension WHERE extname='vector'`；成功写 `vector_capability='pgvector'`，失败写“PG 可用，未安装 pgvector 扩展”。
+- 只有 `enabled=1`、`status='ok'` 且具备 `vector_capability` 的连接才能被知识库选为向量后端；选择结果存 `kb_collections.vector_backend / vector_connection_id`。
+- 运行时以管理后台连接配置为准，不读环境变量覆盖；连接新增/修改/测试后热刷新可用后端，不重启 EAB。
+- 外部向量库不可用时按“外部 → 本地 SQLite → 关键词”降级；上传/索引失败不阻塞文档可用，检索失败不阻塞对话。
+- 现有“连接注册表不改 EAB 审计/会话后端”的边界不变；向量库只是知识库的显式消费者。
+
+详细设计见 `docs/EAB知识库全流程升级方案.md` 第 10 节。

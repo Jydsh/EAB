@@ -100,7 +100,7 @@ vi.mock('../src/llm.js', async (importOriginal) => {
   }
 })
 
-import { runAgentTurn } from '../src/routes/chat.js'
+import { runAgentTurn, shouldRunAgentTaskInBackground } from '../src/routes/chat.js'
 
 function testEnv() {
   const db = openDatabase({ path: ':memory:' })
@@ -155,8 +155,26 @@ describe('子 Agent 向父 Agent 提问', () => {
     expect(state.childCalls).toBe(2)
     const agentEvents = events.filter((event) => event.type === 'agent')
     expect(agentEvents.filter((event) => event.action === 'question')).toHaveLength(1)
-    expect(agentEvents.find((event) => event.action === 'question')?.status).toBe('waiting')
+    const questionEvent = agentEvents.find((event) => event.action === 'question')
+    expect(questionEvent?.status).toBe('waiting')
+    expect(String(questionEvent?.text ?? '')).toContain('【问题】要按哪个口径统计？')
+    expect(String(questionEvent?.text ?? '')).toContain('【当前进度与卡点】已经查到两份口径')
     expect(agentEvents.filter((event) => event.action === 'assign')).toHaveLength(2)
     expect(agentEvents.filter((event) => event.action === 'done')).toHaveLength(1)
+  })
+})
+
+describe('回复等待中的子 Agent 的执行方式', () => {
+  it('后台决策轮必须强制续跑为后台任务，普通前台仍按调用方选择', () => {
+    expect(shouldRunAgentTaskInBackground(true)).toBe(true)
+    expect(shouldRunAgentTaskInBackground('true')).toBe(true)
+    expect(shouldRunAgentTaskInBackground(undefined)).toBe(false)
+    expect(shouldRunAgentTaskInBackground(false)).toBe(false)
+    // 工程任务默认转后台：父 Agent 不占用前台工具调用一直等，失败/完成由唤醒轮处理。
+    expect(shouldRunAgentTaskInBackground(undefined, false, true)).toBe(true)
+    expect(shouldRunAgentTaskInBackground(false, false, true)).toBe(true)
+    // 后台决策轮强制续跑：即使模型没写 background，也必须转后台。
+    expect(shouldRunAgentTaskInBackground(undefined, true)).toBe(true)
+    expect(shouldRunAgentTaskInBackground(false, true)).toBe(true)
   })
 })

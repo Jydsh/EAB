@@ -23,7 +23,8 @@
     </style>
     <script src="/theme.js?v=20261117a" data-surface="admin"></script>
     <script src="/brand.js?v=20261115c" defer></script>
-    <link rel="stylesheet" href="/app.css?v=20261117a" />
+    <link rel="stylesheet" href="/app.css?v=20261118z31" />
+    <link rel="stylesheet" href="/kb-pipeline.css?v=20261118d8" />
     <link rel="stylesheet" href="/theme.css?v=20261115b" />
     <link rel="stylesheet" href="/boot-splash.css?v=20261115i" />
   </head>
@@ -120,18 +121,17 @@
         <span class="who-divider"></span>
         <div class="account" id="account">
           <button class="account-btn" id="account-toggle" type="button" aria-haspopup="true" aria-expanded="false">
-            <span class="account-avatar" aria-hidden="true">管</span>
+            <span class="account-avatar" id="account-avatar" aria-hidden="true">管</span>
             <span class="account-name">
-              <strong>超级管理员</strong>
-              <small>服务器侧</small>
+              <strong id="account-name">超级管理员</strong>
             </span>
             <span class="account-caret" aria-hidden="true">▾</span>
           </button>
           <div class="account-pop" id="account-pop" hidden>
             <div class="account-head">
-              <span class="account-avatar lg" aria-hidden="true">管</span>
+              <span class="account-avatar lg" id="account-avatar-pop" aria-hidden="true">管</span>
               <div class="account-head-text">
-                <strong>超级管理员</strong>
+                <strong id="account-name-pop">超级管理员</strong>
                 <small id="account-user">admin</small>
               </div>
             </div>
@@ -151,24 +151,28 @@
       </div>
     </header>
 
-    <!-- 一级导航：只按业务域分组；点一下切到该域，页面列表在左侧常驻 -->
+    <!-- 一级导航：悬停后自身向下展开一行，横排显示当前业务域的二级页面 -->
     <nav class="topnav primary-nav" id="topnav" aria-label="业务域导航">
-      <button class="nav-primary" type="button" data-domain="overview">概览</button>
-      <button class="nav-primary" type="button" data-domain="org">组织与权限</button>
-      <button class="nav-primary" type="button" data-domain="knowledge">知识与模型</button>
-      <button class="nav-primary" type="button" data-domain="platform">连接与平台</button>
-      <button class="nav-primary" type="button" data-domain="plugins">插件管理</button>
-      <button class="nav-primary" type="button" data-domain="skills">技能管理</button>
-      <button class="nav-primary" type="button" data-domain="ops">运营与审计</button>
-      <div class="nav-tail" id="nav-tail"></div>
+      <div class="topnav-row" id="topnav-row">
+        <button class="nav-primary" type="button" data-domain="overview">概览</button>
+        <button class="nav-primary" type="button" data-domain="org">组织与权限</button>
+        <button class="nav-primary" type="button" data-domain="knowledge">知识与模型</button>
+        <button class="nav-primary" type="button" data-domain="platform">连接与平台</button>
+        <button class="nav-primary" type="button" data-domain="features">功能管理</button>
+        <button class="nav-primary" type="button" data-domain="ops">运营与审计</button>
+        <div class="nav-tail" id="nav-tail"></div>
+      </div>
+      <div class="nav-subbar" id="nav-subbar" aria-hidden="true">
+        <div class="nav-subbar-inner" id="nav-subbar-inner" aria-label="二级页面导航"></div>
+      </div>
     </nav>
 
-    <div class="workspace">
-      <!-- 二级导航：当前业务域下的页面列表，常驻左侧，不再靠悬停发现 -->
-      <aside class="nav-rail" id="nav-rail" aria-label="二级导航"></aside>
+    <div class="workspace no-side">
+      <!-- 插件 / 技能页的左侧列表属于页面内容，不属于全站二级导航；其余页面不再常驻侧栏 -->
+      <aside class="nav-rail" id="nav-rail" aria-label="页面列表"></aside>
 
       <main class="page">
-        <div class="page-head">
+        <div class="page-head is-headingless">
           <div class="page-heading">
             <div class="page-kicker" id="page-kicker">EAB CONFIG</div>
             <h1 id="page-title">概览</h1>
@@ -180,14 +184,14 @@
         </div>
 
         <!-- 页内 rail：组织树 / 知识库列表 / 角色列表这类"本页选择器"，不是全站导航 -->
-        <div class="page-body" id="page-body">
+        <div class="page-body no-rail" id="page-body">
           <aside class="page-rail" id="page-rail" aria-label="页内选择器"></aside>
           <div id="view" class="view"></div>
         </div>
       </main>
     </div>
 
-    <script src="/boot-splash.js?v=20261116a" data-surface="admin" defer></script>
-    <script src="/app.js?v=20261117f" defer></script>
+    <script src="/boot-splash.js?v=20261118d" data-surface="admin" defer></script>
+    <script src="/app.js?v=20261118z39" defer></script>
   </body>
 </html>

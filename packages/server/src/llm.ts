@@ -158,6 +158,10 @@ export interface ModelCallOptions {
   maxTokensCap?: number
   /** 单次上游请求超时；批量分析的大输入需要比普通对话更长的等待。 */
   timeoutMs?: number
+  /** 本地 vLLM 上的 Qwen 清洗/抽取任务关闭思考，避免长输出被推理 token 拖到数分钟。 */
+  disableThinking?: boolean
+  /** 调用方中止（例如知识库文档清洗预算到点）。 */
+  signal?: AbortSignal
 }
 
 export interface ModelStreamOptions extends ModelCallOptions {
@@ -290,8 +294,12 @@ async function callOpenAi(
   tools: ToolSpec[] = [],
   reasoningEffort?: string,
   timeoutMs = 90_000,
+  disableThinking = false,
+  signal?: AbortSignal,
 ): Promise<CallResult> {
   const wireEffort = reasoningEffort ? providerReasoningEffort(reasoningEffort) : undefined
+  const timeoutSignal = AbortSignal.timeout(timeoutMs)
+  const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal
   const res = await fetchModelWithRetry(`${trimBase(base)}/chat/completions`, {
     method: 'POST',
     headers: {
@@ -304,9 +312,11 @@ async function callOpenAi(
       max_tokens: maxTokens,
       temperature: 0.4,
       ...(wireEffort ? { reasoning_effort: wireEffort } : {}),
+      // vLLM 的 Qwen 模板参数：关闭思考后清洗吞吐约提升一个数量级。
+      ...(disableThinking ? { chat_template_kwargs: { enable_thinking: false } } : {}),
       ...(tools.length > 0 ? { tools, tool_choice: 'auto' } : {}),
     }),
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: requestSignal,
   })
   if (!res.ok) {
     throw new EabError(EC.UPSTREAM, `模型返回 HTTP ${res.status}：${await readError(res)}`, {
@@ -332,13 +342,22 @@ async function callOpenAi(
       : Array.isArray(content)
         ? content.map((part) => part.text ?? '').join('')
         : ''
+  const reasoning = message?.reasoning ?? message?.reasoning_content ?? ''
   const toolCalls = message?.tool_calls ?? []
   if (!text.trim() && toolCalls.length === 0) {
+    // 推理模型把 max_tokens 花在 reasoning 上时 content 会是空的。
+    // 单独标记，交给 callModel 用更大的预算重试，而不是当成上游故障。
+    if (reasoning.trim()) {
+      throw new EabError(EC.UPSTREAM, '模型只输出了推理内容，没有生成最终答复', {
+        hint: '推理过程可能占满了 max_tokens',
+        details: { reasoningChars: reasoning.length },
+      })
+    }
     throw new EabError(EC.UPSTREAM, '模型返回了空内容', { hint: '上游可能限流或模型名不匹配' })
   }
   return {
     text,
-    reasoning: message?.reasoning ?? message?.reasoning_content ?? '',
+    reasoning,
     toolCalls,
     promptTokens: Number(json.usage?.prompt_tokens ?? 0),
     completionTokens: Number(json.usage?.completion_tokens ?? 0),
@@ -705,16 +724,37 @@ export async function callModel(
   if (provider.kind === 'azure_openai') {
     return callAzure(base, key, provider.modelKey, messages, maxTokens, options.reasoningEffort)
   }
-  return callOpenAi(
-    base,
-    key,
-    provider.modelKey,
-    messages,
-    maxTokens,
-    options.tools ?? [],
-    options.reasoningEffort,
-    options.timeoutMs,
-  )
+  const disableThinking =
+    Boolean(options.disableThinking) &&
+    provider.kind === 'openai' &&
+    (/vllm/i.test(provider.name) || /qwen/i.test(provider.modelKey))
+  const callOpenAiWithBudget = (tokens: number) =>
+    callOpenAi(
+      base,
+      key,
+      provider.modelKey,
+      messages,
+      tokens,
+      options.tools ?? [],
+      options.reasoningEffort,
+      options.timeoutMs,
+      disableThinking,
+      options.signal,
+    )
+  try {
+    return await callOpenAiWithBudget(maxTokens)
+  } catch (error) {
+    // 推理模型把输出预算全花在 thinking 上时，content 为空但 reasoning 有内容。
+    // 对这类结果用更大预算重试一次，避免小批次清洗被误判成“模型没有返回”。
+    if (
+      error instanceof EabError &&
+      error.message === '模型只输出了推理内容，没有生成最终答复' &&
+      maxTokens < 8192
+    ) {
+      return callOpenAiWithBudget(8192)
+    }
+    throw error
+  }
 }
 
 export interface EmbeddingResult {

@@ -26,6 +26,8 @@ import { actorFor, findActivePerson, type RequestActor } from './session.js'
 import { resolveModelForPurpose } from './model-registry.js'
 import { publishChatEvent } from './chat-events.js'
 import { dingTalkRecipientOf, sendDingTalkRichTextToUser } from './dingtalk-outbound.js'
+import { memoryQueryForTurn, recentMessageIds, searchChatMemory, shouldRecallPastConversations } from './chat-memory.js'
+import { refreshSessionSummary, sessionSummaryForPrompt } from './chat-summary.js'
 
 export type ScheduleMode = 'once' | 'daily' | 'weekly' | 'interval'
 export type ScheduleChannel = 'dingtalk' | 'web'
@@ -685,15 +687,6 @@ async function runSchedule(deps: ServerDeps, row: ScheduleRow, runId: string): P
       .run(sessionId, Date.now(), row.id)
   }
 
-  const tools = toolSpecsForAgent(deps.db, actor, { kind: 'cloud' })
-  const system = chat.buildSystemPrompt({
-    actor,
-    chatTools: tools,
-    memories: [],
-    hits: [],
-    hasAttachments: false,
-    spaceLabel: '云空间（定时任务自动执行）',
-  })
   // DSH 的 follow-up 语义：到点后不是“假装用户又发了一条”，而是带提醒信封的
   // 新 turn。模型能明确知道这是计划任务，回答里也会自然带出时间。
   const reminderText =
@@ -701,6 +694,31 @@ async function runSchedule(deps: ServerDeps, row: ScheduleRow, runId: string): P
     `计划时间：${toLocalIso(row.next_run_at, row.timezone)}（${row.timezone}）\n` +
     `任务：${row.prompt}`
   const history = chat.historyOf(deps.db, sessionId, 8, row.channel === 'dingtalk' ? 'dingtalk' : undefined)
+  const memoryCrossSession = shouldRecallPastConversations(row.prompt)
+  const memoryHits = searchChatMemory({
+    db: deps.db,
+    companyId: row.company_id,
+    userId: row.user_id,
+    sessionId,
+    crossSession: memoryCrossSession,
+    query: memoryQueryForTurn(row.prompt, history),
+    excludeMessageIds: recentMessageIds(deps.db, sessionId),
+    limit: 5,
+    maxChars: 1800,
+  })
+  const tools = toolSpecsForAgent(deps.db, actor, { kind: 'cloud' })
+  const system = chat.buildSystemPrompt({
+    actor,
+    chatTools: tools,
+    memories: [],
+    memoryHits,
+    memoryCrossSession,
+    sessionSummary: sessionSummaryForPrompt(deps.db, sessionId),
+    userQuestion: reminderText,
+    hits: [],
+    hasAttachments: false,
+    spaceLabel: '云空间（定时任务自动执行）',
+  })
   const messages = [
     { role: 'system' as const, content: system },
     ...history,
@@ -809,6 +827,16 @@ async function runSchedule(deps: ServerDeps, row: ScheduleRow, runId: string): P
     .prepare('UPDATE chat_sessions SET updated_at = ?, last_message_at = ? WHERE id = ?')
     .run(finishedAt, finishedAt, sessionId)
   chat.bumpUsage(deps.db, row.company_id, row.user_id, agent?.promptTokens ?? 0, agent?.completionTokens ?? 0)
+  void refreshSessionSummary({
+    db: deps.db,
+    dbPath: deps.config.dbPath,
+    companyId: row.company_id,
+    userId: row.user_id,
+    sessionId,
+    modelId: model.id,
+  }).catch((error) => {
+    console.warn('[eab] 定时任务会话摘要更新失败：', (error as Error).message)
+  })
   publishChatEvent({
     type: 'message',
     companyId: row.company_id,

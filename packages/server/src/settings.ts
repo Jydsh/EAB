@@ -319,6 +319,8 @@ export interface ConsoleSettings extends NetworkSettings {
   recordRetentionDays: number
   /** 云空间回收区保留天数；超过后物理删除 `_recycle` 文件并清理元数据 */
   workspaceRecycleDays: number
+  /** 知识库召回测试记录保留天数；作用于所有知识库，1–365 天 */
+  kbTestRetentionDays: number
   /** OnlyOffice 在线文档绑定 */
   onlyOffice: OnlyOfficeSettings
   /** 管理控制台 / 员工对话的品牌图标与标签文字 */
@@ -344,6 +346,7 @@ const DEFAULTS: ConsoleSettings = {
   agentRetentionDays: 0,
   recordRetentionDays: 0,
   workspaceRecycleDays: 30,
+  kbTestRetentionDays: 30,
   onlyOffice: { url: null, internalUrl: null, jwtSecretRef: null },
   branding: BRANDING_DEFAULTS,
   bootAnimation: DEFAULT_BOOT_ANIMATION,
@@ -499,6 +502,7 @@ export function readConsoleSettings(): ConsoleSettings {
     const agentDays = Number(raw.agentRetentionDays ?? DEFAULTS.agentRetentionDays)
     const recordDays = Number(raw.recordRetentionDays ?? DEFAULTS.recordRetentionDays)
     const workspaceRecycleDays = Number(raw.workspaceRecycleDays ?? DEFAULTS.workspaceRecycleDays)
+    const kbTestRetentionDays = Number(raw.kbTestRetentionDays ?? DEFAULTS.kbTestRetentionDays)
     return {
       dataDir: readText(raw.dataDir),
       paths: readPaths(raw.paths),
@@ -514,6 +518,10 @@ export function readConsoleSettings(): ConsoleSettings {
         Number.isFinite(workspaceRecycleDays) && workspaceRecycleDays >= 0
           ? Math.trunc(workspaceRecycleDays)
           : DEFAULTS.workspaceRecycleDays,
+      kbTestRetentionDays:
+        Number.isFinite(kbTestRetentionDays) && kbTestRetentionDays >= 1
+          ? Math.min(365, Math.trunc(kbTestRetentionDays))
+          : DEFAULTS.kbTestRetentionDays,
       onlyOffice: readOnlyOffice(raw.onlyOffice),
       branding: readBranding(raw.branding),
       bootAnimation: readBootAnimation(raw.bootAnimation),

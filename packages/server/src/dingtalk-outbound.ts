@@ -1,10 +1,11 @@
 /**
- * 钉钉出站文件：个人云空间文件 → 钉钉单聊文件消息。
+ * 钉钉出站文件/图片：个人云空间文件、工作区图片或知识库图片资产 → 钉钉单聊消息。
  *
  * 链路：
  *   1. `POST oapi.dingtalk.com/media/upload`（multipart：type=file/image + media）→ media_id
  *   2. `POST api.dingtalk.com/v1.0/robot/oToMessages/batchSend`
- *      msgKey=sampleFile，msgParam={ mediaId, fileName, fileType }
+ *      图片优先 msgKey=sampleImageMsg，msgParam={ photoURL }，失败降级 sampleFile；
+ *      文件使用 msgKey=sampleFile，msgParam={ mediaId, fileName, fileType }。
  *
  * 注意：webhook 回复不支持文件，只有接口方式支持；这里不复用 replySessionWebhook。
  */
@@ -296,21 +297,30 @@ export async function sendDingTalkFileToUser(
     mediaType,
   })
 
-  try {
+  if (mediaType === 'image') {
+    // 图片优先发钉钉原生图片消息，客户端直接渲染成图片气泡；部分老机器人没有
+    // sampleImageMsg 权限时才退回 sampleFile，至少保证文件送达。
+    try {
+      await batchSendMessage(token, {
+        robotCode: config.robotCode,
+        externalUserId,
+        msgKey: 'sampleImageMsg',
+        msgParam: { photoURL: mediaId },
+      })
+    } catch (error) {
+      await batchSendMessage(token, {
+        robotCode: config.robotCode,
+        externalUserId,
+        msgKey: 'sampleFile',
+        msgParam: { mediaId, fileName, fileType },
+      })
+    }
+  } else {
     await batchSendMessage(token, {
       robotCode: config.robotCode,
       externalUserId,
       msgKey: 'sampleFile',
       msgParam: { mediaId, fileName, fileType },
-    })
-  } catch (error) {
-    // 图片在 sampleFile 不被接受时，退回钉钉原生图片消息；其它类型不降级成链接或文本。
-    if (mediaType !== 'image') throw error
-    await batchSendMessage(token, {
-      robotCode: config.robotCode,
-      externalUserId,
-      msgKey: 'sampleImageMsg',
-      msgParam: { photoURL: mediaId },
     })
   }
 

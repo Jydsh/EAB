@@ -4,8 +4,8 @@ EAB 是一套面向**单公司本地部署**的企业智能体基座：一个进
 
 - 员工入口：`http://127.0.0.1:8787/chat`
 - 管理控制台：`http://127.0.0.1:8788/admin`
-- 当前版本：`2026.11.17`
-- 本版发布说明：[`docs/releases/v2026.11.17.md`](docs/releases/v2026.11.17.md)
+- 当前版本：`2026.11.18`
+- 本版发布说明：[`docs/releases/v2026.11.18.md`](docs/releases/v2026.11.18.md)
 
 > 单公司边界：一个实例只服务一家公司。钉钉、飞书、企业微信、模型供应商、知识库、插件都在控制台里配置。
 
@@ -43,6 +43,8 @@ node scripts/eab.mjs server
 > **新部署实例是空数据**：代码仓库只包含程序本身，不包含插件、知识库文档、渠道绑定、模型供应商和密钥、组织成员等运行数据。换一台机器或新用户部署后，需要登录控制台自行安装插件、配置模型与渠道、创建/导入知识库并同步组织；本机的 `.eab-dev` 数据不会随 GitHub 代码一起过去。
 
 > 不想先敲 `node scripts/eab.mjs` 也可以直接执行 `pnpm dev`，两种方式等价；`eab start` 是推荐的统一入口（旧命令 `eab server` 仍然兼容）。
+>
+> Windows 前台启动会自动关闭当前终端窗口的“快速编辑”模式。否则鼠标点一下终端就会进入选区，Node 的输出被挂起，表现为服务卡住、再按一次回车才恢复。该设置只影响当前窗口，不改注册表；如果确实需要用鼠标选中日志复制，可以设置 `EAB_KEEP_QUICK_EDIT=1` 跳过这一步，或改用 `eab start --background` 后台运行。
 
 ---
 
@@ -218,8 +220,8 @@ eab start
 
 EAB 的版本来自 GitHub Release：
 
-- Release tag：`v2026.11.17`
-- Release 资产：源码 zip（`EAB-2026.11.17.zip`）。桌面安装包、`latest.yml`、`.blockmap` 已停止发布。
+- Release tag：`v2026.11.18`
+- Release 资产：源码 zip（`EAB-2026.11.18.zip`）。桌面安装包、`latest.yml`、`.blockmap` 已停止发布。
 
 ### 两种更新方式
 
@@ -283,7 +285,7 @@ pnpm dev                  # 等价于 eab start
 
 1. 改根 `package.json` 的 `version`；
 2. 更新 `README.md` 版本与源码包名；
-3. 提交并打 tag：`git tag v2026.11.17 && git push origin v2026.11.17`；
+3. 提交并打 tag：`git tag v2026.11.18 && git push origin v2026.11.18`；
 4. GitHub Actions 只构建源码 zip 并创建/更新 Release，不再生成桌面安装包；
 5. 控制台/CLI 的版本检查读取该 Release。
 

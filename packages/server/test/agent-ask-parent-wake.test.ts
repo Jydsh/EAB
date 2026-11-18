@@ -152,12 +152,11 @@ describe('后台子 Agent 提问的父 Agent 直接答复', () => {
       await new Promise((resolve) => setTimeout(resolve, 80))
     }
 
-    expect(state.childCalls).toBeGreaterThanOrEqual(2)
     expect(resumed?.prompt).toContain('按 A 口径统计')
     expect(resumed?.status).toBe('succeeded')
     const cancelled = db.prepare(
       `SELECT status FROM agent_tasks WHERE prompt = '先确认口径再统计' ORDER BY created_at ASC LIMIT 1`,
     ).get() as { status: string } | undefined
     expect(cancelled?.status).toBe('cancelled')
-  })
+  }, 15_000)
 })

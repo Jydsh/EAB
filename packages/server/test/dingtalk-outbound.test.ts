@@ -174,6 +174,38 @@ describe('钉钉出站文件', () => {
     })
   })
 
+  it('图片优先用 sampleImageMsg 发成钉钉原生图片气泡', async () => {
+    process.env.EAB_TEST_DING_SECRET = 'secret_test'
+    const { deps } = testDeps('ding_test_image')
+    const calls = mockDingTalk()
+
+    const sent = await sendDingTalkFileToUser(deps, {
+      companyId: 'c1',
+      userId: 'u_test',
+      fileName: '趋势图.png',
+      mime: 'image/png',
+      buffer: Buffer.from('png-test'),
+    })
+
+    expect(sent).toMatchObject({
+      mediaId: '@media_test',
+      externalUserId: 'staff_test',
+      fileName: '趋势图.png',
+      fileType: 'png',
+      mediaType: 'image',
+    })
+    const upload = calls.find((call) => call.url.includes('/media/upload'))
+    expect((upload?.init?.body as FormData).get('type')).toBe('image')
+    const send = calls.find((call) => call.url.includes('/oToMessages/batchSend'))
+    const sendBody = JSON.parse(String(send?.init?.body)) as Record<string, unknown>
+    expect(sendBody).toMatchObject({
+      robotCode: 'robot_test',
+      userIds: ['staff_test'],
+      msgKey: 'sampleImageMsg',
+    })
+    expect(JSON.parse(String(sendBody.msgParam))).toEqual({ photoURL: '@media_test' })
+  })
+
   it('超过 20 MB 时直接拒绝，不发起任何钉钉请求', async () => {
     process.env.EAB_TEST_DING_SECRET = 'secret_test'
     const { deps } = testDeps('ding_test_oversize')

@@ -5,7 +5,8 @@
  * 登录失败 5 次锁 10 分钟，锁定键 = IP + 账号，避免一个账号被全公司试。
  */
 import { createHash, randomUUID } from 'node:crypto'
-import type { FastifyInstance, FastifyRequest } from 'fastify'
+import QRCode from 'qrcode'
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 import { EC, EabError, normalizeMobile } from '@eab/domain'
 import { appendAudit } from '@eab/storage'
 import type { ServerDeps } from '../deps.js'
@@ -21,6 +22,10 @@ import {
 } from '../employee-session.js'
 import { findPerson, roleCodesOf } from '../session.js'
 import { refreshDingTalkUserAvatar } from '../dingtalk-avatar.js'
+import { clearSessionCookie } from '../console-auth.js'
+import { createConsoleMemberSession } from '../console-member-session.js'
+import { hasAnyConsolePagePermission } from '../console-permissions.js'
+import { effectiveNetwork } from '../network-settings.js'
 
 const MAX_FAILS = 5
 const LOCK_MS = 10 * 60 * 1000
@@ -87,10 +92,10 @@ function escapeHtml(value: string): string {
     .replace(/'/g, '&#39;')
 }
 
-function loginErrorPage(message: string, hint = ''): string {
-  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" /><title>钉钉登录未完成</title>
+function loginErrorPage(message: string, hint = '', title = '钉钉登录未完成', backPath = '/chat'): string {
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" /><title>${escapeHtml(title)}</title>
 <style>body{margin:0;background:#f6f7f9;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:#1f2329}main{max-width:560px;margin:12vh auto;padding:28px 30px;background:#fff;border:1px solid #e5e6eb;border-radius:14px;box-shadow:0 8px 30px rgba(31,35,41,.06)}h1{font-size:20px;margin:0 0 10px}p{margin:0 0 10px;line-height:1.7;color:#4e5969}.hint{font-size:13px;color:#86909c}a{display:inline-block;margin-top:14px;color:#0b6bcb;text-decoration:none}code{background:#f2f3f5;padding:2px 6px;border-radius:5px;font-size:12px}</style></head>
-<body><main><h1>钉钉登录未完成</h1><p>${escapeHtml(message)}</p>${hint ? `<p class="hint">${escapeHtml(hint)}</p>` : ''}<a href="/chat">返回登录页</a></main></body></html>`
+<body><main><h1>${escapeHtml(title)}</h1><p>${escapeHtml(message)}</p>${hint ? `<p class="hint">${escapeHtml(hint)}</p>` : ''}<a href="${escapeHtml(backPath)}">返回登录页</a></main></body></html>`
 }
 
 function publicBaseUrl(req: FastifyRequest, deps: ServerDeps): string {
@@ -109,6 +114,73 @@ function safeRedirectPath(value: unknown): string {
   const raw = typeof value === 'string' ? value.trim() : ''
   if (!raw || !raw.startsWith('/') || raw.startsWith('//') || raw.includes('\\')) return '/chat'
   return raw.slice(0, 200)
+}
+
+/**
+ * 管理端扫码也复用对话端的钉钉回调（钉钉开放平台只登记了这一个回调地址）。
+ * 控制台与对话端是两个端口时，把当前 Host 的端口换成对话端口，避免回调落到
+ * 不提供 /api/auth/* 的管理端口上。
+ */
+function chatCallbackBase(req: FastifyRequest, deps: ServerDeps): string {
+  const base = new URL(publicBaseUrl(req, deps))
+  const network = effectiveNetwork(deps.config)
+  if (base.port && network.chatPort) base.port = String(network.chatPort)
+  return base.origin
+}
+
+/** 管理端扫码如果走了浏览器重定向回调（不是内嵌 SDK 回调），要把用户送回管理端口。 */
+function adminBaseUrl(req: FastifyRequest, deps: ServerDeps): string {
+  const base = new URL(publicBaseUrl(req, deps))
+  const network = effectiveNetwork(deps.config)
+  if (base.port && network.adminPort) base.port = String(network.adminPort)
+  return base.origin
+}
+
+/**
+ * 扫码身份确认后，统一签发「成员后台会话」。
+ * 内嵌二维码 exchange 与浏览器重定向 callback 共用这一套权限校验和审计。
+ */
+function completeConsoleMemberLogin(
+  reply: FastifyReply,
+  deps: ServerDeps,
+  req: FastifyRequest,
+  companyId: string,
+  member: DingTalkMemberRow,
+  profile: { unionId?: string },
+  externalUserId: string,
+  mode: 'console-embedded-qr' | 'console-redirect-qr' | 'console-sso-redirect',
+  provider: 'dingtalk' | 'feishu' | 'wecom' = 'dingtalk',
+): void {
+  const providerLabel = provider === 'feishu' ? '飞书' : provider === 'wecom' ? '企业微信' : '钉钉'
+  const companyStatus = deps.db.prepare('SELECT status FROM companies WHERE id = ?').get(companyId) as
+    | { status?: string }
+    | undefined
+  if (companyStatus?.status === 'suspended') {
+    throw new EabError(EC.FORBIDDEN, '当前公司已停用，暂时不能登录管理后台')
+  }
+  if (!hasAnyConsolePagePermission(deps.db, companyId, member.user_id)) {
+    throw new EabError(EC.FORBIDDEN, `你没有权限进入管理后台：该${providerLabel}成员还没有开通后台页面权限`, {
+      hint: '请联系平台管理员，在「成员管理 → 角色权限 → 后台访问」给角色配置至少一个页面，或保留该成员的个人页面配置。',
+    })
+  }
+  const session = createConsoleMemberSession(deps.db, member.user_id, companyId, req)
+  // 清掉平台超管 Cookie，避免同一个浏览器把两种身份叠在一起。
+  reply.header('set-cookie', [clearSessionCookie(), session.cookie])
+  appendAudit(deps.db, {
+    companyId,
+    actorUserId: member.user_id,
+    action: 'console.member.login',
+    resourceType: 'session',
+    result: 'success',
+    ip: req.ip ?? null,
+    channel: provider,
+    detail: {
+      provider,
+      externalUserId,
+      ...(profile.unionId ? { unionId: profile.unionId } : {}),
+      mode,
+    },
+  })
 }
 
 function dingtalkAppOf(deps: ServerDeps, companyId: string): DingTalkApp {
@@ -145,6 +217,244 @@ function dingtalkAppOf(deps: ServerDeps, companyId: string): DingTalkApp {
     tenantId: row.tenant_id,
     tenantName: row.tenant_name,
   }
+}
+
+type SsoProvider = 'dingtalk' | 'feishu' | 'wecom'
+
+interface SsoChannelConfig {
+  readonly provider: SsoProvider
+  readonly appId: string
+  readonly corpId: string
+  readonly agentId: string
+  readonly appSecret: string
+  readonly tenantName: string
+}
+
+interface ChannelConfigRow {
+  readonly provider: string
+  readonly enabled: number
+  readonly status: string
+  readonly app_id: string | null
+  readonly agent_id: string | null
+  readonly corp_id: string | null
+  readonly secret_ref: string | null
+  readonly tenant_name: string | null
+}
+
+function channelConfigOf(deps: ServerDeps, companyId: string, provider: SsoProvider): ChannelConfigRow | undefined {
+  return deps.db
+    .prepare(
+      `SELECT provider, enabled, status, app_id, agent_id, corp_id, secret_ref, tenant_name
+         FROM channel_configs
+        WHERE company_id = ? AND provider = ?`,
+    )
+    .get(companyId, provider) as ChannelConfigRow | undefined
+}
+
+/**
+ * 三种渠道的登录配置口径不同：
+ * - 钉钉 / 飞书用 AppID + AppSecret；
+ * - 企业微信走企业应用 OAuth，用 CorpID + AgentID + Secret，不要求填 AppID。
+ */
+function ssoChannelOf(deps: ServerDeps, companyId: string, provider: SsoProvider): SsoChannelConfig {
+  const row = channelConfigOf(deps, companyId, provider)
+  if (!row || !row.enabled || row.status !== 'bound') {
+    throw new EabError(EC.VALIDATION, `这家公司还没有绑定${ssoProviderLabel(provider)}，无法扫码登录`, {
+      hint: `先让公司管理员在控制台「连接与平台 → 渠道接入」完成${ssoProviderLabel(provider)}绑定并同步组织架构。`,
+    })
+  }
+  const appId = String(row.app_id || '')
+  const corpId = String(row.corp_id || '') || appId
+  const agentId = String(row.agent_id || '')
+  const configured =
+    provider === 'wecom' ? Boolean(corpId && agentId && row.secret_ref) : Boolean(appId && row.secret_ref)
+  if (!configured) {
+    throw new EabError(EC.VALIDATION, `${ssoProviderLabel(provider)}扫码登录配置不完整`, {
+      hint:
+        provider === 'wecom'
+          ? '企业微信需要填写企业 CorpID、应用 AgentID 和 Secret 后才能扫码登录。'
+          : `需要填写${ssoProviderLabel(provider)}应用 AppID 和 AppSecret。`,
+    })
+  }
+  const appSecret = resolveSecret(deps.config.dbPath, row.secret_ref)
+  if (!appSecret) {
+    throw new EabError(EC.VALIDATION, `${ssoProviderLabel(provider)}应用密钥没有注入到当前服务器`, {
+      hint: '检查 .eab-dev/secrets.json 里对应的 secret 引用，或重新保存一次应用密钥。',
+    })
+  }
+  return {
+    provider,
+    appId,
+    corpId,
+    agentId,
+    appSecret,
+    tenantName: String(row.tenant_name || '').trim(),
+  }
+}
+
+function ssoProviderLabel(provider: SsoProvider): string {
+  return provider === 'feishu' ? '飞书' : provider === 'wecom' ? '企业微信' : '钉钉'
+}
+
+function ssoProviderConfigured(
+  deps: ServerDeps,
+  row: ChannelConfigRow | undefined,
+  provider: SsoProvider,
+): boolean {
+  if (!row || row.enabled !== 1 || row.status !== 'bound' || !row.secret_ref) return false
+  if (!resolveSecret(deps.config.dbPath, row.secret_ref)) return false
+  if (provider === 'wecom') return Boolean((row.corp_id || row.app_id) && row.agent_id)
+  return Boolean(row.app_id)
+}
+
+function ssoMethodPayload(
+  req: FastifyRequest,
+  deps: ServerDeps,
+  companyId: string,
+  provider: SsoProvider,
+): {
+  provider: SsoProvider
+  label: string
+  configured: boolean
+  tenantName: string | null
+  callback: string
+  mode: 'sdk' | 'qrcode'
+} {
+  const row = channelConfigOf(deps, companyId, provider)
+  return {
+    provider,
+    label: ssoProviderLabel(provider),
+    configured: ssoProviderConfigured(deps, row, provider),
+    tenantName: row?.tenant_name ?? null,
+    callback: `${chatCallbackBase(req, deps)}/api/auth/${provider}/callback`,
+    mode: provider === 'wecom' ? 'qrcode' : 'sdk',
+  }
+}
+
+async function readSsoJson(
+  provider: SsoProvider,
+  url: string,
+  init?: RequestInit,
+  stage = '',
+): Promise<Record<string, unknown>> {
+  const label = ssoProviderLabel(provider)
+  const res = await fetch(url, { ...init, signal: AbortSignal.timeout(15_000) })
+  const text = await res.text()
+  let body: Record<string, unknown> = {}
+  try {
+    body = text ? (JSON.parse(text) as Record<string, unknown>) : {}
+  } catch {
+    throw new EabError(EC.INTERNAL, `${label}接口返回非 JSON（HTTP ${res.status}）：${text.slice(0, 120)}`)
+  }
+  const code = Number(body.code ?? body.errcode ?? 0)
+  if (!res.ok || code !== 0) {
+    const message = String(body.msg ?? body.message ?? body.error_description ?? body.errmsg ?? text).slice(0, 240)
+    throw new EabError(EC.INTERNAL, `${stage ? `${stage}：` : ''}${label}接口失败${code ? `（${code}）` : ''}：${message}`, {
+      hint: `检查${label}应用的密钥、回调地址与接口权限是否已生效。`,
+      details: { status: res.status, code },
+    })
+  }
+  return body
+}
+
+/** 渠道身份登录：优先按同步时写入的 external_user_id 精确匹配，飞书再用 union_id 兜底。 */
+function findSsoMember(
+  deps: ServerDeps,
+  companyId: string,
+  provider: SsoProvider,
+  externalUserId: string,
+  unionId = '',
+): DingTalkMemberRow | undefined {
+  const base = `
+    SELECT ui.user_id, u.name, u.company_id
+      FROM user_identities ui
+      JOIN users u ON u.id = ui.user_id
+     WHERE ui.provider = ?
+       AND u.company_id = ?
+       AND u.deleted_at IS NULL
+       AND u.status = 'active'`
+  if (externalUserId) {
+    const exact = deps.db
+      .prepare(`${base} AND ui.external_user_id = ? LIMIT 1`)
+      .get(provider, companyId, externalUserId) as DingTalkMemberRow | undefined
+    if (exact) return exact
+  }
+  if (unionId) {
+    return deps.db
+      .prepare(`${base} AND ui.union_id = ? LIMIT 1`)
+      .get(provider, companyId, unionId) as DingTalkMemberRow | undefined
+  }
+  return undefined
+}
+
+async function feishuIdentityByCode(
+  config: SsoChannelConfig,
+  code: string,
+  redirectUri: string,
+): Promise<{ externalUserId: string; unionId: string; name: string }> {
+  const tokenBody = await readSsoJson(
+    'feishu',
+    'https://open.feishu.cn/open-apis/authen/v2/oauth/token',
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json; charset=utf-8' },
+      body: JSON.stringify({
+        grant_type: 'authorization_code',
+        client_id: config.appId,
+        client_secret: config.appSecret,
+        code,
+        redirect_uri: redirectUri,
+      }),
+    },
+    '换取飞书用户令牌',
+  )
+  const accessToken = String(tokenBody.access_token || '')
+  if (!accessToken) throw new EabError(EC.INTERNAL, '飞书没有返回 user_access_token')
+
+  const profileBody = await readSsoJson(
+    'feishu',
+    'https://open.feishu.cn/open-apis/authen/v1/user_info',
+    { headers: { authorization: `Bearer ${accessToken}` } },
+    '读取飞书用户信息',
+  )
+  const data = (profileBody.data ?? {}) as { open_id?: unknown; union_id?: unknown; name?: unknown }
+  const openId = typeof data.open_id === 'string' ? data.open_id : ''
+  if (!openId) throw new EabError(EC.INTERNAL, '飞书用户信息里没有 open_id，无法定位企业成员')
+  return {
+    externalUserId: openId,
+    unionId: typeof data.union_id === 'string' ? data.union_id : '',
+    name: typeof data.name === 'string' ? data.name : '',
+  }
+}
+
+async function wecomIdentityByCode(
+  config: SsoChannelConfig,
+  code: string,
+): Promise<{ externalUserId: string; name: string }> {
+  const tokenUrl = new URL('https://qyapi.weixin.qq.com/cgi-bin/gettoken')
+  tokenUrl.searchParams.set('corpid', config.corpId)
+  tokenUrl.searchParams.set('corpsecret', config.appSecret)
+  const tokenBody = await readSsoJson('wecom', tokenUrl.toString(), undefined, '获取企业微信 access_token')
+  const accessToken = String(tokenBody.access_token || '')
+  if (!accessToken) throw new EabError(EC.INTERNAL, '企业微信没有返回 access_token')
+
+  const infoUrl = new URL('https://qyapi.weixin.qq.com/cgi-bin/auth/getuserinfo')
+  infoUrl.searchParams.set('access_token', accessToken)
+  infoUrl.searchParams.set('code', code)
+  const infoBody = await readSsoJson('wecom', infoUrl.toString(), undefined, '读取企业微信用户身份')
+  const userInfo = (infoBody.user_info ?? {}) as { userid?: unknown; UserId?: unknown }
+  const userId =
+    (typeof infoBody.userid === 'string' && infoBody.userid) ||
+    (typeof infoBody.UserId === 'string' && infoBody.UserId) ||
+    (typeof userInfo.userid === 'string' && userInfo.userid) ||
+    (typeof userInfo.UserId === 'string' && userInfo.UserId) ||
+    ''
+  if (!userId) {
+    throw new EabError(EC.INTERNAL, '企业微信没有返回 userid，无法定位企业成员', {
+      hint: '确认扫码成员属于该企业应用可见范围，而不是外部联系人。',
+    })
+  }
+  return { externalUserId: userId, name: typeof infoBody.name === 'string' ? infoBody.name : '' }
 }
 
 async function readDingTalkJson(
@@ -450,12 +760,15 @@ function beginDingTalkLogin(
   deps: ServerDeps,
   companyId: string,
   redirectPath: string,
+  callbackBaseUrl?: string,
+  callbackPath = '/api/auth/dingtalk/callback',
 ): {
   url: string
   state: string
   companyId: string
   companyName: string
   appId: string
+  corpId: string | null
   expiresAt: number
   callback: string
 } {
@@ -487,7 +800,7 @@ function beginDingTalkLogin(
     )
     .run(companyId, companyId)
 
-  const callback = `${publicBaseUrl(req, deps)}/api/auth/dingtalk/callback`
+  const callback = `${callbackBaseUrl || publicBaseUrl(req, deps)}${callbackPath}`
   const url = new URL('https://login.dingtalk.com/oauth2/auth')
   url.searchParams.set('redirect_uri', callback)
   url.searchParams.set('response_type', 'code')
@@ -502,8 +815,88 @@ function beginDingTalkLogin(
     companyId,
     companyName: app.tenantName ?? '',
     appId: app.appId,
+    corpId: app.tenantId,
     expiresAt: now + LOGIN_STATE_TTL_MS,
     callback,
+  }
+}
+
+function storeSsoLoginState(
+  deps: ServerDeps,
+  companyId: string,
+  provider: SsoProvider,
+  state: string,
+  redirectPath: string,
+): void {
+  const now = Date.now()
+  deps.db
+    .prepare(
+      `INSERT INTO auth_login_states
+         (id, company_id, provider, state, redirect_path, created_at, expires_at, consumed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`,
+    )
+    .run(`als_${randomUUID().replace(/-/g, '')}`, companyId, provider, state, redirectPath, now, now + LOGIN_STATE_TTL_MS)
+  deps.db
+    .prepare(
+      `DELETE FROM auth_login_states
+        WHERE company_id = ? AND provider = ? AND consumed_at IS NULL
+          AND id NOT IN (
+            SELECT id FROM auth_login_states
+             WHERE company_id = ? AND provider = ? AND consumed_at IS NULL
+             ORDER BY created_at DESC LIMIT 20
+          )`,
+    )
+    .run(companyId, provider, companyId, provider)
+}
+
+function beginFeishuLogin(
+  req: FastifyRequest,
+  deps: ServerDeps,
+  companyId: string,
+  redirectPath: string,
+  callbackBaseUrl?: string,
+): { url: string; state: string; appId: string; callback: string; expiresAt: number; tenantName: string } {
+  const config = ssoChannelOf(deps, companyId, 'feishu')
+  const state = `fss_${randomUUID().replace(/-/g, '')}`
+  storeSsoLoginState(deps, companyId, 'feishu', state, redirectPath)
+  const callback = `${callbackBaseUrl || publicBaseUrl(req, deps)}/api/auth/feishu/callback`
+  const url = new URL('https://passport.feishu.cn/suite/passport/oauth/authorize')
+  url.searchParams.set('client_id', config.appId)
+  url.searchParams.set('redirect_uri', callback)
+  url.searchParams.set('response_type', 'code')
+  url.searchParams.set('state', state)
+  return {
+    url: url.toString(),
+    state,
+    appId: config.appId,
+    callback,
+    expiresAt: Date.now() + LOGIN_STATE_TTL_MS,
+    tenantName: config.tenantName,
+  }
+}
+
+function beginWecomLogin(
+  req: FastifyRequest,
+  deps: ServerDeps,
+  companyId: string,
+  redirectPath: string,
+  callbackBaseUrl?: string,
+): { url: string; state: string; callback: string; expiresAt: number; tenantName: string } {
+  const config = ssoChannelOf(deps, companyId, 'wecom')
+  const state = `wcs_${randomUUID().replace(/-/g, '')}`
+  storeSsoLoginState(deps, companyId, 'wecom', state, redirectPath)
+  const callback = `${callbackBaseUrl || publicBaseUrl(req, deps)}/api/auth/wecom/callback`
+  const url = new URL('https://open.work.weixin.qq.com/wwopen/sso/qrConnect')
+  url.searchParams.set('appid', config.corpId)
+  url.searchParams.set('agentid', config.agentId)
+  url.searchParams.set('redirect_uri', callback)
+  url.searchParams.set('state', state)
+  return {
+    url: url.toString(),
+    state,
+    callback,
+    expiresAt: Date.now() + LOGIN_STATE_TTL_MS,
+    tenantName: config.tenantName,
   }
 }
 
@@ -693,14 +1086,165 @@ export function registerAuthRoutes(app: FastifyInstance, deps: ServerDeps): void
   })
 
   /**
+   * 管理端扫码配置：管理端口不提供 `/api/auth/*`，这里单独给登录页一个只读入口。
+   * 钉钉、飞书、企业微信都只在“已绑定且密钥已注入”时展示，未绑定渠道不出现。
+   */
+  app.get('/api/console/member/sso/methods', async (req) => {
+    const companyId = deps.companyId
+    const providers = (['dingtalk', 'feishu', 'wecom'] as SsoProvider[]).map((provider) =>
+      ssoMethodPayload(req, deps, companyId, provider),
+    )
+    const company = deps.db.prepare('SELECT name FROM companies WHERE id = ?').get(companyId) as
+      | { name: string | null }
+      | undefined
+    return ok({
+      companyId,
+      companyName: company?.name ?? null,
+      providers,
+      defaultProvider: providers.find((item) => item.configured)?.provider ?? null,
+      dingtalk: providers.find((item) => item.provider === 'dingtalk'),
+      feishu: providers.find((item) => item.provider === 'feishu'),
+      wecom: providers.find((item) => item.provider === 'wecom'),
+    })
+  })
+
+  /**
+   * 扫码登录状态：登录页在二维码展示期间轮询，用于兜住“SDK 回调没触发，
+   * 但浏览器已经通过回调地址建立了成员会话”的情况，也用于把无权限、未同步
+   * 成员等失败从二维码页明确说出来，而不是一直停在二维码上。
+   */
+  app.get<{ Querystring: { state?: string } }>(
+    '/api/console/member/sso/status',
+    async (req) => {
+      const state = String(req.query.state ?? '').trim()
+      if (!state) throw new EabError(EC.VALIDATION, '缺少扫码 state')
+      const row = deps.db
+        .prepare(
+          `SELECT provider, state, created_at, expires_at, consumed_at
+             FROM auth_login_states WHERE company_id = ? AND state = ?`,
+        )
+        .get(deps.companyId, state) as LoginStateRow | undefined
+      if (!row) return ok({ status: 'unknown' })
+      const now = Date.now()
+      if (row.consumed_at) {
+        if (now - row.consumed_at > 10_000) {
+          return ok({
+            status: 'failed',
+            message:
+              '扫码已经处理，但没有建立后台会话：该账号可能还没有同步到当前公司，或者没有开通后台页面权限。',
+          })
+        }
+        return ok({ status: 'processing' })
+      }
+      if (row.expires_at < now) {
+        return ok({ status: 'expired', message: '二维码已过期，请刷新后重新扫码' })
+      }
+      return ok({ status: 'pending' })
+    },
+  )
+
+  /** 兼容旧登录页：保留原名，内容改为三渠道统一结构。 */
+  app.get('/api/console/member/dingtalk/methods', async (req) => {
+    const companyId = deps.companyId
+    const providers = (['dingtalk', 'feishu', 'wecom'] as SsoProvider[]).map((provider) =>
+      ssoMethodPayload(req, deps, companyId, provider),
+    )
+    return ok({
+      companyId,
+      providers,
+      defaultProvider: providers.find((item) => item.configured)?.provider ?? null,
+      dingtalk: providers.find((item) => item.provider === 'dingtalk'),
+      feishu: providers.find((item) => item.provider === 'feishu'),
+      wecom: providers.find((item) => item.provider === 'wecom'),
+    })
+  })
+
+  /** 管理端钉钉扫码：生成 state 与授权地址，二维码由前端内嵌 SDK 渲染。 */
+  app.get('/api/console/member/dingtalk/start', async (req) => {
+    return ok(
+      beginDingTalkLogin(
+        req,
+        deps,
+        deps.companyId,
+        'console:/admin',
+        adminBaseUrl(req, deps),
+        '/api/console/auth/dingtalk/callback',
+      ),
+    )
+  })
+
+  /** 管理端飞书扫码：二维码由飞书官方 QRLogin SDK 内嵌渲染，回调签发后台成员会话。 */
+  app.get('/api/console/member/feishu/start', async (req) => {
+    return ok(beginFeishuLogin(req, deps, deps.companyId, 'console:/admin', chatCallbackBase(req, deps)))
+  })
+
+  /** 管理端企业微信扫码：官方 qrConnect 地址由服务端生成二维码 SVG，前端只展示图片。 */
+  app.get('/api/console/member/wecom/start', async (req) => {
+    const started = beginWecomLogin(req, deps, deps.companyId, 'console:/admin', chatCallbackBase(req, deps))
+    const qrSvg = await QRCode.toString(started.url, { type: 'svg', margin: 1, width: 260 })
+    return ok({ ...started, qrSvg })
+  })
+
+  /**
+   * 管理后台钉钉扫码登录：与对话页共用一次扫码授权，但签发的是「成员后台会话」。
+   *
+   * 扫码只负责证明“这个钉钉账号是谁”；还必须已经同步到当前公司，并且被配置了至少一个
+   * 后台页面权限，才会下发 console_member 会话。平台管理员仍走账号密码入口。
+   */
+  app.post<{
+    Body: { company?: string; authCode?: string; state?: string }
+  }>('/api/console/member/dingtalk/exchange', async (req, reply) => {
+    const companyId = deps.companyId
+    const authCode = String(req.body?.authCode ?? '').trim()
+    const state = String(req.body?.state ?? '').trim()
+    if (!authCode || !state) throw new EabError(EC.VALIDATION, '缺少钉钉授权码，请重新扫码')
+
+    consumeLoginState(deps, companyId, state)
+    const { profile, externalUserId, member } = await dingtalkIdentityByCode(deps, companyId, authCode)
+    if (!member) {
+      throw new EabError(
+        EC.FORBIDDEN,
+        `你的钉钉账号（UserID：${externalUserId || '未知'}）还没有同步到这家 EAB 公司`,
+        {
+          hint: '请让公司管理员在控制台「渠道」里重新同步一次组织架构；同步完成后回来重新扫码。也可以改用账号密码登录。',
+        },
+      )
+    }
+    const companyStatus = deps.db.prepare('SELECT status FROM companies WHERE id = ?').get(companyId) as
+      | { status?: string }
+      | undefined
+    if (companyStatus?.status === 'suspended') {
+      throw new EabError(EC.FORBIDDEN, '当前公司已停用，暂时不能登录管理后台')
+    }
+    if (!hasAnyConsolePagePermission(deps.db, companyId, member.user_id)) {
+      // 没有后台页面权限不拦死：给员工会话，直接落到对话页。
+      const session = createEmployeeSession(deps.db, member.user_id, req)
+      reply.header('set-cookie', cookieHeader(req, session.cookie, COOKIE_DAYS * 24 * 60 * 60))
+      return ok({
+        kind: 'employee',
+        name: member.name,
+        denied: true,
+        redirect: `${chatCallbackBase(req, deps)}/chat?console_denied=1&eab_boot=full`,
+      })
+    }
+    completeConsoleMemberLogin(reply, deps, req, companyId, member, profile, externalUserId, 'console-embedded-qr')
+    return ok({
+      kind: 'member',
+      name: member.name,
+      redirect: `/admin?company=${encodeURIComponent(companyId)}&eab_boot=full`,
+    })
+  })
+
+  /**
    * 钉钉扫码回调：code → 用户 accessToken → unionId → 企业 userid → user_identities。
    *
    * 判定顺序：先按钉钉 userid 精确匹配，再按 unionId 兜底；都查不到就明确告诉用户
    * “还没有同步到这家公司”，不偷偷创建账号。
    */
-  app.get<{ Querystring: { code?: string; state?: string } }>(
-    '/api/auth/dingtalk/callback',
-    async (req, reply) => {
+  const handleDingTalkCallback = async (
+    req: FastifyRequest<{ Querystring: { code?: string; state?: string } }>,
+    reply: FastifyReply,
+  ): Promise<unknown> => {
       const code = String(req.query.code ?? '').trim()
       const state = String(req.query.state ?? '').trim()
       if (!code || !state) {
@@ -740,10 +1284,16 @@ export function registerAuthRoutes(app: FastifyInstance, deps: ServerDeps): void
         .prepare('UPDATE auth_login_states SET consumed_at = ? WHERE id = ?')
         .run(Date.now(), row.id)
 
+      // 管理端二维码如果走了浏览器重定向（而不是内嵌 SDK 回调），仍要签后台成员会话
+      const consoleLogin = row.redirect_path.startsWith('console:')
+
       try {
         const { profile, externalUserId, member } = await dingtalkIdentityByCode(deps, row.company_id, code)
 
         if (!member) {
+          const backPath = consoleLogin
+            ? `${adminBaseUrl(req, deps)}/admin?company=${encodeURIComponent(row.company_id)}`
+            : '/chat'
           return reply
             .status(403)
             .type('text/html; charset=utf-8')
@@ -751,8 +1301,24 @@ export function registerAuthRoutes(app: FastifyInstance, deps: ServerDeps): void
               loginErrorPage(
                 `你的钉钉账号（UserID：${externalUserId}）还没有同步到这家 EAB 公司。`,
                 '请让公司管理员在控制台「渠道」里重新同步一次组织架构；同步完成后回来重新扫码。也可以先用工号、邮箱或手机号登录。',
+                consoleLogin ? '管理后台登录未完成' : '钉钉登录未完成',
+                backPath,
               ),
             )
+        }
+
+        if (consoleLogin && !hasAnyConsolePagePermission(deps.db, row.company_id, member.user_id)) {
+          // 没有后台页面权限：不展示错误页，直接签发员工会话并落到对话页。
+          const session = createEmployeeSession(deps.db, member.user_id, req)
+          reply.header('set-cookie', cookieHeader(req, session.cookie, COOKIE_DAYS * 24 * 60 * 60))
+          return reply.redirect(`${chatCallbackBase(req, deps)}/chat?console_denied=1&eab_boot=full`)
+        }
+
+        if (consoleLogin) {
+          completeConsoleMemberLogin(reply, deps, req, row.company_id, member, profile, externalUserId, 'console-redirect-qr')
+          return reply.redirect(
+            `${adminBaseUrl(req, deps)}/admin?company=${encodeURIComponent(row.company_id)}&eab_boot=full`,
+          )
         }
 
         const session = createEmployeeSession(deps.db, member.user_id, req)
@@ -776,15 +1342,197 @@ export function registerAuthRoutes(app: FastifyInstance, deps: ServerDeps): void
           err instanceof EabError && err.hint
             ? err.hint
             : '如果反复失败，请检查钉钉应用的 AppKey / AppSecret 与「重定向URL」是否和当前访问地址一致。'
+        const backPath = consoleLogin
+          ? `${adminBaseUrl(req, deps)}/admin?company=${encodeURIComponent(row.company_id)}`
+          : '/chat'
         return reply
           .status(400)
           .type('text/html; charset=utf-8')
-          .send(loginErrorPage(message, hint))
+          .send(
+            loginErrorPage(
+              message,
+              hint,
+              consoleLogin ? '管理后台登录未完成' : '钉钉登录未完成',
+              backPath,
+            ),
+          )
+      }
+  }
+
+  app.get<{ Querystring: { code?: string; state?: string } }>(
+    '/api/auth/dingtalk/callback',
+    handleDingTalkCallback,
+  )
+  // 管理后台的内嵌二维码要求页面与 redirect_uri 同源（协议、域名、端口都相同），
+  // 否则钉钉扫码成功后不会把结果回传给父页面。管理端使用 8788 的同源回调。
+  app.get<{ Querystring: { code?: string; state?: string } }>(
+    '/api/console/auth/dingtalk/callback',
+    handleDingTalkCallback,
+  )
+
+  /**
+   * 飞书扫码回调：code → user_access_token → user_info(open_id/union_id) → 成员。
+   * 后台扫码（state 里 redirect_path 以 console: 开头）签发 console_member，否则签员工会话。
+   */
+  app.get<{ Querystring: { code?: string; state?: string; error?: string } }>(
+    '/api/auth/feishu/callback',
+    async (req, reply) => {
+      const code = String(req.query.code ?? '').trim()
+      const state = String(req.query.state ?? '').trim()
+      if (!code || !state) {
+        return reply
+          .status(400)
+          .type('text/html; charset=utf-8')
+          .send(loginErrorPage('飞书回调缺少 code 或 state，请重新扫码。', '', '飞书登录未完成'))
+      }
+      const row = deps.db
+        .prepare(
+          `SELECT id, company_id, provider, state, redirect_path, created_at, expires_at, consumed_at
+             FROM auth_login_states WHERE state = ?`,
+        )
+        .get(state) as LoginStateRow | undefined
+      const expectedProvider = 'feishu'
+      if (!row || row.provider !== expectedProvider) {
+        return reply
+          .status(400)
+          .type('text/html; charset=utf-8')
+          .send(loginErrorPage('登录状态不存在或已失效，请重新扫码。', '', '飞书登录未完成'))
+      }
+      if (row.consumed_at !== null) {
+        return reply.status(400).type('text/html; charset=utf-8').send(loginErrorPage('这个二维码已经使用过，请重新扫码。', '', '飞书登录未完成'))
+      }
+      if (Date.now() > row.expires_at) {
+        return reply.status(400).type('text/html; charset=utf-8').send(loginErrorPage('二维码已过期，请重新扫码。', '', '飞书登录未完成'))
+      }
+      deps.db.prepare('UPDATE auth_login_states SET consumed_at = ? WHERE id = ?').run(Date.now(), row.id)
+      const consoleLogin = row.redirect_path.startsWith('console:')
+      const backPath = consoleLogin ? '/admin' : '/chat'
+
+      try {
+        const config = ssoChannelOf(deps, row.company_id, expectedProvider)
+        const callback = `${chatCallbackBase(req, deps)}/api/auth/feishu/callback`
+        const profile = await feishuIdentityByCode(config, code, callback)
+        const member = findSsoMember(deps, row.company_id, expectedProvider, profile.externalUserId, profile.unionId)
+        if (!member) {
+          return reply
+            .status(403)
+            .type('text/html; charset=utf-8')
+            .send(
+              loginErrorPage(
+                `你的飞书账号（OpenID：${profile.externalUserId}）还没有同步到这家 EAB 公司。`,
+                '请让公司管理员在控制台「连接与平台 → 通讯录同步」重新同步一次飞书组织架构；完成后回来重新扫码。也可以先用账号密码登录。',
+                '飞书登录未完成',
+                backPath,
+              ),
+            )
+        }
+        if (consoleLogin) {
+          completeConsoleMemberLogin(reply, deps, req, row.company_id, member, profile, profile.externalUserId, 'console-sso-redirect', expectedProvider)
+          return reply.redirect(`${adminBaseUrl(req, deps)}/admin?company=${encodeURIComponent(row.company_id)}`)
+        }
+        const session = createEmployeeSession(deps.db, member.user_id, req)
+        reply.header('set-cookie', cookieHeader(req, session.cookie, COOKIE_DAYS * 24 * 60 * 60))
+        appendAudit(deps.db, {
+          companyId: row.company_id,
+          actorUserId: member.user_id,
+          action: 'auth.login',
+          resourceType: 'session',
+          result: 'success',
+          ip: req.ip ?? null,
+          channel: expectedProvider,
+          detail: { provider: expectedProvider, externalUserId: profile.externalUserId, unionId: profile.unionId },
+        })
+        return reply.redirect(row.redirect_path || '/chat')
+      } catch (err) {
+        const message = err instanceof EabError ? err.message : '飞书登录失败，请稍后重试。'
+        const hint =
+          err instanceof EabError && err.hint
+            ? err.hint
+            : '如果反复失败，请检查飞书应用的 App ID / App Secret，以及「重定向 URL」是否登记了 /api/auth/feishu/callback。'
+        return reply.status(400).type('text/html; charset=utf-8').send(loginErrorPage(message, hint, '飞书登录未完成', backPath))
       }
     },
   )
 
-  app.post('/api/auth/logout', async (req, reply) => {    const userId = readSessionUserId(deps.db, req)
+  /**
+   * 企业微信扫码回调：code → corp access_token → getuserinfo(userid) → 成员。
+   * 与飞书一致，后台 state 走 console_member，对话 state 走员工会话。
+   */
+  app.get<{ Querystring: { code?: string; state?: string } }>(
+    '/api/auth/wecom/callback',
+    async (req, reply) => {
+      const code = String(req.query.code ?? '').trim()
+      const state = String(req.query.state ?? '').trim()
+      if (!code || !state) {
+        return reply.status(400).type('text/html; charset=utf-8').send(loginErrorPage('企业微信回调缺少 code 或 state，请重新扫码。', '', '企业微信登录未完成'))
+      }
+      const row = deps.db
+        .prepare(
+          `SELECT id, company_id, provider, state, redirect_path, created_at, expires_at, consumed_at
+             FROM auth_login_states WHERE state = ?`,
+        )
+        .get(state) as LoginStateRow | undefined
+      const expectedProvider = 'wecom'
+      if (!row || row.provider !== expectedProvider) {
+        return reply.status(400).type('text/html; charset=utf-8').send(loginErrorPage('登录状态不存在或已失效，请重新扫码。', '', '企业微信登录未完成'))
+      }
+      if (row.consumed_at !== null) {
+        return reply.status(400).type('text/html; charset=utf-8').send(loginErrorPage('这个二维码已经使用过，请重新扫码。', '', '企业微信登录未完成'))
+      }
+      if (Date.now() > row.expires_at) {
+        return reply.status(400).type('text/html; charset=utf-8').send(loginErrorPage('二维码已过期，请重新扫码。', '', '企业微信登录未完成'))
+      }
+      deps.db.prepare('UPDATE auth_login_states SET consumed_at = ? WHERE id = ?').run(Date.now(), row.id)
+      const consoleLogin = row.redirect_path.startsWith('console:')
+      const backPath = consoleLogin ? '/admin' : '/chat'
+
+      try {
+        const config = ssoChannelOf(deps, row.company_id, expectedProvider)
+        const profile = await wecomIdentityByCode(config, code)
+        const member = findSsoMember(deps, row.company_id, expectedProvider, profile.externalUserId)
+        if (!member) {
+          return reply
+            .status(403)
+            .type('text/html; charset=utf-8')
+            .send(
+              loginErrorPage(
+                `你的企业微信账号（UserID：${profile.externalUserId}）还没有同步到这家 EAB 公司。`,
+                '请让公司管理员在控制台「连接与平台 → 通讯录同步」重新同步一次企业微信组织架构；完成后回来重新扫码。也可以先用账号密码登录。',
+                '企业微信登录未完成',
+                backPath,
+              ),
+            )
+        }
+        if (consoleLogin) {
+          completeConsoleMemberLogin(reply, deps, req, row.company_id, member, {}, profile.externalUserId, 'console-sso-redirect', expectedProvider)
+          return reply.redirect(`${adminBaseUrl(req, deps)}/admin?company=${encodeURIComponent(row.company_id)}`)
+        }
+        const session = createEmployeeSession(deps.db, member.user_id, req)
+        reply.header('set-cookie', cookieHeader(req, session.cookie, COOKIE_DAYS * 24 * 60 * 60))
+        appendAudit(deps.db, {
+          companyId: row.company_id,
+          actorUserId: member.user_id,
+          action: 'auth.login',
+          resourceType: 'session',
+          result: 'success',
+          ip: req.ip ?? null,
+          channel: expectedProvider,
+          detail: { provider: expectedProvider, externalUserId: profile.externalUserId },
+        })
+        return reply.redirect(row.redirect_path || '/chat')
+      } catch (err) {
+        const message = err instanceof EabError ? err.message : '企业微信登录失败，请稍后重试。'
+        const hint =
+          err instanceof EabError && err.hint
+            ? err.hint
+            : '如果反复失败，请检查企业 CorpID、应用 AgentID / Secret，以及应用可信域名是否覆盖当前访问地址。'
+        return reply.status(400).type('text/html; charset=utf-8').send(loginErrorPage(message, hint, '企业微信登录未完成', backPath))
+      }
+    },
+  )
+
+  app.post('/api/auth/logout', async (req, reply) => {
+    const userId = readSessionUserId(deps.db, req)
     revokeCurrentSession(deps.db, req)
     reply.header('set-cookie', cookieHeader(req, '', 0))
     if (userId) {

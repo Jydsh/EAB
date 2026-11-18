@@ -16,7 +16,9 @@ import { buildSubject, createRoleLookup, type RoleDefinition, type RoleLookup } 
 import { EC, EabError, type DataScope, type Scope, type Subject } from '@eab/domain'
 import type { Db } from '@eab/storage'
 import type { ServerConfig } from './config.js'
-import { isConsoleRequest } from './console-auth.js'
+import { isConsoleRequest, memberSessionFromRequest } from './console-auth.js'
+import { readConsoleMemberSession } from './console-member-session.js'
+import { consoleScopesForMember } from './console-permissions.js'
 import { readSessionUserId } from './employee-session.js'
 
 export interface PersonRow {
@@ -193,6 +195,18 @@ export function resolveActor(
    * 单公司模式下忽略 `?company=`：控制台永远管唯一那家公司。
    */
   if (isConsoleRequest(req, config)) {
+    // 成员后台会话：身份是真实公司成员，页面权限翻译成额外 scope；
+    // 平台超管会话 / 服务令牌仍走 consoleActor，保持最高权限。
+    if (memberSessionFromRequest(req)) {
+      const session = readConsoleMemberSession(db, req)
+      if (!session) throw new EabError(EC.AUTH_REQUIRED, '成员后台会话已失效，请重新登录管理后台')
+      const memberPerson = findActivePerson(db, session.userId)
+      if (!memberPerson) throw new EabError(EC.AUTH_REQUIRED, '后台会话对应的成员已停用或不存在')
+      assertSingleCompany(db, memberPerson, canonicalCompanyId)
+      return actorFor(db, memberPerson, {
+        extraScopes: consoleScopesForMember(db, memberPerson.companyId, memberPerson.id),
+      })
+    }
     return consoleActor(db, canonicalCompanyId)
   }
 
@@ -305,7 +319,11 @@ function roleLookupOf(db: Db, companyId: string): RoleLookup {
 }
 
 /** 按成员构造主体（预览矩阵/测试用）。身份只来自库里的组织数据，不来自请求参数。 */
-export function actorFor(db: Db, person: PersonRow): RequestActor {
+export function actorFor(
+  db: Db,
+  person: PersonRow,
+  options: { extraScopes?: readonly Scope[]; deniedScopes?: readonly Scope[] } = {},
+): RequestActor {
   // PERM-05：显式 allow/deny 覆盖，过期自动失效；表不存在时按无覆盖处理（老库兼容）
   let allow: string[] = []
   let deny: string[] = []
@@ -341,6 +359,8 @@ export function actorFor(db: Db, person: PersonRow): RequestActor {
 
   const roleCodes = roleCodesOf(db, person.id)
   const roleLookup = roleLookupOf(db, person.companyId)
+  const extraScopes = [...allow, ...grantedScopes, ...(options.extraScopes ?? [])] as Scope[]
+  const deniedScopes = [...deny, ...(options.deniedScopes ?? [])] as Scope[]
   const subject = buildSubject({
     userId: person.id,
     companyId: person.companyId,
@@ -349,10 +369,8 @@ export function actorFor(db: Db, person: PersonRow): RequestActor {
     // 从渠道同步进来的成员还没有分配角色；按“普通员工”兜底，避免整站无权限
     roles: roleCodes.length > 0 ? roleCodes : ['member'],
     channelType: 'web',
-    extraScopes: allow.length > 0 || grantedScopes.length > 0
-      ? ([...allow, ...grantedScopes] as Scope[])
-      : undefined,
-    deniedScopes: deny.length > 0 ? (deny as Scope[]) : undefined,
+    extraScopes: extraScopes.length > 0 ? extraScopes : undefined,
+    deniedScopes: deniedScopes.length > 0 ? deniedScopes : undefined,
     roleLookup,
   })
 

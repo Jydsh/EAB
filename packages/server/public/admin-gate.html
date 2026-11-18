@@ -3,37 +3,44 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>EAB 管理控制台 · 管理员登录</title>
+    <title>EAB 管理后台 · 登录</title>
     <script src="/brand.js?v=20261115c" defer></script>
-    <link rel="stylesheet" href="/app.css?v=20261117a" />
+    <link rel="stylesheet" href="/app.css?v=20261118z28" />
     <style>
       .gate-body {
         min-height: 100vh;
         display: flex;
         align-items: center;
         justify-content: center;
-        background: #f4f6f7;
+        background: linear-gradient(180deg, #f4f7f6 0%, #f7f9f8 100%);
         padding: 24px;
       }
       .gate-card {
         width: 100%;
-        max-width: 420px;
+        max-width: 500px;
         background: #fff;
         border: 1px solid #e3e8e8;
-        border-radius: 14px;
-        padding: 28px 28px 24px;
-        box-shadow: 0 12px 32px rgba(20, 40, 40, 0.06);
+        border-radius: 16px;
+        padding: 30px 34px 24px;
+        box-shadow: 0 16px 40px rgba(20, 40, 40, 0.08);
+        box-sizing: border-box;
+      }
+      .gate-card.has-sso {
+        min-height: 610px;
+      }
+      .gate-card.is-password-mode {
+        min-height: 0;
       }
       .gate-brand {
         display: flex;
         align-items: center;
         gap: 12px;
-        margin-bottom: 18px;
+        margin-bottom: 12px;
       }
       .gate-brand .logo {
         width: 44px;
         height: 44px;
-        border-radius: 10px;
+        border-radius: 11px;
         background: #0f3f39;
         color: #fff;
         display: grid;
@@ -42,19 +49,168 @@
         letter-spacing: 0.5px;
       }
       .gate-brand h1 {
-        font-size: 17px;
+        font-size: 18px;
         margin: 0;
+        color: #1f2d2b;
       }
       .gate-brand p {
-        margin: 2px 0 0;
+        margin: 3px 0 0;
         font-size: 12px;
         color: #6b7b7b;
       }
-      .gate-lede {
-        margin: 10px 0 2px;
+      .gate-modes {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 4px;
+        padding: 4px;
+        border: 1px solid #e3e8e8;
+        border-radius: 10px;
+        background: #f4f7f6;
+      }
+      .gate-modes[hidden] {
+        display: none;
+      }
+      .gate-mode {
+        border: 0;
+        border-radius: 7px;
+        padding: 9px 8px;
+        background: transparent;
+        color: #6b7b7b;
+        font: inherit;
         font-size: 12.5px;
+        cursor: pointer;
+        transition: background 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+      }
+      .gate-mode.is-active {
+        background: #fff;
+        color: #1f2d2b;
+        box-shadow: 0 1px 4px rgba(20, 40, 40, 0.1);
+        font-weight: 650;
+      }
+      .gate-pane {
+        display: block;
+      }
+      .gate-pane[hidden] {
+        display: none;
+      }
+      .gate-pane-head {
+        margin: 18px auto 14px;
+        text-align: center;
+      }
+      .gate-pane-head h2 {
+        margin: 0 0 6px;
+        font-size: 21px;
+        font-weight: 650;
+        letter-spacing: -0.2px;
+        color: #1f2d2b;
+      }
+      .gate-pane-head p {
+        margin: 0 auto;
+        max-width: 360px;
+        font-size: 12px;
         line-height: 1.6;
         color: #6b7b7b;
+      }
+      .gate-sso-tabs {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 4px;
+        max-width: 340px;
+        margin: 0 auto 18px;
+        padding: 4px;
+        border: 1px solid #e3e8e8;
+        border-radius: 10px;
+        background: #f4f7f6;
+      }
+      .gate-sso-tabs[hidden] {
+        display: none;
+      }
+      .gate-sso-tab {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 6px;
+        padding: 8px 6px;
+        border: 0;
+        border-radius: 7px;
+        background: transparent;
+        color: #3d4d4b;
+        font: inherit;
+        font-size: 12px;
+        cursor: pointer;
+      }
+      .gate-sso-tab.is-active {
+        background: #0f3f39;
+        color: #fff;
+        font-weight: 650;
+      }
+      .gate-method-icon {
+        width: 20px;
+        height: 20px;
+        display: grid;
+        place-items: center;
+        border-radius: 6px;
+        border: 1px solid #dbe3e1;
+        background: #fff;
+        color: #0f3f39;
+        font-size: 10px;
+        font-weight: 650;
+        flex: 0 0 auto;
+      }
+      .gate-sso-tab.is-active .gate-method-icon {
+        background: rgba(255, 255, 255, 0.14);
+        border-color: rgba(255, 255, 255, 0.26);
+        color: #fff;
+      }
+      .gate-qr-shell {
+        position: relative;
+        display: grid;
+        place-items: center;
+        width: 310px;
+        min-height: 310px;
+        margin: 0 auto;
+        border: 1px solid #e3e8e8;
+        border-radius: 14px;
+        background: #fbfcfc;
+        box-shadow: 0 10px 26px rgba(20, 40, 40, 0.09);
+        overflow: hidden;
+      }
+      .gate-qr-frame {
+        width: 310px;
+        min-height: 310px;
+        display: grid;
+        place-items: center;
+        padding: 14px;
+        box-sizing: border-box;
+      }
+      .gate-qr-frame svg,
+      .gate-qr-frame img {
+        width: 260px;
+        height: 260px;
+      }
+      .gate-qr-frame iframe {
+        width: 260px;
+        height: 260px;
+        border: 0;
+      }
+      .gate-qr-placeholder {
+        position: absolute;
+        inset: 0;
+        z-index: 2;
+        width: auto;
+        min-height: 0;
+        display: grid;
+        place-items: center;
+        padding: 26px;
+        box-sizing: border-box;
+        background: #fbfcfc;
+        text-align: center;
+        font-size: 12px;
+        line-height: 1.75;
+        color: #6b7b7b;
+      }
+      .gate-qr-placeholder[hidden] {
+        display: none;
       }
       .gate-card label {
         display: block;
@@ -70,7 +226,7 @@
         border-radius: 8px;
         font: inherit;
       }
-      .gate-card button {
+      .gate-submit {
         width: 100%;
         margin-top: 16px;
         padding: 10px 12px;
@@ -81,165 +237,628 @@
         font: inherit;
         cursor: pointer;
       }
-      .gate-card button:disabled {
+      .gate-submit:disabled {
         opacity: 0.6;
         cursor: progress;
       }
       .gate-err {
-        margin-top: 12px;
+        max-width: 360px;
+        margin: 12px auto 0;
         font-size: 12px;
+        line-height: 1.6;
         color: #b42318;
       }
-      .gate-label-row {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        margin: 14px 0 6px;
+      .gate-err[hidden] {
+        display: none;
       }
-      .gate-label-row label {
-        margin: 0;
-      }
-      .gate-card .gate-help {
-        flex: none;
-        width: 16px;
-        min-width: 16px;
-        height: 16px;
-        margin: 0;
-        padding: 0;
-        box-sizing: border-box;
-        border: 1px solid #cfd8d8;
-        border-radius: 50%;
+      .gate-refresh {
+        display: block;
+        margin: 12px auto 0;
+        padding: 6px 12px;
+        border: 1px solid #d7dfdf;
+        border-radius: 8px;
         background: #fff;
-        color: #8a9a9a;
-        font-size: 11px;
-        line-height: 1;
+        color: #5d6d6d;
+        font: inherit;
+        font-size: 12px;
         cursor: pointer;
       }
-      .gate-card .gate-help:hover,
-      .gate-card .gate-help[aria-expanded="true"] {
+      .gate-refresh:hover {
         border-color: #0f3f39;
         color: #0f3f39;
       }
-      .gate-card .gate-help:focus-visible {
-        outline: 2px solid #0f3f3933;
-        outline-offset: 1px;
+      .gate-refresh[hidden] {
+        display: none;
       }
-      .gate-hint {
-        margin-top: 8px;
-        padding: 8px 10px;
-        border: 1px solid #eef2f2;
-        border-radius: 7px;
-        background: #f8fafa;
-        font-size: 11.5px;
-        line-height: 1.6;
-        color: #6b7b7b;
+      .gate-password-inner {
+        width: 100%;
+        max-width: 360px;
+        margin: 0 auto;
       }
-      @media (max-width: 480px) {
+      @media (max-width: 520px) {
         .gate-card {
-          padding: 22px 18px;
+          padding: 24px 18px 20px;
+        }
+        .gate-card.has-sso {
+          min-height: 0;
+        }
+        .gate-qr-shell,
+        .gate-qr-frame,
+        .gate-qr-placeholder {
+          width: 100%;
+          min-width: 0;
+        }
+        .gate-qr-shell,
+        .gate-qr-placeholder {
+          min-height: 280px;
+        }
+        .gate-qr-frame {
+          min-height: 280px;
+          padding: 10px;
+        }
+        .gate-qr-frame svg,
+        .gate-qr-frame img,
+        .gate-qr-frame iframe {
+          width: 240px;
+          height: 240px;
         }
       }
     </style>
   </head>
   <body class="gate-body">
-    <section class="gate-card">
+    <section class="gate-card" id="gate-card">
       <div class="gate-brand">
         <span class="logo" data-brand-logo>EAB</span>
         <div>
           <h1 data-brand-name>企业智能体基座</h1>
-          <p>管理控制台 · 服务器侧</p>
+          <p>管理后台 · 统一登录</p>
         </div>
       </div>
 
-      <p class="gate-lede">仅限运维账号登录；员工对话请走 8787 端口。</p>
+      <div class="gate-modes" id="gate-modes" role="tablist" aria-label="登录方式" hidden>
+        <button class="gate-mode is-active" id="mode-qr" type="button" role="tab" aria-selected="true" aria-controls="pane-qr">扫码登录</button>
+        <button class="gate-mode" id="mode-password" type="button" role="tab" aria-selected="false" aria-controls="pane-password">账号密码</button>
+      </div>
 
-      <label for="user">管理员账号</label>
-      <input id="user" type="text" autocomplete="username" placeholder="默认 admin" value="admin" />
-      <div class="gate-label-row">
-        <label for="pass">管理员密码</label>
-        <button class="gate-help" id="gate-help" type="button" aria-label="密码在哪里" aria-expanded="false" aria-controls="gate-hint">?</button>
+      <div class="gate-pane" id="pane-qr" role="tabpanel" aria-labelledby="mode-qr" hidden>
+        <div class="gate-pane-head">
+          <h2>扫码进入管理后台</h2>
+        </div>
+        <div class="gate-sso-tabs" id="gate-sso-tabs" role="tablist" aria-label="扫码渠道" hidden></div>
+        <div class="gate-qr-shell">
+          <div class="gate-qr-frame" id="qr-frame"></div>
+          <div class="gate-qr-placeholder" id="qr-placeholder" hidden></div>
+        </div>
+        <div class="gate-err" id="qr-err" hidden></div>
+        <button class="gate-refresh" id="qr-refresh" type="button" hidden>刷新二维码</button>
       </div>
-      <input id="pass" type="password" autocomplete="current-password" placeholder="部署时设置的密码" />
-      <div class="gate-hint" id="gate-hint" hidden>
-        密码在服务器 <code>.eab-dev/admin-credentials.txt</code>，启动日志也会打印；默认仅允许本机登录。
-      </div>
-      <button id="enter" type="button">进入控制台</button>
-      <div class="gate-err" id="gate-err" hidden></div>
+
+      <form class="gate-pane" id="pane-password" role="tabpanel" aria-labelledby="mode-password">
+        <div class="gate-pane-head">
+          <h2>账号密码登录</h2>
+        </div>
+        <div class="gate-password-inner">
+          <label for="account">工号、邮箱、手机号或管理员账号</label>
+          <input id="account" type="text" autocomplete="username" placeholder="例如 U_ZW、13800138000 或 admin" required />
+          <label for="password">密码</label>
+          <input id="password" type="password" autocomplete="current-password" placeholder="成员密码或管理员密码" required />
+          <button class="gate-submit" id="enter" type="submit">登录</button>
+          <div class="gate-err" id="login-err" hidden></div>
+        </div>
+      </form>
     </section>
 
     <script>
       (function () {
-        var user = document.getElementById('user')
-        var pass = document.getElementById('pass')
-        var enter = document.getElementById('enter')
-        var err = document.getElementById('gate-err')
+        var PROVIDERS = {
+          dingtalk: { label: '钉钉', icon: '钉' },
+          feishu: { label: '飞书', icon: '飞' },
+          wecom: { label: '企业微信', icon: '企' },
+        }
+        var ENDPOINTS = {
+          dingtalk: '/api/console/member/dingtalk/start',
+          feishu: '/api/console/member/feishu/start',
+          wecom: '/api/console/member/wecom/start',
+        }
+        var methods = null
+        var providers = []
+        var currentProvider = ''
+        var qrBusy = false
+        var startedFor = {}
+        var sdkPromises = {}
+        var feishuPending = null
+        var qrExpireTimer = null
+        var dingtalkState = ''
+        var dingtalkPollTimer = null
+        var dingtalkAuthBusy = false
+        var dingtalkLastCode = ''
 
-        function fail(message) {
-          err.hidden = false
-          err.textContent = message
-          enter.disabled = false
+        var card = document.getElementById('gate-card')
+        var modes = document.getElementById('gate-modes')
+        var modeQr = document.getElementById('mode-qr')
+        var modePassword = document.getElementById('mode-password')
+        var paneQr = document.getElementById('pane-qr')
+        var panePassword = document.getElementById('pane-password')
+        var ssoTabs = document.getElementById('gate-sso-tabs')
+        var qrFrame = document.getElementById('qr-frame')
+        var qrPlaceholder = document.getElementById('qr-placeholder')
+        var qrErr = document.getElementById('qr-err')
+        var qrRefresh = document.getElementById('qr-refresh')
+        var account = document.getElementById('account')
+        var password = document.getElementById('password')
+        var enter = document.getElementById('enter')
+        var loginErr = document.getElementById('login-err')
+
+        function errText(body, fallback) {
+          if (!body) return fallback
+          var error = body.error
+          var message = body.message || (error && (error.message || error.code)) || (typeof error === 'string' ? error : '')
+          var hint = body.hint || (error && error.hint) || ''
+          return (message || fallback) + (hint ? '：' + hint : '')
         }
 
-        async function submit() {
-          var username = user.value.trim()
-          var password = pass.value
-          if (!username) {
-            fail('先输入管理员账号')
-            user.focus()
-            return
+        async function request(url, options) {
+          var init = options || {}
+          init.credentials = 'same-origin'
+          init.headers = Object.assign({ accept: 'application/json' }, init.headers || {})
+          var res = await fetch(url, init)
+          var body = await res.json().catch(function () { return null })
+          if (!res.ok || !body || body.ok !== true) {
+            var error = new Error(errText(body, '请求失败（HTTP ' + res.status + '）'))
+            error.status = res.status
+            error.body = body
+            throw error
           }
-          if (!password) {
-            fail('先输入管理员密码')
-            pass.focus()
-            return
+          return body.data === undefined ? body : body.data
+        }
+
+        function providerMeta(id) {
+          return PROVIDERS[id] || { label: id || '扫码', icon: '渠' }
+        }
+
+        function setQrMessage(text, showRefresh) {
+          qrFrame.innerHTML = ''
+          qrPlaceholder.hidden = false
+          qrPlaceholder.textContent = text
+          qrRefresh.hidden = !showRefresh
+          feishuPending = null
+        }
+
+        function clearQrExpireTimer() {
+          if (qrExpireTimer) {
+            clearTimeout(qrExpireTimer)
+            qrExpireTimer = null
           }
-          enter.disabled = true
-          err.hidden = true
+        }
+
+        function armQrExpire(expiresAt, provider) {
+          clearQrExpireTimer()
+          var delay = Math.max(0, Number(expiresAt || 0) - Date.now())
+          if (!delay) return
+          qrExpireTimer = setTimeout(function () {
+            if (currentProvider !== provider) return
+            delete startedFor[provider]
+            setQrMessage('二维码已过期，请刷新后重新扫码。', true)
+          }, delay)
+        }
+
+        function stopDingtalkPoll() {
+          if (dingtalkPollTimer) {
+            clearInterval(dingtalkPollTimer)
+            dingtalkPollTimer = null
+          }
+        }
+
+        function enterAdmin() {
+          var params = new URLSearchParams(location.search)
+          params.set('eab_boot', 'full')
+          location.replace('/admin?' + params.toString())
+        }
+
+        async function checkDingtalkSession() {
+          if (dingtalkAuthBusy) return false
           try {
-            var res = await fetch('/api/console/login', {
-              method: 'POST',
-              headers: { 'content-type': 'application/json', accept: 'application/json' },
-              body: JSON.stringify({ username: username, password: password }),
-            })
-            var body = await res.json().catch(function () { return null })
-            if (!res.ok || !body || body.ok !== true) {
-              fail((body && (body.message || body.error)) || '账号或密码不正确（HTTP ' + res.status + '）')
+            var session = await request('/api/console/session')
+            if (session && session.authenticated && session.kind === 'member') {
+              stopDingtalkPoll()
+              enterAdmin()
+              return true
+            }
+          } catch (e) {}
+          if (!dingtalkState) return false
+          try {
+            var status = await request(
+              '/api/console/member/sso/status?state=' + encodeURIComponent(dingtalkState),
+            )
+            if (status && status.status === 'failed') {
+              stopDingtalkPoll()
+              qrErr.hidden = true
+              setQrMessage(
+                '你没有权限进入管理后台，或该账号还没有同步到当前公司。请改用账号密码登录，或联系管理员开通后台页面权限。',
+                true,
+              )
+              return true
+            }
+            if (status && status.status === 'expired') {
+              stopDingtalkPoll()
+              setQrMessage('二维码已过期，请刷新后重新扫码。', true)
+              return true
+            }
+          } catch (e) {}
+          return false
+        }
+
+        function startDingtalkPoll() {
+          stopDingtalkPoll()
+          var deadline = Date.now() + 120000
+          dingtalkPollTimer = setInterval(function () {
+            if (currentProvider !== 'dingtalk') {
+              stopDingtalkPoll()
               return
             }
-            try {
-              sessionStorage.setItem('eab.boot.next', 'admin')
-            } catch (e) {}
-            location.replace('/admin' + location.search)
-          } catch (e) {
-            fail('请求失败：' + (e && e.message ? e.message : e))
+            if (Date.now() > deadline) {
+              stopDingtalkPoll()
+              if (!dingtalkAuthBusy) {
+                setQrMessage('还没有收到扫码授权：请确认手机用的是已加入本公司的钉钉账号，或点下方按钮直接用电脑上的钉钉账号进入。', true)
+              }
+              return
+            }
+            void checkDingtalkSession()
+          }, 2000)
+        }
+
+        function submitDingtalkAuth(authCode, state) {
+          if (!authCode || dingtalkAuthBusy) return
+          if (dingtalkLastCode && dingtalkLastCode === authCode) return
+          dingtalkLastCode = authCode
+          dingtalkAuthBusy = true
+          qrErr.hidden = true
+          request('/api/console/member/dingtalk/exchange', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ authCode: authCode, state: state || dingtalkState }),
+          })
+            .then(function (login) {
+              stopDingtalkPoll()
+              var target = (login && login.redirect) || '/admin?eab_boot=full'
+              location.replace(target)
+            })
+            .catch(function (err) {
+              stopDingtalkPoll()
+              qrErr.hidden = true
+              setQrMessage(err.message || '扫码登录没有完成，请刷新二维码后重试。', true)
+            })
+            .finally(function () {
+              dingtalkAuthBusy = false
+            })
+        }
+
+        function clearQrMessage() {
+          qrPlaceholder.hidden = true
+          qrRefresh.hidden = true
+          qrErr.hidden = true
+        }
+
+        function clearQr() {
+          clearQrExpireTimer()
+          stopDingtalkPoll()
+          dingtalkState = ''
+          dingtalkLastCode = ''
+          dingtalkAuthBusy = false
+          qrFrame.innerHTML = ''
+          qrPlaceholder.hidden = true
+          qrPlaceholder.textContent = ''
+          qrErr.hidden = true
+          qrErr.textContent = ''
+          qrRefresh.hidden = true
+          feishuPending = null
+        }
+
+        function renderSsoTabs() {
+          ssoTabs.innerHTML = ''
+          if (providers.length <= 1) {
+            ssoTabs.hidden = true
+            return
+          }
+          ssoTabs.hidden = false
+          providers.forEach(function (item) {
+            var meta = providerMeta(item.provider)
+            var button = document.createElement('button')
+            button.type = 'button'
+            button.className = 'gate-sso-tab' + (item.provider === currentProvider ? ' is-active' : '')
+            button.setAttribute('role', 'tab')
+            button.setAttribute('aria-selected', item.provider === currentProvider ? 'true' : 'false')
+            button.dataset.provider = item.provider
+            button.innerHTML = '<span class="gate-method-icon">' + meta.icon + '</span><span>' + meta.label + '</span>'
+            button.addEventListener('click', function () {
+              if (currentProvider === item.provider) return
+              currentProvider = item.provider
+              renderSsoTabs()
+              void startQr(true)
+            })
+            ssoTabs.appendChild(button)
+          })
+        }
+
+        function showMode(mode) {
+          var qr = mode === 'qr'
+          modeQr.classList.toggle('is-active', qr)
+          modeQr.setAttribute('aria-selected', qr ? 'true' : 'false')
+          modePassword.classList.toggle('is-active', !qr)
+          modePassword.setAttribute('aria-selected', qr ? 'false' : 'true')
+          paneQr.hidden = !qr
+          panePassword.hidden = qr
+          card.classList.toggle('is-password-mode', !qr)
+          if (qr) {
+            if (currentProvider) {
+              void startQr(false)
+            }
+          } else {
+            account.focus()
           }
         }
 
-        enter.addEventListener('click', submit)
-        pass.addEventListener('keydown', function (event) {
-          if (event.key === 'Enter') submit()
+        function loadScript(url, globalName, errorTextValue) {
+          if (sdkPromises[url]) return sdkPromises[url]
+          if (window[globalName]) return Promise.resolve()
+          sdkPromises[url] = new Promise(function (resolve, reject) {
+            var script = document.createElement('script')
+            script.src = url
+            script.async = true
+            script.onload = function () {
+              if (typeof window[globalName] === 'function') resolve()
+              else {
+                delete sdkPromises[url]
+                reject(new Error(errorTextValue + '（组件没有注册到页面）'))
+              }
+            }
+            script.onerror = function () {
+              delete sdkPromises[url]
+              reject(new Error(errorTextValue + '，请检查网络后刷新页面重试'))
+            }
+            document.head.appendChild(script)
+          })
+          return sdkPromises[url]
+        }
+
+        function showDingTalkQr(data) {
+          return loadScript(
+            'https://g.alicdn.com/dingding/h5-dingtalk-login/0.21.0/ddlogin.js',
+            'DTFrameLogin',
+            '钉钉扫码组件加载失败',
+          ).then(function () {
+            setQrMessage('正在生成钉钉二维码…', false)
+            dingtalkState = data.state || ''
+            dingtalkLastCode = ''
+            dingtalkAuthBusy = false
+            window.DTFrameLogin(
+              { id: 'qr-frame', width: 260, height: 260 },
+              (function () {
+                var params = {
+                  redirect_uri: encodeURIComponent(data.callback || location.origin + '/api/auth/dingtalk/callback'),
+                  client_id: data.appId,
+                  scope: data.corpId ? 'openid corpid' : 'openid',
+                  response_type: 'code',
+                  state: data.state,
+                  prompt: 'consent',
+                }
+                if (data.corpId) {
+                  params.corpId = data.corpId
+                  params.org_type = 'internal'
+                }
+                return params
+              })(),
+              function (result) {
+                if (!result || !result.authCode) {
+                  setQrMessage('没有拿到钉钉授权码，请重新扫码。', true)
+                  return
+                }
+                submitDingtalkAuth(result.authCode, result.state || data.state)
+              },
+              function (msg) {
+                if (!msg) {
+                  return
+                }
+                var text = String(msg)
+                if (/过期|失效|expired|refresh/i.test(text)) {
+                  setQrMessage('二维码已过期，请刷新后重新扫码。', true)
+                } else {
+                  setQrMessage('钉钉扫码登录没有完成：' + text, true)
+                }
+              },
+            )
+            // SDK 只认 login.dingtalk.com 的 postMessage；这里额外监听一次原始消息，
+            // 避免 SDK 因字段差异没有触发成功回调时，页面完全停在二维码上。
+            var frame = qrFrame.querySelector('iframe')
+            if (frame) {
+              var loads = 0
+              frame.addEventListener('load', function () {
+                loads += 1
+                if (loads <= 1) {
+                  qrPlaceholder.hidden = true
+                  return
+                }
+                void checkDingtalkSession()
+                setTimeout(function () { void checkDingtalkSession() }, 1500)
+              })
+            }
+            startDingtalkPoll()
+            startedFor.dingtalk = true
+          })
+        }
+
+        function showFeishuQr(data) {
+          return loadScript(
+            'https://lf-package-cn.feishucdn.com/obj/feishu-static/lark/passport/qrcode/LarkSSOSDKWebQRCode-1.0.3.js',
+            'QRLogin',
+            '飞书扫码组件加载失败',
+          ).then(function () {
+            clearQrMessage()
+            var instance = window.QRLogin({
+              id: 'qr-frame',
+              goto: data.url,
+              width: 260,
+              height: 260,
+              style: 'width:260px;height:260px;border:0;',
+            })
+            feishuPending = { instance: instance, goto: data.url }
+            startedFor.feishu = true
+          })
+        }
+
+        function showWecomQr(data) {
+          if (!data.qrSvg) throw new Error('企业微信没有返回二维码')
+          clearQrMessage()
+          qrFrame.innerHTML = data.qrSvg
+          startedFor.wecom = true
+        }
+
+        async function startQr(force) {
+          if (!currentProvider) {
+            setQrMessage('当前公司还没有绑定可扫码的企业渠道。', false)
+            return
+          }
+          if (qrBusy) return
+          if (!force && startedFor[currentProvider]) return
+          var provider = currentProvider
+          var meta = providerMeta(provider)
+          qrBusy = true
+          qrRefresh.disabled = true
+          clearQr()
+          setQrMessage('正在生成' + meta.label + '登录二维码…', false)
+          try {
+            var data = await request(ENDPOINTS[provider])
+            if (currentProvider !== provider) return
+            if (provider === 'dingtalk') {
+              if (!data.url || !data.appId) throw new Error('没有拿到钉钉登录地址')
+              await showDingTalkQr(data)
+            } else if (provider === 'feishu') {
+              if (!data.url) throw new Error('没有拿到飞书登录地址')
+              await showFeishuQr(data)
+            } else if (provider === 'wecom') {
+              showWecomQr(data)
+            } else {
+              throw new Error('不支持的扫码渠道')
+            }
+            armQrExpire(data.expiresAt, provider)
+          } catch (err) {
+            if (currentProvider !== provider) return
+            qrErr.hidden = false
+            qrErr.textContent = err.message || '二维码生成失败'
+            setQrMessage('暂时无法显示' + meta.label + '登录二维码。', true)
+          } finally {
+            qrBusy = false
+            qrRefresh.disabled = false
+          }
+        }
+
+        function bindProviders(data) {
+          methods = data || null
+          var all = Array.isArray(methods && methods.providers) ? methods.providers : []
+          providers = all.filter(function (item) {
+            return item && item.configured && PROVIDERS[item.provider]
+          })
+          if (!providers.length) {
+            currentProvider = ''
+            ssoTabs.hidden = true
+            ssoTabs.innerHTML = ''
+            return
+          }
+          var preferred = methods && methods.defaultProvider
+          var match = providers.filter(function (item) { return item.provider === preferred })[0]
+          currentProvider = (match || providers[0]).provider
+          renderSsoTabs()
+        }
+
+        async function loadMethods() {
+          try {
+            methods = await request('/api/console/member/sso/methods')
+          } catch (err) {
+            methods = null
+          }
+          bindProviders(methods)
+          var hasSso = providers.length > 0
+          modes.hidden = !hasSso
+          modeQr.hidden = !hasSso
+          card.classList.toggle('has-sso', hasSso)
+          if (hasSso) {
+            showMode('qr')
+          } else {
+            showMode('password')
+          }
+        }
+
+        window.addEventListener('message', function (event) {
+          if (!/login\.dingtalk\.com/.test(event.origin) || !event.data) return
+          var redirectUrl = event.data && event.data.redirectUrl
+          if (!redirectUrl) return
+          try {
+            var parsed = new URL(String(redirectUrl))
+            var authCode = parsed.searchParams.get('authCode') || parsed.searchParams.get('code') || ''
+            var state = parsed.searchParams.get('state') || dingtalkState
+            if (authCode) submitDingtalkAuth(authCode, state)
+          } catch (e) {}
         })
 
-        var help = document.getElementById('gate-help')
-        var hint = document.getElementById('gate-hint')
-        function toggleHint(open) {
-          hint.hidden = !open
-          help.setAttribute('aria-expanded', open ? 'true' : 'false')
-        }
-        help.addEventListener('click', function (event) {
-          event.stopPropagation()
-          toggleHint(hint.hidden)
+        window.addEventListener('message', function (event) {
+          if (!feishuPending || !feishuPending.instance) return
+          try {
+            if (!feishuPending.instance.matchOrigin(event.origin)) return
+            if (!feishuPending.instance.matchData(event.data)) return
+            var tmpCode = event.data && event.data.tmp_code
+            if (!tmpCode) return
+            location.href = feishuPending.goto + '&tmp_code=' + encodeURIComponent(tmpCode)
+          } catch (err) {
+            qrErr.hidden = false
+            qrErr.textContent = '飞书扫码结果校验失败，请刷新二维码重试'
+          }
         })
-        hint.addEventListener('click', function (event) {
-          event.stopPropagation()
+
+        modeQr.addEventListener('click', function () { showMode('qr') })
+        modePassword.addEventListener('click', function () { showMode('password') })
+        qrRefresh.addEventListener('click', function () {
+          startedFor = {}
+          void startQr(true)
         })
-        document.addEventListener('click', function () {
-          toggleHint(false)
+
+        var form = document.getElementById('pane-password')
+        form.addEventListener('submit', async function (event) {
+          event.preventDefault()
+          var name = account.value.trim()
+          if (!name) {
+            loginErr.hidden = false
+            loginErr.textContent = '先输入账号'
+            account.focus()
+            return
+          }
+          if (!password.value) {
+            loginErr.hidden = false
+            loginErr.textContent = '先输入密码'
+            password.focus()
+            return
+          }
+          loginErr.hidden = true
+          enter.disabled = true
+          enter.textContent = '登录中…'
+          try {
+            var login = await request('/api/console/unified-login', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ account: name, password: password.value }),
+            })
+            var target = (login && login.redirect) || '/admin'
+            var params = new URLSearchParams(location.search)
+            params.set('eab_boot', 'full')
+            location.replace(target + (target.indexOf('?') >= 0 ? '&' : '?') + params.toString())
+          } catch (err) {
+            loginErr.hidden = false
+            loginErr.textContent = err.message || '登录失败'
+            enter.disabled = false
+            enter.textContent = '登录'
+          }
         })
-        document.addEventListener('keydown', function (event) {
-          if (event.key === 'Escape') toggleHint(false)
-        })
-        user.focus()
+
+        void loadMethods()
       })()
     </script>
   </body>

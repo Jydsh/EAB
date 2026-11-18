@@ -14,7 +14,7 @@
  *
  * 签名密钥 = HMAC-SHA256(key = 管理员密码, 固定域串)。密码本身不出现在 Cookie 里。
  */
-import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import type { FastifyRequest } from 'fastify'
 import type { ServerConfig } from './config.js'
 
@@ -34,12 +34,40 @@ interface SessionPayload {
   readonly exp: number
 }
 
+/**
+ * 成员后台会话的 Cookie 负载。
+ *
+ * 和平台超管一样是无状态签名 Cookie，但服务端另外在 `console_member_sessions`
+ * 里存 token 哈希与过期时间：路由层只需验签就能判断“这是后台请求”，
+ * 真正取身份和权限时再查表，做到权限收回下一条请求就生效。
+ */
+interface MemberSessionPayload {
+  readonly sid: string
+  readonly u: string
+  readonly c: string
+  readonly ip: string
+  readonly exp: number
+}
+
+export interface ConsoleMemberToken {
+  readonly id: string
+  readonly userId: string
+  readonly companyId: string
+  readonly expiresAt: number
+  readonly ip: string
+}
+
 const COOKIE = 'eab_console_sid'
+const MEMBER_COOKIE = 'eab_console_member_sid'
 const SESSION_MS = 8 * 60 * 60 * 1000
+const MEMBER_SESSION_MS = 7 * 24 * 60 * 60 * 1000
 const REALM = 'eab-console-session'
+const MEMBER_REALM = 'eab-console-member-session'
 
 /** 当前签名密钥：由管理员密码派生；改密码时同步刷新，旧 Cookie 立刻失效。 */
 let signingKey: Buffer | null = null
+/** 成员后台会话的签名密钥；与平台超管分开派生，避免两种身份互相冒用。 */
+let memberSigningKey: Buffer | null = null
 /** 账号中心改过的密码：进程内生效，同时会写回 .eab-dev/admin-credentials.txt，重启后照旧读到 */
 let passwordOverride: string | null = null
 /** 启动时从 config 读到的管理员密码，用于派生签名密钥 */
@@ -49,10 +77,19 @@ function deriveKey(password: string): Buffer {
   return createHmac('sha256', `${REALM}:key`).update(password).digest()
 }
 
+function deriveMemberKey(password: string): Buffer {
+  return createHmac('sha256', `${MEMBER_REALM}:key`).update(password).digest()
+}
+
 function keyOf(): Buffer {
   // 没配置管理员密码时退回进程级随机密钥：会话仍可用，但外部无法伪造签名。
   signingKey ??= deriveKey(`fallback:${randomBytes(32).toString('hex')}`)
   return signingKey
+}
+
+function memberKeyOf(): Buffer {
+  memberSigningKey ??= deriveMemberKey(`fallback:${randomBytes(32).toString('hex')}`)
+  return memberSigningKey
 }
 
 /** 启动时由 app.buildApp 调用一次，把当前管理员密码登记为签名密钥。 */
@@ -60,6 +97,7 @@ export function configureConsoleAuth(config: ServerConfig): void {
   loginPassword = config.adminPassword
   const effective = passwordOverride ?? config.adminPassword
   signingKey = effective ? deriveKey(effective) : null
+  memberSigningKey = effective ? deriveMemberKey(effective) : null
 }
 
 function sign(payload: string): string {
@@ -83,6 +121,41 @@ function decode(value: string): SessionPayload | null {
   try {
     const parsed = JSON.parse(Buffer.from(body, 'base64url').toString('utf8')) as SessionPayload
     if (!parsed || typeof parsed.u !== 'string' || typeof parsed.exp !== 'number') return null
+    return parsed
+  } catch {
+    return null
+  }
+}
+
+function signMember(payload: string): string {
+  return createHmac('sha256', memberKeyOf()).update(`${MEMBER_REALM}:${payload}`).digest('base64url')
+}
+
+function encodeMember(payload: MemberSessionPayload): string {
+  const body = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url')
+  return `${body}.${signMember(body)}`
+}
+
+function decodeMember(value: string): MemberSessionPayload | null {
+  const index = value.lastIndexOf('.')
+  if (index <= 0) return null
+  const body = value.slice(0, index)
+  const signature = value.slice(index + 1)
+  const expected = signMember(body)
+  const left = Buffer.from(signature)
+  const right = Buffer.from(expected)
+  if (left.length !== right.length || !timingSafeEqual(left, right)) return null
+  try {
+    const parsed = JSON.parse(Buffer.from(body, 'base64url').toString('utf8')) as MemberSessionPayload
+    if (
+      !parsed ||
+      typeof parsed.sid !== 'string' ||
+      typeof parsed.u !== 'string' ||
+      typeof parsed.c !== 'string' ||
+      typeof parsed.exp !== 'number'
+    ) {
+      return null
+    }
     return parsed
   } catch {
     return null
@@ -122,6 +195,7 @@ export function setAdminPassword(password: string): void {
   passwordOverride = password
   loginPassword = password
   signingKey = deriveKey(password)
+  memberSigningKey = deriveMemberKey(password)
 }
 
 /** 当前生效的管理员密码（未登录时用于派生，不对外暴露）。 */
@@ -159,6 +233,46 @@ export function sessionFromRequest(req: FastifyRequest): ConsoleSession | null {
   return { id, user: payload.u, expiresAt: payload.exp, ip: payload.ip }
 }
 
+/** 创建成员后台会话 Cookie；DB 里只存 token 哈希，不存 Cookie 原文。 */
+export function createMemberSessionToken(
+  userId: string,
+  companyId: string,
+  ip: string,
+): { token: ConsoleMemberToken; cookieValue: string; cookie: string; tokenHash: string } {
+  const payload: MemberSessionPayload = {
+    sid: randomBytes(18).toString('base64url'),
+    u: userId,
+    c: companyId,
+    ip,
+    exp: Date.now() + MEMBER_SESSION_MS,
+  }
+  const value = encodeMember(payload)
+  return {
+    token: { id: payload.sid, userId, companyId, expiresAt: payload.exp, ip },
+    cookieValue: value,
+    cookie: memberSessionCookie(value),
+    tokenHash: hashToken(value),
+  }
+}
+
+/** 只验签，不查库；用于路由层区分“后台请求”和普通员工请求。 */
+export function memberSessionFromRequest(req: FastifyRequest): ConsoleMemberToken | null {
+  const value = cookieValue(req.headers.cookie, MEMBER_COOKIE)
+  if (!value) return null
+  const payload = decodeMember(value)
+  if (!payload) return null
+  if (payload.exp <= Date.now()) return null
+  return { id: payload.sid, userId: payload.u, companyId: payload.c, expiresAt: payload.exp, ip: payload.ip }
+}
+
+export function memberSessionValueFromRequest(req: FastifyRequest): string {
+  return cookieValue(req.headers.cookie, MEMBER_COOKIE)
+}
+
+export function hashToken(value: string): string {
+  return createHash('sha256').update(value).digest('hex')
+}
+
 export function destroySession(_req: FastifyRequest): void {
   // 无状态会话：服务端不需要删表，浏览器清掉 Cookie 即退出。
 }
@@ -175,6 +289,7 @@ export function hasConsoleSession(req: FastifyRequest): boolean {
 export function isConsoleRequest(req: FastifyRequest, config: ServerConfig): boolean {
   if (req.headers['x-eab-console'] !== '1') return false
   if (sessionFromRequest(req)) return true
+  if (memberSessionFromRequest(req)) return true
   const token = typeof req.headers['x-eab-console-token'] === 'string' ? req.headers['x-eab-console-token'].trim() : ''
   return Boolean(config.consoleToken) && Boolean(token) && safeEqual(token, config.consoleToken)
 }
@@ -188,4 +303,15 @@ export function sessionCookie(session: ConsoleSession): string {
 
 export function clearSessionCookie(): string {
   return `${COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`
+}
+
+/** 成员后台会话 Cookie：httpOnly + SameSite=Lax，7 天 */
+export function memberSessionCookie(value: string): string {
+  return `${MEMBER_COOKIE}=${encodeURIComponent(value)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(
+    MEMBER_SESSION_MS / 1000,
+  )}`
+}
+
+export function clearMemberSessionCookie(): string {
+  return `${MEMBER_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`
 }

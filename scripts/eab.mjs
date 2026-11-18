@@ -22,6 +22,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import { createConnection } from 'node:net'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { disableWindowsQuickEdit } from './windows-console.mjs'
 
 const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)))
 const DEV_DIR = process.env.EAB_HOME ? resolve(process.env.EAB_HOME) : join(ROOT, '.eab-dev')
@@ -310,6 +311,10 @@ async function server(flags) {
     if (!ok) process.exitCode = 1
     return
   }
+  // 前台启动保留日志输出；关掉当前窗口的 Windows 快速编辑，避免点一下终端
+  // 就进入选区把 Node 的 stdout 挂起，表现为服务卡住、按回车才恢复。
+  // 子进程（pnpm/tsx）带标记，避免 package.json 的 dev 前置脚本重复执行。
+  if (disableWindowsQuickEdit()) env.EAB_QUICK_EDIT_GUARDED = '1'
   console.log(`启动 EAB 服务：员工端 ${effective.chatPort} · 控制台 ${effective.adminPort}（地址 ${effective.host}）`)
   // 有些 Windows 环境的 PATH 里没有 pnpm（例如从任务计划或隐藏窗口启动）。
   // 此时回退到等价的 tsx 直启，避免“服务没起来但只提示找不到 pnpm”。

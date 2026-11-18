@@ -5,6 +5,7 @@
  * 所有数据接口都要求 `x-eab-console: 1`，避免同浏览器登录控制台后员工页被误认成操作员。
  */
 import type { FastifyInstance, FastifyRequest } from 'fastify'
+import '@fastify/multipart'
 import { createHash, createHmac, randomUUID } from 'node:crypto'
 import { writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -12,7 +13,8 @@ import { ALL_SCOPES, EC, EabError, SCOPE_REGISTRY, isKnownScope } from '@eab/dom
 import { appendAudit } from '@eab/storage'
 import type { ServerDeps } from '../deps.js'
 import { ok } from '../http.js'
-import { resolveActor } from '../session.js'
+import { resolveActor, CONSOLE_OPERATOR_ID } from '../session.js'
+import { getDocAsset, listDocAssetSummaries } from '../kb-assets.js'
 import { effectiveNetwork } from '../network-settings.js'
 import { resolveSecret, secretConfigured, storeSecret } from '../secrets.js'
 import {
@@ -62,21 +64,46 @@ import {
   type ModelProfileSuggestion,
 } from '../model-registry.js'
 import { collectionVectorStats, latestKbIndexJob, startKbIndexJob } from '../kb-vector.js'
+import {
+  createKbUploadDocument,
+  enqueueDocumentPipeline,
+  kickKbPipelineWorker,
+  readKbPipelineStatus,
+  saveManualPipelineText,
+  startKbPipelineWorker,
+  updateManualKbChunk,
+} from '../kb-pipeline.js'
+import { splitKbBlocks } from '../kb-splitter.js'
+import { retrieveKbCore, type KbRetrievalMode } from '../kb-retrieval.js'
+import { pruneKbTestRuns, startKbTestRetentionWorker } from '../kb-testing.js'
 import { callModel } from '../llm.js'
 import { readThinkingConfig, storedThinkingConfig, thinkingConfigOf } from '../thinking.js'
 import { createModelStressState, modelStressSnapshot, runModelStress, type ModelStressState } from '../model-stress.js'
 import {
+  clearMemberSessionCookie,
   clearSessionCookie,
   createSession,
   destroySession,
+  hasConsoleSession,
   isConsoleRequest,
   isLoopback,
+  memberSessionFromRequest,
   revokeOtherSessions,
   sessionCookie,
   sessionFromRequest,
   setAdminPassword,
   verifyAdminCredentials,
 } from '../console-auth.js'
+import { readConsoleMemberSession, revokeConsoleMemberSession } from '../console-member-session.js'
+import { readConsolePagePermissions } from '../console-permissions.js'
+import {
+  consoleActionsByPage,
+  consolePermissionCatalog,
+  consoleVisibleParentPages,
+  readConsoleRolePagePermissions,
+  saveConsoleRolePagePermissions,
+} from '../console-permissions.js'
+import { findPerson } from '../session.js'
 
 /** 模型目录变更：清掉原始目录缓存，并把“目录已变化”推给同公司的网页工作台。 */
 async function modelCatalogChanged(companyId: string): Promise<void> {
@@ -245,6 +272,10 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
     string,
     { companyId: string; modelId: string; modelName: string; state: ModelStressState }
   >()
+  // 入库 worker 与进程同生命周期；重启后 pending/stale 任务会被重新捡起。
+  startKbPipelineWorker(deps.db, { dbPath: deps.config.dbPath, dataDir: deps.config.dataDir })
+  // 召回测试记录按过期时间清理，和入库 worker 一样与进程同生命周期。
+  startKbTestRetentionWorker(deps.db)
 
   app.post<{ Body: { username?: string; password?: string; token?: string } }>(
     '/api/console/login',
@@ -269,30 +300,67 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
       }
 
       const session = createSession(byPassword ? username : 'service-token', req.ip ?? '')
-      reply.header('set-cookie', sessionCookie(session))
+      reply.header('set-cookie', [clearMemberSessionCookie(), sessionCookie(session)])
       return ok({ user: session.user, expiresAt: new Date(session.expiresAt).toISOString() })
     },
   )
 
   app.post('/api/console/logout', async (req, reply) => {
+    const member = memberSessionFromRequest(req)
+    if (member) {
+      const session = readConsoleMemberSession(deps.db, req)
+      if (session) revokeConsoleMemberSession(deps.db, session.id)
+    }
     destroySession(req)
-    reply.header('set-cookie', clearSessionCookie())
+    reply.header('set-cookie', [clearSessionCookie(), clearMemberSessionCookie()])
     return ok({ loggedOut: true })
   })
 
   app.get('/api/console/session', async (req) => {
     requireConsole(req, deps)
-    return ok({ authenticated: true })
+    const member = memberSessionFromRequest(req)
+    if (member) {
+      const session = readConsoleMemberSession(deps.db, req)
+      if (!session) throw new EabError(EC.AUTH_REQUIRED, '成员后台会话已失效，请重新登录')
+      return ok({ authenticated: true, kind: 'member', userId: session.userId, companyId: session.companyId })
+    }
+    return ok({ authenticated: true, kind: 'platform' })
   })
 
   /** 账号中心：顶栏头像点开后展示的身份信息 */
   app.get('/api/console/account', async (req) => {
     requireConsole(req, deps)
+    if (memberSessionFromRequest(req)) {
+      const session = readConsoleMemberSession(deps.db, req)
+      if (!session) throw new EabError(EC.AUTH_REQUIRED, '成员后台会话已失效，请重新登录')
+      const person = findPerson(deps.db, session.userId)
+      const pages = readConsolePagePermissions(deps.db, session.companyId, session.userId)
+      const account = deps.db
+        .prepare('SELECT employee_no, email, mobile FROM users WHERE id = ?')
+        .get(session.userId) as { employee_no: string | null; email: string | null; mobile: string | null } | undefined
+      return ok({
+        user: session.userId,
+        displayName: person?.name ?? '公司成员',
+        role: '公司成员',
+        kind: 'member',
+        account: account?.employee_no || account?.email || account?.mobile || null,
+        pageCount: pages.size,
+        managePageCount: [...pages.values()].filter((item) => item.canManage).length,
+        createPageCount: [...pages.values()].filter((item) => item.canCreate).length,
+        editPageCount: [...pages.values()].filter((item) => item.canEdit).length,
+        deletePageCount: [...pages.values()].filter((item) => item.canDelete).length,
+        passwordSource: 'member',
+        allowRemote: deps.config.allowRemoteConsole,
+        ip: session.ip ?? req.ip ?? '',
+        expiresAt: new Date(session.expiresAt).toISOString(),
+      })
+    }
     const session = sessionFromRequest(req)
     return ok({
       user: session?.user ?? deps.config.adminUser,
       displayName: '超级管理员',
       role: '服务器侧',
+      kind: 'platform',
       passwordSource: deps.config.adminPasswordSource ?? 'auto',
       allowRemote: deps.config.allowRemoteConsole,
       ip: session?.ip ?? req.ip ?? '',
@@ -479,16 +547,23 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
       companyId,
       dataScopes: ['self', 'dept', 'company', 'global'],
       quotaDefaults: defaultWorkspaceQuota(deps.db, companyId),
-      roles: rows.map((row) => ({
-        code: row.code,
-        name: row.name,
-        dataScope: row.data_scope,
-        builtin: row.builtin === 1,
-        requestable: roleRequestableOf.has(row.id),
-        members: Number(row.members),
-        scopes: (scopesByRole.get(row.id) ?? []).sort(),
-        quota: quotasByRole.get(row.code) ?? null,
-      })),
+      catalog: consolePermissionCatalog(),
+      roles: rows.map((row) => {
+        const consolePages = readConsoleRolePagePermissions(deps.db, companyId, row.id)
+        return {
+          code: row.code,
+          name: row.name,
+          dataScope: row.data_scope,
+          builtin: row.builtin === 1,
+          requestable: roleRequestableOf.has(row.id),
+          members: Number(row.members),
+          scopes: (scopesByRole.get(row.id) ?? []).sort(),
+          quota: quotasByRole.get(row.code) ?? null,
+          consolePages: [...consolePages.values()],
+          consoleAllowedPages: consoleVisibleParentPages(consolePages),
+          consoleActionsByPage: consoleActionsByPage(consolePages),
+        }
+      }),
     })
   })
 
@@ -750,15 +825,43 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
 
   app.put<{
     Params: { code: string }
-    Body: { name?: string; dataScope?: string; scopes?: string[] }
+    Body: {
+      name?: string
+      dataScope?: string
+      scopes?: string[]
+      consolePages?: Array<{
+        page?: string
+        section?: string
+        canView?: boolean
+        canCreate?: boolean
+        canEdit?: boolean
+        canDelete?: boolean
+        canManage?: boolean
+      }>
+    }
   }>('/api/console/roles/:code', async (req) => {
     requireConsole(req, deps)
-    const companyId = companyOf(req, deps)
+    const actor = resolveActor(deps.db, deps.config, req, deps.companyId)
+    const companyId = actor.subject.companyId
+    // 角色后台权限的写入人和审计人都必须是当前操作者，不能再写死控制台操作员。
+    const actorUserId = actor.subject.userId
     const code = String(req.params.code)
     const role = deps.db
       .prepare('SELECT id, code, name, data_scope FROM roles WHERE company_id = ? AND code = ? AND deleted_at IS NULL')
       .get(companyId, code) as { id: string; code: string; name: string; data_scope: string } | undefined
     if (!role) throw new EabError(EC.NOT_FOUND, `角色不存在：${code}`)
+
+    // 后台权限能决定成员能进哪些后台页面，不能让自己给自己追加入口。
+    if (req.body?.consolePages !== undefined && actorUserId !== CONSOLE_OPERATOR_ID) {
+      const selfBound = deps.db
+        .prepare('SELECT 1 AS bound FROM user_roles WHERE user_id = ? AND role_id = ?')
+        .get(actorUserId, role.id)
+      if (selfBound) {
+        throw new EabError(EC.FORBIDDEN, '不能修改自己所属角色的后台权限', {
+          hint: '请由平台管理员或其他角色管理员调整该角色',
+        })
+      }
+    }
 
     const name = req.body?.name === undefined ? role.name : String(req.body.name).trim()
     if (!name) throw new EabError(EC.VALIDATION, '角色名不能为空')
@@ -780,6 +883,26 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
       }
     }
 
+    let consolePages: ReturnType<typeof saveConsoleRolePagePermissions> | null = null
+    if (req.body?.consolePages !== undefined) {
+      if (!Array.isArray(req.body.consolePages)) throw new EabError(EC.VALIDATION, 'consolePages 必须是数组')
+      consolePages = saveConsoleRolePagePermissions(
+        deps.db,
+        companyId,
+        role.id,
+        req.body.consolePages.map((item) => ({
+          page: String(item.page ?? ''),
+          section: item.section ? String(item.section) : undefined,
+          canView: item.canView === true,
+          canCreate: item.canCreate === true,
+          canEdit: item.canEdit === true,
+          canDelete: item.canDelete === true,
+          canManage: item.canManage === true,
+        })),
+        actorUserId,
+      )
+    }
+
     const now = Date.now()
     deps.db
       .prepare('UPDATE roles SET name = ?, data_scope = ? WHERE id = ?')
@@ -790,7 +913,27 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
       for (const scope of scopes) insert.run(role.id, scope)
     }
 
-    return ok({ code, name, dataScope, scopes: scopes ?? null, updatedAt: new Date(now).toISOString() })
+    if (consolePages) {
+      appendAudit(deps.db, {
+        companyId,
+        actorUserId,
+        action: 'console.role.permissions.update',
+        resourceType: 'role',
+        resourceId: role.code,
+        result: 'success',
+        channel: 'web',
+        detail: { pages: [...consolePages.values()] },
+      })
+    }
+
+    return ok({
+      code,
+      name,
+      dataScope,
+      scopes: scopes ?? null,
+      consolePages: consolePages ? [...consolePages.values()] : null,
+      updatedAt: new Date(now).toISOString(),
+    })
   })
 
   app.post<{
@@ -939,6 +1082,9 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
     // 删除自定义角色时，连带解除所有成员绑定，避免留下指向已删除角色的授权行
     deps.db.prepare('DELETE FROM user_roles WHERE role_id = ?').run(role.id)
     deps.db.prepare('DELETE FROM role_scopes WHERE role_id = ?').run(role.id)
+    deps.db
+      .prepare('DELETE FROM console_role_page_permissions WHERE company_id = ? AND role_id = ?')
+      .run(companyId, role.id)
     deps.db
       .prepare('DELETE FROM tool_role_bindings WHERE company_id = ? AND role_code = ?')
       .run(companyId, role.code)
@@ -1263,17 +1409,193 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
     }
   }
 
-  function chunkKbContent(content: string): string[] {
-    const rawChunks = content
-      .split(/\n{2,}/)
-      .map((part) => part.trim())
-      .filter(Boolean)
-    const chunks: string[] = []
-    for (const part of rawChunks.length ? rawChunks : [content]) {
-      if (part.length <= 800) chunks.push(part)
-      else for (let i = 0; i < part.length; i += 800) chunks.push(part.slice(i, i + 800))
+  function chunkKbContent(content: string, maxTokens = 500, overlapTokens = 80): string[] {
+    const chunks = splitKbBlocks(
+      [{ id: 'manual', text: content, type: 'paragraph', headingPath: [] }],
+      { maxTokens, overlapTokens },
+    )
+    return chunks.map((chunk) => chunk.text)
+  }
+
+  function parseJsonIds(raw: string | null | undefined): string[] {
+    if (!raw) return []
+    try {
+      const parsed: unknown = JSON.parse(raw)
+      if (Array.isArray(parsed)) return parsed.map(String).filter(Boolean)
+    } catch {
+      // 兼容旧数据里用逗号分隔的 ID。
     }
-    return chunks
+    return String(raw)
+      .split(/[,，\s]+/)
+      .map((item) => item.trim())
+      .filter(Boolean)
+  }
+
+  function normalizeIdList(value: unknown): string[] {
+    if (Array.isArray(value)) return value.map(String).map((item) => item.trim()).filter(Boolean)
+    if (typeof value === 'string') return parseJsonIds(value)
+    return []
+  }
+
+  function testCollection(companyId: string, collectionId: string): {
+    id: string
+    name: string
+    source_kind: string | null
+    test_retention_days: number
+  } {
+    const row = deps.db
+      .prepare(
+        `SELECT id, name, source_kind, test_retention_days
+           FROM kb_collections WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
+      )
+      .get(collectionId, companyId) as
+      | { id: string; name: string; source_kind: string | null; test_retention_days: number | null }
+      | undefined
+    if (!row) throw new EabError(EC.NOT_FOUND, '知识库不存在')
+    if (row.source_kind === 'dify' || row.source_kind === 'generic') {
+      throw new EabError(EC.VALIDATION, '外部知识库请用“测试连接”，召回测试只对本地知识库生效')
+    }
+    return {
+      id: row.id,
+      name: row.name,
+      source_kind: row.source_kind ?? 'local',
+      test_retention_days: Math.max(1, Math.min(365, Number(row.test_retention_days ?? 30))),
+    }
+  }
+
+  function gradeTestHits(
+    hits: ReadonlyArray<{ docId: string; chunkId: string }>,
+    expectDocIds: readonly string[],
+    expectChunkIds: readonly string[],
+  ): { top1Hit: number; recallAtK: number; mrr: number; matched: number; expected: number } {
+    const expectedKeys = new Set<string>([
+      ...expectDocIds.map((id) => `doc:${id}`),
+      ...expectChunkIds.map((id) => `chunk:${id}`),
+    ])
+    if (expectedKeys.size === 0) return { top1Hit: 0, recallAtK: 0, mrr: 0, matched: 0, expected: 0 }
+    const found = new Set<string>()
+    let firstRank = 0
+    hits.forEach((hit, index) => {
+      const keys = [`doc:${hit.docId}`, `chunk:${hit.chunkId}`]
+      let hitExpected = false
+      for (const key of keys) {
+        if (expectedKeys.has(key)) {
+          found.add(key)
+          hitExpected = true
+        }
+      }
+      if (hitExpected && firstRank === 0) firstRank = index + 1
+    })
+    return {
+      top1Hit: firstRank === 1 ? 1 : 0,
+      recallAtK: found.size / expectedKeys.size,
+      mrr: firstRank > 0 ? 1 / firstRank : 0,
+      matched: found.size,
+      expected: expectedKeys.size,
+    }
+  }
+
+  async function executeKbTest(
+    companyId: string,
+    collectionId: string,
+    input: {
+      query?: string
+      mode?: string
+      topK?: number
+      vectorThreshold?: number
+      rerank?: boolean
+      caseId?: string
+      embeddingModelId?: string
+      expectDocIds?: unknown
+      expectChunkIds?: unknown
+    },
+    caseRow?: {
+      id: string
+      query: string
+      expect_doc_ids: string | null
+      expect_chunk_ids: string | null
+    },
+  ): Promise<Record<string, unknown>> {
+    const collection = testCollection(companyId, collectionId)
+    const query = String(input.query ?? caseRow?.query ?? '').trim()
+    if (!query) throw new EabError(EC.VALIDATION, '测试问题不能为空')
+    const mode: KbRetrievalMode =
+      input.mode === 'keyword' || input.mode === 'vector' ? input.mode : 'hybrid'
+    const topK = Math.max(1, Math.min(20, Math.round(Number(input.topK ?? 5))))
+    const vectorThreshold = Math.max(0, Math.min(1, Number(input.vectorThreshold ?? 0)))
+    const rerank = input.rerank !== false
+    const expectDocIds = normalizeIdList(input.expectDocIds ?? parseJsonIds(caseRow?.expect_doc_ids))
+    const expectChunkIds = normalizeIdList(input.expectChunkIds ?? parseJsonIds(caseRow?.expect_chunk_ids))
+
+    const result = await retrieveKbCore(deps.db, deps.config.dbPath, companyId, [collectionId], query, {
+      mode,
+      topK,
+      vectorThreshold: Number.isFinite(vectorThreshold) ? vectorThreshold : 0,
+      rerank,
+      canConfidential: true,
+      embeddingModelId: input.embeddingModelId,
+    })
+    const metrics = gradeTestHits(result.hits, expectDocIds, expectChunkIds)
+    const now = Date.now()
+    const expiresAt = now + collection.test_retention_days * 24 * 60 * 60 * 1000
+    const runId = `kbt_${randomUUID()}`
+    const config = {
+      mode,
+      topK,
+      vectorThreshold: Number.isFinite(vectorThreshold) ? vectorThreshold : 0,
+      rerank,
+      retentionDays: collection.test_retention_days,
+      embeddingModelId: input.embeddingModelId ?? null,
+    }
+    const resultPayload = {
+      query,
+      expectations: { docIds: expectDocIds, chunkIds: expectChunkIds },
+      hits: result.hits.map((hit) => ({ ...hit, text: hit.text.slice(0, 800) })),
+      diagnostics: result.diagnostics,
+      metrics,
+    }
+    const modelLabel = `${mode}${result.diagnostics.rerankUsed ? ' + rerank' : ''}${
+      result.diagnostics.embeddingModelIds.length > 0
+        ? ` · ${result.diagnostics.embeddingModelIds.join(' / ')}`
+        : ''
+    }`
+    deps.db
+      .prepare(
+        `INSERT INTO kb_test_runs
+           (id, company_id, collection_id, case_id, query, config_json, result_json, hit_count,
+            top1_hit, recall_at_k, mrr, latency_ms, model_label, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        runId,
+        companyId,
+        collectionId,
+        caseRow?.id ?? input.caseId ?? null,
+        query,
+        JSON.stringify(config),
+        JSON.stringify(resultPayload),
+        result.hits.length,
+        metrics.top1Hit,
+        metrics.recallAtK,
+        metrics.mrr,
+        result.diagnostics.elapsedMs,
+        modelLabel,
+        now,
+        expiresAt,
+      )
+    return {
+      runId,
+      query,
+      collectionId,
+      collectionName: collection.name,
+      config,
+      hits: resultPayload.hits,
+      diagnostics: result.diagnostics,
+      metrics,
+      modelLabel,
+      createdAt: now,
+      expiresAt,
+    }
   }
 
   app.get('/api/console/kb/collections', async (req) => {
@@ -1283,6 +1605,7 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
       .prepare(
         `SELECT c.id, c.name, c.description, c.acl_mode, c.acl_roles, c.acl_dept_paths, c.created_at,
                 c.source_kind, c.source_config, c.source_secret_ref, c.last_synced_at,
+                c.test_retention_days,
                 (SELECT COUNT(*) FROM kb_docs d
                    WHERE d.collection_id = c.id AND d.company_id = c.company_id AND d.status != 'deleted') AS doc_count
            FROM kb_collections c
@@ -1301,6 +1624,7 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
       source_config: string | null
       source_secret_ref: string | null
       last_synced_at: number | null
+      test_retention_days: number | null
       doc_count: number
     }>
     return ok({
@@ -1319,6 +1643,7 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
         sourceConfig: row.source_config ? (JSON.parse(row.source_config) as unknown) : {},
         sourceSecretConfigured: secretConfigured(deps.config.dbPath, row.source_secret_ref),
         lastSyncedAt: row.last_synced_at,
+        testRetentionDays: Number(row.test_retention_days ?? 30),
       })),
     })
   })
@@ -1405,6 +1730,7 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
       sourceKind?: string
       sourceConfig?: Record<string, unknown>
       sourceSecret?: string
+      testRetentionDays?: number
     }
   }>('/api/console/kb/collections/:id', async (req) => {
     requireConsole(req, deps)
@@ -1412,7 +1738,7 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
     const row = deps.db
       .prepare(
         `SELECT id, name, description, acl_mode, acl_roles, acl_dept_paths,
-                source_kind, source_config, source_secret_ref
+                source_kind, source_config, source_secret_ref, test_retention_days
            FROM kb_collections WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
       )
       .get(String(req.params.id), companyId) as
@@ -1426,6 +1752,7 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
           source_kind: string | null
           source_config: string | null
           source_secret_ref: string | null
+          test_retention_days: number | null
         }
       | undefined
     if (!row) throw new EabError(EC.NOT_FOUND, '知识库不存在')
@@ -1454,12 +1781,17 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
       : source.kind === 'local'
         ? null
         : row.source_secret_ref
+    const retentionDays =
+      req.body?.testRetentionDays === undefined
+        ? Number(row.test_retention_days ?? 30)
+        : Math.min(365, Math.max(1, Math.round(Number(req.body.testRetentionDays))))
+    if (!Number.isFinite(retentionDays)) throw new EabError(EC.VALIDATION, '测试记录保留天数必须是 1–365')
 
     deps.db
       .prepare(
         `UPDATE kb_collections
             SET name = ?, description = ?, acl_mode = ?, acl_roles = ?, acl_dept_paths = ?,
-                source_kind = ?, source_config = ?, source_secret_ref = ?, updated_at = ?
+                source_kind = ?, source_config = ?, source_secret_ref = ?, test_retention_days = ?, updated_at = ?
           WHERE id = ?`,
       )
       .run(
@@ -1471,6 +1803,7 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
         source.kind,
         JSON.stringify(source.config),
         sourceSecretRef,
+        retentionDays,
         Date.now(),
         row.id,
       )
@@ -1486,6 +1819,7 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
         sourceLabel: KB_SOURCE_LABEL[source.kind as keyof typeof KB_SOURCE_LABEL] ?? source.kind,
         sourceConfig: source.config,
         sourceSecretConfigured: secretConfigured(deps.config.dbPath, sourceSecretRef),
+        testRetentionDays: retentionDays,
       },
     })
   })
@@ -1517,10 +1851,387 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
     return ok({ deleted: true })
   })
 
-  app.get<{ Params: { id: string } }>('/api/console/kb/collections/:id/docs', async (req) => {
+  app.get<{ Params: { id: string } }>(
+    '/api/console/kb/collections/:id/embedding-models',
+    async (req) => {
+      requireConsole(req, deps)
+      const companyId = companyOf(req, deps)
+      const collection = testCollection(companyId, String(req.params.id))
+      const rows = deps.db
+        .prepare(
+          `SELECT e.model_id, COUNT(DISTINCT e.chunk_id) AS chunks
+             FROM kb_chunk_embeddings e
+             JOIN kb_chunks c ON c.id = e.chunk_id
+             JOIN kb_docs d ON d.id = c.doc_id
+            WHERE c.collection_id = ? AND d.deleted_at IS NULL
+            GROUP BY e.model_id
+            ORDER BY chunks DESC`,
+        )
+        .all(collection.id) as unknown as Array<{ model_id: string; chunks: number }>
+      return ok({
+        collectionId: collection.id,
+        models: rows.map((row) => ({
+          id: row.model_id,
+          name: findModelById(deps.db, companyId, row.model_id)?.name ?? row.model_id,
+          chunks: Number(row.chunks),
+        })),
+      })
+    },
+  )
+
+  app.post<{
+    Params: { id: string }
+    Body: {
+      query?: string
+      mode?: string
+      topK?: number
+      vectorThreshold?: number
+      rerank?: boolean
+      embeddingModelIds?: unknown
+      expectChunkIds?: unknown
+    }
+  }>('/api/console/kb/collections/:id/test-compare', async (req) => {
     requireConsole(req, deps)
     const companyId = companyOf(req, deps)
     const collectionId = String(req.params.id)
+    const query = String(req.body?.query ?? '').trim()
+    if (!query) throw new EabError(EC.VALIDATION, '对比测试的问题不能为空')
+    const requested = normalizeIdList(req.body?.embeddingModelIds)
+    const available = deps.db
+      .prepare(
+        `SELECT e.model_id, COUNT(DISTINCT e.chunk_id) AS chunks
+           FROM kb_chunk_embeddings e
+           JOIN kb_chunks c ON c.id = e.chunk_id
+           JOIN kb_docs d ON d.id = c.doc_id
+          WHERE c.collection_id = ? AND d.deleted_at IS NULL
+          GROUP BY e.model_id`,
+      )
+      .all(collectionId) as unknown as Array<{ model_id: string; chunks: number }>
+    const modelIds = requested.length > 0 ? requested : available.map((row) => row.model_id)
+    if (modelIds.length === 0) throw new EabError(EC.VALIDATION, '该知识库还没有向量模型索引，无法做模型对比')
+    if (modelIds.length > 6) throw new EabError(EC.VALIDATION, '一次最多对比 6 个向量模型')
+    const results: Array<Record<string, unknown>> = []
+    for (const modelId of modelIds) {
+      const run = await executeKbTest(companyId, collectionId, {
+        query,
+        mode: req.body?.mode,
+        topK: req.body?.topK,
+        vectorThreshold: req.body?.vectorThreshold,
+        rerank: req.body?.rerank,
+        embeddingModelId: modelId,
+        expectChunkIds: req.body?.expectChunkIds,
+      })
+      results.push({
+        modelId,
+        modelName: findModelById(deps.db, companyId, modelId)?.name ?? modelId,
+        runId: run.runId,
+        metrics: run.metrics,
+        hitCount: (run.hits as unknown[]).length,
+        elapsedMs: (run.diagnostics as { elapsedMs?: number }).elapsedMs ?? 0,
+        hits: run.hits,
+        diagnostics: run.diagnostics,
+      })
+    }
+    return ok({ collectionId, query, results })
+  })
+
+  app.post<{
+    Params: { id: string }
+    Body: {
+      query?: string
+      mode?: string
+      topK?: number
+      vectorThreshold?: number
+      rerank?: boolean
+      expectDocIds?: unknown
+      expectChunkIds?: unknown
+    }
+  }>('/api/console/kb/collections/:id/test-runs', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    return ok(await executeKbTest(companyId, String(req.params.id), req.body ?? {}))
+  })
+
+  app.get<{ Params: { id: string }; Querystring: { limit?: string } }>(
+    '/api/console/kb/collections/:id/test-runs',
+    async (req) => {
+      requireConsole(req, deps)
+      const companyId = companyOf(req, deps)
+      const collection = testCollection(companyId, String(req.params.id))
+      pruneKbTestRuns(deps.db)
+      const limit = Math.max(1, Math.min(100, Number(req.query.limit ?? 20)))
+      const rows = deps.db
+        .prepare(
+          `SELECT id, case_id, query, config_json, result_json, hit_count, top1_hit,
+                  recall_at_k, mrr, latency_ms, model_label, created_at, expires_at
+             FROM kb_test_runs
+            WHERE company_id = ? AND collection_id = ?
+            ORDER BY created_at DESC
+            LIMIT ?`,
+        )
+        .all(companyId, collection.id, limit) as unknown as Array<{
+        id: string
+        case_id: string | null
+        query: string
+        config_json: string | null
+        result_json: string | null
+        hit_count: number
+        top1_hit: number
+        recall_at_k: number
+        mrr: number
+        latency_ms: number
+        model_label: string | null
+        created_at: number
+        expires_at: number | null
+      }>
+      return ok({
+        collectionId: collection.id,
+        retentionDays: collection.test_retention_days,
+        runs: rows.map((row) => ({
+          id: row.id,
+          caseId: row.case_id,
+          query: row.query,
+          config: row.config_json ? JSON.parse(row.config_json) : {},
+          result: row.result_json ? JSON.parse(row.result_json) : {},
+          hitCount: Number(row.hit_count),
+          top1Hit: Number(row.top1_hit),
+          recallAtK: Number(row.recall_at_k),
+          mrr: Number(row.mrr),
+          latencyMs: Number(row.latency_ms),
+          modelLabel: row.model_label ?? '',
+          createdAt: Number(row.created_at),
+          expiresAt: row.expires_at ? Number(row.expires_at) : null,
+        })),
+      })
+    },
+  )
+
+  app.delete<{ Params: { id: string } }>('/api/console/kb/collections/:id/test-runs', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const collection = testCollection(companyId, String(req.params.id))
+    const result = deps.db
+      .prepare('DELETE FROM kb_test_runs WHERE company_id = ? AND collection_id = ?')
+      .run(companyId, collection.id)
+    return ok({ deleted: Number(result.changes ?? 0) })
+  })
+
+  app.patch<{
+    Params: { id: string }
+    Body: { testRetentionDays?: number }
+  }>('/api/console/kb/collections/:id/test-settings', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const collection = testCollection(companyId, String(req.params.id))
+    const days = Math.max(1, Math.min(365, Math.round(Number(req.body?.testRetentionDays ?? 30))))
+    if (!Number.isFinite(days)) throw new EabError(EC.VALIDATION, '测试记录保留天数必须是 1–365')
+    const now = Date.now()
+    deps.db
+      .prepare('UPDATE kb_collections SET test_retention_days = ?, updated_at = ? WHERE id = ? AND company_id = ?')
+      .run(days, now, collection.id, companyId)
+    deps.db
+      .prepare(
+        `UPDATE kb_test_runs
+            SET expires_at = created_at + ?
+          WHERE company_id = ? AND collection_id = ?`,
+      )
+      .run(days * 24 * 60 * 60 * 1000, companyId, collection.id)
+    pruneKbTestRuns(deps.db, now)
+    return ok({ collectionId: collection.id, testRetentionDays: days })
+  })
+
+  app.get<{ Params: { id: string } }>('/api/console/kb/collections/:id/test-cases', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const collection = testCollection(companyId, String(req.params.id))
+    const rows = deps.db
+      .prepare(
+        `SELECT id, name, query, expect_doc_ids, expect_chunk_ids, tags, enabled, created_at, updated_at
+           FROM kb_test_cases
+          WHERE company_id = ? AND collection_id = ? AND deleted_at IS NULL
+          ORDER BY created_at DESC`,
+      )
+      .all(companyId, collection.id) as unknown as Array<{
+      id: string
+      name: string
+      query: string
+      expect_doc_ids: string | null
+      expect_chunk_ids: string | null
+      tags: string | null
+      enabled: number
+      created_at: number
+      updated_at: number
+    }>
+    return ok({
+      collectionId: collection.id,
+      cases: rows.map((row) => ({
+        id: row.id,
+        name: row.name,
+        query: row.query,
+        expectDocIds: parseJsonIds(row.expect_doc_ids),
+        expectChunkIds: parseJsonIds(row.expect_chunk_ids),
+        tags: parseJsonIds(row.tags),
+        enabled: Boolean(row.enabled),
+        createdAt: Number(row.created_at),
+        updatedAt: Number(row.updated_at),
+      })),
+    })
+  })
+
+  app.post<{
+    Params: { id: string }
+    Body: {
+      name?: string
+      query?: string
+      expectDocIds?: unknown
+      expectChunkIds?: unknown
+      tags?: unknown
+      enabled?: boolean
+    }
+  }>('/api/console/kb/collections/:id/test-cases', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const collection = testCollection(companyId, String(req.params.id))
+    const query = String(req.body?.query ?? '').trim()
+    if (!query) throw new EabError(EC.VALIDATION, '测试问题不能为空')
+    const name = String(req.body?.name ?? '').trim() || query.slice(0, 40)
+    const now = Date.now()
+    const id = `kbc_${randomUUID()}`
+    deps.db
+      .prepare(
+        `INSERT INTO kb_test_cases
+           (id, company_id, collection_id, name, query, expect_doc_ids, expect_chunk_ids, tags, enabled, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        id,
+        companyId,
+        collection.id,
+        name,
+        query,
+        JSON.stringify(normalizeIdList(req.body?.expectDocIds)),
+        JSON.stringify(normalizeIdList(req.body?.expectChunkIds)),
+        JSON.stringify(normalizeIdList(req.body?.tags)),
+        req.body?.enabled === false ? 0 : 1,
+        now,
+        now,
+      )
+    return ok({ id, name, query, collectionId: collection.id })
+  })
+
+  app.patch<{
+    Params: { caseId: string }
+    Body: {
+      name?: string
+      query?: string
+      expectDocIds?: unknown
+      expectChunkIds?: unknown
+      tags?: unknown
+      enabled?: boolean
+    }
+  }>('/api/console/kb/test-cases/:caseId', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const row = deps.db
+      .prepare(
+        `SELECT id, collection_id, name, query, expect_doc_ids, expect_chunk_ids, tags, enabled
+           FROM kb_test_cases WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
+      )
+      .get(String(req.params.caseId), companyId) as
+      | {
+          id: string
+          collection_id: string
+          name: string
+          query: string
+          expect_doc_ids: string | null
+          expect_chunk_ids: string | null
+          tags: string | null
+          enabled: number
+        }
+      | undefined
+    if (!row) throw new EabError(EC.NOT_FOUND, '测试用例不存在')
+    const name = req.body?.name === undefined ? row.name : String(req.body.name).trim()
+    if (!name) throw new EabError(EC.VALIDATION, '用例名称不能为空')
+    const query = req.body?.query === undefined ? row.query : String(req.body.query).trim()
+    if (!query) throw new EabError(EC.VALIDATION, '测试问题不能为空')
+    deps.db
+      .prepare(
+        `UPDATE kb_test_cases
+            SET name = ?, query = ?, expect_doc_ids = ?, expect_chunk_ids = ?, tags = ?, enabled = ?, updated_at = ?
+          WHERE id = ? AND company_id = ?`,
+      )
+      .run(
+        name,
+        query,
+        JSON.stringify(req.body?.expectDocIds === undefined ? parseJsonIds(row.expect_doc_ids) : normalizeIdList(req.body.expectDocIds)),
+        JSON.stringify(req.body?.expectChunkIds === undefined ? parseJsonIds(row.expect_chunk_ids) : normalizeIdList(req.body.expectChunkIds)),
+        JSON.stringify(req.body?.tags === undefined ? parseJsonIds(row.tags) : normalizeIdList(req.body.tags)),
+        req.body?.enabled === undefined ? row.enabled : req.body.enabled ? 1 : 0,
+        Date.now(),
+        row.id,
+        companyId,
+      )
+    return ok({ id: row.id, name, query, collectionId: row.collection_id })
+  })
+
+  app.delete<{ Params: { caseId: string } }>('/api/console/kb/test-cases/:caseId', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const row = deps.db
+      .prepare('SELECT id FROM kb_test_cases WHERE id = ? AND company_id = ? AND deleted_at IS NULL')
+      .get(String(req.params.caseId), companyId)
+    if (!row) throw new EabError(EC.NOT_FOUND, '测试用例不存在')
+    deps.db
+      .prepare('UPDATE kb_test_cases SET deleted_at = ?, updated_at = ? WHERE id = ? AND company_id = ?')
+      .run(Date.now(), Date.now(), String(req.params.caseId), companyId)
+    return ok({ id: String(req.params.caseId) })
+  })
+
+  app.post<{
+    Params: { caseId: string }
+    Body: {
+      mode?: string
+      topK?: number
+      vectorThreshold?: number
+      rerank?: boolean
+    }
+  }>('/api/console/kb/test-cases/:caseId/run', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const row = deps.db
+      .prepare(
+        `SELECT id, collection_id, query, expect_doc_ids, expect_chunk_ids
+           FROM kb_test_cases WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
+      )
+      .get(String(req.params.caseId), companyId) as
+      | {
+          id: string
+          collection_id: string
+          query: string
+          expect_doc_ids: string | null
+          expect_chunk_ids: string | null
+        }
+      | undefined
+    if (!row) throw new EabError(EC.NOT_FOUND, '测试用例不存在')
+    return ok(
+      await executeKbTest(companyId, row.collection_id, req.body ?? {}, {
+        id: row.id,
+        query: row.query,
+        expect_doc_ids: row.expect_doc_ids,
+        expect_chunk_ids: row.expect_chunk_ids,
+      }),
+    )
+  })
+
+  app.get<{
+    Params: { id: string }
+    Querystring: { page?: string; pageSize?: string }
+  }>('/api/console/kb/collections/:id/docs', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const collectionId = String(req.params.id)
+    const page = Math.max(1, Math.floor(Number(req.query.page ?? 1) || 1))
+    const pageSize = Math.min(50, Math.max(1, Math.floor(Number(req.query.pageSize ?? 10) || 10)))
     const collection = deps.db
       .prepare(
         `SELECT id, name, acl_mode, source_kind, source_config, source_secret_ref
@@ -1548,6 +2259,11 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
         source_config: collection.source_config,
         source_secret_ref: collection.source_secret_ref,
       })
+      const total = remoteDocs.length
+      const totalPages = Math.max(1, Math.ceil(total / pageSize))
+      const currentPage = Math.min(page, totalPages)
+      const offset = (currentPage - 1) * pageSize
+      const pageDocs = remoteDocs.slice(offset, offset + pageSize)
       return ok({
         collection: {
           id: collection.id,
@@ -1557,7 +2273,9 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
           sourceLabel: KB_SOURCE_LABEL[sourceKind as keyof typeof KB_SOURCE_LABEL] ?? sourceKind,
         },
         external: true,
-        docs: remoteDocs.map((doc) => ({
+        totalChunks: remoteDocs.reduce((sum, doc) => sum + Number(doc.chunkCount || 0), 0),
+        pagination: { page: currentPage, pageSize, total, totalPages },
+        docs: pageDocs.map((doc) => ({
           id: doc.id,
           title: doc.title,
           classification: 'internal',
@@ -1569,14 +2287,28 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
       })
     }
 
+    const docsCount = deps.db
+      .prepare(
+        `SELECT COUNT(*) AS total, COALESCE(SUM(chunk_count), 0) AS total_chunks
+           FROM kb_docs
+          WHERE collection_id = ? AND company_id = ? AND deleted_at IS NULL`,
+      )
+      .get(collectionId, companyId) as unknown as { total: number; total_chunks: number }
+    const total = Number(docsCount?.total ?? 0)
+    const totalPages = Math.max(1, Math.ceil(total / pageSize))
+    const currentPage = Math.min(page, totalPages)
+    const offset = (currentPage - 1) * pageSize
+
     const docs = deps.db
       .prepare(
-        `SELECT id, title, classification, chunk_count, status, index_error, indexed_at, index_model_id
+        `SELECT id, title, classification, chunk_count, status, index_error, indexed_at, index_model_id,
+                source_type, pipeline_stage, pipeline_error, page_count, clean_mode, original_path
            FROM kb_docs
           WHERE collection_id = ? AND company_id = ? AND deleted_at IS NULL
-          ORDER BY title`,
+          ORDER BY created_at DESC, rowid DESC
+          LIMIT ? OFFSET ?`,
       )
-      .all(collectionId, companyId) as unknown as Array<{
+      .all(collectionId, companyId, pageSize, offset) as unknown as Array<{
       id: string
       title: string
       classification: string
@@ -1585,6 +2317,12 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
       index_error: string | null
       indexed_at: number | null
       index_model_id: string | null
+      source_type: string
+      pipeline_stage: string
+      pipeline_error: string | null
+      page_count: number
+      clean_mode: string | null
+      original_path: string | null
     }>
     const vectorStats = collectionVectorStats(deps.db, companyId, collectionId)
     return ok({
@@ -1596,6 +2334,8 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
         sourceLabel: KB_SOURCE_LABEL[sourceKind as keyof typeof KB_SOURCE_LABEL] ?? sourceKind,
       },
       external: false,
+      totalChunks: Number(docsCount?.total_chunks ?? 0),
+      pagination: { page: currentPage, pageSize, total, totalPages },
       vector: vectorStats,
       docs: docs.map((doc) => ({
         id: doc.id,
@@ -1606,6 +2346,12 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
         indexError: doc.index_error,
         indexedAt: doc.indexed_at ? new Date(Number(doc.indexed_at)).toISOString() : null,
         indexModelId: doc.index_model_id,
+        sourceType: doc.source_type,
+        pipelineStage: doc.pipeline_stage,
+        pipelineError: doc.pipeline_error,
+        pageCount: Number(doc.page_count),
+        cleanMode: doc.clean_mode,
+        originalPath: doc.original_path,
         visible: doc.classification !== 'confidential',
       })),
     })
@@ -1673,8 +2419,13 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
     const companyId = companyOf(req, deps)
     const collectionId = String(req.params.id)
     const collection = deps.db
-      .prepare('SELECT id, name, source_kind FROM kb_collections WHERE id = ? AND company_id = ? AND deleted_at IS NULL')
-      .get(collectionId, companyId) as { id: string; name: string; source_kind: string | null } | undefined
+      .prepare(
+        `SELECT id, name, source_kind, chunk_size, chunk_overlap
+           FROM kb_collections WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
+      )
+      .get(collectionId, companyId) as
+      | { id: string; name: string; source_kind: string | null; chunk_size: number; chunk_overlap: number }
+      | undefined
     if (!collection) throw new EabError(EC.NOT_FOUND, '知识库不存在')
     if (collection.source_kind === 'dify' || collection.source_kind === 'generic') {
       throw new EabError(EC.VALIDATION, '外部知识库的文档由上游管理，不能在 EAB 里新增')
@@ -1691,23 +2442,29 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
 
     const docId = `doc_${randomUUID()}`
     const now = Date.now()
-    const rawChunks = content
-      .split(/\n{2,}/)
-      .map((part) => part.trim())
-      .filter(Boolean)
-    const chunks: string[] = []
-    for (const part of rawChunks.length ? rawChunks : [content]) {
-      if (part.length <= 800) chunks.push(part)
-      else for (let i = 0; i < part.length; i += 800) chunks.push(part.slice(i, i + 800))
-    }
+    const chunks = chunkKbContent(content, Number(collection.chunk_size) || 500, Number(collection.chunk_overlap) || 80)
 
     deps.db
       .prepare(
         `INSERT INTO kb_docs
-           (id, company_id, collection_id, title, source_type, mime, size_bytes, classification, status, chunk_count, content, created_at, updated_at)
-         VALUES (?, ?, ?, ?, 'manual', 'text/plain', ?, ?, 'indexed', ?, ?, ?, ?)`,
+           (id, company_id, collection_id, title, source_type, mime, size_bytes, classification, status,
+            chunk_count, content, raw_text, clean_text, pipeline_stage, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'manual', 'text/plain', ?, ?, 'indexed', ?, ?, ?, ?, 'indexed', ?, ?)`,
       )
-      .run(docId, companyId, collectionId, title, Buffer.byteLength(content, 'utf8'), classification, chunks.length, content, now, now)
+      .run(
+        docId,
+        companyId,
+        collectionId,
+        title,
+        Buffer.byteLength(content, 'utf8'),
+        classification,
+        chunks.length,
+        content,
+        content,
+        content,
+        now,
+        now,
+      )
     const insertChunk = deps.db.prepare(
       `INSERT INTO kb_chunks (id, company_id, doc_id, collection_id, ordinal, text, token_count, classification, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -1728,6 +2485,321 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
     }
 
     return ok({ doc: { id: docId, title, classification, chunks: chunks.length, collectionId } })
+  })
+
+  app.post<{ Params: { id: string } }>('/api/console/kb/collections/:id/docs/upload', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const collectionId = String(req.params.id)
+    const collection = deps.db
+      .prepare('SELECT id, name, source_kind FROM kb_collections WHERE id = ? AND company_id = ? AND deleted_at IS NULL')
+      .get(collectionId, companyId) as { id: string; name: string; source_kind: string | null } | undefined
+    if (!collection) throw new EabError(EC.NOT_FOUND, '知识库不存在')
+    if (collection.source_kind === 'dify' || collection.source_kind === 'generic') {
+      throw new EabError(EC.VALIDATION, '外部知识库的文档由上游管理，不能在 EAB 里上传')
+    }
+    if (!req.isMultipart()) throw new EabError(EC.VALIDATION, '上传请求必须是 multipart/form-data')
+
+    const fields: Record<string, string> = {}
+    const files: Array<{ filename: string; mime: string; buffer: Buffer }> = []
+    let totalBytes = 0
+    try {
+      const parts = req.parts({
+        limits: {
+          fileSize: 50 * 1024 * 1024,
+          files: 20,
+          fields: 20,
+        },
+      })
+      for await (const part of parts) {
+        if (part.type === 'file') {
+          const buffer = await part.toBuffer()
+          totalBytes += buffer.byteLength
+          if (totalBytes > 200 * 1024 * 1024) {
+            throw new EabError(EC.VALIDATION, '单次上传总大小不能超过 200MB')
+          }
+          files.push({ filename: part.filename ?? '未命名文档', mime: part.mimetype ?? 'application/octet-stream', buffer })
+        } else {
+          fields[part.fieldname] = String(part.value ?? '')
+        }
+      }
+    } catch (error) {
+      if (error instanceof EabError) throw error
+      throw new EabError(EC.VALIDATION, `读取上传文件失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+    if (files.length === 0) throw new EabError(EC.VALIDATION, '没有收到文件')
+
+    const cleanMode = String(fields.cleanMode ?? '').trim()
+    if (cleanMode && !['rules', 'model', 'auto'].includes(cleanMode)) {
+      throw new EabError(EC.VALIDATION, '清洗方式只能是 rules / model / auto')
+    }
+    const classification = String(fields.classification ?? 'internal').trim()
+    if (!['public', 'internal', 'confidential'].includes(classification)) {
+      throw new EabError(EC.VALIDATION, '密级只能是 public / internal / confidential')
+    }
+
+    const results: Array<{ filename: string; ok: boolean; docId?: string; title?: string; duplicate?: boolean; error?: string }> = []
+    for (const file of files) {
+      try {
+        const result = createKbUploadDocument(
+          deps.db,
+          { dbPath: deps.config.dbPath, dataDir: deps.config.dataDir },
+          companyId,
+          collectionId,
+          file,
+          {
+            classification,
+            cleanMode: (cleanMode || undefined) as 'rules' | 'model' | 'auto' | undefined,
+            autoStart: true,
+          },
+        )
+        results.push({ filename: file.filename, ok: true, ...result })
+      } catch (error) {
+        results.push({
+          filename: file.filename,
+          ok: false,
+          error: error instanceof EabError ? error.message : error instanceof Error ? error.message : String(error),
+        })
+      }
+    }
+    kickKbPipelineWorker(deps.db, { dbPath: deps.config.dbPath, dataDir: deps.config.dataDir })
+    return ok({
+      collectionId,
+      accepted: results.filter((item) => item.ok).length,
+      failed: results.filter((item) => !item.ok).length,
+      files: results,
+    })
+  })
+
+  app.post('/api/console/kb/docs/pipeline/batch', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const body = (req.body ?? {}) as { docIds?: unknown }
+    const docIds = Array.isArray(body.docIds) ? body.docIds.map((item) => String(item)).filter(Boolean) : []
+    if (docIds.length === 0) throw new EabError(EC.VALIDATION, '至少传入一个文档 ID')
+    if (docIds.length > 50) throw new EabError(EC.VALIDATION, '单次最多查询 50 篇文档状态')
+    const unique = [...new Set(docIds)]
+    const items = unique.map((docId) => {
+      try {
+        return { ok: true, status: readKbPipelineStatus(deps.db, companyId, docId) }
+      } catch (error) {
+        return {
+          ok: false,
+          docId,
+          error: error instanceof EabError ? error.message : error instanceof Error ? error.message : String(error),
+        }
+      }
+    })
+    return ok({ items })
+  })
+
+  app.put<{ Params: { docId: string } }>(
+    '/api/console/kb/docs/:docId/pipeline/content',
+    { bodyLimit: 8 * 1024 * 1024 },
+    async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const docId = String(req.params.docId)
+    const doc = deps.db
+      .prepare('SELECT source_type FROM kb_docs WHERE id = ? AND company_id = ? AND deleted_at IS NULL')
+      .get(docId, companyId) as { source_type: string } | undefined
+    if (!doc) throw new EabError(EC.NOT_FOUND, '文档不存在')
+    if (doc.source_type !== 'upload') throw new EabError(EC.VALIDATION, '只有上传文档支持流水线内容修正')
+    const active = deps.db
+      .prepare(
+        `SELECT id FROM kb_ingest_jobs
+          WHERE company_id = ? AND doc_id = ? AND status IN ('pending', 'running')
+          LIMIT 1`,
+      )
+      .get(companyId, docId) as { id: string } | undefined
+    if (active) throw new EabError(EC.CONFLICT, '文档正在处理中，请等待当前任务结束后再修改', { details: { jobId: active.id } })
+    const body = (req.body ?? {}) as { stage?: unknown; text?: unknown }
+    const stage = String(body.stage ?? '')
+    if (stage !== 'parse' && stage !== 'clean') throw new EabError(EC.VALIDATION, '只能修正 parse / clean 阶段文本')
+    const result = saveManualPipelineText(
+      deps.db,
+      { dbPath: deps.config.dbPath, dataDir: deps.config.dataDir },
+      companyId,
+      docId,
+      stage,
+      String(body.text ?? ''),
+    )
+    return ok(result)
+    },
+  )
+
+  app.put<{ Params: { docId: string; ordinal: string } }>(
+    '/api/console/kb/docs/:docId/chunks/:ordinal',
+    { bodyLimit: 8 * 1024 * 1024 },
+    async (req) => {
+      requireConsole(req, deps)
+      const companyId = companyOf(req, deps)
+      const docId = String(req.params.docId)
+      const doc = deps.db
+        .prepare('SELECT source_type FROM kb_docs WHERE id = ? AND company_id = ? AND deleted_at IS NULL')
+        .get(docId, companyId) as { source_type: string } | undefined
+      if (!doc) throw new EabError(EC.NOT_FOUND, '文档不存在')
+      if (doc.source_type !== 'upload') throw new EabError(EC.VALIDATION, '只有上传文档支持修正切片')
+      const active = deps.db
+        .prepare(
+          `SELECT id FROM kb_ingest_jobs
+            WHERE company_id = ? AND doc_id = ? AND status IN ('pending', 'running')
+            LIMIT 1`,
+        )
+        .get(companyId, docId) as { id: string } | undefined
+      if (active) throw new EabError(EC.CONFLICT, '文档正在处理中，请等待当前任务结束后再修改', { details: { jobId: active.id } })
+      const ordinal = Number(req.params.ordinal)
+      const body = (req.body ?? {}) as { text?: unknown }
+      const result = updateManualKbChunk(deps.db, companyId, docId, ordinal, String(body.text ?? ''))
+      return ok(result)
+    },
+  )
+
+  app.post<{ Params: { docId: string } }>('/api/console/kb/docs/:docId/pipeline/retry', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const docId = String(req.params.docId)
+    const doc = deps.db
+      .prepare(
+        `SELECT d.id, d.collection_id, d.source_type, k.source_kind
+           FROM kb_docs d JOIN kb_collections k ON k.id = d.collection_id
+          WHERE d.id = ? AND d.company_id = ? AND d.deleted_at IS NULL`,
+      )
+      .get(docId, companyId) as
+      | { id: string; collection_id: string; source_type: string; source_kind: string | null }
+      | undefined
+    if (!doc) throw new EabError(EC.NOT_FOUND, '文档不存在')
+    if (doc.source_kind === 'dify' || doc.source_kind === 'generic') {
+      throw new EabError(EC.VALIDATION, '外部知识库文档由上游管理，不能在 EAB 里重跑')
+    }
+    if (doc.source_type !== 'upload') {
+      throw new EabError(EC.VALIDATION, '只有上传的文档支持流水线重跑；手工文本请直接编辑')
+    }
+    const stage = String((req.body as { stage?: string } | undefined)?.stage ?? 'parse')
+    if (!['parse', 'clean', 'chunk', 'index'].includes(stage)) {
+      throw new EabError(EC.VALIDATION, '重跑阶段只能是 parse / clean / chunk / index')
+    }
+    const jobId = enqueueDocumentPipeline(
+      deps.db,
+      companyId,
+      doc.collection_id,
+      doc.id,
+      stage as 'parse' | 'clean' | 'chunk' | 'index',
+    )
+    kickKbPipelineWorker(deps.db, { dbPath: deps.config.dbPath, dataDir: deps.config.dataDir })
+    return ok({ docId: doc.id, jobId, stage, message: '已重新排入入库队列' })
+  })
+
+  app.get<{ Params: { docId: string } }>('/api/console/kb/docs/:docId/pipeline', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    return ok(readKbPipelineStatus(deps.db, companyId, String(req.params.docId)))
+  })
+
+  app.get<{ Params: { docId: string } }>('/api/console/kb/docs/:docId/assets', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const docId = String(req.params.docId)
+    const assets = listDocAssetSummaries(deps.db, companyId, docId).map((asset) => ({
+      ...asset,
+      url: `/api/console/kb/docs/${encodeURIComponent(docId)}/assets/${encodeURIComponent(asset.id)}`,
+    }))
+    return ok({ docId, assets, count: assets.length })
+  })
+
+  /**
+   * 图片二进制：浏览器 <img> 带不了 x-eab-console 自定义头，所以这里只对 GET 图片
+   * 放宽为“控制台会话 cookie 或后台成员 cookie”任一有效；仍然只读、同源、不可跨站带 cookie。
+   */
+  app.get<{ Params: { docId: string; assetId: string } }>(
+    '/api/console/kb/docs/:docId/assets/:assetId',
+    async (req, reply) => {
+      if (!isConsoleRequest(req, deps.config) && !hasConsoleSession(req) && !memberSessionFromRequest(req)) {
+        throw new EabError(EC.AUTH_REQUIRED, '需要控制台会话或后台成员会话')
+      }
+      const companyId = deps.companyId
+      const docId = String(req.params.docId)
+      const assetId = String(req.params.assetId)
+      const { row, buffer } = getDocAsset(deps.db, deps.config, companyId, docId, assetId)
+      reply.header('Cache-Control', 'private, max-age=3600')
+      reply.header('Content-Disposition', 'inline')
+      return reply.type(row.mime).send(buffer)
+    },
+  )
+
+  app.get<{
+    Params: { docId: string }
+    Querystring: { kind?: string; limit?: string; offset?: string }
+  }>('/api/console/kb/docs/:docId/preview', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const docId = String(req.params.docId)
+    const kind = String(req.query.kind ?? 'clean')
+    const limit = Math.max(200, Math.min(200_000, Number(req.query.limit ?? 20_000) || 20_000))
+    const offset = Math.max(0, Number(req.query.offset ?? 0) || 0)
+    const row = deps.db
+      .prepare(
+        `SELECT id, title, raw_text, clean_text, chunk_count, source_type, classification
+           FROM kb_docs WHERE id = ? AND company_id = ? AND deleted_at IS NULL`,
+      )
+      .get(docId, companyId) as unknown as
+      | { id: string; title: string; raw_text: string | null; clean_text: string | null; chunk_count: number; source_type: string; classification: string }
+      | undefined
+    if (!row) throw new EabError(EC.NOT_FOUND, '文档不存在')
+    if (kind === 'chunks') {
+      const chunks = deps.db
+        .prepare(
+          `SELECT ordinal, text, token_count, heading, page_no, char_count, meta_json
+             FROM kb_chunks WHERE doc_id = ? AND company_id = ? ORDER BY ordinal LIMIT ? OFFSET ?`,
+        )
+        .all(docId, companyId, limit, offset) as unknown as Array<{
+        ordinal: number
+        text: string
+        token_count: number
+        heading: string | null
+        page_no: number | null
+        char_count: number | null
+        meta_json: string | null
+      }>
+      return ok({
+        docId: row.id,
+        title: row.title,
+        kind: 'chunks',
+        chunkCount: Number(row.chunk_count),
+        chunks: chunks.map((chunk) => {
+          let meta: Record<string, unknown> = {}
+          try {
+            meta = chunk.meta_json ? (JSON.parse(chunk.meta_json) as Record<string, unknown>) : {}
+          } catch {
+            meta = {}
+          }
+          const assetId = typeof meta.imageAssetId === 'string' ? meta.imageAssetId : ''
+          return {
+            ordinal: Number(chunk.ordinal),
+            text: chunk.text,
+            tokenCount: Number(chunk.token_count),
+            heading: chunk.heading,
+            pageNo: chunk.page_no === null ? null : Number(chunk.page_no),
+            charCount: chunk.char_count === null ? null : Number(chunk.char_count),
+            meta,
+            imageUrl: assetId
+              ? `/api/console/kb/docs/${encodeURIComponent(docId)}/assets/${encodeURIComponent(assetId)}`
+              : null,
+          }
+        }),
+      })
+    }
+    const source = kind === 'raw' ? row.raw_text : kind === 'clean' ? row.clean_text : row.clean_text ?? row.raw_text
+    const text = String(source ?? '')
+    return ok({
+      docId: row.id,
+      title: row.title,
+      kind: kind === 'raw' ? 'raw' : 'clean',
+      text: text.slice(offset, offset + limit),
+      totalLength: text.length,
+      offset,
+      limit,
+    })
   })
 
   app.get<{ Params: { docId: string } }>('/api/console/kb/docs/:docId', async (req) => {
@@ -1785,17 +2857,31 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
     const companyId = companyOf(req, deps)
     const row = deps.db
       .prepare(
-        `SELECT d.id, d.collection_id, d.title, d.classification, d.content, k.source_kind
+        `SELECT d.id, d.collection_id, d.title, d.classification, d.content, d.source_type,
+                k.source_kind, k.chunk_size, k.chunk_overlap
            FROM kb_docs d
            JOIN kb_collections k ON k.id = d.collection_id
           WHERE d.id = ? AND d.company_id = ? AND d.deleted_at IS NULL`,
       )
       .get(String(req.params.docId), companyId) as
-      | { id: string; collection_id: string; title: string; classification: string; content: string | null; source_kind: string | null }
+      | {
+          id: string
+          collection_id: string
+          title: string
+          classification: string
+          content: string | null
+          source_type: string
+          source_kind: string | null
+          chunk_size: number
+          chunk_overlap: number
+        }
       | undefined
     if (!row) throw new EabError(EC.NOT_FOUND, '文档不存在')
     if (row.source_kind === 'dify' || row.source_kind === 'generic') {
       throw new EabError(EC.VALIDATION, '外部知识库文档由上游管理，不能在 EAB 里编辑')
+    }
+    if (row.source_type === 'upload' && req.body?.content !== undefined) {
+      throw new EabError(EC.VALIDATION, '上传文档的正文由流水线生成，不能直接覆盖；请重跑解析/清洗/切片')
     }
 
     const title = req.body?.title === undefined ? row.title : String(req.body.title).trim()
@@ -1813,7 +2899,7 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
     if (!['public', 'internal', 'confidential'].includes(classification)) {
       throw new EabError(EC.VALIDATION, '密级只能是 public / internal / confidential')
     }
-    const chunks = chunkKbContent(content)
+    const chunks = chunkKbContent(content, Number(row.chunk_size) || 500, Number(row.chunk_overlap) || 80)
     const now = Date.now()
     const checksum = createHash('sha256').update(content).digest('hex')
     deps.db.exec('BEGIN')
@@ -1840,10 +2926,22 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
         .prepare(
           `UPDATE kb_docs
               SET title = ?, classification = ?, size_bytes = ?, checksum = ?, status = 'indexed',
-                  chunk_count = ?, content = ?, updated_at = ?
+                  chunk_count = ?, content = ?, raw_text = ?, clean_text = ?, pipeline_stage = 'indexed',
+                  pipeline_error = NULL, updated_at = ?
             WHERE id = ?`,
         )
-        .run(title, classification, Buffer.byteLength(content, 'utf8'), checksum, chunks.length, content, now, row.id)
+        .run(
+          title,
+          classification,
+          Buffer.byteLength(content, 'utf8'),
+          checksum,
+          chunks.length,
+          content,
+          content,
+          content,
+          now,
+          row.id,
+        )
       deps.db.exec('COMMIT')
     } catch (error) {
       deps.db.exec('ROLLBACK')

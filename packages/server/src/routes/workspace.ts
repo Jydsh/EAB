@@ -24,7 +24,7 @@ import {
 import { readFile } from 'node:fs/promises'
 import { basename, dirname, extname, join } from 'node:path'
 import { EC, EabError, ulid, SC } from '@eab/domain'
-import { appendAudit, type Db } from '@eab/storage'
+import { appendAudit, type Db, withTransaction } from '@eab/storage'
 import { normalizeRelativePath, safeJoin, toSlug } from '@eab/workspace'
 import type { ServerDeps } from '../deps.js'
 import { ok, requireScope } from '../http.js'
@@ -224,6 +224,444 @@ export function deleteUserWorkspaceFile(
   const updated = deps.db.prepare('SELECT * FROM workspace_files WHERE id = ?').get(row.id) as unknown as FileRow
   publishWorkspaceFilesChanged(row.company_id, row.owner_user_id, 'deleted', [row.id])
   return { file: publicFile(updated), row: updated, recycled }
+}
+
+export interface WorkspaceFolderSummary {
+  path: string
+  name: string
+  parentPath: string
+  fileCount: number
+}
+
+/**
+ * 从扁平的 `workspace_files.rel_path` 推导文件夹树。
+ * `.gitkeep` 只负责保留空文件夹，不计入文件数；所有后代文件都计入祖先文件夹。
+ */
+export function workspaceFolderSummaries(
+  rows: ReadonlyArray<{ rel_path: string }>,
+): WorkspaceFolderSummary[] {
+  const folders = new Map<string, WorkspaceFolderSummary>()
+  for (const row of rows) {
+    const relPath = String(row?.rel_path || '')
+      .replace(/\\/g, '/')
+      .split('/')
+      .filter((segment) => segment && segment !== '.')
+    if (relPath.length <= 1) continue
+    const placeholder = relPath[relPath.length - 1] === '.gitkeep'
+    for (let index = 1; index < relPath.length; index += 1) {
+      const path = relPath.slice(0, index).join('/')
+      const folder = folders.get(path) || {
+        path,
+        name: relPath[index - 1],
+        parentPath: relPath.slice(0, Math.max(0, index - 1)).join('/'),
+        fileCount: 0,
+      }
+      if (!placeholder) folder.fileCount += 1
+      folders.set(path, folder)
+    }
+  }
+  return [...folders.values()].sort((a, b) => a.path.localeCompare(b.path, 'zh-CN', { numeric: true }))
+}
+
+const FOLDER_ROOT_INTERNAL_PREFIXES = ['_', '.']
+
+/** 文件夹路径只允许普通业务目录，内部目录（_recycle/_versions/.eab-*）不参与用户操作。 */
+export function normalizeWorkspaceFolderPath(input: string): string {
+  const path = normalizeRelativePath(String(input ?? '').trim())
+  const segments = path.split('/')
+  const bad = segments.find((segment) =>
+    FOLDER_ROOT_INTERNAL_PREFIXES.some((prefix) => segment.startsWith(prefix)),
+  )
+  if (bad) {
+    throw new EabError(EC.VALIDATION, `文件夹路径不能使用内部目录「${bad}」`, {
+      hint: '请换一个不以 . 或 _ 开头的文件夹名称。',
+    })
+  }
+  return path
+}
+
+/** 文件夹改名只接受最后一级名称，避免把“重命名”误当成跨目录移动。 */
+function normalizeFolderLeafName(input: string): string {
+  const name = String(input ?? '').trim()
+  if (!name) throw new EabError(EC.VALIDATION, '文件夹名称不能为空')
+  if (name.includes('/') || name.includes('\\')) {
+    throw new EabError(EC.VALIDATION, '文件夹名称不能包含斜杠')
+  }
+  const normalized = normalizeRelativePath(name)
+  if (normalized.includes('/')) throw new EabError(EC.VALIDATION, '文件夹名称不能包含多级路径')
+  if (normalized.startsWith('.') || normalized.startsWith('_')) {
+    throw new EabError(EC.VALIDATION, '文件夹名称不能以 . 或 _ 开头')
+  }
+  return normalized
+}
+
+/** 把 LIKE 前缀里的通配符转义，避免 `my_docs` 把 `myXdocs` 也当成自己的子目录。 */
+function folderLikePrefix(path: string): string {
+  return `${path.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_')}/%`
+}
+
+function userFolderRows(deps: ServerDeps, actor: RequestActor, folderPath: string): FileRow[] {
+  return deps.db
+    .prepare(
+      `SELECT * FROM workspace_files
+        WHERE company_id = ? AND scope_type = 'user' AND scope_id = ? AND owner_user_id = ?
+          AND deleted_at IS NULL AND (rel_path = ? OR rel_path LIKE ? ESCAPE '\\')
+        ORDER BY rel_path`,
+    )
+    .all(
+      actor.subject.companyId,
+      actor.subject.userId,
+      actor.subject.userId,
+      folderPath,
+      folderLikePrefix(folderPath),
+    ) as unknown as FileRow[]
+}
+
+/**
+ * 文件夹可能被多个人的共享文件合并展示；整体重命名/删除只能处理本人文件，
+ * 若目录里还有别人共享来的文件，直接拒绝，避免出现“旧目录仍在、只动了一半”的状态。
+ */
+function folderHasForeignSharedFiles(
+  deps: ServerDeps,
+  actor: RequestActor,
+  folderPath: string,
+): boolean {
+  const deptIds = deptIdsOf(actor)
+  const row = deps.db
+    .prepare(
+      `SELECT 1
+         FROM workspace_shares s
+         JOIN workspace_files f ON f.id = s.file_id
+        WHERE s.company_id = ? AND s.revoked_at IS NULL AND f.deleted_at IS NULL
+          AND f.owner_user_id <> ?
+          AND f.rel_path LIKE ? ESCAPE '\\'
+          AND ((s.scope_type = 'user' AND s.scope_id = ?)
+            OR (s.scope_type = 'dept' AND s.scope_id IN (${deptIds.map(() => '?').join(',') || 'NULL'}))
+            OR s.scope_type = 'company')
+        LIMIT 1`,
+    )
+    .get(
+      actor.subject.companyId,
+      actor.subject.userId,
+      folderLikePrefix(folderPath),
+      actor.subject.userId,
+      ...deptIds,
+    )
+  return Boolean(row)
+}
+
+function assertFolderAncestorsFree(
+  deps: ServerDeps,
+  actor: RequestActor,
+  folderPath: string,
+): void {
+  const segments = folderPath.split('/')
+  for (let index = 1; index < segments.length; index += 1) {
+    const ancestor = segments.slice(0, index).join('/')
+    const row = deps.db
+      .prepare(
+        `SELECT id FROM workspace_files
+          WHERE company_id = ? AND scope_type = 'user' AND scope_id = ? AND owner_user_id = ?
+            AND deleted_at IS NULL AND rel_path = ?`,
+      )
+      .get(actor.subject.companyId, actor.subject.userId, actor.subject.userId, ancestor)
+    if (row) {
+      throw new EabError(EC.VALIDATION, `上级路径「${ancestor}」已被同名文件占用`, {
+        hint: '请先重命名或删除那个文件。',
+      })
+    }
+  }
+}
+
+function folderDiskPath(deps: ServerDeps, actor: RequestActor, folderPath: string): string {
+  const root = userScopeDir(deps, actor.subject.companyId, actor.subject.userId)
+  return safeJoin(root, folderPath)
+}
+
+function removeEmptyDirectories(dir: string): void {
+  if (!existsSync(dir)) return
+  let entries: string[]
+  try {
+    entries = readdirSync(dir)
+  } catch {
+    return
+  }
+  for (const entry of entries) {
+    const full = join(dir, entry)
+    try {
+      if (statSync(full).isDirectory()) removeEmptyDirectories(full)
+    } catch {
+      // 已被并发删除的条目不再处理
+    }
+  }
+  try {
+    if (readdirSync(dir).length === 0) rmSync(dir, { recursive: true, force: true })
+  } catch {
+    // 目录非空或正被占用时保留，不影响已经提交的删除
+  }
+}
+
+export interface CreatedWorkspaceFolder {
+  folderPath: string
+  row: FileRow
+}
+
+/** 新建个人云空间文件夹；用 `.gitkeep` 占位，让空文件夹在列表和 Agent 视角里都可见。 */
+export function createUserWorkspaceFolder(
+  deps: ServerDeps,
+  actor: RequestActor,
+  input: string,
+): CreatedWorkspaceFolder {
+  const folderPath = normalizeWorkspaceFolderPath(input)
+  assertFolderAncestorsFree(deps, actor, folderPath)
+  const existing = userFolderRows(deps, actor, folderPath)
+  if (existing.some((row) => row.rel_path === folderPath)) {
+    throw new EabError(EC.VALIDATION, '同名文件已占用该路径', { hint: '请换一个文件夹名称。' })
+  }
+  if (existing.length > 0) {
+    throw new EabError(EC.VALIDATION, '文件夹已存在', { hint: '直接点文件夹进入，或换一个名称。' })
+  }
+  const folderDir = folderDiskPath(deps, actor, folderPath)
+  if (existsSync(folderDir)) {
+    if (!statSync(folderDir).isDirectory() || readdirSync(folderDir).length > 0) {
+      throw new EabError(EC.VALIDATION, '磁盘上已有同名目录或文件', {
+        hint: '请换一个文件夹名称，或先清理该目录。',
+      })
+    }
+  }
+  mkdirSync(folderDir, { recursive: true })
+  const placeholderPath = join(folderDir, '.gitkeep')
+  const placeholderRel = `${folderPath}/.gitkeep`
+  writeFileSync(placeholderPath, '')
+  const now = Date.now()
+  const id = ulid()
+  deps.db
+    .prepare(
+      `INSERT INTO workspace_files
+         (id, company_id, scope_type, scope_id, owner_user_id, rel_path, name, size, mime, storage_path, created_at, updated_at)
+       VALUES (?, ?, 'user', ?, ?, ?, '.gitkeep', 0, 'text/plain', ?, ?, ?)`,
+    )
+    .run(
+      id,
+      actor.subject.companyId,
+      actor.subject.userId,
+      actor.subject.userId,
+      placeholderRel,
+      placeholderPath,
+      now,
+      now,
+    )
+  const row = deps.db.prepare('SELECT * FROM workspace_files WHERE id = ?').get(id) as unknown as FileRow
+  publishWorkspaceFilesChanged(actor.subject.companyId, actor.subject.userId, 'created', [id])
+  return { folderPath, row }
+}
+
+export interface RenamedWorkspaceFolder {
+  from: string
+  to: string
+  fileCount: number
+  fileIds: string[]
+}
+
+/** 重命名个人云空间文件夹：整棵目录搬移，并同步所有后代文件的 rel_path / storage_path。 */
+export function renameUserWorkspaceFolder(
+  deps: ServerDeps,
+  actor: RequestActor,
+  input: string,
+  nextNameInput: string,
+): RenamedWorkspaceFolder {
+  const from = normalizeWorkspaceFolderPath(input)
+  const leaf = normalizeFolderLeafName(nextNameInput)
+  const slash = from.lastIndexOf('/')
+  const parent = slash < 0 ? '' : from.slice(0, slash)
+  const to = normalizeWorkspaceFolderPath(parent ? `${parent}/${leaf}` : leaf)
+  if (from === to) {
+    const rows = userFolderRows(deps, actor, from).filter((row) => row.rel_path !== from)
+    return { from, to, fileCount: rows.filter((row) => row.name !== '.gitkeep').length, fileIds: rows.map((row) => row.id) }
+  }
+
+  const rows = userFolderRows(deps, actor, from)
+  if (rows.length === 0) throw new EabError(EC.NOT_FOUND, `文件夹不存在: ${from}`)
+  if (rows.some((row) => row.rel_path === from)) {
+    throw new EabError(EC.VALIDATION, `「${from}」是一个文件，不是文件夹`)
+  }
+  if (folderHasForeignSharedFiles(deps, actor, from)) {
+    throw new EabError(EC.VALIDATION, '文件夹里有其他成员共享的文件，暂不支持整体重命名', {
+      hint: '请先处理这些共享文件，或逐个重命名自己的文件。',
+    })
+  }
+
+  const root = userScopeDir(deps, actor.subject.companyId, actor.subject.userId)
+  const sourceDir = folderDiskPath(deps, actor, from)
+  const targetDir = folderDiskPath(deps, actor, to)
+  assertFolderAncestorsFree(deps, actor, to)
+
+  const targetConflict = deps.db
+    .prepare(
+      `SELECT id, rel_path FROM workspace_files
+        WHERE company_id = ? AND scope_type = 'user' AND scope_id = ? AND owner_user_id = ?
+          AND deleted_at IS NULL
+          AND (rel_path = ? OR rel_path LIKE ? ESCAPE '\\')
+          AND rel_path <> ?
+          AND NOT (rel_path LIKE ? ESCAPE '\\')
+        LIMIT 1`,
+    )
+    .get(
+      actor.subject.companyId,
+      actor.subject.userId,
+      actor.subject.userId,
+      to,
+      folderLikePrefix(to),
+      from,
+      folderLikePrefix(from),
+    ) as { id: string; rel_path: string } | undefined
+  if (targetConflict) {
+    throw new EabError(EC.VALIDATION, `目标路径已被「${targetConflict.rel_path}」占用`, {
+      hint: '请换一个文件夹名称。',
+    })
+  }
+  const caseOnly = sourceDir.toLowerCase() === targetDir.toLowerCase()
+  if (existsSync(targetDir) && !caseOnly) {
+    throw new EabError(EC.VALIDATION, '磁盘上已有同名目录或文件', { hint: '请换一个文件夹名称。' })
+  }
+
+  const moved: Array<{ from: string; to: string }> = []
+  let movedTree = false
+  try {
+    if (existsSync(sourceDir)) {
+      mkdirSync(dirname(targetDir), { recursive: true })
+      if (caseOnly) {
+        const tempDir = `${sourceDir}.rename-${ulid()}`
+        renameSync(sourceDir, tempDir)
+        renameSync(tempDir, targetDir)
+      } else {
+        renameSync(sourceDir, targetDir)
+      }
+      movedTree = true
+    } else {
+      for (const row of rows) {
+        const current = diskPathOf(deps, row)
+        if (!existsSync(current)) continue
+        const suffix = row.rel_path === from ? '' : row.rel_path.slice(from.length + 1)
+        const nextRel = suffix ? `${to}/${suffix}` : to
+        const next = safeJoin(root, nextRel)
+        mkdirSync(dirname(next), { recursive: true })
+        renameSync(current, next)
+        moved.push({ from: current, to: next })
+      }
+    }
+
+    const now = Date.now()
+    withTransaction(deps.db, () => {
+      for (const row of rows) {
+        const suffix = row.rel_path === from ? '' : row.rel_path.slice(from.length + 1)
+        const nextRel = suffix ? `${to}/${suffix}` : to
+        const nextDisk = safeJoin(root, nextRel)
+        deps.db
+          .prepare('UPDATE workspace_files SET rel_path = ?, storage_path = ?, updated_at = ? WHERE id = ?')
+          .run(nextRel, nextDisk, now, row.id)
+      }
+    })
+  } catch (error) {
+    try {
+      for (const item of moved.reverse()) {
+        if (existsSync(item.to)) {
+          mkdirSync(dirname(item.from), { recursive: true })
+          renameSync(item.to, item.from)
+        }
+      }
+      if (movedTree && existsSync(targetDir) && !existsSync(sourceDir)) {
+        renameSync(targetDir, sourceDir)
+      }
+    } catch {
+      // 回滚失败时保留原始错误，交给上层暴露部分完成状态
+    }
+    throw error
+  }
+
+  publishWorkspaceFilesChanged(actor.subject.companyId, actor.subject.userId, 'renamed', rows.map((row) => row.id))
+  return {
+    from,
+    to,
+    fileCount: rows.filter((row) => row.name !== '.gitkeep').length,
+    fileIds: rows.map((row) => row.id),
+  }
+}
+
+export interface DeletedWorkspaceFolder {
+  folderPath: string
+  fileCount: number
+  fileIds: string[]
+}
+
+/** 删除个人云空间文件夹：所有后代文件逐个软删到回收区，最后清理空目录。 */
+export function deleteUserWorkspaceFolder(
+  deps: ServerDeps,
+  actor: RequestActor,
+  input: string,
+): DeletedWorkspaceFolder {
+  const folderPath = normalizeWorkspaceFolderPath(input)
+  const rows = userFolderRows(deps, actor, folderPath)
+  if (rows.length === 0) throw new EabError(EC.NOT_FOUND, `文件夹不存在: ${folderPath}`)
+  if (rows.some((row) => row.rel_path === folderPath)) {
+    throw new EabError(EC.VALIDATION, `「${folderPath}」是一个文件，不是文件夹`)
+  }
+  if (folderHasForeignSharedFiles(deps, actor, folderPath)) {
+    throw new EabError(EC.VALIDATION, '文件夹里有其他成员共享的文件，暂不支持整体删除', {
+      hint: '请先处理这些共享文件，或逐个删除自己的文件。',
+    })
+  }
+
+  const scopeDirPath = userScopeDir(deps, actor.subject.companyId, actor.subject.userId)
+  const folderDir = folderDiskPath(deps, actor, folderPath)
+  const recycleDir = join(scopeDirPath, '_recycle')
+  mkdirSync(recycleDir, { recursive: true })
+  const moves: Array<{ from: string; to: string }> = []
+  try {
+    for (const row of rows) {
+      const current = diskPathOf(deps, row)
+      if (!existsSync(current)) continue
+      const recycled = join(recycleDir, `${row.id}-${row.name}`)
+      if (existsSync(recycled)) rmSync(recycled, { force: true })
+      renameSync(current, recycled)
+      moves.push({ from: current, to: recycled })
+    }
+
+    const now = Date.now()
+    const totalSize = rows.reduce((sum, row) => sum + Math.max(0, Number(row.size) || 0), 0)
+    withTransaction(deps.db, () => {
+      for (const row of rows) {
+        const recycled = join(recycleDir, `${row.id}-${row.name}`)
+        deps.db
+          .prepare('UPDATE workspace_files SET deleted_at = ?, recycled_path = ? WHERE id = ?')
+          .run(now, recycled, row.id)
+      }
+      if (totalSize > 0) {
+        addUsage(deps, actor.subject.companyId, 'user', actor.subject.userId, -totalSize)
+        addUsage(deps, actor.subject.companyId, 'company', actor.subject.companyId, -totalSize)
+      }
+    })
+  } catch (error) {
+    try {
+      for (const item of moves.reverse()) {
+        if (existsSync(item.to)) {
+          mkdirSync(dirname(item.from), { recursive: true })
+          renameSync(item.to, item.from)
+        }
+      }
+    } catch {
+      // 回滚失败时保留原始错误
+    }
+    throw error
+  }
+
+  publishWorkspaceFilesChanged(actor.subject.companyId, actor.subject.userId, 'deleted', rows.map((row) => row.id))
+  removeEmptyDirectories(folderDir)
+  return {
+    folderPath,
+    fileCount: rows.filter((row) => row.name !== '.gitkeep').length,
+    fileIds: rows.map((row) => row.id),
+  }
 }
 
 function ensureQuota(
@@ -1331,7 +1769,9 @@ export function applyWorkspaceTextEdits(
     const find = String(edit?.find ?? '')
     const replace = String(edit?.replace ?? '')
     if (!find) throw new EabError(EC.VALIDATION, 'find 不能为空', { hint: 'find 必须是要替换的原文片段' })
-    if (find === replace) throw new EabError(EC.VALIDATION, 'replace 与 find 相同，没有实际修改')
+    if (find === replace) throw new EabError(EC.VALIDATION, 'replace 与 find 相同，没有实际修改', {
+      hint: '不要重复同一替换。需要整体重写请用 workspace.write {path,text}；局部修改则把 replace 改成新的完整片段。',
+    })
     const occurrence = Number(edit?.occurrence ?? 0)
     if (!Number.isInteger(occurrence) || occurrence < 0) {
       throw new EabError(EC.VALIDATION, 'occurrence 必须是正整数，或省略表示全部替换')
@@ -2704,6 +3144,64 @@ export function registerWorkspaceRoutes(app: FastifyInstance, deps: ServerDeps):
       fileName: content.name,
       toUserId: sent.externalUserId,
       mediaType: sent.mediaType,
+    })
+  })
+
+  app.post<{ Body: { path?: string; name?: string } }>('/api/workspace/folders', async (req) => {
+    const actor = resolveActor(deps.db, deps.config, req)
+    requireEnabled(actor)
+    requireScope(actor.subject, SC.WORKSPACE_WRITE)
+    const folderPath = String(req.body?.path ?? req.body?.name ?? '').trim()
+    if (!folderPath) throw new EabError(EC.VALIDATION, '文件夹路径不能为空')
+    const created = createUserWorkspaceFolder(deps, actor, folderPath)
+    audit(deps, req, 'workspace.folder.create', null, { folderPath: created.folderPath })
+    return ok({ folderPath: created.folderPath, fileId: created.row.id })
+  })
+
+  app.patch<{ Body: { path?: string; newName?: string; name?: string } }>(
+    '/api/workspace/folders',
+    async (req) => {
+      const actor = resolveActor(deps.db, deps.config, req)
+      requireEnabled(actor)
+      requireScope(actor.subject, SC.WORKSPACE_WRITE)
+      const folderPath = String(req.body?.path ?? '').trim()
+      if (!folderPath) throw new EabError(EC.VALIDATION, '文件夹路径不能为空')
+      const renamed = renameUserWorkspaceFolder(
+        deps,
+        actor,
+        folderPath,
+        String(req.body?.newName ?? req.body?.name ?? ''),
+      )
+      audit(deps, req, 'workspace.folder.rename', null, {
+        from: renamed.from,
+        to: renamed.to,
+        fileCount: renamed.fileCount,
+      })
+      return ok({
+        folderPath: renamed.to,
+        from: renamed.from,
+        to: renamed.to,
+        fileCount: renamed.fileCount,
+      })
+    },
+  )
+
+  app.delete<{ Body: { path?: string } }>('/api/workspace/folders', async (req) => {
+    const actor = resolveActor(deps.db, deps.config, req)
+    requireEnabled(actor)
+    requireScope(actor.subject, SC.WORKSPACE_WRITE)
+    const folderPath = String(req.body?.path ?? '').trim()
+    if (!folderPath) throw new EabError(EC.VALIDATION, '文件夹路径不能为空')
+    const deleted = deleteUserWorkspaceFolder(deps, actor, folderPath)
+    audit(deps, req, 'workspace.folder.delete', null, {
+      folderPath: deleted.folderPath,
+      fileCount: deleted.fileCount,
+      fileIds: deleted.fileIds,
+    })
+    return ok({
+      deleted: true,
+      folderPath: deleted.folderPath,
+      fileCount: deleted.fileCount,
     })
   })
 

@@ -12,11 +12,16 @@ import { createRequire } from 'node:module'
 import { dirname, extname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify'
+import multipart from '@fastify/multipart'
 import { EC, EabError, toEabError } from '@eab/domain'
 import type { ServerDeps } from './deps.js'
 import { createChatCapacity } from './chat-capacity.js'
 import { readVersion } from './http.js'
-import { hasConsoleSession, configureConsoleAuth } from './console-auth.js'
+import { hasConsoleSession, configureConsoleAuth, memberSessionFromRequest } from './console-auth.js'
+import { readConsoleMemberSession } from './console-member-session.js'
+import { hasAnyConsolePagePermission } from './console-permissions.js'
+import { enforceConsoleMemberAccess } from './console-guard.js'
+import { registerConsoleAccessRoutes } from './routes/console-access.js'
 import { initChatEventBridge } from './chat-events.js'
 import { initRealtimeControl } from './realtime-control.js'
 import { getBackendRuntime } from './backends/runtime.js'
@@ -225,9 +230,13 @@ function toChat(req: FastifyRequest, reply: FastifyReply): FastifyReply {
   return reply.redirect(target, 302)
 }
 
-/** 控制台页面门：浏览器登录过超级管理员会话才放行；服务令牌只用于脚本接口。 */
-function consoleAuthorized(req: FastifyRequest): boolean {
-  return hasConsoleSession(req)
+/** 控制台页面门：平台超管会话，或已开通后台页面权限的公司成员。 */
+function consoleAuthorized(req: FastifyRequest, db: ServerDeps['db']): boolean {
+  if (hasConsoleSession(req)) return true
+  if (!memberSessionFromRequest(req)) return false
+  const session = readConsoleMemberSession(db, req)
+  if (!session) return false
+  return hasAnyConsolePagePermission(db, session.companyId, session.userId)
 }
 
 /**
@@ -253,7 +262,7 @@ function pluginPageGate(
       .send('<!doctype html><meta charset="utf-8"><title>插件页不可用</title><p>插件页不属于当前公司。</p>')
   }
   if (scope !== 'user') {
-    return consoleAuthorized(req) ? servePublic('plugin-kernel.html', reply) : servePublic('admin-gate.html', reply)
+    return consoleAuthorized(req, db) ? servePublic('plugin-kernel.html', reply) : servePublic('admin-gate.html', reply)
   }
   const sessionUserId = readSessionUserId(db, req)
   if (!sessionUserId) {
@@ -299,9 +308,19 @@ export function buildApp(deps: ServerDeps, surface: AppSurface = 'all'): Fastify
     // OnlyOffice 内容/回调令牌约 300+ 字符，Fastify 默认 100 会在进入路由前返回 414。
     routerOptions: { maxParamLength: MAX_ROUTE_PARAM_LENGTH },
   })
+  // 知识库文件上传走流式 multipart；单文件 50MB、单次 20 个，总量在路由里再按 200MB 兜底。
+  app.register(multipart, {
+    limits: {
+      fileSize: 50 * 1024 * 1024,
+      files: 20,
+      fields: 20,
+    },
+  })
 
   installSurfaceGuard(app, surface)
   installBodyBudgetGuard(app, deps)
+  // 成员后台会话的页面权限守卫：必须在所有 console 路由注册前挂上。
+  app.addHook('onRequest', async (req) => enforceConsoleMemberAccess(req, deps))
 
   const runtimeDeps: ServerDeps = deps.chatCapacity
     ? deps
@@ -345,6 +364,8 @@ export function buildApp(deps: ServerDeps, surface: AppSurface = 'all'): Fastify
     app.get('/brand.js', async (_req, reply) => servePublic('brand.js', reply))
     // 设计令牌与共享组件都在 app.css；对话页只读这份静态样式，不因此获得任何管理接口。
     app.get('/app.css', async (_req, reply) => servePublic('app.css', reply))
+    // 知识库上传/流水线专用样式，只在控制台文档区使用。
+    app.get('/kb-pipeline.css', async (_req, reply) => servePublic('kb-pipeline.css', reply))
     /** PDF 降级预览的 PDF.js 资源；只放行预览需要的文件。 */
     app.get<{ Params: { '*': string } }>('/vendor/pdfjs/*', async (req, reply) =>
       servePdfjsAsset(req.params['*'], reply),
@@ -396,12 +417,13 @@ export function buildApp(deps: ServerDeps, surface: AppSurface = 'all'): Fastify
    */
   if (surface === 'all' || surface === 'console') {
     const adminPage = async (req: FastifyRequest, reply: FastifyReply) =>
-      consoleAuthorized(req) ? servePublic('index.html', reply) : servePublic('admin-gate.html', reply)
+      consoleAuthorized(req, deps.db) ? servePublic('index.html', reply) : servePublic('admin-gate.html', reply)
     if (surface === 'console') app.get('/', async (_req, reply) => reply.redirect('/admin', 302))
     app.get('/admin', adminPage)
     app.get('/admin.html', adminPage)
     app.get('/app.js', async (_req, reply) => servePublic('app.js', reply))
     app.get('/app.css', async (_req, reply) => servePublic('app.css', reply))
+    app.get('/kb-pipeline.css', async (_req, reply) => servePublic('kb-pipeline.css', reply))
     app.get('/theme.css', async (_req, reply) => servePublic('theme.css', reply))
     app.get('/theme.js', async (_req, reply) => servePublic('theme.js', reply))
     app.get('/brand.js', async (_req, reply) => servePublic('brand.js', reply))
@@ -431,6 +453,7 @@ export function buildApp(deps: ServerDeps, surface: AppSurface = 'all'): Fastify
   registerMemoryRoutes(app, deps)
   registerPluginRoutes(app, deps)
   registerSkillRoutes(app, deps)
+  registerConsoleAccessRoutes(app, deps)
   registerConsoleRoutes(app, deps)
   registerConsoleDatabaseRoutes(app, deps)
   registerConsoleOnlyOfficeRoutes(app, deps)

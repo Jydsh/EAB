@@ -28,12 +28,15 @@ import {
   type ChannelTurn,
 } from './channel-turns.js'
 import { acquireLeaderHold, claimOnce, hitRate, readLeaderOwner, type LeaderHold, type LeaderOwner } from './backends/coordination.js'
+import { memoryQueryForTurn, recentMessageIds, searchChatMemory, shouldRecallPastConversations } from './chat-memory.js'
+import { refreshSessionSummary, sessionSummaryForPrompt } from './chat-summary.js'
 import { publishChatEvent, type ChatLiveToolEventPayload } from './chat-events.js'
 import { findActivePerson, findPerson, actorFor, type RequestActor } from './session.js'
 import type { ServerDeps } from './deps.js'
 import { resolveSecret } from './secrets.js'
 import { resolveModelForPurpose } from './model-registry.js'
-import type { ChatMessage as LlmMessage, LlmContent } from './llm.js'
+import { callTranscription, type ChatMessage as LlmMessage, type LlmContent } from './llm.js'
+import { shouldAutoRetrieveKb } from './intent.js'
 import {
   acquireTurn,
   formatClarifyText,
@@ -102,8 +105,17 @@ interface DingTalkRichTextItem {
 interface DingTalkMessage {
   msgtype?: string
   text?: { content?: string }
-  /** picture / richText 消息里携带的临时下载码，用它换钉钉临时下载链接 */
-  content?: { downloadCode?: string; richText?: DingTalkRichTextItem[]; fileName?: string }
+  /**
+   * picture / richText 消息里携带的临时下载码，用它换钉钉临时下载链接。
+   * audio 消息另有 recognition（钉钉侧语音识别结果）和 duration（毫秒）。
+   */
+  content?: {
+    downloadCode?: string
+    richText?: DingTalkRichTextItem[]
+    fileName?: string
+    recognition?: string
+    duration?: number
+  }
   senderStaffId?: string
   senderId?: string
   senderNick?: string
@@ -154,6 +166,8 @@ function splitText(content: string, max = 4000): string[] {
 
 const MAX_INBOUND_IMAGE_BYTES = 10 * 1024 * 1024
 const MAX_INBOUND_FILE_BYTES = 50 * 1024 * 1024
+/** 钉钉语音通常只有几秒到几十秒，12MB 足够且与网页端转写上限一致。 */
+const MAX_INBOUND_AUDIO_BYTES = 12 * 1024 * 1024
 
 function imageMimeType(buffer: Buffer, contentType: string): string | null {
   const declared = contentType.split(';')[0]?.trim().toLowerCase() ?? ''
@@ -264,6 +278,67 @@ async function downloadDingTalkFile(
   return { buffer, mime, fileName }
 }
 
+/** 钉钉语音支持 ogg / amr；下载响应有时只给 application/octet-stream，需要按文件头兜底。 */
+function audioMimeType(buffer: Buffer, contentType: string): string {
+  const declared = contentType.split(';')[0]?.trim().toLowerCase() ?? ''
+  if (declared === 'audio/x-wav' || declared === 'audio/wav') return 'audio/wav'
+  if (declared.startsWith('audio/')) return declared
+  if (buffer.length >= 6 && buffer.subarray(0, 5).toString('ascii') === '#!AMR') return 'audio/amr'
+  if (buffer.length >= 4 && buffer.subarray(0, 4).toString('ascii') === 'OggS') return 'audio/ogg'
+  if (
+    buffer.length >= 12 &&
+    buffer.subarray(0, 4).toString('ascii') === 'RIFF' &&
+    buffer.subarray(8, 12).toString('ascii') === 'WAVE'
+  ) {
+    return 'audio/wav'
+  }
+  if (buffer.length >= 3 && buffer.subarray(0, 3).toString('ascii') === 'ID3') return 'audio/mpeg'
+  if (buffer.length >= 2 && buffer[0] === 0xff && (buffer[1] & 0xe0) === 0xe0) return 'audio/mpeg'
+  // 钉钉移动端语音默认是 AMR；无法判定时按 AMR 交给转写模型，仍保留原始字节。
+  return 'audio/amr'
+}
+
+function audioExtension(mime: string): string {
+  if (mime === 'audio/ogg') return 'ogg'
+  if (mime === 'audio/wav') return 'wav'
+  if (mime === 'audio/mpeg') return 'mp3'
+  if (mime === 'audio/mp4') return 'm4a'
+  return 'amr'
+}
+
+async function downloadDingTalkAudio(
+  deps: ServerDeps,
+  cfg: DingTalkChannelRow,
+  downloadCode: string,
+): Promise<{ buffer: Buffer; mime: string; fileName: string }> {
+  const { buffer, contentType } = await downloadDingTalkAttachment(deps, cfg, downloadCode, {
+    maxBytes: MAX_INBOUND_AUDIO_BYTES,
+    label: '语音',
+  })
+  const mime = audioMimeType(buffer, contentType)
+  return { buffer, mime, fileName: `钉钉语音.${audioExtension(mime)}` }
+}
+
+export interface DingTalkInboundAudio {
+  readonly downloadCode: string
+  readonly recognition: string
+  readonly durationMs: number
+}
+
+/** 解析钉钉语音消息；只有 msgtype=audio 才返回，richText 不使用这一结构。 */
+export function inboundAudio(payload: DingTalkMessage): DingTalkInboundAudio | null {
+  if (payload.msgtype !== 'audio') return null
+  const downloadCode = String(payload.content?.downloadCode ?? '').trim()
+  const recognition = String(payload.content?.recognition ?? '').trim()
+  const duration = Number(payload.content?.duration ?? 0)
+  return {
+    downloadCode,
+    recognition,
+    durationMs: Number.isFinite(duration) && duration > 0 ? duration : 0,
+  }
+}
+
+
 function inboundImageCodes(payload: DingTalkMessage): string[] {
   const codes: string[] = []
   const push = (value: unknown) => {
@@ -303,9 +378,14 @@ export function inboundFileAttachments(payload: DingTalkMessage): Array<{ downlo
   return files
 }
 
-function inboundText(payload: DingTalkMessage): string {
+export function inboundText(payload: DingTalkMessage): string {
   const direct = String(payload.text?.content ?? '').trim()
   if (direct) return direct
+  if (payload.msgtype === 'audio') {
+    const recognized = String(payload.content?.recognition ?? '').trim()
+    if (recognized) return recognized
+    return ''
+  }
   if (payload.msgtype !== 'richText') return ''
   return (payload.content?.richText ?? [])
     .map((item) => String(item.text ?? '').trim())
@@ -682,14 +762,15 @@ export async function handleDingTalkMessage(
   } = {},
 ): Promise<DingTalkResult> {
   const externalId = String(payload.senderStaffId ?? payload.senderId ?? '').trim()
-  const rawText = inboundText(payload)
+  let rawText = inboundText(payload)
+  const audio = inboundAudio(payload)
   const imageCodes = inboundImageCodes(payload)
   const fileAttachments = inboundFileAttachments(payload)
   if (!externalId) return { handled: false, text: null, sessionId: null, reason: 'missing-sender' }
-  if (!rawText && imageCodes.length === 0 && fileAttachments.length === 0) {
+  if (!rawText && imageCodes.length === 0 && fileAttachments.length === 0 && !audio) {
     return {
       handled: false,
-      text: 'EAB 目前支持文字、图片和文件：可以直接问我制度、部门、组长或工作资料，也可以发图片让我读取内容，或发文件到个人云空间。发送 /model 可以查看并切换你有权限使用的模型，发送 /auto 恢复自动选择。',
+      text: 'EAB 目前支持文字、图片、文件和语音：可以直接问我制度、部门、组长或工作资料，也可以发图片让我读取内容，发文件到个人云空间，或直接发语音。发送 /model 可以查看并切换你有权限使用的模型，发送 /auto 恢复自动选择。',
       sessionId: null,
       reason: 'empty-text',
     }
@@ -700,7 +781,7 @@ export async function handleDingTalkMessage(
 
   const eventKey =
     String(payload.msgId ?? '').trim() ||
-    `${externalId}:${payload.createAt ?? ''}:${rawText.slice(0, 40) || imageCodes[0]?.slice(0, 40) || fileAttachments[0]?.fileName.slice(0, 40) || payload.msgtype || ''}`
+    `${externalId}:${payload.createAt ?? ''}:${rawText.slice(0, 40) || imageCodes[0]?.slice(0, 40) || fileAttachments[0]?.fileName.slice(0, 40) || audio?.downloadCode.slice(0, 40) || payload.msgtype || ''}`
   if (options.dedupe !== false && !options.resume) {
     // 先用 Redis 做一次跨实例的原子预去重，避免同一条事件被多个实例同时处理；
     // 缓存层没接或抖动时放行，下面 channel_events 的唯一约束仍是最终闸门。
@@ -786,7 +867,7 @@ export async function handleDingTalkMessage(
    * 先用 null 当前模型做一次纯解析，只有命中命令才建/取会话，普通消息不提前落会话。
    */
   const commandPreview =
-    imageCodes.length === 0 && fileAttachments.length === 0
+    audio === null && imageCodes.length === 0 && fileAttachments.length === 0
       ? planChannelModelCommand(rawText, available, null)
       : null
   if (commandPreview) {
@@ -841,6 +922,61 @@ export async function handleDingTalkMessage(
       text: `${message}。管理员可在 EAB 控制台「运营与审计 → 额度」里调整上限。`,
       sessionId: null,
       reason: 'quota-exceeded',
+    }
+  }
+
+  /**
+   * 钉钉语音消息两条路径：
+   * 1. 钉钉已在 content.recognition 返回识别文本时直接使用（上面的 inboundText 已取到）；
+   * 2. recognition 为空时，下载语音二进制交给 asr.default 转写。
+   * 不能把 audio 当成空消息回退成能力介绍，否则用户会以为机器人听不见。
+   */
+  if (audio && !rawText) {
+    if (!audio.downloadCode) {
+      return {
+        handled: false,
+        text: '语音已收到，但钉钉没有返回语音文件，无法转写。请重发一次，或改用文字。',
+        sessionId: null,
+        reason: 'audio-missing',
+      }
+    }
+    const asrModel = resolveModelForPurpose(deps.db, deps.companyId, 'asr.default')
+    if (!asrModel) {
+      return {
+        handled: false,
+        text: '语音已收到，但 EAB 还没有配置语音转写模型。请管理员在控制台「模型接入 → 用途路由」把 asr.default 绑定到语音转写模型后重试。',
+        sessionId: null,
+        reason: 'audio-no-asr',
+      }
+    }
+    try {
+      const voice = await downloadDingTalkAudio(deps, cfg, audio.downloadCode)
+      const transcribed = await callTranscription(deps.db, deps.config.dbPath, deps.companyId, asrModel.id, {
+        buffer: voice.buffer,
+        mime: voice.mime,
+        fileName: voice.fileName,
+      })
+      rawText = String(transcribed.text ?? '').trim()
+    } catch (error) {
+      console.warn(
+        '[eab] 钉钉语音转写失败：',
+        `model=${asrModel.id}`,
+        (error as Error)?.message ?? error,
+      )
+      return {
+        handled: false,
+        text: '语音没有转写成功，请稍后重发一次，或先用文字告诉我。',
+        sessionId: null,
+        reason: 'audio-transcribe-failed',
+      }
+    }
+    if (!rawText) {
+      return {
+        handled: false,
+        text: '语音已收到，但没有识别出文字。请靠近麦克风再说一次，或改用文字。',
+        sessionId: null,
+        reason: 'audio-empty-result',
+      }
     }
   }
 
@@ -1126,7 +1262,9 @@ export async function handleDingTalkMessage(
     )
     void reaction.start()
 
-    const hits = await retrieveKb(deps.db, deps.config.dbPath, actor, rawText)
+    const kbAuto = shouldAutoRetrieveKb(rawText)
+    const hits = kbAuto ? await retrieveKb(deps.db, deps.config.dbPath, actor, rawText) : []
+    const kbMode = hits.length > 0 ? 'retrieved' : kbAuto ? 'miss' : 'skipped'
     const memories = deps.db
       .prepare(
         `SELECT content FROM memories
@@ -1145,10 +1283,28 @@ export async function handleDingTalkMessage(
     const channelChatTools = [...chatTools, SWITCH_CHAT_MODEL_TOOL_SPEC]
     const pluginPrompts = pluginPromptTexts(deps.db, actor)
     const skillPrompts = skillPromptTexts(deps.db, actor)
+    const channelHistory = historyOf(deps.db, sessionId, 16, 'dingtalk', options.resume?.userMessageId)
+    const memoryCrossSession = shouldRecallPastConversations(promptText)
+    const memoryHits = searchChatMemory({
+      db: deps.db,
+      companyId: actor.subject.companyId,
+      userId: actor.person.id,
+      sessionId,
+      crossSession: memoryCrossSession,
+      query: memoryQueryForTurn(promptText, channelHistory),
+      excludeMessageIds: recentMessageIds(deps.db, sessionId),
+      limit: 5,
+      maxChars: 1800,
+    })
     const system = buildSystemPrompt({
       actor,
       chatTools: channelChatTools,
       memories,
+      memoryHits,
+      memoryCrossSession,
+      sessionSummary: sessionSummaryForPrompt(deps.db, sessionId),
+      userQuestion: promptText,
+      kbMode,
       hits,
       hasAttachments: imageUrls.length > 0,
       pluginPrompts,
@@ -1182,7 +1338,7 @@ export async function handleDingTalkMessage(
     const messages: LlmMessage[] = [
       { role: 'system', content: systemContent },
       // 恢复时当前用户消息可能已经落库；先排除它再单独拼一次，避免模型看到两遍相同提问。
-      ...historyOf(deps.db, sessionId, 16, 'dingtalk', options.resume?.userMessageId),
+      ...channelHistory,
       { role: 'user', content: userContent },
     ]
 
@@ -1653,6 +1809,16 @@ export async function handleDingTalkMessage(
       detail: { channel: 'dingtalk', modelId: effectiveModel.id, tools: toolCallCount, rounds },
       channel: 'dingtalk',
       ip: null,
+    })
+    void refreshSessionSummary({
+      db: deps.db,
+      dbPath: deps.config.dbPath,
+      companyId: actor.subject.companyId,
+      userId: actor.person.id,
+      sessionId,
+      modelId: effectiveModel.id,
+    }).catch((error) => {
+      console.warn('[eab] 钉钉会话摘要更新失败：', (error as Error).message)
     })
 
     deps.db

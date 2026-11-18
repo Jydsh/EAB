@@ -1409,6 +1409,24 @@ query
 - 未做 PDF/Word 解析 worker，当前入库仍是文本切片；解析器接入后再补"解析 → 切分 → 向量化"的异步队列。
 - 未做按 collection 选择向量模型的界面，列已留、API 未暴露。
 
+### 10.11 2026-11 知识库全流程升级（P0/P1 已落地，P2 召回测试已落地）
+
+本轮把知识库从“纯文本入库”升级为“文件上传 → 解析/OCR → 规则/模型清洗 → 结构切片 → 本地向量 → 可选外部向量 → 召回测试”的可追踪流水线。详细设计见 `docs/EAB知识库全流程升级方案.md`，落地口径如下：
+
+| 维度 | 口径 |
+|---|---|
+| 文件 | `pdf / docx / xlsx / pptx / txt / md / csv / json / html / png / jpg / webp`；老 `.doc/.xls/.ppt` 首版提示另存；扫描 PDF 走 OCR，缺组件/模型进 `needs_config` |
+| 清洗 | 默认规则清洗；可选 `kb.clean` 模型清洗；`auto` 无模型自动退回规则；机密文档默认禁止外部云模型清洗 |
+| 切片 | 统一 `kb-splitter`，默认约 500 tokens / 重叠 80；表格按行组并重复表头；保留 heading/page/sheet/row 元数据 |
+| 测试 | Dify 式 query / mode / topK / 阈值 / rerank；返回 keyword/vector/RRF/rerank 分数与耗时；已支持单次测试、用例 CRUD/运行、Top1/Recall@K/MRR 与 embedding 模型对比；批量运行、检索模式并排、rerank A/B 待实施 |
+| 测试记录 | 默认保留 30 天，可配 1–365 天；设置位于「系统 → 系统与运维 → 日志、审计与数据保留」，保存后同步所有知识库；每 6 小时清理过期记录；记录保留命中摘要，正文截断 800 字符 |
+| 向量库 | 本地 SQLite 始终可用；`Qdrant` 新增为数据连接类型；`pgvector` 复用 PostgreSQL 连接并检测扩展；外部不可用时按“外部 → 本地 → 关键词”降级 |
+| 配置源 | 以管理后台「连接与平台 → 数据连接」为准，不读环境变量覆盖；连接变更热生效，不重启 |
+| 任务 | 新增 `kb_ingest_jobs` 管解析/清洗/切片/索引全流程；`kb_index_jobs` 保留为向量子任务；进程内 worker 可重启恢复，不依赖 Redis |
+| 迁移 | `0068_kb_pipeline.sql`（已应用）扩展 KB 表与测试表；`0069`–`0071` 已被其他功能占用，`0072_kb_test_retention.sql`（已应用）增加测试保留期，`0073_database_connections_vector.sql`（待实施）扩展连接类型与 pgvector 能力 |
+
+**边界**：本轮方案不改现有 ACL、RRF、rerank 行为；测试台与对话检索共用同一 `kb-retrieval` 核心，不允许两套检索逻辑。外部向量库只做加速/扩容，本地仍是权威索引；索引失败不阻塞上传，检索失败不阻塞对话。
+
 ---
 
 
@@ -1721,24 +1739,27 @@ DSH（`github.com/deepseek-ai/deepseek-harness`，MIT）是官方开源的 Agent
 
 #### 12.6.2 功能分类（顶部一级导航 + 每页自带子导航）
 
-布局固定为四层：**顶栏 `topbar`（品牌 + 当前公司选择器 + 健康点 + 退出）→ 一级导航 `primary-nav`（业务域）→ 二级导航 `nav-flyout`（悬停一级项时展开该域的页面列表）→ `workspace`（本页子导航 `subnav` + 内容区 `page`）**。
+布局固定为四层：**顶栏 `topbar`（品牌 + 当前公司选择器 + 健康点 + 退出）→ 一级导航 `primary-nav`（业务域）→ 二级导航 `nav-subbar`（悬停/键盘聚焦一级项时，一级导航自身向下增高一行，横排该域页面）→ `workspace`（页面内容区 `page`；插件 / 技能页保留左侧列表）**。
 
 公司选择器固定在顶栏：始终显示“当前公司 · 名称 · ID”，点开可切换；切换后当前页按新公司重新加载，URL 同步 `?company=`，角色、模型、知识库、渠道、用量、审计等页面都以这家公司为范围。组织架构页左侧仍并列展示所有公司，当前公司根节点带「当前」标记。
 
-| 一级导航（顶栏常驻） | 二级导航（悬停展开） | 本页子导航（左栏） | 谁能看 |
+| 一级导航（顶栏常驻） | 二级导航（一级导航向下展开一行，横排） | 页面内容 / 左栏 | 谁能看 |
 |---|---|---|---|
 | 概览 | — | 当前身份（姓名/部门/数据范围/渠道）+ 快捷进入 | 全部登录身份 |
-| 组织与权限 | 组织架构 / 角色权限 / 权限矩阵 | 组织架构=部门树；角色权限=角色列表；权限矩阵=图例 | `org:dept:read` / `perm:read` 类 |
-| 知识与模型 | 知识库 / 模型接入 / 工具 | 知识库=库列表；模型接入=供应商与模型；工具=工具表 | `kb:read` / `model:manage` / `tool:read` |
-| 连接与平台 | 渠道 / 插件 / 系统 | 渠道=绑定与同步；插件=插件清单；系统=小节锚点 | `channel:manage` / `plugin:list` / 登录身份 |
-| 运营与审计 | 用量 / 审计 / 审批 | 用量=按天/按人；审计=哈希链校验；审批=待办与决定 | `usage:read` / `audit:read` / `approval:read` |
+| 组织与权限 | 成员管理 / 部门管理 / 角色管理 / 权限审批 | 成员管理=成员表与角色授权；部门管理=部门树与负责人；角色管理=角色与成员配置；权限审批=审批链 | `org:dept:read` / `perm:read` 类 |
+| 知识与模型 | 知识库 / 模型接入 / 工具 | 知识库=库列表与文档；模型接入=供应商与模型；工具=工具表 | `kb:read` / `model:manage` / `tool:read` |
+| 连接与平台 | 渠道 / 数据连接 / 在线文档 / 公司设置 / 系统 | 渠道=绑定与同步；数据连接=数据库与缓存/向量库；在线文档=OnlyOffice；公司设置=身份与品牌；系统=运行状态与数据运维 | `channel:manage` / `db:manage` / 登录身份 |
+| 插件管理 | —（单页） | 左侧插件清单 + 右侧插件详情 / 安装与启停 | `plugin:list` / `plugin:manage` |
+| 技能管理 | —（单页） | 左侧技能清单 + 右侧技能详情 | `skill:read` / `skill:manage` |
+| 运营与审计 | 用量 / 额度 / 审计 / 任务中心 / 审批 | 用量=按天/按人；额度=配额；审计=哈希链校验；任务中心=后台任务；审批=待办与决定 | `usage:read` / `audit:read` / `approval:read` |
 
 硬约束：
 
-1. **一级导航只按业务域**，最多 5 个；同一业务域的页面放进二级悬停菜单，不把表名当一级项。
-2. **二级导航只在悬停/键盘聚焦一级项时出现**，不常驻占一行；面板覆盖内容区，不挤压页面。
-3. **子导航只属于当前页**，不做全站常驻的部门树 —— 知识库页左边挂组织树会让人以为库是按部门筛的。组织树只出现在「组织架构」页；知识库的左栏是**库列表**。
-4. **选中态唯一**：一级是 `.nav-group.is-active`（或直接项的 `.nav-primary.is-active`），二级是唯一的 `.nav-sub.is-active`，子导航是唯一的 `.side-item.is-active`，不能出现“两个都亮”。
+1. **一级导航只按业务域**，同一业务域的页面放进二级行，不把表名当一级项；插件 / 技能是独立一级项，各只有一个页面，因此没有二级行。
+2. **二级导航不是浮动卡片、也不是卡片块**：鼠标移入或键盘聚焦一级项后，`#topnav` 自身高度从 58px 动画增高，第二行 `.nav-subbar` 横排该域页面；二级项只用与一级导航一致的文字标签（同字号、同字重、透明底、当前页品牌色 + 2px 底边），不再显示说明文字。点击一级项可固定当前二级行，再次点击同一项取消固定；固定后鼠标移入其他一级项仍临时显示该域二级页面，移开后回落到固定项。点击二级项、点击导航外、Esc、滚动或缩放窗口按固定状态处理：未固定时收起，固定时保持。二级行展开会把内容区整体下移，不覆盖页面。
+3. **子导航只属于当前页**，不做全站常驻的部门树 —— 知识库页左边挂组织树会让人以为库是按部门筛的。部门树只出现在「部门管理」页；知识库的左栏是**库列表**。普通业务域为单列内容区；「插件管理」「技能管理」保留左侧清单，因为它属于页面内容。
+4. **选中态唯一**：一级是 `.nav-primary.is-active`（展开时再加 `.is-menu-open`），二级是唯一的 `.nav-sub-link.is-active`，页面左栏是唯一的 `.side-item.is-active`，不能出现“两个都亮”。
+
 5. **公司上下文始终可见**：顶栏选择器不能隐藏；页面内不再重复放公司下拉。切公司只改范围，不改变控制台操作员身份。
 6. **数字必须自洽**：子导航里的「N 人」和点进去内容区的行数同一口径 —— 服务端 `subtreeMemberCount` 按成员 `dept_path` 前缀统计（**含下级**），不能用各部门直属人数相加，否则上游回收过部门后会少数。
 
@@ -1755,7 +1776,7 @@ DSH（`github.com/deepseek-ai/deepseek-harness`，MIT）是官方开源的 Agent
 | 状态 | `--ok` / `--warn` / `--danger` / `--info` | `#0f7b4f` / `#a56a00` / `#b42318` / `#1d5fa8` | 徽标、差异、错误 |
 | 尺度 | `--r-sm/md/lg` = `6/10/14px`；间距 4 的倍数；字号 12/13/15/20/28 | | 全站统一，禁止页面里写魔法值 |
 
-**原语（只允许用这些组合页面）**：`.btn`（primary / ghost / danger / sm）、`.stat`（数字 + 标签）、`.pill`（状态徽标）、`.table`（粘性表头）、`.kv`（键值对，`.kv.single` 单列）、`.empty`（空态 + 下一步动作）、`.banner`（info/warn/danger）、`.modal`、`.checklist`（勾选式要点）、**`.topbar` + `.company-picker` + `.primary-nav` + `.nav-group` + `.nav-flyout` + `.nav-sub`**（顶栏公司选择与一级/二级导航）、**`.subnav` + `.side-list` + `.side-item`（`.is-active`）**（每页子导航）、`.split`（左右两栏）。
+**原语（只允许用这些组合页面）**：`.btn`（primary / ghost / danger / sm）、`.stat`（数字 + 标签）、`.pill`（状态徽标）、`.table`（粘性表头）、`.kv`（键值对，`.kv.single` 单列）、`.empty`（空态 + 下一步动作）、`.banner`（info/warn/danger）、`.modal`、`.checklist`（勾选式要点）、**`.topbar` + `.company-picker` + `.primary-nav` + `.topnav-row` + `.nav-primary` + `.nav-subbar` + `.nav-subbar-inner` + `.nav-sub-link`**（顶栏公司选择与导航自身展开的横排纯文字二级导航）、**`.subnav` + `.side-list` + `.side-item`（`.is-active`）**（插件 / 技能页左栏）、`.split`（左右两栏）。
 
 **规则**：① 一屏只有一个主行动按钮；② 危险动作（解绑、删除）用 ghost + 二次确认；③ 空态必须写"下一步做什么"，不写"暂无数据"；④ 表格里的状态列用 `.pill`，不用彩色文字；⑤ 数字右对齐、等宽字体；⑥ 任何权限拒绝都渲染成 `.banner danger` + traceId，不弹 toast。
 
@@ -1875,7 +1896,7 @@ EAB 部署在服务器上之后，只有两种人碰它：配置这家公司的�
 两条硬约束：
 
 1. **控制台不是"员工登录"，是服务器侧的唯一管理员入口。** 账号密码只给开发/运维；进去之后是"控制台操作员"，不是组织里的王芳/张伟：不继承任何人的角色，也不在成员统计里出现；右上角只显示唯一公司身份牌，不显示谁的账号。默认只接受本机来源，远程必须部署侧显式开 `EAB_CONSOLE_ALLOW_REMOTE=1`。
-2. **入口不混用，而且分端口。** 员工端口 `8787` 的 `/` 302 到 `/chat`，`/admin`、`/app.js`、`/app.css`、`/api/console` 一律 404；管理端口 `8788` 的 `/` 302 到 `/admin`，`/chat`、`/chat.html`、`/chat.js`、`/chat.css`、`/api/chat`、`/api/auth` 等员工面一律 404。`/admin` 没会话只出管理员登录页，员工看不到组织/权限页面；员工侧导航里没有"管理控制台"。控制台登录后同一个浏览器再开员工端口，仍然是员工身份（控制台请求必须显式带 `x-eab-console: 1`，员工接口不带）。
+2. **入口不混用，而且分端口。** 员工端口 `8787` 的 `/` 302 到 `/chat`，`/admin`、`/app.js`、`/app.css`、`/api/console` 一律 404；管理端口 `8788` 的 `/` 302 到 `/admin`，`/chat`、`/chat.html`、`/chat.js`、`/chat.css`、`/api/chat`、`/api/auth` 等员工面一律 404。`/admin` 没会话只出统一登录页（钉钉扫码或账号密码），成员登录后只看到被授权的后台页面；员工侧导航里没有"管理控制台"。控制台登录后同一个浏览器再开员工端口，仍然是员工身份（控制台请求必须显式带 `x-eab-console: 1`，员工接口不带）。
 3. **部署参数只走环境变量。** 端口、库路径、日志级别、devAuth、管理员账号密码都不进界面、不从请求读；`/api/health` 只回答版本与存活。要改这些只能改环境变量并重启，不做"看着能改其实改不了"的假开关。
 
 > 现状（不夸大）：控制台这一版能管"唯一这家公司里的组织、角色权限点、成员授权、知识库 ACL、模型供应商与模型目录、渠道绑定、插件启停、公司重命名/停用/删除"，**不提供切换公司，也不提供新建公司**；新建第二家会 409，组织接入只能走「钉钉扫码绑定组织」。**给公司配额度 / 日志级别** 还没有可写入口，仍属于部署侧（环境变量 + 重启）。管理员登录已做本机限制与 8 小时内存会话，但**还没有失败限速、失败审计、多管理员与轮换**；会话不跨进程，多实例部署需要换成共享会话存储。
@@ -2902,7 +2923,9 @@ eab upgrade
 | acl_roles | JSON 数组：角色码，`mode=roles` 时生效 |
 | acl_dept_paths | JSON 数组：部门物化路径，含下级，`mode=depts` 时生效 |
 | owner_user_id | `mode=private` 时的所有者 |
-| provider / config_json | provider: sqlite-vec / pgvector / qdrant / remote；外部连接配置（密钥用引用） |
+| provider / config_json | 兼容保留；实际向量后端用 `vector_backend(local/qdrant/pgvector)` + `vector_connection_id` + `pipeline_config_json` |
+| clean_mode / clean_model_id / ocr_model_id | 规则/模型清洗、OCR 模型；`auto` 无模型退回规则 |
+| chunk_size / chunk_overlap / rerank_enabled / rerank_model_id | 切片与重排配置 |
 | owner_dept_path / created_by | |
 | status / created_at / updated_at / deleted_at | |
 
@@ -2912,12 +2935,17 @@ eab upgrade
 |---|---|
 | id PK, company_id, collection_id IDX | 所属知识库（可见性继承） |
 | title / source_type / source_uri | source_uri 经 Resolver 存相对路径 |
+| original_path | 服务端生成的原始文件相对路径，不使用用户文件名 |
+| raw_text / clean_text | 解析原文与清洗结果（详细块在 sidecar） |
 | mime / size_bytes / page_count | |
-| checksum | 幂等键（同文档同内容不重复入库） |
+| checksum / content_hash | 幂等键（同文档同内容不重复入库） |
+| parse_meta_json | 页数、工作表、标题树、OCR 页数、解析器版本 |
 | dept_path / scope_type / scope_id / owner_user_id | 管理范围（写/删用，不参与读可见性判定） |
 | classification | `public` / `internal` / `confidential`（**NOT NULL，默认 internal**） |
-| status | pending / indexing / indexed / failed / deleted |
-| chunk_count / error | 入库进度与失败原因 |
+| status | pending / indexing / indexed / failed / deleted（粗粒度投影） |
+| pipeline_stage / pipeline_error | `uploaded…indexed / failed / needs_config`，页面以此为准 |
+| clean_mode / clean_model_id / ocr_model_id / version | 本篇实际使用的清洗、OCR 模型与重跑版本 |
+| chunk_count / error / index_error / indexed_at / index_model_id | 入库进度、失败原因与索引模型 |
 | created_at / updated_at / deleted_at | |
 
 索引：`(company_id, collection_id)`、`(company_id, checksum)`、`(company_id, status)`。
@@ -2934,12 +2962,19 @@ eab upgrade
 | dept_path | 只作来源标注与部门移动后的重写锚点 |
 | classification | 密级（NOT NULL，默认 internal） |
 | source_page / heading_path | 页码与标题层级（引用回链用） |
-| embedding | 向量（sqlite-vec / pgvector），单独列或同列 |
+| heading / page_no / meta_json | 标题路径、页码、工作表/行范围等结构元数据 |
+| char_count / content_hash | 字符数与幂等哈希 |
 | created_at | |
 
-索引：`(company_id, collection_id)`、`(doc_id, ordinal)`、向量索引。
+索引：`(company_id, collection_id)`、`(doc_id, ordinal)`。
 
-**kb_jobs**：`id, doc_id, kind(parse/embed/reindex), status, attempts, last_error, created_at, updated_at` —— 后台任务表（MVP 用表驱动队列，不引入 Redis）。
+**kb_chunk_embeddings**：`(chunk_id, model_id) PK, company_id, collection_id, doc_id, dim, vector BLOB, norm, created_at` —— 本地权威向量旁表；复合主键允许同一 chunk 存多个 embedding 模型，供模型对比与切换。外部 Qdrant / pgvector 只做镜像，检索结果必须回本地校验。
+
+**kb_ingest_jobs**：`id, company_id, collection_id, doc_id, stage(parse/clean/chunk/index), status, attempts, locked_at, heartbeat_at, locked_by, error, meta_json, created_at, updated_at` —— 知识库全流程任务表（进程内 worker + 表驱动队列，不依赖 Redis）；`kb_index_jobs` 保留为向量子任务，页面以 `kb_docs.pipeline_stage` 为准。
+
+**kb_test_cases**：`id, company_id, collection_id, name, query, expect_doc_ids, expect_chunk_ids, tags, enabled, created_by, created_at, updated_at, deleted_at` —— 召回测试用例。
+
+**kb_test_runs**：`id, company_id, collection_id, case_id, query, config_json, result_json, hit_count, top1_hit, recall_at_k, mrr, latency_ms, model_label, created_at, expires_at` —— 测试记录；按公司保留天数（默认 30 天）每日硬删，只留审计摘要。
 
 ### 15.5 渠道
 
@@ -3567,8 +3602,8 @@ web-*   ← shared-types（**禁止** import server/runtime/storage）
 6. **同步三条硬口径**（8.6 规则的实现版）：①同一份通讯录跑第二次必须零写入、差异为空；②上游缺失只 `missing_runs + 1`，连续 2 次才软删/禁用，重新出现则恢复并清零；③部门移动后子树 path 与成员 `dept_path` 由 `rebuildDeptPaths` 一次收敛，不在 N 处补丁里各自记得改。渠道身份先写 `pending`、`bound_by=sync:<provider>`，不自动绑到已有账号。
 7. **绑定口径（8.6.1）**：公司隔离 —— 一家公司每家渠道只绑一个企业租户，一个租户全局只属一家公司（唯一索引挡跨公司撞车）；绑定只能由管理员扫码授权产生，不接受手填密钥；未绑定不允许同步（409 + hint 指向「渠道绑定」）；解绑只把 `sync_mode` 置 `off`、清租户引用，不删已同步的部门与成员（知识库可见范围还锚在 dept path 上）。
 8. **组织树交互口径（多公司改造时修正）**：点**部门行**= 筛出该部门（含下级）成员，同时若有下级就展开/收起；点右侧「N 人」只筛不折叠。叶子部门点了也必须筛出人 —— 原来"点叶子什么都不发生"是 bug，不是设计。
-9. **导航口径（12.6.2）**：布局是**顶部一级导航 + 每页自带子导航 + 内容区**，一级导航按业务域分组（概览 / 组织架构 / 权限矩阵 / 知识库 / 渠道与同步 / 系统），不按数据表或接口名分组；子导航只属于当前页、换页整块换掉，组织树只出现在「组织架构」页的子导航里，知识库的子导航是**库列表**。树上「N 人」按成员 `dept_path` 前缀统计（含下级），必须与点进去筛出的行数一致。插件作为第七个一级项「插件」挂在业务域末尾，不混进任何企业页。
-10. **两个入口（12.8）分端口**：管理控制台 `8788/admin`（**超级管理员账号 + 密码**，默认只允许服务器本机 → 操作员，不登录组织成员；右上角只显示唯一公司身份牌）≠ 员工 `8787/chat`（只对话）。不可越界：员工端口 404 管理接口，管理端口 404 员工对话与 `/api/auth`；`/api/health` 只说版本与存活；部署参数只走环境变量，没有单独"运维入口"；管理员会话不带员工身份，控制台登录后开员工端口仍是员工（请求缺 `x-eab-console: 1`）。**入口不许合并**：`surface guard` 让两个端口互相 404。
+9. **导航口径（12.6.2）**：布局是**顶部一级导航 + 导航自身向下展开的横排二级行 + 内容区**，一级导航按业务域分组（概览 / 组织与权限 / 知识与模型 / 连接与平台 / 插件管理 / 技能管理 / 运营与审计），不按数据表或接口名分组；二级行只在悬停或键盘聚焦一级项时出现，展开时一级导航从 58px 增高并把内容区整体下移，不使用浮动卡片覆盖页面；插件 / 技能页的左侧清单属于页面内容，继续保留。组织树只出现在「部门管理」页，知识库页左栏是**库列表**。树上「N 人」按成员 `dept_path` 前缀统计（含下级），必须与点进去筛出的行数一致。
+10. **两个入口（12.8）分端口**：管理控制台 `8788/admin`（**统一登录：成员可钉钉扫码或用工号/邮箱/手机号密码；平台管理员用服务器管理员账号，管理员默认全量权限且只允许本机/显式放行网络**；成员必须具备至少一个后台页面权限）≠ 员工 `8787/chat`（只对话）。不可越界：员工端口 404 管理接口，管理端口 404 员工对话与 `/api/auth`；管理端扫码走 `/api/console/member/dingtalk/*` 并使用对话端回调地址；`/api/health` 只说版本与存活；部署参数只走环境变量，没有单独"运维入口"；管理员会话不带员工身份，控制台登录后开员工端口仍是员工（请求缺 `x-eab-console: 1`）。**入口不许合并**：`surface guard` 让两个端口互相 404。
 11. **插件口径（12.9）**：插件是磁盘目录（`plugins/<id>/plugin.json`），安装/更新/卸载是**服务器侧控制台的运维动作**（本地目录 → 暂存校验 → 登记版本/来源/指纹 → `.trash` 可恢复卸载），按公司启停仍属企业域（`plugin_states`）；清单只允许声明已存在的 scope，`compatibility.eab` 不满足当前版本判不合法；坏清单不崩服务；页面一律 iframe 沙箱渲染，插件要数据只能走同一套 HTTP API，因而受同一套权限约束；员工侧永远看不到安装来源与服务器路径。
 12. **多公司口径（12.10）**：**公司从人身上取，不从进程配置取**——`deps.companyId` 只是单公司部署的默认公司，参与查询与鉴权的必须是 `subject.companyId`。`dataScope='global'` 只表示"本公司内不受部门限制"，不许退化成 `1 = 1`；跨公司读业务数据如果确实需要，做成控制台里按公司逐家看的独立只读出口，而不是放开超管谓词。渠道租户 `(provider, tenant_id)` 全局唯一，一个租户只能属于一家公司。
 13. **工作台版面口径（12.7.6 / 12.7.7）**：顶栏只放会话级信息，**任何"我是谁"都不出现在右上角**；账号、可用模型、退出登录在左侧栏（员工侧没有控制台入口）；模型选择在输入框里，且左侧列表与输入区胶囊共用同一份选中状态。未登录或登录态失效 → 登录卡，且**不请求 `/api/me`**，避免"默认塞给用户一个身份"。附件正文与图片视觉输入随消息进模型，但附件不落盘、历史不回放旧图；只有附件没有文字的消息允许发送，两者不能同时为空。

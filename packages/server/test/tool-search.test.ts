@@ -65,6 +65,9 @@ describe('Agent 工具按需加载', () => {
     const send = (await executeTool(deps, actor, 'tool.search', { query: '把文件发到钉钉' })) as {
       tools: Array<{ functionName: string }>
     }
+    const sendImage = (await executeTool(deps, actor, 'tool.search', { query: '把图片发给我' })) as {
+      tools: Array<{ functionName: string }>
+    }
     const schedule = (await executeTool(deps, actor, 'tool.search', { query: '查看我的定时任务' })) as {
       tools: Array<{ functionName: string }>
     }
@@ -73,6 +76,7 @@ describe('Agent 工具按需加载', () => {
     }
 
     expect(send.tools.some((tool) => tool.functionName === 'workspace_send_dingtalk')).toBe(true)
+    expect(sendImage.tools.some((tool) => tool.functionName === 'workspace_send_dingtalk')).toBe(true)
     expect(schedule.tools.some((tool) => tool.functionName === 'schedule_list')).toBe(true)
     expect(math.tools.some((tool) => tool.functionName === 'math_eval')).toBe(true)
   })

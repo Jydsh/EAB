@@ -428,6 +428,7 @@ export function registerSettingsRoutes(app: FastifyInstance, deps: ServerDeps): 
       agentTeam: agentTeamSettingsView(deps.config),
       recordRetentionDays: settings.recordRetentionDays,
       workspaceRecycleDays: settings.workspaceRecycleDays,
+      kbTestRetentionDays: settings.kbTestRetentionDays,
       lastCleanupAt: settings.lastCleanupAt,
       lastCleanupStats: settings.lastCleanupStats,
       network: {
@@ -465,6 +466,7 @@ export function registerSettingsRoutes(app: FastifyInstance, deps: ServerDeps): 
         agentTeamMessages: count(deps.db, 'SELECT COUNT(*) AS n FROM agent_team_messages'),
         scheduleRuns: count(deps.db, 'SELECT COUNT(*) AS n FROM schedule_runs'),
         asyncJobs: count(deps.db, 'SELECT COUNT(*) AS n FROM async_jobs'),
+        kbTestRuns: count(deps.db, 'SELECT COUNT(*) AS n FROM kb_test_runs'),
         workspaceDeletedRows: count(
           deps.db,
           'SELECT COUNT(*) AS n FROM workspace_files WHERE deleted_at IS NOT NULL',
@@ -496,7 +498,14 @@ export function registerSettingsRoutes(app: FastifyInstance, deps: ServerDeps): 
   })
 
   app.put<{
-    Body: { days?: number; auditDays?: number; agentDays?: number; recordDays?: number; workspaceDays?: number }
+    Body: {
+      days?: number
+      auditDays?: number
+      agentDays?: number
+      recordDays?: number
+      workspaceDays?: number
+      kbTestDays?: number
+    }
   }>('/api/console/settings/retention', async (req) => {
     requireConsole(req, deps)
     const current = readConsoleSettings()
@@ -509,6 +518,8 @@ export function registerSettingsRoutes(app: FastifyInstance, deps: ServerDeps): 
       req.body?.recordDays === undefined ? current.recordRetentionDays : Number(req.body?.recordDays)
     const workspaceDays =
       req.body?.workspaceDays === undefined ? current.workspaceRecycleDays : Number(req.body?.workspaceDays)
+    const kbTestDays =
+      req.body?.kbTestDays === undefined ? current.kbTestRetentionDays : Number(req.body?.kbTestDays)
     for (const [label, value] of [
       ['日志保留天数', days],
       ['审计保留天数', auditDays],
@@ -520,20 +531,37 @@ export function registerSettingsRoutes(app: FastifyInstance, deps: ServerDeps): 
         throw new EabError(EC.VALIDATION, `${label}只能是 0（永久保留）或 7–3650 天`)
       }
     }
+    if (!Number.isInteger(kbTestDays) || kbTestDays < 1 || kbTestDays > 365) {
+      throw new EabError(EC.VALIDATION, '知识库测试记录保留天数只能是 1–365')
+    }
     const settings = writeConsoleSettings({
       logRetentionDays: days,
       auditRetentionDays: auditDays,
       agentRetentionDays: agentDays,
       recordRetentionDays: recordDays,
       workspaceRecycleDays: workspaceDays,
+      kbTestRetentionDays: kbTestDays,
     })
-    audit(deps, req, 'ops.settings.retention', { days, auditDays, agentDays, recordDays, workspaceDays })
+    deps.db.prepare('UPDATE kb_collections SET test_retention_days = ? WHERE deleted_at IS NULL').run(kbTestDays)
+    deps.db
+      .prepare('UPDATE kb_test_runs SET expires_at = created_at + ?')
+      .run(kbTestDays * 86_400_000)
+    deps.db.prepare('DELETE FROM kb_test_runs WHERE expires_at IS NOT NULL AND expires_at < ?').run(Date.now())
+    audit(deps, req, 'ops.settings.retention', {
+      days,
+      auditDays,
+      agentDays,
+      recordDays,
+      workspaceDays,
+      kbTestDays,
+    })
     return ok({
       retentionDays: settings.logRetentionDays,
       auditRetentionDays: settings.auditRetentionDays,
       agentRetentionDays: settings.agentRetentionDays,
       recordRetentionDays: settings.recordRetentionDays,
       workspaceRecycleDays: settings.workspaceRecycleDays,
+      kbTestRetentionDays: settings.kbTestRetentionDays,
       applied: true,
     })
   })
@@ -583,6 +611,10 @@ export function registerSettingsRoutes(app: FastifyInstance, deps: ServerDeps): 
       settings.workspaceRecycleDays,
     )
     const stats = { ...result.deleted }
+    const kbTestRuns = deps.db
+      .prepare('DELETE FROM kb_test_runs WHERE expires_at IS NOT NULL AND expires_at < ?')
+      .run(Date.now()).changes
+    if (kbTestRuns > 0) stats.kbTestRuns = Number(kbTestRuns)
     if (workspaceRecycle.files > 0) stats.workspaceRecycleFiles = workspaceRecycle.files
     if (workspaceRecycle.bytes > 0) stats.workspaceRecycleBytes = workspaceRecycle.bytes
     if (workspaceRecycle.rows > 0) stats.workspaceRecycleRows = workspaceRecycle.rows

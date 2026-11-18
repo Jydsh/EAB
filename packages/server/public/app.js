@@ -39,6 +39,34 @@ const CLS_LABEL = {
   confidential: '机密',
 }
 
+const KB_STAGE_LABEL = {
+  uploaded: '待解析',
+  parsing: '解析中',
+  parsed: '已解析',
+  cleaning: '清洗中',
+  cleaned: '已清洗',
+  chunking: '切片中',
+  chunked: '已切片',
+  indexing: '向量化中',
+  indexed: '已完成',
+  needs_config: '待配置',
+  failed: '失败',
+}
+
+const KB_STAGE_CLASS = {
+  uploaded: 'warn',
+  parsing: 'warn',
+  parsed: 'warn',
+  cleaning: 'warn',
+  cleaned: 'warn',
+  chunking: 'warn',
+  chunked: 'warn',
+  indexing: 'warn',
+  indexed: 'ok',
+  needs_config: 'danger',
+  failed: 'danger',
+}
+
 const DATA_SCOPE_LABEL = {
   self: '仅本人',
   dept: '本部门',
@@ -71,6 +99,16 @@ const state = {
   company: urlCompany,
   companies: [],
   me: null,
+  /** 当前后台身份与页面权限（/api/console/access） */
+  access: null,
+  allowedPages: [],
+  managePages: [],
+  /** 按页面记录可用写动作：{ org: ['create','edit','delete'], 'channels:sync': ['edit'], ... } */
+  pageActions: {},
+  /** 页内分区权限：{ 'channels:sync': { canView, canCreate, ... } } */
+  sectionPermissions: {},
+  /** 哪些页面已经配置过分区；未配置时沿用旧整页权限 */
+  sectionConfigured: new Set(),
   page: 'overview',
   /** 当前业务域（顶部一级导航）；页面列表由 DOMAINS 决定 */
   domain: 'overview',
@@ -83,10 +121,14 @@ const state = {
   databaseStatus: 'all',
   databaseDrivers: [],
   deptFilter: null,
-  includeSubdepts: false,
+  memberSearch: '',
   collapsed: new Set(),
   kb: null,
   selectedCollection: null,
+  /** 文档列表分页：按知识库记住页码，切库时回到第一页 */
+  kbDocPage: 1,
+  kbDocPageSize: 10,
+  kbDocCollection: null,
   selectedRole: null,
   /** 角色详情当前页签：permissions / members */
   roleTab: 'permissions',
@@ -128,8 +170,8 @@ const PAGES = {
   tasks: { title: '任务中心', sub: '定时任务、最近执行与事件时间线', render: () => loadTasks() },
   approvals: { title: '审批', sub: '高危动作的待办与决定', render: () => loadApprovals() },
   system: { title: '系统', sub: '运行状态与数据运维', render: () => loadSys() },
-  extra: { title: '插件', sub: '安装、启停、页面与工具', render: () => loadPlugins() },
-  skills: { title: '技能', sub: '安装、启停、风险扫描与隔离记录', render: () => loadSkillsPage() },
+  extra: { title: '插件管理', sub: '安装、启停、页面与工具', render: () => loadPlugins() },
+  skills: { title: '技能管理', sub: '安装、启停、风险扫描与隔离记录', render: () => loadSkillsPage() },
 }
 
 
@@ -178,6 +220,117 @@ function esc(value) {
   return String(value ?? '').replace(/[&<>"']/g, (ch) => {
     return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]
   })
+}
+
+/** 流水线预览用的轻量 Markdown：标题、表格、列表、引用、图片占位；输入已转义，避免二次注入。 */
+function renderFlowRich(value) {
+  const source = esc(String(value ?? '').replace(/\r\n?/g, '\n'))
+  const lines = source.split('\n')
+  const output = []
+  const inline = (text) =>
+    String(text ?? '')
+      .replace(/`([^`\n]+)`/g, '<code>$1</code>')
+      .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
+      .replace(/\*([^*\n]+)\*/g, '<em>$1</em>')
+  const isSeparator = (line) => {
+    const cells = String(line ?? '').trim().replace(/^\|/, '').replace(/\|$/, '').split('|')
+    return cells.length >= 2 && cells.every((cell) => /^:?-{3,}:?$/.test(cell.trim()))
+  }
+  const splitRow = (line) =>
+    String(line ?? '').trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((cell) => cell.trim())
+  const blockStart = (line) => {
+    if (!line.trim()) return true
+    if (/^\s{0,3}(#{1,6})\s+/.test(line)) return true
+    if (/^\s*[-*•]\s+/.test(line)) return true
+    if (/^\s*\d+[.)]\s+/.test(line)) return true
+    if (/^\s{0,3}>\s?/.test(line)) return true
+    if (/^\[图片\]/.test(line)) return true
+    if (line.includes('|')) return true
+    return false
+  }
+  let index = 0
+  while (index < lines.length) {
+    const line = lines[index]
+    if (!line.trim()) {
+      index += 1
+      continue
+    }
+    if (/^\[图片\]/.test(line)) {
+      const caption = line.replace(/^\[图片\]\s*/, '').trim()
+      output.push(
+        `<div class="kb-flow-image-line"><span>图片</span><strong>${inline(caption || '文档内嵌图片')}</strong></div>`,
+      )
+      index += 1
+      continue
+    }
+    const heading = /^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$/.exec(line)
+    if (heading) {
+      const level = Math.min(6, heading[1].length)
+      output.push(`<h${level}>${inline(heading[2].trim())}</h${level}>`)
+      index += 1
+      continue
+    }
+    if (line.includes('|') && index + 1 < lines.length && isSeparator(lines[index + 1])) {
+      const header = splitRow(line)
+      const rows = []
+      let cursor = index + 2
+      while (cursor < lines.length && lines[cursor].includes('|') && lines[cursor].trim()) {
+        rows.push(splitRow(lines[cursor]))
+        cursor += 1
+      }
+      output.push(
+        `<div class="kb-flow-table"><table><thead><tr>${header
+          .map((cell) => `<th>${inline(cell)}</th>`)
+          .join('')}</tr></thead><tbody>${rows
+          .map((row) => `<tr>${row.map((cell) => `<td>${inline(cell)}</td>`).join('')}</tr>`)
+          .join('')}</tbody></table></div>`,
+      )
+      index = cursor
+      continue
+    }
+    if (line.includes('|')) {
+      output.push(`<p class="kb-flow-raw-line">${inline(line)}</p>`)
+      index += 1
+      continue
+    }
+    if (/^\s{0,3}>\s?/.test(line)) {
+      const quotes = []
+      let cursor = index
+      while (cursor < lines.length && /^\s{0,3}>\s?/.test(lines[cursor])) {
+        quotes.push(inline(lines[cursor].replace(/^\s{0,3}>\s?/, '')))
+        cursor += 1
+      }
+      output.push(`<blockquote>${quotes.join('<br>')}</blockquote>`)
+      index = cursor
+      continue
+    }
+    const bullet = /^\s{0,3}[-*•]\s+(.+)$/.exec(line)
+    const ordered = /^\s{0,3}\d+[.)]\s+(.+)$/.exec(line)
+    if (bullet || ordered) {
+      const tag = bullet ? 'ul' : 'ol'
+      const pattern = bullet ? /^\s{0,3}[-*•]\s+(.+)$/ : /^\s{0,3}\d+[.)]\s+(.+)$/
+      const items = []
+      let cursor = index
+      while (cursor < lines.length) {
+        const match = pattern.exec(lines[cursor])
+        if (!match) break
+        items.push(`<li>${inline(match[1])}</li>`)
+        cursor += 1
+      }
+      output.push(`<${tag}>${items.join('')}</${tag}>`)
+      index = cursor
+      continue
+    }
+    const paragraph = []
+    let cursor = index
+    while (cursor < lines.length && !blockStart(lines[cursor])) {
+      if (lines[cursor].trim()) paragraph.push(inline(lines[cursor]))
+      cursor += 1
+    }
+    if (paragraph.length) output.push(`<p>${paragraph.join('<br>')}</p>`)
+    index = cursor > index ? cursor : index + 1
+  }
+  return output.join('') || '<p class="kb-flow-rich-empty">（暂无内容）</p>'
 }
 
 /** 把长说明收成小角标；完整文案挂在 data-tip，由统一浮层按需展示。 */
@@ -251,6 +404,119 @@ function queueTopToast(message, options = {}) {
     /* 私密模式 / 存储受限时忽略，不影响绑定结果 */
   }
 }
+
+/** 删除类确认统一成功反馈：只在确认且删除请求成功后提示，取消或失败时不误报。 */
+const DELETE_ACTION_FEEDBACK = /删除|移除|清空/
+
+/** 保存 / 删除按钮统一成功反馈：只在写请求成功后提示，失败时不误报。 */
+const SAVE_TOAST_SKIP_IDS = new Set(['save-role', 'save-role-console', 'branding-save', 'pm-save', 'oo-save'])
+let pendingSaveFeedback = null
+
+function clearPendingSaveFeedback() {
+  if (!pendingSaveFeedback) return
+  clearTimeout(pendingSaveFeedback.idleTimer)
+  clearTimeout(pendingSaveFeedback.toastTimer)
+  pendingSaveFeedback = null
+}
+
+function saveFeedbackMessage(button) {
+  const label = String(button?.textContent || '').replace(/\s+/g, '')
+  if (label.includes('角色')) return '角色已保存'
+  if (label.includes('后台权限')) return '后台权限已保存'
+  if (label.includes('并切换')) return '保存成功，正在切换'
+  if (label.includes('并生效')) return '保存成功，已生效'
+  if (label.includes('并绑定')) return '保存成功，已绑定'
+  if (label.includes('密码')) return '密码已保存'
+  if (label.includes('版本')) return '版本已保存'
+  if (label.includes('用例')) return '用例已保存'
+  if (label.includes('策略')) return '策略已保存'
+  if (label.includes('模型')) return '模型已保存'
+  if (label.includes('品牌')) return '品牌设置已保存'
+  if (label.includes('配置')) return '配置已保存'
+  if (label.includes('绑定')) return '绑定已保存'
+  if (label.includes('权限')) return '权限已保存'
+  return '保存成功'
+}
+
+function deleteFeedbackMessage(text) {
+  const label = String(text || '').replace(/\s+/g, '').replace(/[?？!！。]/g, '')
+  if (label.includes('清空')) {
+    const noun = label.replace(/确认|清空/g, '').trim()
+    return noun ? `${noun}已清空` : '已清空'
+  }
+  const removed = label.includes('移除')
+  const noun = label.replace(/确认|删除|移除/g, '').trim()
+  if (noun) return `${noun}已${removed ? '移除' : '删除'}`
+  return removed ? '已移除' : '删除成功'
+}
+
+function armDeleteFeedback(text) {
+  clearPendingSaveFeedback()
+  pendingSaveFeedback = {
+    message: deleteFeedbackMessage(text),
+    started: false,
+    idleTimer: setTimeout(clearPendingSaveFeedback, 2500),
+    toastTimer: 0,
+  }
+}
+
+function armSaveFeedback(button) {
+  clearPendingSaveFeedback()
+  pendingSaveFeedback = {
+    message: saveFeedbackMessage(button),
+    started: false,
+    idleTimer: setTimeout(clearPendingSaveFeedback, 2500),
+    toastTimer: 0,
+  }
+}
+
+function saveFeedbackRequestStarted() {
+  if (!pendingSaveFeedback) return
+  clearTimeout(pendingSaveFeedback.idleTimer)
+  clearTimeout(pendingSaveFeedback.toastTimer)
+  pendingSaveFeedback.started = true
+}
+
+function saveFeedbackRequestFinished(ok) {
+  if (!pendingSaveFeedback || !pendingSaveFeedback.started) return
+  if (!ok) {
+    clearPendingSaveFeedback()
+    return
+  }
+  clearTimeout(pendingSaveFeedback.toastTimer)
+  pendingSaveFeedback.toastTimer = setTimeout(() => {
+    const message = pendingSaveFeedback.message
+    clearPendingSaveFeedback()
+    showTopToast(message)
+  }, 300)
+}
+
+function trackSaveResponse(promise) {
+  return promise.then(
+    (value) => {
+      saveFeedbackRequestFinished(true)
+      return value
+    },
+    (err) => {
+      saveFeedbackRequestFinished(false)
+      throw err
+    },
+  )
+}
+
+document.addEventListener(
+  'click',
+  (event) => {
+    const target = event.target instanceof Element ? event.target : null
+    const button = target?.closest('button')
+    if (!button || button.disabled || button.dataset.saveToast === 'off') return
+    if (SAVE_TOAST_SKIP_IDS.has(button.id)) return
+    const label = String(button.textContent || '').replace(/\s+/g, '')
+    if (!label.includes('保存')) return
+    armSaveFeedback(button)
+  },
+  true,
+)
 
 function flushQueuedTopToast() {
   try {
@@ -390,23 +656,51 @@ async function apiForCompany(path, companyId) {
 }
 
 async function apiPost(path, body) {
-  const res = await fetch(path + qs(path), {
-    method: 'POST',
-    headers: { accept: 'application/json', 'content-type': 'application/json', 'x-eab-console': '1' },
-    body: JSON.stringify(body ?? {}),
-  })
-  return parseResponse(res)
+  saveFeedbackRequestStarted()
+  try {
+    const res = await fetch(path + qs(path), {
+      method: 'POST',
+      headers: { accept: 'application/json', 'content-type': 'application/json', 'x-eab-console': '1' },
+      body: JSON.stringify(body ?? {}),
+    })
+    return await trackSaveResponse(parseResponse(res))
+  } catch (err) {
+    saveFeedbackRequestFinished(false)
+    throw err
+  }
 }
 
 async function apiSend(method, path, body) {
-  const headers = { accept: 'application/json', 'x-eab-console': '1' }
-  if (body !== undefined) headers['content-type'] = 'application/json'
-  const res = await fetch(path + qs(path), {
-    method,
-    headers,
-    body: body === undefined ? undefined : JSON.stringify(body),
-  })
-  return parseResponse(res)
+  saveFeedbackRequestStarted()
+  try {
+    const headers = { accept: 'application/json', 'x-eab-console': '1' }
+    if (body !== undefined) headers['content-type'] = 'application/json'
+    const res = await fetch(path + qs(path), {
+      method,
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+    })
+    return await trackSaveResponse(parseResponse(res))
+  } catch (err) {
+    saveFeedbackRequestFinished(false)
+    throw err
+  }
+}
+
+/** multipart 上传不设 content-type，浏览器会自动补 boundary。 */
+async function apiUpload(path, formData) {
+  saveFeedbackRequestStarted()
+  try {
+    const res = await fetch(path + qs(path), {
+      method: 'POST',
+      headers: { accept: 'application/json', 'x-eab-console': '1' },
+      body: formData,
+    })
+    return await trackSaveResponse(parseResponse(res))
+  } catch (err) {
+    saveFeedbackRequestFinished(false)
+    throw err
+  }
 }
 
 function renderDenied(container, err) {
@@ -559,13 +853,83 @@ async function applyCompany(companyId) {
   await PAGES[state.page].render()
 }
 
+/**
+ * 顶部账号头像：有钉钉头像时盖在姓名首字上；加载失败只摘掉图片，保留首字，
+ * 避免防盗链或接口异常时出现破图。
+ */
+function setAccountAvatar(el, name, url) {
+  if (!el) return
+  const initial = String(name || '管').trim().charAt(0) || '管'
+  el.textContent = initial
+  el.classList.remove('has-photo')
+  if (!url) return
+  const img = document.createElement('img')
+  img.className = 'account-avatar-img'
+  img.alt = ''
+  img.loading = 'eager'
+  img.addEventListener(
+    'error',
+    () => {
+      img.remove()
+      el.classList.remove('has-photo')
+      el.textContent = initial
+    },
+    { once: true },
+  )
+  img.src = url
+  el.textContent = ''
+  el.append(img)
+  el.classList.add('has-photo')
+}
+
 async function loadMe() {
+  const access = await api('/api/console/access')
+  state.access = access
+  state.allowedPages = Array.isArray(access.allowedPages) ? [...access.allowedPages] : []
+  state.managePages = Array.isArray(access.managePages) ? [...access.managePages] : []
+  state.pageActions = access.actionsByPage && typeof access.actionsByPage === 'object'
+    ? { ...access.actionsByPage }
+    : Object.fromEntries(
+        (Array.isArray(access.pages) ? access.pages : []).map((item) => {
+          const actions = []
+          if (item.canCreate) actions.push('create')
+          if (item.canEdit) actions.push('edit')
+          if (item.canDelete) actions.push('delete')
+          return [item.page, actions]
+        }),
+      )
+  state.sectionPermissions = {}
+  state.sectionConfigured = new Set()
+  for (const item of Array.isArray(access.pages) ? access.pages : []) {
+    if (!item?.section || !item?.parentPage) continue
+    const key = `${item.parentPage}:${item.section}`
+    state.sectionPermissions[key] = {
+      canView: item.canView === true,
+      canCreate: item.canCreate === true,
+      canEdit: item.canEdit === true,
+      canDelete: item.canDelete === true,
+    }
+    state.sectionConfigured.add(item.parentPage)
+  }
   const me = await api('/api/me')
   state.me = me
-  const nameEl = $('#id-name')
-  if (nameEl) nameEl.textContent = me.company ? me.company.name : '管理范围'
-  const subEl = $('#id-sub')
-  if (subEl) subEl.textContent = me.company ? `服务器侧 · ${me.company.id} · 全公司` : '服务器侧配置'
+  const name = access.kind === 'member'
+    ? (access.name || me.person?.name || '公司成员')
+    : me.company
+      ? me.company.name
+      : '管理范围'
+  const nameEl = $('#account-name')
+  if (nameEl) nameEl.textContent = name
+  const popName = $('#account-name-pop')
+  if (popName) popName.textContent = name
+  const avatarUrl = access.kind === 'member' && me.person?.avatar
+    ? `/api/me/avatar?v=${encodeURIComponent(`${me.person.id}:${me.person.avatar}`)}`
+    : ''
+  setAccountAvatar($('#account-avatar'), name, avatarUrl)
+  setAccountAvatar($('#account-avatar-pop'), name, avatarUrl)
+  const passwordAction = $('#account-password')
+  if (passwordAction) passwordAction.hidden = access.kind === 'member'
+  applyAccessToTopNav()
 
   const foot = $('#nav-tail')
   if (foot) foot.textContent = ''
@@ -1121,63 +1485,1773 @@ async function openKbModal(collection) {
   })
 }
 
+const kbFormatSize = (bytes) => {
+  if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+  return `${Math.max(1, Math.round(bytes / 1024))} KB`
+}
+
 function openKbDocModal(collectionId, mode) {
+  void mode
+  const accept =
+    '.pdf,.docx,.xlsx,.pptx,.txt,.md,.markdown,.csv,.json,.html,.htm,.png,.jpg,.jpeg,.webp'
   const overlay = modelModal(`
-    <div class="modal-head"><h3>添加文档</h3><button class="modal-x" type="button">×</button></div>
-    <div class="field-stack">
-      <label class="field"><span>从文件导入（txt / md / csv / json）</span><input id="doc-file" type="file" accept=".txt,.md,.markdown,.csv,.json,.log,.html" /></label>
-      <label class="field"><span>标题</span><input id="doc-title" placeholder="例如 员工考勤管理办法" /></label>
-      <label class="field"><span>正文</span><textarea id="doc-content" rows="9" placeholder="粘贴文本，或者选上面的文件自动读入；保存后按段落切片入库"></textarea></label>
-      <label class="field"><span>密级</span>
-        <select id="doc-cls">
-          <option value="public">公开</option>
-          <option value="internal" selected>内部</option>
-          <option value="confidential">机密</option>
-        </select>
-      </label>
+    <div class="modal-head kb-upload-head">
+      <div class="kb-upload-title">
+        <span class="kb-upload-eyebrow">知识库 / 入库流水线</span>
+        <h3>上传并自动入库</h3>
+        <p>多个文件会组成一个批次，依次完成解析、清洗、切片与索引；入库后可逐篇查看和手动修正。</p>
+      </div>
+      <button class="modal-x" type="button" aria-label="关闭">×</button>
+    </div>
+    <div class="field-stack kb-upload-body">
+      <div class="kb-upload-flow" aria-hidden="true">
+        <span class="is-on"><b>01</b>解析</span>
+        <i></i>
+        <span class="is-on"><b>02</b>清洗</span>
+        <i></i>
+        <span class="is-on"><b>03</b>切片</span>
+        <i></i>
+        <span class="is-on"><b>04</b>索引</span>
+      </div>
+      <div class="kb-drop" id="kb-drop" tabindex="0" role="button" aria-label="选择或拖入文件">
+        <input id="doc-file" type="file" multiple accept="${accept}" hidden />
+        <div class="kb-drop-icon">＋</div>
+        <strong>把文件拖到这里，或点击选择</strong>
+        <span>PDF / Word / Excel / PPT / TXT / Markdown / CSV / JSON / HTML / 图片</span>
+        <em>单文件 ≤ 50MB，单次 ≤ 20 个、合计 ≤ 200MB</em>
+        <div class="kb-drop-summary" id="doc-select-summary">尚未选择文件</div>
+      </div>
+      <div class="kb-file-list" id="doc-file-list"></div>
+      <div class="kb-form-row kb-upload-config">
+        <label class="field"><span>清洗策略</span>
+          <select id="doc-clean-mode">
+            <option value="auto" selected>智能清洗（推荐）</option>
+            <option value="model">模型清洗</option>
+            <option value="rules">规则清洗</option>
+          </select>
+        </label>
+        <label class="field"><span>密级</span>
+          <select id="doc-cls">
+            <option value="public">公开</option>
+            <option value="internal" selected>内部</option>
+            <option value="confidential">机密</option>
+          </select>
+        </label>
+      </div>
+      <div class="kb-upload-strategy">
+        <span class="kb-upload-strategy-icon">⌁</span>
+        <div>
+          <strong>智能策略</strong>
+          <p>配置了清洗模型时自动走模型清洗，未配置或模型超时时回退规则清洗；全程记录每一步结果，可随时人工修正。</p>
+        </div>
+      </div>
+      ${hintNote(
+        '批量自动流程',
+        '点击「上传并开始入库」后会自动进入批次进度页：可以同时看到整批进度和每个文件的解析、清洗、切片、索引状态。',
+      )}
     </div>
     <div class="modal-state" id="doc-state"></div>
-    <div class="modal-actions">
-      <button class="btn primary" type="button" id="doc-save">保存并入库</button>
-      <button class="btn ghost" type="button" id="doc-cancel">取消</button>
+    <div class="modal-actions kb-upload-actions">
+      <span class="kb-upload-tip">入库后可逐篇查看流程，清洗与切片结果支持手动编辑</span>
+      <div class="kb-upload-action-buttons">
+        <button class="btn primary" type="button" id="doc-save" disabled>上传并开始入库</button>
+        <button class="btn ghost" type="button" id="doc-cancel">取消</button>
+      </div>
     </div>`)
   const close = () => overlay.remove()
+  overlay.querySelector('.modal').classList.add('kb-upload-modal')
+  const input = overlay.querySelector('#doc-file')
+  const drop = overlay.querySelector('#kb-drop')
+  const list = overlay.querySelector('#doc-file-list')
+  const stateEl = overlay.querySelector('#doc-state')
+  const save = overlay.querySelector('#doc-save')
+  const summaryEl = overlay.querySelector('#doc-select-summary')
+  const selected = []
+
+  const render = () => {
+    list.innerHTML = selected.length
+      ? selected
+          .map(
+            (file, index) =>
+              `<div class="kb-file-row"><span class="kb-file-name">${esc(file.name)}</span><span class="kb-file-size">${kbFormatSize(
+                file.size,
+              )}</span><button class="kb-file-x" type="button" data-file-index="${index}" aria-label="移除">×</button></div>`,
+          )
+          .join('')
+      : '<div class="kb-file-empty">还没有选择文件，可一次选择多个文件</div>'
+    const total = selected.reduce((sum, file) => sum + file.size, 0)
+    summaryEl.textContent = selected.length
+      ? `已选 ${selected.length} 个文件 · 合计 ${kbFormatSize(total)}`
+      : '尚未选择文件'
+    summaryEl.classList.toggle('has-files', selected.length > 0)
+    save.disabled = selected.length === 0
+  }
+  const addFiles = (files) => {
+    stateEl.className = 'modal-state'
+    stateEl.textContent = ''
+    for (const file of files) {
+      if (selected.length >= 20) {
+        stateEl.className = 'modal-state bad'
+        stateEl.textContent = '单次最多上传 20 个文件'
+        break
+      }
+      if (file.size > 50 * 1024 * 1024) {
+        stateEl.className = 'modal-state bad'
+        stateEl.textContent = `${file.name} 超过 50MB`
+        continue
+      }
+      const duplicate = selected.some((item) => item.name === file.name && item.size === file.size)
+      if (!duplicate) selected.push(file)
+    }
+    render()
+  }
+
   overlay.querySelector('.modal-x').addEventListener('click', close)
   overlay.querySelector('#doc-cancel').addEventListener('click', close)
-  overlay.querySelector('#doc-file').addEventListener('change', async (event) => {
-    const file = event.target.files?.[0]
-    if (!file) return
-    if (file.size > 5 * 1024 * 1024) {
-      alert('文本文件请控制在 5 MB 以内')
-      event.target.value = ''
-      return
-    }
-    try {
-      const text = await file.text()
-      overlay.querySelector('#doc-content').value = text
-      if (!overlay.querySelector('#doc-title').value.trim()) {
-        overlay.querySelector('#doc-title').value = file.name.replace(/\.[^.]+$/, '')
-      }
-    } catch {
-      alert('读取文件失败，换个纯文本文件试试')
+  drop.addEventListener('click', () => input.click())
+  drop.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault()
+      input.click()
     }
   })
-  overlay.querySelector('#doc-save').addEventListener('click', async () => {
-    const stateEl = overlay.querySelector('#doc-state')
-    stateEl.textContent = '入库中…'
+  drop.addEventListener('dragover', (event) => {
+    event.preventDefault()
+    drop.classList.add('is-over')
+  })
+  drop.addEventListener('dragleave', () => drop.classList.remove('is-over'))
+  drop.addEventListener('drop', (event) => {
+    event.preventDefault()
+    drop.classList.remove('is-over')
+    addFiles(event.dataTransfer?.files ?? [])
+  })
+  input.addEventListener('change', () => {
+    addFiles(input.files ?? [])
+    input.value = ''
+  })
+  list.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-file-index]')
+    if (!button) return
+    selected.splice(Number(button.dataset.fileIndex), 1)
+    render()
+  })
+  save.addEventListener('click', async () => {
+    if (selected.length === 0) return
+    const form = new FormData()
+    for (const file of selected) form.append('files', file, file.name)
+    form.append('cleanMode', overlay.querySelector('#doc-clean-mode').value)
+    form.append('classification', overlay.querySelector('#doc-cls').value)
+    save.disabled = true
+    stateEl.className = 'modal-state'
+    stateEl.textContent = `正在上传 ${selected.length} 个文件，准备进入流水线…`
     try {
-      await apiPost(`/api/console/kb/collections/${encodeURIComponent(collectionId)}/docs`, {
-        title: overlay.querySelector('#doc-title').value.trim(),
-        content: overlay.querySelector('#doc-content').value.trim(),
-        classification: overlay.querySelector('#doc-cls').value,
-      })
-      close()
-      loadKb()
+      const result = await apiUpload(
+        `/api/console/kb/collections/${encodeURIComponent(collectionId)}/docs/upload`,
+        form,
+      )
+      const files = Array.isArray(result.files) ? result.files : []
+      const accepted = files.filter((item) => item.ok && item.docId)
+      const failed = files.filter((item) => !item.ok)
+      if (accepted.length) {
+        close()
+        await loadDocs(collectionId)
+        openKbBatchPipeline(accepted, collectionId, failed)
+        return
+      }
+      stateEl.className = 'modal-state bad'
+      stateEl.innerHTML = [
+        '<div>没有文件进入流水线。</div>',
+        ...failed.map((item) => `<div class="kb-upload-error">${esc(item.filename)}：${esc(item.error || '上传失败')}</div>`),
+      ].join('')
     } catch (err) {
       stateEl.className = 'modal-state bad'
-      stateEl.textContent = err.message || '入库失败'
+      stateEl.textContent = err.message || '上传失败'
+    } finally {
+      save.disabled = selected.length === 0
     }
   })
+  render()
+}
+
+async function openKbRetrievalTest(collectionId) {
+  const overlay = modelModal(`
+    <div class="modal-head kb-test-head">
+      <div class="kb-test-title">
+        <span class="kb-test-eyebrow">知识库 / 召回质量</span>
+        <h3>召回测试</h3>
+        <p>输入真实问题，检查命中片段、分数和召回模型表现。</p>
+      </div>
+      <button class="modal-x" type="button" aria-label="关闭召回测试">×</button>
+    </div>
+    <div class="kb-test-body">
+      <div class="kb-test-main">
+        <section class="kb-test-card kb-test-query-card">
+          <div class="kb-test-card-head">
+            <div><span class="kb-test-kicker">QUERY</span><h4>测试问题</h4></div>
+            <span class="kb-test-hint">Ctrl + Enter 运行</span>
+          </div>
+          <label class="field kb-test-query-field"><span>测试问题</span>
+            <textarea id="kbt-query" rows="3" placeholder="输入一个真实用户会问的问题，例如：交换机管理地址是多少？"></textarea>
+          </label>
+          <div class="kb-test-query-foot"><span>尽量使用用户原话，避免只输入关键词</span><span id="kbt-query-count">0 字</span></div>
+          <div class="kb-test-grid kb-test-controls">
+            <label class="field"><span>检索模式</span>
+              <select id="kbt-mode">
+                <option value="hybrid">混合检索（关键词 + 向量）</option>
+                <option value="vector">仅向量</option>
+                <option value="keyword">仅关键词</option>
+              </select>
+            </label>
+            <label class="field"><span>TopK</span><input id="kbt-topk" type="number" min="1" max="20" value="5" /></label>
+            <label class="field"><span>向量阈值</span><input id="kbt-threshold" type="number" min="0" max="1" step="0.01" value="0" /></label>
+            <label class="kb-test-check"><input id="kbt-rerank" type="checkbox" /> 启用重排序</label>
+          </div>
+          <div class="kb-test-actions">
+            <span class="modal-state" id="kbt-state"></span>
+            <div class="kb-test-action-group">
+              <button class="btn ghost" type="button" id="kbt-save">保存为用例</button>
+              <button class="btn ghost" type="button" id="kbt-compare">对比向量模型</button>
+              <button class="btn primary" type="button" id="kbt-run">运行测试</button>
+            </div>
+          </div>
+        </section>
+        <section class="kb-test-result-card">
+          <div class="kb-test-card-head">
+            <div><span class="kb-test-kicker">RESULT</span><h4>召回结果</h4></div>
+            <span class="kb-test-hint">按 RRF 融合分排序</span>
+          </div>
+          <div id="kbt-result" class="kb-test-result">
+            <div class="kb-test-empty-state">
+              <span class="kb-test-empty-glyph">⌕</span>
+              <strong>还没有召回结果</strong>
+              <p>输入问题并运行测试，这里会显示命中片段、TopK 和分数。</p>
+            </div>
+          </div>
+        </section>
+      </div>
+      <aside class="kb-test-side">
+        <div class="kb-test-side-head">
+          <h3>测试资产</h3>
+          <p>用固定用例做回归，保留最近运行结果。</p>
+        </div>
+        <section class="kb-test-side-card">
+          <div class="kb-test-section-head"><h4>测试用例</h4><span class="muted" id="kbt-case-count"></span></div>
+          <div id="kbt-cases"></div>
+        </section>
+        <section class="kb-test-side-card">
+          <div class="kb-test-section-head"><h4>最近记录</h4><button class="btn sm ghost" type="button" id="kbt-clear-runs">清空记录</button></div>
+          <div id="kbt-runs"></div>
+        </section>
+      </aside>
+    </div>`)
+  overlay.querySelector('.modal').classList.add('kb-test-modal')
+  const controller = new AbortController()
+  const close = () => {
+    controller.abort()
+    overlay.remove()
+  }
+  overlay.querySelector('.modal-x')?.addEventListener('click', close)
+  overlay.addEventListener('click', (event) => {
+    if (event.target === overlay) close()
+  })
+  document.addEventListener(
+    'keydown',
+    (event) => {
+      if (event.key === 'Escape' && !document.querySelector('.confirm-overlay')) close()
+    },
+    { signal: controller.signal },
+  )
+  const q = overlay.querySelector('#kbt-query')
+  const stateEl = overlay.querySelector('#kbt-state')
+  const resultEl = overlay.querySelector('#kbt-result')
+  const casesEl = overlay.querySelector('#kbt-cases')
+  const runsEl = overlay.querySelector('#kbt-runs')
+  const queryCountEl = overlay.querySelector('#kbt-query-count')
+  let embeddingModels = []
+  const syncQueryCount = () => {
+    queryCountEl.textContent = `${q.value.length} 字`
+  }
+  q.addEventListener('input', syncQueryCount)
+  syncQueryCount()
+
+  const setState = (text, kind = '') => {
+    stateEl.className = `modal-state ${kind}`
+    stateEl.textContent = text
+  }
+  const config = () => ({
+    query: q.value.trim(),
+    mode: overlay.querySelector('#kbt-mode').value,
+    topK: Number(overlay.querySelector('#kbt-topk').value) || 5,
+    vectorThreshold: Number(overlay.querySelector('#kbt-threshold').value) || 0,
+    rerank: overlay.querySelector('#kbt-rerank').checked,
+  })
+  const renderResult = (data) => {
+    if (!data) return
+    const metrics = data.metrics || {}
+    const diagnostics = data.diagnostics || {}
+    const hits = Array.isArray(data.hits) ? data.hits : []
+    const warnings = Array.isArray(diagnostics.warnings) ? diagnostics.warnings : []
+    const hitHtml = hits.length
+      ? hits
+          .map(
+            (hit, index) => `<div class="kb-test-hit">
+              <div class="kb-test-hit-head">
+                <label class="kb-test-pick"><input type="checkbox" data-hit-chunk="${esc(hit.chunkId)}" /> 期望</label>
+                <span class="kb-test-rank">#${index + 1}</span>
+                <span class="pill">${esc(hit.source)}</span>
+                <span class="kb-test-doc">${esc(hit.docTitle)}</span>
+                <span class="kb-test-score">RRF ${hit.rrfScore}${
+                  hit.vectorScore ? ` · 向量 ${hit.vectorScore}` : ''
+                }${hit.rerankScore !== null ? ` · 重排 ${hit.rerankScore}` : ''}</span>
+              </div>
+              <div class="kb-test-text">${esc(hit.text)}</div>
+            </div>`,
+          )
+          .join('')
+      : '<div class="kb-test-empty">没有命中。可以降低阈值、换关键词，或先重建索引。</div>'
+    resultEl.innerHTML = `
+      <div class="kb-test-summary">
+        <div class="kb-test-metric"><strong>${metrics.top1Hit ? '命中' : '未命中'}</strong><span>Top1</span></div>
+        <div class="kb-test-metric"><strong>${Number(metrics.recallAtK || 0).toFixed(2)}</strong><span>Recall@K</span></div>
+        <div class="kb-test-metric"><strong>${Number(metrics.mrr || 0).toFixed(2)}</strong><span>MRR</span></div>
+        <div class="kb-test-metric"><strong>${data.hits.length}</strong><span>命中条数</span></div>
+      </div>
+      <div class="kb-test-diag">
+        关键词候选 ${diagnostics.keywordCandidates || 0} · 向量候选 ${diagnostics.vectorCandidates || 0} ·
+        合并 ${diagnostics.mergedCandidates || 0} · 耗时 ${diagnostics.elapsedMs || 0}ms · ${esc(data.modelLabel || '')}
+      </div>
+      ${warnings.length ? `<div class="kb-doc-warn">${warnings.map((item) => esc(item)).join('<br />')}</div>` : ''}
+      <div class="kb-test-hit-list">${hitHtml}</div>`
+  }
+  const renderCompare = (data) => {
+    const results = Array.isArray(data.results) ? data.results : []
+    resultEl.innerHTML = `<div class="kb-test-compare-title">模型对比 · ${esc(data.query)}</div>
+      <table class="data kb-test-compare-table">
+        <thead><tr><th>向量模型</th><th>Top1</th><th>Recall@K</th><th>MRR</th><th>命中</th><th>耗时</th></tr></thead>
+        <tbody>${results
+          .map((item) => {
+            const metrics = item.metrics || {}
+            return `<tr>
+              <td><strong>${esc(item.modelName)}</strong><div class="desc mono">${esc(item.modelId)}</div></td>
+              <td><span class="pill ${metrics.top1Hit ? 'ok' : ''}">${metrics.top1Hit ? '命中' : '未命中'}</span></td>
+              <td>${Number(metrics.recallAtK || 0).toFixed(2)}</td>
+              <td>${Number(metrics.mrr || 0).toFixed(2)}</td>
+              <td>${item.hitCount}</td>
+              <td>${item.elapsedMs}ms</td>
+            </tr>`
+          })
+          .join('')}</tbody>
+      </table>`
+  }
+
+  const renderCases = (data) => {
+    const cases = Array.isArray(data.cases) ? data.cases : []
+    overlay.querySelector('#kbt-case-count').textContent = `${cases.length} 个`
+    casesEl.innerHTML = cases.length
+      ? cases
+          .map(
+            (item) => `<div class="kb-test-list-row">
+              <div class="kb-test-list-main"><strong>${esc(item.name)}</strong><span>${esc(item.query)}</span></div>
+              <div class="kb-test-list-actions">
+                <button class="btn sm" type="button" data-case-run="${esc(item.id)}">运行</button>
+                <button class="btn sm danger" type="button" data-case-del="${esc(item.id)}">删除</button>
+              </div>
+            </div>`,
+          )
+          .join('')
+      : '<div class="kb-test-empty">还没有用例。运行测试后可以把当前问题和选中的命中保存为用例。</div>'
+  }
+  const renderRuns = (data) => {
+    const runs = Array.isArray(data.runs) ? data.runs : []
+    runsEl.innerHTML = runs.length
+      ? runs
+          .slice(0, 8)
+          .map(
+            (item) => `<div class="kb-test-list-row">
+              <div class="kb-test-list-main"><strong>${esc(item.query)}</strong><span>${fmtTime(item.createdAt)} · ${esc(
+                item.modelLabel || '',
+              )}</span></div>
+              <div class="kb-test-list-meta"><span class="pill ${item.top1Hit ? 'ok' : ''}">${
+                item.top1Hit ? 'Top1 命中' : '未命中'
+              }</span><span class="muted">R@K ${Number(item.recallAtK || 0).toFixed(2)} · MRR ${Number(
+                item.mrr || 0,
+              ).toFixed(2)}${item.hitCount === 0 ? ' · 0 命中' : ''}</span>
+                <button class="btn sm" type="button" data-run-query="${esc(item.query)}">再跑一次</button>
+              </div>
+            </div>`,
+          )
+          .join('')
+      : '<div class="kb-test-empty">还没有测试记录。每次运行都会落一条记录，过期后自动清理。</div>'
+  }
+  const loadCases = async () => {
+    const data = await api(`/api/console/kb/collections/${encodeURIComponent(collectionId)}/test-cases`)
+    renderCases(data)
+  }
+  const loadRuns = async () => {
+    const data = await api(`/api/console/kb/collections/${encodeURIComponent(collectionId)}/test-runs?limit=20`)
+    renderRuns(data)
+  }
+  const loadEmbeddingModels = async () => {
+    const data = await api(`/api/console/kb/collections/${encodeURIComponent(collectionId)}/embedding-models`)
+    embeddingModels = Array.isArray(data.models) ? data.models : []
+  }
+  const run = async () => {
+    const body = config()
+    if (!body.query) {
+      setState('请输入测试问题', 'bad')
+      q.focus()
+      return
+    }
+    const button = overlay.querySelector('#kbt-run')
+    button.disabled = true
+    setState('检索中…')
+    try {
+      const data = await apiPost(
+        `/api/console/kb/collections/${encodeURIComponent(collectionId)}/test-runs`,
+        body,
+      )
+      renderResult(data)
+      setState(`完成：${data.hits.length} 条命中，${data.diagnostics.elapsedMs}ms`, 'good')
+      await loadRuns()
+    } catch (err) {
+      setState(err.message || '测试失败', 'bad')
+    } finally {
+      button.disabled = false
+    }
+  }
+  const compare = async () => {
+    const body = config()
+    if (!body.query) {
+      setState('请输入对比测试的问题', 'bad')
+      q.focus()
+      return
+    }
+    if (embeddingModels.length === 0) {
+      setState('该知识库还没有可对比的向量模型索引', 'bad')
+      return
+    }
+    const button = overlay.querySelector('#kbt-compare')
+    button.disabled = true
+    setState(`对比 ${embeddingModels.length} 个向量模型…`)
+    try {
+      const picked = [...overlay.querySelectorAll('[data-hit-chunk]:checked')].map((item) => item.dataset.hitChunk)
+      const data = await apiPost(
+        `/api/console/kb/collections/${encodeURIComponent(collectionId)}/test-compare`,
+        {
+          ...body,
+          embeddingModelIds: embeddingModels.map((item) => item.id),
+          expectChunkIds: picked,
+        },
+      )
+      renderCompare(data)
+      setState(`完成：已对比 ${data.results.length} 个向量模型`, 'good')
+      await loadRuns()
+    } catch (err) {
+      setState(err.message || '模型对比失败', 'bad')
+    } finally {
+      button.disabled = false
+    }
+  }
+
+  overlay.addEventListener('click', async (event) => {
+    const target = event.target
+    if (target.closest('#kbt-run')) return void run()
+    if (target.closest('#kbt-compare')) return void compare()
+    if (target.closest('#kbt-clear-runs')) {
+      const confirmed = await confirmCard({
+        title: '清空测试记录？',
+        message: '该知识库的召回测试历史会被删除，测试用例保留。',
+        confirmText: '清空记录',
+      })
+      if (!confirmed) return
+      try {
+        await apiSend('DELETE', `/api/console/kb/collections/${encodeURIComponent(collectionId)}/test-runs`)
+        setState('测试记录已清空', 'good')
+        await loadRuns()
+      } catch (err) {
+        setState(err.message || '清空失败', 'bad')
+      }
+      return
+    }
+    if (target.closest('#kbt-save')) {
+      const body = config()
+      if (!body.query) {
+        setState('先输入测试问题', 'bad')
+        q.focus()
+        return
+      }
+      const picked = [...overlay.querySelectorAll('[data-hit-chunk]:checked')].map((item) => item.dataset.hitChunk)
+      const name = prompt('用例名称', body.query.slice(0, 32))
+      if (name === null) return
+      try {
+        await apiPost(`/api/console/kb/collections/${encodeURIComponent(collectionId)}/test-cases`, {
+          name: name.trim() || body.query.slice(0, 32),
+          query: body.query,
+          expectChunkIds: picked,
+        })
+        setState('用例已保存', 'good')
+        await loadCases()
+      } catch (err) {
+        setState(err.message || '保存失败', 'bad')
+      }
+      return
+    }
+    const caseRun = target.closest('[data-case-run]')
+    if (caseRun) {
+      const button = caseRun
+      button.disabled = true
+      setState('运行用例…')
+      try {
+        const data = await apiPost(
+          `/api/console/kb/test-cases/${encodeURIComponent(caseRun.dataset.caseRun)}/run`,
+          {
+            mode: overlay.querySelector('#kbt-mode').value,
+            topK: Number(overlay.querySelector('#kbt-topk').value) || 5,
+            vectorThreshold: Number(overlay.querySelector('#kbt-threshold').value) || 0,
+            rerank: overlay.querySelector('#kbt-rerank').checked,
+          },
+        )
+        renderResult(data)
+        setState(`用例完成：${data.hits.length} 条命中`, 'good')
+        await loadRuns()
+      } catch (err) {
+        setState(err.message || '用例运行失败', 'bad')
+      } finally {
+        button.disabled = false
+      }
+      return
+    }
+    const caseDel = target.closest('[data-case-del]')
+    if (caseDel) {
+      const confirmed = await confirmCard({
+        title: '删除测试用例？',
+        message: '只删除用例，不会影响测试记录与知识库文档。',
+        confirmText: '删除用例',
+      })
+      if (!confirmed) return
+      try {
+        await apiSend('DELETE', `/api/console/kb/test-cases/${encodeURIComponent(caseDel.dataset.caseDel)}`)
+        setState('用例已删除', 'good')
+        await loadCases()
+      } catch (err) {
+        setState(err.message || '删除失败', 'bad')
+      }
+      return
+    }
+    const runAgain = target.closest('[data-run-query]')
+    if (runAgain) {
+      q.value = runAgain.dataset.runQuery
+      syncQueryCount()
+      return void run()
+    }
+  })
+  q.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+      event.preventDefault()
+      void run()
+    }
+  })
+  try {
+    await Promise.all([loadCases(), loadRuns(), loadEmbeddingModels()])
+  } catch (err) {
+    setState(err.message || '测试数据加载失败', 'bad')
+  }
+}
+async function openKbUploadDocModal(docId, collectionId) {
+  let status
+  try {
+    status = await api(`/api/console/kb/docs/${encodeURIComponent(docId)}/pipeline`)
+  } catch (err) {
+    alert(err.message || '文档状态读取失败')
+    return
+  }
+
+  const STEPS = [
+    {
+      key: 'parse',
+      label: '解析',
+      apiStage: 'parse',
+      retry: '重跑解析',
+      desc: '读取原文件，保留页码、段落和表格结构。',
+    },
+    {
+      key: 'clean',
+      label: '清洗',
+      apiStage: 'clean',
+      retry: '重跑清洗',
+      desc: '规则去噪；配置清洗模型时再做保事实改写。',
+    },
+    {
+      key: 'chunk',
+      label: '切片',
+      apiStage: 'chunk',
+      retry: '重跑切片',
+      desc: '按知识库切片参数生成可召回片段。',
+    },
+    {
+      key: 'index',
+      label: '索引',
+      apiStage: 'index',
+      retry: '重建索引',
+      desc: '写入关键词索引，并生成可选的向量索引。',
+    },
+  ]
+  const ACTIVE_STEP = { parsing: 0, cleaning: 1, chunking: 2, indexing: 3 }
+  const DONE_THROUGH = { uploaded: -1, parsing: -1, parsed: 0, cleaning: 0, cleaned: 1, chunking: 1, chunked: 2, indexing: 2, indexed: 3 }
+  const MODE_LABEL = {
+    rules: '规则清洗',
+    model: '模型清洗',
+    auto: '自动清洗',
+    manual: '人工修正',
+    null: '未清洗',
+  }
+  const formatDuration = (seconds) => {
+    const raw = Math.max(0, Number(seconds) || 0)
+    if (raw > 0 && raw < 1) return '不到 1 秒'
+    const total = Math.round(raw)
+    if (total > 0 && total < 60) return `${Math.max(1, total)} 秒`
+    if (total === 0) return '0 秒'
+    const minutes = Math.floor(total / 60)
+    const rest = total % 60
+    return rest ? `${minutes} 分 ${rest} 秒` : `${minutes} 分钟`
+  }
+  const stepKey = (index) => STEPS[index]?.key || 'parse'
+  const stepEstimate = (index) => Number(status.estimates?.[stepKey(index)] ?? 0)
+  const stepTiming = (index) => Number(status.timings?.[stepKey(index)] ?? 0)
+  const stageElapsed = (index) => {
+    if (status.activeStage !== stepKey(index) || !status.stageStartedAt) return 0
+    return Math.max(0, (Date.now() - Number(status.stageStartedAt)) / 1000)
+  }
+  const stepEtaText = (index, state) => {
+    const estimate = stepEstimate(index)
+    const timing = stepTiming(index)
+    if (state === 'done' || state === 'warn') {
+      if (timing) return `实际 ${formatDuration(timing)}`
+      return estimate ? `预计 ${formatDuration(estimate)}` : ''
+    }
+    if (state === 'error') return timing ? `已用 ${formatDuration(timing)}` : ''
+    if (state === 'active') {
+      const elapsed = stageElapsed(index)
+      const progress = stepKey(index) === 'clean' ? Number(status.progress || 0) : 0
+      const suffix = progress > 0.02 ? ` · 已清洗 ${Math.round(progress * 100)}%` : elapsed ? ` · 已用 ${formatDuration(elapsed)}` : ''
+      return estimate ? `预计 ${formatDuration(estimate)}${suffix}` : suffix.replace(' · ', '')
+    }
+    return estimate ? `预计 ${formatDuration(estimate)}` : ''
+  }
+  const actualTotalSeconds = () =>
+    ['parse', 'clean', 'chunk', 'index'].reduce((sum, key) => sum + Number(status.timings?.[key] ?? 0), 0)
+  const isRunning = (value) =>
+    ['parsing', 'cleaning', 'chunking', 'indexing'].includes(value.pipelineStage) ||
+    ['pending', 'running'].includes(value.lastJob?.status)
+  const initialStep = () => {
+    if (status.pipelineWarning) return 1
+    if (status.pipelineStage === 'failed') {
+      const failed = STEPS.findIndex((item) => item.apiStage === status.lastJob?.stage)
+      return failed >= 0 ? failed : 0
+    }
+    if (status.pipelineStage === 'needs_config') return 0
+    if (status.pipelineStage === 'indexed') return 3
+    const active = ACTIVE_STEP[status.pipelineStage]
+    if (active !== undefined) return active
+    const done = DONE_THROUGH[status.pipelineStage]
+    if (done !== undefined) return Math.min(3, done + 1)
+    return 0
+  }
+  const stageState = (index) => {
+    if (status.pipelineStage === 'failed') {
+      const failed = STEPS.findIndex((item) => item.apiStage === status.lastJob?.stage)
+      if (failed >= 0) return index === failed ? 'error' : index < failed ? 'done' : 'pending'
+      return index === 0 ? 'error' : 'pending'
+    }
+    if (status.pipelineStage === 'needs_config') return index === 0 ? 'error' : 'pending'
+    const active = ACTIVE_STEP[status.pipelineStage]
+    if (active === index) return 'active'
+    if (status.pipelineStage === 'uploaded' && ['pending', 'running'].includes(status.lastJob?.status) && index === 0) {
+      return 'active'
+    }
+    const done = DONE_THROUGH[status.pipelineStage] ?? -1
+    if (index <= done) {
+      if (index === 1 && status.pipelineWarning) return 'warn'
+      if (index === 3 && status.indexError) return 'warn'
+      return 'done'
+    }
+    return 'pending'
+  }
+  const stateLabel = (state) =>
+    ({ done: '已完成', active: isRunning(status) ? '处理中' : '待处理', warn: '已完成 · 有降级', error: '失败', pending: '待处理' })[state] || '待处理'
+
+  const overlay = modelModal(`
+    <div class="kb-flow-head">
+      <div class="kb-flow-title-wrap">
+        <span class="kb-flow-kicker">知识库 · 文档处理流水线</span>
+        <div class="kb-flow-titleline">
+          <h3>${esc(status.title)}</h3>
+          <span class="pill ${KB_STAGE_CLASS[status.pipelineStage] || ''}" id="kb-flow-status-pill">${esc(
+            KB_STAGE_LABEL[status.pipelineStage] || status.pipelineStage || '未知',
+          )}</span>
+        </div>
+        <div class="kb-flow-meta" id="kb-flow-meta"></div>
+      </div>
+      <button class="modal-x" type="button" id="kb-flow-x">×</button>
+    </div>
+    <div class="kb-flow-live" id="kb-flow-live" hidden>
+      <span class="kb-flow-live-dot"></span>
+      <span id="kb-flow-live-text"></span>
+      <span class="kb-flow-live-eta" id="kb-flow-live-eta"></span>
+      <span class="kb-flow-live-bar" id="kb-flow-live-bar" hidden><i></i></span>
+      <button class="kb-flow-follow" type="button" id="kb-flow-follow" hidden>回到当前步骤</button>
+    </div>
+    <div class="kb-flow-rail" id="kb-flow-rail"></div>
+    <div class="kb-flow-content" id="kb-flow-content"></div>
+    <div class="kb-flow-footer">
+      <div class="kb-flow-footer-left">
+        <button class="btn" type="button" id="kb-flow-retry"></button>
+        <span class="modal-state" id="kb-flow-msg"></span>
+      </div>
+      <div class="kb-flow-footer-right">
+        <span class="kb-flow-counter" id="kb-flow-counter"></span>
+        <button class="btn" type="button" id="kb-flow-prev">上一步</button>
+        <button class="btn primary" type="button" id="kb-flow-next">下一步</button>
+        <button class="btn ghost" type="button" id="kb-flow-close">关闭</button>
+      </div>
+    </div>`)
+  overlay.querySelector('.modal').classList.add('kb-flow-modal')
+
+  const railEl = overlay.querySelector('#kb-flow-rail')
+  const contentEl = overlay.querySelector('#kb-flow-content')
+  const metaEl = overlay.querySelector('#kb-flow-meta')
+  const pillEl = overlay.querySelector('#kb-flow-status-pill')
+  const liveEl = overlay.querySelector('#kb-flow-live')
+  const liveTextEl = overlay.querySelector('#kb-flow-live-text')
+  const liveEtaEl = overlay.querySelector('#kb-flow-live-eta')
+  const liveBarEl = overlay.querySelector('#kb-flow-live-bar')
+  const followBtn = overlay.querySelector('#kb-flow-follow')
+  const retryBtn = overlay.querySelector('#kb-flow-retry')
+  const msgEl = overlay.querySelector('#kb-flow-msg')
+  const counterEl = overlay.querySelector('#kb-flow-counter')
+  const prevBtn = overlay.querySelector('#kb-flow-prev')
+  const nextBtn = overlay.querySelector('#kb-flow-next')
+  const caches = { raw: null, clean: null, chunks: null }
+  const loading = { raw: false, clean: false, chunks: false }
+  const previewErrors = { raw: '', clean: '', chunks: '' }
+  let assetsCache = null
+  let assetsLoading = false
+  let assetsError = ''
+  let stepIndex = initialStep()
+  let followProgress = isRunning(status)
+  let closed = false
+  let pollTimer = null
+  let refreshBusy = false
+  let editing = null
+
+  const stopPolling = () => {
+    if (pollTimer) clearInterval(pollTimer)
+    pollTimer = null
+  }
+  const close = () => {
+    closed = true
+    stopPolling()
+    overlay.remove()
+  }
+  const setMsg = (text, kind = '') => {
+    msgEl.className = `modal-state ${kind}`
+    msgEl.textContent = text || ''
+  }
+  const modeText = () => MODE_LABEL[status.cleanMode ?? 'null'] || status.cleanMode || '未清洗'
+  const reduction = () => {
+    if (!status.rawChars || !status.cleanChars) return '—'
+    const value = (1 - status.cleanChars / status.rawChars) * 100
+    return `${Math.max(0, value).toFixed(1)}%`
+  }
+  const previewStats = (kind) => {
+    const data = caches[kind]
+    if (!data) return ''
+    return `${Number(data.totalLength ?? data.text?.length ?? 0).toLocaleString()} 字符`
+  }
+
+  const renderHeader = () => {
+    pillEl.className = `pill ${KB_STAGE_CLASS[status.pipelineStage] || ''}`
+    pillEl.textContent = KB_STAGE_LABEL[status.pipelineStage] || status.pipelineStage || '未知'
+    const actualTotal = actualTotalSeconds()
+    metaEl.innerHTML = [
+      `<span>版本 v${status.version}</span>`,
+      status.pageCount ? `<span>${status.pageCount} 页</span>` : '',
+      `<span>${status.chunkCount} 个切片</span>`,
+      status.imageCount ? `<span>${status.imageCount} 张图片</span>` : '',
+      isRunning(status) && status.remainingSeconds != null
+        ? `<span class="kb-flow-meta-eta">预计还需 ${formatDuration(status.remainingSeconds)}</span>`
+        : status.pipelineStage === 'indexed' && actualTotal
+          ? `<span class="kb-flow-meta-eta">全程耗时 ${formatDuration(actualTotal)}</span>`
+          : status.estimates?.total
+            ? `<span class="kb-flow-meta-eta">预计全程 ${formatDuration(status.estimates.total)}</span>`
+            : '',
+      `<span>最近更新 ${fmtTime(status.updatedAt)}</span>`,
+      status.pipelineWarning ? '<span class="kb-flow-meta-warn">有降级项</span>' : '',
+    ]
+      .filter(Boolean)
+      .join('<i></i>')
+  }
+  const renderLive = () => {
+    if (!isRunning(status)) {
+      liveEl.hidden = true
+      return
+    }
+    liveEl.hidden = false
+    const active = ACTIVE_STEP[status.pipelineStage]
+    const progress = Math.max(0, Math.min(1, Number(status.progress || 0)))
+    const progressCopy =
+      active === 1 && progress > 0.02 ? ` · 已清洗 ${Math.round(progress * 100)}%` : ''
+    liveTextEl.textContent =
+      active === undefined
+        ? '任务已排队，等待 worker 开始处理'
+        : `正在${STEPS[active].label} · 第 ${active + 1} / 4 步${progressCopy}`
+    liveEtaEl.textContent =
+      status.remainingSeconds != null ? `预计还需 ${formatDuration(status.remainingSeconds)}` : ''
+    const showBar = active === 1 && progress > 0.02
+    liveBarEl.hidden = !showBar
+    if (showBar) liveBarEl.querySelector('i').style.width = `${Math.max(2, Math.round(progress * 100))}%`
+    followBtn.hidden = followProgress || active === undefined
+  }
+  const renderRail = () => {
+    railEl.innerHTML = STEPS.map((item, index) => {
+      const state = stageState(index)
+      const active = index === stepIndex ? ' is-current' : ''
+      const icon =
+        state === 'done' ? '✓' : state === 'warn' ? '!' : state === 'error' ? '×' : state === 'active' ? '' : index + 1
+      const eta = stepEtaText(index, state)
+      return `<button class="kb-flow-step is-${state}${active}" type="button" data-flow-step="${index}" ${
+        index === stepIndex ? 'aria-current="step"' : ''
+      }>
+        <span class="kb-flow-step-no">${state === 'active' ? '<i class="kb-flow-spinner"></i>' : icon}</span>
+        <span class="kb-flow-step-copy"><strong>${item.label}</strong><small>${stateLabel(state)}${
+          eta ? `<span class="kb-flow-step-eta is-${state}">${eta}</span>` : ''
+        }</small></span>
+      </button>${index < STEPS.length - 1 ? '<span class="kb-flow-connector"></span>' : ''}`
+    }).join('')
+    for (const button of railEl.querySelectorAll('[data-flow-step]')) {
+      button.addEventListener('click', () => {
+        stepIndex = Number(button.dataset.flowStep)
+        followProgress = false
+        setMsg('')
+        renderAll()
+      })
+    }
+  }
+  const previewPane = (title, text, kind, options = {}) => {
+    if (loading[kind]) {
+      return `<section class="kb-flow-pane"><header><strong>${title}</strong></header><div class="kb-flow-pane-loading">加载中…</div></section>`
+    }
+    if (previewErrors[kind]) {
+      return `<section class="kb-flow-pane"><header><strong>${title}</strong></header><div class="kb-flow-pane-loading is-bad">${esc(
+        previewErrors[kind],
+      )}</div></section>`
+    }
+    const body = text || '（暂无内容）'
+    return `<section class="kb-flow-pane">
+      <header><strong>${title}</strong><span>${previewStats(kind)}</span></header>
+      ${options.plain ? `<pre>${esc(body)}</pre>` : `<div class="kb-flow-rich">${renderFlowRich(body)}</div>`}
+    </section>`
+  }
+  const statCard = (label, value, hint = '') =>
+    `<div class="kb-flow-stat"><span>${label}</span><strong>${value}</strong>${hint ? `<small>${hint}</small>` : ''}</div>`
+  const alertCard = (kind, title, body) =>
+    `<div class="kb-flow-alert is-${kind}"><strong>${esc(title)}</strong>${body ? `<p>${esc(body)}</p>` : ''}</div>`
+  const imageKindLabel = (kind) =>
+    ({ page_render: '扫描页', standalone: '独立图片', document_image: '文档内嵌图' })[kind] || '图片'
+  const fmtAssetSize = (bytes) => {
+    const value = Number(bytes || 0)
+    if (!Number.isFinite(value) || value <= 0) return '0 B'
+    if (value < 1024) return `${value} B`
+    if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`
+    return `${(value / 1024 / 1024).toFixed(1)} MB`
+  }
+  const assetGallery = () => {
+    if (assetsLoading) {
+      return `<section class="kb-flow-assets"><header><strong>文档图片</strong><span>读取中…</span></header><div class="kb-flow-pane-loading">加载图片资产…</div></section>`
+    }
+    if (assetsError) {
+      return `<section class="kb-flow-assets"><header><strong>文档图片</strong><span>读取失败</span></header><div class="kb-flow-pane-loading is-bad">${esc(
+        assetsError,
+      )}</div></section>`
+    }
+    const assets = assetsCache || []
+    if (!assets.length) return ''
+    const withText = assets.filter((asset) => (asset.caption || asset.ocrText || '').trim()).length
+    return `<section class="kb-flow-assets">
+      <header><strong>文档图片</strong><span>${assets.length} 张${withText ? ` · ${withText} 张有说明/OCR` : ''}</span></header>
+      <div class="kb-flow-asset-grid">${assets
+        .map(
+          (asset) => `<figure class="kb-flow-asset">
+            <a href="${esc(asset.url)}" target="_blank" rel="noreferrer noopener"><img src="${esc(asset.url)}" alt="${esc(
+              asset.caption || asset.sourceName || '文档图片',
+            )}" loading="lazy"></a>
+            <figcaption>
+              <div class="kb-flow-asset-badges"><span>${imageKindLabel(asset.kind)}</span>${
+                asset.pageNo ? `<span>第 ${Number(asset.pageNo)} 页</span>` : ''
+              }<span>${fmtAssetSize(Number(asset.sizeBytes || 0))}</span></div>
+              <strong>${esc(asset.caption || asset.sourceName || '未命名图片')}</strong>
+              ${asset.ocrText ? `<p>${esc(asset.ocrText.slice(0, 150))}${asset.ocrText.length > 150 ? '…' : ''}</p>` : '<p class="is-empty">暂无 OCR 文本</p>'}
+            </figcaption>
+          </figure>`,
+        )
+        .join('')}</div>
+    </section>`
+  }
+  const editorPane = (kind, title, note, value, ordinal = null) => {
+    const action =
+      kind === 'raw' ? '保存并重新清洗' : kind === 'clean' ? '保存并重新切片' : '保存并重建索引'
+    const label = kind === 'raw' ? '解析文本' : kind === 'clean' ? '清洗文本' : `切片 #${ordinal + 1}`
+    return `<section class="kb-flow-editor">
+      <header>
+        <div><strong>手动修正${label}</strong><span>${esc(note)}</span></div>
+        <span class="kb-flow-editor-badge">人工编辑</span>
+      </header>
+      <textarea data-kb-editor rows="14" spellcheck="false">${esc(value || '')}</textarea>
+      <footer>
+        <span class="kb-flow-editor-count" data-kb-editor-count>${String(value || '').length.toLocaleString()} 字符</span>
+        <div>
+          <button class="btn" type="button" data-kb-cancel-edit>取消</button>
+          <button class="btn primary" type="button" data-kb-save-edit="${kind}"${
+            ordinal === null ? '' : ` data-kb-chunk-ordinal="${ordinal}"`
+          }>${action}</button>
+        </div>
+      </footer>
+    </section>`
+  }
+  const canManualEdit = (step) =>
+    !isRunning(status) &&
+    ['raw', 'clean', 'chunk'].includes(step.key) &&
+    stageState(stepIndex) !== 'active' &&
+    (step.key === 'chunk' ? Boolean(caches.chunks?.chunks?.length) : Boolean(caches[step.key]))
+
+  const warningCopy = () => {
+    const warning = status.pipelineWarning || ''
+    if (!warning) return null
+    if (/timeout|超时|aborted/i.test(warning)) {
+      return {
+        title: '模型清洗超时，已使用规则清洗结果',
+        body: '模型在超时时间内没有返回。系统没有丢弃文档，已保留规则清洗结果并继续切片；可以只重跑「清洗」步骤。',
+      }
+    }
+    if (/没有配置 kb\.clean/.test(warning)) {
+      return {
+        title: '未配置清洗模型，已使用规则清洗',
+        body: '当前清洗方式要求模型，但知识库与文档都没有绑定 kb.clean 模型。绑定后可从清洗步骤重跑。',
+      }
+    }
+    if (/缺少块标记/.test(warning)) {
+      return {
+        title: '模型输出缺少块标记，已使用规则结果',
+        body: '模型没有按【块n】格式返回，系统保留了规则清洗结果。可重跑清洗，或换一个更稳定的清洗模型。',
+      }
+    }
+    if (/未返回|保留规则/.test(warning)) {
+      return {
+        title: '部分块未返回，已保留规则结果',
+        body: '模型只清洗了部分块，缺失部分已回退规则清洗。文档已经继续入库，不影响检索。',
+      }
+    }
+    return { title: '流水线有降级项', body: warning }
+  }
+
+  const renderContent = () => {
+    const step = STEPS[stepIndex]
+    const state = stageState(stepIndex)
+    const stepError =
+      state === 'error'
+        ? status.pipelineError || status.lastJob?.error || `${step.label}步骤失败`
+        : ''
+    const head = `<div class="kb-flow-step-head">
+      <div><span class="kb-flow-step-eyebrow">STEP ${stepIndex + 1} / 4</span><h4>${step.label}</h4><p>${step.desc}</p></div>
+      <div class="kb-flow-step-head-actions">
+        ${
+          stepEtaText(stepIndex, state)
+            ? `<span class="kb-flow-step-time is-${state}">${stepEtaText(stepIndex, state)}</span>`
+            : ''
+        }
+        <span class="kb-flow-state is-${state}">${stateLabel(state)}</span>
+        ${
+          !editing && canManualEdit(step) && step.key !== 'chunk'
+            ? `<button class="btn kb-flow-edit-btn" type="button" data-kb-edit="${step.key}">✎ 手动修正</button>`
+            : editing
+              ? '<span class="kb-flow-editing-tag">手动修正中</span>'
+              : ''
+        }
+      </div>
+    </div>`
+    let body = ''
+    if (step.key === 'parse') {
+      body = `<div class="kb-flow-stats">
+          ${statCard('页数', status.pageCount || '—', status.pageCount ? '含扫描页' : '文本文件')}
+          ${statCard('原始字符', status.rawChars ? status.rawChars.toLocaleString() : '—')}
+          ${statCard('文档图片', status.imageCount || '—', status.imageTextCount ? `${status.imageTextCount} 张有 OCR/说明` : '未抽取到图片')}
+          ${statCard(
+            stepTiming(0) && ['done', 'warn'].includes(state) ? '本步耗时' : '预计耗时',
+            stepTiming(0) && ['done', 'warn'].includes(state) ? formatDuration(stepTiming(0)) : formatDuration(stepEstimate(0)),
+            ['done', 'warn'].includes(state) && stepEstimate(0) ? `预计 ${formatDuration(stepEstimate(0))}` : '实际计时',
+          )}
+        </div>
+        ${stepError ? alertCard('bad', '解析失败', stepError) : ''}
+        ${
+          editing?.kind === 'raw'
+            ? editorPane('raw', '解析文本', '修正 OCR 或版式解析误差；保存后从清洗步骤重新执行。', editing.text)
+            : `${assetGallery()}${previewPane('解析后的原始文本', caches.raw?.text, 'raw')}`
+        }`
+    } else if (step.key === 'clean') {
+      const copy = warningCopy()
+      const modeHint =
+        status.cleanModelName ||
+        (status.cleanMode === 'manual'
+          ? '人工修正结果'
+          : status.pipelineWarning && /清洗/.test(status.pipelineWarning)
+            ? '模型清洗已降级'
+            : '')
+      body = `<div class="kb-flow-stats">
+          ${statCard('清洗方式', modeText(), modeHint)}
+          ${statCard('原始字符', status.rawChars ? status.rawChars.toLocaleString() : '—')}
+          ${statCard('清洗后字符', status.cleanChars ? status.cleanChars.toLocaleString() : '—', reduction())}
+          ${statCard(
+            stepTiming(1) && ['done', 'warn'].includes(state) ? '本步耗时' : '预计耗时',
+            stepTiming(1) && ['done', 'warn'].includes(state) ? formatDuration(stepTiming(1)) : formatDuration(stepEstimate(1)),
+            state === 'active' && Number(status.progress || 0) > 0.02
+              ? `已清洗 ${Math.round(Number(status.progress) * 100)}%`
+              : ['done', 'warn'].includes(state) && stepEstimate(1)
+                ? `预计 ${formatDuration(stepEstimate(1))}`
+                : '按块数与批次估算',
+          )}
+        </div>
+        ${stepError ? alertCard('bad', '清洗失败', stepError) : ''}
+        ${copy && !stepError ? alertCard('warn', copy.title, copy.body) : ''}
+        ${
+          editing?.kind === 'clean'
+            ? editorPane('clean', '清洗文本', '人工修正清洗结果；保存后重新切片并重建索引。', editing.text)
+            : `<div class="kb-flow-compare">
+          ${previewPane('清洗前', caches.raw?.text, 'raw')}
+          <span class="kb-flow-arrow">→</span>
+          ${previewPane('清洗后', caches.clean?.text, 'clean')}
+        </div>`
+        }`
+    } else if (step.key === 'chunk') {
+      const chunks = caches.chunks?.chunks || []
+      const average = chunks.length
+        ? Math.round(chunks.reduce((sum, item) => sum + Number(item.tokenCount || 0), 0) / chunks.length)
+        : 0
+      body = `<div class="kb-flow-stats">
+          ${statCard('切片数量', status.chunkCount || 0)}
+          ${statCard('平均 tokens', average || '—', chunks.length ? `按前 ${chunks.length} 片计算` : '')}
+          ${statCard('图片切片', chunks.filter((item) => item.imageUrl).length || '—', status.imageCount ? `文档共 ${status.imageCount} 张图片` : '无图片')}
+          ${statCard(
+            stepTiming(2) && ['done', 'warn'].includes(state) ? '本步耗时' : '预计耗时',
+            stepTiming(2) && ['done', 'warn'].includes(state) ? formatDuration(stepTiming(2)) : formatDuration(stepEstimate(2)),
+            ['done', 'warn'].includes(state) && stepEstimate(2) ? `预计 ${formatDuration(stepEstimate(2))}` : '按切片数估算',
+          )}
+        </div>
+        ${stepError ? alertCard('bad', '切片失败', stepError) : ''}
+        ${assetGallery()}
+        ${
+          chunks.length
+            ? `<div class="kb-flow-chunk-list">${chunks
+                .map((chunk) =>
+                  editing?.kind === 'chunk' && editing.ordinal === chunk.ordinal
+                    ? editorPane(
+                        'chunk',
+                        `切片 #${chunk.ordinal + 1}`,
+                        '修正单个切片内容；保存后只重建索引，不重新切片。',
+                        editing.text,
+                        chunk.ordinal,
+                      )
+                    : `<div class="kb-chunk"><div class="kb-chunk-head"><span>#${chunk.ordinal + 1} · ${
+                        chunk.tokenCount
+                      } tokens${chunk.heading ? ` · ${esc(chunk.heading)}` : ''}${
+                        chunk.pageNo ? ` · 第 ${chunk.pageNo} 页` : ''
+                      }</span>${chunk.imageUrl ? '<span class="kb-chunk-image-badge">含图片</span>' : ''}${
+                        !editing && !isRunning(status)
+                          ? `<button class="kb-chunk-edit" type="button" data-kb-edit="chunk" data-kb-edit-ordinal="${chunk.ordinal}">编辑</button>`
+                          : ''
+                      }</div><div class="kb-chunk-body${chunk.imageUrl ? ' has-image' : ''}">${
+                        chunk.imageUrl
+                          ? `<a class="kb-chunk-image" href="${esc(chunk.imageUrl)}" target="_blank" rel="noreferrer noopener"><img src="${esc(
+                              chunk.imageUrl,
+                            )}" alt="${esc(chunk.meta?.imageCaption || '切片关联图片')}" loading="lazy"><span>${esc(
+                              chunk.meta?.imageCaption || '查看原图',
+                            )}</span></a>`
+                          : ''
+                      }<div class="kb-chunk-rich">${renderFlowRich(chunk.text)}</div></div></div>`,
+                )
+                .join('')}</div>`
+            : loading.chunks
+              ? '<div class="kb-flow-empty">加载切片…</div>'
+              : `<div class="kb-flow-empty">${
+                  previewErrors.chunks ? esc(previewErrors.chunks) : '还没有生成切片'
+                }</div>`
+        }`
+    } else {
+      body = `<div class="kb-flow-stats">
+          ${statCard('关键词索引', status.chunkCount ? `${status.chunkCount} 个切片` : '未写入')}
+          ${statCard('向量条数', status.embeddingCount || 0, status.embeddingModels ? `${status.embeddingModels} 个模型` : '')}
+          ${statCard('文档版本', `v${status.version}`)}
+          ${statCard(
+            stepTiming(3) && ['done', 'warn'].includes(state) ? '本步耗时' : '预计耗时',
+            stepTiming(3) && ['done', 'warn'].includes(state) ? formatDuration(stepTiming(3)) : formatDuration(stepEstimate(3)),
+            ['done', 'warn'].includes(state) && stepEstimate(3) ? `预计 ${formatDuration(stepEstimate(3))}` : '含向量索引',
+          )}
+        </div>
+        <div class="kb-flow-index-flow">
+          <div><span>文本切片</span><strong>${status.chunkCount}</strong></div>
+          <i>→</i>
+          <div><span>关键词索引</span><strong>${status.chunkCount ? '已写入' : '未写入'}</strong></div>
+          <i>→</i>
+          <div><span>向量索引</span><strong>${status.embeddingCount ? '已生成' : '未生成'}</strong></div>
+        </div>
+        ${stepError ? alertCard('bad', '索引失败', stepError) : ''}
+        ${
+          status.indexError
+            ? alertCard('warn', '向量索引未完成，当前仍可关键词检索', status.indexError)
+            : status.embeddingCount === 0 && status.pipelineStage === 'indexed'
+              ? alertCard('warn', '尚未生成向量索引', '文档已完成关键词切片的入库；绑定向量模型并重建索引后，才能使用混合检索。')
+              : alertCard('ok', '索引结果', `关键词索引 ${status.chunkCount} 个切片，向量索引 ${status.embeddingCount} 条。`)
+        }`
+    }
+    contentEl.innerHTML = head + body
+  }
+  const renderFooter = () => {
+    const step = STEPS[stepIndex]
+    retryBtn.textContent = step.retry
+    retryBtn.disabled = Boolean(editing) || stageState(stepIndex) === 'active'
+    prevBtn.disabled = stepIndex === 0
+    nextBtn.textContent = stepIndex === STEPS.length - 1 ? '完成' : '下一步'
+    counterEl.textContent = `${stepIndex + 1} / ${STEPS.length}`
+  }
+  const renderAll = () => {
+    renderHeader()
+    renderLive()
+    renderRail()
+    renderContent()
+    renderFooter()
+    void ensureStep(stepIndex)
+  }
+
+  const loadPreview = async (kind) => {
+    if (caches[kind] || loading[kind]) return
+    loading[kind] = true
+    try {
+      const limit = kind === 'chunks' ? 50 : 20000
+      caches[kind] = await api(
+        `/api/console/kb/docs/${encodeURIComponent(docId)}/preview?kind=${kind}&limit=${limit}`,
+      )
+      previewErrors[kind] = ''
+    } catch (err) {
+      previewErrors[kind] = err.message || '预览读取失败'
+    } finally {
+      loading[kind] = false
+      if (!closed) renderContent()
+    }
+  }
+  const loadAssets = async () => {
+    if (assetsCache !== null || assetsLoading) return
+    assetsLoading = true
+    renderContent()
+    try {
+      const data = await api(`/api/console/kb/docs/${encodeURIComponent(docId)}/assets`)
+      assetsCache = Array.isArray(data?.assets) ? data.assets : []
+      assetsError = ''
+    } catch (err) {
+      assetsError = err.message || '图片资产读取失败'
+    } finally {
+      assetsLoading = false
+      if (!closed) renderContent()
+    }
+  }
+  const ensureStep = async (index) => {
+    const key = STEPS[index]?.key
+    if (key === 'parse') return Promise.all([loadPreview('raw'), loadAssets()])
+    if (key === 'clean') return Promise.all([loadPreview('raw'), loadPreview('clean')])
+    if (key === 'chunk') return Promise.all([loadPreview('chunks'), loadAssets()])
+  }
+
+  const refreshStatus = async (options = {}) => {
+    if (closed || refreshBusy) return
+    refreshBusy = true
+    try {
+      const next = await api(`/api/console/kb/docs/${encodeURIComponent(docId)}/pipeline`)
+      const previousStage = status.pipelineStage
+      const previousWarning = status.pipelineWarning
+      status = next
+      if (previousStage !== status.pipelineStage) {
+        caches.raw = null
+        caches.clean = null
+        caches.chunks = null
+        assetsCache = null
+        assetsError = ''
+        previewErrors.raw = ''
+        previewErrors.clean = ''
+        previewErrors.chunks = ''
+      }
+      if (options.follow !== false && followProgress && isRunning(status)) {
+        const active = ACTIVE_STEP[status.pipelineStage]
+        if (active !== undefined) stepIndex = active
+      }
+      if (followProgress && !previousWarning && status.pipelineWarning) {
+        stepIndex = 1
+        followProgress = false
+      }
+      if (status.pipelineStage === 'indexed' && followProgress) {
+        // 用户是从某一步重跑时，完成后停在该步展示结果，不强行跳到索引。
+        followProgress = false
+      }
+      if (!isRunning(status) && !status.pipelineWarning && status.status === 'ready') setMsg('')
+      renderAll()
+      if (isRunning(status)) {
+        if (!pollTimer) pollTimer = setInterval(() => void refreshStatus(), 1800)
+      } else {
+        stopPolling()
+        followBtn.hidden = true
+      }
+    } catch (err) {
+      setMsg(err.message || '状态刷新失败', 'bad')
+    } finally {
+      refreshBusy = false
+    }
+  }
+
+  overlay.querySelector('#kb-flow-x').addEventListener('click', close)
+  overlay.querySelector('#kb-flow-close').addEventListener('click', close)
+  prevBtn.addEventListener('click', () => {
+    if (stepIndex === 0) return
+    stepIndex -= 1
+    followProgress = false
+    setMsg('')
+    renderAll()
+  })
+  nextBtn.addEventListener('click', () => {
+    if (stepIndex === STEPS.length - 1) return close()
+    stepIndex += 1
+    followProgress = false
+    setMsg('')
+    renderAll()
+  })
+  followBtn.addEventListener('click', () => {
+    const active = ACTIVE_STEP[status.pipelineStage]
+    followProgress = true
+    if (active !== undefined) stepIndex = active
+    setMsg('')
+    renderAll()
+  })
+  const beginEdit = async (kind, ordinal = null) => {
+    if (editing) return
+    if (isRunning(status)) {
+      setMsg('流水线正在处理中，请等待当前任务结束后再手动修正。', 'bad')
+      return
+    }
+    stopPolling()
+    setMsg('手动修正中：自动刷新已暂停，保存后会继续执行。')
+    if (kind === 'raw' || kind === 'clean') {
+      if (!caches[kind]) await loadPreview(kind)
+      editing = { kind, ordinal: null, text: caches[kind]?.text || '' }
+    } else {
+      if (!caches.chunks) await loadPreview('chunks')
+      const chunk = (caches.chunks?.chunks || []).find((item) => item.ordinal === ordinal)
+      if (!chunk) {
+        setMsg('切片不存在，请刷新后重试。', 'bad')
+        return
+      }
+      editing = { kind: 'chunk', ordinal, text: chunk.text || '' }
+    }
+    if (!closed) renderAll()
+  }
+  const cancelEdit = () => {
+    editing = null
+    setMsg('已取消手动修正。')
+    renderAll()
+    void refreshStatus()
+  }
+  const saveEdit = async (button) => {
+    if (!editing) return
+    const kind = button.dataset.kbSaveEdit
+    const ordinal = button.dataset.kbChunkOrdinal === undefined ? null : Number(button.dataset.kbChunkOrdinal)
+    const textarea = contentEl.querySelector('[data-kb-editor]')
+    const text = textarea ? textarea.value : ''
+    if (!text.trim()) {
+      setMsg('内容不能为空。', 'bad')
+      textarea?.focus()
+      return
+    }
+    button.disabled = true
+    setMsg('正在保存手动修正…')
+    const savedKind = editing.kind
+    try {
+      if (kind === 'chunk') {
+        await apiSend('PUT', `/api/console/kb/docs/${encodeURIComponent(docId)}/chunks/${ordinal}`, { text })
+      } else {
+        await apiSend('PUT', `/api/console/kb/docs/${encodeURIComponent(docId)}/pipeline/content`, {
+          stage: kind,
+          text,
+        })
+      }
+    } catch (err) {
+      button.disabled = false
+      setMsg(err.message || '保存失败', 'bad')
+      return
+    }
+    editing = null
+    caches.raw = null
+    caches.clean = null
+    caches.chunks = null
+    previewErrors.raw = ''
+    previewErrors.clean = ''
+    previewErrors.chunks = ''
+    followProgress = true
+    stepIndex = savedKind === 'raw' ? 1 : savedKind === 'clean' ? 2 : 3
+    setMsg(
+      savedKind === 'raw'
+        ? '已保存解析文本，正在重新清洗…'
+        : savedKind === 'clean'
+          ? '已保存清洗文本，正在重新切片…'
+          : '已保存切片，正在重建索引…',
+      'good',
+    )
+    renderAll()
+    try {
+      await apiSend('POST', `/api/console/kb/docs/${encodeURIComponent(docId)}/pipeline/retry`, {
+        stage: savedKind === 'raw' ? 'clean' : savedKind === 'clean' ? 'chunk' : 'index',
+      })
+      await loadDocs(collectionId)
+      await refreshStatus({ follow: true })
+    } catch (err) {
+      setMsg(`内容已保存，但启动后续步骤失败：${err.message || '未知错误'}`, 'bad')
+      await refreshStatus()
+    }
+  }
+  contentEl.addEventListener('click', (event) => {
+    const cancel = event.target.closest('[data-kb-cancel-edit]')
+    if (cancel) {
+      cancelEdit()
+      return
+    }
+    const save = event.target.closest('[data-kb-save-edit]')
+    if (save) {
+      void saveEdit(save)
+      return
+    }
+    const edit = event.target.closest('[data-kb-edit]')
+    if (edit) {
+      const kind = edit.dataset.kbEdit
+      const ordinal = edit.dataset.kbEditOrdinal === undefined ? null : Number(edit.dataset.kbEditOrdinal)
+      void beginEdit(kind, ordinal)
+    }
+  })
+  contentEl.addEventListener('input', (event) => {
+    if (!event.target.matches('[data-kb-editor]')) return
+    const count = event.target.closest('.kb-flow-editor')?.querySelector('[data-kb-editor-count]')
+    if (count) count.textContent = `${event.target.value.length.toLocaleString()} 字符`
+  })
+  contentEl.addEventListener('keydown', (event) => {
+    if (!event.target.matches('[data-kb-editor]')) return
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      cancelEdit()
+      return
+    }
+    if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+      event.preventDefault()
+      contentEl.querySelector('[data-kb-save-edit]')?.click()
+    }
+  })
+  retryBtn.addEventListener('click', async () => {
+    const step = STEPS[stepIndex]
+    const confirmed = await confirmCard({
+      title: `${step.retry}？`,
+      message: `将从「${step.label}」步骤重新执行；后续步骤会按最新结果重新生成，文档在完成前不可用于新增召回。`,
+      confirmText: step.retry,
+    })
+    if (!confirmed) return
+    retryBtn.disabled = true
+    followProgress = true
+    setMsg(`已提交${step.label}任务，等待 worker…`)
+    try {
+      await apiSend('POST', `/api/console/kb/docs/${encodeURIComponent(docId)}/pipeline/retry`, {
+        stage: step.apiStage,
+      })
+      setMsg(`已排入队列，正在执行${step.label}。`, 'good')
+      await loadDocs(collectionId)
+      await refreshStatus({ follow: true })
+    } catch (err) {
+      retryBtn.disabled = false
+      setMsg(err.message || '重跑失败', 'bad')
+    }
+  })
+
+  renderAll()
+  if (isRunning(status)) pollTimer = setInterval(() => void refreshStatus(), 1800)
+}
+
+/**
+ * 批量入库进度台：上传成功后直接进入这里，整批与单文件状态同屏可见。
+ * 单文件仍复用 openKbUploadDocModal 的四步详情和手动修正能力。
+ */
+function openKbBatchPipeline(files, collectionId, failed = []) {
+  const STEPS = [
+    { key: 'parse', label: '解析' },
+    { key: 'clean', label: '清洗' },
+    { key: 'chunk', label: '切片' },
+    { key: 'index', label: '索引' },
+  ]
+  const ACTIVE_STEP = { parsing: 0, cleaning: 1, chunking: 2, indexing: 3 }
+  const DONE_THROUGH = {
+    uploaded: -1,
+    parsing: -1,
+    parsed: 0,
+    cleaning: 0,
+    cleaned: 1,
+    chunking: 1,
+    chunked: 2,
+    indexing: 2,
+    indexed: 3,
+  }
+  const items = files.map((item) => ({
+    docId: String(item.docId),
+    title: item.title || item.filename || '未命名文档',
+    filename: item.filename || item.title || '未命名文档',
+    sizeBytes: Number(item.sizeBytes) || 0,
+    duplicate: Boolean(item.duplicate),
+    status: null,
+    statusError: '',
+  }))
+  const failedFiles = Array.isArray(failed) ? failed : []
+  const overlay = modelModal(`
+    <div class="kb-batch-head">
+      <div class="kb-batch-title-wrap">
+        <span class="kb-batch-kicker">知识库 / 智能入库批次</span>
+        <div class="kb-batch-titleline">
+          <h3 id="kb-batch-title">批次正在入库</h3>
+          <span class="pill warn" id="kb-batch-pill">处理中</span>
+        </div>
+        <p id="kb-batch-subtitle"></p>
+      </div>
+      <button class="modal-x" type="button" id="kb-batch-x" aria-label="关闭">×</button>
+    </div>
+    <div class="kb-batch-notice" id="kb-batch-notice" hidden></div>
+    <div class="kb-batch-overview">
+      <div class="kb-batch-progress-head">
+        <div><strong id="kb-batch-progress-text">正在读取处理进度…</strong><span>整批四步流水线进度</span></div>
+        <span class="kb-batch-progress-percent" id="kb-batch-progress-percent">0%</span>
+      </div>
+      <div class="kb-batch-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+        <i id="kb-batch-bar"></i>
+      </div>
+      <div class="kb-batch-tabs" id="kb-batch-tabs"></div>
+    </div>
+    <div class="kb-batch-body">
+      <div class="kb-batch-list" id="kb-batch-list">
+        <div class="kb-batch-loading">正在读取 ${items.length} 个文件的流水线状态…</div>
+      </div>
+    </div>
+    <div class="kb-batch-foot">
+      <div class="kb-batch-live"><span class="kb-batch-live-dot"></span><span id="kb-batch-live">每 1.8 秒自动刷新</span></div>
+      <div class="kb-batch-foot-actions">
+        <button class="btn ghost" type="button" id="kb-batch-refresh">立即刷新</button>
+        <button class="btn primary" type="button" id="kb-batch-close">关闭</button>
+      </div>
+    </div>`)
+  overlay.querySelector('.modal').classList.add('kb-batch-modal')
+  const listEl = overlay.querySelector('#kb-batch-list')
+  const tabsEl = overlay.querySelector('#kb-batch-tabs')
+  const titleEl = overlay.querySelector('#kb-batch-title')
+  const pillEl = overlay.querySelector('#kb-batch-pill')
+  const subtitleEl = overlay.querySelector('#kb-batch-subtitle')
+  const noticeEl = overlay.querySelector('#kb-batch-notice')
+  const progressTextEl = overlay.querySelector('#kb-batch-progress-text')
+  const progressPercentEl = overlay.querySelector('#kb-batch-progress-percent')
+  const barEl = overlay.querySelector('#kb-batch-bar')
+  const liveEl = overlay.querySelector('#kb-batch-live')
+  let filter = 'all'
+  let closed = false
+  let refreshBusy = false
+  let batchDone = false
+  let lastRefreshAt = 0
+  let loadDocsDone = false
+  let pollTimer = null
+  const previousFocus = document.activeElement
+
+  if (failedFiles.length) {
+    noticeEl.hidden = false
+    noticeEl.innerHTML = `<strong>${failedFiles.length} 个文件未进入流水线</strong><ul>${failedFiles
+      .map((item) => `<li>${esc(item.filename || '未命名文件')}：${esc(item.error || '上传失败')}</li>`)
+      .join('')}</ul>`
+  }
+  tabsEl.innerHTML = ''
+
+  const fileExt = (name) => {
+    const ext = String(name).split('.').pop()
+    return ext && ext !== name ? ext.toUpperCase().slice(0, 5) : 'DOC'
+  }
+  const activeStepOf = (status) => ACTIVE_STEP[status?.pipelineStage]
+  const isTerminal = (item) =>
+    Boolean(item.statusError) ||
+    (item.status && ['indexed', 'failed', 'needs_config'].includes(item.status.pipelineStage))
+  const bucketOf = (item) => {
+    if (item.statusError) return 'error'
+    if (!item.status) return 'waiting'
+    const stage = item.status.pipelineStage
+    if (stage === 'indexed') return 'done'
+    if (stage === 'failed' || stage === 'needs_config') return 'error'
+    if (item.status.lastJob?.status === 'pending') return 'waiting'
+    if (activeStepOf(item.status) !== undefined || item.status.lastJob?.status === 'running') return 'processing'
+    return 'waiting'
+  }
+  const progressOf = (item) => {
+    if (item.statusError) return 0
+    const status = item.status
+    if (!status) return 0
+    if (status.pipelineStage === 'indexed') return 4
+    if (status.pipelineStage === 'needs_config') return 0
+    const done = DONE_THROUGH[status.pipelineStage] ?? -1
+    const failedRaw = status.pipelineStage === 'failed' ? STEPS.findIndex((step) => step.key === status.lastJob?.stage) : -1
+    const failed = failedRaw >= 0 ? failedRaw : status.pipelineStage === 'failed' ? 0 : -1
+    if (failed >= 0) return Math.max(0, failed)
+    const active = activeStepOf(status)
+    if (active !== undefined) return Math.min(4, done + 1.5)
+    return Math.max(0, done + 1)
+  }
+  const stepStateOf = (status, index) => {
+    if (!status) return 'pending'
+    if (status.pipelineStage === 'needs_config') return index === 0 ? 'error' : 'pending'
+    if (status.pipelineStage === 'failed') {
+      const raw = STEPS.findIndex((step) => step.key === status.lastJob?.stage)
+      const failed = raw >= 0 ? raw : 0
+      return index === failed ? 'error' : index < failed ? 'done' : 'pending'
+    }
+    const active = activeStepOf(status)
+    if (active === index) return 'active'
+    const done = DONE_THROUGH[status.pipelineStage] ?? -1
+    if (index <= done) return index === 3 && status.indexError ? 'warn' : 'done'
+    if (status.lastJob?.status === 'pending' && index === done + 1) return 'queued'
+    return 'pending'
+  }
+  const stepIcon = (state, index) =>
+    state === 'done' ? '✓' : state === 'warn' ? '!' : state === 'error' ? '×' : state === 'active' ? '' : index + 1
+  const activeCopy = (status) => {
+    if (!status) return '读取状态中…'
+    if (status.pipelineStage === 'needs_config') return status.pipelineError || '缺少 OCR 或兼容解析组件，等待配置'
+    if (status.pipelineStage === 'failed') return status.pipelineError || status.lastJob?.error || '流程执行失败'
+    if (status.pipelineStage === 'indexed') {
+      return status.indexError ? '已完成关键词索引，向量索引有异常' : '解析、清洗、切片、索引全部完成'
+    }
+    const active = activeStepOf(status)
+    if (active !== undefined) {
+      const desc =
+        active === 1 && status.cleanMode
+          ? ` · ${status.cleanMode === 'manual' ? '人工修正' : status.cleanModelName || status.cleanMode}`
+          : ''
+      return `正在${STEPS[active].label}${desc}`
+    }
+    if (status.lastJob?.status === 'pending') {
+      const queuedStage = STEPS.find((step) => step.key === status.lastJob?.stage)
+      return `排队中 · 等待${queuedStage?.label || '处理'}`
+    }
+    return '等待下一步'
+  }
+  const statusPill = (item) => {
+    if (item.statusError) return '<span class="pill danger">读取失败</span>'
+    if (!item.status) return '<span class="pill">查询中</span>'
+    const stage = item.status.pipelineStage
+    return `<span class="pill ${KB_STAGE_CLASS[stage] || ''}">${esc(KB_STAGE_LABEL[stage] || stage)}</span>`
+  }
+
+  const renderTabs = () => {
+    const counts = { all: items.length, processing: 0, waiting: 0, done: 0, error: 0 }
+    for (const item of items) counts[bucketOf(item)] += 1
+    const tabs = [
+      ['all', '全部'],
+      ['processing', '处理中'],
+      ['waiting', '排队中'],
+      ['done', '已完成'],
+      ['error', '异常'],
+    ]
+    tabsEl.innerHTML = tabs
+      .map(
+        ([key, label]) =>
+          `<button class="kb-batch-tab${filter === key ? ' is-active' : ''}" type="button" data-batch-filter="${key}">
+            <strong>${counts[key]}</strong><span>${label}</span>
+          </button>`,
+      )
+      .join('')
+  }
+  const renderItem = (item) => {
+    const bucket = bucketOf(item)
+    const status = item.status
+    const progress = progressOf(item)
+    const steps = STEPS.map((step, index) => {
+      const state = stepStateOf(status, index)
+      return `<span class="kb-batch-step is-${state}"><i>${state === 'active' ? '<b class="kb-batch-spinner"></b>' : stepIcon(state, index)}</i><b>${step.label}</b></span>`
+    }).join('<u></u>')
+    const meta = status
+      ? [
+          status.chunkCount ? `${status.chunkCount} 个切片` : '尚未切片',
+          status.rawChars || status.cleanChars
+            ? `${Number(status.rawChars || 0).toLocaleString()} → ${Number(status.cleanChars || 0).toLocaleString()} 字符`
+            : '',
+          `v${status.version}`,
+          status.cleanMode
+            ? status.cleanMode === 'manual'
+              ? '人工修正'
+              : status.cleanModelName || (status.cleanMode === 'rules' ? '规则清洗' : '智能清洗')
+            : '',
+        ]
+          .filter(Boolean)
+          .join(' · ')
+      : ''
+    const warning =
+      status?.pipelineWarning || status?.indexError
+        ? `<div class="kb-batch-warning">${esc((status.pipelineWarning || status.indexError || '').slice(0, 180))}</div>`
+        : ''
+    return `<article class="kb-batch-item is-${bucket}" tabindex="0" role="button" data-batch-doc="${esc(
+      item.docId,
+    )}" aria-label="查看 ${esc(item.filename)} 的处理流程">
+      <div class="kb-batch-item-body">
+        <div class="kb-batch-item-head">
+          <span class="kb-batch-ext">${esc(fileExt(item.filename))}</span>
+          <div class="kb-batch-item-title">
+            <strong>${esc(item.filename)}</strong>
+            <span>${item.sizeBytes ? kbFormatSize(item.sizeBytes) : ''}${
+              item.duplicate ? ' <em class="kb-batch-reuse">已存在 · 复用原文档</em>' : ''
+            }</span>
+          </div>
+          <div class="kb-batch-item-side">${statusPill(item)}<span class="kb-batch-go">查看流程 →</span></div>
+        </div>
+        <div class="kb-batch-steps">${steps}</div>
+        <div class="kb-batch-item-foot">
+          <span class="kb-batch-active">${esc(item.statusError || activeCopy(status))}</span>
+          <span class="kb-batch-meta">${esc(meta)}</span>
+        </div>
+        ${warning}
+      </div>
+      <div class="kb-batch-item-progress"><i style="width:${Math.round((progress / 4) * 100)}%"></i></div>
+    </article>`
+  }
+  const renderList = () => {
+    const visible = filter === 'all' ? items : items.filter((item) => bucketOf(item) === filter)
+    listEl.innerHTML = visible.length
+      ? visible.map(renderItem).join('')
+      : `<div class="kb-batch-empty">当前筛选下没有文件；${batchDone ? '批次已全部处理完成。' : '可以切回「全部」查看整批进度。'}</div>`
+  }
+  const renderProgress = () => {
+    const total = items.reduce((sum, item) => sum + progressOf(item), 0)
+    const percent = Math.min(100, Math.round((total / Math.max(1, items.length * 4)) * 100))
+    const done = items.filter((item) => item.status?.pipelineStage === 'indexed').length
+    const counts = { processing: 0, waiting: 0, done: 0, error: 0 }
+    for (const item of items) {
+      const bucket = bucketOf(item)
+      if (bucket in counts) counts[bucket] += 1
+    }
+    progressTextEl.textContent = batchDone
+      ? `已处理 ${done} / ${items.length} 个文件`
+      : `已完成 ${done} / ${items.length} 个文件 · ${counts.processing} 个处理中 · ${counts.waiting} 个排队`
+    progressPercentEl.textContent = `${percent}%`
+    barEl.style.width = `${percent}%`
+    barEl.parentElement?.setAttribute('aria-valuenow', String(percent))
+    titleEl.textContent = batchDone ? '批次入库已完成' : `批次正在入库 · ${items.length} 个文件`
+    pillEl.className = `pill ${batchDone ? (counts.error ? 'warn' : 'ok') : 'warn'}`
+    pillEl.textContent = batchDone ? (counts.error ? '完成 · 有异常' : '全部完成') : '处理中'
+    subtitleEl.textContent = batchDone
+      ? '已停止自动刷新；可点击任一文件查看完整四步结果。'
+      : '解析、清洗、切片、索引自动执行；点击任一文件可查看流程并手动修正自动产物。'
+    liveEl.textContent = batchDone
+      ? '批次已结束，自动刷新已停止'
+      : lastRefreshAt
+        ? `每 1.8 秒自动刷新 · 最近 ${fmtTime(lastRefreshAt)}`
+        : '正在连接流水线状态…'
+  }
+  const render = () => {
+    renderProgress()
+    renderTabs()
+    renderList()
+  }
+  const finishIfDone = () => {
+    if (!items.length || !items.every(isTerminal)) return
+    batchDone = true
+    if (pollTimer) clearInterval(pollTimer)
+    pollTimer = null
+    if (!loadDocsDone) {
+      loadDocsDone = true
+      void loadDocs(collectionId)
+    }
+  }
+  const refresh = async () => {
+    if (closed || refreshBusy) return
+    refreshBusy = true
+    try {
+      const result = await apiSend('POST', '/api/console/kb/docs/pipeline/batch', {
+        docIds: items.map((item) => item.docId),
+      })
+      const rows = Array.isArray(result.items) ? result.items : []
+      const byId = new Map(rows.map((row) => [String(row.status?.docId || row.docId), row]))
+      for (const item of items) {
+        const row = byId.get(item.docId)
+        if (!row) continue
+        if (row.ok && row.status) {
+          item.status = row.status
+          item.statusError = ''
+          if (row.status.title) item.title = row.status.title
+        } else {
+          item.statusError = row.error || '状态读取失败'
+        }
+      }
+      lastRefreshAt = Date.now()
+    } catch (err) {
+      liveEl.textContent = `刷新失败：${err.message || '网络错误'}；将继续重试`
+    } finally {
+      refreshBusy = false
+      finishIfDone()
+      render()
+    }
+  }
+  const close = () => {
+    if (closed) return
+    closed = true
+    if (pollTimer) clearInterval(pollTimer)
+    pollTimer = null
+    document.removeEventListener('keydown', onKey)
+    overlay.remove()
+    if (previousFocus && typeof previousFocus.focus === 'function' && document.contains(previousFocus)) {
+      previousFocus.focus()
+    }
+  }
+  const onKey = (event) => {
+    if (event.key !== 'Escape') return
+    if (document.body.lastElementChild !== overlay) return
+    event.preventDefault()
+    close()
+  }
+  const openDetail = (docId) => {
+    if (!docId) return
+    void openKbUploadDocModal(docId, collectionId)
+  }
+  overlay.querySelector('#kb-batch-x').addEventListener('click', close)
+  overlay.querySelector('#kb-batch-close').addEventListener('click', close)
+  overlay.querySelector('#kb-batch-refresh').addEventListener('click', () => void refresh())
+  tabsEl.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-batch-filter]')
+    if (!button) return
+    filter = button.dataset.batchFilter
+    render()
+  })
+  listEl.addEventListener('click', (event) => {
+    const row = event.target.closest('[data-batch-doc]')
+    if (!row) return
+    openDetail(row.dataset.batchDoc)
+  })
+  listEl.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return
+    const row = event.target.closest('[data-batch-doc]')
+    if (!row) return
+    event.preventDefault()
+    openDetail(row.dataset.batchDoc)
+  })
+  document.addEventListener('keydown', onKey)
+  render()
+  void refresh()
+  pollTimer = setInterval(() => void refresh(), 1800)
 }
 
 async function openKbDocEdit(docId) {
@@ -1246,20 +3320,82 @@ async function openKbDocEdit(docId) {
   })
 }
 
-async function loadDocs(collectionId) {
+function setKbPageSizeOpen(wrap, open) {
+  const trigger = wrap.querySelector('#kb-doc-page-size')
+  const menu = wrap.querySelector('.kb-page-size-menu')
+  if (!trigger || !menu) return
+  menu.hidden = !open
+  wrap.classList.toggle('is-open', open)
+  trigger.setAttribute('aria-expanded', String(open))
+  if (open) {
+    const selected = menu.querySelector('[role="option"][aria-selected="true"]')
+    ;(selected || menu.querySelector('[role="option"]'))?.focus()
+  }
+}
+
+document.addEventListener('click', (event) => {
+  const wrap = document.querySelector('[data-kb-page-size].is-open')
+  if (wrap && !wrap.contains(event.target)) setKbPageSizeOpen(wrap, false)
+})
+
+document.addEventListener('keydown', (event) => {
+  if (event.key !== 'Escape') return
+  const wrap = document.querySelector('[data-kb-page-size].is-open')
+  if (!wrap) return
+  event.preventDefault()
+  event.stopPropagation()
+  setKbPageSizeOpen(wrap, false)
+  wrap.querySelector('#kb-doc-page-size')?.focus()
+})
+
+async function loadDocs(collectionId, options = {}) {
   const host = $('#kb-docs')
   if (!host) return
+  if (state.kbDocCollection !== collectionId) {
+    state.kbDocCollection = collectionId
+    state.kbDocPage = 1
+  }
+  if (options.page) state.kbDocPage = Math.max(1, Number(options.page) || 1)
+  if (options.pageSize) {
+    state.kbDocPageSize = Number(options.pageSize) || 10
+    state.kbDocPage = 1
+  }
+  const page = Math.max(1, Number(state.kbDocPage) || 1)
+  const pageSize = [10, 20, 50].includes(Number(state.kbDocPageSize)) ? Number(state.kbDocPageSize) : 10
   renderLoading(host, '加载文档…')
   try {
-    const data = await api(`/api/console/kb/collections/${encodeURIComponent(collectionId)}/docs`)
+    const data = await api(
+      `/api/console/kb/collections/${encodeURIComponent(collectionId)}/docs?page=${page}&pageSize=${pageSize}`,
+    )
     const collection = state.kb?.collections?.find((item) => item.id === collectionId)
     const sourceKind = data.collection.sourceKind || collection?.sourceKind || 'local'
     const sourceLabel = data.collection.sourceLabel || collection?.sourceLabel || sourceKind
     const external = Boolean(data.external)
-    const totalChunks = data.docs.reduce((sum, doc) => sum + Number(doc.chunkCount || 0), 0)
+    const pagination = data.pagination || {
+      page,
+      pageSize,
+      total: data.docs.length,
+      totalPages: 1,
+    }
+    state.kbDocPage = Number(pagination.page) || 1
+    state.kbDocPageSize = Number(pagination.pageSize) || pageSize
+    const totalChunks = Number(
+      data.totalChunks ?? data.docs.reduce((sum, doc) => sum + Number(doc.chunkCount || 0), 0),
+    )
     const vector = data.vector ?? { chunks: 0, vectors: 0, dim: 0, modelIds: [] }
     const indexCell = (doc) => {
       if (external) return `<span class="pill">外部托管</span>`
+      const stage = doc.pipelineStage || (doc.sourceType === 'upload' ? 'uploaded' : 'indexed')
+      const stageLabel = KB_STAGE_LABEL[stage] || stage
+      if (stage === 'needs_config') {
+        return `<span class="pill danger" title="${esc(doc.pipelineError || '')}">待配置</span>`
+      }
+      if (stage === 'failed') {
+        return `<span class="pill danger" title="${esc(doc.pipelineError || doc.indexError || '')}">流水线失败</span>`
+      }
+      if (stage !== 'indexed') {
+        return `<span class="pill warn" title="${esc(doc.pipelineError || '')}">${esc(stageLabel)}</span>`
+      }
       if (doc.status === 'pending') return '<span class="pill warn">待索引</span>'
       if (doc.status === 'indexing') return '<span class="pill warn">向量化中…</span>'
       if (doc.status === 'failed') {
@@ -1275,12 +3411,23 @@ async function loadDocs(collectionId) {
     }
     const docs = data.docs
       .map(
-        (doc) => `<tr${external ? '' : ` class="click-row" data-doc="${esc(doc.id)}"`}>
+        (doc) => `<tr${external ? '' : ` class="click-row" data-doc="${esc(doc.id)}" data-doc-type="${esc(
+          doc.sourceType || 'manual',
+        )}"`}>
           <td class="name-cell"><strong>${esc(doc.title)}</strong><div class="desc">${doc.chunkCount} ${
             external ? '字' : '个切片'
-          }</div></td>
+          }${doc.sourceType === 'upload' && doc.pipelineStage !== 'indexed' ? ` · ${esc(KB_STAGE_LABEL[doc.pipelineStage] || doc.pipelineStage)}` : ''}</div></td>
           <td><span class="pill">${external ? '外部' : esc(CLS_LABEL[doc.classification] || doc.classification)}</span></td>
-          <td>${indexCell(doc)}${doc.indexError && doc.status !== 'failed' ? `<div class="desc kb-index-error">${esc(doc.indexError)}</div>` : ''}</td>
+          <td>${indexCell(doc)}${
+            (doc.pipelineError || doc.indexError) && !['failed', 'needs_config'].includes(doc.pipelineStage)
+              ? `<div class="desc kb-index-error">${esc(doc.pipelineError || doc.indexError)}</div>`
+              : ''
+          }</td>
+          <td class="kb-doc-actions">${
+            external
+              ? '<span class="muted">上游管理</span>'
+              : `<button class="btn sm danger" type="button" data-doc-delete="${esc(doc.id)}" aria-label="删除 ${esc(doc.title)}">删除</button>`
+          }</td>
         </tr>`,
       )
       .join('')
@@ -1291,11 +3438,68 @@ async function loadDocs(collectionId) {
         : `<span class="pill source-pill">${esc(sourceLabel)}</span>`
     const docsHint = external
       ? `上游知识库返回的文档，EAB 内只读。文档由 ${sourceLabel} 上游管理；检索通过 kb.search 在线调用。${
-          data.docs.length === 0 ? '当前没有返回文档，请检查 API Key 是否有 dataset:read 权限。' : ''
+          pagination.total === 0 ? '当前没有返回文档，请检查 API Key 是否有 dataset:read 权限。' : ''
         }`
       : sourceKind === 'obsidian'
         ? 'Obsidian 文档已导入为本地切片，可直接点击编辑；上游新增文件请点“同步 Vault”。'
-        : '点击任意一行可编辑内容、密级与索引状态。'
+        : '点击任意一行查看详情；上传文档会显示解析/清洗/切片/向量化阶段，手工文档可直接编辑。'
+
+    const pageNumbers = []
+    if (pagination.totalPages <= 7) {
+      for (let index = 1; index <= pagination.totalPages; index += 1) pageNumbers.push(index)
+    } else {
+      pageNumbers.push(1)
+      const start = Math.max(2, pagination.page - 1)
+      const end = Math.min(pagination.totalPages - 1, pagination.page + 1)
+      if (start > 2) pageNumbers.push('…')
+      for (let index = start; index <= end; index += 1) pageNumbers.push(index)
+      if (end < pagination.totalPages - 1) pageNumbers.push('…')
+      pageNumbers.push(pagination.totalPages)
+    }
+    const pager = `<div class="kb-doc-pager">
+      <span class="kb-doc-pager-total">共 <strong>${pagination.total}</strong> 篇文档</span>
+      <div class="kb-doc-pager-controls">
+        <div class="kb-doc-page-size"><span>每页</span>
+          <span class="kb-page-size-select" data-kb-page-size>
+            <button class="kb-page-size-trigger" type="button" id="kb-doc-page-size"
+              aria-label="每页文档数，当前 ${pagination.pageSize} 条"
+              aria-haspopup="listbox" aria-expanded="false" aria-controls="kb-doc-page-size-menu">
+              <span class="kb-page-size-value">${pagination.pageSize}</span>
+              <span class="kb-page-size-caret" aria-hidden="true"></span>
+            </button>
+            <span class="kb-page-size-menu" id="kb-doc-page-size-menu" role="listbox" hidden>
+              ${[10, 20, 50]
+                .map(
+                  (size) => `<button class="kb-page-size-option" type="button" role="option"
+                    data-kb-page-size-option="${size}" aria-selected="${pagination.pageSize === size}">
+                    <span>${size} 条</span><span class="kb-page-size-check" aria-hidden="true">${
+                      pagination.pageSize === size ? '✓' : ''
+                    }</span>
+                  </button>`,
+                )
+                .join('')}
+            </span>
+          </span>
+          条
+        </div>
+        <button class="kb-page-btn" type="button" data-kb-page="${pagination.page - 1}" ${
+          pagination.page <= 1 ? 'disabled' : ''
+        } aria-label="上一页">‹</button>
+        ${pageNumbers
+          .map((item) =>
+            item === '…'
+              ? '<span class="kb-page-ellipsis">…</span>'
+              : `<button class="kb-page-btn${item === pagination.page ? ' is-active' : ''}" type="button" data-kb-page="${item}" ${
+                  item === pagination.page ? 'aria-current="page"' : ''
+                } aria-label="第 ${item} 页">${item}</button>`,
+          )
+          .join('')}
+        <button class="kb-page-btn" type="button" data-kb-page="${pagination.page + 1}" ${
+          pagination.page >= pagination.totalPages ? 'disabled' : ''
+        } aria-label="下一页">›</button>
+        <span class="kb-doc-page-jump">${pagination.page} / ${pagination.totalPages}</span>
+      </div>
+    </div>`
 
     host.innerHTML = `
       <section class="panel kb-summary-panel">
@@ -1303,7 +3507,7 @@ async function loadDocs(collectionId) {
           <div>
             <h2>${esc(data.collection.name)} ${sourceBadge}</h2>
             <span class="hint">${esc(MODE_LABEL[data.collection.aclMode] || data.collection.aclMode)} · ${
-              collection?.docCount ?? data.docs.length
+              pagination.total
             } 篇文档${external ? '' : ` · ${totalChunks} 个切片`}</span>
           </div>
           <div class="head-actions">
@@ -1318,8 +3522,9 @@ async function loadDocs(collectionId) {
                 : ''
             }
             <button class="btn" type="button" id="kb-edit">编辑 / 可见范围</button>
+            ${external ? '' : '<button class="btn" type="button" id="kb-retrieval-test">召回测试</button>'}
             ${external ? '' : '<button class="btn" type="button" id="kb-reindex">重建索引</button>'}
-            ${external ? '' : '<button class="btn primary" type="button" id="kb-add-doc">添加文档</button>'}
+            ${external ? '' : '<button class="btn primary" type="button" id="kb-add-doc">上传文件</button>'}
           </div>
         </div>
         <div class="modal-state" id="kb-source-state"></div>
@@ -1348,23 +3553,28 @@ async function loadDocs(collectionId) {
       <section class="panel kb-doc-panel">
         <div class="panel-head">
           <div><h2>文档</h2>${hintBadge(external ? '来源说明' : '文档说明', docsHint)}</div>
-          <span class="pill">${data.docs.length} 篇</span>
+          <span class="pill">${pagination.total} 篇</span>
         </div>
         <table class="data">
-          <thead><tr><th>文档</th><th>密级</th><th>索引状态</th></tr></thead>
-          <tbody>${docs || `<tr><td colspan="3" class="empty">${
+          <thead><tr><th>文档</th><th>密级</th><th>索引状态</th><th>操作</th></tr></thead>
+          <tbody>${docs || `<tr><td colspan="4" class="empty">${
             external ? '上游还没有返回文档' : '还没有文档，点上方添加文档'
           }</td></tr>`}</tbody>
         </table>
+        ${pager}
       </section>`
 
     host.querySelector('#kb-edit')?.addEventListener('click', () => {
       if (collection) openKbModal(collection)
     })
     host.querySelector('#kb-add-doc')?.addEventListener('click', () => openKbDocModal(collectionId, data.collection.aclMode))
+    host.querySelector('#kb-retrieval-test')?.addEventListener('click', () => {
+      openKbRetrievalTest(collectionId)
+    })
     host.querySelector('#kb-test')?.addEventListener('click', async (event) => {
       const stateEl = host.querySelector('#kb-source-state')
-      event.currentTarget.disabled = true
+      const button = event.currentTarget
+      button.disabled = true
       stateEl.className = 'modal-state'
       stateEl.textContent = '测试连接中…'
       try {
@@ -1375,12 +3585,13 @@ async function loadDocs(collectionId) {
         stateEl.className = 'modal-state bad'
         stateEl.textContent = err.message || '测试失败'
       } finally {
-        event.currentTarget.disabled = false
+        button.disabled = false
       }
     })
     host.querySelector('#kb-sync')?.addEventListener('click', async (event) => {
       const stateEl = host.querySelector('#kb-source-state')
-      event.currentTarget.disabled = true
+      const button = event.currentTarget
+      button.disabled = true
       stateEl.className = 'modal-state'
       stateEl.textContent = '同步 Vault 中…'
       try {
@@ -1392,7 +3603,7 @@ async function loadDocs(collectionId) {
         stateEl.className = 'modal-state bad'
         stateEl.textContent = err.message || '同步失败'
       } finally {
-        event.currentTarget.disabled = false
+        button.disabled = false
       }
     })
     host.querySelector('#kb-reindex')?.addEventListener('click', async (event) => {
@@ -1431,7 +3642,75 @@ async function loadDocs(collectionId) {
       }
     })
     for (const row of host.querySelectorAll('[data-doc]')) {
-      row.addEventListener('click', () => openKbDocEdit(row.dataset.doc))
+      row.addEventListener('click', () => {
+        if (row.dataset.docType === 'upload') openKbUploadDocModal(row.dataset.doc, collectionId)
+        else openKbDocEdit(row.dataset.doc)
+      })
+    }
+    for (const button of host.querySelectorAll('[data-kb-page]')) {
+      button.addEventListener('click', async () => {
+        const target = Number(button.dataset.kbPage)
+        if (!target || target < 1 || target > pagination.totalPages || target === pagination.page) return
+        await loadDocs(collectionId, { page: target })
+      })
+    }
+    const pageSizeControl = host.querySelector('[data-kb-page-size]')
+    const pageSizeTrigger = pageSizeControl?.querySelector('#kb-doc-page-size')
+    pageSizeTrigger?.addEventListener('click', () => {
+      for (const other of document.querySelectorAll('[data-kb-page-size].is-open')) {
+        if (other !== pageSizeControl) setKbPageSizeOpen(other, false)
+      }
+      setKbPageSizeOpen(pageSizeControl, !pageSizeControl.classList.contains('is-open'))
+    })
+    for (const option of pageSizeControl?.querySelectorAll('[data-kb-page-size-option]') || []) {
+      option.addEventListener('click', async (event) => {
+        event.stopPropagation()
+        const size = Number(option.dataset.kbPageSizeOption)
+        setKbPageSizeOpen(pageSizeControl, false)
+        if (![10, 20, 50].includes(size) || size === pagination.pageSize) return
+        await loadDocs(collectionId, { pageSize: size })
+      })
+    }
+    for (const button of host.querySelectorAll('[data-doc-delete]')) {
+      button.addEventListener('click', async (event) => {
+        event.preventDefault()
+        event.stopPropagation()
+        const doc = data.docs.find((item) => item.id === button.dataset.docDelete)
+        if (!doc) return
+        const confirmed = await confirmCard({
+          title: '删除文档？',
+          message: `「${doc.title}」删除后不再参与检索，切片会一并移除。`,
+          confirmText: '删除文档',
+        })
+        if (!confirmed) return
+        const label = button.textContent
+        button.disabled = true
+        button.textContent = '删除中…'
+        try {
+          await apiSend('DELETE', `/api/console/kb/docs/${encodeURIComponent(doc.id)}`)
+          if (collection) collection.docCount = Math.max(0, pagination.total - 1)
+          if (state.kb) renderKbSide(state.kb)
+          await loadDocs(collectionId)
+        } catch (err) {
+          button.disabled = false
+          button.textContent = label
+          alert(err.message || '删除失败')
+        }
+      })
+    }
+    const activeStages = new Set([
+      'uploaded',
+      'parsing',
+      'parsed',
+      'cleaning',
+      'cleaned',
+      'chunking',
+      'chunked',
+      'indexing',
+    ])
+    if (state.kbPollTimer) clearTimeout(state.kbPollTimer)
+    if (!external && data.docs.some((doc) => activeStages.has(doc.pipelineStage))) {
+      state.kbPollTimer = setTimeout(() => loadDocs(collectionId), 2500)
     }
   } catch (err) {
     renderDenied(host, err)
@@ -1550,7 +3829,6 @@ function renderDeptDetail(node) {
   host.querySelector('[data-dept-detail-delete]')?.addEventListener('click', () => deleteDept(node))
   host.querySelector('[data-dept-view-members]')?.addEventListener('click', () => {
     state.deptFilter = node.path
-    state.includeSubdepts = true
     navigate('org')
   })
   host.querySelectorAll('[data-dept-child]').forEach((button) => {
@@ -1586,8 +3864,29 @@ async function loadMembers(container) {
     const companyRoot = `/${state.company}/`
     const members = data.members.filter((m) => {
       if (state.deptFilter === companyRoot) return true
-      return state.includeSubdepts ? m.deptPath.startsWith(state.deptFilter) : m.deptPath === state.deptFilter
+      // 部门成员默认包含所有下级部门成员，不再提供单独开关
+      return m.deptPath.startsWith(state.deptFilter)
     })
+    const searchTextOf = (m) =>
+      [
+        m.name,
+        m.title,
+        m.employeeNo,
+        m.externalUserId,
+        m.deptName,
+        m.deptPath,
+        STATUS_LABEL[m.status] || m.status,
+        ...(m.roles || []).flatMap((r) => [r.code, r.name, ROLE_LABEL[r.code] || '']),
+        ...(m.identities || []).flatMap((identity) => [
+          identity.provider,
+          CHANNEL_SOURCE_LABEL[identity.provider] || '',
+          identity.externalUserId,
+        ]),
+      ]
+        .filter(Boolean)
+        .join(' ')
+        .toLowerCase()
+
     const rows = members
       .map((m) => {
         const identities = Array.isArray(m.identities) && m.identities.length
@@ -1602,7 +3901,7 @@ async function loadMembers(container) {
           })
           .join('')
         const titleLine = m.title ? `<div class="desc">${esc(m.title)}</div>` : ''
-        return `<tr>
+        return `<tr data-member-search="${esc(searchTextOf(m))}">
         <td class="name-cell"><strong>${esc(m.name)}</strong>${titleLine}${identityRows}</td>
         <td>${esc(m.deptName)}<div class="desc mono">${esc(m.deptPath)}</div></td>
         <td>${(m.roles || []).map((r) => `<span class="chip accent">${esc(ROLE_LABEL[r.code] || r.code)}</span>`).join(' ')}</td>
@@ -1610,7 +3909,7 @@ async function loadMembers(container) {
           STATUS_LABEL[m.status] || m.status,
         )}</span></td>
         <td><div class="row-actions member-actions">
-          <button class="row-action primary" type="button" data-member-roles="${esc(m.id)}" title="配置角色与权限">配置权限</button>
+          <button class="row-action primary" type="button" data-member-roles="${esc(m.id)}" title="角色权限">角色权限</button>
           <button class="row-action" type="button" data-member-edit="${esc(m.id)}" title="编辑成员资料">编辑</button>
           <button class="row-action icon" type="button" data-member-more="${esc(m.id)}" title="更多操作" aria-haspopup="true">⋯</button>
         </div></td>
@@ -1631,14 +3930,14 @@ async function loadMembers(container) {
     host.innerHTML = `
       <section class="panel">
         <div class="panel-head">
-          <div><h2>${esc(deptLabel(state.deptFilter))} · 成员</h2><span class="hint">${members.length} 人</span></div>
+          <div><h2>${esc(deptLabel(state.deptFilter))} · 成员</h2><span class="hint" id="member-count">${members.length} 人</span></div>
           <div class="panel-actions">
             <label class="inline-field"><span>部门</span><select id="org-dept-filter">${deptSelectOptions(
               state.deptFilter,
             )}</select></label>
-            <label class="switch"><input type="checkbox" id="org-subdepts"${
-              state.includeSubdepts ? ' checked' : ''
-            } /><span>含下级</span></label>
+            <label class="inline-field member-search-field"><span>搜索</span><input id="member-search" type="search" placeholder="姓名 / 工号 / 部门 / 角色" value="${esc(
+              state.memberSearch,
+            )}" autocomplete="off" /></label>
             <button class="btn sm ghost" type="button" id="member-export">导出名单</button>
             <button class="btn sm ghost" type="button" id="member-bulk">批量授权</button>
             <button class="btn sm primary" type="button" id="member-new">＋ 新建成员</button>
@@ -1647,7 +3946,11 @@ async function loadMembers(container) {
         <div class="table-scroll">
           <table class="data member-table">
             <thead><tr><th>姓名</th><th>部门</th><th>角色</th><th>状态</th><th>操作</th></tr></thead>
-            <tbody>${rows || '<tr><td colspan="5" class="empty">该部门下没有直属成员</td></tr>'}</tbody>
+            <tbody>${
+              rows
+                ? `${rows}<tr id="member-search-empty" hidden><td colspan="5" class="empty">没有匹配的成员</td></tr>`
+                : '<tr><td colspan="5" class="empty">该部门及下级没有成员</td></tr>'
+            }</tbody>
           </table>
         </div>
       </section>
@@ -1682,18 +3985,35 @@ async function loadMembers(container) {
         if (box) box.textContent = `读取知识库失败：${err.message}`
       })
 
+    const applyMemberSearch = () => {
+      const query = state.memberSearch.trim().toLowerCase()
+      const tokens = query.split(/\s+/).filter(Boolean)
+      let shown = 0
+      for (const row of host.querySelectorAll('.member-table tbody tr[data-member-search]')) {
+        const haystack = row.dataset.memberSearch || ''
+        const matched = tokens.length === 0 || tokens.every((token) => haystack.includes(token))
+        row.hidden = !matched
+        if (matched) shown += 1
+      }
+      const count = host.querySelector('#member-count')
+      if (count) count.textContent = tokens.length ? `${shown} / ${members.length} 人` : `${members.length} 人`
+      const empty = host.querySelector('#member-search-empty')
+      if (empty) empty.hidden = !tokens.length || shown > 0
+    }
+    const searchInput = host.querySelector('#member-search')
+    if (searchInput) {
+      searchInput.addEventListener('input', () => {
+        state.memberSearch = searchInput.value
+        applyMemberSearch()
+      })
+      applyMemberSearch()
+    }
+
     const deptSelect = host.querySelector('#org-dept-filter')
     if (deptSelect) {
       deptSelect.addEventListener('change', () => {
         const option = deptSelect.selectedOptions[0]
         state.deptFilter = option?.dataset.path || null
-        loadMembers(host)
-      })
-    }
-    const subToggle = host.querySelector('#org-subdepts')
-    if (subToggle) {
-      subToggle.addEventListener('change', () => {
-        state.includeSubdepts = subToggle.checked
         loadMembers(host)
       })
     }
@@ -1951,13 +4271,79 @@ function formatStorageBytes(bytes) {
 
 async function openMemberRoles(member) {
   let roleData
+  let accessData = null
   try {
     roleData = await api('/api/console/roles')
+    if (state.access?.canConfigureAccess) {
+      accessData = await api(`/api/console/member-console-permissions/${encodeURIComponent(member.id)}`)
+    }
   } catch (err) {
     alert(err.message || '读取角色失败')
     return
   }
   const current = new Set((member.roles || []).map((role) => role.code))
+  const permissionMap = new Map((accessData?.pages || []).map((item) => [item.page, item]))
+  const pageMetaMap = new Map((accessData?.catalog?.pages || []).map((item) => [item.page, item]))
+  const actionChecked = (perm, action) => {
+    if (action === 'create') return perm?.canCreate === true
+    if (action === 'edit') return perm?.canEdit === true
+    return perm?.canDelete === true
+  }
+  const pageRowHtml = (key, title, perm, actions, className = '', hideView = false) => `
+    <div class="perm-page-row${className ? ` ${className}` : ''}" data-page-row="${esc(key)}">
+      <strong>${esc(title)}</strong>
+      <span class="perm-page-actions">
+        ${hideView ? '' : `<label class="scope-check"><input type="checkbox" data-page-view${perm?.canView ? ' checked' : ''} /> 可见</label>`}
+        ${actions
+          .map(
+            (action) => `<label class="scope-check"><input type="checkbox" data-page-action="${esc(action.id)}"${
+              actionChecked(perm, action.id) ? ' checked' : ''
+            } /> ${esc(action.label || action.id)}</label>`,
+          )
+          .join('')}
+      </span>
+    </div>`
+  const pageBlockHtml = (page) => {
+    const meta = pageMetaMap.get(page)
+    const perm = permissionMap.get(page)
+    const sections = Array.isArray(meta?.sections) ? meta.sections : []
+    if (sections.length === 0) {
+      return pageRowHtml(page, meta?.title || page, perm, Array.isArray(meta?.actions) ? meta.actions : [])
+    }
+    const hasSectionRows = sections.some((section) => permissionMap.has(`${page}:${section.key}`))
+    return `<div class="perm-page-block">
+      <div class="perm-page-parent"><strong>${esc(meta?.title || page)}</strong><span class="muted">页内选项分别授权</span></div>
+      ${sections
+        .map((section) => {
+          const key = `${page}:${section.key}`
+          // 旧数据只有整页权限时，分区先按整页权限回显；保存后会物化为独立分区行。
+          const childPerm = permissionMap.get(key) || (hasSectionRows ? undefined : perm)
+          return pageRowHtml(key, section.title, childPerm, Array.isArray(section.actions) ? section.actions : [], 'is-section', section.hideView === true)
+        })
+        .join('')}
+    </div>`
+  }
+  const accessTree = accessData
+    ? `
+    <div class="modal-section-title">后台访问 ${hintBadge('页面权限', '可见=只读；新增、编辑、删除分别控制该页对应操作。页内有选项的页面按选项分别授权，不再把整页写权限一次性交出去。')}</div>
+    <div class="muted role-console-summary">${
+      (accessData.roleAllowedPages || []).length
+        ? `角色已授予 ${(accessData.roleAllowedPages || []).length} 个页面；这里只配置个人额外权限，两者叠加生效。`
+        : '这里配置的是个人额外权限；角色带来的后台权限请在角色详情「后台权限」中配置。'
+    }</div>
+    <div class="perm-page-groups">
+      ${(accessData.catalog?.domains || [])
+        .map(
+          (domain) => `<div class="perm-page-group">
+            <div class="perm-page-domain">${esc(domain.title || domain.label || domain.id)}</div>
+            ${(domain.pages || []).map(pageBlockHtml).join('')}
+          </div>`,
+        )
+        .join('')}
+    </div>`
+    : `
+    <div class="modal-section-title">后台访问</div>
+    <div class="muted role-console-summary">当前账号没有「配置成员后台访问」权限。拥有「成员管理 → 后台访问 → 配置后台访问」的成员才能修改这里；请联系平台管理员开通。</div>`
   const overlay = modelModal(`
     <div class="modal-head"><h3>配置成员权限 · ${esc(member.name)}</h3><button class="modal-x" type="button">×</button></div>
     <div class="member-sum"><strong>${esc(member.deptName)}</strong><span>${esc(member.title || '未设置职务')}</span></div>
@@ -1974,6 +4360,7 @@ async function openMemberRoles(member) {
           .join('')}
       </div>
     </div>
+    ${accessTree}
     <div class="modal-state" id="a-state"></div>
     <div class="modal-actions">
       <button class="btn primary" type="button" id="a-save">保存</button>
@@ -1982,6 +4369,20 @@ async function openMemberRoles(member) {
   const close = () => overlay.remove()
   overlay.querySelector('.modal-x').addEventListener('click', close)
   overlay.querySelector('#a-cancel').addEventListener('click', close)
+  for (const actionBox of overlay.querySelectorAll('[data-page-action]')) {
+    actionBox.addEventListener('change', () => {
+      const row = actionBox.closest('[data-page-row]')
+      const viewBox = row?.querySelector('[data-page-view]')
+      if (actionBox.checked && viewBox) viewBox.checked = true
+    })
+  }
+  for (const viewBox of overlay.querySelectorAll('[data-page-view]')) {
+    viewBox.addEventListener('change', () => {
+      if (viewBox.checked) return
+      const row = viewBox.closest('[data-page-row]')
+      for (const actionBox of row?.querySelectorAll('[data-page-action]') || []) actionBox.checked = false
+    })
+  }
   overlay.querySelector('#a-save').addEventListener('click', async () => {
     const stateEl = overlay.querySelector('#a-state')
     const roles = [...overlay.querySelectorAll('[data-assign]:checked')].map((el) => el.dataset.assign)
@@ -1992,6 +4393,25 @@ async function openMemberRoles(member) {
     }
     stateEl.textContent = '保存中…'
     try {
+      if (accessData) {
+        const pages = [...overlay.querySelectorAll('[data-page-row]')]
+          .map((row) => {
+            const page = row.dataset.pageRow
+            const canView = row.querySelector('[data-page-view]')?.checked === true
+            const canCreate = row.querySelector('[data-page-action="create"]')?.checked === true
+            const canEdit = row.querySelector('[data-page-action="edit"]')?.checked === true
+            const canDelete = row.querySelector('[data-page-action="delete"]')?.checked === true
+            return {
+              page,
+              canView: canView || canCreate || canEdit || canDelete,
+              canCreate,
+              canEdit,
+              canDelete,
+            }
+          })
+          .filter((item) => item.canView || item.canCreate || item.canEdit || item.canDelete)
+        await apiSend('PUT', `/api/console/member-console-permissions/${encodeURIComponent(member.id)}`, { pages })
+      }
       await apiPost(`/api/console/members/${encodeURIComponent(member.id)}/roles`, { roles })
       close()
       loadMembers($('#org-members'))
@@ -2670,7 +5090,106 @@ document.addEventListener('visibilitychange', () => {
   if (!document.hidden) refreshOverviewChannels()
 })
 
+/**
+ * 成员后台的概览：只读一个聚合接口，不读角色/模型/渠道/插件明细。
+ * 这样只开通「概览」权限的成员也能正常看到概览，不会因为其它页面 403 而空白。
+ */
+async function loadOverviewMember() {
+  const view = $('#view')
+  const me = state.me
+  const [health, overview] = await Promise.all([
+    api('/api/health').catch(() => null),
+    api('/api/console/overview').catch(() => null),
+  ])
+  const counts = overview?.counts ?? {}
+  const channels = Array.isArray(overview?.channels) ? overview.channels : []
+  const bound = channels.filter((item) => Number(item.enabled) === 1).length
+  const tasks = [
+    { key: 'org', title: '组织架构', meta: `${counts.departments ?? 0} 个部门 · ${counts.members ?? 0} 名成员`, action: '查看组织' },
+    { key: 'roles', title: '角色权限', meta: `${counts.roles ?? 0} 个角色`, action: '查看角色' },
+    { key: 'kb', title: '知识库', meta: `${counts.kbCollections ?? 0} 个知识库`, action: '查看知识库' },
+    { key: 'models', title: '模型接入', meta: `${counts.providers ?? 0} 个供应商 · ${counts.models ?? 0} 个模型`, action: '查看模型' },
+    { key: 'channels', title: '渠道接入', meta: `${bound} / ${channels.length} 已启用`, action: '查看渠道' },
+    { key: 'extra', title: '插件', meta: `${counts.plugins ?? 0} 个已安装`, action: '查看插件' },
+  ].filter((task) => canViewPage(task.key))
+  const quickLinks = [
+    { key: 'org', title: '组织与成员', meta: `${counts.members ?? 0} 名成员` },
+    { key: 'models', title: '模型接入', meta: `${counts.models ?? 0} 个模型` },
+    { key: 'kb', title: '知识库与 RAG', meta: `${counts.kbCollections ?? 0} 个库` },
+    { key: 'channels', title: '渠道绑定', meta: `${bound} / ${channels.length} 已启用` },
+  ].filter((item) => canViewPage(item.key))
+
+  view.innerHTML = `
+    <div class="stats overview-stats">
+      <div class="stat"><div class="stat-label">服务状态</div><div class="stat-value">${health ? '运行中' : '异常'}<span class="stat-unit">${health ? `v${esc(health.version)}` : ''}</span></div></div>
+      <div class="stat"><div class="stat-label">组织规模</div><div class="stat-value">${counts.members ?? 0}<span class="stat-unit">成员 · ${counts.departments ?? 0} 部门</span></div></div>
+      <div class="stat"><div class="stat-label">知识与模型</div><div class="stat-value">${counts.kbCollections ?? 0}<span class="stat-unit">库 · ${counts.models ?? 0} 模型</span></div></div>
+      <div class="stat"><div class="stat-label">接入完成度</div><div class="stat-value">${bound}<span class="stat-unit">/ ${channels.length} 渠道已启用 · ${counts.plugins ?? 0} 插件</span></div></div>
+    </div>
+
+    <div class="overview-grid">
+      <section class="panel overview-tasks">
+        <div class="panel-head">
+          <div><h2>可访问的配置</h2>${hintBadge('权限说明', '这里只列出当前账号有「可见」权限的页面。')}</div>
+          <span class="pill">${tasks.length} 个页面</span>
+        </div>
+        <div class="setup-list">
+          ${
+            tasks.length
+              ? tasks
+                  .map(
+                    (task) => `<div class="setup-row">
+                      <span class="setup-state">可见</span>
+                      <div class="setup-main"><strong>${esc(task.title)}</strong><span>${esc(task.meta)}</span></div>
+                      <button class="btn sm" type="button" data-go="${task.key}">${esc(task.action)}</button>
+                    </div>`,
+                  )
+                  .join('')
+              : `<div class="empty">当前账号没有可配置页面；可查看的页面以上方导航为准。</div>`
+          }
+        </div>
+      </section>
+
+      <aside class="overview-side">
+        ${
+          quickLinks.length
+            ? `<section class="panel">
+                <div class="panel-head"><div><h2>快捷入口</h2></div></div>
+                <div class="quick-grid">
+                  ${quickLinks
+                    .map(
+                      (item) => `<button class="quick-link" type="button" data-go="${item.key}">
+                        <span>${esc(item.title)}</span>
+                        <small>${esc(item.meta)}</small>
+                        <i aria-hidden="true">→</i>
+                      </button>`,
+                    )
+                    .join('')}
+                </div>
+              </section>`
+            : ''
+        }
+        <section class="panel">
+          <div class="panel-head"><div><h2>当前身份</h2></div></div>
+          <div class="kv-grid">
+            <div><span>成员</span><strong>${esc(state.access?.name || me?.person?.name || '—')}</strong></div>
+            <div><span>公司</span><strong>${esc(overview?.company?.name ?? me?.company?.name ?? '—')}</strong></div>
+            <div><span>后台角色</span><strong>公司成员</strong></div>
+            <div><span>可见页面</span><strong>${state.allowedPages.length} 个</strong></div>
+            <div><span>写权限</span><strong>新增 ${countActionPages('create')} · 编辑 ${countActionPages('edit')} · 删除 ${countActionPages('delete')}</strong></div>
+            <div><span>健康检查</span><strong>${health ? `正常 · v${esc(health.version)}` : '不可用'}</strong></div>
+          </div>
+        </section>
+      </aside>
+    </div>`
+
+  // 成员概览没有页内选择器，必须收起 page-body 的 264px 侧栏列；
+  // 否则登录后内容会被这列空白推到右边，看起来像“侧边栏还在”。
+  setSide('', true)
+}
+
 async function loadOverview() {
+  if (state.access?.kind === 'member') return loadOverviewMember()
   const view = $('#view')
   const me = state.me
   const [health, org, kb, roles, providers, models, channels, plugins] = await Promise.all([
@@ -2801,27 +5320,6 @@ function switchCompany(companyId) {
   url.searchParams.set('company', companyId)
   history.replaceState(null, '', url.toString())
   renderCompanyPicker()
-}
-
-function roleRailSubmenuHtml(roles) {
-  if (!Array.isArray(roles)) {
-    return `<div class="org-rail-sub"><div class="org-rail-sub-empty">角色加载中…</div></div>`
-  }
-  if (!roles.length) {
-    return `<div class="org-rail-sub"><div class="org-rail-sub-empty">暂无角色</div></div>`
-  }
-  return `<div class="org-rail-sub">
-    ${roles
-      .map(
-        (role) => `<button class="org-role-item${state.selectedRole === role.code ? ' is-active' : ''}" type="button" data-role="${esc(
-          role.code,
-        )}">
-          <span class="org-role-name">${esc(ROLE_LABEL[role.code] || role.name)}</span>
-          <span class="org-role-meta">${role.members} 人</span>
-        </button>`,
-      )
-      .join('')}
-  </div>`
 }
 
 function openRoleCreateModal() {
@@ -3067,6 +5565,60 @@ async function openRoleMemberPicker(role, allMembers, boundIds) {
   })
 }
 
+function roleConsolePermissionTreeHtml(catalog, pages) {
+  const permissionMap = new Map((pages || []).map((item) => [item.page, item]))
+  const pageMetaMap = new Map((catalog?.pages || []).map((item) => [item.page, item]))
+  const actionChecked = (perm, action) => {
+    if (action === 'create') return perm?.canCreate === true
+    if (action === 'edit') return perm?.canEdit === true
+    return perm?.canDelete === true
+  }
+  const rowHtml = (key, title, perm, actions, className = '', hideView = false) => `
+    <div class="perm-page-row${className ? ` ${className}` : ''}" data-role-page-row="${esc(key)}">
+      <strong>${esc(title)}</strong>
+      <span class="perm-page-actions">
+        ${hideView ? '' : `<label class="scope-check"><input type="checkbox" data-role-page-view${perm?.canView ? ' checked' : ''} /> 可见</label>`}
+        ${actions
+          .map(
+            (action) => `<label class="scope-check"><input type="checkbox" data-role-page-action="${esc(action.id)}"${
+              actionChecked(perm, action.id) ? ' checked' : ''
+            } /> ${esc(action.label || action.id)}</label>`,
+          )
+          .join('')}
+      </span>
+    </div>`
+  const pageBlockHtml = (page) => {
+    const meta = pageMetaMap.get(page)
+    const perm = permissionMap.get(page)
+    const sections = Array.isArray(meta?.sections) ? meta.sections : []
+    if (sections.length === 0) {
+      return rowHtml(page, meta?.title || page, perm, Array.isArray(meta?.actions) ? meta.actions : [])
+    }
+    const hasSectionRows = sections.some((section) => permissionMap.has(`${page}:${section.key}`))
+    return `<div class="perm-page-block">
+      <div class="perm-page-parent"><strong>${esc(meta?.title || page)}</strong><span class="muted">页内选项分别授权</span></div>
+      ${sections
+        .map((section) => {
+          const key = `${page}:${section.key}`
+          const childPerm = permissionMap.get(key) || (hasSectionRows ? undefined : perm)
+          return rowHtml(key, section.title, childPerm, Array.isArray(section.actions) ? section.actions : [], 'is-section', section.hideView === true)
+        })
+        .join('')}
+    </div>`
+  }
+  return `
+    <div class="perm-page-groups">
+      ${(catalog?.domains || [])
+        .map(
+          (domain) => `<div class="perm-page-group">
+            <div class="perm-page-domain">${esc(domain.title || domain.label || domain.id)}</div>
+            ${(domain.pages || []).map(pageBlockHtml).join('')}
+          </div>`,
+        )
+        .join('')}
+    </div>`
+}
+
 function renderRoleEditor(role, allScopes = [], meta = {}) {
   const view = $('#view')
   const labels = meta.labels || {}
@@ -3078,7 +5630,16 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
   const boundMembers = allMembers.filter((member) => roleMemberIds.has(member.id))
   const groups = {}
   const selected = new Set(role.scopes)
-  const activeRoleTab = state.roleTab === 'members' ? 'members' : 'permissions'
+  const roleConsoleCatalog = meta.catalog || state.access?.catalog || null
+  const roleConsolePages = Array.isArray(role.consolePages) ? role.consolePages : []
+  const roleConsoleGrantedPages = new Set(
+    roleConsolePages.filter((item) => item.canView && item.parentPage).map((item) => item.parentPage),
+  ).size
+  const roleConsoleTree = roleConsoleCatalog
+    ? roleConsolePermissionTreeHtml(roleConsoleCatalog, roleConsolePages)
+    : '<div class="muted">后台页面目录加载中，刷新后重试。</div>'
+  const activeRoleTab =
+    state.roleTab === 'members' ? 'members' : state.roleTab === 'console' ? 'console' : 'permissions'
   for (const scope of allScopes.length ? allScopes : role.scopes) {
     const prefix = scopeGroups[scope] || scope.split(':')[0] || 'other'
     groups[prefix] = groups[prefix] || []
@@ -3091,6 +5652,9 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
       <button class="role-detail-tab${activeRoleTab === 'permissions' ? ' is-active' : ''}" type="button" role="tab" aria-selected="${
         activeRoleTab === 'permissions'
       }" data-role-tab="permissions">角色权限</button>
+      <button class="role-detail-tab${activeRoleTab === 'console' ? ' is-active' : ''}" type="button" role="tab" aria-selected="${
+        activeRoleTab === 'console'
+      }" data-role-tab="console">后台权限 <span class="role-tab-count" id="role-console-tab-count">${roleConsoleGrantedPages}</span></button>
       <button class="role-detail-tab${activeRoleTab === 'members' ? ' is-active' : ''}" type="button" role="tab" aria-selected="${
         activeRoleTab === 'members'
       }" data-role-tab="members">角色成员 <span class="role-tab-count">${boundMembers.length}</span></button>
@@ -3151,6 +5715,24 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
         <span class="muted" id="role-msg"></span>
       </div>
     </section>
+    <section class="panel role-console-panel" data-role-pane="console"${activeRoleTab === 'console' ? '' : ' hidden'}>
+      <div class="panel-head">
+        <div>
+          <h2>后台访问</h2>
+          ${hintBadge(
+            '角色后台权限',
+            '成员绑定该角色后自动获得这里的后台页面；成员单独配置的后台权限作为额外补充，两者取并集。页内有选项的页面按选项分别授权。',
+          )}
+        </div>
+        <span class="pill" id="role-console-granted">已授予 ${roleConsoleGrantedPages} 个页面</span>
+      </div>
+      <div class="muted role-console-summary">不配置则绑定成员不会因角色获得后台入口。这里只保存后台页面权限，不改角色权限点和角色成员。</div>
+      ${roleConsoleTree}
+      <div class="panel-actions">
+        <button class="btn primary" type="button" id="save-role-console">保存后台权限</button>
+        <span class="muted" id="role-console-msg"></span>
+      </div>
+    </section>
     <section class="panel role-member-panel" data-role-pane="members"${activeRoleTab === 'members' ? '' : ' hidden'}>
       <div class="panel-head">
         <div>
@@ -3191,7 +5773,7 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
     </section>`
 
   const setRoleTab = (tab) => {
-    state.roleTab = tab === 'members' ? 'members' : 'permissions'
+    state.roleTab = tab === 'members' ? 'members' : tab === 'console' ? 'console' : 'permissions'
     for (const button of view.querySelectorAll('[data-role-tab]')) {
       const active = button.dataset.roleTab === state.roleTab
       button.classList.toggle('is-active', active)
@@ -3209,6 +5791,48 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
     state.roleTab = 'permissions'
     loadRoles()
   })
+  for (const actionBox of view.querySelectorAll('[data-role-page-action]')) {
+    actionBox.addEventListener('change', () => {
+      const row = actionBox.closest('[data-role-page-row]')
+      const viewBox = row?.querySelector('[data-role-page-view]')
+      if (actionBox.checked && viewBox) viewBox.checked = true
+    })
+  }
+  for (const viewBox of view.querySelectorAll('[data-role-page-view]')) {
+    viewBox.addEventListener('change', () => {
+      if (viewBox.checked) return
+      const row = viewBox.closest('[data-role-page-row]')
+      for (const actionBox of row?.querySelectorAll('[data-role-page-action]') || []) actionBox.checked = false
+    })
+  }
+
+  const roleConsolePagesPayload = () =>
+    [...view.querySelectorAll('[data-role-pane="console"] [data-role-page-row]')].map((row) => ({
+      page: row.dataset.rolePageRow,
+      canView: row.querySelector('[data-role-page-view]')?.checked === true,
+      canCreate: row.querySelector('[data-role-page-action="create"]')?.checked === true,
+      canEdit: row.querySelector('[data-role-page-action="edit"]')?.checked === true,
+      canDelete: row.querySelector('[data-role-page-action="delete"]')?.checked === true,
+    }))
+
+  const roleConsoleGrantedCountFromDom = () => {
+    const pages = new Set()
+    for (const row of view.querySelectorAll('[data-role-pane="console"] [data-role-page-row]')) {
+      const page = String(row.dataset.rolePageRow || '').split(':')[0]
+      const granted =
+        row.querySelector('[data-role-page-view]')?.checked === true ||
+        [...row.querySelectorAll('[data-role-page-action]')].some((box) => box.checked)
+      if (page && granted) pages.add(page)
+    }
+    return pages.size
+  }
+  const refreshRoleConsoleGrantedCount = () => {
+    const count = roleConsoleGrantedCountFromDom()
+    const tabCount = view.querySelector('#role-console-tab-count')
+    const granted = view.querySelector('#role-console-granted')
+    if (tabCount) tabCount.textContent = String(count)
+    if (granted) granted.textContent = `已授予 ${count} 个页面`
+  }
 
   const save = $('#save-role')
   save.addEventListener('click', async () => {
@@ -3251,11 +5875,41 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
         await apiSend('DELETE', `/api/console/workspace-quotas/role/${encodeURIComponent(role.code)}`)
       }
       msg.textContent = '已保存'
+      showTopToast(`角色「${role.name}」已保存`)
       loadRoles()
     } catch (err) {
       msg.textContent = err.message || '保存失败'
     }
   })
+  $('#save-role-console')?.addEventListener('click', async () => {
+    const msg = $('#role-console-msg')
+    if (!roleConsoleCatalog) {
+      msg.textContent = '后台页面目录未加载，刷新后再保存'
+      return
+    }
+    msg.textContent = '保存中…'
+    try {
+      const consolePages = roleConsolePagesPayload()
+      const result = await apiSend('PUT', `/api/console/roles/${encodeURIComponent(role.code)}`, {
+        // 只保存后台访问；角色名、数据范围和权限点由「角色权限」页单独保存，避免互相覆盖。
+        consolePages,
+      })
+      if (Array.isArray(result?.consolePages)) role.consolePages = result.consolePages
+      refreshRoleConsoleGrantedCount()
+      msg.textContent = '已保存'
+      showTopToast(`角色「${role.name}」后台权限已保存`)
+    } catch (err) {
+      msg.textContent = err.message || '保存失败'
+    }
+  })
+
+  for (const box of view.querySelectorAll('[data-role-pane="console"] input[type="checkbox"]')) {
+    box.addEventListener('change', () => {
+      refreshRoleConsoleGrantedCount()
+      const msg = $('#role-console-msg')
+      if (msg && msg.textContent !== '保存中…') msg.textContent = '有未保存的修改'
+    })
+  }
   view.querySelectorAll('[data-role-member-remove]').forEach((button) => {
     const member = allMembers.find((item) => item.id === button.dataset.roleMemberRemove)
     button.addEventListener('click', () => {
@@ -3302,7 +5956,7 @@ async function loadRoles() {
           <div class="panel-head"><div><h2>角色清单</h2>${hintBadge('角色说明', '点左侧角色编辑；成员直接在角色页勾选，和成员管理双向同步。')}</div>
           <button class="btn" type="button" id="role-goto-org">去成员管理</button></div>
           <table class="data">
-            <thead><tr><th>角色</th><th>数据范围</th><th>权限点</th><th>成员</th><th>存储配额</th></tr></thead>
+            <thead><tr><th>角色</th><th>数据范围</th><th>权限点</th><th>后台</th><th>成员</th><th>存储配额</th></tr></thead>
             <tbody>
               ${data.roles
                 .map(
@@ -3310,6 +5964,13 @@ async function loadRoles() {
                     <td><strong>${esc(ROLE_LABEL[role.code] || role.name)}</strong><div class="desc mono">${esc(role.code)}</div></td>
                     <td>${esc(DATA_SCOPE_LABEL[role.dataScope] || role.dataScope)}</td>
                     <td>${role.scopes.length} 项</td>
+                    <td>${
+                      new Set(
+                        (Array.isArray(role.consolePages) ? role.consolePages : [])
+                          .filter((item) => item.canView && item.parentPage)
+                          .map((item) => item.parentPage),
+                      ).size
+                    } 页</td>
                     <td>${role.members} 人</td>
                     <td>${
                       role.quota
@@ -3341,6 +6002,7 @@ async function loadRoles() {
       ...scopeData,
       quotaDefaults: data.quotaDefaults,
       members: allMembers,
+      catalog: data.catalog || state.access?.catalog || null,
     })
     setPageActions(
       `<button class="btn ghost" type="button" id="role-matrix">权限矩阵</button><button class="btn" type="button" id="role-new-top">添加角色</button><button class="btn ghost danger-text" type="button" id="role-delete-top"${
@@ -3797,6 +6459,10 @@ function confirmCard({
     </div>`
     document.body.appendChild(overlay)
     const finish = (value) => {
+      if (value) {
+        const actionText = DELETE_ACTION_FEEDBACK.test(confirmText) ? confirmText : title
+        if (DELETE_ACTION_FEEDBACK.test(actionText)) armDeleteFeedback(actionText)
+      }
       document.removeEventListener('keydown', onKey)
       overlay.remove()
       resolve(value)
@@ -6190,6 +8856,7 @@ function bindBootConfigPanel() {
         await loadSys()
         const deletedState = $('#boot-upload-state')
         if (deletedState) deletedState.textContent = `已删除 ${data.deleted}`
+        showTopToast('启动片源已删除')
       } catch (err) {
         const failedState = $('#boot-upload-state')
         if (failedState) failedState.textContent = err.message || '删除失败'
@@ -6269,6 +8936,7 @@ async function loadSys() {
     let agentRetentionDays = settings?.agentRetentionDays ?? 0
     let recordRetentionDays = settings?.recordRetentionDays ?? 0
     let workspaceRecycleDays = settings?.workspaceRecycleDays ?? 30
+    const kbTestRetentionDays = settings?.kbTestRetentionDays ?? 30
     const logs = settings?.logs ?? {}
     const storageRows = settings?.storage?.rows ?? []
     const storagePending = settings?.storage?.pendingMigrations ?? []
@@ -6612,8 +9280,8 @@ async function loadSys() {
       </section>
       <section class="panel" data-section-panel="data">
         <div class="panel-head">
-          <div><h2>日志、审计与数据保留</h2>${hintBadge('清理说明', '同步记录、渠道事件、登录失败、插件事件按日志保留天数清理；会话与消息、云空间历史版本、工具/技能/团队/计划/异步任务记录按项目记录天数清理（默认永久，设天数后生效）；审计按独立天数，只从最老一端连续删除，被删段最后一行会留作链锚点，所以清理本身不会造成断链。数据连接的外部库内容始终只读，EAB 不自动写删；连接产生的同步记录和查询审计分别随日志/审计清理。回收区到期后物理副本与元数据一并删除。后台每 6 小时检查一次。')}</div>
-          <span class="pill">日志 ${retentionDays > 0 ? `${retentionDays} 天` : '永久'} · 审计 ${auditRetentionDays > 0 ? `${auditRetentionDays} 天` : '永久'} · Agent 轨迹 ${agentRetentionDays > 0 ? `${agentRetentionDays} 天` : '永久'} · 项目记录 ${recordRetentionDays > 0 ? `${recordRetentionDays} 天` : '永久'} · 回收区 ${workspaceRecycleDays > 0 ? `${workspaceRecycleDays} 天` : '永久'}</span>
+          <div><h2>日志、审计与数据保留</h2>${hintBadge('清理说明', '同步记录、渠道事件、登录失败、插件事件按日志保留天数清理；会话与消息、云空间历史版本、工具/技能/团队/计划/异步任务记录按项目记录天数清理（默认永久，设天数后生效）；知识库召回测试记录按测试记录天数清理，作用于所有知识库；审计按独立天数，只从最老一端连续删除，被删段最后一行会留作链锚点，所以清理本身不会造成断链。数据连接的外部库内容始终只读，EAB 不自动写删；连接产生的同步记录和查询审计分别随日志/审计清理。回收区到期后物理副本与元数据一并删除。后台每 6 小时检查一次。')}</div>
+          <span class="pill">日志 ${retentionDays > 0 ? `${retentionDays} 天` : '永久'} · 审计 ${auditRetentionDays > 0 ? `${auditRetentionDays} 天` : '永久'} · Agent 轨迹 ${agentRetentionDays > 0 ? `${agentRetentionDays} 天` : '永久'} · 项目记录 ${recordRetentionDays > 0 ? `${recordRetentionDays} 天` : '永久'} · 测试记录 ${kbTestRetentionDays} 天 · 回收区 ${workspaceRecycleDays > 0 ? `${workspaceRecycleDays} 天` : '永久'}</span>
         </div>
         <div class="kv-grid">
           <div><span>同步记录</span><strong>${fmtNum(logs.syncRuns ?? 0)} 条<span class="desc">差异 ${fmtNum(logs.syncDiffs ?? 0)} 条</span></strong></div>
@@ -6625,6 +9293,7 @@ async function loadSys() {
           <div><span>Agent 运行 / 步骤</span><strong>${fmtNum(logs.agentRuns ?? 0)} / ${fmtNum(logs.agentSteps ?? 0)} 条 ${hintBadge('轨迹保留', agentRetentionDays > 0 ? `超过 ${agentRetentionDays} 天自动清理已结束的 run 与步骤；运行中和挂起等后台结果的 run 不删。` : 'Agent 运行轨迹永久保留；设置天数后只清理已结束的 run。')}</strong></div>
           <div><span>项目记录</span><strong>${fmtNum(logs.chatSessions ?? 0)} 会话 / ${fmtNum(logs.chatMessages ?? 0)} 消息<span class="desc"> · 历史版本 ${fmtNum(logs.workspaceVersions ?? 0)} · 工具 ${fmtNum(logs.toolOperations ?? 0)} · 技能 ${fmtNum(logs.skillEvents ?? 0)} · 团队 ${fmtNum(logs.agentTeamMessages ?? 0)} · 计划 ${fmtNum(logs.scheduleRuns ?? 0)} · 异步 ${fmtNum(logs.asyncJobs ?? 0)}</span></strong></div>
           <div><span>数据连接查询审计</span><strong>${fmtNum(logs.databaseQueries ?? 0)} 条 ${hintBadge('连接数据', '外部数据库内容始终只读，EAB 不会按保留策略写删；连接产生的查询审计随审计天数清理，连接同步记录随日志天数清理。连接配置本身不自动删除。')}</strong></div>
+          <div><span>知识库召回测试记录</span><strong>${fmtNum(logs.kbTestRuns ?? 0)} 条 ${hintBadge('测试记录', `超过 ${kbTestRetentionDays} 天自动清理，作用于所有知识库；只删测试记录，不删用例和知识库内容。`)}</strong></div>
           <div><span>回收区</span><strong>${fmtNum(logs.workspaceRecycleFiles ?? 0)} 个 · ${fmtBytes(logs.workspaceRecycleBytes ?? 0)} ${hintBadge('回收区保留', workspaceRecycleDays > 0 ? `删除的文件超过 ${workspaceRecycleDays} 天自动清理：物理副本、历史快照和回收区元数据一并删除；活跃文件不动。` : '回收区永久保留，不自动删除磁盘文件与元数据。')}<span class="desc"> · 已删元数据 ${fmtNum(logs.workspaceDeletedRows ?? 0)} 条</span></strong></div>
         </div>
         <div class="form-grid" style="align-items:end;margin-top:14px">
@@ -6639,6 +9308,9 @@ async function loadSys() {
           </label>
           <label class="field"><span>项目记录保留天数（0 = 永久保留）</span>
             <input id="record-retention-input" type="number" min="0" max="3650" value="${recordRetentionDays}" />
+          </label>
+          <label class="field"><span>知识库测试记录保留天数（1–365）</span>
+            <input id="kb-test-retention-input" type="number" min="1" max="365" value="${kbTestRetentionDays}" />
           </label>
           <label class="field"><span>回收区保留天数（0 = 永久保留）</span>
             <input id="workspace-retention-input" type="number" min="0" max="3650" value="${workspaceRecycleDays}" />
@@ -6785,6 +9457,7 @@ async function loadSys() {
           button.addEventListener('click', async () => {
             const name = button.dataset.delBackup
             if (!confirm(`删除备份 ${name}？删除后无法恢复。`)) return
+            armDeleteFeedback('删除备份')
             button.disabled = true
             try {
               await apiSend('DELETE', `/api/console/backups/${encodeURIComponent(name)}`)
@@ -6976,6 +9649,7 @@ async function loadSys() {
         const agentDays = Number($('#agent-retention-input')?.value)
         const recordDays = Number($('#record-retention-input')?.value)
         const workspaceDays = Number($('#workspace-retention-input')?.value)
+        const kbTestDays = Number($('#kb-test-retention-input')?.value)
         for (const [label, value] of [
           ['日志保留天数', days],
           ['审计保留天数', auditDays],
@@ -6987,9 +9661,12 @@ async function loadSys() {
             return setNote(`${label}只能填 0（永久）或 7–3650`, true)
           }
         }
+        if (!Number.isInteger(kbTestDays) || kbTestDays < 1 || kbTestDays > 365) {
+          return setNote('知识库测试记录保留天数只能填 1–365', true)
+        }
         retentionSave.disabled = true
         try {
-          await apiSend('PUT', '/api/console/settings/retention', { days, auditDays, agentDays, recordDays, workspaceDays })
+          await apiSend('PUT', '/api/console/settings/retention', { days, auditDays, agentDays, recordDays, workspaceDays, kbTestDays })
           // 保存成功后同步确认框使用的策略值，避免“刚保存 30 天却仍提示永久保留”。
           agentRetentionDays = agentDays
           recordRetentionDays = recordDays
@@ -6999,6 +9676,7 @@ async function loadSys() {
             auditDays > 0 ? `审计超过 ${auditDays} 天` : '审计永久保留',
             agentDays > 0 ? `Agent 轨迹超过 ${agentDays} 天` : 'Agent 轨迹永久保留',
             recordDays > 0 ? `项目记录超过 ${recordDays} 天` : '项目记录永久保留',
+            `知识库测试记录超过 ${kbTestDays} 天`,
             workspaceDays > 0 ? `回收区超过 ${workspaceDays} 天` : '回收区永久保留',
           ]
           setNote(`已保存：${policy.join('；')}（后台每 6 小时检查一次）`)
@@ -7015,7 +9693,7 @@ async function loadSys() {
         const note = $('#retention-state')
         const recordDays = recordRetentionDays
         const workspaceDays = workspaceRecycleDays
-        if (!window.confirm(`立即清理一次？\n\n将按已保存的策略删除超过保留期的日志、审计、Agent 轨迹、项目记录和回收区数据。${recordDays > 0 ? `\n项目记录超过 ${recordDays} 天会被删除。` : '\n项目记录当前为永久保留。'}${workspaceDays > 0 ? `\n回收区超过 ${workspaceDays} 天的物理文件和元数据会被删除。` : '\n回收区当前为永久保留。'}`)) return
+        if (!window.confirm(`立即清理一次？\n\n将按已保存的策略删除超过保留期的日志、审计、Agent 轨迹、项目记录、知识库测试记录和回收区数据。${recordDays > 0 ? `\n项目记录超过 ${recordDays} 天会被删除。` : '\n项目记录当前为永久保留。'}${workspaceDays > 0 ? `\n回收区超过 ${workspaceDays} 天的物理文件和元数据会被删除。` : '\n回收区当前为永久保留。'}`)) return
         retentionRun.disabled = true
         if (note) note.textContent = '清理中…'
         try {
@@ -7048,6 +9726,7 @@ async function loadSys() {
               scheduleRuns: '计划运行',
               scheduleEvents: '计划事件',
               asyncJobs: '异步任务',
+              kbTestRuns: '知识库测试记录',
               guiFallbacks: 'GUI 兜底',
               officeRefreshGuards: 'Office 水位',
               robotFileSends: '文件回声',
@@ -8829,7 +11508,8 @@ async function deleteCompany(company) {
   if (!ok) return
   try {
     await apiSend('DELETE', `/api/console/companies/${encodeURIComponent(company.id)}`)
-    alert('公司已删除。请在控制台用「绑定钉钉机器人」重新接入。')
+    clearPendingSaveFeedback()
+    queueTopToast('公司已删除。请在控制台用「绑定钉钉机器人」重新接入。', { duration: 6000 })
     location.replace('/admin')
   } catch (err) {
     alert(err.message || '删除失败')
@@ -13780,8 +16460,7 @@ const DOMAINS = [
   { id: 'org', label: '组织与权限', kicker: 'ORGANIZATION & ACCESS', pages: ['org', 'departments', 'roles', 'approvalPolicies', 'access'] },
   { id: 'knowledge', label: '知识与模型', kicker: 'KNOWLEDGE & MODELS', pages: ['kb', 'models', 'tools'] },
   { id: 'platform', label: '连接与平台', kicker: 'PLATFORMS', pages: ['channels', 'databases', 'documents', 'company', 'system'] },
-  { id: 'plugins', label: '插件管理', kicker: 'PLUGIN ECOSYSTEM', pages: ['extra'] },
-  { id: 'skills', label: '技能管理', kicker: 'SKILL ECOSYSTEM', pages: ['skills'] },
+  { id: 'features', label: '功能管理', kicker: 'CAPABILITIES', pages: ['extra', 'skills'] },
   { id: 'ops', label: '运营与审计', kicker: 'OPERATIONS', pages: ['usage', 'quota', 'audit', 'tasks', 'approvals'] },
 ]
 
@@ -13797,6 +16476,402 @@ function domainOf(page) {
   return DOMAINS.find((domain) => domain.id === PAGE_DOMAIN[page]) ?? DOMAINS[0]
 }
 
+/** 页面是否对当前后台身份可见；权限还没加载时先按可见处理，避免首屏误伤。 */
+function canViewPage(page) {
+  if (!state.access) return true
+  return state.allowedPages.includes(page)
+}
+
+/** 页内分区是否可见；未配置分区的旧权限沿用整页可见。 */
+function canViewSection(page, section) {
+  if (!state.access) return true
+  if (state.access.kind !== 'member') return true
+  if (!state.allowedPages.includes(page)) return false
+  if (!state.sectionConfigured?.has(page)) return true
+  return state.sectionPermissions?.[`${page}:${section}`]?.canView === true
+}
+
+/** 当前后台身份是否拥有该页面（或页内某个分区）的指定写动作。 */
+function canPageAction(page, action, section) {
+  if (!state.access) return true
+  if (state.access.kind !== 'member') return true
+  if (!state.allowedPages.includes(page)) return false
+  if (section) {
+    const key = `${page}:${section}`
+    const sectionPermission = state.sectionPermissions?.[key]
+    if (sectionPermission) {
+      if (!sectionPermission.canView) return false
+      if (action === 'view') return true
+      return sectionPermission[`can${action[0].toUpperCase()}${action.slice(1)}`] === true
+    }
+    // 旧数据只有整页权限时，所有分区继承整页动作。
+    if (state.sectionConfigured?.has(page)) return false
+  }
+  const actions = state.pageActions?.[page]
+  return Array.isArray(actions) && actions.includes(action)
+}
+
+/** 当前页面是否有任意写动作；配置了分区时按子分区汇总。 */
+function canWritePage(page) {
+  if (state.access?.kind === 'member' && state.sectionConfigured?.has(page)) {
+    const prefix = `${page}:`
+    return Object.keys(state.pageActions || {})
+      .filter((key) => key.startsWith(prefix))
+      .some((key) => Array.isArray(state.pageActions[key]) && state.pageActions[key].length > 0)
+  }
+  return ['create', 'edit', 'delete'].some((action) => canPageAction(page, action))
+}
+
+/** 兼容旧调用点：有任意写动作就是“可管理”。 */
+function canManagePage(page) {
+  return canWritePage(page)
+}
+
+/** 统计有某一动作的页面数；页内分区只计父页面一次。 */
+function countActionPages(action) {
+  if (!state.access) return 0
+  if (state.access.kind === 'member') {
+    const pages = new Set()
+    for (const [key, actions] of Object.entries(state.pageActions || {})) {
+      if (!Array.isArray(actions) || !actions.includes(action)) continue
+      const parent = key.includes(':') ? key.split(':')[0] : key
+      if (state.allowedPages.includes(parent)) pages.add(parent)
+    }
+    return pages.size
+  }
+  const pages = Array.isArray(state.access.catalog?.pages) ? state.access.catalog.pages : []
+  return pages.filter((page) => Array.isArray(page.actions) && page.actions.some((item) => item.id === action)).length
+}
+
+function visiblePagesOfDomain(domain) {
+  return domain.pages.filter((page) => PAGES[page] && canViewPage(page))
+}
+
+function firstAllowedPageInDomain(domainId) {
+  const domain = DOMAINS.find((item) => item.id === domainId)
+  if (!domain) return null
+  return visiblePagesOfDomain(domain)[0] ?? null
+}
+
+function firstAllowedPage() {
+  for (const domain of DOMAINS) {
+    const pages = visiblePagesOfDomain(domain)
+    if (pages.length > 0) return pages[0]
+  }
+  return null
+}
+
+/** 顶部一级导航只保留“至少有一个可见页面”的业务域。 */
+function applyAccessToTopNav() {
+  for (const button of document.querySelectorAll('.nav-primary[data-domain]')) {
+    const domain = DOMAINS.find((item) => item.id === button.dataset.domain)
+    if (!domain) continue
+    button.hidden = visiblePagesOfDomain(domain).length === 0
+  }
+  hideNavSubbar()
+}
+
+/* ---------------- 一级导航悬停：导航自身向下展开一行二级页面 ---------------- */
+
+let navSubbarTimer = null
+let navSubbarPinnedDomain = null
+
+function navPrimaryButton(domainId) {
+  return [...document.querySelectorAll('.nav-primary[data-domain]')].find((button) => button.dataset.domain === domainId) || null
+}
+
+function syncNavPinState() {
+  for (const button of document.querySelectorAll('.nav-primary[data-domain]')) {
+    const pinned = Boolean(navSubbarPinnedDomain && button.dataset.domain === navSubbarPinnedDomain)
+    button.classList.toggle('is-pinned', pinned)
+    button.setAttribute('aria-pressed', pinned ? 'true' : 'false')
+  }
+}
+
+function restorePinnedNavSubbar() {
+  if (!navSubbarPinnedDomain) return false
+  const button = navPrimaryButton(navSubbarPinnedDomain)
+  const domain = DOMAINS.find((item) => item.id === navSubbarPinnedDomain)
+  if (!button || button.hidden || !domain || navSubbarPages(domain).length < 2) {
+    navSubbarPinnedDomain = null
+    syncNavPinState()
+    return false
+  }
+  // 页面跳转会先收起二级行；恢复固定时直接展开，避免高度过渡在跳转后被卡在 0
+  const subbar = document.getElementById('nav-subbar')
+  const transition = subbar?.style.transition || ''
+  if (subbar) subbar.style.transition = 'none'
+  openNavSubbar(button)
+  if (subbar) {
+    void subbar.offsetHeight
+    subbar.style.transition = transition
+  }
+  return true
+}
+
+function hideNavSubbarNow() {
+  const subbar = document.getElementById('nav-subbar')
+  const transition = subbar?.style.transition || ''
+  if (subbar) subbar.style.transition = 'none'
+  hideNavSubbar()
+  if (subbar) {
+    void subbar.offsetHeight
+    subbar.style.transition = transition
+  }
+}
+
+function toggleNavSubbarPin(button) {
+  const domainId = String(button.dataset.domain || '')
+  if (!domainId) return
+  navSubbarPinnedDomain = navSubbarPinnedDomain === domainId ? null : domainId
+  syncNavPinState()
+  if (navSubbarPinnedDomain) openNavSubbar(button)
+  else hideNavSubbarNow()
+}
+
+function navSubbarPages(domain) {
+  // access 是角色页的别名，不在二级导航里重复出现
+  return domain.pages.filter((page) => page !== 'access' && PAGES[page] && canViewPage(page))
+}
+
+function hideNavSubbar() {
+  if (navSubbarTimer) {
+    clearTimeout(navSubbarTimer)
+    navSubbarTimer = null
+  }
+  const subbar = document.getElementById('nav-subbar')
+  const inner = document.getElementById('nav-subbar-inner')
+  if (subbar) {
+    subbar.style.height = '0px'
+    subbar.classList.remove('is-open')
+    subbar.setAttribute('aria-hidden', 'true')
+  }
+  if (inner) inner.inert = true
+  for (const button of document.querySelectorAll('.nav-primary.is-menu-open')) {
+    button.classList.remove('is-menu-open')
+    button.setAttribute('aria-expanded', 'false')
+  }
+}
+
+function scheduleHideNavSubbar() {
+  if (navSubbarTimer) clearTimeout(navSubbarTimer)
+  navSubbarTimer = setTimeout(() => {
+    const subbar = document.getElementById('nav-subbar')
+    if (subbar && (subbar.matches(':hover') || subbar.matches(':focus-within'))) return
+    if (restorePinnedNavSubbar()) return
+    hideNavSubbar()
+  }, 220)
+}
+
+function openNavSubbar(button) {
+  const domain = DOMAINS.find((item) => item.id === button.dataset.domain)
+  if (!domain) return
+  const pages = navSubbarPages(domain)
+  if (pages.length < 2) {
+    hideNavSubbar()
+    return
+  }
+  if (navSubbarTimer) {
+    clearTimeout(navSubbarTimer)
+    navSubbarTimer = null
+  }
+  const subbar = document.getElementById('nav-subbar')
+  const inner = document.getElementById('nav-subbar-inner')
+  if (!subbar || !inner) return
+  const activePage = state.page === 'access' ? 'roles' : state.page
+  inner.innerHTML = pages
+    .map((page) => {
+      const meta = PAGES[page]
+      if (!meta) return ''
+      const active = page === activePage
+      return `<button class="nav-sub-link${active ? ' is-active' : ''}" type="button" data-sub-page="${page}">${esc(meta.title)}</button>`
+    })
+    .join('')
+  inner.inert = false
+  const wasOpen = subbar.classList.contains('is-open')
+  const currentHeight = subbar.getBoundingClientRect().height
+  const targetHeight = Math.max(inner.scrollHeight, inner.offsetHeight)
+  if (!wasOpen || currentHeight < 1) {
+    subbar.style.height = '0px'
+    void subbar.offsetHeight
+  }
+  subbar.style.height = `${targetHeight}px`
+  subbar.classList.add('is-open')
+  subbar.setAttribute('aria-hidden', 'false')
+  for (const item of document.querySelectorAll('.nav-primary.is-menu-open')) {
+    item.classList.remove('is-menu-open')
+    item.setAttribute('aria-expanded', 'false')
+  }
+  button.classList.add('is-menu-open')
+  button.setAttribute('aria-expanded', 'true')
+}
+
+function setupNavSubbar() {
+  const subbar = document.getElementById('nav-subbar')
+  const inner = document.getElementById('nav-subbar-inner')
+  if (!subbar || !inner) return
+  // 登录前后可能重复触发初始化；重复绑定会让一次点击把固定状态切换两次
+  if (subbar.dataset.navSubbarBound === '1') return
+  subbar.dataset.navSubbarBound = '1'
+  inner.inert = true
+  for (const button of document.querySelectorAll('.nav-primary[data-domain]')) {
+    const domain = DOMAINS.find((item) => item.id === button.dataset.domain)
+    if (!domain) continue
+    if (navSubbarPages(domain).length < 2) continue
+    if (button.dataset.navSubbarBound === '1') continue
+    button.dataset.navSubbarBound = '1'
+    // 多页面业务域：悬停临时展开，点击固定；再次点击同一项取消固定
+    button.setAttribute('aria-expanded', 'false')
+    button.setAttribute('aria-pressed', 'false')
+    button.addEventListener('pointerenter', () => openNavSubbar(button))
+    button.addEventListener('pointerleave', scheduleHideNavSubbar)
+    button.addEventListener('focus', () => openNavSubbar(button))
+    button.addEventListener('blur', scheduleHideNavSubbar)
+    button.addEventListener('click', () => toggleNavSubbarPin(button))
+  }
+  subbar.addEventListener('pointerenter', () => {
+    if (navSubbarTimer) {
+      clearTimeout(navSubbarTimer)
+      navSubbarTimer = null
+    }
+  })
+  subbar.addEventListener('pointerleave', scheduleHideNavSubbar)
+  subbar.addEventListener('focusin', () => {
+    if (navSubbarTimer) {
+      clearTimeout(navSubbarTimer)
+      navSubbarTimer = null
+    }
+  })
+  subbar.addEventListener('focusout', (event) => {
+    if (event.relatedTarget && subbar.contains(event.relatedTarget)) return
+    scheduleHideNavSubbar()
+  })
+  subbar.addEventListener('click', (event) => {
+    const target = event.target.closest('[data-sub-page]')
+    if (!target) return
+    const page = target.dataset.subPage
+    if (navSubbarPinnedDomain && PAGE_DOMAIN[page]) {
+      navSubbarPinnedDomain = PAGE_DOMAIN[page]
+      syncNavPinState()
+    }
+    hideNavSubbar()
+    navigate(page)
+  })
+  document.addEventListener('pointerdown', (event) => {
+    if (event.target.closest('#topnav')) return
+    if (!restorePinnedNavSubbar()) hideNavSubbar()
+  })
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape' || navSubbarPinnedDomain) return
+    hideNavSubbar()
+  })
+  window.addEventListener('scroll', () => {
+    if (navSubbarPinnedDomain) return
+    hideNavSubbar()
+  }, true)
+  window.addEventListener('resize', () => {
+    if (!restorePinnedNavSubbar()) hideNavSubbar()
+  })
+}
+
+const DELETE_ACTION_LABEL = /删除|移除|卸载|解绑|撤销|清除|作废/
+const CREATE_ACTION_LABEL = /新增|新建|创建|添加|导入|上传|安装|注册|开通|接入|绑定/
+const EDIT_ACTION_LABEL = /编辑|修改|保存|更新|配置|设置|启用|停用|授权|审批|通过|拒绝|重置|同步|重跑|重试|执行/
+
+/** 从按钮文案判断它属于哪类写动作；判断不出就按普通操作放行，交给服务端兜底。 */
+function actionKindForLabel(label) {
+  const text = String(label || '').trim()
+  if (!text) return null
+  if (DELETE_ACTION_LABEL.test(text)) return 'delete'
+  if (CREATE_ACTION_LABEL.test(text)) return 'create'
+  if (EDIT_ACTION_LABEL.test(text)) return 'edit'
+  return null
+}
+
+/** 图标按钮只显示“⋯”时，用 aria-label / title 取出它真实表达的动作。 */
+function controlLabel(target) {
+  const text = String(target.textContent || '').trim()
+  const aria = String(target.getAttribute('aria-label') || target.getAttribute('title') || '').trim()
+  if (!text || /^[.…·⋯]+$/.test(text)) return aria || text
+  return text
+}
+
+function isMoreActionsLabel(label) {
+  return /更多/.test(String(label || ''))
+}
+
+/** 按钮所在的页内分区：tab 面板、渠道面板或角色详情面板。 */
+function sectionOfPane(target) {
+  const pane = target.closest?.('[data-section-panel], [data-channel-pane], [data-role-pane], [data-pane]')
+  if (!pane) return null
+  return pane.dataset.sectionPanel || pane.dataset.channelPane || pane.dataset.rolePane || pane.dataset.pane || null
+}
+
+/** 页签按钮自身对应的分区，用于隐藏整个页签。 */
+function sectionOfTab(target) {
+  return target.dataset?.sectionTarget || target.dataset?.channelTab || target.dataset?.roleTab || null
+}
+
+function paneSectionOf(pane) {
+  return pane.dataset?.sectionPanel || pane.dataset?.channelPane || pane.dataset?.rolePane || pane.dataset?.pane || null
+}
+
+function setTabActive(tab, active) {
+  tab.classList.toggle('is-active', active)
+  tab.setAttribute('aria-selected', active ? 'true' : 'false')
+}
+
+function applyPagePermissionMode(page) {
+  const isMember = Boolean(state.access && state.access.kind === 'member')
+  document.body.classList.toggle('is-readonly-page', isMember && !canWritePage(page))
+  const sectionTabs = [...document.querySelectorAll('#view [data-section-target], [data-channel-tab], [data-role-tab]')]
+  for (const target of document.querySelectorAll('#view button, #view a, #page-actions button, #page-actions a')) {
+    const tabSection = sectionOfTab(target)
+    if (tabSection) {
+      const visible = !isMember || canViewSection(page, tabSection)
+      target.hidden = !visible
+      target.style.display = visible ? '' : 'none'
+      target.setAttribute('aria-hidden', visible ? 'false' : 'true')
+      continue
+    }
+    const section = sectionOfPane(target)
+    // 页面入口卡片（例如“模型接入”）只是导航，不按“接入/新增”等文案当成写动作。
+    if (target.closest('[data-page], [data-domain], [data-go]')) continue
+    const label = controlLabel(target)
+    const kind = actionKindForLabel(label)
+    const moreActions = !kind && isMoreActionsLabel(label)
+    const disabled = isMember && (
+      (Boolean(kind) && !canPageAction(page, kind, section || undefined)) ||
+      (moreActions && !canPageAction(page, 'edit', section || undefined) && !canPageAction(page, 'delete', section || undefined))
+    )
+    target.classList.toggle('is-readonly-action', disabled)
+    if (disabled) {
+      target.setAttribute('aria-disabled', 'true')
+      target.dataset.requiredAction = kind || 'edit|delete'
+    } else {
+      target.removeAttribute('aria-disabled')
+      delete target.dataset.requiredAction
+    }
+  }
+  if (isMember && sectionTabs.length > 0) {
+    const visibleTabs = sectionTabs.filter((tab) => !tab.hidden)
+    let activeTab = visibleTabs.find((tab) => tab.classList.contains('is-active')) || null
+    // 当前激活的页签被隐藏时，直接切到第一个可见页签；不能只依赖各页自己注册的 click，
+    // 否则渠道页会停在无权限面板上（页签已隐藏但面板还显示）。
+    if (!activeTab && visibleTabs.length > 0) {
+      activeTab = visibleTabs[0]
+      for (const tab of sectionTabs) setTabActive(tab, false)
+      setTabActive(activeTab, true)
+    }
+    const activeSection = activeTab ? sectionOfTab(activeTab) : null
+    if (activeSection) {
+      for (const pane of document.querySelectorAll('#view [data-section-panel], .channel-pane, [data-role-pane], [data-pane]')) {
+        pane.hidden = paneSectionOf(pane) !== activeSection
+      }
+    }
+  }
+}
+
 /** 页内选择器（组织树 / 知识库列表 / 角色列表）落在 page-rail，不是全站二级导航 */
 const $side = () => document.getElementById('page-rail')
 
@@ -13809,11 +16884,10 @@ function setSide(html, empty = false) {
   body.classList.toggle('no-rail', blank)
 }
 
-/** 左侧二级导航：普通域是页面列表；插件域改渲染插件概览与插件列表 */
+/** 左侧列表：插件域渲染插件概览与列表；技能域渲染技能概览与列表；其余域已改悬停二级菜单 */
 function renderNavRail() {
   const rail = document.getElementById('nav-rail')
   if (!rail) return
-  // 插件管理域只有一页，左侧改成插件概览 + 插件列表，避免“域→唯一页面”的重复导航
   if (state.page === 'extra') {
     rail.classList.add('plugin-mode')
     rail.classList.remove('skill-mode')
@@ -13825,9 +16899,8 @@ function renderNavRail() {
     }
     return
   }
-  // 技能管理同样只有一页：左侧承载技能概览、搜索列表和安全治理入口
   if (state.page === 'skills') {
-    rail.classList.remove('plugin-mode', 'org-rail-mode')
+    rail.classList.remove('plugin-mode')
     rail.classList.add('skill-mode')
     if (state.skillConsoleData) {
       rail.innerHTML = skillRailHtml(state.skillConsoleData)
@@ -13838,52 +16911,7 @@ function renderNavRail() {
     return
   }
   rail.classList.remove('plugin-mode', 'skill-mode')
-  const domain = domainOf(state.page)
-  if (domain.id === 'org') {
-    const orgPages = [
-      ['org', '成员管理', '成员列表与角色授权'],
-      ['departments', '部门管理', '部门结构、负责人与下级'],
-      ['roles', '角色管理', '角色权限与成员配置'],
-      ['approvalPolicies', '权限审批', '按权限范围配置审批链'],
-    ]
-    const activePage = state.page === 'access' ? 'roles' : state.page
-    rail.classList.add('org-rail-mode')
-    rail.innerHTML = `<nav class="org-rail-nav" aria-label="组织与权限分类">
-      ${orgPages
-        .map(([page, label, sub]) => {
-          const isRoles = page === 'roles'
-          const isOpen = isRoles && state.page === 'roles'
-          return `<button class="org-rail-item${page === activePage ? ' is-active' : ''}${isRoles ? ' has-sub' : ''}" type="button" data-page="${page}">
-            <span class="org-rail-copy"><strong>${label}</strong><small>${sub}</small></span>
-            ${isRoles ? '<span class="org-rail-caret" aria-hidden="true">⌄</span>' : ''}
-          </button>
-          ${isOpen ? roleRailSubmenuHtml(state.roles) : ''}`
-        })
-        .join('')}
-    </nav>`
-    return
-  }
-  rail.classList.remove('org-rail-mode')
-  // 「连接与平台」页面的说明文字改成一个信息角标：悬停才展开，左侧导航不再被长句撑高
-  const hintIcon =
-    '<span class="nav-hint-icon"><svg aria-hidden="true" width="9" height="9" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6.2" stroke="currentColor" stroke-width="1.3"/><path d="M8 7.3v3.7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><circle cx="8" cy="4.5" r=".9" fill="currentColor"/></svg></span>'
-  const hintMode = domain.id === 'platform'
-  rail.innerHTML = `
-    ${domain.pages
-      .map((page) => {
-        const meta = PAGES[page]
-        if (!meta) return ''
-        const active = page === state.page ? ' is-active' : ''
-        return `<button class="nav-rail-item${active}${hintMode ? ' has-hint' : ''}" type="button" data-page="${page}">
-          <span class="nav-rail-label">${esc(meta.title)}</span>
-          ${
-            hintMode
-              ? `<span class="nav-rail-hint" title="${esc(meta.sub)}" aria-label="${esc(meta.sub)}">${hintIcon}</span>`
-              : `<span class="nav-rail-sub">${esc(meta.sub)}</span>`
-          }
-        </button>`
-      })
-      .join('')}`
+  rail.innerHTML = ''
 }
 
 function setPageActions(html) {
@@ -13892,12 +16920,35 @@ function setPageActions(html) {
   slot?.closest('.page-head')?.classList.toggle('has-actions', Boolean(String(html ?? '').trim()))
 }
 
+function renderNoAccess() {
+  setPageActions('')
+  const rail = document.getElementById('nav-rail')
+  if (rail) rail.innerHTML = ''
+  const host = $('#view')
+  if (!host) return
+  host.innerHTML = `<section class="panel"><div class="empty">
+    <strong>当前账号没有可访问的后台页面</strong>
+    <p class="muted">让平台管理员在「成员管理 → 角色管理 → 后台权限」里勾选至少一个页面的可见权限。</p>
+  </div></section>`
+}
+
 function navigate(page) {
   if (!state.companies.length) {
     renderFirstCompany()
     return
   }
   if (!PAGES[page]) return
+  hideNavSubbar()
+  if (state.access && !canViewPage(page)) {
+    // 同一业务域内优先落到可见页；不能因为首页不可见就跳到别的域
+    const sameDomain = firstAllowedPageInDomain(PAGE_DOMAIN[page] ?? 'overview')
+    const fallback = sameDomain ?? firstAllowedPage()
+    if (!fallback) {
+      renderNoAccess()
+      return
+    }
+    page = fallback
+  }
   state.page = page
   state.domain = PAGE_DOMAIN[page] ?? 'overview'
   lastPageByDomain.set(state.domain, page)
@@ -13911,10 +16962,10 @@ function navigate(page) {
   for (const button of document.querySelectorAll('.nav-primary[data-domain]')) {
     button.classList.toggle('is-active', button.dataset.domain === state.domain)
   }
-  // 插件域 / 技能域：左侧栏承载概览与列表，内容区不再保留页内 rail，右侧视图铺满
+  // 插件 / 技能页：左侧栏承载概览与列表，内容区不再保留页内 rail，右侧视图铺满
   const workspace = document.querySelector('.workspace')
-  workspace?.classList.toggle('is-plugin-domain', state.domain === 'plugins')
-  workspace?.classList.toggle('is-skill-domain', state.domain === 'skills')
+  workspace?.classList.toggle('is-plugin-domain', page === 'extra')
+  workspace?.classList.toggle('is-skill-domain', page === 'skills')
   // 概览域只有一页，左侧二级导航没有可切换项；收起侧栏，让概览卡片铺满内容区
   workspace?.classList.toggle('no-side', state.domain === 'overview')
   // 所有页面统一不显示大标题/副标题；page-head 只作为页面操作的右侧工具条保留。
@@ -13922,8 +16973,16 @@ function navigate(page) {
   pageHead?.classList.remove('is-hidden')
   pageHead?.classList.add('is-headingless')
   renderNavRail()
+  applyPagePermissionMode(page)
   state.deptFilter = null
-  meta.render()
+  const rendered = meta.render()
+  Promise.resolve(rendered)
+    .then(() => {
+      if (state.page === page) applyPagePermissionMode(page)
+    })
+    .catch(() => {})
+  // 点击一级导航会先走页面跳转；固定状态在跳转后恢复，避免被 hideNavSubbar 清掉
+  if (navSubbarPinnedDomain) restorePinnedNavSubbar()
 }
 
 async function refresh() {
@@ -13943,6 +17002,14 @@ async function logoutConsole() {
 async function loadAccountPanel() {
   const meta = $('#account-meta')
   if (!meta) return
+  if (state.access?.kind === 'member') {
+    const accountUser = $('#account-user')
+    if (accountUser) accountUser.textContent = state.me?.person?.employeeNo || '公司成员账号'
+    meta.innerHTML = `
+      <div><span>身份</span><strong>${esc(state.access.name || state.me?.person?.name || '公司成员')} · 公司成员</strong></div>
+      <div><span>登录方式</span><strong>成员账号密码</strong></div>`
+    return
+  }
   try {
     const acc = await api('/api/console/account')
     state.account = acc
@@ -14115,6 +17182,7 @@ async function boot() {
    */
   const needsFirstCompany = state.companies.length === 0
   setupAccount()
+  setupNavSubbar()
   if (needsFirstCompany) renderFirstCompany()
 
   // 顶部：只切业务域。点同一个域时回到该域上次停留的页面。
@@ -14146,6 +17214,39 @@ async function boot() {
     }
     navigate(target.dataset.page)
   })
+
+  document.addEventListener('click', (event) => {
+    if (!state.access || state.access.kind !== 'member') return
+    const target = event.target.closest('button, a')
+    if (!target) return
+    // 导航、组织树、页内筛选和弹窗内的保存/取消不是页面入口动作；
+    // 弹窗动作由服务端守卫按请求动作判定，避免把“新建后保存”误判成“编辑”。
+    if (
+      target.closest(
+        '#account, [data-account-action], #nav-rail, #nav-subbar, #page-rail, [data-page], [data-domain], [data-go], [data-tree-expand], [data-tree-collapse], .modal-overlay',
+      )
+    ) {
+      return
+    }
+    const label = controlLabel(target)
+    // 页内页签本身只负责切换分区，不按“同步/配置”等文案当成写动作拦截。
+    if (sectionOfTab(target)) return
+    const section = sectionOfPane(target)
+    const kind = actionKindForLabel(label)
+    if (kind && canPageAction(state.page, kind, section || undefined)) return
+    if (!kind && isMoreActionsLabel(label)) {
+      if (canPageAction(state.page, 'edit', section || undefined) || canPageAction(state.page, 'delete', section || undefined)) return
+      event.preventDefault()
+      event.stopPropagation()
+      showTopToast('当前页面没有“编辑”或“删除”权限；需要时让平台管理员在后台访问里单独勾选。', { tone: 'warn' })
+      return
+    }
+    if (!kind) return
+    event.preventDefault()
+    event.stopPropagation()
+    const actionLabel = kind === 'create' ? '新增' : kind === 'delete' ? '删除' : '编辑'
+    showTopToast(`当前页面没有“${actionLabel}”权限；需要时让平台管理员在后台访问里单独勾选。`, { tone: 'warn' })
+  }, true)
 
   document.addEventListener('click', (event) => {
     if (!event.target.closest('#company-picker')) closeCompanyPicker()

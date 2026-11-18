@@ -63,6 +63,7 @@
     previewing: false,
     leaveScheduled: false,
     loginTransition: false,
+    fullIntro: false,
     finishTimer: 0,
   }
 
@@ -92,6 +93,10 @@
 
   function bootIntent() {
     if (!config.enabled || config.mode === 'off') return 'off'
+    // 登录成功后由目标页面播放完整启动动画做过渡，避免中间出现空白帧。
+    const requested = new URL(location.href).searchParams.get('eab_boot')
+    if (requested === 'full') return 'full'
+    if (requested === 'off') return 'off'
     const jump = safeGet('eab.boot.next') === surface
     if (jump) {
       safeRemove('eab.boot.next')
@@ -125,6 +130,18 @@
   function clearBootBackground() {
     // 保留首帧兜底样式，但退场后让 body 自己的底色接管，避免页面边缘露出深绿色。
     document.documentElement.style.background = 'transparent'
+  }
+
+  function resetLoginScroll() {
+    if (!state.fullIntro) return
+    // 登录跳转不能被浏览器恢复成上一次的滚动位置，否则控制台标题栏会“消失”，看起来像布局变形。
+    try {
+      window.scrollTo({ top: 0, left: 0, behavior: 'auto' })
+      document.documentElement.scrollTop = 0
+      document.body.scrollTop = 0
+    } catch {
+      /* ignore */
+    }
   }
 
   function setText(node, value) {
@@ -211,6 +228,7 @@
       }
     }
     overlay.classList.add('is-leaving')
+    resetLoginScroll()
     clearTimeout(state.finishTimer)
     state.finishTimer = window.setTimeout(() => {
       state.finishTimer = 0
@@ -220,6 +238,7 @@
       overlay.classList.remove('is-leaving', 'is-film-ready', 'is-login-transition', 'is-refresh')
       document.documentElement.classList.remove('eab-booting')
       clearBootBackground()
+      resetLoginScroll()
       if (video) {
         video.removeAttribute('src')
         try {
@@ -391,6 +410,7 @@
     state.leaving = false
     state.leaveScheduled = false
     state.loginTransition = Boolean(options?.loginTransition)
+    state.fullIntro = Boolean(options?.fullIntro)
     state.refresh = Boolean(options?.refresh)
     overlay.classList.toggle('is-login-transition', state.loginTransition)
     overlay.classList.toggle('is-refresh', state.refresh)
@@ -402,6 +422,29 @@
     applyCopy()
     show()
     startProgress()
+    if (options?.fullIntro) {
+      // 登录过渡只覆盖真实加载时间：应用 ready 就退场，不强制播完整片头。
+      prepareCode()
+      state.minMs = 250
+      state.minElapsed = false
+      setStatus(surface === 'admin' ? '正在进入管理控制台…' : '正在进入工作台…')
+      clearTimeout(state.maxTimer)
+      state.maxTimer = window.setTimeout(() => {
+        if (state.ready) {
+          state.minElapsed = true
+          checkFinish()
+          return
+        }
+        setStatus('页面加载较慢，正在等待控制台就绪…')
+        state.maxTimer = window.setTimeout(() => finish(true), 5000)
+      }, 8000)
+      window.setTimeout(() => {
+        if (state.finished || state.leaving) return
+        state.minElapsed = true
+        checkFinish()
+      }, 250)
+      return
+    }
     if (options?.preview) {
       if (config.mode === 'film' && config.assetUrl) prepareFilm()
       else prepareCode()
@@ -536,8 +579,10 @@
       overlay.setAttribute('aria-hidden', 'true')
       document.documentElement.classList.remove('eab-booting')
       clearBootBackground()
+    } else if (intent === 'full' || intent === 'login') {
+      start({ fullIntro: true })
     } else {
-      start({ refresh: intent === 'refresh' })
+      start({ refresh: true })
     }
   } catch (error) {
     // 启动层自身出错时，宁可少一段动画，也不能让覆盖层把后台页面按住。
