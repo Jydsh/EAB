@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { EabError } from '@eab/domain'
-import { readBatchPage, saveTextBatch, saveToolResultBatch } from '../src/batch-results.js'
+import { parseTabularBatchText, readBatchPage, saveTextBatch, saveToolResultBatch } from '../src/batch-results.js'
 
 const dirs: string[] = []
 
@@ -195,6 +195,15 @@ describe('大工具结果批次', () => {
       limit: 20_000,
     })
     expect(page.text).toContain('蓝鲸-7742')
+  })
+
+  it('CSV 文本批次按行还原成全量记录，不再按字符切段', () => {
+    const csv = '站名,问题类别,严重程度描述\n贵阳北（弱电）,A,一般\n贵阳北（机电）,B,严重\n眉山东,A,一般\n'
+    const table = parseTabularBatchText(csv, 'attachment:检查整治_近半个月_343条.csv')
+    expect(table?.columns).toEqual(['站名', '问题类别', '严重程度描述'])
+    expect(table?.rows).toHaveLength(3)
+    expect(table?.rows[0]).toMatchObject({ 站名: '贵阳北（弱电）', 问题类别: 'A' })
+    expect(parseTabularBatchText('普通文章，不是表格。\n第二行。', 'attachment:说明.txt')).toBeNull()
   })
 
   it('默认日志级别不把批次落盘和进度写进控制台', () => {

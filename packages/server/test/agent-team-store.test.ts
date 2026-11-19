@@ -193,4 +193,19 @@ describe('AgentTeamStore 持久化团队', () => {
     expect(s.listTasksAwaitingWake(10, [interrupted.id]).map((item) => item.id)).toEqual([interrupted.id])
     expect(s.listTasksAwaitingWake(10, [historical.id]).map((item) => item.id)).toEqual([historical.id])
   })
+
+  it('重启收尾把等待父 Agent 的岗位也收回 idle，不留下永久等待', () => {
+    const s = store()
+    s.registerWorker({ key: 'asker', name: '等待岗位' })
+    const task = s.createTask({ workerKey: 'asker', prompt: '等父 Agent 答复', parentRunId: 'run-1' })
+    s.markTaskRunning(task.id, 'child-ask')
+    s.markWorkerWaiting('asker', '需要父 Agent 回答', 1000)
+    expect(s.findWorker('asker')?.status).toBe('waiting')
+
+    expect(recoverInterruptedAgentTasks(db, 2000)).toBe(1)
+    expect(s.getTask(task.id)?.status).toBe('failed')
+    expect(s.findWorker('asker')?.status).toBe('idle')
+    expect(s.findWorker('asker')?.lastTaskAt).toBe(2000)
+    expect(s.findWorker('asker')?.lastText).toContain('服务重启中断')
+  })
 })

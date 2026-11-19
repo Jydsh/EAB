@@ -188,6 +188,12 @@ export interface TextSearchMatch {
   text: string
 }
 
+export interface TextSearchNameMatch {
+  /** 相对 root 的路径，可直接交给 workspace.read。 */
+  path: string
+  name: string
+}
+
 export interface TextSearchResult {
   matches: TextSearchMatch[]
   /** 实际命中的总条数（最多统计到扫描上限）；matches 只按 maxResults 返回前几条。 */
@@ -196,10 +202,20 @@ export interface TextSearchResult {
   truncated: boolean
   /** 达到 30 秒搜索预算被截止；和“结果太多被截断”分开，便于界面说明。 */
   timeLimitHit: boolean
+  /**
+   * 文件名/路径命中。工具名是“搜索工作区文件”，模型经常直接把文件名当 query；
+   * 只搜正文会返回 0 命中，模型随后误以为文件不存在并反复猜路径。
+   */
+  nameMatches: TextSearchNameMatch[]
 }
 
 function toRelativePath(root: string, target: string): string {
   return relative(root, target).split(sep).join('/')
+}
+
+/** 文件名匹配忽略空格差异，避免“343 条.csv”和“343条.csv”被当成两个文件。 */
+function normalizeNameForMatch(value: string): string {
+  return String(value || '').replace(/[\s\u3000]+/g, '').toLowerCase()
 }
 
 function collectTextFiles(
@@ -292,6 +308,16 @@ export function searchWorkspaceText(
   if (targetStat.isSymbolicLink()) throw new EabError(EC.VALIDATION, '不支持搜索符号链接')
   const scan = collectTextFiles(target, MAX_SEARCH_FILES, deadline)
   const matches: TextSearchMatch[] = []
+  const nameMatches: TextSearchNameMatch[] = []
+  const nameNeedle = normalizeNameForMatch(query)
+  if (nameNeedle) {
+    for (const file of scan.files) {
+      if (nameMatches.length >= maxResults) break
+      const path = toRelativePath(root, file)
+      if (!normalizeNameForMatch(path).includes(nameNeedle)) continue
+      nameMatches.push({ path, name: basename(file) })
+    }
+  }
   let total = 0
   let filesScanned = 0
   let truncated = scan.truncated
@@ -356,5 +382,5 @@ export function searchWorkspaceText(
   }
   if (total > matches.length) truncated = true
 
-  return { matches, total, filesScanned, truncated, timeLimitHit }
+  return { matches, total, filesScanned, truncated, timeLimitHit, nameMatches }
 }

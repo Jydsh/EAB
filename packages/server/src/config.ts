@@ -115,6 +115,18 @@ export interface ServerConfig {
   readonly agentChildMaxRounds?: number
   /** 父 Agent 等待子 Agent 事件的最长时间；默认 30 秒 */
   readonly agentWaitTimeoutMs?: number
+  /**
+   * 后台子 Agent 结束时唤醒父 Agent 的内部调度轮最长等待；默认 120 秒。
+   * 超时后不能再让等待中的子 Agent 一直停在「等待主 Agent 回答」，
+   * 服务端会中止本轮并给子 Agent 一条可执行的兜底指令。
+   */
+  readonly agentWakeTimeoutMs?: number
+  /**
+   * 父回合仍在运行时唤醒重试的次数与间隔；默认 60 次、每 5 秒一次。
+   * 超过后不再无限重试，而是让等待中的子 Agent 收口并给用户说明。
+   */
+  readonly agentWakeRetryLimit?: number
+  readonly agentWakeRetryIntervalMs?: number
   /** 所有请求体同时在内存中的粗略预算（MB）；超过时新的大请求直接 429 */
   readonly maxInflightBodyMb?: number
   /** 缓存后端：auto（数据连接里有 Redis 才接入）、memory、redis、off（仍用内存，只是不尝试外部） */
@@ -297,6 +309,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     ),
     agentChildMaxRounds: readInt(env.EAB_AGENT_CHILD_MAX_ROUNDS, 64, 'EAB_AGENT_CHILD_MAX_ROUNDS'),
     agentWaitTimeoutMs: readInt(env.EAB_AGENT_WAIT_TIMEOUT_MS, 30_000, 'EAB_AGENT_WAIT_TIMEOUT_MS'),
+    // 本地大模型一轮长上下文推理可能超过 2 分钟；默认放宽到 5 分钟，避免把慢当故障转移。
+    agentWakeTimeoutMs: readInt(env.EAB_AGENT_WAKE_TIMEOUT_MS, 300_000, 'EAB_AGENT_WAKE_TIMEOUT_MS'),
+    agentWakeRetryLimit: readInt(env.EAB_AGENT_WAKE_RETRY_LIMIT, 60, 'EAB_AGENT_WAKE_RETRY_LIMIT'),
+    agentWakeRetryIntervalMs: readInt(
+      env.EAB_AGENT_WAKE_RETRY_INTERVAL_MS,
+      5000,
+      'EAB_AGENT_WAKE_RETRY_INTERVAL_MS',
+    ),
     maxInflightBodyMb: readInt(env.EAB_MAX_INFLIGHT_BODY_MB, 256, 'EAB_MAX_INFLIGHT_BODY_MB'),
     cacheBackend: readEnum(env.EAB_CACHE, ['auto', 'memory', 'redis', 'off'] as const, 'auto', 'EAB_CACHE'),
     redisUrl: (env.EAB_REDIS_URL ?? '').trim(),

@@ -47,11 +47,13 @@ import {
   ensureChannelSession,
   historyOf,
   loadModelCatalogCached,
+  modelFailoverNotice,
   modelSupportsVision,
   releaseTurn,
   setChannelOpenConversationId,
   retrieveKb,
   runAgentTurn,
+  shouldPersistFailoverModel,
   visibleModelsFor,
   type AgentTurnResult,
 } from './routes/chat.js'
@@ -67,7 +69,7 @@ import { prepareDshImCompat, syncDshImSession } from './dsh-im-compat.js'
 import { pluginPromptTexts } from './plugin-tools.js'
 import { skillPromptTexts } from './skills.js'
 import { assertChatQuota } from './quota.js'
-import { planChannelModelCommand } from './channel-model-command.js'
+import { planChannelModelCommand, planChannelModelPicker, planChannelModelSelection, type ChannelModelOption } from './channel-model-command.js'
 import { SWITCH_CHAT_MODEL_TOOL_SPEC, updateConversationModelPreference, type ModelSwitchContext } from './channel-model-switch.js'
 import {
   resolveUserWorkspaceQuota,
@@ -76,11 +78,14 @@ import {
 } from './workspace-quota.js'
 import {
   dingTalkClarifyCardState,
+  forgetDingTalkClarifyCard,
+  isDingTalkClarifyCardConsumed,
   DingTalkAICardStream,
   DingTalkCardStream,
   DingTalkReaction,
   dingTalkAccessToken,
   dingTalkConversationSummary,
+  registerDingTalkClarifyCard,
   renderDingTalkFinalCard,
   renderDingTalkProgressCard,
   updateDingTalkClarifyDraft,
@@ -88,6 +93,7 @@ import {
   type DingTalkCardAttachment,
   type DingTalkClarifyAnswer,
   type DingTalkClarifyQuestion,
+  type DingTalkClarifyState,
   type DingTalkRichCardState,
   type DingTalkToolRecord,
 } from './dingtalk-card.js'
@@ -732,6 +738,59 @@ async function rateLimited(externalId: string): Promise<boolean> {
 }
 
 /**
+ * “有哪些模型/切换模型”不再回一段文字列表，而是直接下发可点击的模型卡。
+ *
+ * 卡片只负责呈现和回传选项；真正的切换仍由卡片回调里的静默分支完成，
+ * 因此点选后不会再出现一条独立的“已切换模型”机器人消息。
+ */
+async function showDingTalkModelPickerCard(
+  deps: ServerDeps,
+  cfg: DingTalkChannelRow,
+  externalId: string,
+  sessionId: string,
+  models: readonly ChannelModelOption[],
+  currentModelId: string | null,
+): Promise<boolean> {
+  const picker = planChannelModelPicker(models, currentModelId)
+  if (!picker) return false
+  const appId = String(cfg.app_id ?? '').trim()
+  const secret = cfg.secret_ref ? resolveSecret(deps.config.dbPath, cfg.secret_ref) : ''
+  if (!appId || !secret) return false
+  const robotCode = String(cfg.robot_code ?? '').trim() || appId
+
+  const card = new DingTalkAICardStream(appId, secret, externalId, robotCode)
+  const clarify: DingTalkClarifyState = {
+    sessionId,
+    question: picker.question,
+    options: picker.options,
+    kind: 'single',
+    allowCustom: false,
+    flowId: `cf_model_picker_${randomUUID()}`,
+    step: 1,
+    origin: 'model-picker',
+  }
+  const state: DingTalkRichCardState = {
+    answer: picker.question,
+    reasoning: '',
+    tools: [],
+    thinkingDone: true,
+    toolDetails: [],
+    sessionId,
+    clarify,
+  }
+
+  if (!(await card.start(state, '选择对话模型'))) return false
+  // start 成功后卡片选项已经可见；先登记再 finish，避免 finish 失败时按钮点了无响应。
+  const outTrackId = card.providerMessageIds[0] ?? ''
+  if (!outTrackId) return false
+  registerDingTalkClarifyCard(outTrackId, clarify)
+  if (!(await card.finish(state, '选择对话模型'))) {
+    console.warn('[eab] 钉钉模型卡收口失败，选项已可见，保留卡片等待点选：', outTrackId)
+  }
+  return true
+}
+
+/**
  * 处理一条钉钉私聊消息。
  * `dedupe=true` 时由本函数自己写 channel_events；HTTP 路由已去重时传 false。
  */
@@ -897,6 +956,33 @@ export async function handleDingTalkMessage(
     }
     const modelCommand = planChannelModelCommand(rawText, available, currentModelId)
     if (modelCommand) {
+      // “有哪些模型/切换模型/模型名有歧义”统一走引导卡，不再回文字列表；
+      // 点选后由卡片回调静默切换，用户不需要再说“用引导模式”。
+      if (modelCommand.kind === 'list' || modelCommand.kind === 'ambiguous') {
+        const pickerModels =
+          modelCommand.kind === 'ambiguous'
+            ? (modelCommand.candidates ?? []).filter((candidate) =>
+                availableChatModels.some((model) => model.id === candidate.id),
+              )
+            : availableChatModels
+        if (
+          await showDingTalkModelPickerCard(
+            deps,
+            cfg,
+            externalId,
+            commandSessionId,
+            pickerModels.length > 0 ? pickerModels : availableChatModels,
+            currentModelId,
+          )
+        ) {
+          return {
+            handled: true,
+            text: null,
+            sessionId: commandSessionId,
+            reason: 'model-picker-card',
+          }
+        }
+      }
       if (modelCommand.modelId !== undefined) {
         deps.db
           .prepare('UPDATE chat_sessions SET model_id = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL')
@@ -1517,7 +1603,7 @@ export async function handleDingTalkMessage(
           const next = available.find((item) => item.id === change.toModelId)
           if (next) effectiveModel = next
           modelSwitchContext.activeModelId = change.toModelId
-          failoverNote = `当前模型「${change.fromModelName}」暂时不可用，已自动切换到「${change.toModelName}」。\n\n`
+          failoverNote = modelFailoverNotice(change)
         },
         onModelFallbackStart: () => {
           // 备用模型开始输出前清空失败模型的半截内容；等成功后再清会把新模型的 token 也抹掉。
@@ -1612,8 +1698,9 @@ export async function handleDingTalkMessage(
         const usedId = agentResult.usedModelId
         const used = usedId ? available.find((item) => item.id === usedId) : undefined
         if (used) effectiveModel = used
-        if (preferredModel && agentResult.fallbackFromModelId && effectiveModel.id !== model.id) {
-          // 用户固定选过模型时，故障转移后的模型写入本会话；自动模式仍保持 NULL。
+        if (preferredModel && shouldPersistFailoverModel(agentResult.fallbackFromModelId)) {
+          // 只有插件模型失败才把接替模型写回：插件模型会被健康表长期排除；
+          // 本地/自建模型的一次失败是临时的，保持用户原来的选择。
           deps.db
             .prepare('UPDATE chat_sessions SET model_id = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL')
             .run(effectiveModel.id, Date.now(), sessionId)
@@ -2357,6 +2444,9 @@ export async function handleDingTalkCardCallback(
   const outTrackId = String(payload.outTrackId ?? '').trim()
   const externalId = String(payload.userId ?? '').trim()
   if (!outTrackId || !externalId) return
+  // 模型点选已经把这张卡消费完：后续再点同一张卡直接忽略，
+  // 不能因为卡片收口失败就重新跑一轮 Agent、再冒出一条独立消息。
+  if (isDingTalkClarifyCardConsumed(outTrackId)) return
 
   let content: { actionIds: string[]; params: Record<string, unknown> }
   try {
@@ -2684,8 +2774,11 @@ export async function handleDingTalkCardCallback(
   let assistantMessageId = registered?.messageId || ''
   let flowId = registered?.flowId || ''
   let questionStep = Number(registered?.step ?? 0)
+  let clarifyQuestion = String(registered?.question ?? '')
   let fallbackOptions: Array<{ id: string; label: string }> = []
-  if (!assistantMessageId) {
+  // 模型卡没有对应的 assistant 消息；若仍按历史消息兜底，会误把上一条
+  // 真实澄清消息当成这张卡的归属，点选模型后改写错消息。
+  if (!assistantMessageId && registered?.origin !== 'model-picker') {
     const rows = deps.db
       .prepare(
         `SELECT id, meta_json FROM chat_messages
@@ -2702,11 +2795,13 @@ export async function handleDingTalkCardCallback(
         }
         if (!meta.clarify || typeof meta.clarify !== 'object') continue
         const clarify = meta.clarify as {
+          question?: unknown
           options?: Array<{ id?: unknown; label?: unknown }>
         }
         assistantMessageId = row.id
         flowId = typeof meta.clarifyFlowId === 'string' ? meta.clarifyFlowId : ''
         questionStep = Number(meta.clarifyStep) || 0
+        clarifyQuestion = String(clarify.question ?? '')
         fallbackOptions = (clarify.options ?? [])
           .map((option) => ({
             id: String(option.id ?? ''),
@@ -2753,6 +2848,116 @@ export async function handleDingTalkCardCallback(
 
   const cfg = dingTalkConfig(deps.db, deps.companyId)
   const channelSecret = cfg?.secret_ref ? resolveSecret(deps.config.dbPath, cfg.secret_ref) : null
+
+  /**
+   * 模型选择卡片走静默切换：这是用户点选，不是自然语言提问，不需要再跑一轮
+   * Agent，也不该生成一条新的“已切换模型”消息。直接写会话偏好，并把结果
+   * 收口回用户点的同一张卡；卡片失效时宁可无提示，也不再补发文字气泡。
+   */
+  let selectedModel: ReturnType<typeof planChannelModelSelection> = null
+  if (!isBatch && registeredKind === 'single' && /(模型|model)/i.test(clarifyQuestion)) {
+    const catalog = await loadModelCatalogCached(
+      deps.db,
+      actor.subject.companyId,
+      deps.config.devAuth,
+      actor.subject.userId,
+    )
+    const available = visibleModelsFor(catalog, [...actor.subject.roles], actor.subject.companyId)
+      .filter((item) => (item.endpointKind ?? 'chat') === 'chat')
+    selectedModel = planChannelModelSelection(clarifyQuestion, optionLabel, available)
+  }
+  if (selectedModel) {
+    const stored = deps.db
+      .prepare('SELECT model_id FROM chat_sessions WHERE id = ? AND deleted_at IS NULL')
+      .get(sessionId) as { model_id: string | null } | undefined
+    const currentModelId = stored?.model_id ?? null
+    const changed = currentModelId !== selectedModel.modelId
+    if (changed) {
+      updateConversationModelPreference(deps.db, {
+        companyId: actor.subject.companyId,
+        userId: actor.person.id,
+        sessionId,
+        modelId: selectedModel.modelId,
+      })
+    }
+    const confirmation = selectedModel.modelId
+      ? changed
+        ? `已切换到「${selectedModel.modelName}」，下一条消息开始使用。`
+        : `当前已经在使用「${selectedModel.modelName}」。`
+      : changed
+        ? '已切回自动选择，下一条消息开始按可用模型自动选择。'
+        : '当前已经是自动选择。'
+
+    const richState: DingTalkRichCardState = {
+      answer: confirmation,
+      reasoning: '',
+      tools: [],
+      thinkingDone: true,
+      toolDetails: [],
+      clarify: null,
+    }
+    let cardUpdated = false
+    if (cfg?.app_id && channelSecret) {
+      const stream = new DingTalkAICardStream(
+        cfg.app_id,
+        channelSecret,
+        externalId,
+        cfg.robot_code || cfg.app_id,
+      )
+      cardUpdated = await stream.completeClarify(outTrackId, richState)
+      if (!cardUpdated) {
+        const resumed = await stream.resume(outTrackId, richState)
+        if (resumed) cardUpdated = await stream.finish(richState)
+      }
+    }
+    if (!cardUpdated) {
+      console.info(
+        `[eab] 钉钉模型点选：原卡已失效，已静默切换为「${selectedModel.modelName}」，不补发文字消息`,
+      )
+    }
+
+    // 网页工作台和钉钉共用同一份历史：把原来那张提问卡改成切换结果，
+    // 不在消息列表里留下一个永远等你点选的旧问题。
+    if (assistantMessageId) {
+      const row = deps.db
+        .prepare('SELECT id, meta_json FROM chat_messages WHERE id = ? AND role = ? LIMIT 1')
+        .get(assistantMessageId, 'assistant') as { id: string; meta_json: string | null } | undefined
+      if (row) {
+        try {
+          const meta = JSON.parse(row.meta_json || '{}') as Record<string, unknown>
+          const clarify = meta.clarify as { question?: unknown } | null | undefined
+          if (clarify && String(clarify.question ?? '') === clarifyQuestion) {
+            deps.db
+              .prepare('UPDATE chat_messages SET text = ?, meta_json = ? WHERE id = ?')
+              .run(
+                confirmation,
+                JSON.stringify({ ...meta, clarify: null, interaction: 'model_select' }),
+                assistantMessageId,
+              )
+          }
+        } catch (error) {
+          console.warn('[eab] 钉钉模型点选改写历史失败：', (error as Error).message)
+        }
+      }
+    }
+
+    forgetDingTalkClarifyCard(outTrackId)
+    deps.db
+      .prepare('UPDATE channel_events SET result_json = ? WHERE provider = ? AND event_key = ?')
+      .run(
+        JSON.stringify({
+          phase: 'model-select',
+          target: selectedModel.modelId,
+          changed,
+          cardUpdated,
+          outTrackId,
+        }),
+        'dingtalk',
+        cardEventKey,
+      )
+    return
+  }
+
   let resumedCard: DingTalkAICardStream | undefined
   if (cfg?.app_id && channelSecret) {
     const stream = new DingTalkAICardStream(

@@ -1,12 +1,11 @@
 /**
  * 成员后台页面权限的读写与 scope 翻译。
  *
- * 权限模型从“可见 / 管理”拆成：
- * - 可见（can_view）：能看页面、能读该页对应接口；
- * - 新增（can_create）、编辑（can_edit）、删除（can_delete）：分别对应三类写动作。
- *
- * 旧数据的 `can_manage=1` 会回填成三项写动作全开，保证升级后原有权限不缩水；
- * 新保存一律按动作落库。权限按页面保存，导航是否显示仍按页面可见计算。
+ * 权限模型只登记页面可见：
+ * - 可见（can_view）：能看页面，并能使用该页全部功能；
+ * - 新增 / 编辑 / 删除动作列仅为旧数据兼容保留，不参与守卫判断；
+ * - 系统页的二级页面各自登记可见，互不继承；
+ * - 旧数据的 `can_manage=1` 仍能读回为可见，保证升级后入口不丢失。
  */
 import type { Db } from '@eab/storage'
 import { withTransaction } from '@eab/storage'
@@ -26,15 +25,16 @@ import {
 } from './console-pages.js'
 
 export interface ConsolePagePermission {
-  /** 权限键：整页是 `page`，页内分区是 `page:section`。 */
+  /** 权限键：整页是 `page`，系统二级页是 `page:section`。 */
   readonly page: string
   readonly parentPage: ConsolePageKey
   readonly section?: string
   readonly canView: boolean
+  /** 以下动作字段仅用于旧数据兼容，不再决定功能是否可用。 */
   readonly canCreate: boolean
   readonly canEdit: boolean
   readonly canDelete: boolean
-  /** 兼容旧调用方：任一写动作打开即为 true；新代码请用三项动作字段。 */
+  /** 兼容旧调用方：任一写动作打开即为 true。 */
   readonly canManage: boolean
 }
 
@@ -42,10 +42,11 @@ export interface ConsolePagePermissionInput {
   readonly page: string
   readonly section?: string
   readonly canView?: boolean
+  /** 旧接口动作字段；新界面只提交 canView。 */
   readonly canCreate?: boolean
   readonly canEdit?: boolean
   readonly canDelete?: boolean
-  /** 旧接口字段；传 true 等价于三项写动作全开。 */
+  /** 旧接口字段；传 true 等价于旧版三项写动作全开。 */
   readonly canManage?: boolean
 }
 
@@ -82,22 +83,6 @@ function permissionOfRow(row: PermissionRow): ConsolePagePermission | null {
     canDelete,
     canManage,
   }
-}
-
-function actionsOf(permission: ConsolePagePermission): {
-  create: boolean
-  edit: boolean
-  delete: boolean
-} {
-  return { create: permission.canCreate, edit: permission.canEdit, delete: permission.canDelete }
-}
-
-function writeActionList(permission: ConsolePagePermission): ConsoleWriteAction[] {
-  const actions: ConsoleWriteAction[] = []
-  if (permission.canCreate) actions.push('create')
-  if (permission.canEdit) actions.push('edit')
-  if (permission.canDelete) actions.push('delete')
-  return actions
 }
 
 /**
@@ -294,28 +279,30 @@ export function hasAnyConsolePagePermission(db: Db, companyId: string, userId: s
 /**
  * 是否允许配置其他成员的后台访问。
  *
- * 这是一个独立能力，挂在「成员管理 → 后台访问 → 配置后台访问」；
- * 老数据只有整页 org 编辑权限、还没有分区记录时，按整页编辑兼容，
- * 一旦该页配置了任一分区，就只认 memberAccess 分区自己的动作。
+ * 页面权限只登记可见；成员管理页可见即可配置成员后台访问。
+ * 旧数据里的 `org:memberAccess` 分区不再作为独立能力。
  */
 export function canConfigureMemberConsoleAccess(
   permissions: ReadonlyMap<string, ConsolePagePermission>,
 ): boolean {
-  const sectionKey = consolePermissionPageKey('org', 'memberAccess')
-  const section = permissions.get(sectionKey)
-  if (section) return section.canEdit
-  const sectionConfigured = [...permissions.values()].some(
-    (permission) => permission.parentPage === 'org' && permission.section,
-  )
-  return sectionConfigured ? false : permissions.get('org')?.canEdit === true
+  return permissions.get('org')?.canView === true
 }
 
 /** 把页面权限翻译成员工 scope；只用于成员后台会话，不影响成员对话会话。 */
 export function consoleScopesForMember(db: Db, companyId: string, userId: string): Scope[] {
   const permissions = readConsolePagePermissions(db, companyId, userId)
   const scopes = new Set<Scope>()
+  // 父页面行只是系统二级页的入口，不能在只勾了「系统更新」时把整套系统写 scope 带出去。
+  const sectionParents = new Set(
+    [...permissions.values()].filter((item) => item.section).map((item) => item.parentPage),
+  )
   for (const permission of permissions.values()) {
-    for (const scope of consoleScopesForPage(permission.parentPage, actionsOf(permission))) scopes.add(scope)
+    if (!permission.canView) continue
+    if (permission.section == null && sectionParents.has(permission.parentPage)) continue
+    // 「系统更新」的执行能力只由 /api/console/update 守卫判断；不能因为该页可见
+    // 就顺带拿到系统页的 SERVICE_CONTROL / 备份 / 恢复 scope。
+    if (permission.parentPage === 'system' && permission.section === 'update') continue
+    for (const scope of consoleScopesForPage(permission.parentPage, true)) scopes.add(scope)
   }
   return [...scopes]
 }
@@ -471,14 +458,13 @@ export function consolePermissionCatalog() {
   }
 }
 
-/** 给访问载荷复用的动作数组，前端无需自己推导；页内分区使用 `page:section` 键。 */
+/** 给访问载荷复用：页面只登记可见，可见即拥有该页全部功能，统一返回三种写动作。 */
 export function consoleActionsByPage(
   permissions: ReadonlyMap<string, ConsolePagePermission>,
 ): Record<string, ConsoleWriteAction[]> {
   const result: Record<string, ConsoleWriteAction[]> = {}
   for (const [page, permission] of permissions) {
-    const actions = writeActionList(permission)
-    if (actions.length > 0) result[page] = actions
+    if (permission.canView) result[page] = ['create', 'edit', 'delete']
   }
   return result
 }
@@ -494,19 +480,10 @@ export function consoleVisibleParentPages(
   return [...pages]
 }
 
+/** 页面只登记可见；任意写动作的页面集合都等于可见页面集合。 */
 export function consoleActionParentPages(
   permissions: ReadonlyMap<string, ConsolePagePermission>,
-  action: ConsoleWriteAction,
+  _action: ConsoleWriteAction,
 ): ConsolePageKey[] {
-  const pages = new Set<ConsolePageKey>()
-  for (const permission of permissions.values()) {
-    if (
-      (action === 'create' && permission.canCreate) ||
-      (action === 'edit' && permission.canEdit) ||
-      (action === 'delete' && permission.canDelete)
-    ) {
-      pages.add(permission.parentPage)
-    }
-  }
-  return [...pages]
+  return consoleVisibleParentPages(permissions)
 }

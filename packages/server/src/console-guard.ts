@@ -9,7 +9,7 @@ import type { ServerDeps } from './deps.js'
 import { memberSessionFromRequest, sessionFromRequest } from './console-auth.js'
 import { readConsoleMemberSession } from './console-member-session.js'
 import { consoleActionsByPage, readConsolePagePermissions, type ConsolePagePermission } from './console-permissions.js'
-import { consoleApiActionLabel, consoleApiRuleFor, ruleAllowsPage, type ConsoleApiAction } from './console-api-access.js'
+import { consoleApiRuleFor, ruleAllowsPage, type ConsoleApiAction } from './console-api-access.js'
 import {
   consolePermissionLabel,
   type ConsolePageKey,
@@ -21,7 +21,7 @@ function pageLabel(page: ConsolePageKey, section?: string): string {
 
 function forbidden(message: string, details?: Record<string, unknown>): EabError {
   return new EabError(EC.FORBIDDEN, message, {
-    hint: '让平台管理员或有权限的成员在「成员管理 → 后台访问」里给对应页面勾选所需的可见、新增、编辑或删除。',
+    hint: '让平台管理员或有权限的成员在「成员管理 → 后台访问」里给对应页面勾选「可见」。页面可见即可使用该页全部功能。',
     details,
   })
 }
@@ -60,17 +60,9 @@ export function enforceConsoleMemberAccess(req: FastifyRequest, deps: ServerDeps
   const sectionConfigured = new Set(
     [...permissions.values()].filter((item) => item.section).map((item) => item.parentPage),
   )
-  const allows = (permission: ConsolePagePermission, action: ConsoleApiAction): boolean => {
-    switch (action) {
-      case 'view':
-        return permission.canView
-      case 'create':
-        return permission.canCreate
-      case 'edit':
-        return permission.canEdit
-      case 'delete':
-        return permission.canDelete
-    }
+  const allows = (permission: ConsolePagePermission, _action: ConsoleApiAction): boolean => {
+    // 页面权限只登记可见；可见即拥有该页全部功能。动作列仅为旧数据兼容保留。
+    return permission.canView
   }
   const allowed = (page: ConsolePageKey, action: ConsoleApiAction, section?: string): boolean => {
     if (section) {
@@ -90,7 +82,6 @@ export function enforceConsoleMemberAccess(req: FastifyRequest, deps: ServerDeps
     return [...permissions.values()].some((item) => item.parentPage === page && allows(item, action))
   }
   if (!ruleAllowsPage(rule, allowed)) {
-    const required = rule.actions.map((action) => consoleApiActionLabel(action)).join('、')
     const requiredSections = rule.section
       ? [rule.section]
       : rule.sections
@@ -99,7 +90,7 @@ export function enforceConsoleMemberAccess(req: FastifyRequest, deps: ServerDeps
           ? Object.entries(rule.sectionPages).flatMap(([page, sections]) =>
               (sections ?? []).map((section) => `${page}:${section}`))
           : []
-    throw forbidden(`当前后台账号没有该页面的${required}权限：${rule.pages.map((page) => pageLabel(page, rule.section)).join('、')}`, {
+    throw forbidden(`当前后台账号没有该页面的可见权限：${rule.pages.map((page) => pageLabel(page, rule.section)).join('、')}`, {
       path,
       requiredActions: rule.actions,
       requiredPages: rule.pages,

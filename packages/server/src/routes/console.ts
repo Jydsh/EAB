@@ -27,7 +27,15 @@ import { resolveOrgSyncIntervalMs, syncChannelOrg, type ChannelProvider } from '
 import { dispatchPluginRpc } from '../plugin-host.js'
 import { hitRate } from '../backends/coordination.js'
 import { bumpHotVersion } from '../hot-cache.js'
-import { isPermissionAdminRole } from '../permission-approvals.js'
+import { defaultPolicyView, isPermissionAdminRole } from '../permission-approvals.js'
+import {
+  deleteApprovalWorkflow,
+  getApprovalWorkflow,
+  listApprovalWorkflows,
+  publishApprovalWorkflow,
+  saveApprovalWorkflow,
+  validateWorkflowFlow,
+} from '../approval-workflows.js'
 import { publishChatEvent } from '../chat-events.js'
 import { listPluginChannels, listAllPluginModels, listPluginModels } from '../plugin-models.js'
 import { invalidatePluginToolSpecsEverywhere, pluginToolCatalogFor } from '../plugin-tools.js'
@@ -624,6 +632,7 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
         group: registry[scope]?.group ?? '',
         label: registry[scope]?.label ?? scope,
       })),
+      defaultPolicy: defaultPolicyView(deps.db, companyId),
     })
   })
 
@@ -642,12 +651,18 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
     const companyId = companyOf(req, deps)
     const targetType = String(req.body?.targetType ?? '').trim()
     const targetKey = String(req.body?.targetKey ?? '').trim()
-    if (targetType !== 'scope' && targetType !== 'role') {
-      throw new EabError(EC.VALIDATION, 'targetType 只能是 scope / role')
+    if (targetType !== 'scope' && targetType !== 'role' && targetType !== 'default') {
+      throw new EabError(EC.VALIDATION, 'targetType 只能是 scope / role / default')
     }
-    if (!targetKey) throw new EabError(EC.VALIDATION, 'targetKey 不能为空')
+    if (targetType === 'default' && targetKey && targetKey !== 'default') {
+      throw new EabError(EC.VALIDATION, 'default 策略的 targetKey 只能是 default')
+    }
+    if (targetType !== 'default' && !targetKey) throw new EabError(EC.VALIDATION, 'targetKey 不能为空')
     if (targetType === 'scope' && !isKnownScope(targetKey)) {
       throw new EabError(EC.VALIDATION, `未登记的权限点：${targetKey}`)
+    }
+    if (targetType === 'default' && req.body?.approverStrategy === 'fixed_users') {
+      throw new EabError(EC.VALIDATION, '默认审批链只支持部门负责人链')
     }
     if (targetType === 'role') {
       const role = deps.db
@@ -664,6 +679,7 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
     }
     const includeCompanyAdmin = req.body?.includeCompanyAdmin === true
     const now = Date.now()
+    const effectiveTargetKey = targetType === 'default' ? 'default' : targetKey
     deps.db
       .prepare(
         `INSERT INTO permission_approval_policies
@@ -683,7 +699,7 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
         `pap_${randomUUID().replace(/-/g, '')}`,
         companyId,
         targetType,
-        targetKey,
+        effectiveTargetKey,
         maxLevels,
         includeCompanyAdmin ? 1 : 0,
         timeoutHours,
@@ -693,7 +709,96 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
         now,
         now,
       )
-    return ok({ saved: true, targetType, targetKey })
+    return ok({ saved: true, targetType, targetKey: effectiveTargetKey })
+  })
+
+  app.get('/api/console/approval-workflows', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    return ok({ workflows: listApprovalWorkflows(deps.db, companyId) })
+  })
+
+  app.get<{ Params: { id: string } }>('/api/console/approval-workflows/:id', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    return ok({ workflow: getApprovalWorkflow(deps.db, companyId, req.params.id) })
+  })
+
+  app.delete<{ Params: { id: string } }>('/api/console/approval-workflows/:id', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const workflow = deleteApprovalWorkflow(deps.db, companyId, req.params.id)
+    appendAudit(deps.db, {
+      companyId,
+      actorUserId: CONSOLE_OPERATOR_ID,
+      action: 'approval_workflow.delete',
+      resourceType: 'approval_workflow',
+      resourceId: workflow.id,
+      result: 'success',
+      detail: { name: workflow.name },
+      ip: req.ip ?? null,
+      channel: 'console',
+    })
+    return ok({ deleted: true, id: workflow.id })
+  })
+
+  app.post<{
+    Body: {
+      id?: string
+      name?: string
+      description?: string
+      scopeMode?: string
+      roleMode?: string
+      flow?: unknown
+    }
+  }>('/api/console/approval-workflows', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const workflow = saveApprovalWorkflow(deps.db, companyId, 'console-operator', req.body ?? {})
+    appendAudit(deps.db, {
+      companyId,
+      actorUserId: CONSOLE_OPERATOR_ID,
+      action: req.body?.id ? 'approval_workflow.save' : 'approval_workflow.create',
+      resourceType: 'approval_workflow',
+      resourceId: workflow.id,
+      result: 'success',
+      detail: { name: workflow.name, version: workflow.version, draftVersion: workflow.draftVersion },
+      ip: req.ip ?? null,
+      channel: 'console',
+    })
+    return ok({ workflow })
+  })
+
+  app.post<{
+    Params: { id: string }
+    Body: { flow?: unknown }
+  }>('/api/console/approval-workflows/:id/validate', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const workflow = getApprovalWorkflow(deps.db, companyId, req.params.id)
+    const flow = req.body?.flow === undefined ? workflow.flow : req.body.flow
+    return ok({ validation: validateWorkflowFlow(flow) })
+  })
+
+  app.post<{
+    Params: { id: string }
+    Body: { flow?: unknown }
+  }>('/api/console/approval-workflows/:id/publish', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const workflow = publishApprovalWorkflow(deps.db, companyId, 'console-operator', req.params.id, req.body?.flow)
+    appendAudit(deps.db, {
+      companyId,
+      actorUserId: CONSOLE_OPERATOR_ID,
+      action: 'approval_workflow.publish',
+      resourceType: 'approval_workflow',
+      resourceId: workflow.id,
+      result: 'success',
+      detail: { name: workflow.name, version: workflow.version },
+      ip: req.ip ?? null,
+      channel: 'console',
+    })
+    return ok({ workflow })
   })
 
   app.post<{

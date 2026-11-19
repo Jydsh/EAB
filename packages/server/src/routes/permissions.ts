@@ -7,8 +7,10 @@ import {
   cancelPermissionRequest,
   createPermissionRequest,
   currentScopeViews,
+  defaultPolicyView,
   decidePermissionRequest,
   getPermissionRequest,
+  listCurrentRoles,
   listPermissionRequests,
   listRequestableRoles,
   listRequestableScopes,
@@ -25,18 +27,21 @@ function canView(actor: RequestActor, view: PermissionRequestView): boolean {
 }
 
 export function registerPermissionRoutes(app: FastifyInstance, deps: ServerDeps): void {
-  /** 可申请权限点、当前已有权限摘要 + 当前身份能否审批。 */
+  /** 全部可申请权限点、当前角色、当前已有权限摘要 + 当前身份能否审批。 */
   app.get('/api/permissions/config', async (req) => {
     const actor = resolveActor(deps.db, deps.config, req)
     requireScope(actor.subject, SC.APPROVAL_READ)
     const roles = listRequestableRoles(deps.db, actor.person.companyId)
+    const currentRoles = listCurrentRoles(deps.db, actor)
     const scopes = listRequestableScopes(deps.db, actor)
     const currentScopes = currentScopeViews(actor)
     return ok({
-      // roles 保留给旧版面板/兼容调用；员工端新面板只读 scopes。
+      // roles 保留给旧版面板/兼容调用；新面板使用 currentRoles 作为申请角色来源。
       roles,
+      currentRoles,
       scopes,
       currentScopes,
+      defaultPolicy: defaultPolicyView(deps.db, actor.person.companyId),
       canDecide: scopeAllows(actor.subject.scopes, SC.APPROVAL_DECIDE),
       selfOnly: true,
     })
@@ -79,6 +84,7 @@ export function registerPermissionRoutes(app: FastifyInstance, deps: ServerDeps)
         name: row.name,
         requestable: Number(row.requestable) === 1,
       })),
+      defaultPolicy: defaultPolicyView(deps.db, actor.person.companyId),
     })
   })
 
@@ -98,12 +104,18 @@ export function registerPermissionRoutes(app: FastifyInstance, deps: ServerDeps)
     const companyId = actor.person.companyId
     const targetType = String(req.body?.targetType ?? '').trim()
     const targetKey = String(req.body?.targetKey ?? '').trim()
-    if (targetType !== 'scope' && targetType !== 'role') {
-      throw new EabError(EC.VALIDATION, 'targetType 只能是 scope / role')
+    if (targetType !== 'scope' && targetType !== 'role' && targetType !== 'default') {
+      throw new EabError(EC.VALIDATION, 'targetType 只能是 scope / role / default')
     }
-    if (!targetKey) throw new EabError(EC.VALIDATION, 'targetKey 不能为空')
+    if (targetType === 'default' && targetKey && targetKey !== 'default') {
+      throw new EabError(EC.VALIDATION, 'default 策略的 targetKey 只能是 default')
+    }
+    if (targetType !== 'default' && !targetKey) throw new EabError(EC.VALIDATION, 'targetKey 不能为空')
     if (targetType === 'scope' && !isKnownScope(targetKey)) {
       throw new EabError(EC.VALIDATION, `未登记的权限点：${targetKey}`)
+    }
+    if (targetType === 'default' && req.body?.approverStrategy === 'fixed_users') {
+      throw new EabError(EC.VALIDATION, '默认审批链只支持部门负责人链')
     }
     if (targetType === 'role') {
       const role = deps.db
@@ -121,6 +133,7 @@ export function registerPermissionRoutes(app: FastifyInstance, deps: ServerDeps)
     const includeCompanyAdmin = req.body?.includeCompanyAdmin === true
     const now = Date.now()
     const id = `pap_${ulid(now)}`
+    const effectiveTargetKey = targetType === 'default' ? 'default' : targetKey
     deps.db
       .prepare(
         `INSERT INTO permission_approval_policies
@@ -140,7 +153,7 @@ export function registerPermissionRoutes(app: FastifyInstance, deps: ServerDeps)
         id,
         companyId,
         targetType,
-        targetKey,
+        effectiveTargetKey,
         maxLevels,
         includeCompanyAdmin ? 1 : 0,
         timeoutHours,
@@ -150,7 +163,7 @@ export function registerPermissionRoutes(app: FastifyInstance, deps: ServerDeps)
         now,
         now,
       )
-    return ok({ saved: true, targetType, targetKey })
+    return ok({ saved: true, targetType, targetKey: effectiveTargetKey })
   })
 
   app.post<{
@@ -201,7 +214,7 @@ export function registerPermissionRoutes(app: FastifyInstance, deps: ServerDeps)
       : undefined
     const view = createPermissionRequest(deps.db, actor, {
       scopeCodes,
-      roleCode: scopeCodes && scopeCodes.length > 0 ? undefined : String(req.body?.roleCode ?? ''),
+      roleCode: String(req.body?.roleCode ?? ''),
       reason: String(req.body?.reason ?? ''),
       durationHours: req.body?.durationHours === undefined ? undefined : Number(req.body.durationHours),
     })

@@ -11425,6 +11425,11 @@ body.is-resizing-team-list .team-list-resizer {
 
 .perm-apply-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .perm-selected-count { color: #0f766e; font-size: 10px; font-weight: 700; white-space: nowrap; }
+.perm-current-details { border: 1px solid #e7efed; border-radius: 10px; background: #fbfdfc; padding: 10px 12px; }
+.perm-current-details summary { display: flex; align-items: center; justify-content: space-between; gap: 8px; cursor: pointer; list-style: none; }
+.perm-current-details summary::-webkit-details-marker { display: none; }
+.perm-current-label { color: #35534f; font-size: 12px; font-weight: 650; }
+.perm-current-details[open] .perm-current-scopes { margin-top: 9px; max-height: 126px; }
 .perm-current-scopes { display: flex; flex-wrap: wrap; gap: 4px; max-height: 92px; overflow: auto; padding: 1px 0; }
 .perm-current-scopes-empty { margin-top: 10px; justify-content: center; }
 .perm-chip {
@@ -11440,6 +11445,9 @@ body.is-resizing-team-list .team-list-resizer {
 .perm-chip.is-dangerous { border-color: rgba(180, 70, 49, .22); color: #8a3b2b; background: rgba(180, 70, 49, .06); }
 
 .perm-scope-list { display: flex; flex-direction: column; gap: 9px; }
+.perm-scope-empty { display: flex; flex-direction: column; gap: 4px; padding: 18px 16px; border: 1px dashed #dfeae6; border-radius: 10px; background: #fbfdfc; text-align: center; }
+.perm-scope-empty strong { color: #2f4f4a; font-size: 13px; font-weight: 650; }
+.perm-scope-empty span { color: #7b9290; font-size: 12px; line-height: 1.65; }
 .perm-scope-group { display: flex; flex-direction: column; gap: 4px; }
 .perm-scope-group-title {
   color: #6f888d;
@@ -11917,3 +11925,35 @@ body.is-resizing-team-list .team-list-resizer {
   .agent-row-progress-label { max-width: 54%; }
   .ai-team-progress { max-width: none; }
 }
+
+/* 申请权限：身份锚点、个人授权说明与审批路径预览 */
+.perm-grant-note {
+  display: flex; align-items: flex-start; gap: 8px; padding: 9px 10px;
+  border: 1px solid #cfe9e1; border-radius: 10px;
+  background: linear-gradient(180deg, #f5fcfa 0%, #eef9f5 100%);
+}
+.perm-grant-icon {
+  display: grid; place-items: center; flex: none; width: 20px; height: 20px; margin-top: 1px;
+  border-radius: 50%; background: #0f766e; color: #fff; font-size: 10px; font-weight: 700;
+}
+.perm-grant-note strong { display: block; color: #0b5f56; font-size: 11px; line-height: 1.45; }
+.perm-grant-note span { display: block; margin-top: 2px; color: #55766f; font-size: 9.5px; line-height: 1.55; }
+.perm-path-box {
+  min-height: 54px; padding: 9px 10px; border: 1px solid #e0eae7; border-radius: 9px;
+  background: #fbfdfc;
+}
+.perm-path { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; }
+.perm-path-node {
+  padding: 3px 6px; border: 1px solid #dfeae6; border-radius: 5px;
+  background: #fff; color: #465d58; font-size: 9.5px; line-height: 1.4; white-space: nowrap;
+}
+.perm-path-node.is-start { border-color: #cfe9e1; background: #eff9f6; color: #0c665c; font-weight: 700; }
+.perm-path-node.is-approval { border-color: #e4ddcd; background: #fffbf3; color: #7f5b24; }
+.perm-path-node.is-end { border-color: #0f766e; background: #0f766e; color: #fff; font-weight: 700; }
+.perm-path-arrow { color: #9aa5a1; font-size: 10px; font-style: normal; line-height: 1; }
+.perm-path-meta {
+  display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 5px;
+  margin-top: 7px; color: #85938f; font-size: 9px; line-height: 1.4;
+}
+.perm-path-empty { padding: 6px 1px; color: #85938f; font-size: 10px; line-height: 1.55; }
+.perm-select#perm-role { font-weight: 650; }

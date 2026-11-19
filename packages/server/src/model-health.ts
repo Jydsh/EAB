@@ -12,6 +12,7 @@
 import { EC, EabError } from '@eab/domain'
 import {
   callPluginModel,
+  isPluginModelId,
   listAllPluginModels,
   type PluginModelDefinition,
 } from './plugin-models.js'
@@ -200,6 +201,20 @@ export function isModelHealthKnown(companyId: string, modelId: string): boolean 
  */
 export function filterHealthyModels<T extends { id: string }>(companyId: string, models: readonly T[]): T[] {
   return models.filter((model) => isModelHealthy(companyId, model.id))
+}
+
+/**
+ * 对话/子 Agent 的候选过滤：只对插件模型套用健康结论。
+ *
+ * 数据库里的本地或自建供应商模型由真实调用结果决定当前这一轮是否故障转移，
+ * 不能因为一次瞬时失败被长期排除在候选之外；否则正常的本地模型会被误判成
+ * “不可用或未对当前员工开放”。插件模型没有落库记录，仍必须先探测通过。
+ */
+export function filterHealthyModelsForChat<T extends { id: string }>(
+  companyId: string,
+  models: readonly T[],
+): T[] {
+  return models.filter((model) => !isPluginModelId(model.id) || isModelHealthy(companyId, model.id))
 }
 
 /**

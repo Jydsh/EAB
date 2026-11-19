@@ -89,4 +89,19 @@ describe('Agent 工具按需加载', () => {
     const noScope = searchToolCatalog(deps.db, noScopeActor as any, { kind: 'cloud' }, '发送文件到钉钉')
     expect(noScope.tools.length).toBe(0)
   })
+
+  it('项目命令未启用时，目录和搜索都不应给出 project_exec', () => {
+    const { deps, actor } = testEnv()
+    const previous = process.env.EAB_PROJECT_EXEC
+    delete process.env.EAB_PROJECT_EXEC
+    try {
+      const specs = toolSpecsForActor(deps.db, actor, { kind: 'cloud' })
+      expect(specs.some((tool) => tool.function.name === 'project_exec')).toBe(false)
+      const search = searchToolCatalog(deps.db, actor, { kind: 'cloud' }, 'project_exec 执行 python 脚本', 12)
+      expect(search.tools.some((tool) => tool.functionName === 'project_exec')).toBe(false)
+    } finally {
+      if (previous === undefined) delete process.env.EAB_PROJECT_EXEC
+      else process.env.EAB_PROJECT_EXEC = previous
+    }
+  })
 })

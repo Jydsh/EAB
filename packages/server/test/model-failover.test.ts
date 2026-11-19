@@ -3,7 +3,7 @@ import { SC } from '@eab/domain'
 import { migrate, openDatabase } from '@eab/storage'
 import { isModelHealthy, preferredModelId, sortModelsForChat } from '../src/model-health.js'
 import { listPluginModels, registerPluginAdapter } from '../src/plugin-models.js'
-import { runAgentTurn } from '../src/routes/chat.js'
+import { modelFailoverNotice, runAgentTurn, shouldPersistFailoverModel } from '../src/routes/chat.js'
 
 const COMPANY = 'failover-test-company'
 
@@ -113,6 +113,35 @@ describe('对话模型故障转移', () => {
       registration.dispose()
       d.db.close()
     }
+  })
+
+  it('只有插件模型失败才把接替模型写回会话，本地模型保持原选择', () => {
+    expect(shouldPersistFailoverModel(null)).toBe(false)
+    expect(shouldPersistFailoverModel('model_d7b81423-c626-4c4a-8c65-b4030c54fbd5')).toBe(false)
+    expect(shouldPersistFailoverModel(pluginId('failover-route', 'bad'))).toBe(true)
+  })
+
+  it('本地模型的故障转移提示说明本轮失败原因，并承诺下一条仍优先用原模型', () => {
+    const local = modelFailoverNotice({
+      fromModelId: 'model_d7b81423-c626-4c4a-8c65-b4030c54fbd5',
+      toModelId: 'model_1c326ac9-137a-4474-b451-7de25744b1dd',
+      fromModelName: 'Qwen3.6-35B-A3B-NVFP4',
+      toModelName: 'Qwen/Qwen3-8B',
+      reason: '模型返回了空内容',
+    })
+    expect(local).toContain('模型返回了空内容')
+    expect(local).toContain('下一条消息会继续优先尝试「Qwen3.6-35B-A3B-NVFP4」')
+    expect(local).not.toContain('暂时不可用')
+
+    const plugin = modelFailoverNotice({
+      fromModelId: pluginId('failover-route', 'bad'),
+      toModelId: pluginId('failover-route', 'good'),
+      fromModelName: '坏模型',
+      toModelName: '接替模型',
+      reason: '上游 503',
+    })
+    expect(plugin).toContain('已切换到「接替模型」')
+    expect(plugin).not.toContain('下一条消息会继续优先尝试')
   })
 
   it('所有有权限模型都失败时返回聚合错误，而不是单个上游报错', async () => {

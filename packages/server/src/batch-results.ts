@@ -13,6 +13,7 @@ import { EC, EabError } from '@eab/domain'
 import type { Db } from '@eab/storage'
 import type { ChatMessage } from './llm.js'
 import { callModel } from './llm.js'
+import { parseDelimitedRecords } from './delimited.js'
 import { findModelById, resolveModelForPurpose } from './model-registry.js'
 import type { ChatToolSpec } from './routes/tools.js'
 
@@ -461,10 +462,18 @@ function buildChunkDigest(rows: readonly unknown[], columns: readonly string[], 
  * 全量字段统计。用于最终汇总时给出精确总数，避免模型把各批数字相加算错。
  * 高基数字段只保留问题直接命中的值 + top20，避免把整张表的所有取值都塞进汇总上下文。
  */
-function buildBatchOverview(rows: readonly unknown[], columns: readonly string[], question: string): string {
+export function buildBatchOverview(
+  rows: readonly unknown[],
+  columns: readonly string[],
+  question: string,
+  options: { maxColumns?: number; maxValues?: number; maxChars?: number } = {},
+): string {
   const total = rows.length
+  const maxColumns = Math.max(1, Math.floor(Number(options.maxColumns ?? columns.length)))
+  const maxValues = Math.max(6, Math.floor(Number(options.maxValues ?? 60)))
+  const maxChars = Math.max(2_000, Math.floor(Number(options.maxChars ?? 40_000)))
   const lines: string[] = []
-  for (const column of columns) {
+  for (const column of columns.slice(0, maxColumns)) {
     const counts = new Map<string, number>()
     let nonEmpty = 0
     for (const row of rows) {
@@ -480,9 +489,9 @@ function buildBatchOverview(rows: readonly unknown[], columns: readonly string[]
     const entries = [...counts.entries()].sort((a, b) => b[1] - a[1])
     const distinct = entries.length
     const relevant = entries.filter(([value]) => value.length >= 2 && question.includes(value))
-    const selected = distinct <= 60
+    const selected = distinct <= maxValues
       ? entries
-      : [...new Map([...relevant, ...entries.slice(0, 20)].map((item) => [item[0], item])).values()]
+      : [...new Map([...relevant, ...entries.slice(0, Math.min(20, maxValues))].map((item) => [item[0], item])).values()]
     lines.push(
       `${column}（非空 ${nonEmpty}/${total}，去重 ${distinct}）：` +
       (selected.length > 0
@@ -490,7 +499,13 @@ function buildBatchOverview(rows: readonly unknown[], columns: readonly string[]
         : '无值'),
     )
   }
-  return `总记录数 ${total} 条。全量字段统计（数量以此为准）：\n${lines.join('\n')}`
+  const omittedColumns = Math.max(0, columns.length - maxColumns)
+  const body = `${lines.join('\n')}` +
+    (omittedColumns > 0 ? `\n（还有 ${omittedColumns} 个字段未展开，可先用 workspace.search 或 batch_read 查看）` : '')
+  const clipped = body.length > maxChars
+    ? `${body.slice(0, maxChars)}\n…（字段统计过长，尾部已截断）`
+    : body
+  return `总记录数 ${total} 条。全量字段统计（数量以此为准）：\n${clipped}`
 }
 
 /**
@@ -523,6 +538,22 @@ function resolveBatchModelId(options: BatchAnalyzeOptions): string {
   }
   console.warn(`[eab] 批次分析模型 ${options.modelId} 不在平台模型目录，回退到 ${fallback.name}（${fallback.id}）`)
   return fallback.id
+}
+
+/**
+ * CSV/TSV 附件被保存成文本批次时，按行还原成记录，复用记录批次的全量字段统计。
+ * 只认扩展名明确的 csv/tsv，避免把普通文章里的逗号误判成表格。
+ */
+export function parseTabularBatchText(
+  text: string,
+  toolId: string,
+): { columns: string[]; rows: Array<Record<string, string>> } | null {
+  const name = toolId.toLowerCase()
+  let delimiter: string | null = null
+  if (name.endsWith('.csv')) delimiter = ','
+  else if (name.endsWith('.tsv') || name.endsWith('.tab')) delimiter = '\t'
+  if (!delimiter) return null
+  return parseDelimitedRecords(text, delimiter)
 }
 
 async function analyzeTextBatch(
@@ -651,11 +682,11 @@ async function analyzeTextBatch(
   }
 }
 
-/**
- * 全量分批分析：每批用独立 messages 调一次模型，避免所有原始行都堆进同一个上下文；
- * 最后再把“每批摘要”汇总成回答。记录批次走字段统计，文本批次走分段摘要。
- */
-export async function analyzeBatch(options: BatchAnalyzeOptions): Promise<{
+async function analyzeRowsBatch(
+  file: BatchFile,
+  options: BatchAnalyzeOptions,
+  modelId: string,
+): Promise<{
   batchId: string
   kind: BatchKind
   totalRows: number
@@ -666,9 +697,6 @@ export async function analyzeBatch(options: BatchAnalyzeOptions): Promise<{
   answer: string
   failedChunks: number
 }> {
-  const file = loadBatch(options)
-  const modelId = resolveBatchModelId(options)
-  if (file.kind === 'text') return analyzeTextBatch(file, { ...options, modelId })
   if (file.totalRows > MAX_BATCH_ROWS) {
     throw new EabError(
       EC.VALIDATION,
@@ -770,6 +798,7 @@ export async function analyzeBatch(options: BatchAnalyzeOptions): Promise<{
         `共 ${file.totalRows} 条记录，分成 ${chunks} 批。\n\n` +
         `各批摘要：\n${summariesText}\n\n` +
         '请汇总成最终回答，控制在 2000 字以内；如果某些批次失败，要明确说明。' +
+        '最终回答的第一句必须写“服务端共解析到 ' + file.totalRows + ' 条记录”，不要采用文件名、标题或分段摘要里的其它总数；' +
         '如果全量统计和某批摘要的数字不一致，以全量统计为准。',
     },
   ]
@@ -790,6 +819,9 @@ export async function analyzeBatch(options: BatchAnalyzeOptions): Promise<{
     answer = `分批分析完成，但最终汇总失败：${message}\n\n各批摘要：\n${summariesText.slice(0, 6_000)}`
   }
   batchTrace(`分批分析完成：批次 ${file.id}，${chunks} 批，失败 ${failedChunks} 批`)
+  if (!new RegExp(`(^|[^0-9])${file.totalRows}([^0-9]|$)`).test(answer)) {
+    answer = `服务端共解析到 ${file.totalRows} 条记录。\n\n${answer}`
+  }
   return {
     batchId: file.id,
     kind: 'rows',
@@ -801,6 +833,45 @@ export async function analyzeBatch(options: BatchAnalyzeOptions): Promise<{
     answer,
     failedChunks,
   }
+}
+
+/**
+ * 全量分批分析：每批用独立 messages 调一次模型，避免所有原始行都堆进同一个上下文；
+ * 最后再把“每批摘要”汇总成回答。
+ * - 记录批次走字段统计；
+ * - CSV/TSV 附件即使保存成文本批次，也先还原成记录再走字段统计；
+ * - 其余文本批次才按字符切段摘要。
+ */
+export async function analyzeBatch(options: BatchAnalyzeOptions): Promise<{
+  batchId: string
+  kind: BatchKind
+  totalRows: number
+  totalChars: number
+  chunkRows: number
+  chunkChars: number
+  chunks: number
+  answer: string
+  failedChunks: number
+}> {
+  const file = loadBatch(options)
+  const modelId = resolveBatchModelId(options)
+  if (file.kind === 'text') {
+    const table = parseTabularBatchText(file.text ?? '', file.toolId)
+    if (table && table.rows.length > 0) {
+      batchTrace(
+        `文本批次识别为表格：批次 ${file.id}，${table.rows.length} 条记录，${table.columns.length} 个字段；改走全量字段统计`,
+      )
+      return analyzeRowsBatch({
+        ...file,
+        kind: 'rows',
+        totalRows: table.rows.length,
+        columns: table.columns,
+        rows: table.rows,
+      }, { ...options, modelId }, modelId)
+    }
+    return analyzeTextBatch(file, { ...options, modelId })
+  }
+  return analyzeRowsBatch(file, { ...options, modelId }, modelId)
 }
 
 export const BATCH_READ_TOOL_SPEC: ChatToolSpec = {
@@ -830,7 +901,8 @@ export const BATCH_ANALYZE_TOOL_SPEC: ChatToolSpec = {
     name: BATCH_ANALYZE_TOOL_NAME,
     description:
       '对一个“大结果批次”做全量分批分析：服务端把内容切成多批、每批独立调用模型分析，最后汇总成回答。' +
-      '记录批次会先按字段做精确计数，再让模型读每批统计摘要和样本；文本批次按字符切段，让模型逐段分析。' +
+      '记录批次会先按字段做精确计数，再让模型读每批统计摘要和样本；' +
+      'CSV/TSV 附件即使保存成文本批次，也会先完整解析成记录再按字段全量统计；只有其它纯文本才按字符切段。' +
       '当工具结果或上传附件被截断、但用户要求基于全部内容做统计/汇总/分析时使用；它不会把所有原始内容塞进当前上下文。' +
       '几千行或几万字符通常需要几分钟；只查某一条或某一页明细时用 batch_read，不要用本工具。',
     parameters: {

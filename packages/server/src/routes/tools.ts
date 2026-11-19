@@ -7,13 +7,15 @@
  */
 import type { FastifyInstance, FastifyRequest } from 'fastify'
 import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
-import { basename, dirname, isAbsolute, relative } from 'node:path'
+import { basename, dirname, extname, isAbsolute, relative } from 'node:path'
 import { EC, EabError, SC, ulid, type Scope } from '@eab/domain'
 import { appendAudit } from '@eab/storage'
 import { assertScoped, buildScopeFilter, predicateToSql } from '@eab/authz'
 import type { Db } from '@eab/storage'
 import type { ToolParameterSchema } from '../llm.js'
 import { safeJoin, isWithinRoot } from '@eab/workspace'
+import { parseTabularText } from '../delimited.js'
+import { buildXlsxFromTabular } from '../xlsx-create.js'
 import type { ServerDeps } from '../deps.js'
 import { ok, requireScope } from '../http.js'
 import { resolveActor, type RequestActor } from '../session.js'
@@ -82,8 +84,9 @@ import {
   workspaceFolderSummaries,
   type WorkspaceTextEdit,
 } from './workspace.js'
-import { readTextFileRange, searchWorkspaceText, type TextRangeResult, type TextSearchResult } from '../workspace-text.js'
+import { countTextLines, readTextFileRange, searchWorkspaceText, type TextRangeResult, type TextSearchResult } from '../workspace-text.js'
 import { saveTextBatch } from '../batch-results.js'
+import { analyzeWorkspaceFile } from '../workspace-analyze.js'
 import {
   assertProjectExecEnabled,
   killProjectJob,
@@ -190,6 +193,24 @@ export interface ChatToolSpec {
 }
 
 type Actor = ReturnType<typeof resolveActor>
+
+/** 文件名纠错只做空白差异匹配；不做模糊相似度，避免把模型带到另一个文件。 */
+function nearestWorkspacePath(deps: ServerDeps, actor: RequestActor, rawPath: string): string | null {
+  const normalized = rawPath.replace(/[\s\u3000]+/g, '').replace(/\\/g, '/').toLowerCase()
+  if (!normalized) return null
+  const rows = deps.db
+    .prepare(
+      'SELECT name, rel_path FROM workspace_files WHERE company_id = ? AND owner_user_id = ? AND deleted_at IS NULL',
+    )
+    .all(actor.subject.companyId, actor.subject.userId) as unknown as Array<{ name: string; rel_path: string }>
+  const matches = rows.filter((row) => {
+    const rel = String(row.rel_path || '').replace(/\\/g, '/')
+    const name = String(row.name || '')
+    return rel.replace(/[\s\u3000]+/g, '').toLowerCase() === normalized
+      || name.replace(/[\s\u3000]+/g, '').toLowerCase() === normalized
+  })
+  return matches.length === 1 ? matches[0].rel_path : null
+}
 
 /**
  * 工具级资源锁。只在当前 EAB 进程内有效，用于挡住“同一文件/同一任务被两个 Agent
@@ -436,6 +457,14 @@ function readWorkspaceImageFileByPath(
     buffer: readFileSync(real),
   }
 }
+
+/**
+ * 全文分析不是把整份文件塞进模型上下文，而是服务端分块读取后逐段分析再汇总。
+ * 单次上限 2,000,000 字符，按 40,000 字符分块约 50 段，避免一次分析无限调用模型；
+ * 小文件直接全文返回，让模型自己做精确核对。
+ */
+const WORKSPACE_ANALYZE_MAX_CHARS = 2_000_000
+const WORKSPACE_ANALYZE_DIRECT_CHARS = 50_000
 
 export const TOOLS: readonly ToolDef[] = [
   {
@@ -716,7 +745,9 @@ export const TOOLS: readonly ToolDef[] = [
     id: 'workspace.write',
     name: '写入工作区文件',
     description:
-      '把一段文本写成个人工作区里的文件（同名覆盖）。如果文件已存在且只需要改其中某几段、某几个字段，优先调用 workspace.edit，不要整篇重写；只有新建文件或确实要整篇替换时才用本工具。成功后只说明文件名和结果，不要重复粘贴文件正文，界面会展示文件内容预览。',
+      '把一段文本写成个人工作区里的文件（同名覆盖）。如果文件已存在且只需要改其中某几段、某几个字段，优先调用 workspace.edit，不要整篇重写；只有新建文件或确实要整篇替换时才用本工具。' +
+      '写 .xlsx 时服务端会把 CSV/TSV、Markdown 表格、JSON 记录或逐行文本转换成真实 Excel 工作簿，不再把纯文本冒充 xlsx。' +
+      'docx/pptx/xls/xlsm 不能用本工具生成；需要多列表格时优先写 .csv/.tsv 文本。成功后只说明文件名和结果，不要重复粘贴文件正文，界面会展示文件内容预览。',
     scope: SC.WORKSPACE_WRITE,
     dangerous: false,
     concurrency: 'write',
@@ -763,20 +794,29 @@ export const TOOLS: readonly ToolDef[] = [
     id: 'workspace.read',
     name: '读取工作区文件',
     description:
-      '按行读取云空间里的文本文件，和 DSH 的 read 一样始终有界：默认/单次最多 2000 行、单次输出 50 KB、单行最多 2000 字符。offset 从 1 开始，limit 可缩小读取行数。返回 text、startLine、endLine、totalLines、truncated、truncatedByBytes、longLines 和 nextOffset；有 nextOffset 时用它继续读，不要把大文件整段硬读。代码或长日志先 workspace.search 定位 path:line，再读取命中行附近。',
+      '读取云空间里的文本文件。mode=lines（默认）按行读取，和 DSH 的 read 一样单次最多 2000 行、50 KB、单行 2000 字符，超过时返回 nextOffset，用 offset 继续读。mode=analyze 用于“内容太多、需要基于全文统计或总结”：服务端会完整读取整份文件（小文件直接全文返回；大文件由服务端解析全部记录或统计全部行后给出全量概览），不受 2000 行/50 KB 限制，建议传 question 说明关注点；单文件上限 2,000,000 字符。代码或长日志先 workspace.search 定位 path:line，再读取命中行附近。',
     scope: SC.WORKSPACE_READ,
     dangerous: false,
     input: {
       path: { type: 'string', description: '相对路径，例如 notes/todo.md', required: true },
-      offset: { type: 'number', description: '可选：从第几行开始读取，1 表示第一行；默认 1' },
-      limit: { type: 'number', description: '可选：读取多少行，默认 2000，最大 2000；输出超过 50 KB 会在字节上限处提前结束' },
+      mode: {
+        type: 'string',
+        description: 'lines=按行分页读取（默认）；analyze=完整读取并分析整份文件，适用于内容超过 2000 行/50 KB 或需要全文统计的文件',
+        enum: ['lines', 'analyze'],
+      },
+      offset: { type: 'number', description: 'mode=lines 时可选：从第几行开始读取，1 表示第一行；默认 1' },
+      limit: { type: 'number', description: 'mode=lines 时可选：读取多少行，默认 2000，最大 2000；输出超过 50 KB 会在字节上限处提前结束' },
+      question: {
+        type: 'string',
+        description: 'mode=analyze 时建议填写：要基于全文回答的问题，例如“按站点和问题类别统计全部记录并指出异常”；不填则总结整体内容、结构和关键数据',
+      },
     },
   },
   {
     id: 'workspace.search',
     name: '搜索工作区文件',
     description:
-      '在云空间文本文件里按关键词或正则搜索，像 DSH 的 grep 一样返回 path、line、column、命中行片段，并给出总命中数 total。默认最多返回 30 条，单次最多 100 条；命中更多时 truncated=true，可用更精确的 query 或 path 缩小范围。默认递归搜索，30 秒搜索预算，最多扫描 2000 个文件、单文件 2 MB，跳过 node_modules、.git、dist 等目录。先定位 path:line，再用 workspace.read 的 offset/limit 读取上下文。',
+      '在云空间文本文件里按关键词或正则搜索，像 DSH 的 grep 一样返回 path、line、column、命中行片段，并给出总命中数 total。query 也可以是文件名：会额外返回 nameMatches，文件名命中时直接用其中的 path。默认最多返回 30 条，单次最多 100 条；命中更多时 truncated=true，可用更精确的 query 或 path 缩小范围。默认递归搜索，30 秒搜索预算，最多扫描 2000 个文件、单文件 2 MB，跳过 node_modules、.git、dist 等目录。先定位 path:line，再用 workspace.read 的 offset/limit 读取上下文。',
     scope: SC.WORKSPACE_READ,
     dangerous: false,
     input: {
@@ -2136,6 +2176,72 @@ export async function executeTool(
       const path = String(args.path ?? '')
       const root = userScopeDir(deps, actor.subject.companyId, actor.subject.userId)
       const target = safeJoin(root, path)
+      const mode = String(args.mode ?? 'lines').trim().toLowerCase() || 'lines'
+      if (mode === 'analyze') {
+        let size = 0
+        let text = ''
+        try {
+          size = statSync(target).size
+          text = readFileSync(target, 'utf8')
+        } catch (error) {
+          if (error instanceof EabError) throw error
+          const suggestion = nearestWorkspacePath(deps, actor, path)
+          throw new EabError(
+            EC.NOT_FOUND,
+            suggestion
+              ? `云空间文件不存在: ${path}；最接近的是 ${suggestion}，请直接使用这个 path`
+              : `云空间文件不存在: ${path}`,
+          )
+        }
+        const question = String(args.question ?? '').trim()
+          || '总结整份文件的内容、结构、关键数据、分布和异常；如果能确认总量，请给出总量。'
+        const totalLines = countTextLines(text)
+        if (text.length > WORKSPACE_ANALYZE_MAX_CHARS) {
+          throw new EabError(
+            EC.VALIDATION,
+            `文件有 ${text.length.toLocaleString('en-US')} 字符，超过全文分析上限 ${WORKSPACE_ANALYZE_MAX_CHARS.toLocaleString('en-US')} 字符；请先用 workspace.search 缩小范围，或把文件拆分后再分析`,
+          )
+        }
+        if (text.length <= WORKSPACE_ANALYZE_DIRECT_CHARS) {
+          // 小文件直接全文返回：模型可以逐项核对，不额外消耗多轮模型调用。
+          result = {
+            path,
+            mode: 'full',
+            size,
+            text,
+            startLine: totalLines > 0 ? 1 : 0,
+            endLine: totalLines,
+            totalLines,
+            truncated: false,
+            truncatedByBytes: false,
+            longLines: 0,
+            nextOffset: null,
+            coverage: '全文已返回，可直接基于 text 做精确分析',
+          }
+          break
+        }
+        // 大文件不做逐段模型调用：服务端直接解析/统计全文，避免上游限流或超时
+        // 导致只分析了前面几段。结构化文件给出全量字段计数，文本给出全量行数和高频内容。
+        const analysis = analyzeWorkspaceFile(text, path, question)
+        result = {
+          path,
+          mode: 'overview',
+          size,
+          totalChars: text.length,
+          totalLines,
+          kind: analysis.kind,
+          totalRows: analysis.totalRows,
+          columns: analysis.columns,
+          question,
+          overview: analysis.overview,
+          answer: analysis.overview,
+          coverage: analysis.coverage,
+        }
+        break
+      }
+      if (mode !== 'lines') {
+        throw new EabError(EC.VALIDATION, `mode 只能是 lines 或 analyze，收到: ${mode}`)
+      }
       let range: TextRangeResult
       try {
         range = readTextFileRange(target, {
@@ -2144,7 +2250,13 @@ export async function executeTool(
         })
       } catch (error) {
         if (error instanceof EabError) throw error
-        throw new EabError(EC.NOT_FOUND, `云空间文件不存在: ${path}`)
+        const suggestion = nearestWorkspacePath(deps, actor, path)
+        throw new EabError(
+          EC.NOT_FOUND,
+          suggestion
+            ? `云空间文件不存在: ${path}；最接近的是 ${suggestion}，请直接使用这个 path`
+            : `云空间文件不存在: ${path}`,
+        )
       }
       result = {
         path,
@@ -2158,6 +2270,12 @@ export async function executeTool(
         longLines: range.longLines,
         nextOffset: range.nextOffset,
         mode: 'lines',
+        ...(range.truncated
+          ? {
+              analysisHint:
+                '这次只返回了一页。如果问题需要基于整份文件统计或总结，请改用 mode="analyze" 并传 question，服务端会读完整份文件再分析；不要只读第一页就下结论。',
+            }
+          : {}),
       }
       break
     }
@@ -2183,12 +2301,15 @@ export async function executeTool(
       result = {
         query: String(args.query ?? ''),
         path: String(args.path ?? ''),
+        regex: Boolean(args.regex),
+        caseSensitive: Boolean(args.caseSensitive),
         count: search.matches.length,
         total: search.total,
         filesScanned: search.filesScanned,
         truncated: search.truncated,
         timeLimitHit: search.timeLimitHit,
         matches: search.matches,
+        nameMatches: search.nameMatches,
       }
       break
     }
@@ -4253,33 +4374,67 @@ export async function executeTool(
       const path = String(args.path ?? '')
       const text = String(args.text ?? '')
       if (!path) throw new EabError(EC.VALIDATION, 'path 不能为空')
+      if (text.startsWith('PK\u0003\u0004')) {
+        throw new EabError(EC.VALIDATION, 'workspace.write 只接受文本内容，不能直接写二进制 Office 文件', {
+          hint: '请把表格写成 CSV/TSV 文本并保存为 .csv，或保存为 .xlsx 让服务端自动转换成真实工作簿；docx/pptx 请用对应的 Office 工具处理。',
+        })
+      }
+      const ext = extname(path).toLowerCase()
+      if (ext === '.docx' || ext === '.docm' || ext === '.pptx' || ext === '.pptm' || ext === '.xls' || ext === '.xlsm') {
+        throw new EabError(EC.VALIDATION, `workspace.write 不支持直接生成 ${ext} 文件`, {
+          hint: 'docx/pptx/xls/xlsm 需要二进制结构，不能用一段文本冒充。表格请写 .csv/.tsv，或写 .xlsx 由服务端生成真实工作簿；Word/PowerPoint 请另存为文本或使用对应的 Office 编辑工具。',
+        })
+      }
       const root = userScopeDir(deps, actor.subject.companyId, actor.subject.userId)
       const target = safeJoin(root, path)
       if (!target) throw new EabError(EC.VALIDATION, '非法路径')
       mkdirSync(dirname(target), { recursive: true })
-      writeFileSync(target, text, 'utf8')
+      let buffer: Buffer = Buffer.from(text, 'utf8')
+      let mime = 'text/plain'
+      let note: string | undefined
+      if (ext === '.xlsx') {
+        const table = parseTabularText(text)
+        buffer = buildXlsxFromTabular({
+          sheetName: basename(path, ext),
+          columns: table.columns,
+          rows: table.rows,
+        })
+        mime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        const formatLabel = table.format === 'json'
+          ? 'JSON 记录'
+          : table.format === 'markdown'
+            ? 'Markdown 表格'
+            : table.format === 'csv' || table.format === 'tsv'
+              ? table.format.toUpperCase()
+              : '逐行文本'
+        note = `已把${formatLabel}转换为真实 xlsx：${table.rows.length} 行数据、${table.columns.length} 列，可直接用 Excel/OnlyOffice 打开。`
+        if (table.format === 'lines') {
+          note += ' 当前内容没有识别出多列结构，已按每行一列保存；需要多列表格时请写 CSV、TSV 或 Markdown 表格。'
+        }
+      }
+      writeFileSync(target, buffer)
       const row = deps.db
         .prepare(
           `SELECT id FROM workspace_files WHERE company_id = ? AND scope_type = 'user' AND scope_id = ? AND rel_path = ? AND deleted_at IS NULL`,
         )
         .get(actor.subject.companyId, actor.subject.userId, path) as { id: string } | undefined
-      const size = Buffer.byteLength(text, 'utf8')
+      const size = buffer.byteLength
       const fileId = row?.id ?? ulid()
       const now = Date.now()
       if (row) {
         deps.db
-          .prepare('UPDATE workspace_files SET size = ?, storage_path = ?, updated_at = ? WHERE id = ?')
-          .run(size, target, now, row.id)
+          .prepare('UPDATE workspace_files SET size = ?, mime = ?, storage_path = ?, updated_at = ? WHERE id = ?')
+          .run(size, mime, target, now, row.id)
       } else {
         deps.db
           .prepare(
             `INSERT INTO workspace_files (id, company_id, scope_type, scope_id, owner_user_id, rel_path, name, size, mime, storage_path, created_at, updated_at)
-             VALUES (?, ?, 'user', ?, ?, ?, ?, ?, 'text/plain', ?, ?, ?)`,
+             VALUES (?, ?, 'user', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           )
-          .run(fileId, actor.subject.companyId, actor.subject.userId, actor.subject.userId, path, basename(path), size, target, now, now)
+          .run(fileId, actor.subject.companyId, actor.subject.userId, actor.subject.userId, path, basename(path), size, mime, target, now, now)
       }
       publishWorkspaceFilesChanged(actor.subject.companyId, actor.subject.userId, row ? 'updated' : 'created', [fileId])
-      result = { fileId, path, size, created: !row }
+      result = { fileId, path, size, created: !row, mime, ...(note ? { note } : {}) }
       break
     }
     case 'workspace.edit': {

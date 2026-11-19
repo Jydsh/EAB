@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { migrate, openDatabase, type Db } from '@eab/storage'
+import { SC } from '@eab/domain'
 import type { ServerConfig } from '../src/config.js'
 import type { ServerDeps } from '../src/deps.js'
 import { buildApp } from '../src/app.js'
@@ -10,6 +11,7 @@ import { hashPassword } from '../src/password.js'
 import { createSession, sessionCookie } from '../src/console-auth.js'
 import { createEmployeeSession } from '../src/employee-session.js'
 import {
+  consoleScopesForMember,
   saveConsolePagePermissions,
   saveConsoleRolePagePermissions,
 } from '../src/console-permissions.js'
@@ -177,7 +179,11 @@ describe('console member access', () => {
     const body = JSON.parse(access.body).data
     expect(body.kind).toBe('member')
     expect(body.allowedPages.sort()).toEqual(['overview', 'usage'])
-    expect(body.managePages).toEqual([])
+    expect(body.managePages.sort()).toEqual(['overview', 'usage'])
+    expect(body.actionsByPage).toEqual({
+      overview: ['create', 'edit', 'delete'],
+      usage: ['create', 'edit', 'delete'],
+    })
 
     const overview = await app.inject({
       method: 'GET',
@@ -214,159 +220,62 @@ describe('console member access', () => {
     expect(page.body).toContain('id="page-body"')
   })
 
-  it('allows manage actions only when can_manage is on', async () => {
+  it('unlocks all member-management functions when the page is visible', async () => {
     const { app, db } = makeApp()
-    saveConsolePagePermissions(db, 'c1', 'u1', [{ page: 'org', canView: true, canManage: false }], 'test')
+    saveConsolePagePermissions(db, 'c1', 'u1', [{ page: 'org', canView: true }], 'test')
     const { cookie } = await login(app)
-    const read = await app.inject({
-      method: 'GET',
-      url: '/api/org/members',
-      headers: { 'x-eab-console': '1', cookie },
-    })
-    expect(read.statusCode).toBe(200)
-    const write = await app.inject({
-      method: 'POST',
-      url: '/api/console/members',
-      headers: { 'x-eab-console': '1', cookie },
-      payload: { name: '新成员' },
-    })
-    expect(write.statusCode).toBe(403)
-
-    saveConsolePagePermissions(db, 'c1', 'u1', [{ page: 'org', canView: true, canManage: true }], 'test')
-    const writeAgain = await app.inject({
-      method: 'POST',
-      url: '/api/console/members',
-      headers: { 'x-eab-console': '1', cookie },
-      payload: { name: '新成员' },
-    })
-    expect(writeAgain.statusCode).not.toBe(403)
-  })
-
-  it('separates create, edit and delete actions on the same page', async () => {
-    const { app, db } = makeApp()
-
-    // 只给“新增”：能建成员，不能改也不能删；也不能通过角色接口绕过去改。
-    saveConsolePagePermissions(db, 'c1', 'u1', [
-      { page: 'org', canView: true, canCreate: true, canEdit: false, canDelete: false },
-    ], 'test')
-    const createOnly = await login(app)
-    const access = await app.inject({
-      method: 'GET',
-      url: '/api/console/access',
-      headers: { 'x-eab-console': '1', cookie: createOnly.cookie },
-    })
+    const headers = { 'x-eab-console': '1', cookie }
+    const access = await app.inject({ method: 'GET', url: '/api/console/access', headers })
     const body = JSON.parse(access.body).data
+    expect(body.allowedPages).toEqual(['org'])
+    expect(body.actionsByPage).toEqual({ org: ['create', 'edit', 'delete'] })
     expect(body.createPages).toEqual(['org'])
-    expect(body.editPages).toEqual([])
-    expect(body.deletePages).toEqual([])
-    expect(body.actionsByPage).toEqual({ org: ['create'] })
+    expect(body.editPages).toEqual(['org'])
+    expect(body.deletePages).toEqual(['org'])
 
-    const createMember = await app.inject({
+    const read = await app.inject({ method: 'GET', url: '/api/org/members', headers })
+    expect(read.statusCode).toBe(200)
+    const create = await app.inject({
       method: 'POST',
       url: '/api/console/members',
-      headers: { 'x-eab-console': '1', cookie: createOnly.cookie },
+      headers,
       payload: { name: '新成员' },
     })
-    expect(createMember.statusCode).not.toBe(403)
-
-    const editMember = await app.inject({
+    expect(create.statusCode).not.toBe(403)
+    const edit = await app.inject({
       method: 'PUT',
       url: '/api/console/members/u-missing',
-      headers: { 'x-eab-console': '1', cookie: createOnly.cookie },
+      headers,
       payload: { name: '改成员' },
     })
-    expect(editMember.statusCode).toBe(403)
-    const editBody = JSON.parse(editMember.body)
-    expect(editBody.details.requiredActions).toEqual(['edit'])
-    expect(editBody.details.actionsByPage).toEqual({ org: ['create'] })
-
-    const deleteMember = await app.inject({
+    expect(edit.statusCode).not.toBe(403)
+    const remove = await app.inject({
       method: 'DELETE',
       url: '/api/console/members/u-missing',
-      headers: { 'x-eab-console': '1', cookie: createOnly.cookie },
+      headers,
     })
-    expect(deleteMember.statusCode).toBe(403)
-
-    // 只给“编辑”：能改，不能建也不能删。
-    saveConsolePagePermissions(db, 'c1', 'u1', [
-      { page: 'org', canView: true, canCreate: false, canEdit: true, canDelete: false },
-    ], 'test')
-    const editOnly = await login(app)
-    const editMissing = await app.inject({
-      method: 'PUT',
-      url: '/api/console/members/u-missing',
-      headers: { 'x-eab-console': '1', cookie: editOnly.cookie },
-      payload: { name: '改成员' },
-    })
-    expect(editMissing.statusCode).not.toBe(403)
-    const createAgain = await app.inject({
-      method: 'POST',
-      url: '/api/console/members',
-      headers: { 'x-eab-console': '1', cookie: editOnly.cookie },
-      payload: { name: '新成员' },
-    })
-    expect(createAgain.statusCode).toBe(403)
-    const deleteAgain = await app.inject({
-      method: 'DELETE',
-      url: '/api/console/members/u-missing',
-      headers: { 'x-eab-console': '1', cookie: editOnly.cookie },
-    })
-    expect(deleteAgain.statusCode).toBe(403)
-
-    // 只给“删除”：能删，不能建也不能改。
-    saveConsolePagePermissions(db, 'c1', 'u1', [
-      { page: 'org', canView: true, canCreate: false, canEdit: false, canDelete: true },
-    ], 'test')
-    const deleteOnly = await login(app)
-    const deleteMissing = await app.inject({
-      method: 'DELETE',
-      url: '/api/console/members/u-missing',
-      headers: { 'x-eab-console': '1', cookie: deleteOnly.cookie },
-    })
-    expect(deleteMissing.statusCode).not.toBe(403)
-    const createBlocked = await app.inject({
-      method: 'POST',
-      url: '/api/console/members',
-      headers: { 'x-eab-console': '1', cookie: deleteOnly.cookie },
-      payload: { name: '新成员' },
-    })
-    expect(createBlocked.statusCode).toBe(403)
-    const editBlocked = await app.inject({
-      method: 'PUT',
-      url: '/api/console/members/u-missing',
-      headers: { 'x-eab-console': '1', cookie: deleteOnly.cookie },
-      payload: { name: '改成员' },
-    })
-    expect(editBlocked.statusCode).toBe(403)
+    expect(remove.statusCode).not.toBe(403)
   })
 
-  it('separates page sections such as channel tabs', async () => {
+  it('requires channels page visibility instead of per-tab actions', async () => {
     const { app, db } = makeApp()
-    saveConsolePagePermissions(db, 'c1', 'u1', [
-      { page: 'channels', section: 'sync', canView: true, canEdit: true },
-      { page: 'channels', section: 'history', canView: true },
-    ], 'test')
+    saveConsolePagePermissions(db, 'c1', 'u1', [{ page: 'channels', canView: true }], 'test')
 
     const { cookie } = await login(app)
     const headers = { 'x-eab-console': '1', cookie }
     const access = await app.inject({ method: 'GET', url: '/api/console/access', headers })
     expect(access.statusCode).toBe(200)
-    const body = JSON.parse(access.body).data
-    expect(body.allowedPages).toEqual(['channels'])
-    expect(body.actionsByPage).toEqual({ 'channels:sync': ['edit'] })
+    expect(JSON.parse(access.body).data.allowedPages).toEqual(['channels'])
 
     const list = await app.inject({ method: 'GET', url: '/api/console/channels', headers })
     expect(list.statusCode).toBe(200)
-
     const config = await app.inject({
       method: 'POST',
       url: '/api/console/channels/dingtalk',
       headers,
       payload: {},
     })
-    expect(config.statusCode).toBe(403)
-    expect(JSON.parse(config.body).details.requiredSections).toEqual(['config'])
-
+    expect(config.statusCode).not.toBe(403)
     const sync = await app.inject({
       method: 'POST',
       url: '/api/console/channels/dingtalk/sync',
@@ -374,17 +283,66 @@ describe('console member access', () => {
       payload: {},
     })
     expect(sync.statusCode).not.toBe(403)
-
     const bind = await app.inject({
       method: 'POST',
       url: '/api/console/channels/dingtalk/bind',
       headers,
       payload: {},
     })
-    expect(bind.statusCode).toBe(403)
-
+    expect(bind.statusCode).not.toBe(403)
     const identities = await app.inject({ method: 'GET', url: '/api/console/channel-identities', headers })
-    expect(identities.statusCode).toBe(403)
+    expect(identities.statusCode).not.toBe(403)
+  })
+
+  it('keeps system update as an independently visible secondary page', async () => {
+    const { app, db } = makeApp()
+    saveConsolePagePermissions(db, 'c1', 'u1', [
+      { page: 'system', section: 'data', canView: true },
+      { page: 'system', section: 'update', canView: true },
+    ], 'test')
+
+    const { cookie } = await login(app)
+    const headers = { 'x-eab-console': '1', cookie }
+    const access = await app.inject({ method: 'GET', url: '/api/console/access', headers })
+    expect(access.statusCode).toBe(200)
+    const body = JSON.parse(access.body).data
+    expect(body.allowedPages).toEqual(['system'])
+    expect(body.pages.find((item: { page: string }) => item.page === 'system:update')).toMatchObject({
+      canView: true,
+    })
+
+    const update = await app.inject({ method: 'GET', url: '/api/console/update', headers })
+    expect(update.statusCode).toBe(200)
+
+    // 只取消「系统更新」可见权限，保留「系统与运维」；读取接口应立即拒绝。
+    saveConsolePagePermissions(db, 'c1', 'u1', [
+      { page: 'system', section: 'data', canView: true },
+    ], 'test')
+    const denied = await app.inject({ method: 'GET', url: '/api/console/update', headers })
+    expect(denied.statusCode).toBe(403)
+    expect(JSON.parse(denied.body).details.requiredSections).toEqual(['update'])
+  })
+
+  it('does not leak system scopes from a visible system-update page', async () => {
+    const { app, db } = makeApp()
+    saveConsolePagePermissions(db, 'c1', 'u1', [
+      { page: 'system', section: 'update', canView: true },
+    ], 'test')
+
+    const { cookie } = await login(app)
+    const headers = { 'x-eab-console': '1', cookie }
+    const access = await app.inject({ method: 'GET', url: '/api/console/access', headers })
+    expect(access.statusCode).toBe(200)
+    const body = JSON.parse(access.body).data
+    expect(body.pages.find((item: { page: string }) => item.page === 'system:update')).toMatchObject({
+      canView: true,
+    })
+
+    // 「系统更新」不应顺带把系统页的运维 scope 放大给成员。
+    const scopes = consoleScopesForMember(db, 'c1', 'u1')
+    expect(scopes).not.toContain(SC.SERVICE_CONTROL)
+    expect(scopes).not.toContain(SC.SYSTEM_BACKUP)
+    expect(scopes).not.toContain(SC.SYSTEM_RESTORE)
   })
 
   it('grants console access through a role and keeps personal permissions additive', async () => {
@@ -398,7 +356,7 @@ describe('console member access', () => {
 
     saveConsoleRolePagePermissions(db, 'c1', 'r-sub', [
       { page: 'overview', canView: true },
-      { page: 'channels', section: 'sync', canView: true, canEdit: true },
+      { page: 'channels', canView: true },
     ], 'test')
 
     // 没有个人权限也能登录：角色带来的后台入口已经生效。
@@ -409,7 +367,10 @@ describe('console member access', () => {
     expect(access.statusCode).toBe(200)
     const body = JSON.parse(access.body).data
     expect(body.allowedPages.sort()).toEqual(['channels', 'overview'])
-    expect(body.actionsByPage).toEqual({ 'channels:sync': ['edit'] })
+    expect(body.actionsByPage).toEqual({
+      overview: ['create', 'edit', 'delete'],
+      channels: ['create', 'edit', 'delete'],
+    })
 
     const sync = await app.inject({
       method: 'POST',
@@ -537,10 +498,10 @@ describe('console member access', () => {
     expect(Number(rows.count)).toBe(0)
   })
 
-  it('allows a member with org:memberAccess edit to configure member console permissions', async () => {
+  it('lets a member with the member-management page configure member console permissions', async () => {
     const { app, db } = makeApp()
     saveConsolePagePermissions(db, 'c1', 'u1', [
-      { page: 'org', section: 'memberAccess', canView: true, canEdit: true },
+      { page: 'org', canView: true },
     ], 'test')
 
     const { res, cookie } = await login(app)
@@ -551,7 +512,11 @@ describe('console member access', () => {
     const accessBody = JSON.parse(access.body).data
     expect(accessBody.kind).toBe('member')
     expect(accessBody.canConfigureAccess).toBe(true)
-    expect(accessBody.actionsByPage).toEqual({ 'org:memberAccess': ['edit'] })
+    expect(accessBody.actionsByPage).toEqual({ org: ['create', 'edit', 'delete'] })
+    const scopes = consoleScopesForMember(db, 'c1', 'u1')
+    expect(scopes).toContain(SC.ORG_MEMBER_READ)
+    expect(scopes).toContain(SC.ORG_MEMBER_MANAGE)
+    expect(scopes).toContain(SC.AUTHZ_GRANT)
 
     const read = await app.inject({
       method: 'GET',
@@ -567,7 +532,7 @@ describe('console member access', () => {
       payload: {
         pages: [
           { page: 'overview', canView: true },
-          { page: 'org', section: 'memberAccess', canView: true, canEdit: true },
+          { page: 'org', canView: true },
         ],
       },
     })
@@ -578,15 +543,41 @@ describe('console member access', () => {
     ).all() as Array<{ page: string; can_edit: number; updated_by: string }>
     expect(rows).toEqual([
       { page: 'org', can_edit: 0, updated_by: 'u1' },
-      { page: 'org:memberAccess', can_edit: 1, updated_by: 'u1' },
       { page: 'overview', can_edit: 0, updated_by: 'u1' },
     ])
   })
 
-  it('rejects member console permission changes with view-only access to the capability', async () => {
+  it('lets the member-management page assign roles without extra section grants', async () => {
+    const { app, db } = makeApp()
+    saveConsolePagePermissions(db, 'c1', 'u1', [{ page: 'org', canView: true }], 'test')
+
+    const { cookie } = await login(app)
+    const headers = { 'x-eab-console': '1', cookie }
+    const allowed = await app.inject({
+      method: 'POST',
+      url: '/api/console/members/u-missing/roles',
+      headers,
+      payload: { roles: ['member'] },
+    })
+    expect(allowed.statusCode).not.toBe(403)
+
+    // 角色管理页本身可见也可以分配成员角色。
+    saveConsolePagePermissions(db, 'c1', 'u1', [
+      { page: 'roles', canView: true },
+    ], 'test')
+    const allowedByRoles = await app.inject({
+      method: 'POST',
+      url: '/api/console/members/u-missing/roles',
+      headers,
+      payload: { roles: ['member'] },
+    })
+    expect(allowedByRoles.statusCode).not.toBe(403)
+  })
+
+  it('lets a visible member-management page change member console permissions', async () => {
     const { app, db } = makeApp()
     saveConsolePagePermissions(db, 'c1', 'u1', [
-      { page: 'org', section: 'memberAccess', canView: true },
+      { page: 'org', canView: true },
     ], 'test')
     const { cookie } = await login(app)
     const access = await app.inject({
@@ -594,14 +585,14 @@ describe('console member access', () => {
       url: '/api/console/access',
       headers: { 'x-eab-console': '1', cookie },
     })
-    expect(JSON.parse(access.body).data.canConfigureAccess).toBe(false)
-    const denied = await app.inject({
+    expect(JSON.parse(access.body).data.canConfigureAccess).toBe(true)
+    const save = await app.inject({
       method: 'PUT',
       url: '/api/console/member-console-permissions/u1',
       headers: { 'x-eab-console': '1', cookie },
       payload: { pages: [{ page: 'overview', canView: true }] },
     })
-    expect(denied.statusCode).toBe(403)
+    expect(save.statusCode).toBe(200)
   })
 
   it('lets a role manager configure role tools without the tools page', async () => {

@@ -95,6 +95,22 @@ describe('文件读写工具的工具卡摘要', () => {
     expect(text).toBe('读取 big.ts｜第 250001–251505 行 / 共 300000 行（剩余 48495 行，达到 50 KB 输出上限）｜继续 offset=251506')
   })
 
+  it('全量概览说明总字符、总行数、记录数和覆盖情况', () => {
+    const text = summarizeWorkspaceReadToolResult('workspace_read', {
+      path: '大文件.csv',
+      mode: 'overview',
+      totalChars: 1_200_000,
+      totalLines: 20_000,
+      totalRows: 5_000,
+      coverage: '已完整解析全部 5000 条记录，字段统计覆盖 100% 记录',
+      answer: 'private-analysis-marker',
+    })
+    expect(text).toContain('分析 大文件.csv')
+    expect(text).toContain('全文 1,200,000 字符 / 20,000 行 / 5,000 条记录')
+    expect(text).toContain('覆盖 100% 记录')
+    expect(text).not.toContain('private-analysis-marker')
+  })
+
   it('搜索显示命中数、扫描文件数和首个 path:line', () => {
     const text = summarizeWorkspaceFileToolResult('workspace_search', {
       query: '蓝鲸-行号-18',
@@ -119,6 +135,19 @@ describe('文件读写工具的工具卡摘要', () => {
       matches: [{ path: 'many.txt', line: 1, column: 1, text: 'Needle' }],
     })
     expect(text).toContain('显示 3 条 / 共 10 处命中（已截断）')
+  })
+
+  it('正文 0 命中但文件名命中时把可用路径直接写给模型', () => {
+    const text = summarizeWorkspaceFileToolResult('workspace_search', {
+      query: '检查整治_近半个月_343 条.csv',
+      count: 0,
+      total: 0,
+      filesScanned: 88,
+      matches: [],
+      nameMatches: [{ path: '检查整治_近半个月_343条.csv', name: '检查整治_近半个月_343条.csv' }],
+    })
+    expect(text).toContain('0 处命中')
+    expect(text).toContain('文件名命中 1 个：检查整治_近半个月_343条.csv')
   })
 })
 

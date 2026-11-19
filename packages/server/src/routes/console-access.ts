@@ -118,7 +118,7 @@ function requireMemberConsoleAdmin(req: FastifyRequest, deps: ServerDeps): { act
   const permissions = readConsolePagePermissions(deps.db, session.companyId, session.userId)
   if (!canConfigureMemberConsoleAccess(permissions)) {
     throw new EabError(EC.FORBIDDEN, '当前后台账号没有配置成员后台访问的权限', {
-      hint: '让平台管理员或有权限的成员在「成员管理 → 后台访问」里勾选“配置后台访问”。',
+      hint: '让平台管理员或有权限的成员在「成员管理」页面勾选可见；成员管理页可见即可配置成员后台访问。',
     })
   }
   return { actorUserId: session.userId }

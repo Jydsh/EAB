@@ -817,8 +817,35 @@ export async function callPluginModel(
   let finishMessage = ''
   const toolCalls = new Map<number, { id: string; name: string; arguments: string }>()
 
-  try {
+  /**
+   * 插件 adapter 自己可能配置了很长的总超时（our-free-model 默认 30 分钟）。
+   * 调用方可以显式给上限：主对话与子 Agent 默认沿用插件自己的长时间预算，
+   * 后台唤醒轮会传更短的值，保证子 Agent 不会无限等父 Agent。
+   */
+  const timeoutMs = Math.max(1_000, Math.min(options.timeoutMs ?? 30 * 60_000, 30 * 60_000))
+  const controller = new AbortController()
+  const onOuterAbort = () => controller.abort(options.signal?.reason)
+  if (options.signal?.aborted) onOuterAbort()
+  else options.signal?.addEventListener('abort', onOuterAbort, { once: true })
+  callOptions.signal = controller.signal
+  let timedOut = false
+  const timeoutTimer = setTimeout(() => {
+    timedOut = true
+    controller.abort(new Error(`插件模型调用超时（${Math.round(timeoutMs / 1000)} 秒）`))
+  }, timeoutMs)
+  timeoutTimer.unref?.()
+  const abortPromise = new Promise<never>((_, reject) => {
+    const onControllerAbort = () => {
+      const reason = controller.signal.reason
+      reject(reason instanceof Error ? reason : new Error('插件模型请求已取消'))
+    }
+    if (controller.signal.aborted) onControllerAbort()
+    else controller.signal.addEventListener('abort', onControllerAbort, { once: true })
+  })
+
+  const consumeStream = async (): Promise<void> => {
     for await (const raw of streamFn.call(target.adapter, callOptions)) {
+      if (controller.signal.aborted) throw new Error('插件模型请求已取消')
       const chunk = asRecord(raw)
       const type = String(chunk.type ?? '')
       if (type === 'reasoning-delta') {
@@ -867,10 +894,36 @@ export async function callPluginModel(
         finishMessage = String(asRecord(reason.failure).message ?? '')
       }
     }
-  } catch (error) {
-    throw pluginUpstreamError(target, error)
   }
 
+  const consumePromise = consumeStream()
+  // 超时后 consumeStream 可能仍在底层连接上挂着；先挂空 catch，避免迟到 rejection。
+  consumePromise.catch(() => {})
+  try {
+    await Promise.race([consumePromise, abortPromise])
+  } catch (error) {
+    if (timedOut) {
+      throw new EabError(
+        EC.UPSTREAM,
+        `插件模型「${target.modelId}」${Math.round(timeoutMs / 1000)} 秒内没有返回，已中止`,
+        {
+          hint: '检查插件上游、模型通道或网络出口；该模型由插件提供，不在 EAB 模型供应商配置中。',
+          details: { modelId: target.modelId, provider: target.provider, timeoutMs },
+        },
+      )
+    }
+    if (options.signal?.aborted) throw new EabError(EC.UPSTREAM, '请求已取消')
+    throw pluginUpstreamError(target, error)
+  } finally {
+    clearTimeout(timeoutTimer)
+    options.signal?.removeEventListener('abort', onOuterAbort)
+  }
+
+  if (timedOut || controller.signal.aborted) {
+    throw new EabError(EC.UPSTREAM, `插件模型「${target.modelId}」请求已中止`, {
+      details: { modelId: target.modelId, provider: target.provider },
+    })
+  }
   if (options.signal?.aborted) {
     throw new EabError(EC.UPSTREAM, '请求已取消')
   }

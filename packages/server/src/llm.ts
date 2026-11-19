@@ -207,6 +207,36 @@ function trimBase(url: string): string {
   return url.replace(/\/+$/, '')
 }
 
+const DEFAULT_STREAM_TIMEOUT_MS = 120_000
+const LOCAL_STREAM_TIMEOUT_MS = 600_000
+
+/**
+ * 本地/内网模型端点的流式超时要比云供应商宽松。
+ * 本地 vLLM 在长上下文、首次加载或长工具任务上可能超过 120 秒，
+ * 不能把一次慢响应直接等同为模型不可用。
+ */
+function isLocalModelEndpoint(base: string): boolean {
+  try {
+    const host = new URL(base).hostname.toLowerCase()
+    return (
+      host === 'localhost' ||
+      host === '127.0.0.1' ||
+      host === '::1' ||
+      host.endsWith('.local') ||
+      /^10\./.test(host) ||
+      /^192\.168\./.test(host) ||
+      /^172\.(1[6-9]|2\d|3[01])\./.test(host)
+    )
+  } catch {
+    return false
+  }
+}
+
+function streamTimeoutFor(base: string, explicit?: number): number {
+  if (Number.isFinite(explicit) && (explicit ?? 0) >= 1_000) return Math.trunc(explicit as number)
+  return isLocalModelEndpoint(base) ? LOCAL_STREAM_TIMEOUT_MS : DEFAULT_STREAM_TIMEOUT_MS
+}
+
 function providerOf(db: Db, companyId: string, modelId: string): ProviderRow & { modelKey: string } {
   const row = db
     .prepare(
@@ -521,7 +551,9 @@ async function callOpenAiStream(
   maxTokens: number,
   options: ModelStreamOptions,
 ): Promise<CallResult> {
-  const timeout = AbortSignal.timeout(120_000)
+  const timeout = AbortSignal.timeout(
+    Math.max(1_000, options.timeoutMs ?? DEFAULT_STREAM_TIMEOUT_MS),
+  )
   const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout
   const wireEffort = options.reasoningWireEffort
     ? providerReasoningEffort(options.reasoningEffort ?? options.reasoningWireEffort, options.reasoningWireEffort)
@@ -689,21 +721,33 @@ export async function callModelStream(
     return result
   }
   try {
-    return await callOpenAiStream(base, key, provider.modelKey, messages, maxTokens, options)
+    const timeoutMs = streamTimeoutFor(base, options.timeoutMs)
+    return await callOpenAiStream(base, key, provider.modelKey, messages, maxTokens, {
+      ...options,
+      timeoutMs,
+    })
   } catch (error) {
-    if (error instanceof EabError && error.message === '模型只输出了推理内容，没有生成最终答复') {
-      // 推理模型在长任务上可能把预算全用在 thinking 上。用翻倍预算重试一次，
-      // 并丢弃第二次的 reasoning 事件，避免前端看到重复思考过程。
-      // budget 策略下不得超过档位上限，否则「精简」会被悄悄放大。
+    // 推理模型在长任务上可能把预算全用在 thinking 上；本地上游也可能偶发返回
+    // 200 但正文为空。这两种结果都不代表模型不可用，先用更大预算重试一次，
+    // 再决定是否故障转移。第二次的 reasoning 事件丢弃，避免前端看到重复思考。
+    // budget 策略下不得超过档位上限，否则「精简」会被悄悄放大。
+    const reasoningOnly = error instanceof EabError && error.message === '模型只输出了推理内容，没有生成最终答复'
+    const emptyContent = error instanceof EabError && error.message === '模型返回了空内容'
+    if (reasoningOnly || emptyContent) {
       const cap = options.maxTokensCap ?? 16_384
-      const retryTokens = Math.min(maxTokens * 2, 16_384, cap)
-      if (retryTokens <= maxTokens) throw error
-      return await callOpenAiStream(base, key, provider.modelKey, messages, retryTokens, {
-        ...options,
-        onEvent: (event) => {
-          if (event.type === 'content') options.onEvent?.(event)
-        },
-      })
+      const retryTokens = reasoningOnly
+        ? Math.min(maxTokens * 2, 16_384, cap)
+        : maxTokens
+      if (!reasoningOnly || retryTokens > maxTokens) {
+        const timeoutMs = streamTimeoutFor(base, options.timeoutMs)
+        return await callOpenAiStream(base, key, provider.modelKey, messages, retryTokens, {
+          ...options,
+          timeoutMs,
+          onEvent: (event) => {
+            if (event.type === 'content') options.onEvent?.(event)
+          },
+        })
+      }
     }
     throw error
   }

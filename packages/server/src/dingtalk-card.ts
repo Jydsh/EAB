@@ -47,6 +47,8 @@ class DingTalkHttpError extends Error {
   constructor(
     message: string,
     readonly status: number,
+    readonly code = '',
+    readonly errorMsg = '',
   ) {
     super(message)
     this.name = 'DingTalkHttpError'
@@ -59,6 +61,18 @@ function sleep(ms: number): Promise<void> {
 
 function nonEmpty(value: unknown): string {
   return typeof value === 'string' ? value.trim() : ''
+}
+
+/**
+ * 流式 chunk 可能在 emoji/生僻字代理对中间切开，临时留下孤立代理字符；
+ * JSON.stringify 会把它写成 \ud83d 这类转义，部分服务端会以 Unicode 非法
+ * 直接返回 param.invalid。卡片侧统一剔除孤立代理，等下一帧补齐。
+ */
+function sanitizeLoneSurrogates(text: string): string {
+  return text.replace(
+    /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g,
+    '',
+  )
 }
 
 function parseBody(text: string): Record<string, unknown> {
@@ -86,13 +100,23 @@ async function requestJson(
   })
   const text = await response.text().catch(() => '')
   const body = parseBody(text)
+  const code = nonEmpty(body.code)
+  const errorMsg = nonEmpty(body.errorMsg)
+  const bodyMessage = nonEmpty(body.message)
+  // 钉钉 A2UI 的 400 通常只给 code=param.invalid，真正非法字段/消息在
+  // 动态 errorMsg 里；旧实现只取 message/code，导致现场只剩一句“参数非法”。
+  const reason = [errorMsg, bodyMessage].find((value) => value && value !== code) || ''
+  const detail = reason || code || text.slice(0, 200) || '未知错误'
   if (!response.ok) {
-    const detail = nonEmpty(body.message) || nonEmpty(body.code) || text.slice(0, 200)
-    throw new DingTalkHttpError(`钉钉卡片接口 HTTP ${response.status}：${detail}`, response.status)
+    throw new DingTalkHttpError(
+      `钉钉卡片接口 HTTP ${response.status}：${code && code !== detail ? `${code}：${detail}` : detail}`,
+      response.status,
+      code,
+      errorMsg,
+    )
   }
   if (body.success === false) {
-    const detail = nonEmpty(body.message) || nonEmpty(body.code) || 'success=false'
-    throw new Error(`钉钉卡片接口拒绝了请求：${detail}`)
+    throw new Error(`钉钉卡片接口拒绝了请求：${code && code !== detail ? `${code}：${detail}` : detail}`)
   }
   return body
 }
@@ -307,7 +331,25 @@ function previewLine(text: string, maxLength = 120): string {
   // 首行已经是完整句子就不再并下一行；只有短碎片才并上下一句。
   const completeSentence = /[。！？!?]$/.test(first)
   const normalized = !completeSentence && first.length < 24 && lines[1] ? `${first} ${lines[1]}` : first
-  return normalized.length > maxLength ? `${normalized.slice(0, maxLength)}…` : normalized
+  if (normalized.length <= maxLength) return normalized
+  // 按 Unicode 码点截断，避免从代理对中间切开后给钉钉传非法字符。
+  return `${Array.from(normalized.slice(0, maxLength * 2)).slice(0, maxLength).join('')}…`
+}
+
+/**
+ * 流式思考预览取最新一段：长段落没有换行时，首行摘要会一直停在开头，
+ * 看起来像思考卡住了。这里与网页 livePreview 保持一致，思考结束后再收回首行摘要。
+ */
+function livePreviewLine(text: string, maxLength = 96): string {
+  const normalized = sanitizeLoneSurrogates(String(text ?? ''))
+    .replace(/\*\*/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!normalized) return ''
+  if (normalized.length <= maxLength) return normalized
+  // 先裁到尾部两倍窗口，再按码点取最后 N 个，防止 slice 切在 emoji 代理对中间。
+  const tail = normalized.slice(-maxLength * 2)
+  return `…${Array.from(tail).slice(-maxLength).join('').trimStart()}`
 }
 
 function thinkingDuration(ms: number | undefined): string {
@@ -348,6 +390,79 @@ function compactValue(value: unknown, maxLength = 360): string {
   const text = typeof value === 'string' ? value : JSON.stringify(value)
   if (!text) return ''
   return text.length > maxLength ? `${text.slice(0, maxLength)}…` : text
+}
+
+function truncateUtf8(text: string, maxBytes: number): string {
+  let result = ''
+  let used = 0
+  for (const char of text) {
+    const bytes = Buffer.byteLength(char, 'utf8')
+    if (used + bytes > maxBytes) break
+    result += char
+    used += bytes
+  }
+  return result
+}
+
+/**
+ * 单段正文/思考只保留钉钉一次 update 能承载的体量。
+ * 触发场景是模型偶发输出数 MB 的思维链或大表格，整条 updateDataModel
+ * 会超过 256 KiB 被统一报 param.invalid；截断后仍保留开头和明确提示。
+ */
+function capCardText(text: string, maxBytes = CARD_TEXT_MAX_BYTES): string {
+  const raw = sanitizeLoneSurrogates(String(text ?? ''))
+  if (Buffer.byteLength(raw, 'utf8') <= maxBytes) return raw
+  const suffixBytes = Buffer.byteLength(CARD_TEXT_TRUNCATED, 'utf8')
+  return `${truncateUtf8(raw, Math.max(0, maxBytes - suffixBytes)).trimEnd()}${CARD_TEXT_TRUNCATED}`
+}
+
+function a2uiMessagePath(message: string): string {
+  try {
+    const parsed = JSON.parse(message) as {
+      updateDataModel?: { path?: unknown }
+      updateComponents?: unknown
+    }
+    if (parsed.updateDataModel) return String(parsed.updateDataModel.path ?? '/')
+    if (parsed.updateComponents) return '<components>'
+    return '<unknown>'
+  } catch {
+    return '<unparseable>'
+  }
+}
+
+function a2uiMessagesBytes(messages: string[]): number {
+  return messages.reduce((total, message) => total + Buffer.byteLength(message, 'utf8'), 0)
+}
+
+/**
+ * 钉钉一次 update 只接受 100 条消息、总计 256 KiB。把当前帧拆成多个请求，
+ * 避免 24 块正文 + 澄清题组时被统一报 param.invalid；FINISH/FAILED 不拆分，
+ * 终态由 putFinalStatus 的紧凑降级路径保证一次收口。
+ */
+function chunkA2uiMessages(
+  messages: string[],
+  maxMessages = A2UI_MAX_MESSAGES,
+  maxBytes = A2UI_MAX_PAYLOAD_BYTES,
+): string[][] {
+  if (messages.length === 0) return []
+  const chunks: string[][] = []
+  let current: string[] = []
+  let currentBytes = 0
+  for (const message of messages) {
+    const bytes = Buffer.byteLength(message, 'utf8')
+    if (
+      current.length > 0 &&
+      (current.length + 1 > maxMessages || currentBytes + bytes > maxBytes)
+    ) {
+      chunks.push(current)
+      current = []
+      currentBytes = 0
+    }
+    current.push(message)
+    currentBytes += bytes
+  }
+  if (current.length > 0) chunks.push(current)
+  return chunks
 }
 
 function richToolsMarkdown(details: DingTalkToolRecord[], tools: string[]): string {
@@ -434,7 +549,7 @@ export function renderDingTalkProgressCard(progress: DingTalkCardProgress): stri
   const thinkingDone = Boolean(progress.thinkingDone)
   blocks.push(thinkingDone ? '**✦ 已深度思考**' : '**✦ 正在思考中…**')
   if (!thinkingDone) {
-    const preview = previewLine(progress.reasoning || '正在分析你的问题…', 90)
+    const preview = livePreviewLine(progress.reasoning || '正在分析你的问题…', 90)
     if (preview) blocks.push(`> ${preview}`)
   }
   if (progress.tool) blocks.push(`**🛠️ 工具调用中…**\n_${progress.tool}_`)
@@ -755,19 +870,36 @@ const A2UI_STATUS = {
   failed: 'FAILED',
 } as const
 
-// 钉钉一次 A2UI update 最多接受 100 条 a2uiMessages，超过统一报 param.invalid。
+// 钉钉一次 A2UI update 最多接受 100 条 a2uiMessages，超出统一报 param.invalid。
 const A2UI_MAX_MESSAGES = 95
+// 官方限制总请求体不超过 256 KiB；留出协议字段与重试余量，单条消息再单独设上限。
+const A2UI_MAX_PAYLOAD_BYTES = 192 * 1024
+const A2UI_MAX_MESSAGE_BYTES = 128 * 1024
+// 卡片不是全文阅读器；单段正文/思考过大时截断，避免一条 updateDataModel
+// 就把整个请求顶到 256 KiB 上限。完整内容仍在网页工作台。
+const CARD_TEXT_MAX_BYTES = Math.min(56 * 1024, A2UI_MAX_MESSAGE_BYTES - 8 * 1024)
+const CARD_TEXT_TRUNCATED = '\n\n…（内容过长，卡片仅显示前 56 KB，完整内容请在工作台查看）'
+// 建卡后立刻刷新可能撞上卡片尚未就绪；失败后按退避重试，覆盖官方示例
+// “创建后等待 3 秒再更新”的就绪窗口，连续 4 次仍失败才判死。
+const A2UI_RETRY_DELAYS_MS = [200, 900, 2000] as const
+const A2UI_MAX_UPDATE_FAILURES = A2UI_RETRY_DELAYS_MS.length + 1
 
 /**
  * 澄清按钮的卡片归属。按钮事件里的 context 可能因客户端实现差异丢失，
  * 回调时用 outTrackId 反查会话和选项作为兜底；只保留最近少量卡片。
  */
 const clarifyCardStates = new Map<string, DingTalkClarifyState>()
+/**
+ * 已消费完的模型选择卡。即使钉钉侧旧卡没被成功收口，用户再点同一张卡
+ * 也不能重新触发 Agent 回合、又冒出一条独立消息。
+ */
+const consumedClarifyCards = new Set<string>()
 
 /** 卡片状态持久化接口；测试/未配置时只用进程内 Map。 */
 export interface DingTalkClarifyCardStore {
   load(outTrackId: string): DingTalkClarifyState | null
   save(outTrackId: string, state: DingTalkClarifyState): void
+  remove?(outTrackId: string): void
 }
 
 let clarifyCardStore: DingTalkClarifyCardStore | null = null
@@ -819,6 +951,7 @@ function cloneClarifyState(clarify: DingTalkClarifyState): DingTalkClarifyState 
     ...(questions.length > 0 ? { questions } : {}),
     ...(Object.keys(answers).length > 0 ? { answers } : {}),
     index: Math.max(0, Math.trunc(Number(clarify.index ?? 0) || 0)),
+    ...(clarify.origin === 'model-picker' ? { origin: 'model-picker' as const } : {}),
   }
 }
 
@@ -836,6 +969,19 @@ function rememberClarifyCard(outTrackId: string, clarify: DingTalkClarifyState |
     if (!oldest) break
     clarifyCardStates.delete(oldest)
   }
+}
+
+/**
+ * 建卡后立即登记澄清状态。
+ *
+ * `finish()` 在带澄清时会自动登记，但如果首次更新失败、卡片选项已经可见，
+ * 用户仍然能点；这里显式登记一次，保证回调不依赖 finish 是否成功。
+ */
+export function registerDingTalkClarifyCard(
+  outTrackId: string,
+  clarify: DingTalkClarifyState | null | undefined,
+): void {
+  rememberClarifyCard(String(outTrackId ?? '').trim(), clarify)
 }
 
 function readClarifyCardState(outTrackId: string): DingTalkClarifyState | null {
@@ -856,6 +1002,29 @@ function readClarifyCardState(outTrackId: string): DingTalkClarifyState | null {
 
 export function dingTalkClarifyCardState(outTrackId: string): DingTalkClarifyState | null {
   return readClarifyCardState(outTrackId)
+}
+
+/** 卡片已经消费完（例如模型点选走静默切换）后立即注销，避免旧卡继续被点击。 */
+export function forgetDingTalkClarifyCard(outTrackId: string): void {
+  const id = String(outTrackId ?? '').trim()
+  if (!id) return
+  clarifyCardStates.delete(id)
+  consumedClarifyCards.add(id)
+  while (consumedClarifyCards.size > 500) {
+    const oldest = consumedClarifyCards.values().next().value
+    if (!oldest) break
+    consumedClarifyCards.delete(oldest)
+  }
+  try {
+    clarifyCardStore?.remove?.(id)
+  } catch (error) {
+    console.warn('[eab] 钉钉澄清卡注销失败：', (error as Error).message)
+  }
+}
+
+/** 这个卡片是否已经完成过一次不需要再跑 Agent 的消费（例如模型点选）。 */
+export function isDingTalkClarifyCardConsumed(outTrackId: string): boolean {
+  return consumedClarifyCards.has(String(outTrackId ?? '').trim())
 }
 
 /** 题组回调：把某道题的草稿写回登记表，供同一张卡翻页/统一提交时读取。 */
@@ -960,6 +1129,8 @@ export interface DingTalkClarifyState {
   answers?: Record<string, DingTalkClarifyAnswer>
   /** 多题模式当前页，0-based；单题模式为 0。 */
   index?: number
+  /** 模型选择卡没有对应的 assistant 消息，回调不能按历史消息兜底恢复。 */
+  origin?: 'model-picker'
 }
 
 export interface DingTalkRichCardState {
@@ -1335,20 +1506,26 @@ function richCardData(
   active: boolean,
 ): DingTalkRichCardData {
   const reasoning = state.reasoning.trim()
+  const reasoningText = capCardText(reasoning)
   const tools = state.tools ?? []
   const details = state.toolDetails ?? []
   const hasTools = richHasTools(state)
   const thinkingDone = richThinkingDone(state)
   const toolRunning = richToolRunning(state)
-  const thinkingPreviewText = reasoning || (active && !thinkingDone ? '正在分析你的问题…' : '')
-  const thinkingPreview = previewLine(thinkingPreviewText, 96)
+  const thinkingPreviewText = reasoningText || (active && !thinkingDone ? '正在分析你的问题…' : '')
+  // 思考进行中跟网页一样取最新尾文，避免长段落没有换行时摘要一直停在开头；
+  // 思考结束后再收回首行摘要，保留可读的结论入口。
+  const thinkingPreview =
+    active && !thinkingDone && reasoning
+      ? livePreviewLine(reasoning, 96)
+      : previewLine(thinkingPreviewText, 96)
   const toolsPreview = hasTools ? richToolsPreview(details, tools, active) : ''
   const thinkingHeader = richPanelHeader(richThinkingTitle(thinkingDone, state.thinkingMs), thinkingPreview)
   // 工具事件可能先到 tools 名称、后到 toolDetails；预览已经显示“执行中”时，
   // 头部也要同步切成“工具调用中”，不能只剩一个“工具”。
   const toolRunningForHeader = toolRunning || toolsPreview.endsWith('执行中')
   const toolsHeader = richPanelHeader(richToolTitle(toolRunningForHeader), toolsPreview)
-  const answerText = state.answer.trim()
+  const answerText = capCardText(state.answer.trim())
   const answerBlocks = parseAnswerBlocks(answerText)  // 不在正文里拼光标或 loading 图标：流式刷新本身已经能表达“还在生成”。
   // 光标既会破坏 Markdown（表格/代码块尾部尤其明显），也容易在收口失败时残留。
   const attachments = (state.attachments ?? []).slice(0, 3).map((attachment) => ({
@@ -1436,14 +1613,14 @@ function richCardData(
     // 正文拆成文本段和原生表格段；表格由 Table 组件自己横滚，不改成竖排列表。
     answer: { blocks: visibleAnswerBlocks },
     thinking: {
-      text: flattenMarkdownTables(thinkingPreviewText),
+      text: capCardText(flattenMarkdownTables(thinkingPreviewText)),
       // 和网页 CoT 一样保留首句摘要：收起时标题 + 首句，展开后仍能看完整思维链。
       preview: thinkingPreview,
       // 单行入口由同一个 Text 承载标题、首句和箭头，避免 A2UI 客户端拆成两行。
       header: thinkingHeader,
     },
     tools: {
-      text: flattenMarkdownTables(richToolsMarkdown(details, tools)),
+      text: capCardText(flattenMarkdownTables(richToolsMarkdown(details, tools))),
       // 工具结束后仍保留数量/总耗时，避免收起后只剩一个“工具”标题。
       preview: toolsPreview,
       header: toolsHeader,
@@ -2176,16 +2353,22 @@ export function buildDingTalkA2UIUpdateMessages(
 }
 
 /**
- * 终态兜底：把数据压到 9 条以内。钉钉单次 update 超过 100 条会统一报
+ * 终态/活跃兜底：把数据压到 11 条以内。钉钉单次 update 超过 100 条会统一报
  * param.invalid；正文/头部/附件/澄清外，UI 显隐整包下发一次即可。
  */
-function compactFinalDataMessages(surfaceId: string, state: DingTalkRichCardState): string[] {
-  const data = richCardData(state, false)
+function compactDataMessages(
+  surfaceId: string,
+  state: DingTalkRichCardState,
+  active: boolean,
+): string[] {
+  const data = richCardData(state, active)
   return [
     a2uiMessage({ updateDataModel: { surfaceId, path: '/answer', value: data.answer } }),
     a2uiMessage({ updateDataModel: { surfaceId, path: '/thinking/text', value: data.thinking.text } }),
+    a2uiMessage({ updateDataModel: { surfaceId, path: '/thinking/preview', value: data.thinking.preview } }),
     a2uiMessage({ updateDataModel: { surfaceId, path: '/thinking/header', value: data.thinking.header } }),
     a2uiMessage({ updateDataModel: { surfaceId, path: '/tools/text', value: data.tools.text } }),
+    a2uiMessage({ updateDataModel: { surfaceId, path: '/tools/preview', value: data.tools.preview } }),
     a2uiMessage({ updateDataModel: { surfaceId, path: '/tools/header', value: data.tools.header } }),
     a2uiMessage({ updateDataModel: { surfaceId, path: '/ui', value: data.ui } }),
     a2uiMessage({ updateDataModel: { surfaceId, path: '/attachments', value: data.attachments } }),
@@ -2194,6 +2377,10 @@ function compactFinalDataMessages(surfaceId: string, state: DingTalkRichCardStat
       updateDataModel: { surfaceId, path: '/ui/thinkingExpanded', value: false },
     }),
   ]
+}
+
+function compactFinalDataMessages(surfaceId: string, state: DingTalkRichCardState): string[] {
+  return compactDataMessages(surfaceId, state, false)
 }
 
 /**
@@ -2215,6 +2402,12 @@ export class DingTalkAICardStream {
   private lastUpdateAt = 0
   /** 连续刷新失败次数；瞬时网络错误不应直接判死整张流式卡。 */
   private updateFailures = 0
+  /** 失败退避到期时间；期间保持最新状态待发，不提前打接口。 */
+  private retryAt = 0
+  /** 某些卡片对 updateComponents 组合返回 400 时，后续只推数据。 */
+  private skipComponentUpdates = false
+  /** 单条数据也被拒时，降级为整包数据刷新，保证卡片仍能继续流式。 */
+  private compactUpdates = false
 
   constructor(
     private readonly appId: string,
@@ -2251,39 +2444,96 @@ export class DingTalkAICardStream {
     active: boolean,
     previous?: DingTalkRichCardState | null,
   ): Promise<boolean> {
-    const messages = buildDingTalkA2UIUpdateMessages(
+    if (this.compactUpdates && flowStatus === A2UI_STATUS.processing) {
+      await this.putUpdateMessages(compactDataMessages(this.surfaceId, state, true), flowStatus)
+      return true
+    }
+    let messages = buildDingTalkA2UIUpdateMessages(
       this.surfaceId,
       state,
       active,
       A2UI_DELTA_UPDATES && previous ? previous : undefined,
     )
+    if (this.skipComponentUpdates) {
+      messages = messages.filter((message) => !message.includes('"updateComponents"'))
+    }
     if (messages.length === 0) return false
-    await this.putUpdateMessages(messages, flowStatus)
-    return true
+    try {
+      await this.putUpdateMessages(messages, flowStatus)
+      return true
+    } catch (error) {
+      if (
+        flowStatus !== A2UI_STATUS.processing ||
+        !(error instanceof DingTalkHttpError) ||
+        error.status !== 400
+      ) {
+        throw error
+      }
+      console.info('[eab] 钉钉 A2UI 更新被拒，尝试降级：', error.message)
+      // 第一层：先去掉 updateComponents，只推数据。历史上终态帧带组件时
+      // 多次出现 400，去掉组件后同一批数据可以正常更新。
+      const dataOnly = messages.filter((message) => !message.includes('"updateComponents"'))
+      if (dataOnly.length > 0 && dataOnly.length !== messages.length) {
+        try {
+          await this.putUpdateMessages(dataOnly, flowStatus)
+          this.skipComponentUpdates = true
+          console.info('[eab] 钉钉 A2UI 组件更新被拒，本次及后续改为只推数据')
+          return true
+        } catch (retryError) {
+          error = retryError
+        }
+      }
+      // 第二层：单条 updateDataModel 仍被拒时，整包刷新数据与 UI 显隐，
+      // 避免同一非法字段反复重试；后续帧也走这条紧凑路径。
+      try {
+        await this.putUpdateMessages(compactDataMessages(this.surfaceId, state, true), flowStatus)
+        this.skipComponentUpdates = true
+        this.compactUpdates = true
+        console.info('[eab] 钉钉 A2UI 数据更新被拒，已降级为整包数据刷新')
+        return true
+      } catch (compactError) {
+        throw compactError
+      }
+    }
   }
 
-  private async putUpdateMessages(messages: string[], flowStatus: string): Promise<void> {
+  private async putUpdateMessages(
+    messages: string[],
+    flowStatus: string,
+    options: { allowChunks?: boolean } = {},
+  ): Promise<void> {
+    if (messages.length === 0) return
+    // 活跃帧可能因为 24 块正文 + 澄清题组超过 95 条；按条数与字节拆成多个
+    // 连续 update。终态不拆，避免第一包就把卡片收口、后续包变成非法更新。
+    const allowChunks = options.allowChunks ?? flowStatus === A2UI_STATUS.processing
+    const chunks = allowChunks ? chunkA2uiMessages(messages) : [messages]
+    if (chunks.length > 1) {
+      console.info(
+        `[eab] 钉钉 A2UI 更新分批：${messages.length} 条 -> ${chunks.length} 批`,
+      )
+    }
     const token = await this.token()
-    try {
-      await this.cardRequest('/v1.0/card/ai/instances/update', {
-        method: 'PUT',
-        token,
-        body: {
-          outTrackId: this.cardInstanceId,
-          outUpdateId: randomUUID(),
-          flowStatus,
-          a2uiMessages: messages,
-        },
-      })
-    } catch (error) {
-      // 钉钉 A2UI 更新一次最多接受 100 条 a2uiMessages；超过时接口只返回
-      // 笼统的 param.invalid，看起来像 flowStatus 非法，实际是消息条数超限。
-      if (error instanceof DingTalkHttpError && error.status === 400) {
-        this.logger.warn?.(
-          `[eab] 钉钉 A2UI 更新被拒：outTrackId=${this.cardInstanceId} phase=${this.phase} flowStatus=${flowStatus} 消息数=${messages.length} 含组件=${messages.some((message) => message.includes('"updateComponents"'))}`,
-        )
+    for (const [index, chunk] of chunks.entries()) {
+      try {
+        await this.cardRequest('/v1.0/card/ai/instances/update', {
+          method: 'PUT',
+          token,
+          body: {
+            outTrackId: this.cardInstanceId,
+            outUpdateId: randomUUID(),
+            flowStatus,
+            a2uiMessages: chunk,
+          },
+        })
+      } catch (error) {
+        if (error instanceof DingTalkHttpError && error.status === 400) {
+          const paths = chunk.slice(0, 6).map(a2uiMessagePath).join(',')
+          this.logger.warn?.(
+            `[eab] 钉钉 A2UI 更新被拒：outTrackId=${this.cardInstanceId} phase=${this.phase} flowStatus=${flowStatus} 批次=${index + 1}/${chunks.length} 消息数=${chunk.length} 字节=${a2uiMessagesBytes(chunk)} 含组件=${chunk.some((message) => message.includes('"updateComponents"'))} 路径=${paths} 错误=${(error as Error).message}`,
+          )
+        }
+        throw error
       }
-      throw error
     }
   }
 
@@ -2446,6 +2696,9 @@ export class DingTalkAICardStream {
       this.lastSentChars = richTextLength(state)
       a2uiDisabledUntil = 0
       this.updateFailures = 0
+      this.retryAt = 0
+      this.skipComponentUpdates = false
+      this.compactUpdates = false
       console.info('[eab] 钉钉 A2UI 新卡已创建：', outTrackId, 'initial=PROCESSING')
       return true
     } catch (error) {
@@ -2537,6 +2790,9 @@ export class DingTalkAICardStream {
       this.lastSentChars = richTextLength(state)
       this.lastUpdateAt = Date.now()
       this.updateFailures = 0
+      this.retryAt = 0
+      this.skipComponentUpdates = false
+      this.compactUpdates = false
       console.info('[eab] 钉钉 A2UI 卡片已续用：', id)
       return true
     } catch (error) {
@@ -2561,6 +2817,8 @@ export class DingTalkAICardStream {
     this.cardInstanceId = id
     this.surfaceId = `${A2UI_SURFACE_PREFIX}${id.slice('eab_a2ui_'.length)}`
     try {
+      this.compactUpdates = false
+      this.skipComponentUpdates = false
       await this.putFinalStatus(cloneRichState(state), [A2UI_STATUS.finished])
       this.phase = 'finished'
       return true
@@ -2576,6 +2834,8 @@ export class DingTalkAICardStream {
     this.cardInstanceId = id
     this.surfaceId = `${A2UI_SURFACE_PREFIX}${id.slice('eab_a2ui_'.length)}`
     try {
+      this.compactUpdates = false
+      this.skipComponentUpdates = false
       await this.putUpdate(state, A2UI_STATUS.processing, true, null)
       return true
     } catch (error) {
@@ -2611,6 +2871,14 @@ export class DingTalkAICardStream {
       this.scheduled = null
     }
     const now = Date.now()
+    if (this.retryAt > now) {
+      this.scheduled = setTimeout(() => {
+        this.scheduled = null
+        this.drain()
+      }, this.retryAt - now)
+      return
+    }
+    this.retryAt = 0
     const elapsed = now - this.lastUpdateAt
     const newChars = richTextLength(this.pendingState) - this.lastSentChars
     const structureChanged = this.lastSentState
@@ -2649,22 +2917,30 @@ export class DingTalkAICardStream {
         this.lastSentChars = richTextLength(state)
         this.lastUpdateAt = Date.now()
         this.updateFailures = 0
+        this.retryAt = 0
       })
       .catch((error) => {
         if (this.phase !== 'active') return
         this.updateFailures += 1
-        this.logger.warn?.(
-          `[eab] 钉钉 A2UI 卡片更新失败（第 ${this.updateFailures} 次，保留卡片重试）：`,
-          (error as Error).message,
-        )
-        // 瞬时网络错误不应让整张卡退出流式：把最新状态放回待发队列，
-        // 由 finally 重新排期；连续失败 3 次才判死，且 finish 仍会尝试终态。
-        if (this.updateFailures >= 3) {
+        const failures = this.updateFailures
+        if (failures >= A2UI_MAX_UPDATE_FAILURES) {
+          this.logger.warn?.(
+            `[eab] 钉钉 A2UI 卡片更新失败（第 ${failures} 次，停止流式，保留卡片等待终态）：`,
+            (error as Error).message,
+          )
           this.phase = 'failed'
           return
         }
+        const retryDelay = A2UI_RETRY_DELAYS_MS[failures - 1] ?? 2000
+        console.info(
+          `[eab] 钉钉 A2UI 卡片更新失败（第 ${failures}/${A2UI_MAX_UPDATE_FAILURES} 次，${retryDelay}ms 后重试）：`,
+          (error as Error).message,
+        )
+        // 建卡后立刻刷新可能撞上卡片尚未就绪；按 200/900/2000ms 退避，
+        // 覆盖官方示例“创建后等待 3 秒再更新”的就绪窗口。
         if (this.pendingState === null) this.pendingState = cloneRichState(state)
-        // 失败也算一次发送窗口，避免 150ms 内立刻重试造成风暴。
+        this.retryAt = Date.now() + retryDelay
+        // 失败也算一次发送窗口，避免退避期间又被 150ms 调度器提前拉起。
         this.lastUpdateAt = Date.now()
       })
       .finally(() => {

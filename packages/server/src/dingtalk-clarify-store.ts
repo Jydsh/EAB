@@ -28,6 +28,10 @@ export function createDingTalkClarifyCardStore(
     `DELETE FROM dingtalk_clarify_cards
       WHERE company_id = ? AND updated_at < ?`,
   )
+  const removeStatement = db.prepare(
+    `DELETE FROM dingtalk_clarify_cards
+      WHERE out_track_id = ? AND company_id = ?`,
+  )
 
   return {
     load(outTrackId: string): DingTalkClarifyState | null {
@@ -51,6 +55,9 @@ export function createDingTalkClarifyCardStore(
       )
       // 答题卡是短生命周期数据，顺手清掉 30 天前的旧记录，避免表无限增长。
       purgeStatement.run(companyId, now - 30 * 24 * 60 * 60 * 1000)
+    },
+    remove(outTrackId: string): void {
+      removeStatement.run(outTrackId, companyId)
     },
   }
 }

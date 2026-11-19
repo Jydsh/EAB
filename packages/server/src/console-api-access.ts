@@ -3,10 +3,10 @@
  *
  * 原则：
  * - 平台超管 / 服务令牌不受页面权限限制；
- * - 成员后台会话必须命中一条规则，读接口要求 view，新增/编辑/删除分别要求对应动作；
- * - 一个接口同时具备两种语义（例如额度 PUT 是新增或编辑）时，命中任一动作即放行；
+ * - 成员后台会话必须命中一条规则；规则只声明页面或系统二级页，守卫按「可见」放行该页全部功能；
+ * - 规则里的 actions 仅保留接口语义，用于错误提示和旧数据兼容，不参与是否放行的判断；
  * - 没有映射的 `/api/console/*` 默认拒绝，避免新增接口忘了加守卫；
- * - 平台专属接口即使成员有对应页面写权限也拒绝（改超管密码、建公司、备份、更新等）。
+ * - 平台专属接口即使成员有对应页面可见权限也拒绝，仅限改超管密码、公司开通、钉钉开通等平台全局操作。
  */
 import type { ConsolePageKey } from './console-pages.js'
 
@@ -31,13 +31,6 @@ const PLATFORM_ONLY: readonly RegExp[] = [
   /^\/api\/console\/companies\/check-admin-account$/,
   /^\/api\/console\/companies\/onboard-dingtalk$/,
   /^\/api\/console\/dingtalk\/onboard(?:\/|$)/,
-  /^\/api\/console\/backups(?:\/|$)/,
-  /^\/api\/console\/backup-jobs(?:\/|$)/,
-  /^\/api\/console\/runtime-backups?(?:\/|$)/,
-  /^\/api\/console\/update\/(?:check|apply)$/,
-  /^\/api\/console\/settings\/(?:network|storage|data-dir)(?:\/|$)/,
-  /^\/api\/console\/system\/pick-directory(?:\/|$)/,
-  /^\/api\/console\/boot\/assets(?:\/|$)/,
 ]
 
 /** 无需页面权限的引导接口：登录、退出、看自己是谁、看权限、公司列表。 */
@@ -111,19 +104,37 @@ export function consoleApiRuleFor(method: string, path: string): ConsoleApiRule 
     return { pages: [], actions, platformOnly: true }
   }
 
-  // 版本更新：查版本所有后台成员可读，执行更新平台专属。
+  // 版本更新：只授权「系统更新」二级页可见；可见即可查看、检查并执行一键更新。
+  if (/^\/api\/console\/update\/check$/.test(path)) {
+    return { pages: P('system'), section: 'update', actions: ['view'] }
+  }
+  if (/^\/api\/console\/update\/apply$/.test(path)) {
+    return { pages: P('system'), section: 'update', actions: ['view'] }
+  }
   if (/^\/api\/console\/update/.test(path)) {
-    if (method.toUpperCase() === 'GET') return null
+    if (method.toUpperCase() === 'GET') return { pages: P('system'), section: 'update', actions }
     return { pages: [], actions, platformOnly: true }
   }
 
   if (/^\/api\/console\/overview$/.test(path)) return { pages: P('overview'), actions }
-  // 成员权限配置本身是「成员管理 → 后台访问」分区的独立能力，不再只限平台管理员。
-  // 读接口也要求“配置后台访问”，避免只勾“可见”就能读取他人的完整权限。
+  // 成员权限配置属于「成员管理」页；页面可见即可读取和保存。
   if (/^\/api\/console\/member-console-permissions(?:\/|$)/.test(path)) {
-    return { pages: P('org'), section: 'memberAccess', actions: ['edit'] }
+    return { pages: P('org'), actions: ['view'] }
   }
-  if (/^\/api\/console\/members(?:\/|$)/.test(path)) return { pages: P('org'), actions }
+  // 成员资料、角色分配都属于「成员管理」页；页面可见即可使用。
+  if (/^\/api\/console\/members\/(?:bulk-roles|[^/]+\/roles)$/.test(path)) {
+    return { pages: P('org', 'roles'), actions: ['edit'] }
+  }
+  if (/^\/api\/console\/members(?:\/|$)/.test(path)) {
+    if (method.toUpperCase() === 'GET') return { pages: P('org'), actions: ['view'] }
+    if (method.toUpperCase() === 'POST' && path === '/api/console/members') {
+      return { pages: P('org'), actions: ['create'] }
+    }
+    if (method.toUpperCase() === 'DELETE' && /^\/api\/console\/members\/[^/]+$/.test(path)) {
+      return { pages: P('org'), actions: ['delete'] }
+    }
+    return { pages: P('org'), actions: ['edit'] }
+  }
   if (/^\/api\/console\/departments(?:\/|$)/.test(path)) return { pages: P('departments'), actions }
 
   if (/^\/api\/console\/roles(?:\/|$)/.test(path)) {
@@ -149,58 +160,16 @@ export function consoleApiRuleFor(method: string, path: string): ConsoleApiRule 
 
   if (/^\/api\/console\/kb(?:\/|$)/.test(path)) return { pages: P('kb'), actions }
 
-  // 模型页三个页内分区。读接口会被多个分区共用，写接口按分区精确判断。
-  if (/^\/api\/console\/providers(?:\/|$)/.test(path)) {
-    if (actions.length === 1 && actions[0] === 'view') {
-      return { pages: P('models'), sections: ['providers', 'catalog', 'routes'], actions }
-    }
-    return { pages: P('models'), section: 'providers', actions }
-  }
-  if (/^\/api\/console\/models(?:\/|$)/.test(path)) {
-    if (actions.length === 1 && actions[0] === 'view') {
-      return { pages: P('models'), sections: ['providers', 'catalog', 'routes'], actions }
-    }
-    return { pages: P('models'), section: 'catalog', actions }
-  }
-  if (/^\/api\/console\/model-routes(?:\/|$)/.test(path)) {
-    if (actions.length === 1 && actions[0] === 'view') {
-      return { pages: P('models'), sections: ['providers', 'catalog', 'routes'], actions }
-    }
-    return { pages: P('models'), section: 'routes', actions }
+  // 模型接入是整页权限；页面可见即可使用供应商、模型目录和用途路由。
+  if (/^\/api\/console\/(?:providers|models|model-routes)(?:\/|$)/.test(path)) {
+    return { pages: P('models'), actions }
   }
   if (/^\/api\/console\/(?:model-kinds|model-stress-tests|plugin-channels)(?:\/|$)/.test(path)) {
-    if (actions.length === 1 && actions[0] === 'view') {
-      return { pages: P('models'), sections: ['providers', 'catalog', 'routes'], actions }
-    }
-    return { pages: P('models'), section: 'providers', actions }
+    return { pages: P('models'), actions }
   }
 
-  // 渠道页五个页内分区：企业绑定、渠道接入、通讯录同步、同步记录、外部身份。
-  if (/^\/api\/console\/channel-identities(?:\/|$)/.test(path)) {
-    return { pages: P('channels'), section: 'identities', actions }
-  }
-  if (/^\/api\/console\/channels\/[^/]+\/bind$/.test(path)) {
-    return { pages: P('channels'), section: 'binding', actions }
-  }
-  if (/^\/api\/console\/channels\/[^/]+\/onboard(?:\/|$)/.test(path)) {
-    return { pages: P('channels'), section: 'binding', actions }
-  }
-  if (/^\/api\/console\/channels\/[^/]+\/unbind$/.test(path)) {
-    return { pages: P('channels'), section: 'binding', actions }
-  }
-  if (/^\/api\/console\/channels\/[^/]+\/sync$/.test(path)) {
-    return { pages: P('channels'), section: 'sync', actions }
-  }
-  if (/^\/api\/console\/channels\/[^/]+\/org$/.test(path)) {
-    return { pages: P('channels'), section: 'sync', actions }
-  }
-  if (/^\/api\/console\/channels\/[^/]+\/test$/.test(path)) {
-    return { pages: P('channels'), section: 'config', actions }
-  }
-  if (/^\/api\/console\/channels\/[^/]+$/.test(path)) {
-    return { pages: P('channels'), section: 'config', actions }
-  }
-  if (/^\/api\/console\/channels(?:\/|$)/.test(path)) {
+  // 渠道页是整页权限；页面可见即可绑企业、配渠道、同步通讯录和管理外部身份。
+  if (/^\/api\/console\/(?:channel-identities|channels)(?:\/|$)/.test(path)) {
     return { pages: P('channels'), actions }
   }
 
@@ -212,7 +181,10 @@ export function consoleApiRuleFor(method: string, path: string): ConsoleApiRule 
   }
   if (/^\/api\/console\/company(?:\/|$)/.test(path)) return { pages: P('company'), actions }
 
-  // 系统页六个页内分区。
+  // 系统页七个二级页；每页只配「可见」。备份、目录、设置属于「系统与运维」。
+  if (/^\/api\/console\/(?:backups|backup-jobs|runtime-backups?)(?:\/|$)/.test(path)) {
+    return { pages: P('system'), section: 'data', actions }
+  }
   if (/^\/api\/console\/(?:settings|system|backends)(?:\/|$)/.test(path)) {
     return { pages: P('system'), section: 'data', actions }
   }
@@ -244,6 +216,7 @@ export function consoleApiRuleFor(method: string, path: string): ConsoleApiRule 
   if (/^\/api\/console\/audit(?:\/|$)/.test(path)) return { pages: P('audit'), actions }
 
   if (/^\/api\/console\/schedules(?:\/|$)/.test(path)) return { pages: P('tasks'), actions }
+  if (/^\/api\/console\/approval-workflows(?:\/|$)/.test(path)) return { pages: P('approvalPolicies'), actions }
   if (/^\/api\/console\/approvals(?:\/|$)/.test(path)) return { pages: P('approvals'), actions }
 
   // 未映射的 console 接口默认拒绝。

@@ -3,6 +3,7 @@ import { EC, EabError } from '@eab/domain'
 import { listPluginModels, registerPluginAdapter } from '../src/plugin-models.js'
 import {
   filterHealthyModels,
+  filterHealthyModelsForChat,
   forgetModelHealth,
   isModelHealthy,
   markModelHealthy,
@@ -50,6 +51,19 @@ describe('模型健康状态', () => {
 
     markModelHealthy(company, 'b')
     expect(filterHealthyModels(company, models)).toEqual([{ id: 'b' }])
+  })
+
+  it('对话候选只对插件模型套用健康状态，本地模型不被误排除', () => {
+    const company = 'health-chat-filter-test'
+    const local = { id: 'model_local_vllm' }
+    const plugin = { id: pluginId('route', 'qwen') }
+    markModelHealthy(company, plugin.id)
+
+    expect(filterHealthyModelsForChat(company, [local, plugin])).toEqual([local, plugin])
+
+    markModelUnhealthy(company, plugin.id, 'timeout')
+    expect(filterHealthyModelsForChat(company, [local, plugin])).toEqual([local])
+    expect(isModelHealthy(company, local.id)).toBe(false)
   })
 
   it('真实成功的模型排到最前，真实失败的模型降级并清掉首选', () => {

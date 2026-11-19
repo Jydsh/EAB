@@ -24,6 +24,8 @@ export interface ChannelModelCommandResult {
   text: string
   /** switch 时为选中的模型 ID；auto 时为 null；list/ambig/not-found 不修改。 */
   modelId?: string | null
+  /** ambiguous 时给出候选模型，渠道可以据此直接渲染可点击的引导卡。 */
+  candidates?: ChannelModelOption[]
 }
 
 function compact(value: string): string {
@@ -74,6 +76,91 @@ export function matchChannelModels(
 }
 
 /**
+ * 卡片引导里的模型选项：只有题目在问模型、且选项能唯一匹配当前可见模型时才返回。
+ *
+ * 这条判定让钉钉卡片回调可以走“静默切换”分支，不再为了一个点选跑完整
+ * Agent 回合，也就不该再生成一条“已切换…”的独立机器人消息。
+ */
+export function planChannelModelSelection(
+  question: string,
+  optionLabel: string,
+  models: readonly ChannelModelOption[],
+): { modelId: string | null; modelName: string } | null {
+  if (!/(模型|model)/i.test(String(question || '')) || models.length === 0) return null
+  const label = String(optionLabel || '').trim()
+  if (!label) return null
+  const normalized = label.replace(/[（(]\s*(?:当前使用|当前|已使用)\s*[）)]/g, '').trim()
+  if (/^(自动选择|自动|默认|auto)$/i.test(normalized)) {
+    return { modelId: null, modelName: '自动选择' }
+  }
+  const matches = matchChannelModels(models, normalized)
+  if (matches.length !== 1) return null
+  return { modelId: matches[0].id, modelName: matches[0].name }
+}
+
+/**
+ * 把“有哪些模型/切换模型”这类意图直接变成可点击的模型卡。
+ *
+ * 钉钉卡片最多渲染 4 个选项；模型较多时优先展示前 4 个，并在题目里提示
+ * 其余模型可以直接发 /model 模型名切换。自动选择只在有空位时占一个按钮。
+ */
+export interface ChannelModelPickerOption {
+  id: string
+  label: string
+  description: string
+}
+
+export interface ChannelModelPicker {
+  question: string
+  options: ChannelModelPickerOption[]
+  omitted: number
+}
+
+export function planChannelModelPicker(
+  models: readonly ChannelModelOption[],
+  currentModelId: string | null,
+  maxOptions = 4,
+): ChannelModelPicker | null {
+  const unique: ChannelModelOption[] = []
+  const seen = new Set<string>()
+  for (const model of models) {
+    const id = String(model?.id ?? '').trim()
+    const name = String(model?.name ?? '').trim()
+    if (!id || !name || seen.has(id)) continue
+    seen.add(id)
+    unique.push({ ...model, id, name })
+  }
+  if (unique.length === 0) return null
+
+  const limit = Math.min(4, Math.max(2, Math.trunc(maxOptions) || 4))
+  // 自动选择是“恢复不固定模型”，不是某个模型；只有留出空位时才和模型并列。
+  const showAuto = unique.length <= limit - 1
+  const modelSlots = showAuto ? limit - 1 : limit
+  const visible = unique.slice(0, modelSlots)
+  const options: ChannelModelPickerOption[] = visible.map((model, index) => ({
+    id: `option-model-${index + 1}`,
+    label: `${model.name}${model.id === currentModelId ? '（当前使用）' : ''}`,
+    description: model.id === currentModelId ? '当前正在使用' : '',
+  }))
+  if (showAuto) {
+    options.push({
+      id: 'option-auto',
+      label: '自动选择',
+      description: '按当前可用模型自动选择',
+    })
+  }
+  const omitted = unique.length - visible.length
+  return {
+    question:
+      omitted > 0
+        ? `要切换到哪个模型？（还有 ${omitted} 个模型，发送 /model 模型名可直接切换）`
+        : '要切换到哪个模型？',
+    options,
+    omitted,
+  }
+}
+
+/**
  * 解析一条渠道消息；不是模型命令时返回 null，调用方继续走普通对话。
  * 传入的 models 已经是当前员工可见模型；本函数不会访问任何未传入的模型。
  */
@@ -107,7 +194,10 @@ export function planChannelModelCommand(
 
   if (
     /^\/(model|models|模型)$/i.test(raw) ||
-    /^(切换模型|换模型|有哪些模型|还有哪些模型|还能用哪些模型|能用哪些模型|还有别的模型吗|有什么模型|都有哪些模型)(?:吧|呢|。|！|!)?$/.test(raw)
+    /^(?:现在|目前|当前)?(?:都)?(?:有|还有|能用|可用|支持)?(?:哪些|那些|什么)(?:模型|大模型)(?:吧|呢|啊)?(?:[，,。！!？?\s][\s\S]*)?$/.test(raw) ||
+    /^(?:还有别的模型吗|还有其他模型吗)(?:？|\?)?$/.test(raw) ||
+    /^(?:模型列表|模型清单|模型菜单|可用模型列表)(?:吧|呢|。|！|!)?$/.test(raw) ||
+    /^(?:我想|我要|帮我|给我|麻烦)?(?:切换一下|切换|换一下|换)(?:一个|个)?模型(?:吧|呢|。|！|!)?$/.test(raw)
   ) {
     return { kind: 'list', text: availableListText(models, currentModelId) }
   }
@@ -161,6 +251,7 @@ export function planChannelModelCommand(
     return {
       kind: 'ambiguous',
       text: `找到多个匹配「${query}」的模型：\n${names}\n请发送更完整的模型名称。`,
+      candidates: matches.slice(0, 8),
     }
   }
   return {

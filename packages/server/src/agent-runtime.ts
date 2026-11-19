@@ -116,9 +116,36 @@ function removeRun(id: string): void {
   void clearRunAlive(id)
 }
 
+/**
+ * 从外部强制收尾一个仍挂在 running 的 run。
+ *
+ * 后台唤醒轮必须有自己的兜底：只依赖 `run.finish()` 时，如果插件上游一直
+ * 不返回、AbortSignal 也没能打断底层连接，`agent_runs` 会永久停在 running，
+ * 等待中的子 Agent 就会被 `wakeParentForBackground()` 无限重试下去。
+ */
+export function forceFailAgentRun(db: Db, runId: string, error: string): boolean {
+  const active = activeRuns.get(runId)
+  try {
+    active?.controller.abort(new Error(error))
+  } catch {
+    // abort 失败不阻止写终态。
+  }
+  try {
+    const result = db.prepare(
+      `UPDATE agent_runs
+          SET status = 'failed', error = ?, ended_at = ?
+        WHERE id = ? AND status = 'running'`,
+    ).run(error, Date.now(), runId)
+    return Number(result.changes ?? 0) > 0
+  } catch {
+    return false
+  } finally {
+    removeRun(runId)
+  }
+}
+
 /** 标记某一棵 run 树为 cancelled；正在执行的子任务由 AbortSignal 真正中断。 */
-export function cancelAgentRunTree(db: Db, rootRunId: string, reason = '任务已取消'): string[] {
-  const cancelled: string[] = []
+export function cancelAgentRunTree(db: Db, rootRunId: string, reason = '任务已取消'): string[] {  const cancelled: string[] = []
   const visit = (id: string): void => {
     const run = activeRuns.get(id)
     if (run) {

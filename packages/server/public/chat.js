@@ -444,6 +444,8 @@ const state = {
   permView: 'apply',
   /** 申请权限时勾选的 scope 集合；只保留当前接口返回的可申请权限。 */
   permScopeCodes: [],
+  /** 申请权限时选择的当前角色；只作为审批策略上下文，不作为授权落点。 */
+  permRoleCode: '',
   permConfig: null,
   permRequests: { mine: [], todo: [] },
   permSelected: '',
@@ -3246,28 +3248,27 @@ function clampProgressPercent(value) {
 function agentTeamProgress(runs) {
   const list = Array.isArray(runs) ? runs : []
   const total = list.length
-  const done = list.filter((run) => {
-    const status = run?.status || 'running'
-    return status === 'done' || status === 'failed' || status === 'cancelled'
-  }).length
+  const completed = list.filter((run) => run?.status === 'done').length
+  const failed = list.filter((run) => run?.status === 'failed' || run?.status === 'cancelled').length
+  const done = completed + failed
   const active = list.filter((run) => (run?.status || 'running') === 'running').length
   const waiting = list.filter((run) => run?.status === 'waiting').length
-  const failed = list.filter((run) => run?.status === 'failed' || run?.status === 'cancelled').length
-  const remaining = Math.max(0, total - done)
+  const remaining = Math.max(0, total - done - active - waiting)
   return {
     total,
-    completed: done,
+    completed,
+    failed,
+    done,
     remaining,
     active,
     waiting,
-    failed,
     percent: total > 0 ? clampProgressPercent((done / total) * 100) : 0,
-    label: total > 0 ? `已完成 ${done} / ${total}` : '等待派发',
+    label: total > 0 ? (failed > 0 ? `已结束 ${done} / ${total}` : `已完成 ${completed} / ${total}`) : '等待派发',
     detail: failed > 0
-      ? `已完成 ${done} · 失败 ${failed} · 待汇总 ${remaining}`
-      : `已完成 ${done} · 进行中 ${active + waiting} · 待汇总 ${remaining}`,
-    state: total > 0 && done === total ? '已完成' : waiting > 0 ? '等待回复' : '进行中',
-    tone: total > 0 && done === total ? 'is-complete' : failed > 0 ? 'is-failed' : waiting > 0 ? 'is-waiting' : 'is-running',
+      ? `成功 ${completed} · 失败 ${failed} · 待汇总 ${remaining}`
+      : `已完成 ${completed} · 进行中 ${active + waiting} · 待汇总 ${remaining}`,
+    state: total > 0 && done === total ? (failed > 0 ? '已结束' : '已完成') : waiting > 0 ? '等待回复' : '进行中',
+    tone: total > 0 && done === total ? (failed > 0 ? 'is-failed' : 'is-complete') : failed > 0 ? 'is-failed' : waiting > 0 ? 'is-waiting' : 'is-running',
   }
 }
 
@@ -3282,8 +3283,16 @@ function normalizeTeamProgress(input) {
   const waiting = Math.max(0, Number(input.waiting) || 0)
   const total = explicitTotal || completed + remaining
   if (total <= 0) return null
-  const done = Math.min(total, completed + failed)
-  const left = Math.max(0, total - done)
+  // 成功和失败必须互斥：历史快照可能把同一个岗位的两次尝试分别计入，
+  // 先按失败优先裁剪，再算完成数，避免出现“总数 1、成功 1、失败 1”。
+  const failedCount = Math.min(total, failed)
+  const completedCount = Math.min(total - failedCount, completed)
+  const done = completedCount + failedCount
+  const activeCount = Math.min(total - done, active)
+  const waitingCount = Math.min(total - done - activeCount, waiting)
+  // “待汇总”只指还没进入运行/等待的排队任务；进行中、等待回复各自单列，
+  // 否则 total=1 + active=1 会同时显示“进行中 1”和“待汇总 1”。
+  const left = Math.max(0, total - done - activeCount - waitingCount)
   const rawState = String(input.state || '').trim()
   const stateText = rawState === 'completed'
     ? '已完成'
@@ -3294,29 +3303,38 @@ function normalizeTeamProgress(input) {
         : rawState === 'running'
           ? '进行中'
           : rawState
+  const label = activeCount > 0 && done <= 0
+    ? `进行中 ${activeCount} / ${total}`
+    : done <= 0
+      ? `已派发 ${total} 个`
+      : activeCount > 0
+        ? `已结束 ${done} / ${total} · ${activeCount} 进行中`
+        : failedCount > 0
+          ? `已结束 ${done} / ${total}`
+          : `已完成 ${done} / ${total}`
+  const detailParts = [`成功 ${completedCount}`, `失败 ${failedCount}`]
+  if (activeCount > 0) detailParts.push(`进行中 ${activeCount}`)
+  if (waitingCount > 0) detailParts.push(`等待回复 ${waitingCount}`)
+  if (left > 0) detailParts.push(`待汇总 ${left}`)
   return {
     total,
-    completed: Math.min(total, completed),
-    failed: Math.min(total, failed),
+    completed: completedCount,
+    failed: failedCount,
     done,
     remaining: left,
-    active: Math.max(0, active),
-    waiting: Math.max(0, waiting),
+    active: activeCount,
+    waiting: waitingCount,
     percent: clampProgressPercent((done / total) * 100),
-    label: done <= 0
-      ? `已派发 ${total} 个`
-      : failed > 0
-        ? `已结束 ${done} / ${total}`
-        : `已完成 ${done} / ${total}`,
-    detail: failed > 0
-      ? `成功 ${Math.min(total, completed)} · 失败 ${Math.min(total, failed)} · 待汇总 ${left}`
-      : `已完成 ${Math.min(total, completed)} · 进行中 ${active + waiting} · 待汇总 ${left}`,
-    state: stateText || (done >= total ? '已完成' : waiting > 0 ? '等待回复' : '进行中'),
+    label,
+    detail: detailParts.join(' · '),
+    state: done >= total && failedCount > 0
+      ? '已结束'
+      : stateText || (done >= total ? '已完成' : waitingCount > 0 ? '等待回复' : '进行中'),
     tone: done >= total
-      ? (failed > 0 ? 'is-failed' : 'is-complete')
-      : failed > 0
+      ? (failedCount > 0 ? 'is-failed' : 'is-complete')
+      : failedCount > 0
         ? 'is-failed'
-        : waiting > 0
+        : waitingCount > 0
           ? 'is-waiting'
           : 'is-running',
     note: String(input.note || '').trim(),
@@ -3330,7 +3348,20 @@ function teamProgressCardHtml(progressInput, note = '') {
   const runKey = esc(progress.parentRunId)
   let noteText = String(note || progress.note || '').trim()
   const finished = progress.total > 0 && progress.completed + progress.failed >= progress.total
-  if (finished && noteText && !/最终汇总已生成|汇总已生成/.test(noteText)) noteText = '全部子 Agent 已完成。'
+  if (finished && noteText && !/最终汇总已生成|汇总已生成/.test(noteText)) {
+    noteText = progress.failed > 0
+      ? `全部子 Agent 已结束：成功 ${progress.completed} · 失败 ${progress.failed}，等待主 Agent 汇总。`
+      : '全部子 Agent 已完成。'
+  }
+  if (!noteText) {
+    noteText = progress.state === '进行中'
+      ? `子 Agent 并行工作中 · ${progress.active} 个进行中，${progress.remaining} 个待汇总。`
+      : progress.state === '等待回复'
+        ? `${progress.waiting} 个子 Agent 正在等待回复。`
+        : progress.state === '已结束' || progress.failed > 0
+          ? `子 Agent 已结束：成功 ${progress.completed} · 失败 ${progress.failed}，等待主 Agent 汇总。`
+          : '全部子 Agent 已完成。'
+  }
   return `<div class="team-progress-card ${progress.tone}" data-team-progress data-team-progress-run="${runKey}"
     data-team-progress-total="${progress.total}" data-team-progress-completed="${progress.completed}"
     data-team-progress-failed="${progress.failed}" data-team-progress-active="${progress.active}"
@@ -3376,12 +3407,87 @@ function applyTeamProgressCard(card, progress) {
   if (note) {
     const fallbackNote = progress.state === '已完成'
       ? '全部子 Agent 已完成。'
-      : `子 Agent 并行工作中 · ${progress.completed} / ${progress.total} 已完成。`
+      : progress.state === '等待回复'
+        ? `${progress.waiting} 个子 Agent 正在等待回复。`
+        : progress.state === '进行中'
+          ? `子 Agent 并行工作中 · ${progress.active} 个进行中，${progress.remaining} 个待汇总。`
+          : `子 Agent 已结束 · 已结束 ${progress.done} / ${progress.total}，等待主 Agent 汇总。`
     note.textContent = oneLinePreview(progress.note || fallbackNote, 180)
   }
 }
 
 /** 进度气泡和团队面板共享同一份实时 run；当前父运行中的进度卡随团队状态一起刷新。 */
+function mergeTeamProgressCounts(previous, current) {
+  const cardTotal = Math.max(0, Number(previous?.total) || 0)
+  const cardCompleted = Math.max(0, Number(previous?.completed) || 0)
+  const cardFailed = Math.max(0, Number(previous?.failed) || 0)
+  const currentTotal = Math.max(0, Number(current?.total) || 0)
+  const currentCompleted = Math.max(0, Number(current?.completed) || 0)
+  const currentFailed = Math.max(0, Number(current?.failed) || 0)
+  const currentActive = Math.max(0, Number(current?.active) || 0)
+  const currentWaiting = Math.max(0, Number(current?.waiting) || 0)
+  const total = Math.max(cardTotal, currentTotal)
+  if (total <= 0) return null
+
+  // 新快照只要还有可读计数，就以它为准；旧卡的累计只用于避免岗位退休后
+  // 总数倒退。不能把旧快照的成功数和最新快照的失败数相加，那是两次尝试。
+  const snapshotHasCounts = currentCompleted + currentFailed + currentActive + currentWaiting > 0
+  const useSnapshot = snapshotHasCounts && (currentTotal >= cardTotal || currentActive > 0 || currentWaiting > 0)
+  let completed = useSnapshot ? currentCompleted : Math.max(cardCompleted, currentCompleted)
+  let failed = useSnapshot ? currentFailed : Math.max(cardFailed, currentFailed)
+  let active = currentActive
+  let waiting = currentWaiting
+
+  // 成功、失败、进行中、等待回复互斥，且总和不能超过总数。
+  failed = Math.min(total, failed)
+  completed = Math.min(total - failed, completed)
+  active = Math.min(total - completed - failed, active)
+  waiting = Math.min(total - completed - failed - active, waiting)
+
+  const done = completed + failed
+  const remaining = Math.max(0, total - done - active - waiting)
+  const state = active > 0
+    ? '进行中'
+    : waiting > 0
+      ? '等待回复'
+      : done >= total
+        ? (failed > 0 ? '已结束' : '已完成')
+        : '待汇总'
+  const label = active > 0 && done <= 0
+    ? `进行中 ${active} / ${total}`
+    : done <= 0
+      ? `已派发 ${total} 个`
+      : active > 0
+        ? `已结束 ${done} / ${total} · ${active} 进行中`
+        : failed > 0
+          ? `已结束 ${done} / ${total}`
+          : `已完成 ${done} / ${total}`
+  const detailParts = [`成功 ${completed}`, `失败 ${failed}`]
+  if (active > 0) detailParts.push(`进行中 ${active}`)
+  if (waiting > 0) detailParts.push(`等待回复 ${waiting}`)
+  if (remaining > 0) detailParts.push(`待汇总 ${remaining}`)
+  return {
+    total,
+    completed,
+    failed,
+    done,
+    remaining,
+    active,
+    waiting,
+    percent: total > 0 ? clampProgressPercent((done / total) * 100) : 0,
+    label,
+    detail: detailParts.join(' · '),
+    state,
+    tone: failed > 0
+      ? 'is-failed'
+      : active > 0
+        ? 'is-running'
+        : waiting > 0
+          ? 'is-waiting'
+          : 'is-complete',
+  }
+}
+
 function syncTeamProgressBubbles(runs) {
   const parentRunId = String(state.agentParentRunId || '')
   if (!parentRunId) return
@@ -3394,50 +3500,13 @@ function syncTeamProgressBubbles(runs) {
     if (!runKey && cards.length > 1) continue
     // 已完成的员工到 2 分钟会从团队栏注销，实时 run 的总数会变小；
     // 进度卡不能因此从 4/4 退回 2/2，必须保留已经写入的累计口径。
-    const cardTotal = Math.max(0, Number(card.dataset.teamProgressTotal) || 0)
-    const cardCompleted = Math.max(0, Number(card.dataset.teamProgressCompleted) || 0)
-    const cardFailed = Math.max(0, Number(card.dataset.teamProgressFailed) || 0)
-    const total = Math.max(cardTotal, progress.total)
-    const completed = Math.min(total, Math.max(cardCompleted, progress.completed))
-    const failed = Math.min(total, Math.max(cardFailed, progress.failed))
-    const done = Math.min(total, completed + failed)
-    const remaining = Math.max(0, total - done)
-    const active = Math.max(0, progress.active)
-    const waiting = Math.max(0, progress.waiting)
-    const state = done >= total && active === 0
-      ? '已完成'
-      : waiting > 0
-        ? '等待回复'
-        : active > 0
-          ? '进行中'
-          : '待汇总'
-    applyTeamProgressCard(card, {
-      total,
-      completed,
-      failed,
-      done,
-      remaining,
-      active,
-      waiting,
-      percent: total > 0 ? clampProgressPercent((done / total) * 100) : 0,
-      label: done <= 0
-        ? `已派发 ${total} 个`
-        : failed > 0
-          ? `已结束 ${done} / ${total}`
-          : `已完成 ${done} / ${total}`,
-      detail: failed > 0
-        ? `成功 ${completed} · 失败 ${failed} · 待汇总 ${remaining}`
-        : `已完成 ${completed} · 进行中 ${active + waiting} · 待汇总 ${remaining}`,
-      state,
-      tone: done >= total
-        ? (failed > 0 ? 'is-failed' : 'is-complete')
-        : failed > 0
-          ? 'is-failed'
-          : waiting > 0
-            ? 'is-waiting'
-            : 'is-running',
-      parentRunId,
-    })
+    const merged = mergeTeamProgressCounts({
+      total: Math.max(0, Number(card.dataset.teamProgressTotal) || 0),
+      completed: Math.max(0, Number(card.dataset.teamProgressCompleted) || 0),
+      failed: Math.max(0, Number(card.dataset.teamProgressFailed) || 0),
+    }, progress)
+    if (!merged) continue
+    applyTeamProgressCard(card, { ...merged, parentRunId })
   }
 }
 
@@ -3627,22 +3696,84 @@ function permScopeLabel(code) {
 
 function permPolicyText(policy) {
   if (!policy) return '暂不可申请'
-  return `审批链：最多 ${policy.maxLevels} 级，${policy.includeCompanyAdmin ? '公司管理员兜底' : '不兜底'}，${policy.timeoutHours} 小时内处理`
+  return `${policy.isDefault ? '默认审批链：' : ''}审批链最多 ${policy.maxLevels} 级，${policy.includeCompanyAdmin ? '公司管理员兜底' : '不兜底'}，${policy.timeoutHours} 小时内处理`
+}
+
+function permRoleEntries() {
+  const configured = Array.isArray(state.permConfig?.currentRoles) ? state.permConfig.currentRoles : []
+  if (configured.length) {
+    return configured
+      .map((role) => {
+        const code = String(role?.code || '').trim()
+        if (!code) return null
+        return { code, name: role?.name || ROLE_LABEL[code] || code, policy: role?.policy || null }
+      })
+      .filter(Boolean)
+  }
+  const roles = Array.isArray(state.me?.roles) ? state.me.roles : []
+  return roles
+    .map((role) => {
+      if (typeof role === 'string') return { code: role, name: ROLE_LABEL[role] || role }
+      const code = String(role?.code || role?.roleCode || '').trim()
+      if (!code) return null
+      return { code, name: role?.name || role?.roleName || ROLE_LABEL[code] || code }
+    })
+    .filter(Boolean)
+}
+
+function permSelectedScopes() {
+  const selected = new Set(state.permScopeCodes || [])
+  return (state.permConfig?.scopes || []).filter((scope) => selected.has(scope.code))
+}
+
+/** 审批路径：角色级策略优先，否则按所选权限里最严格的一条策略展示。 */
+function permPathInnerHtml() {
+  const selected = permSelectedScopes()
+  const role = permRoleEntries().find((item) => item.code === state.permRoleCode)
+    || permRoleEntries()[0]
+  if (!selected.length) {
+    return '<div class="perm-path-empty">勾选权限后，这里会显示需要经过的审批节点。</div>'
+  }
+  const rolePolicy = role?.policy || null
+  const policies = rolePolicy ? [rolePolicy] : selected.map((scope) => scope.policy).filter(Boolean)
+  if (!policies.length) {
+    return '<div class="perm-path-empty">所选权限还没有配置审批策略，暂时无法提交。</div>'
+  }
+  const maxLevels = Math.max(...policies.map((policy) => Number(policy.maxLevels) || 1))
+  const includeCompanyAdmin = policies.some((policy) => policy.includeCompanyAdmin)
+  const fixed = policies.some((policy) => policy.approverStrategy === 'fixed_users')
+  const hasDefault = policies.some((policy) => policy.isDefault === true)
+  const nodes = [{ label: '提交申请', tone: 'start' }]
+  for (let level = 1; level <= Math.min(3, maxLevels); level += 1) {
+    nodes.push({
+      label: level === 1 ? (fixed ? '指定审批人' : '部门负责人') : `第 ${level} 级审批`,
+      tone: 'approval',
+    })
+  }
+  if (includeCompanyAdmin && maxLevels < 3) nodes.push({ label: '公司管理员兜底', tone: 'approval' })
+  nodes.push({ label: '仅本人生效', tone: 'end' })
+  return `<div class="perm-path">
+    ${nodes.map((node, index) => `${index ? '<i class="perm-path-arrow" aria-hidden="true">→</i>' : ''}<span class="perm-path-node is-${node.tone}">${esc(node.label)}</span>`).join('')}
+  </div>
+  <div class="perm-path-meta">
+    <span data-perm-path-role>身份：${esc(role?.name || '未识别角色')}</span>
+    <span>${rolePolicy ? '按申请角色的审批策略执行' : hasDefault ? '按所选权限中最严格的一条执行，未单独配置的走默认链' : '按所选权限中最严格的一条执行'} · 最多 ${maxLevels} 级</span>
+  </div>`
 }
 
 function permApplyHtml() {
   const scopes = state.permConfig?.scopes || []
   const current = state.permConfig?.currentScopes || []
-  const currentChips = current.map((scope) => `<span class="perm-chip${scope.dangerous ? ' is-dangerous' : ''}">${esc(scope.label)}</span>`).join('')
-  if (!scopes.length) {
-    return `
-      <div class="perm-empty">
-        <span class="perm-empty-title">当前没有可申请的新权限</span>
-        你已拥有可申请角色的全部权限，或管理员还没有开放新的权限点。
-        ${current.length ? `<div class="perm-current-scopes perm-current-scopes-empty">${currentChips}</div>` : ''}
-      </div>`
+  const roles = permRoleEntries()
+  if (!state.permRoleCode || !roles.some((item) => item.code === state.permRoleCode)) {
+    state.permRoleCode = roles[0]?.code || ''
   }
+  const currentChips = current.map((scope) => `<span class="perm-chip${scope.dangerous ? ' is-dangerous' : ''}">${esc(scope.label)}</span>`).join('')
   const selected = new Set(state.permScopeCodes || [])
+  const emptyScopes = `<div class="perm-scope-empty">
+    <strong>当前没有可申请的新权限</strong>
+    <span>你已拥有全部已登记权限点。</span>
+  </div>`
   const groups = new Map()
   for (const scope of scopes) {
     const key = scope.group || '其他'
@@ -3667,20 +3798,39 @@ function permApplyHtml() {
   return `
     <form class="perm-form" id="perm-apply-form">
       <div class="perm-field">
-        <div class="perm-apply-head">
-          <span class="perm-field-label">当前身份已有权限</span>
-          <span class="perm-selected-count">${current.length} 项</span>
-        </div>
-        <div class="perm-current-scopes">${currentChips || '<span class="perm-field-hint">暂无可用权限</span>'}</div>
-        <span class="perm-field-hint">下面只列出当前身份没有、且管理员已开放申请的权限点。</span>
+        <label class="perm-field-label" for="perm-role">申请角色</label>
+        <select class="perm-select" id="perm-role"${roles.length ? '' : ' disabled'}>
+          ${roles.length
+            ? roles.map((role) => `<option value="${esc(role.code)}"${role.code === state.permRoleCode ? ' selected' : ''}>${esc(role.name)} · ${esc(role.code)}</option>`).join('')
+            : '<option>未识别到当前角色</option>'}
+        </select>
+        <span class="perm-field-hint">角色只用于匹配审批策略和审批人。审批通过只给本人授权，不会把权限写入这个角色。</span>
+      </div>
+      <div class="perm-grant-note">
+        <span class="perm-grant-icon" aria-hidden="true">✓</span>
+        <div><strong>审批通过后只授予你本人</strong><span>不会加入任何角色，也不会连带开放给同角色的其他成员；到期自动失效。</span></div>
+      </div>
+      <div class="perm-field">
+        <details class="perm-current-details">
+          <summary><span class="perm-current-label">当前身份已有权限</span><span class="perm-selected-count">${current.length} 项</span></summary>
+          <div class="perm-current-scopes">${currentChips || '<span class="perm-field-hint">暂无可用权限</span>'}</div>
+        </details>
+        <span class="perm-field-hint">下面列出当前身份没有的全部已登记权限点；未单独配置的按默认审批链。</span>
       </div>
       <div class="perm-field">
         <div class="perm-apply-head">
           <span class="perm-field-label">可申请权限</span>
           <span class="perm-selected-count" id="perm-selected-count">已选 ${selected.size} 项</span>
         </div>
-        <div class="perm-scope-list">${groupHtml}</div>
-        <span class="perm-field-hint">可多选；审批链取所选权限中最严格的一条，通过后只授予勾选权限，不新增角色。</span>
+        <div class="perm-scope-list">${groupHtml || emptyScopes}</div>
+        <span class="perm-field-hint">可多选；审批链取所选权限中最严格的一条。</span>
+      </div>
+      <div class="perm-field">
+        <div class="perm-apply-head">
+          <span class="perm-field-label">审批路径预览</span>
+          <span class="perm-selected-count">${selected.size > 0 ? `${selected.size} 项` : ''}</span>
+        </div>
+        <div class="perm-path-box" id="perm-path">${permPathInnerHtml()}</div>
       </div>
       <div class="perm-field">
         <label class="perm-field-label" for="perm-reason">申请原因</label>
@@ -3703,6 +3853,7 @@ function permApplyHtml() {
       </div>
     </form>`
 }
+
 
 function permRequestTitle(request) {
   if (request?.requestType === 'scope') {
@@ -3917,7 +4068,7 @@ async function submitPermissionApply(event) {
     const result = await api('/api/permissions/requests', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ scopeCodes, reason, durationHours }),
+      body: JSON.stringify({ scopeCodes, roleCode: state.permRoleCode || undefined, reason, durationHours }),
     })
     state.permSuccess = result.cardPending
       ? '权限申请已提交，正在给第一级审批人发钉钉审批卡。'
@@ -4002,6 +4153,13 @@ function bindPermissionPane() {
     renderPermissionPane()
   })
   $('#perm-body')?.addEventListener('change', (event) => {
+    const roleSelect = event.target.closest('#perm-role')
+    if (roleSelect) {
+      state.permRoleCode = roleSelect.value
+      const path = document.querySelector('#perm-path')
+      if (path) path.innerHTML = permPathInnerHtml()
+      return
+    }
     const input = event.target.closest('input[name="perm-scope"]')
     if (!input) return
     const code = input.value
@@ -4014,6 +4172,8 @@ function bindPermissionPane() {
     if (count) count.textContent = `已选 ${selected.size} 项`
     const submit = document.querySelector('#perm-submit')
     if (submit) submit.textContent = selected.size > 0 ? `提交 ${selected.size} 项申请` : '提交申请'
+    const path = document.querySelector('#perm-path')
+    if (path) path.innerHTML = permPathInnerHtml()
   })
   $('#perm-body')?.addEventListener('submit', (event) => {
     if (event.target?.id !== 'perm-apply-form') return
@@ -4273,11 +4433,14 @@ function updateParentAgentProgress() {
   )
   if (runs.length === 0) return
   const progress = agentTeamProgress(runs)
+  const note = progress.active + progress.waiting > 0
+    ? `子 Agent 并行工作中 · ${progress.active} 个进行中，${progress.remaining} 个待汇总`
+    : progress.failed > 0
+      ? `子 Agent 已结束：成功 ${progress.completed} · 失败 ${progress.failed}`
+      : '全部子 Agent 已完成，主 Agent 正在整理最终汇总。'
   turn.teamProgress({
     ...progress,
-    note: progress.active + progress.waiting > 0
-      ? `子 Agent 并行工作中 · ${progress.completed}/${progress.total} 已完成`
-      : '全部子 Agent 已完成，主 Agent 正在整理最终汇总。',
+    note,
   })
 }
 

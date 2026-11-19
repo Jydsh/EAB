@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { matchChannelModels, planChannelModelCommand, type ChannelModelOption } from '../src/channel-model-command.js'
+import {
+  matchChannelModels,
+  planChannelModelCommand,
+  planChannelModelPicker,
+  planChannelModelSelection,
+  type ChannelModelOption,
+} from '../src/channel-model-command.js'
 
 const models: ChannelModelOption[] = [
   { id: 'plugin:mrrp:route', name: 'MRRP 智能路由' },
@@ -71,6 +77,15 @@ describe('渠道机器人对话内模型切换', () => {
     expect(planChannelModelCommand('有哪些模型', models, null)).toMatchObject({
       kind: 'list',
     })
+    expect(planChannelModelCommand('现在有那些模型', models, null)).toMatchObject({
+      kind: 'list',
+    })
+    expect(planChannelModelCommand('我想切换模型', models, null)).toMatchObject({
+      kind: 'list',
+    })
+    expect(
+      planChannelModelCommand('现在有那些模型，用引导模型弄出来我点击后切换', models, null),
+    ).toMatchObject({ kind: 'list' })
   })
 
   it('普通“改用/换成”句子不会被误判为模型命令', () => {
@@ -105,5 +120,86 @@ describe('渠道机器人对话内模型切换', () => {
     const matches = matchChannelModels(models, 'plugin:our-free-model:mimo-v2.6-flash-free')
     expect(matches).toHaveLength(1)
     expect(matches[0].name).toBe('MiMo V2.6 Flash')
+  })
+
+  it('模型引导选项只匹配唯一可见模型，并兼容“当前使用”后缀', () => {
+    expect(planChannelModelSelection('请选择要切换的模型', 'Deepseek V4 Flash', models)).toEqual({
+      modelId: 'deepseek-v4-flash',
+      modelName: 'Deepseek V4 Flash',
+    })
+    expect(
+      planChannelModelSelection('你想用哪个模型？', 'MiMo V2.6 Flash（当前使用）', models),
+    ).toEqual({
+      modelId: 'plugin:our-free-model:mimo-v2.6-flash-free',
+      modelName: 'MiMo V2.6 Flash',
+    })
+  })
+
+  it('模型引导选项支持自动选择，且不会把无关选项当模型', () => {
+    expect(planChannelModelSelection('请选择模型', '自动选择', models)).toEqual({
+      modelId: null,
+      modelName: '自动选择',
+    })
+    expect(planChannelModelSelection('请选择模型', '再看看', models)).toBeNull()
+    expect(planChannelModelSelection('请选择处理方式', 'Deepseek V4 Flash', models)).toBeNull()
+    expect(planChannelModelSelection('请选择模型', 'MiMo', models)).toBeNull()
+  })
+
+  it('带厂商前缀的模型名（如 Qwen/Qwen3.5-4B）也能唯一命中', () => {
+    const qwenModels: ChannelModelOption[] = [
+      { id: 'Qwen/Qwen3-8B', name: 'Qwen/Qwen3-8B' },
+      { id: 'Qwen/Qwen3.5-4B', name: 'Qwen/Qwen3.5-4B' },
+    ]
+    expect(planChannelModelSelection('请选择模型', 'Qwen/Qwen3.5-4B（当前使用）', qwenModels)).toEqual({
+      modelId: 'Qwen/Qwen3.5-4B',
+      modelName: 'Qwen/Qwen3.5-4B',
+    })
+  })
+
+  it('模型引导卡最多 4 个选项，3 个模型时保留自动选择', () => {
+    const picker = planChannelModelPicker(
+      [
+        { id: 'plugin:our-free-model:kilo-auto%2Ffree', name: 'Kilo Auto Free' },
+        { id: 'Qwen/Qwen3-8B', name: 'Qwen/Qwen3-8B' },
+        { id: 'Qwen/Qwen3.5-4B', name: 'Qwen/Qwen3.5-4B' },
+      ],
+      'Qwen/Qwen3-8B',
+    )
+    expect(picker?.omitted).toBe(0)
+    expect(picker?.question).toBe('要切换到哪个模型？')
+    expect(picker?.options.map((option) => option.label)).toEqual([
+      'Kilo Auto Free',
+      'Qwen/Qwen3-8B（当前使用）',
+      'Qwen/Qwen3.5-4B',
+      '自动选择',
+    ])
+    expect(picker?.options[0].id).not.toBe('option-auto')
+    expect(picker?.options[3].id).toBe('option-auto')
+  })
+
+  it('模型超过 4 个时只展示前 4 个，并提示用 /model 切换其余模型', () => {
+    const picker = planChannelModelPicker(models, null)
+    expect(picker?.omitted).toBe(0)
+    expect(picker?.options).toHaveLength(4)
+    expect(picker?.options.some((option) => option.id === 'option-auto')).toBe(false)
+
+    const many = [...models, secretModel]
+    const truncated = planChannelModelPicker(many, null)
+    expect(truncated?.omitted).toBe(1)
+    expect(truncated?.options).toHaveLength(4)
+    expect(truncated?.question).toContain('/model')
+  })
+
+  it('模型卡不会重复同一个模型，空列表不建卡', () => {
+    const duplicate = planChannelModelPicker(
+      [models[1], { ...models[1] }, models[2]],
+      null,
+    )
+    expect(duplicate?.options.map((option) => option.label)).toEqual([
+      'MiMo V2.6 Flash',
+      'MiMo V2.6 Pro',
+      '自动选择',
+    ])
+    expect(planChannelModelPicker([], null)).toBeNull()
   })
 })

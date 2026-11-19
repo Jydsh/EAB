@@ -84,6 +84,33 @@ describe('插件 LLM adapter 注册表', () => {
     expect(findPluginModel(COMPANY, 'plugin:demo-route:demo%2Fmodel')).toBeNull()
   })
 
+  it('上游一直不返回文字时，按调用超时中止并返回可解释错误', async () => {
+    const company = 'c_plugin_timeout_test'
+    const adapter = {
+      ...makeAdapter(),
+      prepareCall: async (provider: string, model: string) => ({
+        model: { provider, id: model, name: '挂起模型' },
+        // 模拟上游连接建立后既不产出 chunk，也不结束。
+        stream: () => (async function* () { await new Promise(() => {}) })(),
+      }),
+      stream: () => (async function* () { await new Promise(() => {}) })(),
+    }
+    const registration = registerPluginAdapter(company, 'dsh-hang', ['hang-route'], adapter as any)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    await expect(
+      callPluginModel(
+        company,
+        'plugin:hang-route:demo%2Fmodel',
+        [{ role: 'user', content: '嗨' }],
+        { timeoutMs: 1_000 },
+      ),
+    ).rejects.toThrow(/没有返回|已中止/)
+
+    registration.dispose()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  }, 10_000)
+
   it('把 adapter 路由投影成控制台插件通道，并支持刷新模型', async () => {
     const company = 'c_plugin_channels_test'
     const adapter = makeAdapter()

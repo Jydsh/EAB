@@ -735,6 +735,26 @@ export class AgentTeamStore {
     return this.findWorker(key)
   }
 
+  /**
+   * 父 Agent 没能在时限内答复时，把仍显示“等待父 Agent 回答”的岗位收回到 idle。
+   * 只改 waiting，避免覆盖已经重新跑起来的 running 岗位。
+   */
+  settleWaitingWorkers(keys: readonly string[], text = '', now = Date.now()): string[] {
+    const unique = [...new Set(keys.map((key) => String(key || '').trim()).filter(Boolean))]
+    const settled: string[] = []
+    const statement = this.db.prepare(
+      `UPDATE agent_workers SET status = 'idle', last_task_at = ?, last_text = ?, updated_at = ?
+        WHERE team_id = ? AND key = ? AND status = 'waiting'`,
+    )
+    for (const key of unique) {
+      const result = statement.run(now, String(text || '').slice(-1200), now, this.teamId, key) as
+        | { changes?: number | bigint }
+        | undefined
+      if (Number(result?.changes ?? 0) > 0) settled.push(key)
+    }
+    return settled
+  }
+
   findWorker(key: string): TeamWorker | undefined {
     const row = this.db.prepare(
       `SELECT key, name, idx, status, run_id, model_id, model_name, last_task_at, last_text,
@@ -1206,9 +1226,9 @@ export function recoverInterruptedAgentTasks(db: Db, now = Date.now()): number {
     }
     db.prepare(
       `UPDATE agent_workers
-          SET status = 'idle', last_text = ?, updated_at = ?
-        WHERE status = 'running'`,
-    ).run('服务重启中断，等待父 Agent 重新派活', now)
+          SET status = 'idle', last_task_at = ?, last_text = ?, updated_at = ?
+        WHERE status IN ('running', 'waiting')`,
+    ).run(now, '服务重启中断，等待父 Agent 重新派活', now)
   } catch {
     // 启动收尾失败只影响展示，不阻断服务启动。
   }

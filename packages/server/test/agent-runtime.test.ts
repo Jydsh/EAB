@@ -3,6 +3,7 @@ import { migrate, openDatabase } from '@eab/storage'
 import {
   activeAgentRunCount,
   cancelAgentRunTree,
+  forceFailAgentRun,
   listAgentRuns,
   recordAgentStep,
   startAgentRun,
@@ -92,6 +93,20 @@ describe('Agent 运行树', () => {
     const runs = listAgentRuns(database, 'c1')
     expect(runs.find((run) => run.id === parent.id)?.status).toBe('cancelled')
     expect(runs.find((run) => run.id === child.id)?.status).toBe('cancelled')
+  })
+
+  it('强制失败会把 run 收成 failed，后续 finish 不能覆盖成 succeeded', () => {
+    const database = db()
+    const run = startAgentRun(database, { ...base, id: 'wake-timeout', agentId: 'eab-main' })
+    expect(forceFailAgentRun(database, run.id, '模型上游超时（120 秒未返回）')).toBe(true)
+    expect(run.signal.aborted).toBe(true)
+    // 底层调用迟到返回时，runAgentTurn 仍会走 finally；这里确认不会再改写终态。
+    run.finish('succeeded', null, 10)
+    const row = database
+      .prepare(`SELECT status, error FROM agent_runs WHERE id = ?`)
+      .get(run.id) as { status: string; error: string | null } | undefined
+    expect(row?.status).toBe('failed')
+    expect(row?.error).toContain('超时')
   })
 
   it('启动清理只回收没有心跳的僵尸 run，活着的 run 不动', async () => {

@@ -48,7 +48,7 @@ export interface ConsolePageActionMeta {
   readonly label: string
 }
 
-/** 页内二级分区（页面里的 tab / 分段），权限按“页面 + 分区”分别保存。 */
+/** 系统页的二级页面；每页只登记可见，`actions` 仅为旧数据兼容保留。 */
 export interface ConsolePageSectionMeta {
   readonly key: string
   readonly title: string
@@ -73,10 +73,10 @@ export const CONSOLE_DOMAINS: readonly ConsoleDomainMeta[] = [
   { id: 'overview', title: '概览', pages: ['overview'] },
   { id: 'org', title: '组织与权限', pages: ['org', 'departments', 'roles', 'approvalPolicies', 'access'] },
   { id: 'knowledge', title: '知识与模型', pages: ['kb', 'models', 'tools'] },
-  { id: 'platform', title: '连接与平台', pages: ['channels', 'databases', 'documents', 'company', 'system'] },
-  { id: 'plugins', title: '插件管理', pages: ['extra'] },
-  { id: 'skills', title: '技能管理', pages: ['skills'] },
+  { id: 'platform', title: '连接与平台', pages: ['channels', 'databases', 'documents', 'company'] },
+  { id: 'features', title: '功能管理', pages: ['extra', 'skills'] },
   { id: 'ops', title: '运营与审计', pages: ['usage', 'quota', 'audit', 'tasks', 'approvals'] },
+  { id: 'system', title: '系统', pages: ['system'] },
 ]
 
 export const CONSOLE_PAGES: readonly ConsolePageMeta[] = [
@@ -93,14 +93,14 @@ export const CONSOLE_PAGES: readonly ConsolePageMeta[] = [
   { key: 'databases', title: '数据连接', domain: 'platform' },
   { key: 'documents', title: '在线文档', domain: 'platform' },
   { key: 'company', title: '公司设置', domain: 'platform' },
-  { key: 'system', title: '系统', domain: 'platform' },
+  { key: 'system', title: '系统', domain: 'system' },
   { key: 'usage', title: '用量', domain: 'ops' },
   { key: 'quota', title: '额度', domain: 'ops' },
   { key: 'audit', title: '审计', domain: 'ops' },
   { key: 'tasks', title: '任务中心', domain: 'ops' },
   { key: 'approvals', title: '审批', domain: 'ops' },
-  { key: 'extra', title: '插件', domain: 'plugins' },
-  { key: 'skills', title: '技能', domain: 'skills' },
+  { key: 'extra', title: '插件管理', domain: 'features' },
+  { key: 'skills', title: '技能管理', domain: 'features' },
 ]
 
 export const CONSOLE_PAGE_KEYS: readonly ConsolePageKey[] = CONSOLE_PAGES.map((page) => page.key)
@@ -112,10 +112,10 @@ export function isConsolePageKey(value: string): value is ConsolePageKey {
 }
 
 /**
- * 每个页面实际允许哪些写动作。
+ * 旧版页面写动作元数据，仅用于兼容已有权限行与历史接口载荷。
  *
- * 只读页（概览、权限矩阵、用量）没有写动作；有列表增删改的页面按实际按钮给到三项；
- * “审计”“系统”这类页面没有新增/删除，只保留一个能表达原有能力的动作。
+ * 新版权限模型只登记页面「可见」，页面可见即可使用该页全部功能；
+ * 前端角色 / 成员权限界面不再渲染这些动作，守卫也不按它们判断。
  */
 export const CONSOLE_PAGE_ACTIONS: Record<ConsolePageKey, readonly ConsolePageActionMeta[]> = {
   overview: [],
@@ -191,52 +191,15 @@ export function consolePageActionMetas(page: ConsolePageKey): readonly ConsolePa
 }
 
 /**
- * 页内二级分区。只有页面内确实用 tab / 分段切换内容时才登记；
- * 分区 key 必须与前端 `data-section-target` / `data-channel-tab` / `data-role-tab` 一致。
+ * 系统页的二级页面。只有系统页保留二级导航，每个二级页只登记「可见」，
+ * 可见即可使用该二级页全部功能；actions 仅作为旧数据兼容字段保留。
  */
 export const CONSOLE_PAGE_SECTIONS: Partial<Record<ConsolePageKey, readonly ConsolePageSectionMeta[]>> = {
   /**
-   * 成员管理里的“后台访问”是给成员配置页面权限的能力，本身也必须可授权。
-   * 单独放分区，避免把“编辑成员资料”与“改别人的后台权限”混成同一个勾选。
+   * 只有「系统」的二级导航是独立页面。每个二级页只登记「可见」，
+   * 可见即可使用该二级页的全部功能。成员管理、渠道、模型接入等页内 tab
+   * 不再拆权限，整页可见即全部可用。
    */
-  org: [
-    { key: 'memberAccess', title: '后台访问', hideView: true, actions: [{ id: 'edit', label: '配置后台访问' }] },
-  ],
-  channels: [
-    {
-      key: 'binding',
-      title: '企业绑定',
-      actions: [
-        { id: 'create', label: '开通/绑定' },
-        { id: 'delete', label: '解绑' },
-      ],
-    },
-    { key: 'config', title: '渠道接入', actions: [{ id: 'edit', label: '配置' }] },
-    { key: 'sync', title: '通讯录同步', actions: [{ id: 'edit', label: '立即同步' }] },
-    { key: 'history', title: '同步记录', actions: [] },
-    {
-      key: 'identities',
-      title: '外部身份',
-      actions: [
-        { id: 'create', label: '新增绑定' },
-        { id: 'edit', label: '编辑' },
-        { id: 'delete', label: '解绑' },
-      ],
-    },
-  ],
-  models: [
-    {
-      key: 'providers',
-      title: '供应商与端点',
-      actions: [
-        { id: 'create', label: '新增供应商' },
-        { id: 'edit', label: '编辑' },
-        { id: 'delete', label: '删除' },
-      ],
-    },
-    { key: 'catalog', title: '模型目录', actions: [{ id: 'create', label: '新增模型' }, { id: 'edit', label: '编辑模型' }, { id: 'delete', label: '删除模型' }] },
-    { key: 'routes', title: '用途路由', actions: [{ id: 'edit', label: '绑定路由' }] },
-  ],
   system: [
     { key: 'runtime', title: '运行与准入', actions: [{ id: 'edit', label: '修改运行设置' }] },
     { key: 'concurrency', title: '并发与队列', actions: [{ id: 'edit', label: '修改并发配置' }] },
@@ -258,6 +221,15 @@ export const CONSOLE_PAGE_SECTIONS: Partial<Record<ConsolePageKey, readonly Cons
       ],
     },
     { key: 'data', title: '系统与运维', actions: [{ id: 'edit', label: '配置/备份/恢复' }] },
+    // 独立二级页：只配置可见；可见即可查看版本、检查更新、一键更新和复制命令。
+    {
+      key: 'update',
+      title: '系统更新',
+      actions: [
+        { id: 'create', label: '检查更新' },
+        { id: 'edit', label: '一键更新' },
+      ],
+    },
   ],
 }
 
@@ -280,7 +252,7 @@ export function isConsolePageSectionAllowed(
   return consolePageSectionActionMetas(page, section).some((meta) => meta.id === action)
 }
 
-/** 复合权限键：`page` 表示整页，`page:section` 表示页内某个分区。 */
+/** 复合权限键：`page` 表示整页，`page:section` 表示系统二级页。 */
 export function consolePermissionPageKey(page: ConsolePageKey, section?: string | null): string {
   return section ? `${page}:${section}` : page
 }

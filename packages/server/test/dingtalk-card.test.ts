@@ -6,6 +6,8 @@ import {
   dingTalkConversationSummary,
   DingTalkAICardStream,
   flattenMarkdownTables,
+  forgetDingTalkClarifyCard,
+  isDingTalkClarifyCardConsumed,
   renderDingTalkProgressCard,
 } from '../src/dingtalk-card.js'
 
@@ -61,6 +63,13 @@ function finalComponentsOf(messages: string[]): Array<Record<string, any>> {
 }
 
 describe('钉钉 A2UI 卡片可见性与底色', () => {
+  it('模型点选消费完的卡片会被注销并标记，重复点击不再触发回合', () => {
+    const outTrackId = 'eab_a2ui_consumed_model_card'
+    forgetDingTalkClarifyCard(outTrackId)
+    expect(isDingTalkClarifyCardConsumed(outTrackId)).toBe(true)
+    expect(isDingTalkClarifyCardConsumed('eab_a2ui_other_card')).toBe(false)
+  })
+
   it('把回答正文段标为 artifact，供钉钉生成会话列表正文', () => {
     expect(buildDingTalkA2UIArtifactAnnotations('s')).toEqual(
       Array.from({ length: 24 }, (_, index) => ({
@@ -152,6 +161,51 @@ describe('钉钉 A2UI 卡片可见性与底色', () => {
     )
     const thinkingHeader = finalComponentsOf(messages).find((component) => component.id === 'thinkingHeader')
     expect(thinkingHeader?.textEffect).toBeUndefined()
+  })
+
+  it('思考进行中的摘要随最新尾文变化，结束后收回首行摘要', () => {
+    const prefix =
+      '先确认用户身份、可用工具和当前页面权限，再核对成员所属部门与审批流程，最后整理成可执行的步骤。'.repeat(2)
+    const liveText = `${prefix}现在开始查询组织架构。`
+    const live = initialData(
+      buildDingTalkA2UICreateMessages('s', {
+        answer: '',
+        reasoning: liveText,
+        tools: [],
+        thinkingDone: false,
+      }),
+    )
+    const tail = liveText.replace(/\s+/g, ' ').trim().slice(-96).trimStart()
+    expect(live.thinking.preview).toBe(`…${tail}`)
+    expect(live.thinking.header).toBe(`✦ 思考中 · …${tail}`)
+
+    const final = buildDingTalkA2UIUpdateMessages(
+      's',
+      {
+        answer: '答案',
+        reasoning: `${prefix}现在开始查询组织架构。\n第二段不应进入首行摘要。`,
+        tools: [],
+        thinkingDone: true,
+        thinkingMs: 1200,
+      },
+      false,
+    )
+    expect(updateValues(final)['/thinking/preview']).toContain('先确认用户身份')
+    expect(updateValues(final)['/thinking/preview']).not.toContain('现在开始查询组织架构')
+  })
+
+  it('旧模板卡的流式摘要也取最新尾文，不卡在长段落开头', () => {
+    const prefix =
+      '先确认用户身份、可用工具和当前页面权限，再核对成员所属部门与审批流程，最后整理成可执行的步骤。'.repeat(2)
+    const liveText = `${prefix}现在开始查询组织架构。`
+    const tail = liveText.replace(/\s+/g, ' ').trim().slice(-90).trimStart()
+    const card = renderDingTalkProgressCard({
+      answer: '',
+      reasoning: liveText,
+      tool: '',
+      thinkingDone: false,
+    })
+    expect(card).toContain(`> …${tail}`)
   })
 
   it('真正调用工具后仍显示“思考中”标题和思考摘要，工具结束后工具面板保留数量与耗时', () => {
@@ -1512,6 +1566,172 @@ describe('钉钉 A2UI 多选与填空澄清', () => {
     expect(components.find((component) => component.id === 'clarifySubmitLabel')).toMatchObject({
       text: '提交全部',
     })
+  })
+
+  it('更新 400 时先去掉组件重试并保留完整 errorMsg', async () => {
+    const requests: Array<{ url: string; body: Record<string, any> }> = []
+    const logs: string[] = []
+    let updateAttempts = 0
+    const realFetch = globalThis.fetch
+    globalThis.fetch = (async (input: any, init?: RequestInit) => {
+      const url = String(input)
+      const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, any>
+      requests.push({ url, body })
+      if (url.includes('/v1.0/oauth2/accessToken')) {
+        return { ok: true, status: 200, text: async () => JSON.stringify({ accessToken: 'test-token', expireIn: 7200 }) } as Response
+      }
+      if (url.endsWith('/v1.0/card/ai/instances/update')) {
+        updateAttempts += 1
+        if (updateAttempts === 1) {
+          return {
+            ok: false,
+            status: 400,
+            text: async () => JSON.stringify({
+              code: 'param.invalid',
+              errorMsg: 'updateComponents[0].id is invalid',
+            }),
+          } as Response
+        }
+      }
+      return { ok: true, status: 200, text: async () => JSON.stringify({ success: true }) } as Response
+    }) as typeof fetch
+
+    try {
+      const card = new DingTalkAICardStream(
+        'fallback-app',
+        'secret',
+        'user-1',
+        'robot-1',
+        { warn: (...args: unknown[]) => logs.push(args.map(String).join(' ')) },
+      )
+      expect(
+        await card.start(
+          { answer: '', reasoning: '先确认身份', tools: [], thinkingDone: false },
+          'EAB 企业智能助手',
+        ),
+      ).toBe(true)
+      requests.length = 0
+      card.update({ answer: '答', reasoning: '先确认身份', tools: ['org.search'], thinkingDone: true })
+      await new Promise((resolve) => setTimeout(resolve, 350))
+
+      const updates = requests.filter((request) => request.url.endsWith('/v1.0/card/ai/instances/update'))
+      expect(updateAttempts).toBeGreaterThanOrEqual(2)
+      expect(updates[1]?.body.a2uiMessages?.some((message: string) => message.includes('"updateComponents"'))).toBe(false)
+      expect(logs.join('\n')).toContain('param.invalid')
+      expect(logs.join('\n')).toContain('updateComponents[0].id is invalid')
+      expect(await card.finish({ answer: '答', reasoning: '先确认身份', tools: ['org.search'], thinkingDone: true }, '答')).toBe(true)
+    } finally {
+      globalThis.fetch = realFetch
+    }
+  })
+
+  it('组件与纯数据都被拒时整包数据兜底，卡片不退出流式', async () => {
+    const requests: Array<{ url: string; body: Record<string, any> }> = []
+    let updateAttempts = 0
+    const realFetch = globalThis.fetch
+    globalThis.fetch = (async (input: any, init?: RequestInit) => {
+      const url = String(input)
+      const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, any>
+      requests.push({ url, body })
+      if (url.includes('/v1.0/oauth2/accessToken')) {
+        return { ok: true, status: 200, text: async () => JSON.stringify({ accessToken: 'test-token', expireIn: 7200 }) } as Response
+      }
+      if (url.endsWith('/v1.0/card/ai/instances/update')) {
+        updateAttempts += 1
+        if (updateAttempts <= 2) {
+          return {
+            ok: false,
+            status: 400,
+            text: async () => JSON.stringify({ code: 'param.invalid', errorMsg: 'a2ui message invalid' }),
+          } as Response
+        }
+      }
+      return { ok: true, status: 200, text: async () => JSON.stringify({ success: true }) } as Response
+    }) as typeof fetch
+
+    try {
+      const card = new DingTalkAICardStream('compact-app', 'secret', 'user-1', 'robot-1')
+      expect(
+        await card.start(
+          { answer: '', reasoning: '先确认身份', tools: [], thinkingDone: false },
+          'EAB 企业智能助手',
+        ),
+      ).toBe(true)
+      card.update({ answer: '答', reasoning: '先确认身份', tools: ['org.search'], thinkingDone: true })
+      await new Promise((resolve) => setTimeout(resolve, 400))
+
+      const updates = requests.filter((request) => request.url.endsWith('/v1.0/card/ai/instances/update'))
+      expect(updateAttempts).toBe(3)
+      expect(updates[2]?.body.a2uiMessages?.some((message: string) => {
+        const parsedMessage = JSON.parse(message) as Record<string, any>
+        return parsedMessage.updateDataModel?.path === '/ui'
+      })).toBe(true)
+      expect(await card.finish({ answer: '答', reasoning: '先确认身份', tools: ['org.search'], thinkingDone: true }, '答')).toBe(true)
+    } finally {
+      globalThis.fetch = realFetch
+    }
+  })
+
+  it('超长正文和思考在卡片侧截断，单次创建/更新不会超过钉钉体积上限', () => {
+    const huge = '字'.repeat(800_000)
+    const created = initialData(buildDingTalkA2UICreateMessages('s-huge', {
+      answer: huge,
+      reasoning: huge,
+      tools: [],
+      thinkingDone: false,
+    }))
+    const answer = created.answer as { blocks: Array<Record<string, any>> }
+    expect(answer.blocks[0]?.text).toContain('内容过长')
+    expect(Buffer.byteLength(String(created.thinking.text), 'utf8')).toBeLessThan(80 * 1024)
+    expect(Buffer.byteLength(JSON.stringify(created), 'utf8')).toBeLessThan(200 * 1024)
+  })
+
+  it('流式切开的孤立代理字符不进入卡片请求，避免 Unicode 校验 400', () => {
+    const broken = `前${'\uD83D'}后`
+    const created = initialData(buildDingTalkA2UICreateMessages('s-broken', {
+      answer: broken,
+      reasoning: broken,
+      tools: [],
+      thinkingDone: false,
+    }))
+    const answer = created.answer as { blocks: Array<Record<string, any>> }
+    expect(answer.blocks[0]?.text).toBe('前后')
+    expect(JSON.stringify(created)).not.toMatch(/[\uD800-\uDFFF]/)
+  })
+
+  it('更新消息超过 95 条时自动分批，不把整包打到钉钉', async () => {
+    const requests: Array<{ url: string; body: Record<string, any> }> = []
+    const realFetch = globalThis.fetch
+    globalThis.fetch = (async (input: any, init?: RequestInit) => {
+      const url = String(input)
+      const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, any>
+      requests.push({ url, body })
+      const response = url.includes('/v1.0/oauth2/accessToken')
+        ? { accessToken: 'test-token', expireIn: 7200 }
+        : { success: true }
+      return { ok: true, status: 200, text: async () => JSON.stringify(response) } as Response
+    }) as typeof fetch
+
+    try {
+      const card = new DingTalkAICardStream('chunk-app', 'secret', 'user-1', 'robot-1')
+      expect(
+        await card.start({ answer: '', reasoning: '开始', tools: [], thinkingDone: false }, 'EAB 企业智能助手'),
+      ).toBe(true)
+      const messages = Array.from({ length: 100 }, (_, index) => JSON.stringify({
+        version: 'v1.0',
+        updateDataModel: { surfaceId: 's-chunk', path: `/batch${index}`, value: index },
+      }))
+      await (card as unknown as {
+        putUpdateMessages: (messages: string[], flowStatus: string) => Promise<void>
+      }).putUpdateMessages(messages, 'PROCESSING')
+
+      const updateCalls = requests.filter((request) => request.url.endsWith('/v1.0/card/ai/instances/update'))
+      expect(updateCalls).toHaveLength(2)
+      expect(updateCalls[0]?.body.a2uiMessages).toHaveLength(95)
+      expect(updateCalls[1]?.body.a2uiMessages).toHaveLength(5)
+    } finally {
+      globalThis.fetch = realFetch
+    }
   })
 
   it('题组单选点选项走翻页动作：非末页下一题，末页只记选中', () => {

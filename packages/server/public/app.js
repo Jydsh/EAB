@@ -166,8 +166,36 @@ const state = {
   selectedRole: null,
   /** 角色详情当前页签：permissions / members */
   roleTab: 'permissions',
+  /** 角色左侧列表搜索词，切换角色时保留 */
+  roleQuery: '',
+  /** 权限矩阵：scope=功能权限，pages=后台页面 */
+  matrixMode: 'scopes',
+  /** 权限矩阵：all / builtin / custom */
+  matrixFilter: 'all',
+  matrixQuery: '',
   /** 角色列表：渲染左侧导航「角色管理」子菜单 */
   roles: null,
+  /** 权限审批工作台：页签、模板、选中节点、记录筛选 */
+  approvalTab: 'design',
+  approvalData: null,
+  approvalTemplates: null,
+  approvalTemplateId: 'default',
+  approvalNodeId: 'start',
+  approvalMembers: null,
+  approvalDrag: null,
+  /** 流程画布：缩放、平移和右键菜单 */
+  approvalCanvas: null,
+  approvalCanvasMenu: null,
+  approvalPan: null,
+  /** 自由连线：当前选中的连线、专注画布 */
+  approvalEdgeFrom: '',
+  approvalEdgeTo: '',
+  approvalFocus: false,
+  approvalRecordTab: 'todo',
+  approvalRecordId: '',
+  approvalRecordQuery: '',
+  approvalCatalogQuery: '',
+  approvalCatalogFilter: 'all',
   /** 插件页：当前选中的插件、详情标签、当前页面 */
   pluginData: null,
   pluginSelected: null,
@@ -189,8 +217,8 @@ const PAGES = {
   org: { title: '成员管理', sub: '成员列表、角色授权与部门筛选', render: () => loadOrg() },
   departments: { title: '部门管理', sub: '部门结构、负责人、下级与成员', render: () => loadDepartments() },
   roles: { title: '角色管理', sub: '角色权限、数据范围与成员配置', render: () => loadRoles() },
-  approvalPolicies: { title: '权限审批', sub: '按权限点配置多级审批链，并控制哪些角色开放权限申请', render: () => loadPermissionPolicies() },
-  access: { title: '权限矩阵', sub: '成员 × 知识库可见性核对', render: () => loadMatrix() },
+  approvalPolicies: { title: '权限审批', sub: '可视化流程设计、审批记录与全量权限目录', render: () => loadPermissionPolicies() },
+  access: { title: '权限矩阵', sub: '角色 × 功能权限与后台页面核对', render: () => loadMatrix() },
   kb: { title: '知识库', sub: '知识库、可见范围与文档', render: () => loadKb() },
   models: { title: '模型接入', sub: '供应商端点、模型目录与用途路由', render: () => loadModels() },
   tools: { title: '工具', sub: '智能体可调用的工具与审批要求', render: () => loadTools() },
@@ -203,7 +231,7 @@ const PAGES = {
   audit: { title: '审计', sub: '追加写入、哈希链可校验的操作记录', render: () => loadAudit() },
   tasks: { title: '任务中心', sub: '定时任务、最近执行与事件时间线', render: () => loadTasks() },
   approvals: { title: '审批', sub: '高危动作的待办与决定', render: () => loadApprovals() },
-  system: { title: '系统', sub: '运行状态与数据运维', render: () => loadSys() },
+  system: { title: '系统', sub: '运行状态与系统更新', render: () => loadSys() },
   extra: { title: '插件管理', sub: '安装、启停、页面与工具', render: () => loadPlugins() },
   skills: { title: '技能管理', sub: '安装、启停、风险扫描与隔离记录', render: () => loadSkillsPage() },
 }
@@ -446,7 +474,18 @@ function showTopToast(message, options = {}) {
   close.setAttribute('aria-label', '关闭提示')
   close.textContent = '×'
 
-  item.append(icon, copy, close)
+  const action = options.action && options.action.label ? options.action : null
+  const actionButton = action
+    ? Object.assign(document.createElement('button'), {
+        className: 'top-toast-action',
+        type: 'button',
+        textContent: String(action.label),
+      })
+    : null
+
+  item.append(icon, copy)
+  if (actionButton) item.append(actionButton)
+  item.append(close)
   host.appendChild(item)
 
   let timer = 0
@@ -463,6 +502,18 @@ function showTopToast(message, options = {}) {
     clearTimeout(timer)
     dismiss()
   })
+  if (actionButton && action) {
+    actionButton.addEventListener('click', () => {
+      clearTimeout(timer)
+      dismiss()
+      try {
+        action.onClick?.()
+      } catch {
+        /* 用户点击撤销后的异常不打断提示关闭 */
+      }
+    })
+  }
+  return { dismiss }
 }
 
 /** 跳页前把成功提示暂存，目标页 boot 后接着显示。 */
@@ -4349,142 +4400,107 @@ async function openMemberRoles(member) {
     return
   }
   const current = new Set((member.roles || []).map((role) => role.code))
-  const permissionMap = new Map((accessData?.pages || []).map((item) => [item.page, item]))
-  const pageMetaMap = new Map((accessData?.catalog?.pages || []).map((item) => [item.page, item]))
-  const actionChecked = (perm, action) => {
-    if (action === 'create') return perm?.canCreate === true
-    if (action === 'edit') return perm?.canEdit === true
-    return perm?.canDelete === true
-  }
-  const pageRowHtml = (key, title, perm, actions, className = '', hideView = false) => `
-    <div class="perm-page-row${className ? ` ${className}` : ''}" data-page-row="${esc(key)}">
-      <strong>${esc(title)}</strong>
-      <span class="perm-page-actions">
-        ${hideView ? '' : `<label class="scope-check"><input type="checkbox" data-page-view${perm?.canView ? ' checked' : ''} /> 可见</label>`}
-        ${actions
-          .map(
-            (action) => `<label class="scope-check"><input type="checkbox" data-page-action="${esc(action.id)}"${
-              actionChecked(perm, action.id) ? ' checked' : ''
-            } /> ${esc(action.label || action.id)}</label>`,
-          )
-          .join('')}
-      </span>
-    </div>`
-  const pageBlockHtml = (page) => {
-    const meta = pageMetaMap.get(page)
-    const perm = permissionMap.get(page)
-    const sections = Array.isArray(meta?.sections) ? meta.sections : []
-    if (sections.length === 0) {
-      return pageRowHtml(page, meta?.title || page, perm, Array.isArray(meta?.actions) ? meta.actions : [])
-    }
-    const hasSectionRows = sections.some((section) => permissionMap.has(`${page}:${section.key}`))
-    return `<div class="perm-page-block">
-      <div class="perm-page-parent"><strong>${esc(meta?.title || page)}</strong><span class="muted">页内选项分别授权</span></div>
-      ${sections
-        .map((section) => {
-          const key = `${page}:${section.key}`
-          // 旧数据只有整页权限时，分区先按整页权限回显；保存后会物化为独立分区行。
-          const childPerm = permissionMap.get(key) || (hasSectionRows ? undefined : perm)
-          return pageRowHtml(key, section.title, childPerm, Array.isArray(section.actions) ? section.actions : [], 'is-section', section.hideView === true)
-        })
-        .join('')}
-    </div>`
-  }
+  const canAssignMemberRoles = canPageAction('org', 'edit')
   const accessTree = accessData
     ? `
-    <div class="modal-section-title">后台访问 ${hintBadge('页面权限', '可见=只读；新增、编辑、删除分别控制该页对应操作。页内有选项的页面按选项分别授权，不再把整页写权限一次性交出去。')}</div>
+    <div class="modal-section-title">后台访问 ${hintBadge('页面权限', '每个页面只勾「可见」。页面可见即可使用该页全部功能，不再单独配置新增、编辑、删除或检查更新等动作。')}</div>
     <div class="muted role-console-summary">${
       (accessData.roleAllowedPages || []).length
         ? `角色已授予 ${(accessData.roleAllowedPages || []).length} 个页面；这里只配置个人额外权限，两者叠加生效。`
         : '这里配置的是个人额外权限；角色带来的后台权限请在角色详情「后台权限」中配置。'
     }</div>
-    <div class="perm-page-groups">
-      ${(accessData.catalog?.domains || [])
-        .map(
-          (domain) => `<div class="perm-page-group">
-            <div class="perm-page-domain">${esc(domain.title || domain.label || domain.id)}</div>
-            ${(domain.pages || []).map(pageBlockHtml).join('')}
-          </div>`,
-        )
-        .join('')}
-    </div>`
+    ${consolePermissionTreeHtml(accessData.catalog, accessData.pages || [], {
+      rowAttr: 'data-page-row',
+      viewAttr: 'data-page-view',
+      domainAllAttr: 'data-page-domain-all',
+    })}`
     : `
     <div class="modal-section-title">后台访问</div>
-    <div class="muted role-console-summary">当前账号没有「配置成员后台访问」权限。拥有「成员管理 → 后台访问 → 配置后台访问」的成员才能修改这里；请联系平台管理员开通。</div>`
+    <div class="muted role-console-summary">当前账号没有「成员管理」页面可见权限。成员管理页可见后才能配置成员后台访问；请联系平台管理员开通。</div>`
   const overlay = modelModal(`
     <div class="modal-head"><h3>配置成员权限 · ${esc(member.name)}</h3><button class="modal-x" type="button">×</button></div>
-    <div class="member-sum"><strong>${esc(member.deptName)}</strong><span>${esc(member.title || '未设置职务')}</span></div>
-    <div class="modal-section-title">授予角色 ${hintBadge('角色说明', '一个成员可以同时拥有多个角色；保存后立即生效。')}</div>
-    <div class="scope-groups">
-      <div class="scope-group">
-        ${roleData.roles
-          .map(
-            (role) => `<label class="scope-check"><input type="checkbox" data-assign="${esc(role.code)}"${
-              current.has(role.code) ? ' checked' : ''
-            } /> ${esc(ROLE_LABEL[role.code] || role.name)}
-              <span class="muted">（${esc(DATA_SCOPE_LABEL[role.dataScope] || role.dataScope)}）</span></label>`,
-          )
-          .join('')}
-      </div>
+    <div class="member-access-shell">
+      <aside class="member-access-side" aria-label="成员角色">
+        <div class="member-sum"><strong>${esc(member.deptName)}</strong><span>${esc(member.title || '未设置职务')}</span></div>
+        <div class="modal-section-title">授予角色 ${hintBadge('角色说明', '一个成员可以同时拥有多个角色；保存后立即生效。')}</div>
+        ${
+          canAssignMemberRoles
+            ? ''
+            : '<div class="muted role-console-summary">当前账号没有「成员管理」页面可见权限，角色分配只读；右侧「后台访问」权限仍可单独保存。</div>'
+        }
+        <div class="scope-groups">
+          <div class="scope-group">
+            ${roleData.roles
+              .map(
+                (role) => `<label class="scope-check"><input type="checkbox" data-assign="${esc(role.code)}"${
+                  current.has(role.code) ? ' checked' : ''
+                }${canAssignMemberRoles ? '' : ' disabled'} /> ${esc(ROLE_LABEL[role.code] || role.name)}
+                  <span class="muted">（${esc(DATA_SCOPE_LABEL[role.dataScope] || role.dataScope)}）</span></label>`,
+              )
+              .join('')}
+          </div>
+        </div>
+        <div class="member-access-tip">
+          <strong>权限叠加</strong>
+          <p>角色决定基础后台页面，个人权限只做额外补充；保存后立即生效。</p>
+        </div>
+      </aside>
+      <main class="member-access-main" aria-label="后台访问权限">
+        ${accessTree}
+      </main>
     </div>
-    ${accessTree}
     <div class="modal-state" id="a-state"></div>
     <div class="modal-actions">
       <button class="btn primary" type="button" id="a-save">保存</button>
       <button class="btn ghost" type="button" id="a-cancel">取消</button>
     </div>`)
+  if (accessData) {
+    setupPermissionDomainSelectAll(overlay, {
+      rowSelector: '[data-page-row]',
+      viewSelector: 'input[data-page-view]',
+      allSelector: 'input[data-page-domain-all]',
+    })
+  }
   const close = () => overlay.remove()
   overlay.querySelector('.modal-x').addEventListener('click', close)
   overlay.querySelector('#a-cancel').addEventListener('click', close)
-  for (const actionBox of overlay.querySelectorAll('[data-page-action]')) {
-    actionBox.addEventListener('change', () => {
-      const row = actionBox.closest('[data-page-row]')
-      const viewBox = row?.querySelector('[data-page-view]')
-      if (actionBox.checked && viewBox) viewBox.checked = true
-    })
-  }
-  for (const viewBox of overlay.querySelectorAll('[data-page-view]')) {
-    viewBox.addEventListener('change', () => {
-      if (viewBox.checked) return
-      const row = viewBox.closest('[data-page-row]')
-      for (const actionBox of row?.querySelectorAll('[data-page-action]') || []) actionBox.checked = false
-    })
-  }
   overlay.querySelector('#a-save').addEventListener('click', async () => {
     const stateEl = overlay.querySelector('#a-state')
     const roles = [...overlay.querySelectorAll('[data-assign]:checked')].map((el) => el.dataset.assign)
-    if (roles.length === 0) {
+    if (canAssignMemberRoles && roles.length === 0) {
       stateEl.className = 'modal-state bad'
       stateEl.textContent = '至少保留一个角色'
       return
     }
+    if (!accessData && !canAssignMemberRoles) {
+      stateEl.className = 'modal-state bad'
+      stateEl.textContent = '当前账号没有「成员管理」页面可见权限，无法保存'
+      return
+    }
     stateEl.textContent = '保存中…'
+    let pageSaved = false
     try {
       if (accessData) {
         const pages = [...overlay.querySelectorAll('[data-page-row]')]
-          .map((row) => {
-            const page = row.dataset.pageRow
-            const canView = row.querySelector('[data-page-view]')?.checked === true
-            const canCreate = row.querySelector('[data-page-action="create"]')?.checked === true
-            const canEdit = row.querySelector('[data-page-action="edit"]')?.checked === true
-            const canDelete = row.querySelector('[data-page-action="delete"]')?.checked === true
-            return {
-              page,
-              canView: canView || canCreate || canEdit || canDelete,
-              canCreate,
-              canEdit,
-              canDelete,
-            }
-          })
-          .filter((item) => item.canView || item.canCreate || item.canEdit || item.canDelete)
+          .map((row) => ({
+            page: row.dataset.pageRow,
+            canView: row.querySelector('[data-page-view]')?.checked === true,
+          }))
+          .filter((item) => item.canView)
         await apiSend('PUT', `/api/console/member-console-permissions/${encodeURIComponent(member.id)}`, { pages })
+        pageSaved = true
       }
-      await apiPost(`/api/console/members/${encodeURIComponent(member.id)}/roles`, { roles })
+      if (canAssignMemberRoles) {
+        await apiPost(`/api/console/members/${encodeURIComponent(member.id)}/roles`, { roles })
+      }
       close()
       loadMembers($('#org-members'))
     } catch (err) {
       stateEl.className = 'modal-state bad'
-      stateEl.textContent = err.message || '保存失败'
+      stateEl.textContent = pageSaved
+        ? `后台访问权限已保存，但角色保存失败：${err.message || '保存失败'}`
+        : (err.message || '保存失败')
+      if (pageSaved) loadMembers($('#org-members'))
     }
   })
 }
@@ -5243,7 +5259,7 @@ async function loadOverviewMember() {
             <div><span>公司</span><strong>${esc(overview?.company?.name ?? me?.company?.name ?? '—')}</strong></div>
             <div><span>后台角色</span><strong>公司成员</strong></div>
             <div><span>可见页面</span><strong>${state.allowedPages.length} 个</strong></div>
-            <div><span>写权限</span><strong>新增 ${countActionPages('create')} · 编辑 ${countActionPages('edit')} · 删除 ${countActionPages('delete')}</strong></div>
+            <div><span>权限模型</span><strong>页面可见即可使用该页全部功能</strong></div>
             <div><span>健康检查</span><strong>${health ? `正常 · v${esc(health.version)}` : '不可用'}</strong></div>
           </div>
         </section>
@@ -5659,67 +5675,86 @@ async function openRoleMemberPicker(role, allMembers, boundIds) {
   })
 }
 
-function roleConsolePermissionTreeHtml(catalog, pages) {
+function consolePermissionTreeHtml(catalog, pages, options = {}) {
+  const rowAttr = options.rowAttr || 'data-role-page-row'
+  const viewAttr = options.viewAttr || 'data-role-page-view'
+  const domainAllAttr = options.domainAllAttr || 'data-perm-domain-all'
   const permissionMap = new Map((pages || []).map((item) => [item.page, item]))
   const pageMetaMap = new Map((catalog?.pages || []).map((item) => [item.page, item]))
-  const actionChecked = (perm, action) => {
-    if (action === 'create') return perm?.canCreate === true
-    if (action === 'edit') return perm?.canEdit === true
-    return perm?.canDelete === true
-  }
-  const rowHtml = (key, title, perm, actions, className = '', hideView = false) => `
-    <div class="perm-page-row${className ? ` ${className}` : ''}" data-role-page-row="${esc(key)}">
+  const actionsHtml = (perm, hideView = false) => `
+    <span class="perm-page-actions">
+      ${hideView ? '' : `<label class="scope-check"><input type="checkbox" ${viewAttr}${perm?.canView ? ' checked' : ''} /> 可见</label>`}
+    </span>`
+  const sectionRowHtml = (key, title, perm, hideView = false) => `
+    <div class="perm-page-row is-section" ${rowAttr}="${esc(key)}">
       <strong>${esc(title)}</strong>
-      <span class="perm-page-actions">
-        ${hideView ? '' : `<label class="scope-check"><input type="checkbox" data-role-page-view${perm?.canView ? ' checked' : ''} /> 可见</label>`}
-        ${actions
-          .map(
-            (action) => `<label class="scope-check"><input type="checkbox" data-role-page-action="${esc(action.id)}"${
-              actionChecked(perm, action.id) ? ' checked' : ''
-            } /> ${esc(action.label || action.id)}</label>`,
-          )
-          .join('')}
-      </span>
+      ${actionsHtml(perm, hideView)}
     </div>`
-  const pageBlockHtml = (page) => {
+  const pageBlockHtml = (page, collapsePageName = false) => {
     const meta = pageMetaMap.get(page)
     const perm = permissionMap.get(page)
     const sections = Array.isArray(meta?.sections) ? meta.sections : []
+    const pageTitle = meta?.title || page
     if (sections.length === 0) {
-      return rowHtml(page, meta?.title || page, perm, Array.isArray(meta?.actions) ? meta.actions : [])
+      return `<div class="perm-page-block is-single${collapsePageName ? ' is-domain-only' : ''}" ${rowAttr}="${esc(
+        page,
+      )}" aria-label="${esc(pageTitle)}页面权限">
+        <div class="perm-page-name">${
+          collapsePageName ? '<span class="perm-page-note">页面权限</span>' : `<strong>${esc(pageTitle)}</strong>`
+        }</div>
+        ${actionsHtml(perm)}
+      </div>`
     }
     const hasSectionRows = sections.some((section) => permissionMap.has(`${page}:${section.key}`))
-    return `<div class="perm-page-block">
-      <div class="perm-page-parent"><strong>${esc(meta?.title || page)}</strong><span class="muted">页内选项分别授权</span></div>
-      ${sections
-        .map((section) => {
-          const key = `${page}:${section.key}`
-          const childPerm = permissionMap.get(key) || (hasSectionRows ? undefined : perm)
-          return rowHtml(key, section.title, childPerm, Array.isArray(section.actions) ? section.actions : [], 'is-section', section.hideView === true)
-        })
-        .join('')}
+    return `<div class="perm-page-block has-sections">
+      <div class="perm-page-name">
+        <strong>${esc(pageTitle)}</strong>
+        <span class="perm-page-note">${sections.length} 个二级页 · 分别勾选可见</span>
+      </div>
+      <div class="perm-page-content">
+        ${sections
+          .map((section) => {
+            const key = `${page}:${section.key}`
+            const childPerm = permissionMap.get(key) || (hasSectionRows ? undefined : perm)
+            return sectionRowHtml(key, section.title, childPerm, section.hideView === true)
+          })
+          .join('')}
+      </div>
     </div>`
   }
   return `
-    <div class="perm-page-groups">
+    <div class="perm-page-groups permission-tree-modern">
       ${(catalog?.domains || [])
         .map(
-          (domain) => `<div class="perm-page-group">
+          (domain) => {
+            const domainTitle = domain.title || domain.label || domain.id
+            const domainPages = domain.pages || []
+            const onlyPage = domainPages.length === 1 ? pageMetaMap.get(domainPages[0]) : null
+            const collapsePageName =
+              domainPages.length === 1 &&
+              (onlyPage?.sections || []).length === 0 &&
+              (onlyPage?.title || domainPages[0]) === domainTitle
+            return `<div class="perm-page-group">
             <div class="perm-page-domain">
-              <span class="perm-page-domain-title">${esc(domain.title || domain.label || domain.id)}</span>
+              <div class="perm-page-domain-title">
+                <span class="perm-domain-mark" aria-hidden="true"></span>
+                <strong>${esc(domainTitle)}</strong>
+                <span class="perm-domain-count">${domainPages.length} 个页面</span>
+              </div>
               ${
-                (domain.pages || []).length
+                domainPages.length
                   ? `<label class="perm-page-all" title="全选本业务域后台权限">
-                      <input type="checkbox" data-perm-domain-all aria-label="全选${esc(
-                        domain.title || domain.label || domain.id,
-                      )}后台权限" />
+                      <input type="checkbox" ${domainAllAttr} aria-label="全选${esc(domainTitle)}后台权限" />
                       <span>全选</span>
                     </label>`
                   : ''
               }
             </div>
-            ${(domain.pages || []).map(pageBlockHtml).join('')}
-          </div>`,
+            <div class="perm-page-list">${domainPages
+              .map((page) => pageBlockHtml(page, collapsePageName))
+              .join('')}</div>
+          </div>`
+          },
         )
         .join('')}
     </div>`
@@ -5747,10 +5782,17 @@ function setupScopeGroupSelectAll(root) {
   }
 }
 
-function setupConsoleDomainSelectAll(root) {
+function setupPermissionDomainSelectAll(
+  root,
+  {
+    rowSelector = '[data-role-page-row]',
+    viewSelector = 'input[data-role-page-view]',
+    allSelector = 'input[data-perm-domain-all]',
+  } = {},
+) {
   for (const group of root.querySelectorAll('.perm-page-group')) {
-    const allBox = group.querySelector('input[data-perm-domain-all]')
-    const items = [...group.querySelectorAll('input[data-role-page-view], input[data-role-page-action]')]
+    const allBox = group.querySelector(allSelector)
+    const items = [...group.querySelectorAll(viewSelector)]
     if (!allBox || items.length === 0) continue
     const label = allBox.parentElement?.querySelector('span')
     const sync = () => {
@@ -5761,16 +5803,19 @@ function setupConsoleDomainSelectAll(root) {
     }
     allBox.addEventListener('change', () => {
       const on = allBox.checked
-      for (const row of group.querySelectorAll('[data-role-page-row]')) {
-        const viewBox = row.querySelector('[data-role-page-view]')
+      for (const row of group.querySelectorAll(rowSelector)) {
+        const viewBox = row.querySelector(viewSelector)
         if (viewBox) viewBox.checked = on
-        for (const actionBox of row.querySelectorAll('[data-role-page-action]')) actionBox.checked = on
       }
       sync()
     })
     for (const item of items) item.addEventListener('change', sync)
     sync()
   }
+}
+
+function setupConsoleDomainSelectAll(root) {
+  setupPermissionDomainSelectAll(root)
 }
 
 function setupRoleMemberPanel(root, role, allMembers, currentIds) {
@@ -5870,6 +5915,177 @@ function setupRoleMemberPanel(root, role, allMembers, currentIds) {
   applyFilter()
 }
 
+function roleDisplayName(role) {
+  return ROLE_LABEL[role.code] || role.name || role.code
+}
+
+function roleRailHtml(roles, selectedCode = null) {
+  const builtin = roles.filter((role) => role.builtin)
+  const custom = roles.filter((role) => !role.builtin)
+  const item = (role) => {
+    const name = roleDisplayName(role)
+    const active = role.code === selectedCode
+    const searchText = [name, role.code, role.dataScope, role.builtin ? '内置角色' : '自定义角色'].join(' ').toLowerCase()
+    return `<button class="role-rail-item${active ? ' is-active' : ''}" type="button" data-role-pick="${esc(
+      role.code,
+    )}" data-search="${esc(searchText)}" aria-current="${active ? 'true' : 'false'}">
+      <span class="role-rail-avatar" aria-hidden="true">${esc(String(name).slice(0, 1))}</span>
+      <span class="role-rail-main">
+        <span class="role-rail-name"><span>${esc(name)}</span><em class="role-rail-tag">${role.builtin ? '内置' : '自定义'}</em></span>
+        <small>${esc(DATA_SCOPE_LABEL[role.dataScope] || role.dataScope)} · ${role.scopes.length} 权限点 · ${
+          role.members || 0
+        } 人</small>
+      </span>
+    </button>`
+  }
+  const section = (title, list) =>
+    list.length
+      ? `<div class="role-rail-section" data-role-section>
+          <div class="role-rail-section-head"><span>${title}</span><span>${list.length}</span></div>
+          ${list.map(item).join('')}
+        </div>`
+      : ''
+  return `<aside class="role-rail" aria-label="角色列表">
+    <div class="role-rail-head">
+      <div><span class="role-eyebrow">组织与权限</span><h2>角色</h2></div>
+      <span class="pill">${roles.length} 个</span>
+    </div>
+    <label class="role-rail-search">
+      <span class="role-rail-search-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="6.5"></circle><path d="m16 16 4 4"></path></svg></span>
+      <input id="role-rail-search" type="search" value="${esc(state.roleQuery || '')}" placeholder="搜索角色名或角色编码" aria-label="搜索角色" autocomplete="off" />
+    </label>
+    <div class="role-rail-list" id="role-rail-list">
+      ${section('内置角色', builtin)}
+      ${section('自定义角色', custom)}
+      <div class="role-rail-empty" id="role-rail-empty" hidden>没有匹配的角色</div>
+    </div>
+    <div class="role-rail-foot">
+      <button class="btn sm primary role-rail-add" type="button" id="role-rail-add">＋ 新建角色</button>
+      <span class="muted" id="role-rail-count">共 ${roles.length} 个角色</span>
+    </div>
+  </aside>`
+}
+
+function setupRoleRail(root, roles) {
+  const search = root.querySelector('#role-rail-search')
+  const items = [...root.querySelectorAll('[data-role-pick]')]
+  const sections = [...root.querySelectorAll('[data-role-section]')]
+  const empty = root.querySelector('#role-rail-empty')
+  const count = root.querySelector('#role-rail-count')
+  const apply = () => {
+    const tokens = String(search?.value || '')
+      .trim()
+      .toLowerCase()
+      .split(/\s+/)
+      .filter(Boolean)
+    let shown = 0
+    for (const item of items) {
+      const hit = tokens.every((token) => String(item.dataset.search || '').includes(token))
+      item.hidden = !hit
+      if (hit) shown += 1
+    }
+    for (const section of sections) {
+      const visible = [...section.querySelectorAll('[data-role-pick]')].some((item) => !item.hidden)
+      section.hidden = !visible
+    }
+    if (empty) empty.hidden = shown > 0
+    if (count) count.textContent = tokens.length ? `筛选出 ${shown} / ${roles.length} 个角色` : `共 ${roles.length} 个角色`
+  }
+  if (search) {
+    search.addEventListener('input', () => {
+      state.roleQuery = search.value
+      apply()
+    })
+    search.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape' || !search.value) return
+      event.stopPropagation()
+      search.value = ''
+      state.roleQuery = ''
+      apply()
+    })
+  }
+  for (const item of items) {
+    item.addEventListener('click', () => {
+      if (item.dataset.rolePick === state.selectedRole) return
+      state.selectedRole = item.dataset.rolePick
+      state.roleTab = 'permissions'
+      window.scrollTo(0, 0)
+      loadRoles()
+    })
+  }
+  root.querySelector('#role-rail-add')?.addEventListener('click', () => openRoleCreateModal())
+  apply()
+}
+
+function roleOverviewHtml(roles) {
+  const builtin = roles.filter((role) => role.builtin).length
+  const custom = roles.length - builtin
+  const withConsole = roles.filter(
+    (role) =>
+      new Set(
+        (Array.isArray(role.consolePages) ? role.consolePages : [])
+          .filter((page) => page.canView && page.parentPage)
+          .map((page) => page.parentPage),
+      ).size > 0,
+  ).length
+  return `<div class="role-overview">
+    <section class="role-overview-hero">
+      <div class="role-overview-copy">
+        <span class="role-eyebrow">组织与权限 · 角色</span>
+        <h2>角色定义能做什么，成员决定谁来做</h2>
+        <p>从左侧选择角色开始配置。角色权限只保存权限点与数据范围，后台入口按页面单独配置；改完即对该角色下所有成员生效。</p>
+        <div class="role-overview-actions">
+          <button class="btn primary" type="button" id="role-overview-add">添加角色</button>
+          <button class="btn ghost" type="button" id="role-overview-matrix">打开权限矩阵</button>
+          <button class="btn ghost" type="button" id="role-overview-org">成员管理</button>
+        </div>
+      </div>
+      <div class="role-stat-grid">
+        <div class="role-stat"><span>角色总数</span><strong>${roles.length}</strong><small>内置与自定义</small></div>
+        <div class="role-stat"><span>内置角色</span><strong>${builtin}</strong><small>随产品预置</small></div>
+        <div class="role-stat"><span>自定义角色</span><strong>${custom}</strong><small>按业务创建</small></div>
+        <div class="role-stat"><span>已配后台入口</span><strong>${withConsole}</strong><small>至少一个页面可见</small></div>
+      </div>
+    </section>
+    <div class="permission-flow role-flow">
+      <div class="flow-step"><span>1</span><strong>定义角色</strong><p>命名角色并选择数据范围</p></div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step"><span>2</span><strong>授予权限</strong><p>勾选权限点；后台页面只配「可见」</p></div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step"><span>3</span><strong>绑定成员</strong><p>成员可叠加多个角色，权限取并集</p></div>
+    </div>
+    <section class="panel role-guide-panel">
+      <div class="panel-head">
+        <div><h2>配置边界</h2><span class="panel-sub">三个页签各自独立保存，互不覆盖</span></div>
+      </div>
+      <div class="role-guide-grid">
+        <div><strong>角色权限</strong><p>权限点决定能调用哪些能力，数据范围决定数据可见边界。</p></div>
+        <div><strong>后台权限</strong><p>只配置页面是否可见；页面可见即可使用该页全部功能，系统二级页分别可见。</p></div>
+        <div><strong>角色成员</strong><p>在这里加减成员会同步到成员管理页；成员的个人配置作为额外补充。</p></div>
+      </div>
+    </section>
+  </div>`
+}
+
+function consoleVisibleLeafCount(catalog, pages) {
+  const visible = new Set((pages || []).filter((page) => page.canView).map((page) => page.page))
+  const pageMeta = new Map((catalog?.pages || []).map((page) => [page.page, page]))
+  let count = 0
+  for (const domain of catalog?.domains || []) {
+    for (const pageKey of domain.pages || []) {
+      const sections = pageMeta.get(pageKey)?.sections || []
+      if (sections.length) {
+        for (const section of sections) {
+          if (visible.has(`${pageKey}:${section.key}`)) count += 1
+        }
+      } else if (visible.has(pageKey)) {
+        count += 1
+      }
+    }
+  }
+  return count
+}
+
 function renderRoleEditor(role, allScopes = [], meta = {}) {
   const view = $('#view')
   const labels = meta.labels || {}
@@ -5892,13 +6108,13 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
   const selected = new Set(role.scopes)
   const roleConsoleCatalog = meta.catalog || state.access?.catalog || null
   const roleConsolePages = Array.isArray(role.consolePages) ? role.consolePages : []
-  const roleConsoleGrantedPages = new Set(
-    roleConsolePages.filter((item) => item.canView && item.parentPage).map((item) => item.parentPage),
-  ).size
+  const roleConsoleGrantedPages = consoleVisibleLeafCount(roleConsoleCatalog, roleConsolePages)
   const roleConsoleTree = roleConsoleCatalog
-    ? roleConsolePermissionTreeHtml(roleConsoleCatalog, roleConsolePages)
+    ? consolePermissionTreeHtml(roleConsoleCatalog, roleConsolePages)
     : '<div class="muted">后台页面目录加载中，刷新后重试。</div>'
   const roleToolsGranted = roleTools.filter(roleToolSelected).length
+  const allRoles = Array.isArray(meta.roles) ? meta.roles : state.roles || []
+  const roleName = roleDisplayName(role)
   const activeRoleTab =
     state.roleTab === 'members'
       ? 'members'
@@ -5915,24 +6131,45 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
   }
 
   view.innerHTML = `
-    <div class="role-detail-tabs" role="tablist" aria-label="角色详情">
-      <button class="role-detail-back" type="button" id="role-back">← 角色管理</button>
-      <button class="role-detail-tab${activeRoleTab === 'permissions' ? ' is-active' : ''}" type="button" role="tab" aria-selected="${
-        activeRoleTab === 'permissions'
-      }" data-role-tab="permissions">角色权限</button>
-      <button class="role-detail-tab${activeRoleTab === 'console' ? ' is-active' : ''}" type="button" role="tab" aria-selected="${
-        activeRoleTab === 'console'
-      }" data-role-tab="console">后台权限 <span class="role-tab-count" id="role-console-tab-count">${roleConsoleGrantedPages}</span></button>
-      <button class="role-detail-tab${activeRoleTab === 'tools' ? ' is-active' : ''}" type="button" role="tab" aria-selected="${
-        activeRoleTab === 'tools'
-      }" data-role-tab="tools">可用工具 <span class="role-tab-count" id="role-tools-tab-count">${roleToolsGranted}</span></button>
-      <button class="role-detail-tab${activeRoleTab === 'members' ? ' is-active' : ''}" type="button" role="tab" aria-selected="${
-        activeRoleTab === 'members'
-      }" data-role-tab="members">角色成员 <span class="role-tab-count">${boundMembers.length}</span></button>
-    </div>
+    <div class="role-workbench">
+      ${roleRailHtml(allRoles, role.code)}
+      <div class="role-workbench-main">
+        <div class="role-detail-head">
+          <div class="role-detail-identity">
+            <span class="role-detail-avatar" aria-hidden="true">${esc(String(roleName).slice(0, 1))}</span>
+            <div class="role-detail-title">
+              <span class="role-eyebrow">角色详情</span>
+              <h2>${esc(roleName)}<span class="role-code mono">${esc(role.code)}</span></h2>
+              <div class="role-detail-meta">
+                <span class="role-meta-chip">${esc(DATA_SCOPE_LABEL[role.dataScope] || role.dataScope)}</span>
+                <span class="role-meta-chip">${role.builtin ? '内置角色' : '自定义角色'}</span>
+                <span class="role-meta-chip">${boundMembers.length} 名成员</span>
+                <span class="role-meta-chip">${role.scopes.length} 个权限点</span>
+                <span class="role-meta-chip">${roleConsoleGrantedPages} 个后台页面</span>
+              </div>
+            </div>
+          </div>
+          <div class="role-detail-head-actions">
+            <button class="btn sm ghost" type="button" id="role-overview-back">角色总览</button>
+          </div>
+        </div>
+        <div class="role-detail-tabs" role="tablist" aria-label="角色详情">
+          <button class="role-detail-tab${activeRoleTab === 'permissions' ? ' is-active' : ''}" type="button" role="tab" aria-selected="${
+            activeRoleTab === 'permissions'
+          }" data-role-tab="permissions">角色权限</button>
+          <button class="role-detail-tab${activeRoleTab === 'console' ? ' is-active' : ''}" type="button" role="tab" aria-selected="${
+            activeRoleTab === 'console'
+          }" data-role-tab="console">后台权限 <span class="role-tab-count" id="role-console-tab-count">${roleConsoleGrantedPages}</span></button>
+          <button class="role-detail-tab${activeRoleTab === 'tools' ? ' is-active' : ''}" type="button" role="tab" aria-selected="${
+            activeRoleTab === 'tools'
+          }" data-role-tab="tools">可用工具 <span class="role-tab-count" id="role-tools-tab-count">${roleToolsGranted}</span></button>
+          <button class="role-detail-tab${activeRoleTab === 'members' ? ' is-active' : ''}" type="button" role="tab" aria-selected="${
+            activeRoleTab === 'members'
+          }" data-role-tab="members">角色成员 <span class="role-tab-count">${boundMembers.length}</span></button>
+        </div>
     <section class="panel" data-role-pane="permissions"${activeRoleTab === 'permissions' ? '' : ' hidden'}>
       <div class="panel-head">
-        <h2>${esc(companyMeta()?.name || '')} · ${esc(ROLE_LABEL[role.code] || role.name)} <span class="mono muted">${esc(role.code)}</span></h2>
+        <div><h2>角色权限</h2><span class="panel-sub">角色名、数据范围与权限点；保存后立即对本角色成员生效</span></div>
         ${hintBadge('角色说明', role.builtin ? '内置角色：改权限点会立即影响该角色下所有人。' : '自定义角色：只影响被授予该角色的成员。')}
       </div>
       <div class="form-grid">
@@ -5998,12 +6235,16 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
           <h2>后台访问</h2>
           ${hintBadge(
             '角色后台权限',
-            '成员绑定该角色后自动获得这里的后台页面；成员单独配置的后台权限作为额外补充，两者取并集。页内有选项的页面按选项分别授权。',
+            '成员绑定该角色后自动获得这里的后台页面；成员单独配置的后台权限作为额外补充，两者取并集。每个页面只勾「可见」，页面可见即可使用该页全部功能；系统二级页分别勾选可见。',
+          )}
+          ${hintBadge(
+            '默认不授权',
+            '不配置则绑定成员不会因角色获得后台入口。这里只保存后台页面权限，不改角色权限点和角色成员。',
+            '后台权限默认不授权说明',
           )}
         </div>
         <span class="pill" id="role-console-granted">已授予 ${roleConsoleGrantedPages} 个页面</span>
       </div>
-      <div class="muted role-console-summary">不配置则绑定成员不会因角色获得后台入口。这里只保存后台页面权限，不改角色权限点和角色成员。</div>
       ${roleConsoleTree}
       <div class="panel-actions">
         <button class="btn primary" type="button" id="save-role-console">保存后台权限</button>
@@ -6152,10 +6393,13 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
         }
         <div class="empty role-member-empty" id="role-member-filter-empty" hidden>没有匹配的成员，换个关键词试试。</div>
       </div>
-    </section>`
+    </section>
+      </div>
+    </div>`
 
   setupScopeGroupSelectAll(view)
   setupRoleMemberPanel(view, role, allMembers, roleMemberIds)
+  setupRoleRail(view, allRoles)
 
   const setRoleTab = (tab) => {
     state.roleTab =
@@ -6172,46 +6416,27 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
   view.querySelectorAll('[data-role-tab]').forEach((button) => {
     button.addEventListener('click', () => setRoleTab(button.dataset.roleTab))
   })
-  view.querySelector('#role-back')?.addEventListener('click', () => {
+  view.querySelector('#role-overview-back')?.addEventListener('click', () => {
     state.selectedRole = null
     state.roleTab = 'permissions'
     loadRoles()
   })
-  for (const actionBox of view.querySelectorAll('[data-role-page-action]')) {
-    actionBox.addEventListener('change', () => {
-      const row = actionBox.closest('[data-role-page-row]')
-      const viewBox = row?.querySelector('[data-role-page-view]')
-      if (actionBox.checked && viewBox) viewBox.checked = true
-    })
-  }
-  for (const viewBox of view.querySelectorAll('[data-role-page-view]')) {
-    viewBox.addEventListener('change', () => {
-      if (viewBox.checked) return
-      const row = viewBox.closest('[data-role-page-row]')
-      for (const actionBox of row?.querySelectorAll('[data-role-page-action]') || []) actionBox.checked = false
-    })
-  }
   setupConsoleDomainSelectAll(view)
 
   const roleConsolePagesPayload = () =>
-    [...view.querySelectorAll('[data-role-pane="console"] [data-role-page-row]')].map((row) => ({
-      page: row.dataset.rolePageRow,
-      canView: row.querySelector('[data-role-page-view]')?.checked === true,
-      canCreate: row.querySelector('[data-role-page-action="create"]')?.checked === true,
-      canEdit: row.querySelector('[data-role-page-action="edit"]')?.checked === true,
-      canDelete: row.querySelector('[data-role-page-action="delete"]')?.checked === true,
-    }))
+    [...view.querySelectorAll('[data-role-pane="console"] [data-role-page-row]')]
+      .map((row) => ({
+        page: row.dataset.rolePageRow,
+        canView: row.querySelector('[data-role-page-view]')?.checked === true,
+      }))
+      .filter((item) => item.canView)
 
   const roleConsoleGrantedCountFromDom = () => {
-    const pages = new Set()
+    let count = 0
     for (const row of view.querySelectorAll('[data-role-pane="console"] [data-role-page-row]')) {
-      const page = String(row.dataset.rolePageRow || '').split(':')[0]
-      const granted =
-        row.querySelector('[data-role-page-view]')?.checked === true ||
-        [...row.querySelectorAll('[data-role-page-action]')].some((box) => box.checked)
-      if (page && granted) pages.add(page)
+      if (row.querySelector('[data-role-page-view]')?.checked === true) count += 1
     }
-    return pages.size
+    return count
   }
   const refreshRoleConsoleGrantedCount = () => {
     const count = roleConsoleGrantedCountFromDom()
@@ -6389,265 +6614,3368 @@ async function loadRoles() {
     renderNavRail()
     const selected = data.roles.find((role) => role.code === state.selectedRole)
     if (!selected) {
-      view.innerHTML = `
-        <div class="permission-flow">
-          <div class="flow-step"><span>1</span><strong>角色</strong><p>定义能做什么：权限点 + 数据范围</p></div>
-          <div class="flow-arrow">→</div>
-          <div class="flow-step"><span>2</span><strong>部门</strong><p>定义管理到哪：本人 / 本部门 / 全公司</p></div>
-          <div class="flow-arrow">→</div>
-          <div class="flow-step"><span>3</span><strong>成员</strong><p>把角色授予人，可多角色叠加</p></div>
-        </div>
-        <section class="panel">
-          <div class="panel-head"><div><h2>角色清单</h2>${hintBadge('角色说明', '点左侧角色编辑；成员直接在角色页勾选，和成员管理双向同步。')}</div>
-          <button class="btn" type="button" id="role-goto-org">去成员管理</button></div>
-          <table class="data">
-            <thead><tr><th>角色</th><th>数据范围</th><th>权限点</th><th>后台</th><th>成员</th><th>存储配额</th></tr></thead>
-            <tbody>
-              ${data.roles
-                .map(
-                  (role) => `<tr class="clickable" data-role-row="${esc(role.code)}">
-                    <td><strong>${esc(ROLE_LABEL[role.code] || role.name)}</strong><div class="desc mono">${esc(role.code)}</div></td>
-                    <td>${esc(DATA_SCOPE_LABEL[role.dataScope] || role.dataScope)}</td>
-                    <td>${role.scopes.length} 项</td>
-                    <td>${
-                      new Set(
-                        (Array.isArray(role.consolePages) ? role.consolePages : [])
-                          .filter((item) => item.canView && item.parentPage)
-                          .map((item) => item.parentPage),
-                      ).size
-                    } 页</td>
-                    <td>${role.members} 人</td>
-                    <td>${
-                      role.quota
-                        ? `${esc(formatStorageBytes(role.quota.limitBytes))} · 单文件 ${esc(
-                            formatStorageBytes(role.quota.fileLimitBytes),
-                          )}`
-                        : '<span class="muted">默认</span>'
-                    }</td>
-                  </tr>`,
-                )
-                .join('')}
-            </tbody>
-          </table>
-        </section>`
-      $('#role-goto-org')?.addEventListener('click', () => navigate('org'))
-      view.querySelectorAll('[data-role-row]').forEach((row) => {
-        row.addEventListener('click', () => {
-          state.selectedRole = row.dataset.roleRow
-          loadRoles()
-        })
-      })
-      setPageActions(
-        '<button class="btn primary" type="button" id="role-new-top">添加角色</button><button class="btn ghost danger-text" type="button" id="role-delete-top" disabled title="先选择一个角色">删除角色</button>',
-      )
-      $('#role-new-top')?.addEventListener('click', () => openRoleCreateModal())
+      view.innerHTML = `<div class="role-workbench">
+        ${roleRailHtml(data.roles)}
+        <div class="role-workbench-main">${roleOverviewHtml(data.roles)}</div>
+      </div>`
+      setupRoleRail(view, data.roles)
+      $('#role-overview-add')?.addEventListener('click', () => openRoleCreateModal())
+      $('#role-overview-matrix')?.addEventListener('click', () => navigate('access'))
+      $('#role-overview-org')?.addEventListener('click', () => navigate('org'))
+      setPageActions('')
       return
     }
     renderRoleEditor(selected, scopeData.scopes, {
       ...scopeData,
+      roles: data.roles,
       quotaDefaults: data.quotaDefaults,
       members: allMembers,
       catalog: data.catalog || state.access?.catalog || null,
       toolAccess: toolAccessData,
     })
-    setPageActions(
-      `<button class="btn ghost" type="button" id="role-matrix">权限矩阵</button><button class="btn" type="button" id="role-new-top">添加角色</button><button class="btn ghost danger-text" type="button" id="role-delete-top"${
-        selected.builtin ? ' disabled title="内置角色不可删除"' : ''
-      }>删除角色</button>`,
-    )
-    $('#role-new-top')?.addEventListener('click', () => openRoleCreateModal())
-    $('#role-matrix')?.addEventListener('click', () => navigate('access'))
-    $('#role-delete-top')?.addEventListener('click', () => deleteRoleCascade(selected, null))
+    setPageActions('')
   } catch (err) {
     renderDenied(view, err)
   }
 }
 
-/* ---------------- 权限审批策略 ---------------- */
+/* ---------------- 权限审批工作台 ---------------- */
+
+const APPROVAL_STATUS_META = {
+  pending: { label: '审批中', cls: 'pending' },
+  approved: { label: '已通过', cls: 'approved' },
+  rejected: { label: '已拒绝', cls: 'rejected' },
+  expired: { label: '已超时', cls: 'expired' },
+}
+
+const APPROVAL_NODE_META = {
+  start: { label: '开始', icon: '▶' },
+  condition: { label: '条件分支', icon: '◇' },
+  approval: { label: '审批节点', icon: '✓' },
+  cc: { label: '抄送节点', icon: 'CC' },
+  end: { label: '结束', icon: '■' },
+}
+
+const APPROVAL_MODES = ['或签', '会签', '依次审批']
+const APPROVAL_SOURCES = {
+  dept_chain: { label: '部门负责人链', short: '部门负责人链' },
+  members: { label: '指定成员', short: '指定成员' },
+  manager: { label: '申请人直属上级', short: '申请人直属上级' },
+  company_admin: { label: '公司管理员', short: '公司管理员' },
+}
+const APPROVAL_BRANCH_RULES = {
+  risk_high: { label: '包含高危权限', field: 'scopeRisk', op: 'eq', value: 'high' },
+  risk_medium: { label: '包含中危权限', field: 'scopeRisk', op: 'eq', value: 'medium' },
+  risk_low: { label: '仅普通权限', field: 'scopeRisk', op: 'eq', value: 'low' },
+  role: { label: '指定申请角色', field: 'role', op: 'eq', value: '' },
+  dept: { label: '指定申请人部门', field: 'dept', op: 'eq', value: '' },
+  else: { label: '其他情况', field: 'else', op: 'else', value: '' },
+}
+
+let approvalUidSeq = 0
+
+function approvalUid(prefix) {
+  approvalUidSeq += 1
+  return `${prefix}_${Date.now().toString(36)}${approvalUidSeq}`
+}
+
+function approvalModeOf(node) {
+  if (APPROVAL_MODES.includes(node?.mode)) return node.mode
+  if (APPROVAL_MODES.includes(node?.meta)) return node.meta
+  return '或签'
+}
+
+function approvalSourceOf(node) {
+  if (node?.source && APPROVAL_SOURCES[node.source]) return node.source
+  return 'dept_chain'
+}
+
+function approvalApproversOf(node) {
+  if (!Array.isArray(node?.approvers)) return []
+  return node.approvers.filter((item) => item && item.id && item.name)
+}
+
+function approvalNodeSummary(node) {
+  const source = approvalSourceOf(node)
+  const timeout = Number(node?.timeoutHours) || 72
+  if (source === 'members') {
+    const count = approvalApproversOf(node).length
+    return `指定成员 · ${count ? `${count} 人` : '未选择'} · ${timeout} 小时`
+  }
+  if (source === 'dept_chain') return `部门负责人链 · 最多 10 级 · ${timeout} 小时`
+  if (source === 'manager') return `申请人直属上级 · 1 人 · ${timeout} 小时`
+  return `公司管理员 · 1 人 · ${timeout} 小时`
+}
+
+function approvalMakeApprovalNode(title, source = 'dept_chain', mode = '或签') {
+  const node = {
+    id: approvalUid('a'),
+    kind: 'approval',
+    title,
+    meta: mode,
+    mode,
+    source,
+    timeoutHours: 72,
+    approvers: [],
+  }
+  node.desc = approvalNodeSummary(node)
+  return node
+}
+
+function approvalNewConditionNode() {
+  const branches = [
+    {
+      id: approvalUid('br'),
+      label: '包含高危权限',
+      rule: { ...APPROVAL_BRANCH_RULES.risk_high },
+      nodes: [approvalMakeApprovalNode('高危权限审批', 'company_admin', '会签')],
+    },
+    {
+      id: approvalUid('br'),
+      label: '其他情况',
+      rule: { ...APPROVAL_BRANCH_RULES.else },
+      nodes: [approvalMakeApprovalNode('负责人审批', 'dept_chain', '或签')],
+    },
+  ]
+  return {
+    id: approvalUid('cond'),
+    kind: 'condition',
+    title: '权限风险判断',
+    desc: '按权限风险自动分流',
+    meta: '条件分支',
+    branches,
+  }
+}
+
+function approvalBranchRuleKey(branch) {
+  if (branch?.rule?.field === 'else') return 'else'
+  if (branch?.rule?.field === 'scopeRisk') {
+    const value = String(branch.rule.value || '')
+    if (value === 'high' || value === 'medium' || value === 'low') return `risk_${value}`
+  }
+  if (branch?.rule?.field === 'role') return 'role'
+  if (branch?.rule?.field === 'dept') return 'dept'
+  const label = String(branch?.label || '')
+  if (/其他|否则|兜底/.test(label)) return 'else'
+  if (/普通|低危|低敏感/.test(label)) return 'risk_low'
+  if (/高危|管理|敏感|管理类/.test(label)) return 'risk_high'
+  if (/否/.test(label)) return 'else'
+  return 'risk_medium'
+}
+
+function approvalBranchRuleLabel(key, value) {
+  const meta = APPROVAL_BRANCH_RULES[key] || APPROVAL_BRANCH_RULES.risk_high
+  if ((key === 'role' || key === 'dept') && String(value || '').trim()) {
+    const text =
+      key === 'role'
+        ? (state.approvalData?.roles || []).find((role) => role.code === value)?.name || value
+        : value
+    return `${meta.label} · ${text}`
+  }
+  return meta.label
+}
+
+function approvalBranchOf(template, branchId) {
+  for (const node of template?.flow || []) {
+    for (const branch of node.branches || []) {
+      if (branch.id === branchId) return branch
+    }
+  }
+  return null
+}
+
+function approvalApplyBranchValue(template, shell, input) {
+  const branch = approvalBranchOf(template, input.getAttribute('data-wf-branch-value'))
+  if (!branch) return
+  branch.rule = { ...(branch.rule || {}), value: input.value }
+  const key = approvalBranchRuleKey(branch)
+  const base = APPROVAL_BRANCH_RULES[key]?.label || ''
+  if (branch.label === base || branch.label.startsWith(`${base} · `)) {
+    branch.label = approvalBranchRuleLabel(key, input.value)
+    const labelInput = shell.querySelector(`[data-wf-branch-label="${branch.id}"]`)
+    if (labelInput) labelInput.value = branch.label
+    const tag = shell.querySelector(`[data-wf-branch-tag="${branch.id}"]`)
+    if (tag) tag.textContent = branch.label
+  }
+  approvalTouchTemplate(template)
+}
+
+function approvalLocateNode(flow, id) {
+  for (let index = 0; index < (flow || []).length; index += 1) {
+    const node = flow[index]
+    if (node.id === id) return { node, nodes: flow, index, branch: null }
+    for (const branch of node.branches || []) {
+      if (branch.id === id) return { node: null, nodes: branch.nodes, index: -1, branch }
+      const hit = approvalLocateNode(branch.nodes, id)
+      if (hit) return hit
+    }
+  }
+  return null
+}
+
+function approvalTemplatesOf() {
+  return Array.isArray(state.approvalTemplates) ? state.approvalTemplates : []
+}
+
+function approvalTemplateOf() {
+  const templates = approvalTemplatesOf()
+  if (!templates.length) return null
+  return templates.find((item) => item.id === state.approvalTemplateId) || templates[0]
+}
+
+function approvalApplyWorkflow(workflow) {
+  if (!workflow || !workflow.id) return
+  const templates = approvalTemplatesOf()
+  const index = templates.findIndex((item) => item.id === workflow.id)
+  if (index >= 0) templates[index] = workflow
+  else templates.push(workflow)
+  state.approvalTemplates = templates
+  state.approvalTemplateId = workflow.id
+  if (!approvalFindNode(workflow.flow, state.approvalNodeId)) {
+    state.approvalNodeId = workflow.flow?.[0]?.id || 'start'
+  }
+}
+
+function approvalWorkflowPayload(template) {
+  return {
+    id: template.id,
+    name: template.name,
+    description: template.description || '',
+    scopeMode: template.scopeMode || '全部权限点',
+    roleMode: template.roleMode || '全部员工角色',
+    flow: template.flow || [],
+  }
+}
+
+function approvalCountNodes(flow) {
+  let count = 0
+  for (const node of flow || []) {
+    count += 1
+    for (const branch of node.branches || []) count += approvalCountNodes(branch.nodes)
+  }
+  return count
+}
+
+function approvalFindNode(flow, id) {
+  for (const node of flow || []) {
+    if (node.id === id) return node
+    for (const branch of node.branches || []) {
+      const hit = approvalFindNode(branch.nodes, id)
+      if (hit) return hit
+    }
+  }
+  return null
+}
+
+function approvalFindBranch(flow, id) {
+  for (const node of flow || []) {
+    for (const branch of node.branches || []) {
+      if (branch.id === id) return branch
+      const hit = approvalFindBranch(branch.nodes, id)
+      if (hit) return hit
+    }
+  }
+  return null
+}
+
+function approvalDetachNode(flow, id) {
+  for (let index = 0; index < flow.length; index += 1) {
+    const node = flow[index]
+    if (node.id === id) {
+      flow.splice(index, 1)
+      return true
+    }
+    for (const branch of node.branches || []) {
+      if (approvalDetachNode(branch.nodes, id)) return true
+    }
+  }
+  return false
+}
+
+function approvalFlowLevelOf(flow, id) {
+  if (!Array.isArray(flow)) return null
+  if (flow.some((node) => node.id === id)) return flow
+  for (const node of flow) {
+    for (const branch of node.branches || []) {
+      const hit = approvalFlowLevelOf(branch.nodes, id)
+      if (hit) return hit
+    }
+  }
+  return null
+}
+
+function approvalMoveNodeRelative(flow, movingId, anchorId, mode = 'after') {
+  if (movingId === anchorId) return false
+  const level = approvalFlowLevelOf(flow, movingId)
+  if (!level || level !== approvalFlowLevelOf(flow, anchorId)) return false
+  const moving = level.find((node) => node.id === movingId)
+  const anchor = level.find((node) => node.id === anchorId)
+  if (!moving || !anchor) return false
+  if (moving.kind === 'start' || moving.kind === 'end') return false
+  if (mode === 'link' && anchor.kind === 'end') return false
+  const from = level.findIndex((node) => node.id === movingId)
+  level.splice(from, 1)
+  let target = level.findIndex((node) => node.id === anchorId)
+  if (target < 0) return false
+  if (mode === 'before' || (mode === 'node' && anchor.kind === 'end')) {
+    level.splice(target, 0, moving)
+  } else {
+    level.splice(target + 1, 0, moving)
+  }
+  return true
+}
+
+function approvalStatusPill(status) {
+  const meta = APPROVAL_STATUS_META[status] || { label: status, cls: 'pending' }
+  return `<span class="ap-status is-${esc(meta.cls)}">${esc(meta.label)}</span>`
+}
+
+const APPROVAL_GRAPH_NODE_W = 224
+const APPROVAL_GRAPH_NODE_H = 58
+const APPROVAL_PORT_SIDES = ['top', 'bottom', 'left', 'right']
+const APPROVAL_PORT_STUB = 22
+
+function approvalNormalizePortSide(side) {
+  return APPROVAL_PORT_SIDES.includes(side) ? side : ''
+}
+
+function approvalAutoPortSides(from, to) {
+  const x1 = Number(from?.x) + APPROVAL_GRAPH_NODE_W / 2
+  const y1 = Number(from?.y) + APPROVAL_GRAPH_NODE_H / 2
+  const x2 = Number(to?.x) + APPROVAL_GRAPH_NODE_W / 2
+  const y2 = Number(to?.y) + APPROVAL_GRAPH_NODE_H / 2
+  const dx = x2 - x1
+  const dy = y2 - y1
+  if (Math.abs(dy) >= Math.abs(dx) * .82) {
+    return dy >= 0 ? { from: 'bottom', to: 'top' } : { from: 'top', to: 'bottom' }
+  }
+  return dx >= 0 ? { from: 'right', to: 'left' } : { from: 'left', to: 'right' }
+}
+
+function approvalPortAnchor(node, side, offset = 0) {
+  const x = Number(node?.x) || 0
+  const y = Number(node?.y) || 0
+  const cx = x + APPROVAL_GRAPH_NODE_W / 2
+  const cy = y + APPROVAL_GRAPH_NODE_H / 2
+  if (side === 'top') return { x: cx + offset, y }
+  if (side === 'bottom') return { x: cx + offset, y: y + APPROVAL_GRAPH_NODE_H }
+  if (side === 'left') return { x, y: cy + offset }
+  return { x: x + APPROVAL_GRAPH_NODE_W, y: cy + offset }
+}
+
+function approvalSideDirection(side) {
+  if (side === 'top') return { x: 0, y: -1 }
+  if (side === 'bottom') return { x: 0, y: 1 }
+  if (side === 'left') return { x: -1, y: 0 }
+  return { x: 1, y: 0 }
+}
+
+function approvalSamePoint(a, b, tolerance = .5) {
+  return Math.abs(a.x - b.x) <= tolerance && Math.abs(a.y - b.y) <= tolerance
+}
+
+function approvalCleanOrthogonalPoints(points) {
+  const out = []
+  for (const point of points) {
+    if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) continue
+    const last = out[out.length - 1]
+    if (last && approvalSamePoint(last, point)) continue
+    out.push({ x: Math.round(point.x * 10) / 10, y: Math.round(point.y * 10) / 10 })
+  }
+  return out
+}
+
+function approvalOrthogonalPath(points) {
+  const clean = approvalCleanOrthogonalPoints(points)
+  if (clean.length < 2) return ''
+  if (clean.length === 2) return `M ${clean[0].x} ${clean[0].y} L ${clean[1].x} ${clean[1].y}`
+  let path = `M ${clean[0].x} ${clean[0].y}`
+  for (let index = 1; index < clean.length - 1; index += 1) {
+    const prev = clean[index - 1]
+    const point = clean[index]
+    const next = clean[index + 1]
+    const inLength = Math.hypot(point.x - prev.x, point.y - prev.y)
+    const outLength = Math.hypot(next.x - point.x, next.y - point.y)
+    const radius = Math.min(8, inLength / 2, outLength / 2)
+    if (radius < 1) {
+      path += ` L ${point.x} ${point.y}`
+      continue
+    }
+    const inX = point.x + (prev.x - point.x) / inLength * radius
+    const inY = point.y + (prev.y - point.y) / inLength * radius
+    const outX = point.x + (next.x - point.x) / outLength * radius
+    const outY = point.y + (next.y - point.y) / outLength * radius
+    path += ` L ${inX} ${inY} Q ${point.x} ${point.y} ${outX} ${outY}`
+  }
+  const last = clean[clean.length - 1]
+  path += ` L ${last.x} ${last.y}`
+  return path
+}
+
+function approvalOrthLabelPoint(points) {
+  const clean = approvalCleanOrthogonalPoints(points)
+  let best = null
+  for (let index = 1; index < clean.length; index += 1) {
+    const a = clean[index - 1]
+    const b = clean[index]
+    const length = Math.hypot(b.x - a.x, b.y - a.y)
+    const horizontal = Math.abs(b.y - a.y) < .5
+    const score = length * (horizontal ? 1.25 : 1)
+    if (!best || score > best.score) {
+      best = { a, b, score, horizontal }
+    }
+  }
+  if (!best) return { x: 0, y: 0 }
+  return { x: (best.a.x + best.b.x) / 2, y: (best.a.y + best.b.y) / 2 }
+}
+
+function approvalSegmentBlocked(nodes, fromId, toId, a, b) {
+  const vertical = Math.abs(a.x - b.x) <= .5
+  const horizontal = Math.abs(a.y - b.y) <= .5
+  if (!vertical && !horizontal) return false
+  return nodes.some((node) => {
+    if (!node || node.id === fromId || node.id === toId) return false
+    const left = Number(node.x) - 6
+    const right = Number(node.x) + APPROVAL_GRAPH_NODE_W + 6
+    const top = Number(node.y) - 6
+    const bottom = Number(node.y) + APPROVAL_GRAPH_NODE_H + 6
+    if (vertical) {
+      const x = a.x
+      const y1 = Math.min(a.y, b.y)
+      const y2 = Math.max(a.y, b.y)
+      return x > left && x < right && y2 > top && y1 < bottom
+    }
+    const y = a.y
+    const x1 = Math.min(a.x, b.x)
+    const x2 = Math.max(a.x, b.x)
+    return y > top && y < bottom && x2 > left && x1 < right
+  })
+}
+
+function approvalDetourLane(nodes, fromId, toId, center, start, end, vertical) {
+  const blockers = nodes.filter((node) => {
+    if (!node || node.id === fromId || node.id === toId) return false
+    if (vertical) {
+      return Math.abs(Number(node.x) - Number(center) + APPROVAL_GRAPH_NODE_W / 2) < APPROVAL_GRAPH_NODE_W / 2 + 8
+        && Number(node.y) < Math.max(start, end) && Number(node.y) + APPROVAL_GRAPH_NODE_H > Math.min(start, end)
+    }
+    return Math.abs(Number(node.y) - Number(center) + APPROVAL_GRAPH_NODE_H / 2) < APPROVAL_GRAPH_NODE_H / 2 + 8
+      && Number(node.x) < Math.max(start, end) && Number(node.x) + APPROVAL_GRAPH_NODE_W > Math.min(start, end)
+  })
+  if (!blockers.length) return center
+  if (vertical) {
+    const right = Math.max(...blockers.map((node) => Number(node.x) + APPROVAL_GRAPH_NODE_W)) + 28
+    const left = Math.min(...blockers.map((node) => Number(node.x))) - 28
+    return right - Number(center) <= Number(center) - left ? right : left
+  }
+  const below = Math.max(...blockers.map((node) => Number(node.y) + APPROVAL_GRAPH_NODE_H)) + 28
+  const above = Math.min(...blockers.map((node) => Number(node.y))) - 28
+  return below - Number(center) <= Number(center) - above ? below : above
+}
+
+function approvalClearHorizontalLane(nodes, fromId, toId, x1, x2, preferred) {
+  const left = Math.min(x1, x2)
+  const right = Math.max(x1, x2)
+  const candidates = [preferred]
+  nodes.forEach((node) => {
+    if (!node || node.id === fromId || node.id === toId) return
+    const top = Number(node.y)
+    const bottom = top + APPROVAL_GRAPH_NODE_H
+    const nodeLeft = Number(node.x) - 6
+    const nodeRight = Number(node.x) + APPROVAL_GRAPH_NODE_W + 6
+    if (right <= nodeLeft || left >= nodeRight) return
+    candidates.push(top - 24, bottom + 24, top - 44, bottom + 44, top - 12, bottom + 12)
+  })
+  const tried = [...new Set(candidates.map((value) => Math.round(value)))].sort((a, b) => Math.abs(a - preferred) - Math.abs(b - preferred))
+  const clear = tried.find((value) => !approvalSegmentBlocked(nodes, fromId, toId, { x: left, y: value }, { x: right, y: value }))
+  return clear ?? preferred
+}
+
+function approvalOrthogonalPoints(nodes, from, to, fromSide, toSide, fromPoint, toPoint, fromSpread = 0, toSpread = 0) {
+  const fromDir = approvalSideDirection(fromSide)
+  const toDir = approvalSideDirection(toSide)
+  const fromStubLen = Math.max(10, APPROVAL_PORT_STUB + (Number(fromSpread) || 0))
+  const toStubLen = Math.max(10, APPROVAL_PORT_STUB + (Number(toSpread) || 0))
+  const fromStub = { x: fromPoint.x + fromDir.x * fromStubLen, y: fromPoint.y + fromDir.y * fromStubLen }
+  const toStub = { x: toPoint.x + toDir.x * toStubLen, y: toPoint.y + toDir.y * toStubLen }
+  const verticalFrom = fromSide === 'top' || fromSide === 'bottom'
+  const verticalTo = toSide === 'top' || toSide === 'bottom'
+  if (verticalFrom && verticalTo) {
+    if (Math.abs(fromPoint.x - toPoint.x) <= .5) {
+      if (!approvalSegmentBlocked(nodes, from.id, to.id, fromPoint, toPoint)) return [fromPoint, toPoint]
+      const lane = approvalDetourLane(nodes, from.id, to.id, fromPoint.x, fromPoint.y, toPoint.y, true)
+      return approvalCleanOrthogonalPoints([
+        fromPoint,
+        fromStub,
+        { x: lane, y: fromStub.y },
+        { x: lane, y: toStub.y },
+        toStub,
+        toPoint,
+      ])
+    }
+    const laneY = approvalClearHorizontalLane(nodes, from.id, to.id, fromStub.x, toStub.x, (fromStub.y + toStub.y) / 2)
+    const gap = (toPoint.y - fromPoint.y) * (fromSide === 'bottom' ? 1 : -1)
+    if (gap < 50) {
+      const midpoint = (fromPoint.y + toPoint.y) / 2
+      return approvalCleanOrthogonalPoints([
+        fromPoint,
+        { x: fromPoint.x, y: midpoint },
+        { x: toPoint.x, y: midpoint },
+        toPoint,
+      ])
+    }
+    const blockedTarget = approvalSegmentBlocked(nodes, from.id, to.id, { x: toStub.x, y: fromStub.y }, { x: toStub.x, y: toStub.y })
+    const blockedSource = approvalSegmentBlocked(nodes, from.id, to.id, { x: fromStub.x, y: fromStub.y }, { x: fromStub.x, y: toStub.y })
+    if (blockedTarget || blockedSource) {
+      const lane = approvalDetourLane(nodes, from.id, to.id, (fromStub.x + toStub.x) / 2, fromStub.y, toStub.y, true)
+      return approvalCleanOrthogonalPoints([
+        fromPoint,
+        fromStub,
+        { x: lane, y: fromStub.y },
+        { x: lane, y: toStub.y },
+        toStub,
+        toPoint,
+      ])
+    }
+    return approvalCleanOrthogonalPoints([
+      fromPoint,
+      fromStub,
+      { x: fromStub.x, y: laneY },
+      { x: toStub.x, y: laneY },
+      toStub,
+      toPoint,
+    ])
+  }
+  if (!verticalFrom && !verticalTo) {
+    if (Math.abs(fromPoint.y - toPoint.y) <= .5) {
+      if (!approvalSegmentBlocked(nodes, from.id, to.id, fromPoint, toPoint)) return [fromPoint, toPoint]
+      const lane = approvalDetourLane(nodes, from.id, to.id, fromPoint.y, fromPoint.x, toPoint.x, false)
+      return approvalCleanOrthogonalPoints([
+        fromPoint,
+        fromStub,
+        { x: fromStub.x, y: lane },
+        { x: toStub.x, y: lane },
+        toStub,
+        toPoint,
+      ])
+    }
+    const laneY = approvalClearHorizontalLane(nodes, from.id, to.id, fromStub.x, toStub.x, (fromPoint.y + toPoint.y) / 2)
+    return approvalCleanOrthogonalPoints([
+      fromPoint,
+      fromStub,
+      { x: fromStub.x, y: laneY },
+      { x: toStub.x, y: laneY },
+      toStub,
+      toPoint,
+    ])
+  }
+  if (verticalFrom) {
+    return approvalCleanOrthogonalPoints([
+      fromPoint,
+      fromStub,
+      { x: toStub.x, y: fromStub.y },
+      toStub,
+      toPoint,
+    ])
+  }
+  return approvalCleanOrthogonalPoints([
+    fromPoint,
+    fromStub,
+    { x: fromStub.x, y: toStub.y },
+    toStub,
+    toPoint,
+  ])
+}
+
+const APPROVAL_GRAPH_LANE_GAP = 286
+const APPROVAL_GRAPH_LEVEL_GAP = 96
+
+function approvalGraphPosition(node) {
+  const x = Number(node?.x)
+  const y = Number(node?.y)
+  return Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null
+}
+
+function approvalGraphNodes(flow, out = []) {
+  for (const node of flow || []) {
+    out.push(node)
+    for (const branch of node.branches || []) approvalGraphNodes(branch.nodes, out)
+  }
+  return out
+}
+
+function approvalLayoutGraphLevel(nodes, startX, startY, assignAll = true) {
+  let cursorY = startY
+  for (const node of nodes || []) {
+    const position = approvalGraphPosition(node)
+    if (assignAll || !position) {
+      node.x = startX
+      node.y = cursorY
+    } else {
+      cursorY = Math.max(cursorY, position.y)
+    }
+    const x = Number(node.x)
+    const y = Number(node.y)
+    let bottom = y + APPROVAL_GRAPH_NODE_H
+    const branches = Array.isArray(node.branches) ? node.branches : []
+    if (node.kind === 'condition' && branches.length) {
+      let maxBottom = bottom
+      branches.forEach((branch, index) => {
+        const laneX = x + (index - (branches.length - 1) / 2) * APPROVAL_GRAPH_LANE_GAP
+        const branchBottom = approvalLayoutGraphLevel(branch.nodes || [], laneX, y + APPROVAL_GRAPH_LEVEL_GAP, assignAll)
+        maxBottom = Math.max(maxBottom, branchBottom)
+      })
+      bottom = maxBottom
+      cursorY = bottom + 44
+    } else {
+      cursorY = bottom + 38
+    }
+  }
+  return cursorY - 38
+}
+
+function approvalLayoutConditionBranches(node) {
+  const branches = Array.isArray(node?.branches) ? node.branches : []
+  const x = Number(node?.x) || 340
+  const y = Number(node?.y) || 24
+  branches.forEach((branch, index) => {
+    const laneX = x + (index - (branches.length - 1) / 2) * APPROVAL_GRAPH_LANE_GAP
+    approvalLayoutGraphLevel(branch.nodes || [], laneX, y + APPROVAL_GRAPH_LEVEL_GAP, true)
+  })
+}
+
+function approvalEnsureGraphLayout(flow) {
+  const nodes = approvalGraphNodes(flow)
+  if (!nodes.length) return
+  if (nodes.every((node) => approvalGraphPosition(node))) return
+  const missing = nodes.filter((node) => !approvalGraphPosition(node))
+  if (missing.length === nodes.length) {
+    approvalLayoutGraphLevel(flow, 340, 24, true)
+    return
+  }
+  approvalLayoutGraphLevel(flow, 340, 24, false)
+  for (const node of nodes) {
+    if (node.kind !== 'condition' || !Array.isArray(node.branches)) continue
+    const branchMissing = node.branches.some((branch) => (branch.nodes || []).some((child) => !approvalGraphPosition(child)))
+    if (branchMissing) approvalLayoutConditionBranches(node)
+  }
+}
+
+function approvalGraphBounds(flow) {
+  const nodes = approvalGraphNodes(flow)
+  let minX = Infinity
+  let minY = Infinity
+  let maxX = 0
+  let maxY = 0
+  for (const node of nodes) {
+    const position = approvalGraphPosition(node)
+    if (!position) continue
+    minX = Math.min(minX, position.x)
+    minY = Math.min(minY, position.y)
+    maxX = Math.max(maxX, position.x + APPROVAL_GRAPH_NODE_W)
+    maxY = Math.max(maxY, position.y + APPROVAL_GRAPH_NODE_H)
+  }
+  if (!Number.isFinite(minX) || !Number.isFinite(minY)) return { minX: 0, minY: 0, maxX: 640, maxY: 400, width: 640, height: 400 }
+  return { minX, minY, maxX, maxY, width: maxX - minX, height: maxY - minY }
+}
+
+function approvalHasExplicitLinks(flow) {
+  return approvalGraphNodes(flow).some((node) => Array.isArray(node?.nextIds))
+}
+
+function approvalEdgeKey(fromId, toId) {
+  return `${fromId}->${toId}`
+}
+
+function approvalGraphEdgesLegacy(flow) {
+  const edges = []
+  const visit = (nodes) => {
+    for (let index = 0; index < (nodes || []).length; index += 1) {
+      const node = nodes[index]
+      const next = nodes[index + 1]
+      const branches = Array.isArray(node.branches) ? node.branches : []
+      if (node.kind === 'condition' && branches.length) {
+        let routed = false
+        for (const branch of branches) {
+          const branchNodes = branch.nodes || []
+          if (!branchNodes.length) continue
+          edges.push({ from: node.id, to: branchNodes[0].id, label: branch.label || '', rule: branch.rule || null })
+          visit(branchNodes)
+          if (next) edges.push({ from: branchNodes[branchNodes.length - 1].id, to: next.id, label: '', rule: null })
+          routed = true
+        }
+        if (!routed && next) edges.push({ from: node.id, to: next.id, label: '', rule: null })
+      } else if (next) {
+        edges.push({ from: node.id, to: next.id, label: '', rule: null })
+      }
+    }
+  }
+  visit(flow)
+  return edges
+}
+
+function approvalGraphEdges(flow) {
+  if (!approvalHasExplicitLinks(flow)) return approvalGraphEdgesLegacy(flow)
+  const edges = []
+  for (const node of approvalGraphNodes(flow)) {
+    if (!Array.isArray(node.nextIds)) continue
+    for (const target of node.nextIds) {
+      const to = String(target || '')
+      if (!to) continue
+      edges.push({
+        from: node.id,
+        to,
+        label: String(node.edgeLabels?.[to] || ''),
+        rule: node.edgeRules?.[to] || null,
+        ports: node.edgePorts?.[to] || null,
+      })
+    }
+  }
+  return edges
+}
+
+function approvalMaterializeLinks(template) {
+  const flow = template.flow || []
+  if (approvalHasExplicitLinks(flow)) return false
+  const nodes = approvalGraphNodes(flow)
+  const legacy = approvalGraphEdgesLegacy(flow)
+  for (const node of nodes) {
+    node.nextIds = []
+    node.edgeLabels = {}
+    node.edgeRules = {}
+  }
+  for (const edge of legacy) {
+    const from = nodes.find((node) => node.id === edge.from)
+    const to = nodes.find((node) => node.id === edge.to)
+    if (!from || !to || from.nextIds.includes(to.id)) continue
+    from.nextIds.push(to.id)
+    if (from.kind === 'condition') {
+      const key = edge.rule ? approvalBranchRuleKey({ label: edge.label, rule: edge.rule }) : approvalBranchRuleKey({ label: edge.label, rule: null })
+      const rule = APPROVAL_BRANCH_RULES[key] || APPROVAL_BRANCH_RULES.risk_high
+      from.edgeLabels[to.id] = edge.label || rule.label
+      from.edgeRules[to.id] = edge.rule
+        ? { field: edge.rule.field, op: edge.rule.op, value: edge.rule.value }
+        : { field: rule.field, op: rule.op, value: rule.value }
+    } else if (edge.label) {
+      from.edgeLabels[to.id] = edge.label
+    }
+  }
+  return true
+}
+
+function approvalEdgeLabelOf(template, fromId, toId) {
+  const from = approvalFindNode(template.flow, fromId)
+  return String(from?.edgeLabels?.[toId] || '')
+}
+
+function approvalEdgeRuleOf(template, fromId, toId) {
+  const from = approvalFindNode(template.flow, fromId)
+  return from?.edgeRules?.[toId] || null
+}
+
+function approvalReachesNode(flow, startId, targetId, ignoreEdge = null) {
+  if (!startId || !targetId) return false
+  const adjacency = new Map()
+  for (const edge of approvalGraphEdges(flow)) {
+    if (ignoreEdge && edge.from === ignoreEdge.from && edge.to === ignoreEdge.to) continue
+    if (!adjacency.has(edge.from)) adjacency.set(edge.from, [])
+    adjacency.get(edge.from).push(edge.to)
+  }
+  const seen = new Set()
+  const stack = [startId]
+  while (stack.length) {
+    const id = stack.pop()
+    if (!id || seen.has(id)) continue
+    if (id === targetId) return true
+    seen.add(id)
+    for (const next of adjacency.get(id) || []) stack.push(next)
+  }
+  return false
+}
+
+function approvalConnectionIssue(template, fromId, toId, ignoreEdge = null) {
+  const flow = template.flow || []
+  const from = approvalFindNode(flow, fromId)
+  const to = approvalFindNode(flow, toId)
+  if (!from || !to) return '节点不存在'
+  if (fromId === toId) return '不能连接到节点自身'
+  if (from.kind === 'end') return '结束节点不能再连出线'
+  if (to.kind === 'start') return '开始节点不能作为连线目标'
+  const edges = approvalGraphEdges(flow).filter(
+    (edge) => !(ignoreEdge && edge.from === ignoreEdge.from && edge.to === ignoreEdge.to),
+  )
+  if (edges.some((edge) => edge.from === fromId && edge.to === toId)) return '这两个节点之间已经有连线'
+  if (from.kind === 'start' && edges.some((edge) => edge.from === fromId)) return '开始节点只能有一条出线'
+  if (approvalReachesNode(flow, toId, fromId, ignoreEdge)) return '这条连线会形成循环'
+  return ''
+}
+
+function approvalNextConditionBranch(node, ignoreToId = '') {
+  const usedRules = Object.entries(node.edgeRules || {})
+    .filter(([id]) => id !== ignoreToId)
+    .map(([, rule]) => rule)
+  const hasElse = usedRules.some((item) => item?.field === 'else')
+  const nextCount = Array.isArray(node.nextIds)
+    ? node.nextIds.filter((id) => id !== ignoreToId).length
+    : 0
+  if (!hasElse && nextCount >= 1) {
+    return { label: '其他情况', rule: { field: 'else' } }
+  }
+  return { label: `分支 ${nextCount + 1}`, rule: { field: 'scopeRisk', op: 'eq', value: 'high' } }
+}
+
+function approvalUniqueConditionBranch(node, preferredLabel = '', preferredRule = null, ignoreToId = '') {
+  const labels = new Set(
+    Object.entries(node.edgeLabels || {})
+      .filter(([id]) => id !== ignoreToId)
+      .map(([, label]) => String(label || '').trim()),
+  )
+  const usedRules = Object.entries(node.edgeRules || {})
+    .filter(([id]) => id !== ignoreToId)
+    .map(([, rule]) => rule)
+  if (preferredLabel && !labels.has(preferredLabel)) {
+    if (preferredRule?.field === 'else' && usedRules.some((item) => item?.field === 'else')) {
+      return approvalNextConditionBranch(node, ignoreToId)
+    }
+    return {
+      label: preferredLabel,
+      rule: preferredRule?.field
+        ? preferredRule
+        : (() => {
+            const fallback = APPROVAL_BRANCH_RULES[approvalBranchRuleKey({ label: preferredLabel, rule: null })]
+              || APPROVAL_BRANCH_RULES.risk_high
+            return { field: fallback.field, op: fallback.op, value: fallback.value }
+          })(),
+    }
+  }
+  const generated = approvalNextConditionBranch(node, ignoreToId)
+  let label = generated.label
+  let index = 2
+  while (labels.has(label)) {
+    label = `${generated.label} ${index}`
+    index += 1
+  }
+  return { label, rule: generated.rule }
+}
+
+function approvalConnectNodes(template, fromId, toId, options = {}) {
+  approvalMaterializeLinks(template)
+  const issue = approvalConnectionIssue(template, fromId, toId)
+  if (issue) return { ok: false, message: issue }
+  const from = approvalFindNode(template.flow, fromId)
+  const to = approvalFindNode(template.flow, toId)
+  if (!from || !to) return { ok: false, message: '节点不存在' }
+  if (!Array.isArray(from.nextIds)) from.nextIds = []
+  if (from.nextIds.includes(toId)) return { ok: false, message: '这两个节点之间已经有连线' }
+
+  let branch = null
+  if (from.kind === 'condition') {
+    if (!from.edgeLabels) from.edgeLabels = {}
+    if (!from.edgeRules) from.edgeRules = {}
+    branch = approvalUniqueConditionBranch(from)
+  }
+
+  from.nextIds.push(toId)
+  if (branch) {
+    from.edgeLabels[toId] = branch.label
+    from.edgeRules[toId] = branch.rule
+  }
+  const auto = approvalAutoPortSides(from, to)
+  from.edgePorts = {
+    ...(from.edgePorts || {}),
+    [toId]: {
+      from: approvalNormalizePortSide(options.fromSide) || auto.from,
+      to: approvalNormalizePortSide(options.toSide) || auto.to,
+    },
+  }
+  approvalTouchTemplate(template)
+  return { ok: true, message: branch ? `已连接并生成分支「${branch.label}」` : '已创建连线' }
+}
+
+function approvalReconnectEdgeTarget(template, fromId, oldToId, newToId, toSide = '') {
+  approvalMaterializeLinks(template)
+  const issue = approvalConnectionIssue(template, fromId, newToId, { from: fromId, to: oldToId })
+  if (issue) return { ok: false, message: issue }
+  const from = approvalFindNode(template.flow, fromId)
+  const newTo = approvalFindNode(template.flow, newToId)
+  if (!from || !newTo) return { ok: false, message: '节点不存在' }
+  if (!Array.isArray(from.nextIds) || !from.nextIds.includes(oldToId)) return { ok: false, message: '原连线不存在' }
+  const index = from.nextIds.indexOf(oldToId)
+  const oldPorts = from.edgePorts?.[oldToId] || {}
+  const side = approvalNormalizePortSide(toSide) || approvalNormalizePortSide(oldPorts.to) || approvalAutoPortSides(from, newTo).to
+  if (oldToId === newToId) {
+    from.edgePorts = { ...(from.edgePorts || {}), [oldToId]: { ...oldPorts, to: side } }
+    approvalTouchTemplate(template)
+    return { ok: true, message: '已更新连线方向' }
+  }
+  const label = from.edgeLabels?.[oldToId] || ''
+  const rule = from.edgeRules?.[oldToId] || null
+  let branch = null
+  if (from.kind === 'condition') {
+    branch = approvalUniqueConditionBranch(from, label, rule, oldToId)
+    if (!from.edgeLabels) from.edgeLabels = {}
+    if (!from.edgeRules) from.edgeRules = {}
+  }
+  from.nextIds[index] = newToId
+  if (from.edgeLabels) delete from.edgeLabels[oldToId]
+  if (from.edgeRules) delete from.edgeRules[oldToId]
+  if (from.edgePorts) delete from.edgePorts[oldToId]
+  if (branch) {
+    from.edgeLabels[newToId] = branch.label
+    from.edgeRules[newToId] = branch.rule
+  }
+  from.edgePorts = {
+    ...(from.edgePorts || {}),
+    [newToId]: {
+      from: approvalNormalizePortSide(oldPorts.from) || approvalAutoPortSides(from, newTo).from,
+      to: side,
+    },
+  }
+  approvalTouchTemplate(template)
+  return { ok: true, message: branch ? `已重连到「${newTo.title}」，分支「${branch.label}」保留` : `已重连到「${newTo.title}」` }
+}
+
+function approvalReconnectEdgeSource(template, oldFromId, toId, newFromId, fromSide = '') {
+  approvalMaterializeLinks(template)
+  const issue = approvalConnectionIssue(template, newFromId, toId, { from: oldFromId, to: toId })
+  if (issue) return { ok: false, message: issue }
+  const oldFrom = approvalFindNode(template.flow, oldFromId)
+  const newFrom = approvalFindNode(template.flow, newFromId)
+  const to = approvalFindNode(template.flow, toId)
+  if (!oldFrom || !newFrom || !to) return { ok: false, message: '节点不存在' }
+  if (!Array.isArray(oldFrom.nextIds) || !oldFrom.nextIds.includes(toId)) return { ok: false, message: '原连线不存在' }
+  const oldPorts = oldFrom.edgePorts?.[toId] || {}
+  const side = approvalNormalizePortSide(fromSide) || approvalNormalizePortSide(oldPorts.from) || approvalAutoPortSides(newFrom, to).from
+  if (oldFromId === newFromId) {
+    oldFrom.edgePorts = { ...(oldFrom.edgePorts || {}), [toId]: { ...oldPorts, from: side } }
+    approvalTouchTemplate(template)
+    return { ok: true, message: '已更新连线方向' }
+  }
+  const label = oldFrom.edgeLabels?.[toId] || ''
+  const rule = oldFrom.edgeRules?.[toId] || null
+  const index = oldFrom.nextIds.indexOf(toId)
+  oldFrom.nextIds.splice(index, 1)
+  if (oldFrom.edgeLabels) delete oldFrom.edgeLabels[toId]
+  if (oldFrom.edgeRules) delete oldFrom.edgeRules[toId]
+  if (oldFrom.edgePorts) delete oldFrom.edgePorts[toId]
+
+  if (!Array.isArray(newFrom.nextIds)) newFrom.nextIds = []
+  newFrom.nextIds.push(toId)
+  let branch = null
+  if (newFrom.kind === 'condition') {
+    if (!newFrom.edgeLabels) newFrom.edgeLabels = {}
+    if (!newFrom.edgeRules) newFrom.edgeRules = {}
+    branch = approvalUniqueConditionBranch(newFrom, label, rule)
+    newFrom.edgeLabels[toId] = branch.label
+    newFrom.edgeRules[toId] = branch.rule
+  }
+  newFrom.edgePorts = {
+    ...(newFrom.edgePorts || {}),
+    [toId]: {
+      from: side,
+      to: approvalNormalizePortSide(oldPorts.to) || approvalAutoPortSides(newFrom, to).to,
+    },
+  }
+  approvalTouchTemplate(template)
+  return { ok: true, message: branch ? `已改由「${newFrom.title}」发起并生成分支「${branch.label}」` : `已改由「${newFrom.title}」发起` }
+}
+
+function approvalRemoveEdge(template, fromId, toId) {
+  const from = approvalFindNode(template.flow, fromId)
+  if (!from) return false
+  approvalMaterializeLinks(template)
+  if (!Array.isArray(from.nextIds)) return false
+  const index = from.nextIds.indexOf(toId)
+  if (index < 0) return false
+  from.nextIds.splice(index, 1)
+  if (from.edgeLabels) delete from.edgeLabels[toId]
+  if (from.edgeRules) delete from.edgeRules[toId]
+  if (from.edgePorts) delete from.edgePorts[toId]
+  approvalTouchTemplate(template)
+  return true
+}
+
+function approvalDetachNodeWithLinks(template, nodeId) {
+  approvalMaterializeLinks(template)
+  for (const node of approvalGraphNodes(template.flow)) {
+    if (!Array.isArray(node.nextIds)) continue
+    node.nextIds = node.nextIds.filter((id) => id !== nodeId)
+    if (node.edgeLabels) delete node.edgeLabels[nodeId]
+    if (node.edgeRules) delete node.edgeRules[nodeId]
+    if (node.edgePorts) delete node.edgePorts[nodeId]
+  }
+  const removed = approvalDetachNode(template.flow, nodeId)
+  if (removed) approvalTouchTemplate(template)
+  return removed
+}
+
+function approvalAutoLayoutGraph(template) {
+  const flow = template.flow || []
+  const nodes = approvalGraphNodes(flow)
+  if (!nodes.length) return
+  const edges = approvalGraphEdges(flow)
+  const indegree = new Map(nodes.map((node) => [node.id, 0]))
+  const outgoing = new Map(nodes.map((node) => [node.id, []]))
+  for (const edge of edges) {
+    if (!indegree.has(edge.from) || !indegree.has(edge.to)) continue
+    indegree.set(edge.to, indegree.get(edge.to) + 1)
+    outgoing.get(edge.from).push(edge.to)
+  }
+  const nodeOrder = (id) => {
+    const node = nodes.find((item) => item.id === id)
+    const kindRank = node?.kind === 'start' ? 0 : node?.kind === 'end' ? 2 : 1
+    return [kindRank, Number(node?.x) || 0, id]
+  }
+  const compare = (a, b) => {
+    const left = nodeOrder(a)
+    const right = nodeOrder(b)
+    return left[0] - right[0] || left[1] - right[1] || String(left[2]).localeCompare(String(right[2]))
+  }
+  const queue = nodes.filter((node) => indegree.get(node.id) === 0).map((node) => node.id).sort(compare)
+  const level = new Map(nodes.map((node) => [node.id, 0]))
+  let processed = 0
+  while (queue.length) {
+    const id = queue.shift()
+    processed += 1
+    for (const target of outgoing.get(id) || []) {
+      level.set(target, Math.max(level.get(target), level.get(id) + 1))
+      indegree.set(target, indegree.get(target) - 1)
+      if (indegree.get(target) === 0) {
+        queue.push(target)
+        queue.sort(compare)
+      }
+    }
+  }
+  const maxLevel = Math.max(0, ...[...level.values()])
+  if (processed < nodes.length) {
+    for (const node of nodes) {
+      if (indegree.get(node.id) > 0) level.set(node.id, maxLevel + 1)
+    }
+  }
+
+  const reachable = new Set()
+  const stack = ['start']
+  while (stack.length) {
+    const id = stack.pop()
+    if (!id || reachable.has(id)) continue
+    reachable.add(id)
+    for (const target of outgoing.get(id) || []) stack.push(target)
+  }
+  if (!reachable.size) {
+    for (const node of nodes) reachable.add(node.id)
+  }
+  const detachedLevel = Math.max(0, ...[...level.values()]) + 2
+  for (const node of nodes) {
+    if (!reachable.has(node.id)) level.set(node.id, detachedLevel)
+  }
+
+  const rows = new Map()
+  for (const node of nodes) {
+    const row = level.get(node.id) || 0
+    if (!rows.has(row)) rows.set(row, [])
+    rows.get(row).push(node)
+  }
+  for (const [row, items] of [...rows.entries()].sort((a, b) => a[0] - b[0])) {
+    items.sort((a, b) => compare(a.id, b.id))
+    const span = (items.length - 1) * APPROVAL_GRAPH_LANE_GAP
+    const baseX = Math.max(40 + span / 2, 340)
+    items.forEach((node, index) => {
+      node.x = Math.round(baseX + (index - (items.length - 1) / 2) * APPROVAL_GRAPH_LANE_GAP)
+      node.y = Math.round(24 + row * APPROVAL_GRAPH_LEVEL_GAP)
+    })
+  }
+  approvalTouchTemplate(template)
+}
+
+function approvalGraphEdgeDetourSide(from, to, nodes = []) {
+  if (!from || !to) return 0
+  const x1 = Number(from.x) + APPROVAL_GRAPH_NODE_W / 2
+  const x2 = Number(to.x) + APPROVAL_GRAPH_NODE_W / 2
+  const y1 = Number(from.y) + APPROVAL_GRAPH_NODE_H
+  const y2 = Number(to.y)
+  if (Math.abs(x2 - x1) >= 40 || y2 - y1 <= 0) return 0
+  const blocking = nodes.some((node) => {
+    if (!node || node.id === from.id || node.id === to.id) return false
+    const top = Number(node.y)
+    const bottom = top + APPROVAL_GRAPH_NODE_H
+    return bottom > y1 - 6 && top < y2 + 6 && Number(node.x) < x1 + 10 && Number(node.x) + APPROVAL_GRAPH_NODE_W > x1 - 10
+  })
+  if (!blocking) return 0
+  const reach = APPROVAL_GRAPH_NODE_W / 2 + 72
+  const corridorConflicts = (side) => nodes.filter((node) => {
+    if (!node || node.id === from.id || node.id === to.id) return false
+    const top = Number(node.y)
+    const bottom = top + APPROVAL_GRAPH_NODE_H
+    const center = x1 + side * reach
+    return bottom > y1 && top < y2 && Number(node.x) < center + 34 && Number(node.x) + APPROVAL_GRAPH_NODE_W > center - 34
+  }).length
+  const right = corridorConflicts(1)
+  const left = corridorConflicts(-1)
+  return right <= left ? 1 : -1
+}
+
+function approvalEdgeLayouts(flow) {
+  const nodes = new Map(approvalGraphNodes(flow).map((node) => [node.id, node]))
+  const items = []
+  for (const edge of approvalGraphEdges(flow)) {
+    const from = nodes.get(edge.from)
+    const to = nodes.get(edge.to)
+    if (!from || !to) continue
+    const auto = approvalAutoPortSides(from, to)
+    const stored = edge.ports || {}
+    items.push({
+      ...edge,
+      fromNode: from,
+      toNode: to,
+      fromSide: approvalNormalizePortSide(stored.from) || auto.from,
+      toSide: approvalNormalizePortSide(stored.to) || auto.to,
+    })
+  }
+
+  const groups = new Map()
+  const groupKey = (kind, node, side) => `${kind}|${node.id}|${side}`
+  for (const item of items) {
+    const fromKey = groupKey('out', item.fromNode, item.fromSide)
+    const toKey = groupKey('in', item.toNode, item.toSide)
+    if (!groups.has(fromKey)) groups.set(fromKey, { vertical: item.fromSide === 'left' || item.fromSide === 'right', items: [] })
+    if (!groups.has(toKey)) groups.set(toKey, { vertical: item.toSide === 'left' || item.toSide === 'right', items: [] })
+    groups.get(fromKey).items.push({ item, side: 'from' })
+    groups.get(toKey).items.push({ item, side: 'to' })
+  }
+
+  const fromOffsets = new Map()
+  const toOffsets = new Map()
+  for (const group of groups.values()) {
+    group.items.sort((a, b) => {
+      const itemA = a.item
+      const itemB = b.item
+      const aAxis = group.vertical
+        ? Number(a.side === 'from' ? itemA.toNode.y : itemA.fromNode.y)
+        : Number(a.side === 'from' ? itemA.toNode.x : itemA.fromNode.x)
+      const bAxis = group.vertical
+        ? Number(b.side === 'from' ? itemB.toNode.y : itemB.fromNode.y)
+        : Number(b.side === 'from' ? itemB.toNode.x : itemB.fromNode.x)
+      return aAxis - bAxis || String(itemA.to).localeCompare(String(itemB.to))
+    })
+    const span = group.vertical ? APPROVAL_GRAPH_NODE_H - 26 : APPROVAL_GRAPH_NODE_W - 30
+    const step = group.items.length > 1 ? Math.min(12, span / (group.items.length - 1)) : 0
+    const start = -((group.items.length - 1) * step) / 2
+    group.items.forEach((entry, index) => {
+      const offset = start + index * step
+      if (entry.side === 'from') fromOffsets.set(entry.item, offset)
+      else toOffsets.set(entry.item, offset)
+    })
+  }
+
+  for (const item of items) {
+    item.fromOffset = fromOffsets.get(item) || 0
+    item.toOffset = toOffsets.get(item) || 0
+    item.fromPoint = approvalPortAnchor(item.fromNode, item.fromSide, item.fromOffset)
+    item.toPoint = approvalPortAnchor(item.toNode, item.toSide, item.toOffset)
+    item.points = approvalOrthogonalPoints(
+      [...nodes.values()],
+      item.fromNode,
+      item.toNode,
+      item.fromSide,
+      item.toSide,
+      item.fromPoint,
+      item.toPoint,
+      item.fromOffset || 0,
+      item.toOffset || 0,
+    )
+    item.path = approvalOrthogonalPath(item.points)
+    item.labelPoint = approvalOrthLabelPoint(item.points)
+  }
+  return items
+}
+
+function approvalGraphEdgeSvg(flow, selectedEdge = null, hiddenEdge = null) {
+  const layouts = approvalEdgeLayouts(flow).filter((edge) => {
+    return !(hiddenEdge && hiddenEdge.from === edge.from && hiddenEdge.to === edge.to)
+  })
+  const selectedLayout = selectedEdge
+    ? layouts.find((edge) => selectedEdge.from === edge.from && selectedEdge.to === edge.to)
+    : null
+  if (selectedLayout) {
+    layouts.splice(layouts.indexOf(selectedLayout), 1)
+    layouts.push(selectedLayout)
+  }
+  const defs = `<defs>
+    <marker id="wf-edge-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L8 4 L0 8 Z"></path></marker>
+    <marker id="wf-edge-arrow-selected" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L8 4 L0 8 Z"></path></marker>
+  </defs>`
+  return defs + layouts.map((edge) => {
+    const label = String(edge.label || '').trim()
+    const selected = selectedEdge && selectedEdge.from === edge.from && selectedEdge.to === edge.to
+    const head = `<g class="wf-edge-group${selected ? ' is-selected' : ''}" data-wf-edge-group data-wf-edge-from="${esc(edge.from)}" data-wf-edge-to="${esc(edge.to)}" data-wf-edge-from-side="${esc(edge.fromSide)}" data-wf-edge-to-side="${esc(edge.toSide)}">
+      <path class="wf-edge-hit" d="${edge.path}"></path>
+      <path class="wf-edge" d="${edge.path}" marker-end="url(#wf-edge-arrow${selected ? '-selected' : ''})"></path>`
+    if (!label) return `${head}</g>`
+    const point = edge.labelPoint
+    const labelWidth = Math.max(52, [...label].length * 11 + 20)
+    return `${head}
+      <g class="wf-edge-label" transform="translate(${Math.round(point.x)} ${Math.round(point.y)})">
+        <rect x="${-labelWidth / 2}" y="-9.5" width="${labelWidth}" height="19" rx="9.5"></rect>
+        <text text-anchor="middle" dominant-baseline="middle">${esc(label)}</text>
+      </g>
+    </g>`
+  }).join('')
+}
+
+function approvalEdgeHandlesHtml(flow, selectedEdge = null) {
+  if (!selectedEdge) return ''
+  const layout = approvalEdgeLayouts(flow).find(
+    (edge) => edge.from === selectedEdge.from && edge.to === selectedEdge.to,
+  )
+  if (!layout) return ''
+  return `<div class="wf-edge-handles" data-wf-edge-handles>
+    <button type="button" class="wf-edge-handle is-from" data-wf-edge-handle="from" data-wf-edge-from="${esc(layout.from)}" data-wf-edge-to="${esc(layout.to)}" data-wf-edge-side="${esc(layout.fromSide)}" style="left:${layout.fromPoint.x}px;top:${layout.fromPoint.y}px" aria-label="拖动起点重新连接"></button>
+    <button type="button" class="wf-edge-handle is-to" data-wf-edge-handle="to" data-wf-edge-from="${esc(layout.from)}" data-wf-edge-to="${esc(layout.to)}" data-wf-edge-side="${esc(layout.toSide)}" style="left:${layout.toPoint.x}px;top:${layout.toPoint.y}px" aria-label="拖动终点重新连接"></button>
+  </div>`
+}
+
+function approvalNodeHtml(node, selectedId, portCounts = {}) {
+  const meta = APPROVAL_NODE_META[node.kind] || APPROVAL_NODE_META.approval
+  const selected = node.id === selectedId ? ' is-selected' : ''
+  const position = approvalGraphPosition(node) || { x: 0, y: 0 }
+  const kicker =
+    node.kind === 'approval'
+      ? `${meta.label} · ${approvalModeOf(node)}`
+      : node.meta && node.meta !== meta.label
+        ? `${meta.label} · ${node.meta}`
+        : meta.label
+  const ports = APPROVAL_PORT_SIDES.map((side) => {
+    const count = Number(portCounts?.[side] || 0)
+    if (node.kind === 'end') {
+      return `<span class="wf-port is-${side} is-disabled" data-wf-port-side="${side}" aria-hidden="true"><span class="wf-port-dot"></span></span>`
+    }
+    return `<span class="wf-port is-${side}${count > 1 ? ' is-split' : ''}" data-wf-link-after="${esc(node.id)}" data-wf-port-side="${side}" data-wf-link-side="${side}" title="从这里拖出连线；可选任意节点作为目标">
+      <span class="wf-port-dot"></span>${count > 1 ? `<i class="wf-port-count">${count}</i>` : ''}
+    </span>`
+  }).join('')
+  return `<button type="button" class="wf-node is-${esc(node.kind)}${selected}" data-wf-node="${esc(node.id)}" style="left:${Math.round(position.x)}px;top:${Math.round(position.y)}px" title="拖动节点调整位置；拖动四向圆点创建连线">
+    <span class="wf-node-icon">${esc(meta.icon)}</span>
+    <span class="wf-node-copy">
+      <span class="wf-node-kicker">${esc(kicker)}</span>
+      <strong>${esc(node.title)}</strong>
+      <small>${esc(node.desc || '')}</small>
+    </span>
+    <span class="wf-node-grip" aria-hidden="true">⋮⋮</span>
+    ${ports}
+  </button>`
+}
+
+function approvalFlowHtml(template, selectedId, selectedEdge = null) {
+  const flow = template.flow || []
+  const layouts = approvalEdgeLayouts(flow)
+  const portCounts = new Map()
+  for (const edge of layouts) {
+    const counts = portCounts.get(edge.from) || { top: 0, bottom: 0, left: 0, right: 0 }
+    counts[edge.fromSide] = (counts[edge.fromSide] || 0) + 1
+    portCounts.set(edge.from, counts)
+  }
+  return `<svg class="wf-edges" aria-hidden="true"><g data-wf-edge-layer>${approvalGraphEdgeSvg(flow, selectedEdge)}</g></svg>
+    ${approvalGraphNodes(flow).map((node) => approvalNodeHtml(node, selectedId, portCounts.get(node.id) || {})).join('')}
+    ${approvalEdgeHandlesHtml(flow, selectedEdge)}`
+}
+
+function approvalCanvasState() {
+  if (!state.approvalCanvas) {
+    state.approvalCanvas = { templateId: '', scale: 1, x: 0, y: 0, pendingFit: true }
+  }
+  return state.approvalCanvas
+}
+
+function approvalApplyCanvasView() {
+  const viewport = document.querySelector('[data-wf-viewport]')
+  const stage = viewport?.querySelector('[data-wf-stage]')
+  if (!viewport || !stage) return
+  const view = approvalCanvasState()
+  stage.style.transform = `translate(${view.x}px, ${view.y}px) scale(${view.scale})`
+  const label = viewport.closest('.wf-canvas')?.querySelector('[data-wf-zoom-label]')
+  if (label) label.textContent = `${Math.round(view.scale * 100)}%`
+}
+
+function approvalFitCanvas() {
+  const viewport = document.querySelector('[data-wf-viewport]')
+  const stage = viewport?.querySelector('[data-wf-stage]')
+  const template = approvalTemplateOf()
+  if (!viewport || !stage || !template) return
+  const view = approvalCanvasState()
+  const bounds = approvalGraphBounds(template.flow)
+  const width = Math.max(1, bounds.width)
+  const height = Math.max(1, bounds.height)
+  const padding = 34
+  const availableW = Math.max(120, viewport.clientWidth - padding * 2)
+  const availableH = Math.max(120, viewport.clientHeight - padding * 2)
+  const scale = Math.min(1.15, Math.max(.32, Math.min(availableW / width, availableH / height)))
+  view.scale = scale
+  view.x = (viewport.clientWidth - width * scale) / 2 - bounds.minX * scale
+  view.y = (viewport.clientHeight - height * scale) / 2 - bounds.minY * scale
+  approvalApplyCanvasView()
+}
+
+function approvalScheduleCanvasView(template) {
+  const view = approvalCanvasState()
+  if (view.templateId !== template.id) {
+    view.templateId = template.id
+    view.scale = 1
+    view.x = 0
+    view.y = 0
+    view.pendingFit = true
+  }
+  if (view.pendingFit) {
+    approvalFitCanvas()
+    view.pendingFit = false
+  } else {
+    approvalApplyCanvasView()
+  }
+}
+
+function approvalZoomCanvas(factor, clientX, clientY) {
+  const viewport = document.querySelector('[data-wf-viewport]')
+  if (!viewport) return
+  const view = approvalCanvasState()
+  const rect = viewport.getBoundingClientRect()
+  const anchorX = Number.isFinite(clientX) ? clientX - rect.left : viewport.clientWidth / 2
+  const anchorY = Number.isFinite(clientY) ? clientY - rect.top : viewport.clientHeight / 2
+  const nextScale = Math.min(2.5, Math.max(.32, view.scale * factor))
+  const worldX = (anchorX - view.x) / view.scale
+  const worldY = (anchorY - view.y) / view.scale
+  view.scale = nextScale
+  view.x = anchorX - worldX * nextScale
+  view.y = anchorY - worldY * nextScale
+  approvalApplyCanvasView()
+}
+
+function approvalCanvasWorldPoint(clientX, clientY) {
+  const viewport = document.querySelector('[data-wf-viewport]')
+  const view = approvalCanvasState()
+  if (!viewport) return { x: 0, y: 0 }
+  const rect = viewport.getBoundingClientRect()
+  return {
+    x: (clientX - rect.left - view.x) / view.scale,
+    y: (clientY - rect.top - view.y) / view.scale,
+  }
+}
+
+function approvalCloseCanvasMenu() {
+  state.approvalCanvasMenu = null
+  document.querySelector('[data-wf-canvas-menu]')?.remove()
+}
+
+function approvalNearestGraphNode(flow, x, y) {
+  let best = null
+  let bestDistance = Infinity
+  for (const node of approvalGraphNodes(flow)) {
+    const position = approvalGraphPosition(node)
+    if (!position) continue
+    const cx = position.x + APPROVAL_GRAPH_NODE_W / 2
+    const cy = position.y + APPROVAL_GRAPH_NODE_H / 2
+    const distance = Math.hypot(cx - x, cy - y)
+    if (distance < bestDistance) {
+      bestDistance = distance
+      best = node
+    }
+  }
+  return best
+}
+
+function approvalNewFlowNode(kind) {
+  if (kind === 'condition') return approvalNewConditionNode()
+  if (kind === 'cc') {
+    return { id: approvalUid('cc'), kind: 'cc', title: '新增抄送节点', desc: '站内通知 + 钉钉机器人', meta: '抄送' }
+  }
+  return approvalMakeApprovalNode('新增审批节点', 'dept_chain', '或签')
+}
+
+function approvalVisibleWorldRect() {
+  const viewport = document.querySelector('[data-wf-viewport]')
+  const view = approvalCanvasState()
+  if (!viewport) return null
+  return {
+    left: -view.x / view.scale,
+    top: -view.y / view.scale,
+    right: (viewport.clientWidth - view.x) / view.scale,
+    bottom: (viewport.clientHeight - view.y) / view.scale,
+  }
+}
+
+function approvalInsertFlowNode(template, newNode, anchorId, x, y) {
+  const anchor = anchorId ? approvalFindNode(template.flow, anchorId) : null
+  const located = anchorId ? approvalLocateNode(template.flow, anchorId) : null
+  const explicit = approvalHasExplicitLinks(template.flow)
+  let inserted = false
+  if (located?.node) {
+    if (located.node.kind === 'end') {
+      template.flow.splice(located.index, 0, newNode)
+    } else {
+      located.nodes.splice(located.index + 1, 0, newNode)
+    }
+    inserted = true
+  }
+  if (!inserted) {
+    const endIndex = template.flow.findIndex((node) => node.kind === 'end')
+    template.flow.splice(endIndex >= 0 ? endIndex : template.flow.length, 0, newNode)
+  }
+  if (explicit) {
+    newNode.nextIds = []
+    newNode.edgeLabels = {}
+    newNode.edgeRules = {}
+    if (newNode.kind === 'condition') newNode.branches = []
+  }
+  const anchorPosition = approvalGraphPosition(anchor)
+  const world = approvalVisibleWorldRect()
+  const margin = world ? 18 / approvalCanvasState().scale : 0
+  newNode.x = Math.max(0, Number.isFinite(x) ? x : anchorPosition ? anchorPosition.x : 340)
+  newNode.y = Math.max(0, Number.isFinite(y) ? y : anchorPosition ? anchorPosition.y + (anchor.kind === 'end' ? -APPROVAL_GRAPH_LEVEL_GAP : APPROVAL_GRAPH_LEVEL_GAP) : 24)
+  if (world) {
+    newNode.x = Math.min(Math.max(newNode.x, world.left + margin), Math.max(world.left + margin, world.right - APPROVAL_GRAPH_NODE_W - margin))
+    newNode.y = Math.min(Math.max(newNode.y, world.top + margin), Math.max(world.top + margin, world.bottom - APPROVAL_GRAPH_NODE_H - margin))
+  }
+  if (newNode.kind === 'condition') approvalLayoutConditionBranches(newNode)
+  approvalTouchTemplate(template)
+  return newNode
+}
+
+function approvalOpenCanvasMenu(template, shell, event) {
+  const viewport = shell.querySelector('[data-wf-viewport]')
+  if (!viewport) return
+  approvalCloseCanvasMenu()
+  const nodeElement = event.target.closest?.('[data-wf-node]')
+  const edgeElement = event.target.closest?.('[data-wf-edge-group]')
+  const node = nodeElement ? approvalFindNode(template.flow, nodeElement.getAttribute('data-wf-node')) : null
+  const edge = edgeElement
+    ? {
+        from: edgeElement.getAttribute('data-wf-edge-from'),
+        to: edgeElement.getAttribute('data-wf-edge-to'),
+      }
+    : null
+  const point = approvalCanvasWorldPoint(event.clientX, event.clientY)
+  const anchor = node || approvalNearestGraphNode(template.flow, point.x, point.y)
+  const anchorId = anchor?.id || ''
+  const canCreate = !edge && (!node || node.kind !== 'end')
+  const item = (kind, label, note) => `<button type="button" class="wf-menu-item" data-wf-menu-add="${esc(kind)}"><i class="wf-menu-icon">${esc(APPROVAL_NODE_META[kind]?.icon || '＋')}</i><span><strong>${esc(label)}</strong><small>${esc(note)}</small></span></button>`
+  const menu = document.createElement('div')
+  menu.className = 'wf-menu'
+  menu.setAttribute('data-wf-canvas-menu', '1')
+  let headText = '新建节点'
+  if (edge) {
+    const from = approvalFindNode(template.flow, edge.from)
+    const to = approvalFindNode(template.flow, edge.to)
+    headText = `连线：${esc(from?.title || edge.from)} → ${esc(to?.title || edge.to)}`
+  } else if (node?.kind === 'end') {
+    headText = '结束节点'
+  } else if (node) {
+    headText = `在「${esc(node.title)}」附近新建`
+  } else if (anchor) {
+    headText = `在「${esc(anchor.title)}」附近新建`
+  }
+  menu.innerHTML = `<div class="wf-menu-head"><span>${headText}</span><small>右键菜单</small></div>
+    ${canCreate ? item('approval', '审批节点', '部门负责人链 · 或签') + item('cc', '抄送节点', '站内通知 + 钉钉机器人') + item('condition', '条件判断', '按权限风险自动分流') : edge ? '<div class="wf-menu-note">连线可单独设置标签或删除</div>' : '<div class="wf-menu-note">结束节点后不能再添加节点</div>'}
+    ${edge ? `<div class="wf-menu-sep"></div><button type="button" class="wf-menu-item is-danger" data-wf-menu-edge-delete="1"><i class="wf-menu-icon">×</i><span><strong>删除连线</strong><small>${esc(approvalEdgeLabelOf(template, edge.from, edge.to) || '断开这两个节点')}</small></span></button>` : ''}
+    ${node && node.kind !== 'start' && node.kind !== 'end' ? '<div class="wf-menu-sep"></div><button type="button" class="wf-menu-item is-danger" data-wf-menu-delete="1"><i class="wf-menu-icon">×</i><span><strong>删除节点</strong><small>同时清理关联连线</small></span></button>' : ''}
+    <div class="wf-menu-sep"></div>
+    <button type="button" class="wf-menu-item" data-wf-menu-action="layout"><i class="wf-menu-icon">⌗</i><span><strong>自动布局</strong><small>按连线层级重新排布</small></span></button>
+    <button type="button" class="wf-menu-item" data-wf-menu-action="fit"><i class="wf-menu-icon">⛶</i><span><strong>适应画布</strong><small>让全部节点回到视野</small></span></button>`
+  viewport.append(menu)
+  const rect = viewport.getBoundingClientRect()
+  let left = event.clientX - rect.left
+  let top = event.clientY - rect.top
+  const menuRect = menu.getBoundingClientRect()
+  left = Math.min(Math.max(8, left), Math.max(8, viewport.clientWidth - menuRect.width - 8))
+  top = Math.min(Math.max(8, top), Math.max(8, viewport.clientHeight - menuRect.height - 8))
+  menu.style.left = `${left}px`
+  menu.style.top = `${top}px`
+  state.approvalCanvasMenu = {
+    templateId: template.id,
+    anchorId,
+    worldX: point.x,
+    worldY: point.y,
+    edgeFrom: edge?.from || '',
+    edgeTo: edge?.to || '',
+  }
+}
+
+function approvalField(label, body, hint = '') {
+  return `<label class="wf-field"><span>${esc(label)}</span>${body}${hint ? `<small>${esc(hint)}</small>` : ''}</label>`
+}
+
+function approvalReadonly(value, tone = '') {
+  return `<div class="wf-readonly${tone ? ` is-${tone}` : ''}">${esc(value)}</div>`
+}
+
+function approvalBranchEditorHtml(node) {
+  const branches = node.branches || []
+  const hasElse = branches.some((branch) => approvalBranchRuleKey(branch) === 'else')
+  const roles = state.approvalData?.roles || []
+  const branchCards = branches.map((branch) => {
+    const key = approvalBranchRuleKey(branch)
+    const value = String(branch.rule?.value || '')
+    const valueControl =
+      key === 'role'
+        ? `<select class="wf-input" data-wf-branch-value="${esc(branch.id)}">
+            <option value="">选择角色</option>
+            ${roles.map((role) => `<option value="${esc(role.code)}"${value === role.code ? ' selected' : ''}>${esc(role.name || role.code)}</option>`).join('')}
+          </select>`
+        : key === 'dept'
+          ? `<input class="wf-input" data-wf-branch-value="${esc(branch.id)}" value="${esc(value)}" placeholder="部门名称，如 研发部">`
+          : `<span class="wf-rule-hint">${esc(key === 'else' ? '其余情况进入此分支' : '按权限危险级别判断')}</span>`
+    return `<div class="wf-branch-card">
+      <div class="wf-branch-card-head">
+        <input class="wf-input" data-wf-branch-label="${esc(branch.id)}" value="${esc(branch.label)}" aria-label="分支名称">
+        <button type="button" class="wf-mini-btn wf-danger-text" data-wf-branch-del="${esc(branch.id)}" title="删除分支">×</button>
+      </div>
+      <select class="wf-input" data-wf-branch-rule="${esc(branch.id)}" aria-label="分支条件">
+        ${Object.entries(APPROVAL_BRANCH_RULES).map(([ruleKey, rule]) => `<option value="${ruleKey}"${ruleKey === key ? ' selected' : ''}>${esc(rule.label)}</option>`).join('')}
+      </select>
+      ${valueControl}
+      <div class="wf-branch-node-line">
+        <span>${(branch.nodes || []).length} 个节点</span>
+        <button type="button" class="wf-mini-btn" data-wf-branch-node="${esc(branch.id)}">＋审批节点</button>
+      </div>
+    </div>`
+  }).join('')
+  return `<div class="wf-field">
+    <span>条件规则</span>
+    <div class="wf-rule-list">${branchCards || '<div class="wf-rule-empty">暂无分支</div>'}</div>
+    <div class="wf-branch-actions">
+      <button type="button" class="btn ghost wf-branch-action" data-wf-add-branch>＋ 条件</button>
+      <button type="button" class="btn ghost wf-branch-action" data-wf-add-else${hasElse ? ' disabled' : ''}>＋ 否则</button>
+    </div>
+  </div>`
+}
+
+function approvalEdgeRuleKey(rule) {
+  if (!rule) return 'risk_high'
+  return approvalBranchRuleKey({ rule, label: '' })
+}
+
+function approvalRuleValueHtml(key, value, attrs, inputClass = 'wf-input') {
+  if (key === 'role') {
+    const roles = state.approvalData?.roles || []
+    return `<select class="${inputClass}" ${attrs}>
+      <option value="">选择角色</option>
+      ${roles.map((role) => `<option value="${esc(role.code)}"${String(value) === role.code ? ' selected' : ''}>${esc(role.name || role.code)}</option>`).join('')}
+    </select>`
+  }
+  if (key === 'dept') {
+    return `<input class="${inputClass}" ${attrs} value="${esc(value || '')}" placeholder="部门名称，如 研发部">`
+  }
+  return `<span class="wf-rule-hint">${esc(key === 'else' ? '其余情况进入此分支' : '按权限危险级别判断')}</span>`
+}
+
+function approvalEdgeRuleFieldsHtml(key, value, prefix) {
+  return `<select class="wf-input" data-wf-edge-rule="${esc(prefix)}" aria-label="连线条件">
+      ${Object.entries(APPROVAL_BRANCH_RULES).map(([ruleKey, rule]) => `<option value="${ruleKey}"${ruleKey === key ? ' selected' : ''}>${esc(rule.label)}</option>`).join('')}
+    </select>
+    ${approvalRuleValueHtml(key, value, `data-wf-edge-value="${esc(prefix)}"`)}`
+}
+
+function approvalFreeBranchEditorHtml(template, node) {
+  const edges = approvalGraphEdges(template.flow).filter((edge) => edge.from === node.id)
+  const cards = edges.map((edge, index) => {
+    const target = approvalFindNode(template.flow, edge.to)
+    const key = approvalEdgeRuleKey(edge.rule)
+    const prefix = `${edge.from}|${edge.to}`
+    return `<div class="wf-edge-card">
+      <div class="wf-edge-card-head">
+        <span class="wf-edge-index">${index + 1}</span>
+        <input class="wf-input" data-wf-edge-label data-wf-edge-from="${esc(edge.from)}" data-wf-edge-to="${esc(edge.to)}" value="${esc(edge.label || '')}" aria-label="分支名称">
+        <button type="button" class="wf-mini-btn wf-danger-text" data-wf-edge-delete data-wf-edge-from="${esc(edge.from)}" data-wf-edge-to="${esc(edge.to)}" title="删除连线">×</button>
+      </div>
+      ${approvalEdgeRuleFieldsHtml(key, edge.rule?.value, prefix)}
+      <div class="wf-edge-target">→ ${esc(target?.title || edge.to)}</div>
+    </div>`
+  }).join('')
+  return `<div class="wf-field">
+    <span>出线分支 <i class="wf-field-count">${edges.length}</i></span>
+    <div class="wf-rule-list">${cards || '<div class="wf-rule-empty">拖动节点任意一侧的圆点，连接到目标节点即可创建分支</div>'}</div>
+    <div class="wf-edge-tip">自由连线模式 · 建议至少 2 条出线，其中 1 条「否则」兜底</div>
+  </div>`
+}
+
+function approvalEdgeInspectorHtml(template, edge) {
+  const from = approvalFindNode(template.flow, edge.from)
+  const to = approvalFindNode(template.flow, edge.to)
+  if (!from || !to) return approvalInspectorHtml(template, from || to)
+  const key = approvalEdgeRuleKey(edge.rule)
+  const prefix = `${edge.from}|${edge.to}`
+  return `<aside class="wf-inspector">
+    <div class="wf-inspector-head">
+      <div><span>连线属性</span><strong>${esc(from.title)} → ${esc(to.title)}</strong></div>
+      <button type="button" class="wf-icon-btn" data-wf-edge-close title="返回节点属性">×</button>
+    </div>
+    <div class="wf-inspector-body">
+      ${approvalField('连线路径', approvalReadonly(`${from.title} → ${to.title}`, '拖动节点可实时调整连线形态'))}
+      ${approvalField('连线标签', `<input class="wf-input" data-wf-edge-label data-wf-edge-from="${esc(from.id)}" data-wf-edge-to="${esc(to.id)}" value="${esc(edge.label || '')}" placeholder="可选，用于说明这条出线">`)}
+      ${
+        from.kind === 'condition'
+          ? `<div class="wf-field"><span>条件规则</span>${approvalEdgeRuleFieldsHtml(key, edge.rule?.value, prefix)}</div>`
+          : ''
+      }
+      ${approvalField('起点节点', approvalReadonly(from.title, `${APPROVAL_NODE_META[from.kind]?.label || from.kind}节点`))}
+      ${approvalField('终点节点', approvalReadonly(to.title, `${APPROVAL_NODE_META[to.kind]?.label || to.kind}节点`))}
+    </div>
+    <div class="wf-inspector-foot">
+      <button type="button" class="btn ghost wf-danger" data-wf-edge-delete data-wf-edge-from="${esc(from.id)}" data-wf-edge-to="${esc(to.id)}">删除连线</button>
+    </div>
+  </aside>`
+}
+
+function approvalApproverFieldHtml(node) {
+  const source = approvalSourceOf(node)
+  const approvers = approvalApproversOf(node)
+  if (source !== 'members') {
+    const sourceText =
+      source === 'dept_chain'
+        ? '按申请人所在部门逐级向上，最多 10 级'
+        : source === 'manager'
+          ? '只取申请人直属上级'
+          : '固定由公司管理员审批'
+    return `<div class="wf-field"><span>审批人</span>${approvalReadonly(sourceText)}</div>`
+  }
+  return `<div class="wf-field">
+    <span>指定成员</span>
+    <div class="wf-approver-list">
+      ${
+        approvers.length
+          ? approvers
+              .map(
+                (item) =>
+                  `<span class="wf-approver-chip">${esc(item.name)}<button type="button" data-wf-approver-remove="${esc(item.id)}" title="移除">×</button></span>`,
+              )
+              .join('')
+          : '<div class="wf-rule-empty">还没有选择成员</div>'
+      }
+    </div>
+    <button type="button" class="btn ghost wf-wide" data-wf-pick-members>${approvers.length ? '重新选择成员' : '选择成员'}</button>
+  </div>`
+}
+
+function approvalInspectorHtml(template, node) {
+  const meta = APPROVAL_NODE_META[node.kind] || APPROVAL_NODE_META.approval
+  const scopeTotal = (state.approvalData?.scopes || []).length
+  let body = ''
+
+  if (node.kind === 'start') {
+    body = `${approvalField('可申请权限', approvalReadonly(`全部已登记权限点 · ${scopeTotal || 0} 项`))}
+      ${approvalField('申请角色', approvalReadonly(template.roleMode || '全部员工角色'), '角色只作为审批策略上下文，不作为授权落点')}
+      ${approvalField('适用范围', approvalReadonly(template.scopeMode || '全部权限点'))}
+      ${approvalField('必填信息', approvalReadonly('权限用途、期望有效期、审批路径预览'))}`
+  } else if (node.kind === 'condition') {
+    body = `${approvalField('条件名称', `<input class="wf-input" data-wf-field="title" value="${esc(node.title)}">`)}
+      ${approvalHasExplicitLinks(template.flow) ? approvalFreeBranchEditorHtml(template, node) : approvalBranchEditorHtml(node)}
+      ${approvalField('判定方式', approvalReadonly(approvalHasExplicitLinks(template.flow) ? '按出线顺序匹配条件，命中后只走对应连线' : '从上到下命中第一个条件后停止'), '需要兜底分支时，把其中一条出线设为「其他情况」')}`
+  } else if (node.kind === 'approval') {
+    const modes = ['或签', '会签', '依次审批']
+    const source = approvalSourceOf(node)
+    const mode = approvalModeOf(node)
+    body = `${approvalField('节点名称', `<input class="wf-input" data-wf-field="title" value="${esc(node.title)}">`)}
+      ${approvalField('审批人来源', `<select class="wf-input" data-wf-field="source">
+        ${Object.entries(APPROVAL_SOURCES).map(([key, item]) => `<option value="${esc(key)}"${source === key ? ' selected' : ''}>${esc(item.label)}</option>`).join('')}
+      </select>`)}
+      ${approvalApproverFieldHtml(node)}
+      <div class="wf-field"><span>审批方式</span><div class="wf-segment">${modes.map((item) => `<button type="button" class="wf-segment-btn${mode === item ? ' is-active' : ''}" data-wf-mode="${esc(item)}">${esc(item)}</button>`).join('')}</div></div>
+      <div class="wf-field-row">
+        ${approvalField('处理时限', `<input class="wf-input" type="number" min="1" max="720" value="${Number(node.timeoutHours) || 72}" data-wf-field="timeoutHours"><span class="wf-unit">小时</span>`)}
+        ${approvalField('超时动作', `<select class="wf-input" data-wf-field="timeoutAction">
+          <option value="remind"${node.timeoutAction === 'remind' || !node.timeoutAction ? ' selected' : ''}>提醒审批人</option>
+          <option value="approve"${node.timeoutAction === 'approve' ? ' selected' : ''}>自动通过</option>
+          <option value="reject"${node.timeoutAction === 'reject' ? ' selected' : ''}>自动拒绝</option>
+        </select>`)}
+      </div>
+      <div class="wf-toggle-list">
+        <label class="wf-toggle"><span>允许审批人转交</span><input type="checkbox" data-wf-toggle="allowTransfer"${node.allowTransfer !== false ? ' checked' : ''}></label>
+        <label class="wf-toggle"><span>允许审批人加签</span><input type="checkbox" data-wf-toggle="allowAddSign"${node.allowAddSign !== false ? ' checked' : ''}></label>
+        <label class="wf-toggle"><span>审批人空缺时由公司管理员兜底</span><input type="checkbox" data-wf-toggle="fallbackAdmin"${node.fallbackAdmin !== false ? ' checked' : ''}></label>
+      </div>
+      ${approvalField('节点说明', `<textarea class="wf-input wf-textarea" data-wf-field="desc">${esc(node.desc || '')}</textarea>`)}`
+  } else if (node.kind === 'cc') {
+    body = `${approvalField('节点名称', `<input class="wf-input" data-wf-field="title" value="${esc(node.title)}">`)}
+      ${approvalField('抄送对象', `<select class="wf-input"><option>申请人直属上级</option><option>部门负责人</option><option>公司管理员</option><option>指定成员</option></select>`)}
+      ${approvalField('通知渠道', approvalReadonly('对话页通知 + 钉钉机器人卡片'), '审批结束、撤回、超时都沿用同一通知模板')}
+      ${approvalField('通知模板', `<textarea class="wf-input wf-textarea">你申请的「{{scopeSummary}}」已进入「{{nodeName}}」，点击查看详情。</textarea>`)}`
+  } else {
+    body = `${approvalField('通过后动作', approvalReadonly('写入个人权限，不改动角色', '只给申请人本人授权；普通员工角色不会被批量放开'))}
+      ${approvalField('拒绝 / 超时', approvalReadonly('通知申请人，并记录审批意见'))}
+      ${approvalField('授权有效期', approvalReadonly('跟随申请填写，最长 30 天'))}
+      ${approvalField('审计', approvalReadonly('记录申请人、审批人、权限点与有效期'))}`
+  }
+
+  return `<aside class="wf-inspector">
+    <div class="wf-inspector-head">
+      <div><span>节点属性</span><strong>${esc(meta.label)}</strong></div>
+      <span class="wf-kind-dot is-${esc(node.kind)}"></span>
+    </div>
+    <div class="wf-inspector-body">${body}</div>
+    <div class="wf-inspector-foot">
+      ${node.kind === 'start' || node.kind === 'end' ? '<span class="muted">开始与结束节点不可删除</span>' : '<button type="button" class="btn ghost wf-danger" data-wf-delete>删除节点</button>'}
+    </div>
+  </aside>`
+}
+
+function approvalDefaultPolicy() {
+  const stored = state.approvalData?.defaultPolicy
+  return stored && typeof stored === 'object'
+    ? stored
+    : { id: null, maxLevels: 3, includeCompanyAdmin: true, timeoutHours: 72, approverStrategy: 'dept_chain' }
+}
+
+function openApprovalDefaultPolicyModal() {
+  const policy = approvalDefaultPolicy()
+  const overlay = modelModal(`
+    <div class="modal-head"><h3>默认审批链</h3><button class="modal-x" type="button">×</button></div>
+    <div class="field-stack">
+      <label class="field"><span>审批级数</span><input id="ap-default-levels" type="number" min="1" max="10" value="${Number(policy.maxLevels) || 3}" /><small>未单独配置的权限点最多经过几级审批</small></label>
+      <label class="field"><span>处理时限</span><input id="ap-default-timeout" type="number" min="1" max="720" value="${Number(policy.timeoutHours) || 72}" /><small>单位小时，超时后提醒审批人</small></label>
+      <label class="check"><input id="ap-default-admin" type="checkbox"${policy.includeCompanyAdmin ? ' checked' : ''} /><span>公司管理员兜底</span></label>
+    </div>
+    <div class="modal-actions"><button class="btn ghost" type="button" id="ap-default-cancel">取消</button><button class="btn primary" type="button" id="ap-default-save">保存</button></div>
+  `)
+  overlay.querySelector('.modal-x')?.addEventListener('click', () => overlay.remove())
+  overlay.querySelector('#ap-default-cancel')?.addEventListener('click', () => overlay.remove())
+  overlay.querySelector('#ap-default-save')?.addEventListener('click', async (event) => {
+    const button = event.currentTarget
+    const levels = Math.min(10, Math.max(1, Math.trunc(Number(overlay.querySelector('#ap-default-levels')?.value) || 3)))
+    const timeoutHours = Math.min(720, Math.max(1, Math.trunc(Number(overlay.querySelector('#ap-default-timeout')?.value) || 72)))
+    const includeCompanyAdmin = Boolean(overlay.querySelector('#ap-default-admin')?.checked)
+    button.disabled = true
+    try {
+      await apiSend('POST', '/api/console/permission-policies', {
+        targetType: 'default',
+        targetKey: 'default',
+        maxLevels: levels,
+        timeoutHours,
+        includeCompanyAdmin,
+        approverStrategy: 'dept_chain',
+      })
+      state.approvalData = {
+        ...(state.approvalData || {}),
+        defaultPolicy: {
+          id: policy.id || null,
+          maxLevels: levels,
+          includeCompanyAdmin,
+          timeoutHours,
+          approverStrategy: 'dept_chain',
+        },
+      }
+      overlay.remove()
+      approvalRerender()
+      showTopToast('默认审批链已保存')
+    } catch (err) {
+      button.disabled = false
+      showTopToast(err?.message || '保存失败')
+    }
+  })
+}
+
+function approvalUpdatedText(value) {
+  if (typeof value === 'string') return value
+  const ts = Number(value)
+  if (!Number.isFinite(ts) || ts <= 0) return ''
+  const date = new Date(ts)
+  const now = new Date()
+  const sameDay = date.toDateString() === now.toDateString()
+  const time = `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`
+  if (sameDay) return `今天 ${time}`
+  return `${date.getMonth() + 1}-${date.getDate()} ${time}`
+}
+
+function approvalWorkflowStatusText(template) {
+  if (template.status === 'published') return '已发布'
+  if (template.status === 'disabled') return '已停用'
+  return '草稿'
+}
+
+function approvalTouchTemplate(template) {
+  if (!template) return
+  template.status = 'draft'
+  template.updatedAt = Date.now()
+}
+
+async function loadApprovalMembers() {
+  if (Array.isArray(state.approvalMembers)) return state.approvalMembers
+  const data = await api('/api/org/members')
+  state.approvalMembers = Array.isArray(data.members) ? data.members : []
+  return state.approvalMembers
+}
+
+async function openApprovalApproverPicker() {
+  const template = approvalTemplateOf()
+  const node = approvalFindNode(template?.flow, state.approvalNodeId)
+  if (!template || node?.kind !== 'approval') return
+  let members = []
+  try {
+    members = await loadApprovalMembers()
+  } catch (err) {
+    showTopToast(err?.message || '读取成员失败')
+    return
+  }
+  if (!members.length) {
+    showTopToast('当前公司还没有成员')
+    return
+  }
+  const selected = new Set(approvalApproversOf(node).map((item) => item.id))
+  const memberRows = members
+    .map((member) => {
+      const search = `${member.name} ${member.title || ''} ${member.deptName || ''} ${member.employeeNo || ''}`.toLowerCase()
+      return `<label class="scope-check wf-member-row" data-wf-member-row data-search="${esc(search)}">
+        <input type="checkbox" data-wf-approver="${esc(member.id)}"${selected.has(member.id) ? ' checked' : ''}>
+        <span class="wf-member-copy"><strong>${esc(member.name)}</strong><small>${esc([member.deptName, member.title].filter(Boolean).join(' · '))}</small></span>
+      </label>`
+    })
+    .join('')
+  const overlay = modelModal(`
+    <div class="modal-head"><h3>选择审批成员</h3><button class="modal-x" type="button">×</button></div>
+    <div class="ap-search wf-member-search"><span aria-hidden="true">⌕</span><input id="wf-member-query" placeholder="搜索姓名、部门或工号"></div>
+    <div class="scope-groups wf-member-groups"><div class="scope-group">${memberRows}</div></div>
+    <div class="modal-state" id="wf-member-state"></div>
+    <div class="modal-actions">
+      <span class="wf-member-count" id="wf-member-count">已选 0 人</span>
+      <button class="btn ghost" type="button" id="wf-member-cancel">取消</button>
+      <button class="btn primary" type="button" id="wf-member-save" disabled>确定</button>
+    </div>
+  `)
+  overlay.querySelector('.modal')?.classList.add('wf-member-modal')
+  const close = () => overlay.remove()
+  overlay.querySelector('.modal-x')?.addEventListener('click', close)
+  overlay.querySelector('#wf-member-cancel')?.addEventListener('click', close)
+  const saveButton = overlay.querySelector('#wf-member-save')
+  const countLabel = overlay.querySelector('#wf-member-count')
+  const boxes = [...overlay.querySelectorAll('[data-wf-approver]')]
+  const sync = () => {
+    const count = boxes.filter((box) => box.checked).length
+    if (countLabel) countLabel.textContent = `已选 ${count} 人`
+    if (saveButton) {
+      saveButton.disabled = count === 0
+      saveButton.textContent = count ? `确定 · ${count} 人` : '确定'
+    }
+  }
+  for (const box of boxes) box.addEventListener('change', sync)
+  overlay.querySelector('#wf-member-query')?.addEventListener('input', (event) => {
+    const query = String(event.target.value || '').trim().toLowerCase()
+    for (const row of overlay.querySelectorAll('[data-wf-member-row]')) {
+      row.hidden = Boolean(query) && !String(row.getAttribute('data-search') || '').includes(query)
+    }
+  })
+  sync()
+  saveButton?.addEventListener('click', () => {
+    const picked = boxes
+      .filter((box) => box.checked)
+      .map((box) => members.find((member) => member.id === box.getAttribute('data-wf-approver')))
+      .filter(Boolean)
+      .map((member) => ({ id: member.id, name: member.name }))
+    if (!picked.length) return
+    node.approvers = picked
+    node.source = 'members'
+    node.desc = approvalNodeSummary(node)
+    approvalTouchTemplate(template)
+    close()
+    approvalRerender()
+    showTopToast(`已选择 ${picked.length} 名审批成员`)
+  })
+}
+
+function openApprovalWorkflowDeleteModal(template) {
+  if (!template) return
+  const overlay = modelModal(`
+    <div class="modal-head"><h3>删除流程模板</h3><button class="modal-x" type="button">×</button></div>
+    <div class="wf-delete-copy">确认删除「${esc(template.name)}」？流程会从列表中移除，已发布的版本记录仍保留在数据库中。</div>
+    <div class="modal-state" id="wf-delete-state"></div>
+    <div class="modal-actions">
+      <button class="btn ghost" type="button" id="wf-delete-cancel">取消</button>
+      <button class="btn danger" type="button" id="wf-delete-confirm">删除</button>
+    </div>
+  `)
+  const close = () => overlay.remove()
+  overlay.querySelector('.modal-x')?.addEventListener('click', close)
+  overlay.querySelector('#wf-delete-cancel')?.addEventListener('click', close)
+  overlay.querySelector('#wf-delete-confirm')?.addEventListener('click', async (event) => {
+    const button = event.currentTarget
+    button.disabled = true
+    button.textContent = '删除中…'
+    try {
+      await apiSend('DELETE', `/api/console/approval-workflows/${encodeURIComponent(template.id)}`)
+      state.approvalTemplates = approvalTemplatesOf().filter((item) => item.id !== template.id)
+      const activeStillMore = state.approvalTemplates.find((item) => item.id === state.approvalTemplateId)
+      const next = activeStillMore || state.approvalTemplates[0] || null
+      const activeDeleted = template.id === state.approvalTemplateId
+      state.approvalTemplateId = next?.id || ''
+      if (activeDeleted) state.approvalNodeId = next?.flow?.[0]?.id || 'start'
+      close()
+      approvalRerender()
+      showTopToast(`「${template.name}」已删除`)
+    } catch (err) {
+      button.disabled = false
+      button.textContent = '删除'
+      const stateEl = overlay.querySelector('#wf-delete-state')
+      if (stateEl) {
+        stateEl.className = 'modal-state bad'
+        stateEl.textContent = err?.message || '删除失败'
+      }
+    }
+  })
+}
+
+async function approvalSaveTemplate(template, button) {
+  if (!template) throw new Error('请先选择流程模板')
+  if (button) button.disabled = true
+  try {
+    const data = await apiSend('POST', '/api/console/approval-workflows', approvalWorkflowPayload(template))
+    approvalApplyWorkflow(data.workflow)
+    approvalRerender()
+    showTopToast(`「${data.workflow.name}」草稿已保存`)
+    return data.workflow
+  } catch (err) {
+    if (button) button.disabled = false
+    throw err
+  }
+}
+
+async function approvalPublishTemplate(template, button) {
+  if (!template) throw new Error('请先选择流程模板')
+  if (button) button.disabled = true
+  try {
+    const data = await apiSend('POST', `/api/console/approval-workflows/${encodeURIComponent(template.id)}/publish`, {
+      flow: template.flow,
+    })
+    approvalApplyWorkflow(data.workflow)
+    approvalRerender()
+    showTopToast(`「${data.workflow.name}」已发布 v${data.workflow.version}`)
+    return data.workflow
+  } catch (err) {
+    if (button) button.disabled = false
+    throw err
+  }
+}
+
+function openApprovalWorkflowCreateModal() {
+  const overlay = modelModal(`
+    <div class="modal-head"><h3>新建流程模板</h3><button class="modal-x" type="button">×</button></div>
+    <div class="field-stack">
+      <label class="field"><span>流程名称</span><input id="ap-workflow-name" maxlength="80" placeholder="例如：高敏权限复核流程" /><small>发布后名称仍可修改</small></label>
+      <label class="field"><span>流程说明</span><textarea id="ap-workflow-desc" rows="3" maxlength="500" placeholder="说明这个流程覆盖哪些权限点"></textarea></label>
+    </div>
+    <div class="modal-actions"><button class="btn ghost" type="button" id="ap-workflow-cancel">取消</button><button class="btn primary" type="button" id="ap-workflow-create">创建</button></div>
+  `)
+  overlay.querySelector('.modal-x')?.addEventListener('click', () => overlay.remove())
+  overlay.querySelector('#ap-workflow-cancel')?.addEventListener('click', () => overlay.remove())
+  overlay.querySelector('#ap-workflow-create')?.addEventListener('click', async (event) => {
+    const button = event.currentTarget
+    const name = String(overlay.querySelector('#ap-workflow-name')?.value || '').trim()
+    const description = String(overlay.querySelector('#ap-workflow-desc')?.value || '').trim()
+    if (!name) {
+      showTopToast('请输入流程名称')
+      return
+    }
+    button.disabled = true
+    try {
+      const data = await apiSend('POST', '/api/console/approval-workflows', {
+        name,
+        description,
+        scopeMode: '全部权限点',
+        roleMode: '全部员工角色',
+        flow: [
+          { id: 'start', kind: 'start', title: '发起申请', desc: '全部权限点 · 至少选择 1 项', meta: '申请人本人' },
+          { id: 'a_dept', kind: 'approval', title: '部门负责人审批', desc: '部门负责人链 · 最多 10 级 · 72 小时', meta: '或签', mode: '或签', source: 'dept_chain', timeoutHours: 72 },
+          { id: 'end', kind: 'end', title: '结束', desc: '通过：个人授权 / 拒绝：通知申请人', meta: '结束' },
+        ],
+      })
+      overlay.remove()
+      approvalApplyWorkflow(data.workflow)
+      state.approvalNodeId = data.workflow.flow?.[0]?.id || 'start'
+      approvalRerender()
+      showTopToast(`「${data.workflow.name}」已创建`)
+    } catch (err) {
+      button.disabled = false
+      showTopToast(err?.message || '创建失败')
+    }
+  })
+}
+
+function approvalDesignHtml() {
+  const templates = approvalTemplatesOf()
+  const template = approvalTemplateOf()
+  if (!template) {
+    return `<div class="wf-shell">
+      <aside class="wf-rail">
+        <div class="wf-rail-head"><span>流程模板</span><button type="button" class="wf-icon-btn" data-wf-new title="新建流程">＋</button></div>
+        <div class="wf-empty-rail">还没有流程模板</div>
+      </aside>
+      <main class="wf-canvas"><div class="wf-empty">当前公司还没有流程模板<br><button type="button" class="btn primary" data-wf-new>新建流程</button></div></main>
+    </div>`
+  }
+  const node = approvalFindNode(template.flow, state.approvalNodeId) || approvalFindNode(template.flow, 'start') || template.flow[0]
+  if (node && node.id !== state.approvalNodeId) state.approvalNodeId = node.id
+  approvalEnsureGraphLayout(template.flow)
+  const bounds = approvalGraphBounds(template.flow)
+  const stageWidth = Math.max(1280, bounds.maxX + 320)
+  const stageHeight = Math.max(780, bounds.maxY + 280)
+  const published = template.status === 'published'
+  const explicit = approvalHasExplicitLinks(template.flow)
+  const selectedEdge =
+    state.approvalEdgeFrom && state.approvalEdgeTo
+      ? approvalGraphEdges(template.flow).find(
+          (edge) => edge.from === state.approvalEdgeFrom && edge.to === state.approvalEdgeTo,
+        ) || null
+      : null
+  if (!selectedEdge) {
+    state.approvalEdgeFrom = ''
+    state.approvalEdgeTo = ''
+  }
+  const rightPanel = selectedEdge
+    ? approvalEdgeInspectorHtml(template, selectedEdge)
+    : approvalInspectorHtml(template, node)
+  return `<div class="wf-shell${state.approvalFocus ? ' is-focus' : ''}">
+    <aside class="wf-rail">
+      <div class="wf-rail-head"><span>流程模板</span><button type="button" class="wf-icon-btn" data-wf-new title="新建流程">＋</button></div>
+      <div class="wf-rail-list">
+        ${templates.map((item) => `<div class="wf-template-item${item.id === template.id ? ' is-active' : ''}">
+          <button type="button" class="wf-template${item.id === template.id ? ' is-active' : ''}" data-wf-template="${esc(item.id)}">
+            <span class="wf-template-top"><strong>${esc(item.name)}</strong><span class="ap-status is-${item.status === 'published' ? 'approved' : 'draft'}">${approvalWorkflowStatusText(item)}</span></span>
+            <span class="wf-template-meta">${esc(item.scopeMode || '全部权限点')} · ${approvalCountNodes(item.flow)} 个节点</span>
+            <span class="wf-template-time">${esc(approvalUpdatedText(item.updatedAt))}${(item.draftVersion || item.version) ? ` · v${item.draftVersion || item.version}` : ''}</span>
+          </button>
+          <button type="button" class="wf-template-del" data-wf-delete-template="${esc(item.id)}" title="删除流程模板" aria-label="删除${esc(item.name)}">×</button>
+        </div>`).join('')}
+      </div>
+      <div class="wf-rail-foot"><span>共 ${templates.length} 个模板</span><span>已接入服务端</span></div>
+    </aside>
+    <main class="wf-canvas">
+      <div class="wf-canvas-bar">
+        <div class="wf-canvas-title">
+          <strong>${esc(template.name)}</strong>
+          <span class="ap-status is-${published ? 'approved' : 'draft'}">${approvalWorkflowStatusText(template)}</span>
+          <span class="wf-mode-badge${explicit ? ' is-free' : ''}">${explicit ? '自由连线' : '链式流程'}</span>
+        </div>
+        <div class="wf-canvas-tools">
+          <select class="wf-add-select" data-wf-add-kind aria-label="新增节点类型">
+            <option value="approval">审批节点</option>
+            <option value="condition">条件判断</option>
+            <option value="cc">抄送节点</option>
+          </select>
+          <button type="button" class="btn ghost" data-wf-add>添加节点</button>
+          <button type="button" class="btn ghost wf-tool-btn" data-wf-layout title="按连线关系自动分层布局"><span class="wf-tool-icon">⌗</span>自动布局</button>
+          <button type="button" class="btn ghost wf-tool-btn" data-wf-check><span class="wf-tool-icon">✓</span>校验</button>
+          <button type="button" class="btn ghost wf-tool-btn${state.approvalFocus ? ' is-active' : ''}" data-wf-focus title="${state.approvalFocus ? '退出专注画布' : '隐藏两侧栏，专注画布'}"><span class="wf-tool-icon">⤢</span>${state.approvalFocus ? '退出专注' : '专注画布'}</button>
+        </div>
+      </div>
+      <div class="wf-viewport" data-wf-viewport>
+        <div class="wf-stage" data-wf-stage style="width:${Math.round(stageWidth)}px;height:${Math.round(stageHeight)}px">${approvalFlowHtml(template, selectedEdge ? '' : state.approvalNodeId, selectedEdge)}</div>
+        <div class="wf-canvas-hint"><strong>四向圆点连线 · 选中线拖端点重连</strong><span>右键新建节点 · 滚轮缩放 · 拖到空白删除并可撤销</span></div>
+        <div class="wf-canvas-dock">
+          <div class="wf-zoom-group" aria-label="画布缩放">
+            <button type="button" class="wf-zoom-btn" data-wf-zoom="out" title="缩小画布" aria-label="缩小画布">−</button>
+            <span data-wf-zoom-label>100%</span>
+            <button type="button" class="wf-zoom-btn" data-wf-zoom="in" title="放大画布" aria-label="放大画布">＋</button>
+            <span class="wf-zoom-divider"></span>
+            <button type="button" class="wf-zoom-btn" data-wf-zoom="fit" title="适应画布" aria-label="适应画布">⛶</button>
+          </div>
+        </div>
+      </div>
+      ${Array.isArray(template.validation) && template.validation.length ? `<div class="wf-canvas-note is-error">${esc(template.validation.slice(0, 3).join(' · '))}</div>` : ''}
+    </main>
+    ${rightPanel}
+  </div>`
+}
+
+function approvalRecordsOf() {
+  if (!Array.isArray(state.approvalRecords) || !state.approvalRecords.length) {
+    state.approvalRecords = [
+      { id: 'AP-20261119-014', requester: '张辉权', dept: '技术部', role: '普通员工', scopes: ['知识库导出', '智能体工具调用'], status: 'pending', submittedAt: '今天 10:12', currentNode: '部门负责人审批', progress: 1, todo: true, mine: false },
+      { id: 'AP-20261119-013', requester: '李鹏', dept: '信息中心', role: '公司管理员', scopes: ['成员资料编辑', '角色权限配置'], status: 'pending', submittedAt: '今天 09:48', currentNode: '平台超管复核', progress: 2, todo: false, mine: true },
+      { id: 'AP-20261119-011', requester: '王雪', dept: '市场部', role: '普通员工', scopes: ['知识库导出'], status: 'approved', submittedAt: '今天 08:35', currentNode: '已完成', progress: 3, todo: false, mine: false },
+      { id: 'AP-20261118-008', requester: '陈默', dept: '运维部', role: '部门管理员', scopes: ['外部数据源连接'], status: 'rejected', submittedAt: '昨天 16:20', currentNode: '公司管理员终审', progress: 2, todo: false, mine: false },
+      { id: 'AP-20261118-006', requester: '赵一鸣', dept: '产品部', role: '普通员工', scopes: ['智能体创建', '知识库编辑'], status: 'expired', submittedAt: '昨天 14:02', currentNode: '部门负责人审批超时', progress: 1, todo: false, mine: false },
+      { id: 'AP-20261117-003', requester: '李鹏', dept: '信息中心', role: '公司管理员', scopes: ['审计日志查看'], status: 'approved', submittedAt: '11-17 17:10', currentNode: '已完成', progress: 3, todo: false, mine: true },
+    ]
+  }
+  return state.approvalRecords
+}
+
+function approvalRecordsHtml() {
+  const records = approvalRecordsOf()
+  const tabs = [
+    { id: 'todo', label: '待我审批', count: records.filter((item) => item.todo && item.status === 'pending').length },
+    { id: 'mine', label: '我发起的', count: records.filter((item) => item.mine).length },
+    { id: 'all', label: '全部记录', count: records.length },
+  ]
+  const tab = tabs.find((item) => item.id === state.approvalRecordTab) || tabs[0]
+  const filtered = records.filter((item) => {
+    if (tab.id === 'todo') return item.todo && item.status === 'pending'
+    if (tab.id === 'mine') return item.mine
+    return true
+  })
+  const selected = filtered.find((item) => item.id === state.approvalRecordId) || null
+  const pendingCount = records.filter((item) => item.status === 'pending').length
+  const approvedCount = records.filter((item) => item.status === 'approved').length
+  const todayCount = records.filter((item) => String(item.submittedAt).startsWith('今天')).length
+  return `<div class="ap-records${selected ? ' has-detail' : ''}">
+    <div class="ap-records-main">
+      <div class="ap-stat-row">
+        <div class="ap-stat"><span>今日申请</span><strong>${todayCount}</strong><small>较昨日 +2</small></div>
+        <div class="ap-stat"><span>审批中</span><strong>${pendingCount}</strong><small>平均 6.2 小时</small></div>
+        <div class="ap-stat"><span>已通过</span><strong>${approvedCount}</strong><small>本周通过率 82%</small></div>
+        <div class="ap-stat"><span>超时</span><strong>${records.filter((item) => item.status === 'expired').length}</strong><small>自动提醒申请人</small></div>
+      </div>
+      <div class="ap-filter-row">
+        <div class="ap-tabs">${tabs.map((item) => `<button type="button" class="ap-tab${tab.id === item.id ? ' is-active' : ''}" data-ap-record-tab="${esc(item.id)}">${esc(item.label)}<span>${item.count}</span></button>`).join('')}</div>
+        <div class="ap-search"><span aria-hidden="true">⌕</span><input data-ap-record-search placeholder="搜索申请人、权限点或单号" value="${esc(state.approvalRecordQuery)}"></div>
+      </div>
+      <div class="ap-table-wrap">
+        <table class="ap-table">
+          <thead><tr><th>申请单</th><th>申请人</th><th>申请权限</th><th>当前节点</th><th>状态</th><th>提交时间</th></tr></thead>
+          <tbody>
+            ${filtered.map((item) => `<tr data-ap-record-row="${esc(item.id)}" data-search="${esc(`${item.id} ${item.requester} ${item.dept} ${item.scopes.join(' ')} ${item.currentNode}`)}" class="${selected?.id === item.id ? 'is-selected' : ''}">
+              <td><strong class="ap-mono">${esc(item.id)}</strong><small>${esc(item.role)}</small></td>
+              <td><strong>${esc(item.requester)}</strong><small>${esc(item.dept)}</small></td>
+              <td><div class="ap-scope-cell">${item.scopes.slice(0, 2).map((scope) => `<span>${esc(scope)}</span>`).join('')}${item.scopes.length > 2 ? `<em>+${item.scopes.length - 2}</em>` : ''}</div></td>
+              <td>${esc(item.currentNode)}<div class="ap-progress"><span style="width:${Math.min(100, (item.progress / 3) * 100)}%"></span></div></td>
+              <td>${approvalStatusPill(item.status)}</td>
+              <td><span class="ap-time">${esc(item.submittedAt)}</span></td>
+            </tr>`).join('') || '<tr><td colspan="6" class="ap-empty-cell">当前筛选下没有审批记录</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+      <div class="ap-table-foot"><span>展示 ${filtered.length} 条 · 示例数据</span><span>所有审批结果都会通知申请人</span></div>
+    </div>
+    ${selected ? approvalRecordDetailHtml(selected) : ''}
+  </div>`
+}
+
+function approvalRecordDetailHtml(record) {
+  const step2Done = record.progress >= 2
+  const step2Active = record.status === 'pending' && record.progress === 1
+  const step2Desc = record.status === 'rejected' && !step2Done
+    ? '已拒绝 · 权限范围过大'
+    : record.status === 'expired'
+      ? '已超时 · 系统提醒'
+      : step2Done
+        ? '已通过 · 8 分钟'
+        : step2Active
+          ? '等待审批 · 已等待 3 小时'
+          : '等待上一节点'
+  const steps = [
+    { title: '提交申请', desc: `${record.requester} · ${record.submittedAt}`, done: true },
+    { title: '部门负责人审批', desc: step2Desc, done: step2Done, active: step2Active },
+    { title: '公司管理员终审', desc: record.progress >= 3 ? '已通过' : record.status === 'rejected' ? '已拒绝' : '等待上一节点', done: record.progress >= 3 },
+    { title: '个人权限生效', desc: record.status === 'approved' ? '已写入本人权限' : '审批通过后写入', done: record.status === 'approved' },
+  ]
+  return `<aside class="ap-detail">
+    <div class="ap-detail-head">
+      <div><span>申请详情</span><strong class="ap-mono">${esc(record.id)}</strong></div>
+      <button type="button" class="wf-icon-btn" data-ap-record-close aria-label="关闭详情">×</button>
+    </div>
+    <div class="ap-detail-body">
+      <div class="ap-detail-hero">
+        <div><strong>${esc(record.requester)}</strong><span>${esc(record.dept)} · ${esc(record.role)}</span></div>
+        ${approvalStatusPill(record.status)}
+      </div>
+      <div class="ap-detail-section"><span>申请权限</span><div class="ap-detail-scopes">${record.scopes.map((scope) => `<span>${esc(scope)}</span>`).join('')}</div></div>
+      <div class="ap-detail-section"><span>授权方式</span><div class="ap-detail-note">仅授予申请人本人，不改动角色；有效期 7 天。</div></div>
+      <div class="ap-detail-section"><span>审批进度</span>
+        <div class="ap-timeline">${steps.map((step) => `<div class="ap-timeline-step${step.done ? ' is-done' : ''}${step.active ? ' is-active' : ''}"><i></i><div><strong>${esc(step.title)}</strong><small>${esc(step.desc)}</small></div></div>`).join('')}</div>
+      </div>
+      <div class="ap-detail-section"><span>审批意见</span><div class="ap-detail-quote">${record.status === 'pending' ? '暂无审批意见，等待当前节点处理。' : record.status === 'rejected' ? '申请范围超出岗位职责，请拆分后重新提交。' : record.status === 'expired' ? '审批超时，系统已通知申请人重新提交。' : '权限用途明确，同意在有效期内使用。'}</div></div>
+    </div>
+    <div class="ap-detail-foot">
+      ${record.status === 'pending' && record.todo ? `<button type="button" class="btn" data-ap-record-reject>拒绝</button><button type="button" class="btn primary" data-ap-record-approve>同意</button>` : '<span class="muted">该记录已结束</span>'}
+    </div>
+  </aside>`
+}
+
+function approvalCatalogRows() {
+  const data = state.approvalData || {}
+  const scopes = data.scopes || []
+  const policies = data.policies || []
+  const query = String(state.approvalCatalogQuery || '').trim().toLowerCase()
+  const filter = state.approvalCatalogFilter
+  const groups = new Map()
+  for (const item of scopes) {
+    if (filter === 'danger' && !item.dangerous) continue
+    if (filter === 'unconfigured' && policies.some((policy) => policy.targetType === 'scope' && policy.targetKey === item.scope)) continue
+    if (query && !`${item.label} ${item.group} ${item.scope}`.toLowerCase().includes(query)) continue
+    const group = item.group || '其他权限'
+    const list = groups.get(group) || []
+    list.push(item)
+    groups.set(group, list)
+  }
+  if (!groups.size) return '<div class="ap-catalog-empty">没有匹配的权限点</div>'
+  return [...groups.entries()].map(([group, items]) => {
+    const configured = items.filter((item) => policies.some((policy) => policy.targetType === 'scope' && policy.targetKey === item.scope)).length
+    return `<div class="ap-catalog-group">
+      <div class="ap-catalog-group-head"><strong>${esc(group)}</strong><span>${items.length} 项 · ${configured} 项已配置策略</span></div>
+      <div class="ap-catalog-list">
+        ${items.map((item) => {
+          const scoped = policies.some((policy) => policy.targetType === 'scope' && policy.targetKey === item.scope)
+          return `<div class="ap-catalog-row">
+          <div class="ap-catalog-main"><strong>${esc(item.label)}</strong><span class="ap-mono">${esc(item.scope)}</span></div>
+          ${item.dangerous ? '<span class="ap-danger">高危</span>' : ''}
+          <span class="ap-catalog-policy">${scoped ? '已配置审批策略' : '默认审批链'}</span>
+          <button type="button" class="btn ghost ap-catalog-action" data-ap-catalog-flow="${esc(item.dangerous ? 'sensitive' : 'default')}">查看流程</button>
+        </div>`}).join('')}
+      </div>
+    </div>`
+  }).join('')
+}
+
+function approvalCatalogHtml() {
+  const scopes = state.approvalData?.scopes || []
+  const groups = new Set(scopes.map((item) => item.group || '其他权限')).size
+  return `<div class="ap-catalog">
+    <div class="ap-catalog-top">
+      <div>
+        <strong>全量权限目录</strong>
+        <span>${scopes.length} 个权限点 · ${groups} 个分组 · 审批通过后只授予申请人本人</span>
+      </div>
+      <div class="ap-filter">
+        <button type="button" class="ap-filter-btn${state.approvalCatalogFilter === 'all' ? ' is-active' : ''}" data-ap-catalog-filter="all">全部</button>
+        <button type="button" class="ap-filter-btn${state.approvalCatalogFilter === 'danger' ? ' is-active' : ''}" data-ap-catalog-filter="danger">仅高危</button>
+        <button type="button" class="ap-filter-btn${state.approvalCatalogFilter === 'unconfigured' ? ' is-active' : ''}" data-ap-catalog-filter="unconfigured">未单独配置</button>
+        <div class="ap-search"><span aria-hidden="true">⌕</span><input data-ap-catalog-search placeholder="搜索权限名称或标识" value="${esc(state.approvalCatalogQuery)}"></div>
+      </div>
+    </div>
+    <div class="ap-catalog-body">${approvalCatalogRows()}</div>
+    <div class="ap-catalog-foot"><span>权限点来自 domain scope registry</span><span>流程模板与审批记录仍为前端示例数据</span></div>
+  </div>`
+}
+
+function renderApprovalPage() {
+  const view = $('#view')
+  if (!view) return
+  const tab = state.approvalTab || 'design'
+  const tabs = [
+    { id: 'design', label: '流程设计', count: '' },
+    { id: 'records', label: '审批记录', count: (state.approvalRecords || approvalRecordsOf()).length },
+    { id: 'catalog', label: '权限目录', count: (state.approvalData?.scopes || []).length },
+  ]
+  const actions = tab === 'design'
+    ? `<button type="button" class="btn ghost" data-ap-default-policy>默认审批链</button><button type="button" class="btn ghost" data-ap-save>保存草稿</button><button type="button" class="btn primary" data-ap-publish>发布流程</button>`
+    : tab === 'records'
+      ? '<button type="button" class="btn ghost" data-ap-export>导出记录</button>'
+      : `<button type="button" class="btn ghost" data-ap-catalog-refresh>同步权限目录</button>`
+  view.innerHTML = `<section class="approval-shell">
+    <div class="approval-top">
+      <div class="ap-tabs is-main" role="tablist">
+        ${tabs.map((item) => `<button type="button" class="ap-tab${tab === item.id ? ' is-active' : ''}" data-ap-tab="${esc(item.id)}" role="tab" aria-selected="${tab === item.id}">${esc(item.label)}${item.count ? `<span>${item.count}</span>` : ''}</button>`).join('')}
+      </div>
+      <div class="approval-top-actions">${actions}</div>
+    </div>
+    <div class="approval-body">${tab === 'design' ? approvalDesignHtml() : tab === 'records' ? approvalRecordsHtml() : approvalCatalogHtml()}</div>
+  </section>`
+  bindApprovalPage()
+}
+
+function approvalRerender() {
+  approvalCloseCanvasMenu()
+  renderApprovalPage()
+}
+
+function bindApprovalPage() {
+  const shell = document.querySelector('.approval-shell')
+  if (!shell) return
+
+  shell.addEventListener('click', async (event) => {
+    const menuButton = event.target.closest('[data-wf-canvas-menu] button')
+    if (menuButton) {
+      const template = approvalTemplateOf()
+      const menu = state.approvalCanvasMenu
+      if (!template || !menu || menu.templateId !== template.id) {
+        approvalCloseCanvasMenu()
+        return
+      }
+      const addKind = menuButton.getAttribute('data-wf-menu-add')
+      if (addKind) {
+        const newNode = approvalNewFlowNode(addKind)
+        approvalInsertFlowNode(template, newNode, menu.anchorId, menu.worldX, menu.worldY)
+        approvalCloseCanvasMenu()
+        state.approvalNodeId = newNode.id
+        state.approvalEdgeFrom = ''
+        state.approvalEdgeTo = ''
+        approvalRerender()
+        showTopToast(addKind === 'condition' ? '已创建条件判断，拖动圆点继续连接分支' : '已创建节点，拖动圆点连接上下游')
+        return
+      }
+      if (menuButton.closest('[data-wf-menu-edge-delete]')) {
+        if (menu.edgeFrom && menu.edgeTo && approvalRemoveEdge(template, menu.edgeFrom, menu.edgeTo)) {
+          state.approvalEdgeFrom = ''
+          state.approvalEdgeTo = ''
+          approvalCloseCanvasMenu()
+          approvalRerender()
+          showTopToast('连线已删除')
+        }
+        return
+      }
+      if (menuButton.closest('[data-wf-menu-delete]')) {
+        const node = approvalFindNode(template.flow, menu.anchorId)
+        if (!node || node.kind === 'start' || node.kind === 'end') return
+        approvalDetachNodeWithLinks(template, node.id)
+        approvalCloseCanvasMenu()
+        state.approvalNodeId = template.flow[0]?.id || 'start'
+        state.approvalEdgeFrom = ''
+        state.approvalEdgeTo = ''
+        approvalRerender()
+        showTopToast('节点与关联连线已删除')
+        return
+      }
+      const menuAction = menuButton.getAttribute('data-wf-menu-action')
+      if (menuAction === 'layout') {
+        approvalCloseCanvasMenu()
+        approvalAutoLayoutGraph(template)
+        approvalCanvasState().pendingFit = true
+        approvalRerender()
+        showTopToast('已按连线层级重新布局')
+        return
+      }
+      if (menuAction === 'fit') {
+        approvalCloseCanvasMenu()
+        approvalFitCanvas()
+        return
+      }
+      return
+    }
+
+    const zoomButton = event.target.closest('[data-wf-zoom]')
+    if (zoomButton) {
+      approvalCloseCanvasMenu()
+      const action = zoomButton.getAttribute('data-wf-zoom')
+      if (action === 'fit') approvalFitCanvas()
+      else approvalZoomCanvas(action === 'out' ? .82 : 1.22)
+      return
+    }
+
+    if (event.target.closest('[data-wf-layout]')) {
+      const template = approvalTemplateOf()
+      if (!template) return
+      approvalAutoLayoutGraph(template)
+      approvalCanvasState().pendingFit = true
+      approvalRerender()
+      showTopToast('已按连线层级重新布局')
+      return
+    }
+
+    if (event.target.closest('[data-wf-focus]')) {
+      state.approvalFocus = !state.approvalFocus
+      approvalCanvasState().pendingFit = true
+      approvalRerender()
+      showTopToast(state.approvalFocus ? '已进入专注画布' : '已恢复三栏布局')
+      return
+    }
+
+    const tabButton = event.target.closest('[data-ap-tab]')
+    if (tabButton) {
+      state.approvalTab = tabButton.getAttribute('data-ap-tab')
+      state.approvalRecordId = ''
+      approvalRerender()
+      return
+    }
+
+    const templateButton = event.target.closest('[data-wf-template]')
+    if (templateButton) {
+      state.approvalTemplateId = templateButton.getAttribute('data-wf-template')
+      const template = approvalTemplateOf()
+      state.approvalNodeId = template?.flow?.[0]?.id || 'start'
+      state.approvalEdgeFrom = ''
+      state.approvalEdgeTo = ''
+      approvalRerender()
+      return
+    }
+
+    const deleteTemplateButton = event.target.closest('[data-wf-delete-template]')
+    if (deleteTemplateButton) {
+      const template = approvalTemplatesOf().find(
+        (item) => item.id === deleteTemplateButton.getAttribute('data-wf-delete-template'),
+      )
+      openApprovalWorkflowDeleteModal(template)
+      return
+    }
+
+    const edgeButton = event.target.closest('[data-wf-edge-from]')
+    if (edgeButton && edgeButton.closest('[data-wf-edge-group]')) {
+      state.approvalEdgeFrom = edgeButton.getAttribute('data-wf-edge-from')
+      state.approvalEdgeTo = edgeButton.getAttribute('data-wf-edge-to')
+      approvalRerender()
+      return
+    }
+
+    const nodeButton = event.target.closest('[data-wf-node]')
+    if (nodeButton) {
+      state.approvalNodeId = nodeButton.getAttribute('data-wf-node')
+      state.approvalEdgeFrom = ''
+      state.approvalEdgeTo = ''
+      approvalRerender()
+      return
+    }
+
+    if (event.target.closest('[data-ap-default-policy]')) {
+      openApprovalDefaultPolicyModal()
+      return
+    }
+
+    if (event.target.closest('[data-ap-save]')) {
+      const template = approvalTemplateOf()
+      try {
+        await approvalSaveTemplate(template, event.target.closest('button'))
+      } catch (err) {
+        showTopToast(err?.message || '保存失败')
+      }
+      return
+    }
+
+    if (event.target.closest('[data-ap-publish]')) {
+      const template = approvalTemplateOf()
+      try {
+        await approvalPublishTemplate(template, event.target.closest('button'))
+      } catch (err) {
+        showTopToast(err?.message || '发布失败')
+      }
+      return
+    }
+
+    if (event.target.closest('[data-wf-check]')) {
+      const template = approvalTemplateOf()
+      if (!template) return
+      try {
+        const data = await apiSend('POST', `/api/console/approval-workflows/${encodeURIComponent(template.id)}/validate`, {
+          flow: template.flow,
+        })
+        const errors = data.validation?.errors || []
+        template.validation = errors
+        if (data.validation?.valid) {
+          approvalRerender()
+          showTopToast('流程校验通过：节点完整，审批方式已配置')
+        } else {
+          approvalRerender()
+          showTopToast(`校验未通过：${errors[0] || '请检查流程节点'}`)
+        }
+      } catch (err) {
+        showTopToast(err?.message || '校验失败')
+      }
+      return
+    }
+
+    if (event.target.closest('[data-wf-new]')) {
+      openApprovalWorkflowCreateModal()
+      return
+    }
+
+    if (event.target.closest('[data-wf-add]')) {
+      const kindSelect = shell.querySelector('[data-wf-add-kind]')
+      const kind = kindSelect?.value || 'approval'
+      const template = approvalTemplateOf()
+      if (!template) return
+      const newNode = approvalNewFlowNode(kind)
+      approvalInsertFlowNode(template, newNode, state.approvalNodeId)
+      state.approvalNodeId = newNode.id
+      approvalRerender()
+      showTopToast(kind === 'condition' ? '已添加条件判断，可继续配置分支' : '已添加节点，记得配置审批人')
+      return
+    }
+
+    const addBranchButton = event.target.closest('[data-wf-add-branch]')
+    if (addBranchButton) {
+      const template = approvalTemplateOf()
+      const node = template ? approvalFindNode(template.flow, state.approvalNodeId) : null
+      if (!template || node?.kind !== 'condition') return
+      const branch = {
+        id: approvalUid('br'),
+        label: APPROVAL_BRANCH_RULES.risk_high.label,
+        rule: { ...APPROVAL_BRANCH_RULES.risk_high },
+        nodes: [approvalMakeApprovalNode('条件审批', 'dept_chain', '或签')],
+      }
+      const elseIndex = (node.branches || []).findIndex((item) => approvalBranchRuleKey(item) === 'else')
+      node.branches.splice(elseIndex >= 0 ? elseIndex : node.branches.length, 0, branch)
+      approvalTouchTemplate(template)
+      approvalRerender()
+      return
+    }
+
+    if (event.target.closest('[data-wf-add-else]')) {
+      const template = approvalTemplateOf()
+      const node = template ? approvalFindNode(template.flow, state.approvalNodeId) : null
+      if (!template || node?.kind !== 'condition') return
+      if ((node.branches || []).some((branch) => approvalBranchRuleKey(branch) === 'else')) {
+        showTopToast('条件判断已有「否则」分支')
+        return
+      }
+      node.branches = node.branches || []
+      node.branches.push({
+        id: approvalUid('br'),
+        label: APPROVAL_BRANCH_RULES.else.label,
+        rule: { ...APPROVAL_BRANCH_RULES.else },
+        nodes: [approvalMakeApprovalNode('兜底审批', 'dept_chain', '或签')],
+      })
+      approvalTouchTemplate(template)
+      approvalRerender()
+      return
+    }
+
+    const deleteBranchButton = event.target.closest('[data-wf-branch-del]')
+    if (deleteBranchButton) {
+      const template = approvalTemplateOf()
+      const node = template ? approvalFindNode(template.flow, state.approvalNodeId) : null
+      if (!template || node?.kind !== 'condition') return
+      if ((node.branches || []).length <= 1) {
+        showTopToast('条件判断至少保留一个分支')
+        return
+      }
+      const branchId = deleteBranchButton.getAttribute('data-wf-branch-del')
+      node.branches = node.branches.filter((branch) => branch.id !== branchId)
+      approvalTouchTemplate(template)
+      approvalRerender()
+      return
+    }
+
+    const addBranchNode = event.target.closest('[data-wf-branch-node]')
+    if (addBranchNode) {
+      const template = approvalTemplateOf()
+      const branch = template ? approvalBranchOf(template, addBranchNode.getAttribute('data-wf-branch-node')) : null
+      if (!template || !branch) return
+      const newNode = approvalMakeApprovalNode('新增审批节点', 'dept_chain', '或签')
+      branch.nodes = branch.nodes || []
+      branch.nodes.push(newNode)
+      approvalTouchTemplate(template)
+      state.approvalNodeId = newNode.id
+      approvalRerender()
+      return
+    }
+
+    if (event.target.closest('[data-wf-pick-members]')) {
+      await openApprovalApproverPicker()
+      return
+    }
+
+    const removeApprover = event.target.closest('[data-wf-approver-remove]')
+    if (removeApprover) {
+      const template = approvalTemplateOf()
+      const node = template ? approvalFindNode(template.flow, state.approvalNodeId) : null
+      if (!template || node?.kind !== 'approval') return
+      const id = removeApprover.getAttribute('data-wf-approver-remove')
+      node.approvers = approvalApproversOf(node).filter((item) => item.id !== id)
+      node.desc = approvalNodeSummary(node)
+      approvalTouchTemplate(template)
+      approvalRerender()
+      return
+    }
+
+    if (event.target.closest('[data-wf-add-rule]')) {
+      showTopToast('请在条件节点右侧面板编辑分支')
+      return
+    }
+
+    if (event.target.closest('[data-wf-edge-close]')) {
+      state.approvalEdgeFrom = ''
+      state.approvalEdgeTo = ''
+      approvalRerender()
+      return
+    }
+
+    const edgeDelete = event.target.closest('[data-wf-edge-delete]')
+    if (edgeDelete) {
+      const template = approvalTemplateOf()
+      if (!template) return
+      const fromId = edgeDelete.getAttribute('data-wf-edge-from')
+      const toId = edgeDelete.getAttribute('data-wf-edge-to')
+      if (approvalRemoveEdge(template, fromId, toId)) {
+        state.approvalEdgeFrom = ''
+        state.approvalEdgeTo = ''
+        approvalRerender()
+        showTopToast('连线已删除')
+      }
+      return
+    }
+
+    if (event.target.closest('[data-wf-delete]')) {
+      const template = approvalTemplateOf()
+      if (!template) return
+      const node = approvalFindNode(template.flow, state.approvalNodeId)
+      if (!node || node.kind === 'start' || node.kind === 'end') return
+      approvalDetachNodeWithLinks(template, node.id)
+      state.approvalNodeId = template.flow[0]?.id || 'start'
+      state.approvalEdgeFrom = ''
+      state.approvalEdgeTo = ''
+      approvalRerender()
+      showTopToast('节点与关联连线已删除')
+      return
+    }
+
+    const modeButton = event.target.closest('[data-wf-mode]')
+    if (modeButton) {
+      const template = approvalTemplateOf()
+      if (!template) return
+      const node = approvalFindNode(template.flow, state.approvalNodeId)
+      if (node?.kind === 'approval') {
+        const mode = modeButton.getAttribute('data-wf-mode')
+        node.mode = mode
+        node.meta = mode
+        node.desc = approvalNodeSummary(node)
+        approvalTouchTemplate(template)
+        approvalRerender()
+      }
+      return
+    }
+
+    const recordTab = event.target.closest('[data-ap-record-tab]')
+    if (recordTab) {
+      state.approvalRecordTab = recordTab.getAttribute('data-ap-record-tab')
+      state.approvalRecordId = ''
+      approvalRerender()
+      return
+    }
+
+    const recordRow = event.target.closest('[data-ap-record-row]')
+    if (recordRow) {
+      state.approvalRecordId = recordRow.getAttribute('data-ap-record-row')
+      approvalRerender()
+      return
+    }
+
+    if (event.target.closest('[data-ap-record-close]')) {
+      state.approvalRecordId = ''
+      approvalRerender()
+      return
+    }
+
+    if (event.target.closest('[data-ap-record-approve]') || event.target.closest('[data-ap-record-reject]')) {
+      const approve = Boolean(event.target.closest('[data-ap-record-approve]'))
+      const record = approvalRecordsOf().find((item) => item.id === state.approvalRecordId)
+      if (record) {
+        record.status = approve ? 'approved' : 'rejected'
+        record.currentNode = approve ? '已完成' : '已拒绝'
+        record.progress = approve ? 3 : Math.max(1, record.progress)
+        record.todo = false
+        approvalRerender()
+        showTopToast(approve ? '已同意申请，权限将授予申请人本人' : '已拒绝申请，申请人会收到通知')
+      }
+      return
+    }
+
+    const catalogFilter = event.target.closest('[data-ap-catalog-filter]')
+    if (catalogFilter) {
+      state.approvalCatalogFilter = catalogFilter.getAttribute('data-ap-catalog-filter')
+      approvalRerender()
+      return
+    }
+
+    const catalogFlow = event.target.closest('[data-ap-catalog-flow]')
+    if (catalogFlow) {
+      state.approvalTab = 'design'
+      state.approvalTemplateId = catalogFlow.getAttribute('data-ap-catalog-flow')
+      const template = approvalTemplateOf()
+      state.approvalNodeId = template?.flow?.[0]?.id || 'start'
+      approvalRerender()
+      return
+    }
+
+    if (event.target.closest('[data-ap-export]')) {
+      showTopToast('审批记录导出将在后端接入后开放')
+      return
+    }
+
+    if (event.target.closest('[data-ap-catalog-refresh]')) {
+      showTopToast('权限目录已同步（原型）')
+    }
+  })
+
+  const recordSearch = shell.querySelector('[data-ap-record-search]')
+  if (recordSearch) {
+    recordSearch.addEventListener('input', () => {
+      state.approvalRecordQuery = recordSearch.value
+      const query = recordSearch.value.trim().toLowerCase()
+      for (const row of shell.querySelectorAll('[data-ap-record-row]')) {
+        const haystack = (row.getAttribute('data-search') || '').toLowerCase()
+        row.classList.toggle('is-hidden', Boolean(query) && !haystack.includes(query))
+      }
+    })
+  }
+
+  const catalogSearch = shell.querySelector('[data-ap-catalog-search]')
+  if (catalogSearch) {
+    catalogSearch.addEventListener('input', () => {
+      state.approvalCatalogQuery = catalogSearch.value
+      const body = shell.querySelector('.ap-catalog-body')
+      if (body) body.innerHTML = approvalCatalogRows()
+    })
+  }
+
+  const inspector = shell.querySelector('.wf-inspector')
+  inspector?.addEventListener('input', (event) => {
+    const template = approvalTemplateOf()
+    if (!template) return
+    const edgeLabelInput = event.target.closest('[data-wf-edge-label]')
+    if (edgeLabelInput) {
+      const fromId = edgeLabelInput.getAttribute('data-wf-edge-from')
+      const toId = edgeLabelInput.getAttribute('data-wf-edge-to')
+      const from = approvalFindNode(template.flow, fromId)
+      if (!from || !toId) return
+      if (!from.edgeLabels) from.edgeLabels = {}
+      const value = edgeLabelInput.value
+      if (value) from.edgeLabels[toId] = value
+      else delete from.edgeLabels[toId]
+      approvalTouchTemplate(template)
+      repaintApprovalEdges()
+      return
+    }
+    const edgeValueInput = event.target.closest('[data-wf-edge-value]')
+    if (edgeValueInput) {
+      const prefix = edgeValueInput.getAttribute('data-wf-edge-value')
+      const [fromId, toId] = prefix.split('|')
+      const from = approvalFindNode(template.flow, fromId)
+      if (!from || !toId) return
+      if (!from.edgeRules) from.edgeRules = {}
+      from.edgeRules[toId] = { ...(from.edgeRules[toId] || {}), value: edgeValueInput.value }
+      approvalTouchTemplate(template)
+      return
+    }
+    const branchLabel = event.target.closest('[data-wf-branch-label]')
+    if (branchLabel) {
+      const branch = approvalBranchOf(template, branchLabel.getAttribute('data-wf-branch-label'))
+      if (!branch) return
+      branch.label = branchLabel.value
+      const tag = shell.querySelector(`[data-wf-branch-tag="${branch.id}"]`)
+      if (tag) tag.textContent = branch.label
+      approvalTouchTemplate(template)
+      return
+    }
+    const branchValue = event.target.closest('[data-wf-branch-value]')
+    if (branchValue) {
+      approvalApplyBranchValue(template, shell, branchValue)
+      return
+    }
+    const field = event.target.closest('[data-wf-field]')
+    if (!field) return
+    const node = approvalFindNode(template.flow, state.approvalNodeId)
+    if (!node) return
+    const key = field.getAttribute('data-wf-field')
+    node[key] = key === 'timeoutHours' ? Number(field.value) || 72 : field.value
+    approvalTouchTemplate(template)
+    if (key === 'title') {
+      const canvasNode = shell.querySelector(`[data-wf-node="${node.id}"] strong`)
+      if (canvasNode) canvasNode.textContent = field.value
+    }
+  })
+
+  inspector?.addEventListener('change', (event) => {
+    const template = approvalTemplateOf()
+    if (!template) return
+    const edgeRuleSelect = event.target.closest('[data-wf-edge-rule]')
+    if (edgeRuleSelect) {
+      const prefix = edgeRuleSelect.getAttribute('data-wf-edge-rule')
+      const [fromId, toId] = prefix.split('|')
+      const from = approvalFindNode(template.flow, fromId)
+      if (!from || !toId) return
+      const key = edgeRuleSelect.value
+      const rule = { ...(APPROVAL_BRANCH_RULES[key] || APPROVAL_BRANCH_RULES.risk_high) }
+      if (!from.edgeRules) from.edgeRules = {}
+      from.edgeRules[toId] = rule
+      if (!from.edgeLabels) from.edgeLabels = {}
+      const current = String(from.edgeLabels[toId] || '')
+      if (!current || /^分支\s+\d+$/.test(current) || current === '其他情况' || Object.values(APPROVAL_BRANCH_RULES).some((item) => current === item.label)) {
+        from.edgeLabels[toId] = rule.label
+      }
+      approvalTouchTemplate(template)
+      approvalRerender()
+      return
+    }
+    const edgeValueInput = event.target.closest('[data-wf-edge-value]')
+    if (edgeValueInput) {
+      const prefix = edgeValueInput.getAttribute('data-wf-edge-value')
+      const [fromId, toId] = prefix.split('|')
+      const from = approvalFindNode(template.flow, fromId)
+      if (!from || !toId) return
+      if (!from.edgeRules) from.edgeRules = {}
+      const rule = { ...(from.edgeRules[toId] || {}), value: edgeValueInput.value }
+      from.edgeRules[toId] = rule
+      const key = approvalEdgeRuleKey(rule)
+      const base = APPROVAL_BRANCH_RULES[key]?.label || ''
+      const current = String(from.edgeLabels?.[toId] || '')
+      if (!current || current === base || current.startsWith(`${base} · `)) {
+        if (!from.edgeLabels) from.edgeLabels = {}
+        from.edgeLabels[toId] = edgeValueInput.value ? `${base} · ${edgeValueInput.value}` : base
+      }
+      approvalTouchTemplate(template)
+      approvalRerender()
+      return
+    }
+    const node = approvalFindNode(template.flow, state.approvalNodeId)
+    if (!node) return
+    const branchValue = event.target.closest('[data-wf-branch-value]')
+    if (branchValue && node.kind === 'condition') {
+      approvalApplyBranchValue(template, shell, branchValue)
+      return
+    }
+    const branchRule = event.target.closest('[data-wf-branch-rule]')
+    if (branchRule && node.kind === 'condition') {
+      const branch = approvalBranchOf(template, branchRule.getAttribute('data-wf-branch-rule'))
+      if (!branch) return
+      const key = branchRule.value
+      const rule = APPROVAL_BRANCH_RULES[key] || APPROVAL_BRANCH_RULES.risk_high
+      branch.rule = { ...rule }
+      branch.label = approvalBranchRuleLabel(key, branch.rule.value)
+      approvalTouchTemplate(template)
+      approvalRerender()
+      return
+    }
+    const field = event.target.closest('[data-wf-field]')
+    if (field) {
+      const key = field.getAttribute('data-wf-field')
+      if (key === 'source') {
+        node.source = field.value
+        node.desc = approvalNodeSummary(node)
+        approvalTouchTemplate(template)
+        approvalRerender()
+        if (node.source === 'members' && !approvalApproversOf(node).length) showTopToast('请选择具体审批成员')
+        return
+      }
+      if (key === 'timeoutHours') {
+        const value = Math.min(720, Math.max(1, Math.trunc(Number(field.value) || 72)))
+        node.timeoutHours = value
+        node.desc = approvalNodeSummary(node)
+        approvalTouchTemplate(template)
+        approvalRerender()
+        return
+      }
+      if (key === 'timeoutAction') {
+        node.timeoutAction = field.value
+        approvalTouchTemplate(template)
+        return
+      }
+    }
+    const toggle = event.target.closest('[data-wf-toggle]')
+    if (toggle) {
+      node[toggle.getAttribute('data-wf-toggle')] = Boolean(toggle.checked)
+      approvalTouchTemplate(template)
+    }
+  })
+
+  const approvalClientToWorld = (clientX, clientY) => {
+    const canvasViewport = shell.querySelector('[data-wf-viewport]')
+    const view = approvalCanvasState()
+    if (!canvasViewport) return { x: 0, y: 0 }
+    const rect = canvasViewport.getBoundingClientRect()
+    return {
+      x: (clientX - rect.left - view.x) / view.scale,
+      y: (clientY - rect.top - view.y) / view.scale,
+    }
+  }
+
+  const approvalWorldToClient = (point) => {
+    const canvasViewport = shell.querySelector('[data-wf-viewport]')
+    const view = approvalCanvasState()
+    if (!canvasViewport) return { x: 0, y: 0 }
+    const rect = canvasViewport.getBoundingClientRect()
+    return { x: rect.left + view.x + point.x * view.scale, y: rect.top + view.y + point.y * view.scale }
+  }
+
+  const approvalDragIssue = (template, drag, targetId) => {
+    if (drag.mode === 'link') return approvalConnectionIssue(template, drag.sourceId, targetId)
+    if (drag.mode === 'edge-target') {
+      return approvalConnectionIssue(template, drag.edgeFrom, targetId, { from: drag.edgeFrom, to: drag.edgeTo })
+    }
+    if (drag.mode === 'edge-source') {
+      return approvalConnectionIssue(template, targetId, drag.edgeTo, { from: drag.edgeFrom, to: drag.edgeTo })
+    }
+    return ''
+  }
+
+  const approvalNearestPortSide = (node, worldPoint) => {
+    let bestSide = 'bottom'
+    let bestDistance = Infinity
+    for (const side of APPROVAL_PORT_SIDES) {
+      const point = approvalPortAnchor(node, side)
+      const distance = Math.hypot(point.x - worldPoint.x, point.y - worldPoint.y)
+      if (distance < bestDistance) {
+        bestDistance = distance
+        bestSide = side
+      }
+    }
+    return bestSide
+  }
+
+  const approvalDragTargetAt = (clientX, clientY) => {
+    const drag = state.approvalDrag
+    const template = approvalTemplateOf()
+    if (!drag || !template) return null
+    const world = approvalClientToWorld(clientX, clientY)
+    const exactElement = document.elementFromPoint(clientX, clientY)?.closest?.('[data-wf-node]')
+    let targetElement = exactElement || null
+    let targetNode = targetElement ? approvalFindNode(template.flow, targetElement.getAttribute('data-wf-node')) : null
+    if (!targetNode) {
+      const view = approvalCanvasState()
+      const snapDistance = 34 / Math.max(view.scale, .2)
+      let nearest = null
+      for (const candidate of approvalGraphNodes(template.flow)) {
+        const position = approvalGraphPosition(candidate)
+        if (!position) continue
+        const dx = Math.max(position.x - world.x, 0, world.x - (position.x + APPROVAL_GRAPH_NODE_W))
+        const dy = Math.max(position.y - world.y, 0, world.y - (position.y + APPROVAL_GRAPH_NODE_H))
+        const distance = Math.hypot(dx, dy)
+        if (!nearest || distance < nearest.distance) nearest = { candidate, position, distance }
+      }
+      if (nearest && nearest.distance <= snapDistance) {
+        targetElement = shell.querySelector(`[data-wf-node="${nearest.candidate.id}"]`)
+        targetNode = nearest.candidate
+      }
+    }
+    if (!targetNode || !targetElement) return null
+    let side = ''
+    const exactPort = document.elementFromPoint(clientX, clientY)?.closest?.('[data-wf-port-side]')
+    if (exactPort && targetElement.contains(exactPort)) side = exactPort.getAttribute('data-wf-port-side') || ''
+    if (!APPROVAL_PORT_SIDES.includes(side)) side = approvalNearestPortSide(targetNode, world)
+    const issue = approvalDragIssue(template, drag, targetNode.id)
+    return {
+      id: targetNode.id,
+      node: targetNode,
+      element: targetElement,
+      side,
+      valid: !issue,
+      reason: issue,
+    }
+  }
+
+  const paintApprovalDragTarget = (target) => {
+    shell.querySelectorAll('.wf-node').forEach((element) => {
+      element.classList.remove('is-drop-target', 'is-drop-invalid')
+    })
+    shell.querySelectorAll('.wf-port').forEach((element) => {
+      element.classList.remove('is-target-side', 'is-target-invalid')
+    })
+    if (!target) return
+    target.element.classList.add(target.valid ? 'is-drop-target' : 'is-drop-invalid')
+    const sidePort = target.element.querySelector(`.wf-port[data-wf-port-side="${target.side}"]`)
+    sidePort?.classList.add(target.valid ? 'is-target-side' : 'is-target-invalid')
+  }
+
+  const repaintApprovalEdges = () => {
+    const template = approvalTemplateOf()
+    const layer = shell.querySelector('[data-wf-edge-layer]')
+    const selected = state.approvalEdgeFrom
+      ? { from: state.approvalEdgeFrom, to: state.approvalEdgeTo }
+      : null
+    const drag = state.approvalDrag
+    const hidden = drag && (drag.mode === 'edge-target' || drag.mode === 'edge-source')
+      ? { from: drag.edgeFrom, to: drag.edgeTo }
+      : null
+    if (template && layer) layer.innerHTML = approvalGraphEdgeSvg(template.flow, selected, hidden)
+  }
+
+  const clearApprovalDrag = () => {
+    state.approvalDrag = null
+    document.getElementById('wf-drag-guide')?.remove()
+    shell.classList.remove('is-wf-linking', 'is-wf-edge-dragging')
+    shell.querySelectorAll('.wf-node, .wf-port, .wf-viewport').forEach((element) => {
+      element.classList.remove('is-drop-target', 'is-drop-invalid', 'is-dragging', 'is-panning', 'is-target-side', 'is-target-invalid')
+    })
+    repaintApprovalEdges()
+  }
+
+  const paintApprovalDragGuide = (drag, clientX, clientY) => {
+    let guide = document.getElementById('wf-drag-guide')
+    if (!guide) {
+      const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg')
+      svg.id = 'wf-drag-guide'
+      svg.classList.add('wf-drag-guide')
+      svg.setAttribute('aria-hidden', 'true')
+      const line = document.createElementNS('http://www.w3.org/2000/svg', 'line')
+      line.classList.add('wf-drag-guide-line')
+      const dot = document.createElementNS('http://www.w3.org/2000/svg', 'circle')
+      dot.classList.add('wf-drag-guide-dot')
+      dot.setAttribute('r', '3')
+      svg.append(line, dot)
+      document.body.append(svg)
+      guide = svg
+    }
+    const line = guide.querySelector('.wf-drag-guide-line')
+    const dot = guide.querySelector('.wf-drag-guide-dot')
+    line.setAttribute('x1', drag.originX)
+    line.setAttribute('y1', drag.originY)
+    line.setAttribute('x2', clientX)
+    line.setAttribute('y2', clientY)
+    dot.setAttribute('cx', clientX)
+    dot.setAttribute('cy', clientY)
+  }
+
+  const showApprovalUndo = (template, snapshot, message) => {
+    const templateId = template.id
+    showTopToast(message, {
+      tone: 'success',
+      duration: 6500,
+      action: {
+        label: '撤销',
+        onClick: () => {
+          const current = approvalTemplatesOf().find((item) => item.id === templateId)
+          if (!current) return
+          current.flow = snapshot
+          approvalTouchTemplate(current)
+          if (current.id === state.approvalTemplateId) approvalRerender()
+          showTopToast('已撤销删除', { tone: 'success' })
+        },
+      },
+    })
+  }
+
+  const deleteApprovalEdgeWithUndo = (template, fromId, toId) => {
+    const snapshot = JSON.parse(JSON.stringify(template.flow || []))
+    if (!approvalRemoveEdge(template, fromId, toId)) return false
+    state.approvalEdgeFrom = ''
+    state.approvalEdgeTo = ''
+    approvalRerender()
+    showApprovalUndo(template, snapshot, '已删除连线，可撤销')
+    return true
+  }
+
+  shell.addEventListener('pointerdown', (event) => {
+    if (event.button !== 0) return
+    const template = approvalTemplateOf()
+    if (!template) return
+    if (state.approvalCanvasMenu && !event.target.closest('[data-wf-canvas-menu]')) approvalCloseCanvasMenu()
+    if (event.target.closest('[data-wf-canvas-menu]')) return
+    const edgeHandle = event.target.closest('[data-wf-edge-handle]')
+    if (edgeHandle) {
+      const endpoint = edgeHandle.getAttribute('data-wf-edge-handle')
+      const edgeFrom = edgeHandle.getAttribute('data-wf-edge-from')
+      const edgeTo = edgeHandle.getAttribute('data-wf-edge-to')
+      const layout = approvalEdgeLayouts(template.flow).find((edge) => edge.from === edgeFrom && edge.to === edgeTo)
+      if (!endpoint || !layout) return
+      event.preventDefault()
+      event.stopPropagation()
+      try { edgeHandle.setPointerCapture?.(event.pointerId) } catch {}
+      const opposite = endpoint === 'to' ? layout.fromPoint : layout.toPoint
+      const screen = approvalWorldToClient(opposite)
+      state.approvalDrag = {
+        mode: endpoint === 'to' ? 'edge-target' : 'edge-source',
+        edgeFrom,
+        edgeTo,
+        endpoint,
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+        originX: screen.x,
+        originY: screen.y,
+        targetId: null,
+        active: false,
+      }
+      shell.classList.add('is-wf-linking')
+      return
+    }
+    const connector = event.target.closest('[data-wf-link-after]')
+    if (connector) {
+      const sourceId = connector.getAttribute('data-wf-link-after')
+      if (!sourceId) return
+      event.preventDefault()
+      try { connector.setPointerCapture?.(event.pointerId) } catch {}
+      const rect = connector.getBoundingClientRect()
+      state.approvalDrag = {
+        mode: 'link',
+        sourceId,
+        fromSide: connector.getAttribute('data-wf-port-side') || 'bottom',
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+        originX: rect.left + rect.width / 2,
+        originY: rect.top + rect.height / 2,
+        targetId: null,
+        active: false,
+      }
+      shell.classList.add('is-wf-linking')
+      return
+    }
+    const nodeElement = event.target.closest('[data-wf-node]')
+    if (nodeElement) {
+      const sourceId = nodeElement.getAttribute('data-wf-node')
+      const node = approvalFindNode(template.flow, sourceId)
+      const position = approvalGraphPosition(node)
+      if (!node || !position) return
+      try { nodeElement.setPointerCapture?.(event.pointerId) } catch {}
+      state.approvalDrag = {
+        mode: 'node',
+        sourceId,
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+        originNodeX: position.x,
+        originNodeY: position.y,
+        originX: position.x,
+        originY: position.y,
+        targetId: null,
+        active: false,
+      }
+      return
+    }
+    if (event.target.closest('[data-wf-edge-group]')) return
+    const viewport = event.target.closest('[data-wf-viewport]')
+    if (!viewport) return
+    event.preventDefault()
+    const view = approvalCanvasState()
+    state.approvalPan = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      originX: view.x,
+      originY: view.y,
+    }
+    viewport.classList.add('is-panning')
+    try { viewport.setPointerCapture?.(event.pointerId) } catch {}
+  })
+
+  shell.addEventListener('pointermove', (event) => {
+    const pan = state.approvalPan
+    if (pan && event.pointerId === pan.pointerId) {
+      const view = approvalCanvasState()
+      view.x = pan.originX + event.clientX - pan.startX
+      view.y = pan.originY + event.clientY - pan.startY
+      approvalApplyCanvasView()
+      return
+    }
+    const drag = state.approvalDrag
+    if (!drag || event.pointerId !== drag.pointerId) return
+    const distance = Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY)
+    if (!drag.active && distance < 5) return
+    if (!drag.active) {
+      drag.active = true
+      if (drag.mode === 'link') {
+        shell.querySelector(`.wf-port[data-wf-link-after="${drag.sourceId}"]`)?.classList.add('is-dragging')
+      } else if (drag.mode === 'edge-target' || drag.mode === 'edge-source') {
+        shell.classList.add('is-wf-edge-dragging')
+        repaintApprovalEdges()
+        shell.querySelector('[data-wf-edge-handles]')?.remove()
+      } else {
+        shell.querySelector(`[data-wf-node="${drag.sourceId}"]`)?.classList.add('is-dragging')
+      }
+    }
+    event.preventDefault()
+    if (drag.mode === 'link' || drag.mode === 'edge-target' || drag.mode === 'edge-source') {
+      paintApprovalDragGuide(drag, event.clientX, event.clientY)
+      const target = approvalDragTargetAt(event.clientX, event.clientY)
+      const key = target ? `${target.id}|${target.side}|${target.valid ? 1 : 0}` : ''
+      if (key === drag.targetId) return
+      drag.targetId = key
+      paintApprovalDragTarget(target)
+      return
+    }
+    const template = approvalTemplateOf()
+    const node = template ? approvalFindNode(template.flow, drag.sourceId) : null
+    if (!template || !node) return
+    const view = approvalCanvasState()
+    node.x = Math.max(0, drag.originNodeX + (event.clientX - drag.startX) / view.scale)
+    node.y = Math.max(0, drag.originNodeY + (event.clientY - drag.startY) / view.scale)
+    const element = shell.querySelector(`[data-wf-node="${drag.sourceId}"]`)
+    if (element) {
+      element.style.left = `${Math.round(node.x)}px`
+      element.style.top = `${Math.round(node.y)}px`
+    }
+    const stage = shell.querySelector('[data-wf-stage]')
+    if (stage) {
+      stage.style.width = `${Math.max(parseFloat(stage.style.width) || 1200, node.x + APPROVAL_GRAPH_NODE_W + 280)}px`
+      stage.style.height = `${Math.max(parseFloat(stage.style.height) || 760, node.y + APPROVAL_GRAPH_NODE_H + 240)}px`
+    }
+    repaintApprovalEdges()
+  })
+
+  const finishApprovalDrag = (event) => {
+    const pan = state.approvalPan
+    if (pan && event.pointerId === pan.pointerId) {
+      state.approvalPan = null
+      shell.querySelector('.wf-viewport.is-panning')?.classList.remove('is-panning')
+      return
+    }
+    const drag = state.approvalDrag
+    if (!drag || event.pointerId !== drag.pointerId) return
+    if (!drag.active) {
+      clearApprovalDrag()
+      return
+    }
+    const template = approvalTemplateOf()
+    const mode = drag.mode
+    const sourceId = drag.sourceId
+    if (mode === 'node') {
+      clearApprovalDrag()
+      if (!template) return
+      const node = approvalFindNode(template.flow, sourceId)
+      if (!node) return
+      state.approvalNodeId = sourceId
+      approvalTouchTemplate(template)
+      approvalRerender()
+      showTopToast('已移动节点位置')
+      return
+    }
+    const target = approvalDragTargetAt(event.clientX, event.clientY)
+    clearApprovalDrag()
+    if (!template) return
+    if (mode === 'edge-target' || mode === 'edge-source') {
+      if (target && !target.valid) {
+        showTopToast(target.reason || '这个位置不能连接')
+        approvalRerender()
+        return
+      }
+      if (!target) {
+        deleteApprovalEdgeWithUndo(template, drag.edgeFrom, drag.edgeTo)
+        return
+      }
+      const result = mode === 'edge-target'
+        ? approvalReconnectEdgeTarget(template, drag.edgeFrom, drag.edgeTo, target.id, target.side)
+        : approvalReconnectEdgeSource(template, drag.edgeFrom, drag.edgeTo, target.id, target.side)
+      if (!result.ok) {
+        showTopToast(result.message)
+        approvalRerender()
+        return
+      }
+      state.approvalEdgeFrom = mode === 'edge-target' ? drag.edgeFrom : target.id
+      state.approvalEdgeTo = mode === 'edge-target' ? target.id : drag.edgeTo
+      state.approvalNodeId = state.approvalEdgeTo
+      approvalRerender()
+      showTopToast(result.message)
+      return
+    }
+    if (!target) return
+    if (!target.valid) {
+      showTopToast(target.reason || '这个位置不能连接')
+      return
+    }
+    const result = approvalConnectNodes(template, sourceId, target.id, {
+      fromSide: drag.fromSide,
+      toSide: target.side,
+    })
+    if (!result.ok) {
+      showTopToast(result.message)
+      return
+    }
+    state.approvalNodeId = target.id
+    state.approvalEdgeFrom = sourceId
+    state.approvalEdgeTo = target.id
+    approvalRerender()
+    showTopToast(result.message)
+  }
+
+  shell.addEventListener('pointerup', finishApprovalDrag)
+  shell.addEventListener('pointercancel', () => {
+    state.approvalPan = null
+    clearApprovalDrag()
+    approvalRerender()
+  })
+
+  const cancelApprovalInteraction = () => {
+    const pan = state.approvalPan
+    if (pan) {
+      const view = approvalCanvasState()
+      view.x = pan.originX
+      view.y = pan.originY
+      state.approvalPan = null
+      approvalApplyCanvasView()
+    }
+    const drag = state.approvalDrag
+    if (drag?.mode === 'node') {
+      const template = approvalTemplateOf()
+      const node = template ? approvalFindNode(template.flow, drag.sourceId) : null
+      if (node) {
+        node.x = drag.originNodeX
+        node.y = drag.originNodeY
+      }
+    }
+    const hadInteraction = Boolean(drag || pan)
+    clearApprovalDrag()
+    if (hadInteraction) {
+      approvalRerender()
+      return true
+    }
+    return false
+  }
+
+  if (window.__eabApprovalKeyHandler) {
+    document.removeEventListener('keydown', window.__eabApprovalKeyHandler)
+  }
+  if (window.__eabApprovalPointerHandler) {
+    document.removeEventListener('pointerdown', window.__eabApprovalPointerHandler, true)
+  }
+  // 选中连线会触发重绘并再次 bind，这里只初始化一次，避免重绘时清掉画布焦点。
+  if (typeof state.approvalCanvasFocus !== 'boolean') state.approvalCanvasFocus = false
+  window.__eabApprovalPointerHandler = (event) => {
+    if (!shell.isConnected) return
+    state.approvalCanvasFocus = Boolean(event.target?.closest?.('[data-wf-viewport]'))
+  }
+  document.addEventListener('pointerdown', window.__eabApprovalPointerHandler, true)
+  window.__eabApprovalKeyHandler = (event) => {
+    if (!shell.isConnected) return
+    const focused = document.activeElement
+    if (focused && (focused.tagName === 'INPUT' || focused.tagName === 'TEXTAREA' || focused.tagName === 'SELECT' || focused.isContentEditable)) return
+    if (event.key === 'Escape') {
+      if (state.approvalDrag || state.approvalPan) {
+        event.preventDefault()
+        cancelApprovalInteraction()
+        return
+      }
+      if (state.approvalEdgeFrom) {
+        state.approvalEdgeFrom = ''
+        state.approvalEdgeTo = ''
+        approvalRerender()
+      }
+      return
+    }
+    if (event.key === 'Delete' && state.approvalCanvasFocus && state.approvalEdgeFrom && state.approvalEdgeTo) {
+      const template = approvalTemplateOf()
+      if (!template) return
+      event.preventDefault()
+      deleteApprovalEdgeWithUndo(template, state.approvalEdgeFrom, state.approvalEdgeTo)
+    }
+  }
+  document.addEventListener('keydown', window.__eabApprovalKeyHandler)
+
+  const viewport = shell.querySelector('[data-wf-viewport]')
+  if (viewport) {
+    viewport.addEventListener('contextmenu', (event) => {
+      const template = approvalTemplateOf()
+      if (!template || !viewport.contains(event.target)) return
+      event.preventDefault()
+      approvalOpenCanvasMenu(template, shell, event)
+    })
+    viewport.addEventListener('wheel', (event) => {
+      if (event.target.closest('[data-wf-canvas-menu]')) return
+      event.preventDefault()
+      if (!event.deltaY) return
+      approvalZoomCanvas(Math.exp(-event.deltaY * .0015), event.clientX, event.clientY)
+    }, { passive: false })
+  }
+
+  const template = approvalTemplateOf()
+  if (template) approvalScheduleCanvasView(template)
+}
 
 /**
- * 管理端按 scope / 角色配置审批链。
- * 员工端只负责发起与审批；这里决定某类权限点最多几级、多久超时、是否公司管理员兜底。
+ * 管理端权限审批工作台：流程设计 / 审批记录 / 权限目录。
+ *
+ * 权限目录、角色、默认审批链、流程模板与版本都来自真实控制台接口；
+ * 审批记录仍使用示例数据，等待运行时接入。
  */
 async function loadPermissionPolicies() {
   const view = $('#view')
   renderLoading(view)
   setSide('', true)
   try {
-    const data = await api('/api/console/permission-policies')
-    const policies = data.policies ?? []
-    const roles = data.roles ?? []
-    const scopes = data.scopes ?? []
-    const roleOptions = roles
-      .filter((role) => !role.management)
-      .map((role) => `<option value="${esc(role.code)}">${esc(role.name)}（${esc(role.code)}）</option>`)
-      .join('')
-    const scopeOptions = scopes
-      .map(
-        (item) =>
-          `<option value="${esc(item.scope)}">${esc(item.group ? `${item.group} · ` : '')}${esc(item.label)}（${esc(
-            item.scope,
-          )}）</option>`,
-      )
-      .join('')
-    const policyRows =
-      policies
-        .map(
-          (item, index) => `<tr>
-            <td><span class="pill">${item.targetType === 'role' ? '角色' : '权限点'}</span></td>
-            <td><strong class="mono">${esc(item.targetKey)}</strong></td>
-            <td>${item.maxLevels} 级</td>
-            <td>${item.timeoutHours} 小时</td>
-            <td>${item.approverStrategy === 'fixed_users' ? '固定审批人' : '部门负责人链'}${
-              item.includeCompanyAdmin ? ' + 公司管理员兜底' : ''
-            }</td>
-            <td><button class="link-btn accent" type="button" data-pp-edit="${index}">编辑</button></td>
-          </tr>`,
-        )
-        .join('') || '<tr><td colspan="6" class="empty">还没有审批策略。未配置时，对应的权限点不会出现在员工端申请面板。</td></tr>'
-    const roleRows =
-      roles
-        .filter((role) => !role.management)
-        .map(
-          (role) => `<label class="pp-role-row">
-            <input type="checkbox" data-pp-role="${esc(role.code)}" ${role.requestable ? 'checked' : ''} />
-            <span><strong>${esc(role.name)}</strong><small class="mono">${esc(role.code)}</small></span>
-            <span class="muted">${role.builtin ? '内置角色' : '自定义角色'}</span>
-          </label>`,
-        )
-        .join('') || '<div class="empty">没有可申请的角色。</div>'
-    view.innerHTML = `
-      <div class="permission-flow">
-        <div class="flow-step"><span>1</span><strong>开放权限来源</strong><p>勾选的角色决定哪些权限点可以被员工申请</p></div>
-        <div class="flow-arrow">→</div>
-        <div class="flow-step"><span>2</span><strong>按权限点匹配</strong><p>只展示当前身份缺少的权限，逐个匹配最严格策略</p></div>
-        <div class="flow-arrow">→</div>
-        <div class="flow-step"><span>3</span><strong>逐级审批</strong><p>通过后只授予所选权限，不新增角色，按有效期自动失效</p></div>
-      </div>
-      <section class="panel">
-        <div class="panel-head"><div><h2>开放申请的角色</h2>${hintBadge(
-          '申请范围',
-          '仅本人可申请；这里勾选的角色会决定员工端可申请的权限点范围，不会把整个角色作为申请单位。管理角色即使勾选也不会进入自助申请列表。',
-        )}</div></div>
-        <div class="pp-role-grid">${roleRows}</div>
-        <div class="pp-role-note muted">管理角色（公司管理员、部门管理员、平台超管等）不参与自助申请，未在此列出。</div>
-      </section>
-      <section class="panel">
-        <div class="panel-head"><div><h2>审批链策略</h2>${hintBadge(
-          '匹配规则',
-          '角色级策略优先；没有角色级策略时，角色的每个权限点都必须有 scope 策略。多个 scope 冲突时取级数最多、超时最短、要求公司管理员兜底的组合。',
-        )}</div></div>
-        <form class="pp-form" id="pp-form">
-          <label class="field"><span>策略对象</span>
-            <select id="pp-type">
-              <option value="scope">按权限点（scope）</option>
-              <option value="role">按角色（role）</option>
-            </select>
-          </label>
-          <label class="field"><span>权限点 / 角色</span>
-            <select id="pp-key">${scopeOptions}</select>
-          </label>
-          <label class="field"><span>最多级数</span>
-            <input id="pp-levels" type="number" min="1" max="10" value="3" />
-          </label>
-          <label class="field"><span>处理时限（小时）</span>
-            <input id="pp-timeout" type="number" min="1" max="720" value="72" />
-          </label>
-          <label class="field"><span>审批人策略</span>
-            <select id="pp-strategy">
-              <option value="dept_chain">部门负责人链</option>
-              <option value="fixed_users">固定审批人</option>
-            </select>
-          </label>
-          <label class="field pp-check"><span>公司管理员兜底</span>
-            <input id="pp-admin" type="checkbox" checked />
-          </label>
-          <label class="field pp-fixed" hidden><span>固定审批人成员 ID</span>
-            <textarea id="pp-fixed" rows="3" placeholder="多个成员 ID 用换行或逗号分隔"></textarea>
-          </label>
-          <div class="pp-form-actions">
-            <button class="btn primary" type="submit">保存策略</button>
-            <span class="muted">保存后立即生效，员工端刷新即可看到新的审批链。</span>
-          </div>
-        </form>
-        <table class="data">
-          <thead><tr><th>类型</th><th>对象</th><th>级数</th><th>时限</th><th>审批人</th><th>操作</th></tr></thead>
-          <tbody>${policyRows}</tbody>
-        </table>
-      </section>`
-    const typeSelect = $('#pp-type')
-    const keySelect = $('#pp-key')
-    const strategySelect = $('#pp-strategy')
-    const fixedField = view.querySelector('.pp-fixed')
-    const fillKeys = () => {
-      keySelect.innerHTML = typeSelect.value === 'role' ? roleOptions : scopeOptions
+    const [data, workflowData] = await Promise.all([
+      api('/api/console/permission-policies'),
+      api('/api/console/approval-workflows'),
+    ])
+    state.approvalData = {
+      policies: data.policies ?? [],
+      roles: data.roles ?? [],
+      scopes: data.scopes ?? [],
+      defaultPolicy: data.defaultPolicy ?? null,
     }
-    const syncFixed = () => {
-      fixedField.hidden = strategySelect.value !== 'fixed_users'
+    state.approvalTemplates = workflowData.workflows ?? []
+    if (!state.approvalTemplates.some((item) => item.id === state.approvalTemplateId)) {
+      state.approvalTemplateId = state.approvalTemplates[0]?.id || ''
     }
-    typeSelect.addEventListener('change', fillKeys)
-    strategySelect.addEventListener('change', syncFixed)
-    syncFixed()
-    view.querySelectorAll('[data-pp-edit]').forEach((button) => {
-      button.addEventListener('click', () => {
-        const item = policies[Number(button.dataset.ppEdit)]
-        if (!item) return
-        typeSelect.value = item.targetType
-        fillKeys()
-        keySelect.value = item.targetKey
-        $('#pp-levels').value = String(item.maxLevels)
-        $('#pp-timeout').value = String(item.timeoutHours)
-        strategySelect.value = item.approverStrategy
-        $('#pp-admin').checked = Boolean(item.includeCompanyAdmin)
-        $('#pp-fixed').value = (item.fixedApprovers ?? []).join('\n')
-        syncFixed()
-        view.querySelector('#pp-form')?.scrollIntoView({ block: 'center', behavior: 'smooth' })
-      })
-    })
-    view.querySelectorAll('[data-pp-role]').forEach((checkbox) => {
-      checkbox.addEventListener('change', async () => {
-        const code = checkbox.dataset.ppRole
-        const wanted = checkbox.checked
-        checkbox.disabled = true
-        try {
-          await apiPost(`/api/console/permission-policies/roles/${encodeURIComponent(code)}/requestable`, {
-            requestable: wanted,
-          })
-        } catch (err) {
-          checkbox.checked = !wanted
-          alert(err.message || '保存可申请角色失败')
-        } finally {
-          checkbox.disabled = false
-        }
-      })
-    })
-    $('#pp-form')?.addEventListener('submit', async (event) => {
-      event.preventDefault()
-      const targetType = typeSelect.value
-      const targetKey = keySelect.value
-      const fixedApprovers = $('#pp-fixed')
-        .value.split(/[\s,，]+/)
-        .map((value) => value.trim())
-        .filter(Boolean)
-      try {
-        await apiPost('/api/console/permission-policies', {
-          targetType,
-          targetKey,
-          maxLevels: Number($('#pp-levels').value),
-          timeoutHours: Number($('#pp-timeout').value),
-          approverStrategy: strategySelect.value,
-          includeCompanyAdmin: $('#pp-admin').checked,
-          fixedApprovers,
-        })
-        loadPermissionPolicies()
-      } catch (err) {
-        alert(err.message || '保存审批策略失败')
-      }
-    })
+    const active = state.approvalTemplates.find((item) => item.id === state.approvalTemplateId)
+    if (!approvalFindNode(active?.flow, state.approvalNodeId)) {
+      state.approvalNodeId = active?.flow?.[0]?.id || 'start'
+    }
+    renderApprovalPage()
   } catch (err) {
     renderDenied(view, err)
   }
 }
+
 
 /* ---------------- 模型接入 ---------------- */
 
@@ -8951,63 +12279,271 @@ async function loadModels() {
   }
 }
 
+function matrixScopeGroups(scopeData) {
+  const groups = new Map()
+  for (const scope of scopeData.scopes || []) {
+    const title = scopeData.groups?.[scope] || '其他'
+    if (!groups.has(title)) groups.set(title, [])
+    groups.get(title).push({ key: scope, label: scopeData.labels?.[scope] || scope })
+  }
+  return [...groups.entries()].map(([title, items]) => ({ key: title, title, items }))
+}
+
+function matrixConsoleDomains(catalog) {
+  const pageMeta = new Map((catalog?.pages || []).map((page) => [page.page, page]))
+  return (catalog?.domains || []).map((domain) => {
+    const items = []
+    for (const pageKey of domain.pages || []) {
+      const meta = pageMeta.get(pageKey)
+      const sections = Array.isArray(meta?.sections) ? meta.sections : []
+      if (sections.length) {
+        for (const section of sections) {
+          items.push({
+            key: `${pageKey}:${section.key}`,
+            label: section.title || `${pageKey}:${section.key}`,
+            page: pageKey,
+          })
+        }
+      } else {
+        items.push({ key: pageKey, label: meta?.title || pageKey, page: pageKey })
+      }
+    }
+    return { key: domain.id || domain.title, title: domain.title || domain.label || domain.id || '后台页面', items }
+  })
+}
+
+function matrixTooltip(title, grantedLabels) {
+  if (!grantedLabels.length) return `${title}：未授予`
+  const preview = grantedLabels.slice(0, 6).join('、')
+  return `${title}：${preview}${grantedLabels.length > 6 ? ` 等 ${grantedLabels.length} 项` : ''}`
+}
+
+function matrixCellHtml(role, rowTitle, grantedLabels, total) {
+  const granted = grantedLabels.length
+  const ratio = total > 0 ? granted / total : 0
+  const level = granted === 0 ? 'none' : granted === total ? 'full' : ratio >= 0.6 ? 'high' : 'partial'
+  const label = `${roleDisplayName(role)} · ${rowTitle}：${granted} / ${total} 项`
+  return `<td class="role-matrix-cell is-${level}" data-matrix-col="${esc(role.code)}" aria-label="${esc(label)}" title="${esc(
+    matrixTooltip(label, grantedLabels),
+  )}"><span>${granted ? `${granted}<em>/${total}</em>` : '—'}</span></td>`
+}
+
+function roleMatrixPageHtml(data) {
+  const roles = data.roles || []
+  const mode = state.matrixMode === 'pages' ? 'pages' : 'scopes'
+  const filter = state.matrixFilter === 'builtin' || state.matrixFilter === 'custom' ? state.matrixFilter : 'all'
+  const filteredRoles = roles.filter((role) =>
+    filter === 'builtin' ? role.builtin : filter === 'custom' ? !role.builtin : true,
+  )
+  const scopeGroups = matrixScopeGroups(data.scopeData || {})
+  const consoleDomains = matrixConsoleDomains(data.catalog)
+  const scopeTotal = (data.scopeData?.scopes || []).length
+  const pageTotal = consoleDomains.reduce((sum, domain) => sum + domain.items.length, 0)
+  const rows = mode === 'pages' ? consoleDomains : scopeGroups
+  const modeLabel = mode === 'pages' ? '后台页面' : '功能权限'
+  const roleHeader = (role) => `<th class="role-matrix-role" data-matrix-col="${esc(role.code)}">
+    <button class="role-matrix-role-btn" type="button" data-matrix-role="${esc(role.code)}" title="打开 ${esc(
+      roleDisplayName(role),
+    )} 的角色详情">
+      <span class="role-matrix-avatar" aria-hidden="true">${esc(String(roleDisplayName(role)).slice(0, 1))}</span>
+      <span class="role-matrix-role-main">
+        <strong>${esc(roleDisplayName(role))}</strong>
+        <small>${esc(DATA_SCOPE_LABEL[role.dataScope] || role.dataScope)} · ${role.members || 0} 人</small>
+      </span>
+      <em>${role.builtin ? '内置' : '自定义'}</em>
+    </button>
+  </th>`
+  const roleScopes = new Map(filteredRoles.map((role) => [role.code, new Set(role.scopes || [])]))
+  const consoleKeys = new Map(
+    filteredRoles.map((role) => [
+      role.code,
+      new Set(
+        (Array.isArray(role.consolePages) ? role.consolePages : [])
+          .filter((page) => page.canView)
+          .map((page) => page.page),
+      ),
+    ]),
+  )
+  const grantedLabelsFor = (item, role) =>
+    mode === 'pages'
+      ? item.items.filter((leaf) => consoleKeys.get(role.code)?.has(leaf.key)).map((leaf) => leaf.label)
+      : item.items.filter((scope) => roleScopes.get(role.code)?.has(scope.key)).map((scope) => scope.label)
+  const rowScore = (item) => filteredRoles.reduce((sum, role) => sum + grantedLabelsFor(item, role).length, 0)
+  const orderedRows =
+    mode === 'pages' ? [...rows].sort((a, b) => rowScore(b) - rowScore(a)) : rows
+  const row = (item) => {
+    return `<tr>
+      <th class="role-matrix-row-head"><strong>${esc(item.title)}</strong><span>${item.items.length} 项</span></th>
+      ${filteredRoles
+        .map((role) => matrixCellHtml(role, item.title, grantedLabelsFor(item, role), item.items.length))
+        .join('')}
+    </tr>`
+  }
+  const table =
+    filteredRoles.length === 0
+      ? '<div class="empty role-matrix-empty">当前筛选没有角色。</div>'
+      : `<div class="matrix-wrap role-matrix-wrap">
+          <table class="data matrix role-matrix">
+            <thead><tr><th class="role-matrix-corner">权限分组</th>${filteredRoles.map(roleHeader).join('')}</tr></thead>
+            <tbody>${orderedRows.map(row).join('')}<tr id="role-matrix-no-hit" hidden><td class="role-matrix-no-hit" colspan="${
+              filteredRoles.length + 1
+            }">没有匹配的角色，换个关键词试试。</td></tr></tbody>
+          </table>
+        </div>`
+  const matrixHint =
+    mode === 'pages'
+      ? '按业务域汇总每个角色可见的后台页面；只核对结果，具体勾选仍在角色详情的「后台权限」。'
+      : '按权限分组汇总每个角色已获得的权限点；颜色越深表示该组覆盖越完整。'
+  return `<section class="role-matrix-hero">
+      <div class="role-matrix-copy">
+        <span class="role-eyebrow">组织与权限 · 权限矩阵</span>
+        <h2>角色 × ${modeLabel}${hintBadge('?', matrixHint, `${modeLabel}矩阵说明`, 'icon-only')}</h2>
+        <div class="role-matrix-hero-actions">
+          <button class="btn ghost" type="button" id="matrix-refresh">刷新</button>
+          <button class="btn" type="button" id="matrix-to-roles">角色管理</button>
+        </div>
+      </div>
+      <div class="role-matrix-stats">
+        <div><span>角色</span><strong>${roles.length}</strong></div>
+        <div><span>功能权限</span><strong>${scopeTotal}</strong></div>
+        <div><span>后台页面</span><strong>${pageTotal}</strong></div>
+      </div>
+    </section>
+    <div class="role-matrix-toolbar">
+      <div class="role-matrix-modes" role="tablist" aria-label="矩阵维度">
+        <button class="role-matrix-mode${mode === 'scopes' ? ' is-active' : ''}" type="button" role="tab" aria-selected="${
+          mode === 'scopes'
+        }" data-matrix-mode="scopes">功能权限</button>
+        <button class="role-matrix-mode${mode === 'pages' ? ' is-active' : ''}" type="button" role="tab" aria-selected="${
+          mode === 'pages'
+        }" data-matrix-mode="pages">后台页面</button>
+      </div>
+      <div class="role-matrix-tools">
+        <label class="role-matrix-search">
+          <span aria-hidden="true"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="6.5"></circle><path d="m16 16 4 4"></path></svg></span>
+          <input id="role-matrix-search" type="search" value="${esc(state.matrixQuery || '')}" placeholder="搜索角色名或编码" aria-label="搜索矩阵中的角色" autocomplete="off" />
+        </label>
+        <select id="role-matrix-filter" aria-label="筛选角色类型">
+          <option value="all"${filter === 'all' ? ' selected' : ''}>全部角色</option>
+          <option value="builtin"${filter === 'builtin' ? ' selected' : ''}>只看内置</option>
+          <option value="custom"${filter === 'custom' ? ' selected' : ''}>只看自定义</option>
+        </select>
+        <span class="role-matrix-visible-count" id="role-matrix-visible-count">显示 ${filteredRoles.length} / ${roles.length} 个角色</span>
+      </div>
+    </div>
+    <section class="panel role-matrix-panel">
+      <div class="panel-head">
+        <div><h2>${modeLabel}矩阵${hintBadge('?', '行是权限分组，列是角色；数字表示该角色在该组已获得的项数 / 总项数', `${modeLabel}矩阵表格说明`, 'icon-only')}</h2></div>
+        <span class="pill" id="role-matrix-mode-pill">${rows.length} 个分组 · ${filteredRoles.length} 个角色</span>
+      </div>
+      ${table}
+      <div class="role-matrix-legend">
+        <span><i class="role-matrix-dot is-none"></i>未授予</span>
+        <span><i class="role-matrix-dot is-partial"></i>部分授予</span>
+        <span><i class="role-matrix-dot is-high"></i>覆盖较高</span>
+        <span><i class="role-matrix-dot is-full"></i>全部授予</span>
+        <span class="muted">点击列头打开角色详情；矩阵只读，修改请进入角色详情。</span>
+      </div>
+    </section>`
+}
+
+function setupRoleMatrix(root, data) {
+  const roles = data.roles || []
+  const repaint = () => {
+    root.innerHTML = roleMatrixPageHtml(data)
+    setupRoleMatrix(root, data)
+  }
+  root.querySelector('#matrix-refresh')?.addEventListener('click', () => loadMatrix())
+  root.querySelector('#matrix-to-roles')?.addEventListener('click', () => {
+    state.selectedRole = null
+    state.roleTab = 'permissions'
+    navigate('roles')
+  })
+  root.querySelectorAll('[data-matrix-mode]').forEach((button) => {
+    button.addEventListener('click', () => {
+      if (button.dataset.matrixMode === state.matrixMode) return
+      state.matrixMode = button.dataset.matrixMode === 'pages' ? 'pages' : 'scopes'
+      window.scrollTo(0, 0)
+      repaint()
+    })
+  })
+  root.querySelector('#role-matrix-filter')?.addEventListener('change', (event) => {
+    state.matrixFilter = event.target.value
+    repaint()
+  })
+  root.querySelectorAll('[data-matrix-role]').forEach((button) => {
+    button.addEventListener('click', () => {
+      state.selectedRole = button.dataset.matrixRole
+      state.roleTab = 'permissions'
+      navigate('roles')
+    })
+  })
+  const search = root.querySelector('#role-matrix-search')
+  const visibleCount = root.querySelector('#role-matrix-visible-count')
+  const noHit = root.querySelector('#role-matrix-no-hit')
+  const applySearch = () => {
+    const tokens = String(search?.value || '')
+      .trim()
+      .toLowerCase()
+      .split(/\s+/)
+      .filter(Boolean)
+    const columnNodes = [...root.querySelectorAll('[data-matrix-col]')]
+    let shown = 0
+    for (const role of roles) {
+      const text = [roleDisplayName(role), role.code, DATA_SCOPE_LABEL[role.dataScope] || role.dataScope]
+        .join(' ')
+        .toLowerCase()
+      const hit = tokens.every((token) => text.includes(token))
+      if (hit) shown += 1
+      for (const node of columnNodes) {
+        if (node.dataset.matrixCol !== role.code) continue
+        node.hidden = !hit
+      }
+    }
+    if (visibleCount) visibleCount.textContent = `显示 ${shown} / ${roles.length} 个角色`
+    if (noHit) noHit.hidden = shown > 0
+  }
+  if (search) {
+    search.addEventListener('input', () => {
+      state.matrixQuery = search.value
+      applySearch()
+    })
+    search.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape' || !search.value) return
+      event.stopPropagation()
+      search.value = ''
+      state.matrixQuery = ''
+      applySearch()
+    })
+  }
+  applySearch()
+}
+
 async function loadMatrix() {
   const view = $('#view')
   renderLoading(view)
+  setSide('', true)
   try {
-    const data = await api('/api/dev/kb-matrix')
-    const head = `<tr><th>成员</th>${data.collections.map((c) => `<th>${esc(c.name)}</th>`).join('')}</tr>`
-    const body = data.personas
-      .map((person) => {
-        const cells = data.collections
-          .map((collection) =>
-            person.visibleIds.includes(collection.id)
-              ? '<td class="cell-yes">✓</td>'
-              : '<td class="cell-no">—</td>',
-          )
-          .join('')
-        const score = person.blocked
-          ? '<span class="badge deny">缺 kb:read</span>'
-          : `<span class="matrix-score">${person.visibleCount} / ${data.collections.length}</span>`
-        return `<tr><td class="name-cell"><strong>${esc(person.name)} ${score}</strong><div class="desc">${esc(
-          person.deptName,
-        )} · ${(person.roles || []).map((r) => ROLE_LABEL[r] || r).join('/')}</div></td>${cells}</tr>`
-      })
-      .join('')
-
-    view.innerHTML = `
-      <div class="panel">
-        <div class="panel-head">
-          <h2>知识库可见性核对</h2>
-          ${hintBadge('核对说明', '按同一套 ACL 把每个成员重算一遍，用来核对配置结果。')}
-        </div>
-        <div class="matrix-wrap"><table class="data matrix"><thead>${head}</thead><tbody>${body}</tbody></table></div>
-        <div class="legend"><span class="cell-yes">✓</span> 可见 <span class="cell-no">—</span> 不可见 ${hintBadge('图例说明', '同行「缺 kb:read」表示该身份连检索权限都没有，一个库也进不来。')}</div>
-      </div>`
-
-    const me = state.me
-    setSide(`
-      <div class="side-head">本页用途 ${hintBadge('用途说明', '把成员、角色与知识库可见范围放在一张表里核对，不再挨个点开猜。')}</div>
-      <div class="side-head">配置顺序 ${hintBadge('配置顺序', '先在「角色权限」给角色配权限点，再到「知识库」设可见范围，最后回这里核对结果。')}</div>
-      <div class="side-head">图例</div>
-      <div class="legend-box">
-        <div><span class="cell-yes">✓</span> 该成员可读</div>
-        <div><span class="cell-no">—</span> 不可读</div>
-        <div><span class="pill danger">缺 kb:read</span> 没有知识库读取权限</div>
-      </div>
-      <div class="side-foot">${esc(me && me.company ? me.company.name : '—')} ${hintBadge('核对范围', '仅服务器侧核对使用，成员看不到这张矩阵。')}</div>`)
-  } catch (err) {
-    setSide('', true)
-    if (err.status === 404) {
-      view.innerHTML = `
-        <section class="panel">
-          <div class="panel-head">
-            <div><h2>权限矩阵当前未开放 ${hintBadge('未开放原因', '该页调用开发态核对接口；当前部署没有开启开发身份（devAuth）。')}</h2></div>
-          </div>
-          <div class="muted" style="padding:0 2px">日常授权请以「角色权限」和「知识库 · 可见范围」为准。</div>
-        </section>`
-      return
+    const [rolesData, scopeData, membersData] = await Promise.all([
+      api('/api/console/roles'),
+      api('/api/console/scopes'),
+      api('/api/org/members').catch(() => ({ members: [] })),
+    ])
+    const allMembers = membersData?.members ?? []
+    for (const role of rolesData.roles || []) {
+      role.members = allMembers.filter((member) => (member.roles || []).some((item) => item.code === role.code)).length
     }
+    const data = {
+      roles: rolesData.roles || [],
+      catalog: rolesData.catalog || state.access?.catalog || null,
+      scopeData,
+    }
+    state.roles = data.roles
+    renderNavRail()
+    view.innerHTML = roleMatrixPageHtml(data)
+    setupRoleMatrix(view, data)
+    setPageActions('')
+  } catch (err) {
     renderDenied(view, err)
   }
 }
@@ -9530,22 +13066,18 @@ async function loadSys() {
       console: { ...brandBase.console, ...(settings?.branding?.console ?? {}) },
       chat: { ...brandBase.chat, ...(settings?.branding?.chat ?? {}) },
     }
+    const allowedSystemSections = visibleSystemSections()
+    const currentSystemSection = systemSectionKey()
+    const activeSystemSection = allowedSystemSections.some((item) => item.key === currentSystemSection)
+      ? currentSystemSection
+      : (allowedSystemSections[0]?.key ?? 'runtime')
+    const canUseSystemUpdate = canPageAction('system', 'view', 'update')
+    const canCheckSystemUpdate = canUseSystemUpdate
+    const canApplySystemUpdate = canUseSystemUpdate
+    const updateReadonlyNote = canUseSystemUpdate
+      ? ''
+      : '当前没有「系统更新」页面可见权限；勾选角色或成员「后台权限」中的「系统更新 → 可见」后即可检查并一键更新。'
     view.innerHTML = `
-      ${sectionNavHtml(
-        [
-          { key: 'runtime', label: '运行与准入', meta: '服务状态 · 安全边界' },
-          { key: 'concurrency', label: '并发与队列', meta: '对话 · 模型 · 工具 · 插件' },
-          { key: 'agents', label: 'Agent 管理', meta: '容量 · 运行树 · 工具轨迹' },
-          { key: 'jobs', label: '后台作业', meta: '排队 · 进度 · 结果' },
-          { key: 'boot', label: '启动动画', meta: '片头 · 片源 · 公司覆盖' },
-          { key: 'data', label: '系统与运维', meta: '目录 · 日志 · 备份 · 系统设置' },
-        ],
-        state.systemSection === 'company' || !state.systemSection
-          ? 'runtime'
-          : state.systemSection === 'agentTeam'
-            ? 'agents'
-            : state.systemSection,
-      )}
       <div class="section-panels">
       ${brandingPanelHtml(branding)}
       ${bootPanelHtml(boot)}
@@ -9799,10 +13331,12 @@ async function loadSys() {
         </div>
         <div class="inline-note" id="net-state" style="margin-top:10px"></div>
       </section>
-      <section class="panel" id="update-panel" data-section-panel="data">
+      <section class="panel" id="update-panel" data-section-panel="update">
         <div class="panel-head">
-          <div><h2>版本更新</h2>${hintBadge('更新说明', '从 GitHub Release 检测新版本；确认后校验源码包版本与 sha256，备份代码和数据库，再由更新器替换并重启；新版本健康检查失败会自动回滚。命令行方式：eab update（检测） / eab update --apply（确认更新）。数据目录 .eab-dev 不会被整体替换。')}</div>
-          <span class="pill ${update?.hasUpdate ? 'warn' : 'ok'}" id="update-pill">${update?.hasUpdate ? '发现新版本' : update?.latest ? '已是最新' : '尚未检查'}</span>
+          <div><h2>系统更新</h2>${hintBadge('更新说明', '从 GitHub Release 检测新版本；确认后校验源码包版本与 sha256，备份代码和数据库，再由更新器替换并重启；新版本健康检查失败会自动回滚。命令行方式：eab update（检测） / eab update --apply（确认更新）。数据目录 .eab-dev 不会被整体替换。本页只配置「可见」，可见即可查看版本、检查更新并执行一键更新。')}</div>
+          <div class="panel-actions">
+            <span class="pill ${update?.hasUpdate ? 'warn' : 'ok'}" id="update-pill">${update?.hasUpdate ? '发现新版本' : update?.latest ? '已是最新' : '尚未检查'}</span>
+          </div>
         </div>
         <div class="kv-grid kv-2">
           <div><span>当前版本</span><strong class="mono" id="update-current">v${esc(update?.current ?? health.version ?? '—')}</strong></div>
@@ -9814,11 +13348,11 @@ async function loadSys() {
         <div class="inline-note" id="update-result" style="margin-top:10px"></div>
         <div id="update-notes-wrap">${update?.notes ? `<details class="update-notes" style="margin-top:10px"><summary>查看 v${esc(update.latest ?? '')} 更新说明</summary><pre style="white-space:pre-wrap;margin:8px 0 0;max-height:240px;overflow:auto">${esc(update.notes)}</pre></details>` : ''}</div>
         <div class="panel-actions" style="margin-top:12px">
-          <button class="btn sm ghost" type="button" id="update-check">检查更新</button>
-          <button class="btn sm primary" type="button" id="update-apply" ${update?.hasUpdate && update?.sourceUrl ? '' : 'disabled'}>一键更新</button>
+          <button class="btn sm ghost" type="button" id="update-check"${canCheckSystemUpdate ? '' : ' disabled'}>检查更新</button>
+          <button class="btn sm ${canApplySystemUpdate ? 'primary' : 'ghost'}" type="button" id="update-apply" ${canApplySystemUpdate && update?.hasUpdate && update?.sourceUrl ? '' : 'disabled'}>一键更新</button>
           <button class="btn sm ghost" type="button" id="update-copy">复制命令</button>
         </div>
-        <div class="inline-note" id="update-state" style="margin-top:10px"></div>
+        <div class="inline-note" id="update-state" style="margin-top:10px">${updateReadonlyNote}</div>
       </section>
       <section class="panel" data-section-panel="runtime">
         <div class="panel-head"><div><h2>准入与安全</h2>${hintBadge('准入说明', '控制台不是员工入口，只有服务器本机或部署方账号能进；远程访问需部署侧显式开启。')}</div></div>
@@ -9927,9 +13461,9 @@ async function loadSys() {
         <div id="backup-list" class="mini-list"><div class="mini-row"><span>备份</span><div class="muted">加载中…</div></div></div>
       </section>`,
     )
-    mountSectionNav(view, state.systemSection, 'runtime', (key) => {
-      state.systemSection = key
-    })
+    for (const panel of view.querySelectorAll('[data-section-panel]')) {
+      panel.hidden = panel.dataset.sectionPanel !== activeSystemSection
+    }
     bindBootConfigPanel()
     const concurrencyRefresh = $('#concurrency-refresh')
     if (concurrencyRefresh) {
@@ -10758,7 +14292,9 @@ async function loadSys() {
     }
     const refreshUpdateView = () => {
       const applyButton = $('#update-apply')
-      if (applyButton) applyButton.disabled = !(updateNow?.hasUpdate && updateNow?.sourceUrl)
+      if (applyButton) applyButton.disabled = !canApplySystemUpdate || !(updateNow?.hasUpdate && updateNow?.sourceUrl)
+      const checkButton = $('#update-check')
+      if (checkButton) checkButton.disabled = !canCheckSystemUpdate
       const pill = $('#update-pill')
       if (pill) {
         pill.textContent = updateNow?.hasUpdate ? '发现新版本' : updateNow?.latest ? '已是最新' : '尚未检查'
@@ -10786,6 +14322,7 @@ async function loadSys() {
     const updateCheck = $('#update-check')
     if (updateCheck) {
       updateCheck.addEventListener('click', async () => {
+        if (!canCheckSystemUpdate) return
         updateCheck.disabled = true
         setUpdateNote('正在检查 GitHub Release…')
         try {
@@ -10804,14 +14341,14 @@ async function loadSys() {
         } catch (err) {
           setUpdateNote(err.message, true)
         } finally {
-          updateCheck.disabled = false
+          updateCheck.disabled = !canCheckSystemUpdate
         }
       })
     }
     const updateApply = $('#update-apply')
     if (updateApply) {
       updateApply.addEventListener('click', async () => {
-        if (!updateNow?.hasUpdate) return
+        if (!canApplySystemUpdate || !updateNow?.hasUpdate) return
         const confirmed = await confirmCard({
           title: `更新到 v${updateNow.latest}？`,
           message: '更新会下载 GitHub Release 源码包并校验版本/摘要，备份当前代码和数据库后替换；服务随后自动重启。',
@@ -10856,7 +14393,7 @@ async function loadSys() {
                   ? `更新失败，且未确认自动回滚${result.error ? `：${result.error}` : ''}；请检查 .eab-dev/updates/last-update.log`
                   : fallbackMessage
             setUpdateNote(message, true)
-            updateApply.disabled = false
+            updateApply.disabled = !canApplySystemUpdate
           }
           const poll = async () => {
             let running = ''
@@ -10903,7 +14440,7 @@ async function loadSys() {
           setTimeout(poll, 1500)
         } catch (err) {
           setUpdateNote(err.message, true)
-          updateApply.disabled = false
+          updateApply.disabled = !canApplySystemUpdate
         }
       })
     }
@@ -17126,13 +20663,38 @@ async function loadSkillsPage() {
  * 页面清单集中在这里，新页面只加一条，不用再同时改 index.html 与 CSS。
  * 之前是"顶部悬停出二级"，得把鼠标停在某个分组上才知道有哪些页；现在二级常驻左侧。
  */
+const SYSTEM_SECTIONS = [
+  { key: 'runtime', label: '运行与准入', meta: '服务状态 · 安全边界' },
+  { key: 'concurrency', label: '并发与队列', meta: '对话 · 模型 · 工具 · 插件' },
+  { key: 'agents', label: 'Agent 管理', meta: '容量 · 运行树 · 工具轨迹' },
+  { key: 'jobs', label: '后台作业', meta: '排队 · 进度 · 结果' },
+  { key: 'boot', label: '启动动画', meta: '片头 · 片源 · 公司覆盖' },
+  { key: 'data', label: '系统与运维', meta: '目录 · 日志 · 备份 · 系统设置' },
+  { key: 'update', label: '系统更新', meta: '检测 · 发布说明 · 一键更新' },
+]
+
+function systemSectionKey() {
+  const raw = state.systemSection
+  if (!raw || raw === 'company') return 'runtime'
+  if (raw === 'agentTeam') return 'agents'
+  return raw
+}
+
+function visibleSystemSections() {
+  if (!canViewPage('system')) return []
+  return SYSTEM_SECTIONS.filter((item) =>
+    canViewSection('system', item.key),
+  )
+}
+
 const DOMAINS = [
   { id: 'overview', label: '概览', kicker: 'OVERVIEW', pages: ['overview'] },
   { id: 'org', label: '组织与权限', kicker: 'ORGANIZATION & ACCESS', pages: ['org', 'departments', 'roles', 'approvalPolicies', 'access'] },
   { id: 'knowledge', label: '知识与模型', kicker: 'KNOWLEDGE & MODELS', pages: ['kb', 'models', 'tools'] },
-  { id: 'platform', label: '连接与平台', kicker: 'PLATFORMS', pages: ['channels', 'databases', 'documents', 'company', 'system'] },
+  { id: 'platform', label: '连接与平台', kicker: 'PLATFORMS', pages: ['channels', 'databases', 'documents', 'company'] },
   { id: 'features', label: '功能管理', kicker: 'CAPABILITIES', pages: ['extra', 'skills'] },
   { id: 'ops', label: '运营与审计', kicker: 'OPERATIONS', pages: ['usage', 'quota', 'audit', 'tasks', 'approvals'] },
+  { id: 'system', label: '系统', kicker: 'SYSTEM', pages: ['system'] },
 ]
 
 const PAGE_DOMAIN = DOMAINS.reduce((map, domain) => {
@@ -17166,52 +20728,20 @@ function canViewSection(page, section) {
 function canPageAction(page, action, section) {
   if (!state.access) return true
   if (state.access.kind !== 'member') return true
-  if (!state.allowedPages.includes(page)) return false
-  if (section) {
-    const key = `${page}:${section}`
-    const sectionPermission = state.sectionPermissions?.[key]
-    if (sectionPermission) {
-      if (!sectionPermission.canView) return false
-      if (action === 'view') return true
-      return sectionPermission[`can${action[0].toUpperCase()}${action.slice(1)}`] === true
-    }
-    // 旧数据只有整页权限时，所有分区继承整页动作。
-    if (state.sectionConfigured?.has(page)) return false
-  }
-  const actions = state.pageActions?.[page]
-  return Array.isArray(actions) && actions.includes(action)
+  if (!canViewPage(page)) return false
+  // 页面只登记可见；可见即拥有该页全部功能。系统二级页仍需各自可见。
+  if (section) return canViewSection(page, section)
+  return true
 }
 
-/** 当前页面是否有任意写动作；配置了分区时按子分区汇总。 */
+/** 当前页面是否有任意写动作；可见的页面直接视为可写。 */
 function canWritePage(page) {
-  if (state.access?.kind === 'member' && state.sectionConfigured?.has(page)) {
-    const prefix = `${page}:`
-    return Object.keys(state.pageActions || {})
-      .filter((key) => key.startsWith(prefix))
-      .some((key) => Array.isArray(state.pageActions[key]) && state.pageActions[key].length > 0)
-  }
-  return ['create', 'edit', 'delete'].some((action) => canPageAction(page, action))
+  return canPageAction(page, 'edit')
 }
 
 /** 兼容旧调用点：有任意写动作就是“可管理”。 */
 function canManagePage(page) {
   return canWritePage(page)
-}
-
-/** 统计有某一动作的页面数；页内分区只计父页面一次。 */
-function countActionPages(action) {
-  if (!state.access) return 0
-  if (state.access.kind === 'member') {
-    const pages = new Set()
-    for (const [key, actions] of Object.entries(state.pageActions || {})) {
-      if (!Array.isArray(actions) || !actions.includes(action)) continue
-      const parent = key.includes(':') ? key.split(':')[0] : key
-      if (state.allowedPages.includes(parent)) pages.add(parent)
-    }
-    return pages.size
-  }
-  const pages = Array.isArray(state.access.catalog?.pages) ? state.access.catalog.pages : []
-  return pages.filter((page) => Array.isArray(page.actions) && page.actions.some((item) => item.id === action)).length
 }
 
 function visiblePagesOfDomain(domain) {
@@ -17263,7 +20793,7 @@ function restorePinnedNavSubbar() {
   if (!navSubbarPinnedDomain) return false
   const button = navPrimaryButton(navSubbarPinnedDomain)
   const domain = DOMAINS.find((item) => item.id === navSubbarPinnedDomain)
-  if (!button || button.hidden || !domain || navSubbarPages(domain).length < 2) {
+  if (!button || button.hidden || !domain || navSubbarItems(domain).length < 2) {
     navSubbarPinnedDomain = null
     syncNavPinState()
     return false
@@ -17300,9 +20830,25 @@ function toggleNavSubbarPin(button) {
   else hideNavSubbarNow()
 }
 
-function navSubbarPages(domain) {
+function navSubbarItems(domain) {
+  if (domain.id === 'system') {
+    const active = systemSectionKey()
+    return visibleSystemSections().map((item) => ({
+      page: 'system',
+      section: item.key,
+      title: item.label,
+      active: state.page === 'system' && active === item.key,
+    }))
+  }
   // access 是角色页的别名，不在二级导航里重复出现
-  return domain.pages.filter((page) => page !== 'access' && PAGES[page] && canViewPage(page))
+  const activePage = state.page === 'access' ? 'roles' : state.page
+  return domain.pages
+    .filter((page) => page !== 'access' && PAGES[page] && canViewPage(page))
+    .map((page) => ({
+      page,
+      title: PAGES[page].title,
+      active: page === activePage,
+    }))
 }
 
 function hideNavSubbar() {
@@ -17337,8 +20883,8 @@ function scheduleHideNavSubbar() {
 function openNavSubbar(button) {
   const domain = DOMAINS.find((item) => item.id === button.dataset.domain)
   if (!domain) return
-  const pages = navSubbarPages(domain)
-  if (pages.length < 2) {
+  const items = navSubbarItems(domain)
+  if (items.length < 2) {
     hideNavSubbar()
     return
   }
@@ -17350,12 +20896,11 @@ function openNavSubbar(button) {
   const inner = document.getElementById('nav-subbar-inner')
   if (!subbar || !inner) return
   const activePage = state.page === 'access' ? 'roles' : state.page
-  inner.innerHTML = pages
-    .map((page) => {
-      const meta = PAGES[page]
-      if (!meta) return ''
-      const active = page === activePage
-      return `<button class="nav-sub-link${active ? ' is-active' : ''}" type="button" data-sub-page="${page}">${esc(meta.title)}</button>`
+  inner.innerHTML = items
+    .map((item) => {
+      if (!PAGES[item.page]) return ''
+      const active = item.section ? item.active : item.page === activePage
+      return `<button class="nav-sub-link${active ? ' is-active' : ''}" type="button" data-sub-page="${esc(item.page)}"${item.section ? ` data-sub-section="${esc(item.section)}"` : ''}>${esc(item.title)}</button>`
     })
     .join('')
   inner.inert = false
@@ -17388,7 +20933,7 @@ function setupNavSubbar() {
   for (const button of document.querySelectorAll('.nav-primary[data-domain]')) {
     const domain = DOMAINS.find((item) => item.id === button.dataset.domain)
     if (!domain) continue
-    if (navSubbarPages(domain).length < 2) continue
+    if (navSubbarItems(domain).length < 2) continue
     if (button.dataset.navSubbarBound === '1') continue
     button.dataset.navSubbarBound = '1'
     // 多页面业务域：悬停临时展开，点击固定；再次点击同一项取消固定
@@ -17421,6 +20966,7 @@ function setupNavSubbar() {
     const target = event.target.closest('[data-sub-page]')
     if (!target) return
     const page = target.dataset.subPage
+    if (target.dataset.subSection) state.systemSection = target.dataset.subSection
     if (navSubbarPinnedDomain && PAGE_DOMAIN[page]) {
       navSubbarPinnedDomain = PAGE_DOMAIN[page]
       syncNavPinState()
@@ -17620,6 +21166,7 @@ function navigate(page) {
   }
   if (!PAGES[page]) return
   hideNavSubbar()
+  window.scrollTo(0, 0)
   if (state.access && !canViewPage(page)) {
     // 同一业务域内优先落到可见页；不能因为首页不可见就跳到别的域
     const sameDomain = firstAllowedPageInDomain(PAGE_DOMAIN[page] ?? 'overview')
@@ -17887,7 +21434,7 @@ async function refreshUpdateBadge() {
     badge.hidden = !hasUpdate
     if (hasUpdate) {
       badge.textContent = `新版本 v${status.latest}`
-      badge.title = `当前 v${status.current}，点击查看版本更新`
+      badge.title = `当前 v${status.current}，点击查看系统更新`
     }
   } catch {
     badge.hidden = true
@@ -17913,7 +21460,7 @@ async function boot() {
 
   const updateBadge = $('#update-badge')
   updateBadge?.addEventListener('click', () => {
-    state.systemSection = 'data'
+    state.systemSection = 'update'
     navigate('system')
   })
   void refreshUpdateBadge()

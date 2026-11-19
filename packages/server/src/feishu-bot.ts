@@ -26,6 +26,7 @@ import {
   ensureChannelSession,
   historyOf,
   loadModelCatalogCached,
+  modelFailoverNotice,
   releaseTurn,
   retrieveKb,
   runAgentTurn,
@@ -774,7 +775,7 @@ export async function handleFeishuEvent(
           const next = available.find((item) => item.id === change.toModelId)
           if (next) effectiveModel = next
           modelSwitchContext.activeModelId = change.toModelId
-          failoverNote = `当前模型「${change.fromModelName}」暂时不可用，已自动切换到「${change.toModelName}」。\n\n`
+          failoverNote = modelFailoverNotice(change)
         },
         messages,
         sessionId,

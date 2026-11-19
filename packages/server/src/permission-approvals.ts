@@ -3,9 +3,10 @@
  *
  * 设计约束（已拍板）：
  * - 只有成员本人能发起申请，不允许上级代申请。
- * - 员工端按权限点申请；只展示当前身份没有、且由可申请角色提供的权限点。
- * - 多个权限点合并成一张申请单；审批链取所选权限点中最严格的 scope 策略。
+ * - 员工端按权限点申请；所有已登记权限点都可申请，只排除当前身份已经拥有的权限。
+ * - 多个权限点合并成一张申请单；审批链取所选权限点中最严格的 scope 策略，未单独配置的走默认策略。
  * - scope 申请最终只写 permission_scope_grants，不写 user_roles、不新增角色。
+ * - 申请角色只作为申请身份与审批策略上下文，不参与最终授权。
  * - 历史 role 申请继续按原路径审批并授予角色，保证旧单可查看、可处理。
  * - scope 临时授权到期由读侧过滤，保留授权记录用于审计。
  */
@@ -108,11 +109,21 @@ interface ManagedPerson {
 }
 
 export interface PermissionPolicyView {
-  id: string
+  /** 默认审批链也可能有持久化行；没有落库时 id 为 null。 */
+  id: string | null
+  /** 是否为公司默认审批链，用于界面区分“默认”和“单独配置”。 */
+  isDefault: boolean
   maxLevels: number
   includeCompanyAdmin: boolean
   timeoutHours: number
   approverStrategy: string
+}
+
+export interface CurrentRoleView {
+  code: string
+  name: string
+  /** 该角色单独配置的审批策略；没有则 null，表示按所选权限的策略或默认链。 */
+  policy: PermissionPolicyView | null
 }
 
 export interface RequestableRoleView {
@@ -124,7 +135,7 @@ export interface RequestableRoleView {
   reason: string
 }
 
-/** 员工端可勾选的权限点：只来自可申请角色，并且当前身份尚未拥有。 */
+/** 员工端可勾选的权限点：全部已登记权限点中，当前身份尚未拥有的部分。 */
 export interface RequestableScopeView {
   code: string
   label: string
@@ -194,12 +205,40 @@ function parseScopes(value: string): string[] {
 
 function readPolicy(row: PolicyRow): PermissionPolicyView {
   return {
-    id: row.id,
+    id: row.id || null,
+    isDefault: row.target_type === 'default',
     maxLevels: Math.min(MAX_MAX_LEVELS, Math.max(1, Math.trunc(Number(row.max_levels) || DEFAULT_MAX_LEVELS))),
     includeCompanyAdmin: Number(row.include_company_admin) === 1,
     timeoutHours: Math.min(MAX_TIMEOUT_HOURS, Math.max(MIN_TIMEOUT_HOURS, Math.trunc(Number(row.timeout_hours) || DEFAULT_TIMEOUT_HOURS))),
     approverStrategy: row.approver_strategy === 'fixed_users' ? 'fixed_users' : 'dept_chain',
   }
+}
+
+/** 未单独配置权限点或角色策略时的公司默认链。 */
+function defaultScopePolicyRow(policies: PolicyRow[] = []): PolicyRow {
+  const stored = policies.find((row) => row.target_type === 'default')
+  if (stored) return stored
+  return {
+    id: '',
+    company_id: '',
+    target_type: 'default',
+    target_key: 'default',
+    max_levels: DEFAULT_MAX_LEVELS,
+    include_company_admin: 1,
+    timeout_hours: DEFAULT_TIMEOUT_HOURS,
+    approver_strategy: 'dept_chain',
+    fixed_approvers_json: null,
+    created_at: 0,
+  }
+}
+
+function defaultScopePolicyView(policies: PolicyRow[] = []): PermissionPolicyView {
+  return readPolicy(defaultScopePolicyRow(policies))
+}
+
+/** 管理端读取当前生效的默认审批链；没有落库时返回内置默认值。 */
+export function defaultPolicyView(db: Db, companyId: string): PermissionPolicyView {
+  return defaultScopePolicyView(policiesOf(db, companyId))
 }
 
 function policiesOf(db: Db, companyId: string): PolicyRow[] {
@@ -218,7 +257,7 @@ function roleScopesOf(db: Db, roleId: string): string[] {
 }
 
 /**
- * 所选 scope 的审批链：每个 scope 都必须有 scope 策略，取最严格的一条。
+ * 所选 scope 的审批链：每个 scope 优先使用单独策略，未配置的走默认链，取最严格的一条。
  * “最严格”= 级数最多、超时最短、只要有一条要求公司管理员兜底就保留兜底。
  */
 function resolveScopePolicy(
@@ -226,7 +265,8 @@ function resolveScopePolicy(
   scopes: string[],
 ): { policy: PermissionPolicyView; policies: PolicyRow[] } | null {
   if (scopes.length === 0) return null
-  const matched = scopes.map((scope) => policies.find((row) => row.target_type === 'scope' && row.target_key === scope))
+  const fallback = defaultScopePolicyRow(policies)
+  const matched = scopes.map((scope) => policies.find((row) => row.target_type === 'scope' && row.target_key === scope) ?? fallback)
   if (matched.some((row) => !row)) return null
   const rows = matched as PolicyRow[]
   const strategies = new Set(rows.map((row) => row.approver_strategy === 'fixed_users' ? 'fixed_users' : 'dept_chain'))
@@ -255,7 +295,8 @@ function resolveScopePolicy(
   const includeCompanyAdmin = rows.some((row) => readPolicy(row).includeCompanyAdmin)
   return {
     policy: {
-      id: strictest.id,
+      id: strictest.id || null,
+      isDefault: strictest.target_type === 'default',
       maxLevels,
       includeCompanyAdmin,
       timeoutHours,
@@ -266,7 +307,7 @@ function resolveScopePolicy(
 }
 
 /**
- * 角色级策略优先；否则角色拥有的每个 scope 都必须有策略，取最严格的一条。
+ * 角色级策略优先；没有角色策略时按所选 scope 逐项取策略，未单独配置的走默认链。
  */
 function resolveRolePolicy(
   policies: PolicyRow[],
@@ -533,37 +574,44 @@ export function listRequestableRoles(db: Db, companyId: string): RequestableRole
 /**
  * 员工端可申请的权限点。
  *
- * 来源限定为“可申请角色拥有的 scope”，这是管理员的显式开关；
- * 再过滤掉当前身份已经拥有的权限（含 role/scope grant/override 的隐含能力）。
- * 只有配置了 scope 审批策略的权限点才会返回，避免提交后才发现无法建审批链。
+ * 来源是全部已登记权限点，不再受 role.requestable 或可申请角色拥有的 scope 限制；
+ * 只过滤当前身份已经拥有的权限（含 role/scope grant/override 的隐含能力）。
+ * 未单独配置策略的权限点使用默认审批链，仍然可以提交。
  */
 export function listRequestableScopes(db: Db, actor: RequestActor): RequestableScopeView[] {
   const companyId = actor.person.companyId
   const policies = policiesOf(db, companyId)
-  const roles = requestableRoleRows(db, companyId).filter((role) => !isAdminRole(role.code))
-  const codes = new Set<string>()
-  for (const role of roles) {
-    for (const scope of roleScopesOf(db, role.id)) {
-      if (isKnownScope(scope) && !actor.subject.scopes.has(scope)) codes.add(scope)
-    }
-  }
   const views: RequestableScopeView[] = []
-  for (const code of codes) {
-    const meta = SCOPE_REGISTRY[code as Scope]
-    if (!meta) continue
+  for (const [code, meta] of Object.entries(SCOPE_REGISTRY)) {
+    if (!meta || actor.subject.scopes.has(code as Scope)) continue
     const policyRow = policies.find((row) => row.target_type === 'scope' && row.target_key === code)
-    if (!policyRow) continue
     views.push({
       code,
       label: meta.label,
       group: meta.group,
       dangerous: Boolean(meta.dangerous),
       applicable: true,
-      policy: readPolicy(policyRow),
-      reason: '',
+      policy: policyRow ? readPolicy(policyRow) : defaultScopePolicyView(policies),
+      reason: policyRow ? '' : '未单独配置，按公司默认审批链',
     })
   }
   return views.sort((a, b) => a.group.localeCompare(b.group, 'zh-CN') || a.label.localeCompare(b.label, 'zh-CN') || a.code.localeCompare(b.code))
+}
+
+/** 当前身份实际拥有的角色；申请角色下拉与审批路径预览的数据源。 */
+export function listCurrentRoles(db: Db, actor: RequestActor): CurrentRoleView[] {
+  const policies = policiesOf(db, actor.person.companyId)
+  return roleCodesOf(db, actor.person.id)
+    .map((code) => roleRowOf(db, actor.person.companyId, code))
+    .filter((role): role is RoleRow => Boolean(role))
+    .map((role) => {
+      const policyRow = policies.find((row) => row.target_type === 'role' && row.target_key === role.code)
+      return {
+        code: role.code,
+        name: role.name,
+        policy: policyRow ? readPolicy(policyRow) : null,
+      }
+    })
 }
 
 /** 当前身份实际拥有的权限点摘要；只读展示，不参与申请。 */
@@ -580,13 +628,25 @@ export function currentScopeViews(actor: RequestActor): CurrentScopeView[] {
 }
 
 /**
- * scope 申请需要一个现有角色作为身份锚点。
+ * scope 申请需要一个现有角色作为身份与审批策略锚点。
  *
- * 数据库的 role_id / role_code / role_name 是 NOT NULL；这里写入申请人当前的一个角色，
- * 只用于满足历史表结构和审计上下文，审批通过不会把这个角色授予申请人。
+ * 数据库的 role_id / role_code / role_name 是 NOT NULL；这里写入申请人选择（或默认第一个）的当前角色，
+ * 只用于满足历史表结构、审计上下文和角色级审批策略；审批通过不会把这个角色授予申请人。
  */
-function anchorRoleOf(db: Db, companyId: string, actor: RequestActor): RoleRow {
-  for (const code of roleCodesOf(db, actor.person.id)) {
+function anchorRoleOf(db: Db, companyId: string, actor: RequestActor, preferredRoleCode = ''): RoleRow {
+  const currentCodes = roleCodesOf(db, actor.person.id)
+  if (preferredRoleCode) {
+    if (!currentCodes.includes(preferredRoleCode)) {
+      throw new EabError(EC.FORBIDDEN, '申请角色不属于当前身份', {
+        hint: '只能选择自己当前拥有的角色作为申请身份',
+        details: { roleCode: preferredRoleCode },
+      })
+    }
+    const preferred = roleRowOf(db, companyId, preferredRoleCode)
+    if (!preferred) throw new EabError(EC.NOT_FOUND, '申请角色不存在')
+    return preferred
+  }
+  for (const code of currentCodes) {
     const role = roleRowOf(db, companyId, code)
     if (role) return role
   }
@@ -693,6 +753,7 @@ function createScopePermissionRequest(
   db: Db,
   actor: RequestActor,
   scopeCodes: readonly string[],
+  roleCodeInput: string,
   reason: string,
   durationHours: number,
   now: number,
@@ -710,17 +771,8 @@ function createScopePermissionRequest(
     }
   }
 
-  const requestable = listRequestableScopes(db, actor)
-  const allowed = new Set(requestable.map((item) => item.code))
-  const unavailable = scopes.filter((code) => !allowed.has(code))
-  if (unavailable.length > 0) {
-    throw new EabError(EC.FORBIDDEN, '所选权限当前不可申请', {
-      hint: '只有可申请角色提供的权限点，且管理员已配置 scope 审批策略时才可提交',
-      details: { scopes: unavailable },
-    })
-  }
-
-  const resolved = resolveScopePolicy(policiesOf(db, companyId), scopes)
+  const anchorRole = anchorRoleOf(db, companyId, actor, roleCodeInput.trim())
+  const resolved = resolveRolePolicy(policiesOf(db, companyId), anchorRole, scopes)
   if (!resolved) {
     throw new EabError(EC.VALIDATION, '所选权限的审批策略不一致或缺失', {
       hint: '请分开申请审批策略不一致的权限，或让管理员先补齐 scope 审批策略',
@@ -728,19 +780,18 @@ function createScopePermissionRequest(
     })
   }
 
-  // 同一成员对完全相同的权限集合已有待审批申请时，直接返回原单。
+  // 同一成员、同一申请角色、完全相同的权限集合已有待审批申请时，直接返回原单。
   const existing = db
     .prepare(
       `SELECT * FROM permission_requests
         WHERE company_id = ? AND requester_user_id = ? AND request_type = 'scope'
-          AND status = 'pending' AND scopes_json = ?
+          AND role_id = ? AND status = 'pending' AND scopes_json = ?
         ORDER BY created_at DESC
         LIMIT 1`,
     )
-    .get(companyId, actor.person.id, JSON.stringify(scopes)) as RequestRow | undefined
+    .get(companyId, actor.person.id, anchorRole.id, JSON.stringify(scopes)) as RequestRow | undefined
   if (existing) return requestViewOf(db, existing)
 
-  const anchorRole = anchorRoleOf(db, companyId, actor)
   const steps = planSteps(db, companyId, actor, resolved.policy, resolved.policies)
   return persistPermissionRequest(db, {
     companyId,
@@ -827,7 +878,7 @@ export function createPermissionRequest(
   const reason = String(input.reason ?? '').trim().slice(0, 500)
   const scopeCodes = Array.isArray(input.scopeCodes) ? input.scopeCodes : []
   if (scopeCodes.length > 0) {
-    return createScopePermissionRequest(db, actor, scopeCodes, reason, durationHours, now)
+    return createScopePermissionRequest(db, actor, scopeCodes, String(input.roleCode ?? ''), reason, durationHours, now)
   }
   return createRolePermissionRequest(db, actor, String(input.roleCode ?? ''), reason, durationHours, now)
 }

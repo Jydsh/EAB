@@ -93,6 +93,16 @@ describe('工作区文本检索', () => {
     expect(result.total).toBe(10)
     expect(result.truncated).toBe(true)
   })
+
+  it('文件名查询也返回 nameMatches，并忽略文件名中的空格差异', () => {
+    const file = join(dir, '检查整治_近半个月_343条.csv')
+    writeFileSync(file, 'station,issue\nA,占道\n')
+    const result = searchWorkspaceText(dir, dir, { query: '检查整治_近半个月_343 条.csv' })
+    expect(result.total).toBe(0)
+    expect(result.nameMatches).toEqual([
+      { path: '检查整治_近半个月_343条.csv', name: '检查整治_近半个月_343条.csv' },
+    ])
+  })
 })
 
 describe('文本文件类型识别', () => {

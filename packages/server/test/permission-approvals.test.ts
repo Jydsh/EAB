@@ -8,6 +8,7 @@ import {
   decidePermissionRequest,
   expirePermissionRequests,
   getPermissionRequest,
+  listCurrentRoles,
   listPermissionRequests,
   listRequestableRoles,
   listRequestableScopes,
@@ -218,15 +219,94 @@ describe('多级权限审批', () => {
     expect(db.prepare(`SELECT COUNT(*) AS n FROM permission_requests`).get()).toEqual({ n: 1 })
   })
 
-  it('权限点列表只包含当前缺少、且已配置策略的权限', () => {
+  it('权限点列表包含全部未拥有的已登记权限，未配置策略走默认链', () => {
     const db = testDb()
     const scopes = listRequestableScopes(db, actorOf(db, 'u1'))
-    expect(scopes.map((scope) => scope.code)).toEqual(['audit:read', 'service:status', 'kb:admin'])
-    expect(scopes.every((scope) => scope.applicable && scope.policy)).toBe(true)
-    // 当前已有 approval:read / chat:use；audit:export 没有策略，都不应出现。
     expect(scopes.map((scope) => scope.code)).not.toContain('approval:read')
     expect(scopes.map((scope) => scope.code)).not.toContain('chat:use')
-    expect(scopes.map((scope) => scope.code)).not.toContain('audit:export')
+    expect(scopes.length).toBeGreaterThan(3)
+    const exportScope = scopes.find((scope) => scope.code === 'audit:export')
+    expect(exportScope).toBeTruthy()
+    expect(exportScope?.applicable).toBe(true)
+    expect(exportScope?.policy?.maxLevels).toBe(3)
+    expect(exportScope?.reason).toMatch(/默认审批链/)
+    const configured = scopes.find((scope) => scope.code === 'kb:admin')
+    expect(configured?.policy?.id).toBe('pol-kb:admin')
+  })
+
+  it('未单独配置策略的权限点可以提交，并按默认链建三步审批', () => {
+    const db = testDb()
+    const created = createPermissionRequest(db, actorOf(db, 'u1'), {
+      scopeCodes: ['audit:export'],
+      roleCode: 'member',
+      reason: '导出审计记录',
+    })
+    expect(created.requestType).toBe('scope')
+    expect(created.roleCode).toBe('member')
+    expect(created.totalSteps).toBe(3)
+    expect(db.prepare(`SELECT policy_id FROM permission_requests WHERE id = ?`).get(created.id)).toEqual({ policy_id: null })
+  })
+
+  it('默认审批链可持久化，未单独配置的权限按新默认策略建单', () => {
+    const db = testDb()
+    const now = Date.now()
+    db.prepare(
+      `INSERT INTO permission_approval_policies
+         (id, company_id, target_type, target_key, max_levels, include_company_admin,
+          timeout_hours, approver_strategy, fixed_approvers_json, created_by, created_at, updated_at)
+       VALUES ('pol-default', 'c1', 'default', 'default', 2, 0, 24, 'dept_chain', NULL, 'seed', ?, ?)`,
+    ).run(now, now)
+    const exportScope = listRequestableScopes(db, actorOf(db, 'u1')).find((scope) => scope.code === 'audit:export')
+    expect(exportScope?.policy?.id).toBe('pol-default')
+    expect(exportScope?.policy?.maxLevels).toBe(2)
+    expect(exportScope?.policy?.includeCompanyAdmin).toBe(false)
+    expect(exportScope?.reason).toMatch(/默认审批链/)
+    const created = createPermissionRequest(db, actorOf(db, 'u1'), {
+      scopeCodes: ['audit:export'],
+      roleCode: 'member',
+      now,
+    })
+    expect(created.totalSteps).toBe(2)
+    expect(created.steps.map((step) => step.approverUserId)).toEqual(['u2', 'u3'])
+    expect(db.prepare(`SELECT policy_id FROM permission_requests WHERE id = ?`).get(created.id)).toEqual({ policy_id: 'pol-default' })
+  })
+
+  it('申请角色只接受当前身份拥有的角色，并作为申请单锚点与策略优先项', () => {
+    const db = testDb()
+    const now = Date.now()
+    db.prepare(
+      `INSERT INTO user_roles (user_id, role_id, granted_by, granted_at, expires_at)
+       VALUES ('u1', 'r-auditor', 'seed', ?, NULL)`,
+    ).run(now)
+    db.prepare(
+      `INSERT INTO permission_approval_policies
+         (id, company_id, target_type, target_key, max_levels, include_company_admin,
+          timeout_hours, approver_strategy, fixed_approvers_json, created_by, created_at, updated_at)
+       VALUES ('pol-auditor', 'c1', 'role', 'auditor', 2, 1, 48, 'dept_chain', NULL, 'seed', ?, ?)`,
+    ).run(now, now)
+    expect(listCurrentRoles(db, actorOf(db, 'u1')).map((role) => role.code)).toEqual(['auditor', 'member'])
+    expect(listCurrentRoles(db, actorOf(db, 'u1')).find((role) => role.code === 'auditor')?.policy?.id).toBe('pol-auditor')
+    const created = createPermissionRequest(db, actorOf(db, 'u1'), {
+      scopeCodes: ['kb:admin'],
+      roleCode: 'auditor',
+      now,
+    })
+    expect(created.roleCode).toBe('auditor')
+    expect(created.roleName).toBe('auditor')
+    expect(db.prepare(`SELECT policy_id FROM permission_requests WHERE id = ?`).get(created.id)).toEqual({ policy_id: 'pol-auditor' })
+    expect(created.requestDeadline).toBe(now + 48 * 3_600_000)
+    expect(() => createPermissionRequest(db, actorOf(db, 'u1'), {
+      scopeCodes: ['kb:admin'],
+      roleCode: 'company_admin',
+    })).toThrow(/申请角色不属于当前身份/)
+  })
+
+  it('当前身份已经拥有的权限点不能重复申请', () => {
+    const db = testDb()
+    expect(() => createPermissionRequest(db, actorOf(db, 'u1'), {
+      scopeCodes: ['chat:use'],
+      roleCode: 'member',
+    })).toThrow(/当前身份已经拥有权限/)
   })
 
   it('多权限合并成一张单，审批时限取所选权限中最严格的一条', () => {
