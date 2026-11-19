@@ -9217,18 +9217,20 @@ async function loadSys() {
         </div>
         <div class="inline-note" id="net-state" style="margin-top:10px"></div>
       </section>
-      <section class="panel" data-section-panel="data">
+      <section class="panel" id="update-panel" data-section-panel="data">
         <div class="panel-head">
           <div><h2>版本更新</h2>${hintBadge('更新说明', '从 GitHub Release 检测新版本；确认后校验源码包版本与 sha256，备份代码和数据库，再由更新器替换并重启；新版本健康检查失败会自动回滚。命令行方式：eab update（检测） / eab update --apply（确认更新）。数据目录 .eab-dev 不会被整体替换。')}</div>
-          <span class="pill ${update?.hasUpdate ? 'warn' : 'ok'}">${update?.hasUpdate ? '发现新版本' : update?.latest ? '已是最新' : '尚未检查'}</span>
+          <span class="pill ${update?.hasUpdate ? 'warn' : 'ok'}" id="update-pill">${update?.hasUpdate ? '发现新版本' : update?.latest ? '已是最新' : '尚未检查'}</span>
         </div>
         <div class="kv-grid kv-2">
-          <div><span>当前版本</span><strong class="mono">v${esc(update?.current ?? health.version ?? '—')}</strong></div>
-          <div><span>最新版本</span><strong class="mono">${esc(update?.latest ? `v${update.latest}` : '尚未检查')}</strong></div>
-          <div><span>上次检查</span><strong>${esc(update?.checkedAt ? new Date(update.checkedAt).toLocaleString('zh-CN') : '—')}</strong></div>
+          <div><span>当前版本</span><strong class="mono" id="update-current">v${esc(update?.current ?? health.version ?? '—')}</strong></div>
+          <div><span>最新版本</span><strong class="mono" id="update-latest">${esc(update?.latest ? `v${update.latest}` : '尚未检查')}</strong></div>
+          <div><span>上次检查</span><strong id="update-checked">${esc(update?.checkedAt ? new Date(update.checkedAt).toLocaleString('zh-CN') : '—')}</strong></div>
           <div><span>更新来源</span><strong class="mono">GitHub · Jydsh/EAB</strong></div>
         </div>
-        ${update?.error ? `<div class="inline-note bad-text" style="margin-top:10px">${esc(update.error)}</div>` : ''}
+        <div class="inline-note bad-text" id="update-error" style="margin-top:10px" ${update?.error ? '' : 'hidden'}>${esc(update?.error ?? '')}</div>
+        <div class="inline-note" id="update-result" style="margin-top:10px"></div>
+        <div id="update-notes-wrap">${update?.notes ? `<details class="update-notes" style="margin-top:10px"><summary>查看 v${esc(update.latest ?? '')} 更新说明</summary><pre style="white-space:pre-wrap;margin:8px 0 0;max-height:240px;overflow:auto">${esc(update.notes)}</pre></details>` : ''}</div>
         <div class="panel-actions" style="margin-top:12px">
           <button class="btn sm ghost" type="button" id="update-check">检查更新</button>
           <button class="btn sm primary" type="button" id="update-apply" ${update?.hasUpdate && update?.sourceUrl ? '' : 'disabled'}>一键更新</button>
@@ -10147,20 +10149,58 @@ async function loadSys() {
 
     let updateNow = update
     const updateNote = $('#update-state')
+    const updateResult = $('#update-result')
     const setUpdateNote = (text, bad = false) => {
       if (!updateNote) return
       updateNote.textContent = text
       updateNote.classList.toggle('bad-text', bad)
     }
+    const renderUpdateResult = (result) => {
+      if (!updateResult) return
+      if (!result) {
+        updateResult.textContent = ''
+        updateResult.classList.remove('bad-text')
+        return
+      }
+      const at = result.finishedAt || result.at || result.startedAt
+      const time = at ? new Date(at).toLocaleString('zh-CN') : '时间未知'
+      const status = String(result.status || '')
+      let text = ''
+      if (status === 'succeeded') text = `上次更新成功：v${result.version || '—'} · ${time}`
+      else if (status === 'rolled_back') text = `上次更新失败，已自动回滚到 v${result.previousVersion || '—'} · ${time}${result.error ? ` · ${result.error}` : ''}`
+      else if (status === 'failed') text = `上次更新失败，未确认自动回滚 · ${time}${result.error ? ` · ${result.error}` : ''}`
+      else if (status === 'running' || status === 'starting') text = `更新正在执行：v${result.version || '—'} · 开始于 ${time}`
+      else text = `上次更新状态：${status || '未知'} · ${time}`
+      updateResult.textContent = text
+      updateResult.classList.toggle('bad-text', status === 'rolled_back' || status === 'failed')
+    }
     const refreshUpdateView = () => {
       const applyButton = $('#update-apply')
       if (applyButton) applyButton.disabled = !(updateNow?.hasUpdate && updateNow?.sourceUrl)
-      const pill = document.querySelector('[data-section-panel="data"] .panel-head .pill')
+      const pill = $('#update-pill')
       if (pill) {
         pill.textContent = updateNow?.hasUpdate ? '发现新版本' : updateNow?.latest ? '已是最新' : '尚未检查'
         pill.className = `pill ${updateNow?.hasUpdate ? 'warn' : 'ok'}`
       }
+      const current = $('#update-current')
+      if (current) current.textContent = `v${updateNow?.current ?? health.version ?? '—'}`
+      const latest = $('#update-latest')
+      if (latest) latest.textContent = updateNow?.latest ? `v${updateNow.latest}` : '尚未检查'
+      const checked = $('#update-checked')
+      if (checked) checked.textContent = updateNow?.checkedAt ? new Date(updateNow.checkedAt).toLocaleString('zh-CN') : '—'
+      const error = $('#update-error')
+      if (error) {
+        error.textContent = updateNow?.error ?? ''
+        error.hidden = !updateNow?.error
+      }
+      const notes = $('#update-notes-wrap')
+      if (notes) {
+        notes.innerHTML = updateNow?.notes
+          ? `<details class="update-notes" style="margin-top:10px"><summary>查看 v${esc(updateNow.latest ?? '')} 更新说明</summary><pre style="white-space:pre-wrap;margin:8px 0 0;max-height:240px;overflow:auto">${esc(updateNow.notes)}</pre></details>`
+          : ''
+      }
     }
+    renderUpdateResult(updateNow?.lastResult)
     const updateCheck = $('#update-check')
     if (updateCheck) {
       updateCheck.addEventListener('click', async () => {
@@ -10170,6 +10210,7 @@ async function loadSys() {
           updateNow = await apiPost('/api/console/update/check', {})
           void refreshUpdateBadge()
           refreshUpdateView()
+          renderUpdateResult(updateNow?.lastResult)
           setUpdateNote(
             updateNow.error
               ? updateNow.error
@@ -10208,23 +10249,71 @@ async function loadSys() {
           }
           setUpdateNote('更新器已启动，正在等待服务恢复…')
           const targetVersion = String(updateNow.latest || '').replace(/^v/i, '')
+          const previousVersion = String(updateNow.current || '').replace(/^v/i, '')
+          const appliedAt = applied?.startedAt || new Date().toISOString()
+          const appliedAtMs = Date.parse(appliedAt)
           const deadline = Date.now() + 300000
+          const markSuccess = () => {
+            renderUpdateResult({
+              status: 'succeeded',
+              version: targetVersion,
+              previousVersion,
+              startedAt: appliedAt,
+              finishedAt: new Date().toISOString(),
+              at: new Date().toISOString(),
+            })
+            setUpdateNote('更新完成，新版本已恢复健康；正在刷新页面…')
+            setTimeout(() => location.reload(), 1200)
+          }
+          const markFailure = (result, fallbackMessage) => {
+            if (result) renderUpdateResult(result)
+            const message =
+              result?.status === 'rolled_back'
+                ? `更新失败，已自动回滚到 v${result.previousVersion || previousVersion}${result.error ? `：${result.error}` : ''}`
+                : result?.status === 'failed'
+                  ? `更新失败，且未确认自动回滚${result.error ? `：${result.error}` : ''}；请检查 .eab-dev/updates/last-update.log`
+                  : fallbackMessage
+            setUpdateNote(message, true)
+            updateApply.disabled = false
+          }
           const poll = async () => {
+            let running = ''
             try {
               const res = await fetch('/api/health', { cache: 'no-store' })
               const body = await res.json().catch(() => null)
-              const running = String(body?.data?.version || '').replace(/^v/i, '')
+              running = String(body?.data?.version || '').replace(/^v/i, '')
               if (res.ok && running && running === targetVersion) {
-                setUpdateNote('更新完成，新版本已恢复健康；正在刷新页面…')
-                setTimeout(() => location.reload(), 1200)
+                markSuccess()
                 return
               }
             } catch {
               /* 服务重启期间连接失败，继续等 */
             }
+            let result = null
+            try {
+              const payload = await api('/api/console/update/result')
+              result = payload?.result ?? null
+              if (result) renderUpdateResult(result)
+            } catch {
+              /* 旧版本可能还没有该接口，继续靠健康检查兜底 */
+            }
+            const resultAt = Date.parse(result?.finishedAt || result?.at || result?.startedAt || '')
+            const isCurrentRun = Number.isFinite(resultAt) && (!Number.isFinite(appliedAtMs) || resultAt >= appliedAtMs - 1000)
+            if (result && isCurrentRun) {
+              if (result.status === 'succeeded') {
+                markSuccess()
+                return
+              }
+              if (result.status === 'rolled_back' || result.status === 'failed') {
+                markFailure(result, '更新失败，请检查更新日志')
+                return
+              }
+              if (result.status === 'running' || result.status === 'starting') {
+                setUpdateNote(`更新执行中：v${targetVersion}，请保持页面打开…`)
+              }
+            }
             if (Date.now() >= deadline) {
-              setUpdateNote('更新未在 5 分钟内确认完成，请检查 .eab-dev/updates/last-update.log', true)
-              updateApply.disabled = false
+              markFailure(null, '更新未在 5 分钟内确认完成，请检查 .eab-dev/updates/last-update.log')
               return
             }
             setTimeout(poll, 2000)

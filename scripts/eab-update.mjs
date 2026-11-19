@@ -22,6 +22,7 @@ const DEV_DIR = process.env.EAB_HOME ? resolve(process.env.EAB_HOME) : join(ROOT
 const DB_PATH = process.env.EAB_DB ? resolve(process.env.EAB_DB) : join(DEV_DIR, 'eab.db')
 const LOG_DIR = join(DEV_DIR, 'updates')
 const LOG_FILE = join(LOG_DIR, 'last-update.log')
+const STATUS_FILE = join(LOG_DIR, 'last-update.json')
 const CODE_PATHS = [
   // 整包替换，避免新增 packages/* 目录后更新器漏拷代码。
   'packages',
@@ -68,6 +69,12 @@ function log(message) {
   } catch {
     /* 日志失败不影响更新 */
   }
+}
+
+/** 更新状态必须在服务重启/回滚后仍可读；页面靠它区分成功、失败和已回滚。 */
+function writeStatus(payload) {
+  mkdirSync(LOG_DIR, { recursive: true })
+  writeFileSync(STATUS_FILE, `${JSON.stringify(payload, null, 2)}\n`, 'utf8')
 }
 
 function argsOf(argv) {
@@ -132,7 +139,8 @@ function waitPortFree(port, timeoutMs = 30000) {
       })
       socket.once('timeout', () => {
         socket.destroy()
-        resolvePromise(Date.now() > end ? false : true)
+        // 超时说明无法确认端口已释放，不能当成空闲继续替换文件。
+        resolvePromise(false)
       })
       socket.once('error', () => {
         socket.destroy()
@@ -336,6 +344,7 @@ async function main() {
   if (!existsSync(join(root, 'package.json'))) throw new Error(`项目根目录不存在：${root}`)
 
   const previousVersion = readRootVersion(root)
+  const startedAt = new Date().toISOString()
   const chatPort = readChatPort()
   mkdirSync(LOG_DIR, { recursive: true })
   const stamp = new Date().toISOString().replace(/[:.]/g, '-')
@@ -349,6 +358,25 @@ async function main() {
   let rollbackOk = null
 
   log(`开始更新：v${version}（当前 v${previousVersion}），项目根 ${root}`)
+  writeStatus({
+    status: 'running',
+    ok: null,
+    version,
+    previousVersion,
+    startedAt,
+    finishedAt: null,
+    at: startedAt,
+    error: null,
+    healthDetail: null,
+    rolledBack: null,
+    root,
+    backupDir: null,
+    dataBackupDir: null,
+    pid: null,
+    updaterPid: process.pid,
+    sourceUrl: url,
+    sourceDigest: expectedDigest || null,
+  })
   try {
     const res = await fetch(url, { signal: AbortSignal.timeout(60000) })
     if (!res.ok) throw new Error(`下载源码包失败：HTTP ${res.status}`)
@@ -415,26 +443,28 @@ async function main() {
       }
     }
     const ok = restart ? health.ok : true
+    const finishedAt = new Date().toISOString()
+    const status = ok ? 'succeeded' : rollbackOk === true ? 'rolled_back' : 'failed'
     log(ok ? `更新完成：v${version}（${health.detail}）` : `更新失败：v${version} 未恢复健康（${health.detail}）`)
-    writeFileSync(
-      join(LOG_DIR, 'last-update.json'),
-      `${JSON.stringify({
-        version,
-        previousVersion,
-        at: new Date().toISOString(),
-        ok,
-        health: health.ok,
-        healthDetail: health.detail,
-        pid: health.pid,
-        uptimeSec: health.uptime,
-        rolledBack: rollbackOk === true,
-        rollbackHealth: rollbackOk,
-        root,
-        backupDir: backupReady ? backupDir : null,
-        dataBackupDir,
-      }, null, 2)}\n`,
-      'utf8',
-    )
+    writeStatus({
+      status,
+      ok,
+      version,
+      previousVersion,
+      startedAt,
+      finishedAt,
+      at: finishedAt,
+      error: ok ? null : `新版本 v${version} 未恢复健康：${health.detail}`,
+      health: health.ok,
+      healthDetail: health.detail,
+      pid: health.pid,
+      uptimeSec: health.uptime,
+      rolledBack: rollbackOk === true,
+      rollbackHealth: rollbackOk,
+      root,
+      backupDir: backupReady ? backupDir : null,
+      dataBackupDir,
+    })
     if (!ok) process.exitCode = 1
   } catch (error) {
     log(`更新失败：${error.message}；开始回滚`)
@@ -461,24 +491,27 @@ async function main() {
     } catch (rollbackError) {
       log(`回滚失败：${rollbackError.message}`)
     }
-    writeFileSync(
-      join(LOG_DIR, 'last-update.json'),
-      `${JSON.stringify({
-        version,
-        previousVersion,
-        at: new Date().toISOString(),
-        ok: false,
-        health: null,
-        rolledBack: backupReady && rollbackOk === true,
-        restarted: restart ? rollbackOk === true : null,
-        rollbackHealth: rollbackOk,
-        error: error.message,
-        root,
-        backupDir: backupReady ? backupDir : null,
-        dataBackupDir,
-      }, null, 2)}\n`,
-      'utf8',
-    )
+    const finishedAt = new Date().toISOString()
+    writeStatus({
+      status: backupReady && rollbackOk === true ? 'rolled_back' : 'failed',
+      ok: false,
+      version,
+      previousVersion,
+      startedAt,
+      finishedAt,
+      at: finishedAt,
+      error: error.message,
+      health: null,
+      healthDetail: null,
+      pid: null,
+      uptimeSec: null,
+      rolledBack: backupReady && rollbackOk === true,
+      restarted: restart ? rollbackOk === true : null,
+      rollbackHealth: rollbackOk,
+      root,
+      backupDir: backupReady ? backupDir : null,
+      dataBackupDir,
+    })
     process.exitCode = 1
   } finally {
     try {
