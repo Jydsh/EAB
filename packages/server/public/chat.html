@@ -24,7 +24,7 @@
     <script src="/theme.js?v=20261117a" data-surface="chat"></script>
     <script src="/brand.js?v=20261115c" defer></script>
     <link rel="stylesheet" href="/app.css?v=20261118e" />
-    <link rel="stylesheet" href="/chat.css?v=20261118n" />
+    <link rel="stylesheet" href="/chat.css?v=20261119u4" />
     <link rel="stylesheet" href="/theme.css?v=20261115b" />
     <link rel="stylesheet" href="/boot-splash.css?v=20261115i" />
   </head>
@@ -228,6 +228,7 @@
               权限审批 <span class="workbench-tab-count" id="workbench-perm-count" hidden>0</span>
             </button>
             <button class="workbench-tab workbench-split-btn" type="button" id="workbench-split" title="团队与文件并排显示" aria-pressed="false">并排</button>
+            <button class="workbench-collapse workbench-close" type="button" id="workbench-close" title="关闭权限审批" aria-label="关闭权限审批" hidden>关闭</button>
             <button class="workbench-collapse" type="button" id="workbench-collapse" title="收起右侧工作台" aria-label="收起右侧工作台" aria-controls="workbench-rail" aria-expanded="true">收起</button>
           </div>
 
@@ -304,7 +305,6 @@
               <h2>权限审批</h2>
               <p class="perm-pane-sub">勾选当前身份缺少的权限点，多选合并成一张审批单；通过后只授予所选权限，不新增角色，到期自动失效。</p>
             </div>
-            <button class="icon-btn perm-pane-x" id="perm-pane-close" type="button" title="关闭权限审批" aria-label="关闭权限审批">×</button>
           </div>
           <div class="perm-switch" id="perm-switch" role="tablist" aria-label="权限审批视图">
             <button class="perm-switch-btn is-active" type="button" role="tab" data-perm-view="apply" aria-selected="true">申请权限</button>
@@ -581,6 +581,6 @@
       }
     </script>
     <script src="/boot-splash.js?v=20261118d" data-surface="chat" defer></script>
-    <script src="/chat.js?v=20261118p" defer></script>
+    <script src="/chat.js?v=20261119u7" defer></script>
   </body>
 </html>

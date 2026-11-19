@@ -95,6 +95,212 @@ function stripTags(value: string): string {
   return decodeXml(value.replace(/<[^>]+>/g, ' ')).replace(/\s+/g, ' ').trim()
 }
 
+/**
+ * 提取 OOXML 富文本里的可见文字。
+ *
+ * Word 会把一句话拆成多个 run，`<w:t>` 之间并没有空格。旧实现把每个标签都替换成空格，
+ * 会把「正负反馈」变成「正负 反馈」，也会把表格列头拆坏。这里只拼接 run 文本，
+ * 显式保留 `<w:tab>` / `<w:br>`，让正文和表格单元格尽量接近文档原样。
+ */
+function docxText(value: string): string {
+  const withBreaks = value
+    .replace(/<w:tab(?:\s[^>]*)?\/>/g, '\t')
+    .replace(/<w:br(?:\s[^>]*)?\/>/g, '\n')
+  const parts = Array.from(withBreaks.matchAll(/<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/g), (match) =>
+    decodeXml(match[1] ?? ''),
+  )
+  return parts
+    .join('')
+    .replace(/\u00a0/g, ' ')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
+/**
+ * 按 XML 标签深度提取顶层子元素，避免把嵌套表格里的行/单元格当成外层表格的行/单元格。
+ */
+function xmlChildElements(source: string, tag: string): string[] {
+  const token = new RegExp(`<${tag}(?:\\s[^>]*)?>|</${tag}>`, 'g')
+  const result: string[] = []
+  let depth = 0
+  let start = -1
+  for (const match of source.matchAll(token)) {
+    const value = match[0]
+    const index = match.index ?? 0
+    if (value.startsWith('</')) {
+      if (depth === 0) continue
+      depth -= 1
+      if (depth === 0 && start >= 0) {
+        result.push(source.slice(start, index + value.length))
+        start = -1
+      }
+      continue
+    }
+    if (depth === 0) start = index
+    depth += 1
+  }
+  return result
+}
+
+function docxCellText(cell: string): string {
+  const paragraphs = xmlChildElements(cell, 'w:p')
+    .map((paragraph) => docxText(paragraph))
+    .filter(Boolean)
+  if (paragraphs.length) return paragraphs.join(' ').replace(/\s+/g, ' ').trim()
+  return docxText(cell)
+}
+
+function docxOutlineLevel(paragraph: string): number | null {
+  const match = /<w:outlineLvl[^>]*w:val="(\d+)"/.exec(paragraph)
+  return match ? Number(match[1]) : null
+}
+
+function docxHeadingStyleLevel(paragraph: string): number | null {
+  const style = /<w:pStyle[^>]*w:val="([^"]+)"/.exec(paragraph)?.[1] ?? ''
+  const heading = /Heading\s*([1-6])/i.exec(style)?.[1] ?? /^([1-6])$/.exec(style)?.[1]
+  return heading ? Number(heading) : null
+}
+
+const CN_NUMBER = '一二三四五六七八九十百千万零〇两'
+
+/** 中文制度常见的「一、」「（一）」「附件：1、」「第 X 条」编号。 */
+function policyHeadingLevel(text: string, hasParent: boolean): number | null {
+  const value = text.trim()
+  if (!value || value.length > 120) return null
+  if (new RegExp(`^第[${CN_NUMBER}0-9]+[章篇编部分]`).test(value)) return 1
+  if (new RegExp(`^第[${CN_NUMBER}0-9]+条`).test(value)) return 4
+  if (new RegExp(`^[${CN_NUMBER}]+、`).test(value)) return hasParent ? 2 : 1
+  if (new RegExp(`^（[${CN_NUMBER}]+）`).test(value)) return hasParent ? 3 : 2
+  if (/^附件\s*[:：]\s*\d+[、.．]/.test(value)) return 2
+  return null
+}
+
+function isDocxListText(text: string): boolean {
+  const value = text.trim()
+  return /^\d+[、.．]\s*/.test(value) || /^[（(]\d+[）)]\s*/.test(value) || /^[-*•]\s+/.test(value)
+}
+
+function updateHeadingPath(path: string[], level: number, text: string): void {
+  if (level <= 0) return
+  path.length = Math.max(0, level - 1)
+  for (let index = 0; index < level - 1; index += 1) {
+    if (!path[index]) path[index] = ''
+  }
+  path[level - 1] = text
+}
+
+function isTableCaptionText(text: string): boolean {
+  const value = text.trim()
+  if (!value || value.length > 60) return false
+  return !/[。！？!?；;]/.test(value)
+}
+
+interface DocxTableModel {
+  rows: string[][]
+  columns: number
+  caption: string
+  /** 含标题行在内的重复表头行数；0 表示没有表头，通常是跨页续表。 */
+  headerRows: number
+}
+
+function parseDocxTableModels(table: string): DocxTableModel[] {
+  const gridXml = xmlChildElements(table, 'w:tblGrid')[0] ?? ''
+  const gridColumns = (gridXml.match(/<w:gridCol(?:\s[^>]*)?>/g) ?? []).length
+  const rawRows = xmlChildElements(table, 'w:tr').map((row) => {
+    const cells = xmlChildElements(row, 'w:tc').map((cell) => {
+      const span = Math.max(1, Number(/<w:gridSpan[^>]*w:val="(\d+)"/.exec(cell)?.[1] ?? 1))
+      const mergeTag = /<w:vMerge[^>]*>/.exec(cell)?.[0] ?? ''
+      const mergeValue = /w:val="([^"]+)"/.exec(mergeTag)?.[1] ?? ''
+      const continued = Boolean(mergeTag) && (!mergeValue || mergeValue === 'continue')
+      return { text: docxCellText(cell), span, continued }
+    })
+    return cells
+  })
+  const columns = Math.max(
+    1,
+    gridColumns,
+    ...rawRows.map((cells) => cells.reduce((sum, cell) => sum + cell.span, 0)),
+  )
+  let previous = Array<string>(columns).fill('')
+  const rows = rawRows.map((cells) => {
+    const row = Array<string>(columns).fill('')
+    let column = 0
+    for (const cell of cells) {
+      const text = cell.continued && !cell.text ? (previous[column] ?? '') : cell.text
+      row[column] = text
+      previous[column] = text
+      column += cell.span
+    }
+    previous = row.slice()
+    return row
+  })
+  return splitDocxLogicalTables(rows)
+}
+
+function isDocxTitleRow(row: string[]): boolean {
+  const nonEmpty = row.filter((cell) => cell.trim())
+  return nonEmpty.length === 1 && nonEmpty[0]!.trim().length <= 60
+}
+
+function isDocxHeaderRow(row: string[]): boolean {
+  if (!row[0]?.trim()) return false
+  const nonEmpty = row.filter((cell) => cell.trim())
+  if (nonEmpty.length < 2) return false
+  return nonEmpty.every(
+    (cell) =>
+      cell.trim().length <= 40 &&
+      !/^\d+(?:\.\d+)?$/.test(cell.trim()) &&
+      !/[。！？!?；;]/.test(cell.trim()),
+  )
+}
+
+function docxHeaderRows(rows: string[][], start: number): number {
+  let count = 0
+  if (rows[start] && isDocxTitleRow(rows[start]!)) count += 1
+  while (rows[start + count] && isDocxHeaderRow(rows[start + count]!)) count += 1
+  return count
+}
+
+/** 一个物理表里可能塞了两个逻辑表（例如「程度值」和「金额/审批」），按全宽标题行拆开。 */
+function splitDocxLogicalTables(rows: string[][]): DocxTableModel[] {
+  if (!rows.length) return []
+  const segments: Array<[number, number]> = []
+  let start = 0
+  for (let index = 1; index < rows.length; index += 1) {
+    const row = rows[index]!
+    const next = rows[index + 1]
+    if (isDocxTitleRow(row) && next && isDocxHeaderRow(next) && index - start > 1) {
+      segments.push([start, index])
+      start = index
+    }
+  }
+  segments.push([start, rows.length])
+  return segments.map(([from, to]) => {
+    const segmentRows = rows.slice(from, to)
+    const headerRows = docxHeaderRows(segmentRows, 0)
+    const caption = headerRows > 0 && isDocxTitleRow(segmentRows[0]!) ? segmentRows[0]!.find((cell) => cell.trim()) ?? '' : ''
+    return {
+      rows: segmentRows,
+      columns: Math.max(1, ...segmentRows.map((row) => row.length)),
+      caption,
+      headerRows,
+    }
+  })
+}
+
+function docxTableText(model: DocxTableModel, fallbackCaption = ''): { text: string; headerRows: number; caption: string } {
+  const rows = model.rows.map((row) => row.map((cell) => cell.replace(/\t/g, ' ').trim()).join('\t'))
+  const caption = model.caption || fallbackCaption.trim()
+  const needsCaption = Boolean(caption) && !model.caption
+  const textRows = needsCaption ? [caption, ...rows] : rows
+  return {
+    text: textRows.filter((row) => row.trim()).join('\n'),
+    headerRows: model.headerRows + (needsCaption ? 1 : 0),
+    caption,
+  }
+}
+
 function block(
   text: string,
   type: KbBlockType,
@@ -629,58 +835,223 @@ async function renderPdfPagePng(page: any): Promise<Buffer> {
   return canvas.toBuffer('image/png')
 }
 
+function docxBodyNodes(body: string): Array<{ type: 'p' | 'tbl'; xml: string }> {
+  const token = /<w:tbl(?:\s[^>]*)?>|<\/w:tbl>|<w:p(?:\s[^>]*)?>|<\/w:p>/g
+  const nodes: Array<{ type: 'p' | 'tbl'; xml: string }> = []
+  let tableDepth = 0
+  let paragraphDepth = 0
+  let start = -1
+  let kind: 'p' | 'tbl' | null = null
+  for (const match of body.matchAll(token)) {
+    const value = match[0]
+    const index = match.index ?? 0
+    if (value.startsWith('<w:tbl')) {
+      if (tableDepth === 0 && paragraphDepth === 0) {
+        start = index
+        kind = 'tbl'
+      }
+      tableDepth += 1
+      continue
+    }
+    if (value.startsWith('</w:tbl')) {
+      if (tableDepth === 0) continue
+      tableDepth -= 1
+      if (tableDepth === 0 && start >= 0 && kind === 'tbl') {
+        nodes.push({ type: 'tbl', xml: body.slice(start, index + value.length) })
+        start = -1
+        kind = null
+      }
+      continue
+    }
+    if (value.startsWith('<w:p')) {
+      if (tableDepth === 0) {
+        if (paragraphDepth === 0) {
+          start = index
+          kind = 'p'
+        }
+        paragraphDepth += 1
+      }
+      continue
+    }
+    if (value.startsWith('</w:p')) {
+      if (tableDepth !== 0 || paragraphDepth === 0) continue
+      paragraphDepth -= 1
+      if (paragraphDepth === 0 && start >= 0 && kind === 'p') {
+        nodes.push({ type: 'p', xml: body.slice(start, index + value.length) })
+        start = -1
+        kind = null
+      }
+    }
+  }
+  return nodes
+}
+
+function needsDocxParagraphContinuation(previous: string, next: string): boolean {
+  const left = previous.trim()
+  const right = next.trim()
+  if (left.length < 20 || !right || right.length > 240) return false
+  if (/[。！？!?；;：:）)】〕」”"']$/.test(left)) return false
+  if (isDocxListText(right) || policyHeadingLevel(right, true) !== null) return false
+  return true
+}
+
+function joinDocxContinuation(left: string, right: string): string {
+  if (/[A-Za-z0-9]$/.test(left) && /^[A-Za-z0-9]/.test(right)) return `${left} ${right}`
+  return `${left}${right}`
+}
+
 function parseDocx(buffer: Buffer, filename: string): KbParseResult {
   const files = unzipSync(new Uint8Array(buffer))
   const xml = files['word/document.xml']
   if (!xml) throw new KbParseError('PARSE_DOCX', 'DOCX 缺少 word/document.xml')
   const source = Buffer.from(xml).toString('utf8')
+  const body = /<w:body>([\s\S]*)<\/w:body>/.exec(source)?.[1] ?? source
   const rels = parseRelationships(files['word/_rels/document.xml.rels'], 'word/document.xml')
   const blocks: KbBlock[] = []
   const images: KbParsedImage[] = []
   const headingPath: string[] = []
-  const tableRegex = /<w:tbl>[\s\S]*?<\/w:tbl>/g
-  const tables = source.match(tableRegex) ?? []
-  const body = source.replace(tableRegex, '\n')
-  const paragraphRegex = /<w:p(?:\s[^>]*)?>[\s\S]*?<\/w:p>/g
-  const paragraphs = body.match(paragraphRegex) ?? []
-  for (const paragraph of paragraphs) {
-    const text = stripTags(paragraph)
-    if (text) {
-      const styleMatch = /<w:pStyle[^>]*w:val="([^"]+)"/.exec(paragraph)
-      const style = styleMatch?.[1] ?? ''
-      const headingLevel = /Heading\s*([1-6])/i.exec(style)?.[1] ?? /^([1-6])$/.exec(style)?.[1]
-      if (headingLevel) {
-        const level = Number(headingLevel)
-        headingPath.length = Math.max(0, level - 1)
-        headingPath[level - 1] = text
-        blocks.push(block(text, 'heading', [...headingPath], { meta: { level, style } }))
-      } else {
-        blocks.push(block(text, 'paragraph', [...headingPath], { meta: { style } }))
-      }
+  const nodes = docxBodyNodes(body)
+  let pendingTableCaption = ''
+  let lastParagraph: KbBlock | null = null
+  const nextContentNode = (start: number): { type: 'p' | 'tbl'; xml: string } | undefined => {
+    for (let index = start; index < nodes.length; index += 1) {
+      const candidate = nodes[index]!
+      if (candidate.type === 'tbl' || docxText(candidate.xml)) return candidate
     }
-    pushOoxmlImages(blocks, images, paragraph, rels, files, headingPath, {
-      caption: docxCcprCaption(paragraph),
-      source: 'docx',
-    })
+    return undefined
   }
-  for (const table of tables) {
-    const rows = (table.match(/<w:tr[\s\S]*?<\/w:tr>/g) ?? []).map((row) => {
-      const cells = (row.match(/<w:tc[\s\S]*?<\/w:tc>/g) ?? []).map((cell) => stripTags(cell))
-      return cells.join('\t')
-    })
-    const text = rows.filter(Boolean).join('\n')
-    if (text) blocks.push(block(text, 'table', [...headingPath], { meta: { format: 'docx' } }))
-    for (const paragraph of table.match(paragraphRegex) ?? []) {
+
+  const pushImages = (node: string): void => {
+    for (const paragraph of node.match(/<w:p(?:\s[^>]*)?>[\s\S]*?<\/w:p>/g) ?? []) {
       pushOoxmlImages(blocks, images, paragraph, rels, files, headingPath, {
         caption: docxCcprCaption(paragraph),
         source: 'docx',
       })
     }
   }
+
+  const pushParagraph = (text: string, style: string): void => {
+    if (
+      lastParagraph &&
+      lastParagraph.type === 'paragraph' &&
+      lastParagraph.headingPath.join('\u0000') === headingPath.join('\u0000') &&
+      needsDocxParagraphContinuation(lastParagraph.text, text)
+    ) {
+      lastParagraph.text = joinDocxContinuation(lastParagraph.text, text)
+      lastParagraph.meta = { ...lastParagraph.meta, style, mergedParagraph: true }
+      return
+    }
+    const item = block(text, 'paragraph', [...headingPath], { meta: { style } })
+    blocks.push(item)
+    lastParagraph = item
+  }
+
+  nodes.forEach((node, nodeIndex) => {
+    if (node.type === 'tbl') {
+      const models = parseDocxTableModels(node.xml)
+      models.forEach((model, modelIndex) => {
+        const fallbackCaption = modelIndex === 0 ? pendingTableCaption : ''
+        const prepared = docxTableText(model, fallbackCaption)
+        if (!prepared.text) return
+        let previousIndex = blocks.length - 1
+        while (previousIndex >= 0 && blocks[previousIndex]!.type === 'image') previousIndex -= 1
+        const previous = previousIndex >= 0 ? blocks[previousIndex] : undefined
+        const firstRow = model.rows[0] ?? []
+        const continuation =
+          modelIndex === 0 &&
+          !model.caption &&
+          !fallbackCaption.trim() &&
+          model.headerRows === 0 &&
+          previous?.type === 'table' &&
+          Number(previous.meta?.tableColumns) === model.columns &&
+          !String(firstRow[0] ?? '').trim()
+        if (continuation && previous) {
+          const lastFirstColumn = String(previous.meta?.tableLastFirstColumn ?? '').trim()
+          const appendedLines = prepared.text.split('\n').map((line) => {
+            const cells = line.split('\t')
+            if (!cells[0]?.trim() && lastFirstColumn) cells[0] = lastFirstColumn
+            return cells.join('\t')
+          })
+          const appendedText = appendedLines.join('\n')
+          previous.text = `${previous.text}\n${appendedText}`
+          const previousRows = Number(previous.meta?.tableRows ?? 0)
+          const appendedRows = appendedLines.length
+          const lastFirst = [...appendedLines]
+            .reverse()
+            .map((line) => line.split('\t')[0]?.trim() ?? '')
+            .find(Boolean) ?? lastFirstColumn
+          previous.meta = {
+            ...previous.meta,
+            tableRows: previousRows + appendedRows,
+            tableContinuations: Number(previous.meta?.tableContinuations ?? 0) + 1,
+            tableLastFirstColumn: lastFirst,
+          }
+          const range = previous.rowRange
+          previous.rowRange = [range?.[0] ?? 1, (range?.[1] ?? 0) + appendedRows]
+          return
+        }
+        const lineCount = prepared.text.split('\n').length
+        const lastFirstColumn = [...model.rows]
+          .reverse()
+          .map((row) => row[0]?.trim() ?? '')
+          .find(Boolean) ?? ''
+        const item = block(prepared.text, 'table', [...headingPath], {
+          rowRange: [Math.min(lineCount, Math.max(1, prepared.headerRows + 1)), lineCount],
+          meta: {
+            format: 'docx',
+            tableCaption: prepared.caption || undefined,
+            tableHeaderRows: prepared.headerRows,
+            tableColumns: model.columns,
+            tableRows: lineCount,
+            tableLastFirstColumn: lastFirstColumn,
+          },
+        })
+        blocks.push(item)
+        lastParagraph = null
+      })
+      pendingTableCaption = ''
+      pushImages(node.xml)
+      return
+    }
+
+    const text = docxText(node.xml)
+    if (!text) {
+      pushImages(node.xml)
+      return
+    }
+    pendingTableCaption = ''
+    const style = /<w:pStyle[^>]*w:val="([^"]+)"/.exec(node.xml)?.[1] ?? ''
+    const nextIsTable = nextContentNode(nodeIndex + 1)?.type === 'tbl'
+    let level = policyHeadingLevel(text, headingPath.some(Boolean))
+    if (level === null && nextIsTable && isTableCaptionText(text)) {
+      pendingTableCaption = text
+      pushImages(node.xml)
+      return
+    }
+    if (level === null) {
+      const outline = docxOutlineLevel(node.xml)
+      level = outline !== null ? outline + 1 : docxHeadingStyleLevel(node.xml)
+    }
+    if (level !== null) {
+      const headingLevel = Math.max(1, Math.min(6, level))
+      updateHeadingPath(headingPath, headingLevel, text)
+      blocks.push(block(text, 'heading', [...headingPath], { meta: { level: headingLevel, style } }))
+      lastParagraph = null
+      pushImages(node.xml)
+      return
+    }
+    if (isDocxListText(text)) {
+      blocks.push(block(text, 'list', [...headingPath], { meta: { style } }))
+      lastParagraph = null
+    } else {
+      pushParagraph(text, style)
+    }
+    pushImages(node.xml)
+  })
   return {
     blocks,
     text: collectText(blocks),
-    meta: { parser: 'docx', filename, tables: tables.length, images: images.length },
+    meta: { parser: 'docx', filename, tables: nodes.filter((node) => node.type === 'tbl').length, images: images.length },
     pageCount: 0,
     ...(images.length ? { images } : {}),
   }

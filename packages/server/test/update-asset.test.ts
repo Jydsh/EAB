@@ -35,10 +35,32 @@ describe('更新包资产选择', () => {
 })
 
 describe('版本比较', () => {
-  it('去除 v 前缀后按数字段比较', () => {
+  it('无同日序号的基础版本低于任一两位序号版本', () => {
+    expect(isNewerVersion('2026.11.18', '2026.11.18.01')).toBe(true)
+    expect(isNewerVersion('2026.11.18.01', '2026.11.18')).toBe(false)
+    expect(isNewerVersion('2026.11.18.01', '2026.11.18.02')).toBe(true)
+    expect(isNewerVersion('2026.11.18.02', '2026.11.18.01')).toBe(false)
+  })
+
+  it('按年、月、日、同日序号依次比较', () => {
+    expect(isNewerVersion('2026.11.17', '2026.11.18')).toBe(true)
+    expect(isNewerVersion('2026.11.18', '2026.11.17')).toBe(false)
+    expect(isNewerVersion('2026.11.18.99', '2026.11.19')).toBe(true)
+    expect(isNewerVersion('2026.11.19', '2026.11.18.99')).toBe(false)
+    expect(isNewerVersion('2026.11.18.01', '2026.11.18.01')).toBe(false)
+  })
+
+  it('去除 v 前缀后比较', () => {
     expect(normalizeVersion('v2026.11.15')).toBe('2026.11.15')
-    expect(isNewerVersion('2026.11.15', '2026.11.16')).toBe(true)
-    expect(isNewerVersion('2026.11.16', '2026.11.15')).toBe(false)
-    expect(isNewerVersion('2026.11.15', '2026.11.15')).toBe(false)
+    expect(normalizeVersion('v2026.11.15.01')).toBe('2026.11.15.01')
+    expect(isNewerVersion('v2026.11.17', 'v2026.11.18.01')).toBe(true)
+  })
+
+  it('拒绝非日期版本格式，避免把 -1、一位序号或非法日期当成更新', () => {
+    expect(isNewerVersion('2026.11.18', '2026.11.18-1')).toBe(false)
+    expect(isNewerVersion('2026.11.18', '2026.11.18.1')).toBe(false)
+    expect(isNewerVersion('2026.11.18', '2026.11.18.00')).toBe(false)
+    expect(isNewerVersion('2026.11.18', '2026.02.30')).toBe(false)
+    expect(isNewerVersion('2026.11.18', '')).toBe(false)
   })
 })

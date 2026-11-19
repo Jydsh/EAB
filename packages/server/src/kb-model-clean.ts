@@ -217,8 +217,14 @@ export async function cleanBlocksWithModel(
   options: ModelCleanOptions = {},
 ): Promise<ModelCleanResult> {
   if (blocks.length === 0) return { blocks, modelId, keptOriginalCount: 0 }
-  const batches = batchBlocks(blocks)
+  // 表格、代码和图片块不能交给“改写型”模型：表格一旦被压成段落，列结构就无法恢复；
+  // 代码一旦被补全或重排，命令和缩进也会失真。它们由规则清洗保证结构，模型只处理正文。
+  const protectedTypes = new Set<KbBlock['type']>(['table', 'code', 'image'])
+  const cleanable = blocks.filter((block) => !protectedTypes.has(block.type))
+  if (cleanable.length === 0) return { blocks, modelId, keptOriginalCount: 0 }
+  const batches = batchBlocks(cleanable)
   const batchResults = new Array<{ blocks: KbBlock[]; keptOriginalCount: number }>(batches.length)
+  const droppedIds = new Set<string>()
   let completedBatches = 0
   let completedBlocks = 0
   const reportProgress = () => {
@@ -228,7 +234,7 @@ export async function cleanBlocksWithModel(
         completedBatches,
         totalBatches: batches.length,
         completedBlocks,
-        totalBlocks: blocks.length,
+        totalBlocks: cleanable.length,
       })
     } catch {
       // 进度回调只服务 UI，不能影响清洗结果。
@@ -288,6 +294,7 @@ export async function cleanBlocksWithModel(
         const text = (parsed.get(index) ?? '').trim()
         // 标记存在但正文为空，表示模型判定这个块全是噪声，应当整块丢弃。
         if (text) out.push({ ...block, text })
+        else droppedIds.add(block.id)
       })
 
       // 只给少量漏标记的块补洗；其余沿用规则清洗结果，保证长文档耗时有上限。
@@ -323,5 +330,12 @@ export async function cleanBlocksWithModel(
     cleaned.push(...result.blocks)
     keptOriginalCount += result.keptOriginalCount
   }
-  return { blocks: cleaned, modelId, keptOriginalCount }
+  const cleanedById = new Map(cleaned.map((block) => [block.id, block]))
+  const result: KbBlock[] = []
+  for (const block of blocks) {
+    if (protectedTypes.has(block.type) || !droppedIds.has(block.id)) {
+      result.push(protectedTypes.has(block.type) ? block : cleanedById.get(block.id) ?? block)
+    }
+  }
+  return { blocks: result, modelId, keptOriginalCount }
 }

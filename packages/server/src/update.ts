@@ -68,6 +68,30 @@ export function normalizeVersion(value: string): string {
   return String(value ?? '').trim().replace(/^v/i, '')
 }
 
+/**
+ * 发布版本只认两种形式：
+ * - vYYYY.MM.DD：当天首个版本；
+ * - vYYYY.MM.DD.NN：同日追加版本，NN 为 01–99。
+ *
+ * 同日没有序号的基础版本排在所有带序号版本之前，等价于序号 00。
+ */
+const DATE_VERSION_RE = /^(\d{4})\.(\d{2})\.(\d{2})(?:\.(\d{2}))?$/
+
+function parseDateVersion(value: string): [number, number, number, number] | null {
+  const match = DATE_VERSION_RE.exec(normalizeVersion(value))
+  if (!match) return null
+  const year = Number(match[1])
+  const month = Number(match[2])
+  const day = Number(match[3])
+  const sequence = match[4] === undefined ? 0 : Number(match[4])
+  if (month < 1 || month > 12 || day < 1) return null
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0)
+  const daysInMonth = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1]
+  if (day > daysInMonth) return null
+  if (match[4] !== undefined && (sequence < 1 || sequence > 99)) return null
+  return [year, month, day, sequence]
+}
+
 function isInstallerAsset(name: string): boolean {
   return /(installer|setup|portable|desktop|windows|win32|win64|mac|darwin|linux|appimage|msi|exe)/i.test(name)
 }
@@ -91,22 +115,14 @@ export function chooseSourceAsset(assets: ReleaseAsset[]): ReleaseAsset | null {
     .sort((a, b) => sourceAssetScore(b.name) - sourceAssetScore(a.name))[0] ?? null
 }
 
-/** 年月日版本号按数字段比较；非数字段按字符串兜底，避免抛错。 */
+/** 按日期版本四段（年、月、日、同日序号）比较；格式不合法时不做“有更新”判断。 */
 export function isNewerVersion(current: string, latest: string): boolean {
-  const a = normalizeVersion(current)
-  const b = normalizeVersion(latest)
+  const a = parseDateVersion(current)
+  const b = parseDateVersion(latest)
   if (!a || !b) return false
-  const av = a.split('.')
-  const bv = b.split('.')
-  const length = Math.max(av.length, bv.length)
-  for (let i = 0; i < length; i += 1) {
-    const x = Number(av[i] ?? 0)
-    const y = Number(bv[i] ?? 0)
-    if (Number.isNaN(x) || Number.isNaN(y)) {
-      if (av[i] === bv[i]) continue
-      return String(bv[i] ?? '').localeCompare(String(av[i] ?? '')) > 0
-    }
-    if (x !== y) return y > x
+  for (let i = 0; i < 4; i += 1) {
+    if (b[i] === a[i]) continue
+    return b[i] > a[i]
   }
   return false
 }

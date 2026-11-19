@@ -12,6 +12,7 @@ import {
   searchChunkVectors,
   type EmbedFn,
 } from './kb-vector.js'
+import { chunkRetrievalText } from './kb-chunk-text.js'
 
 export type KbRetrievalMode = 'hybrid' | 'keyword' | 'vector'
 
@@ -184,7 +185,9 @@ export async function retrieveKbCore(
 
   let keywordRanked: RankedItem[] = []
   if (mode !== 'vector' && terms.length > 0) {
-    const likeClause = terms.map(() => 'c.text LIKE ?').join(' OR ')
+    // 标题路径存在 meta_json 中，正文不一定重复。只扫 text 会漏掉“三、申诉、执行与公示”
+    // 这类制度条框，因此关键词候选同时匹配正文和元数据里的 headingPath。
+    const likeClause = terms.map(() => '(c.text LIKE ? OR c.meta_json LIKE ?)').join(' OR ')
     const rows = db
       .prepare(
         `SELECT c.id AS chunk_id, c.doc_id, c.collection_id, c.text, c.classification, c.meta_json,
@@ -198,13 +201,14 @@ export async function retrieveKbCore(
             AND (${likeClause})
           LIMIT ${KEYWORD_CANDIDATE_LIMIT}`,
       )
-      .all(...ids, ...terms.map((term) => `%${term}%`)) as unknown as KbCandidateRow[]
+      .all(...ids, ...terms.flatMap((term) => [`%${term}%`, `%${term}%`])) as unknown as KbCandidateRow[]
 
     keywordRanked = rows
       .map((row) => {
+        const searchable = chunkRetrievalText(row.meta_json, row.text)
         let score = 0
         for (const term of terms) {
-          if (row.text.includes(term)) score += 1
+          if (searchable.includes(term)) score += 1
         }
         return {
           row,
@@ -345,9 +349,10 @@ export async function retrieveKbCore(
     } else {
       baseDiagnostics.rerankModelId = rerankModel.id
       const candidates = ranked.slice(0, RERANK_CANDIDATE_LIMIT)
+      const candidateTexts = candidates.map((item) => chunkRetrievalText(item.row.meta_json, item.row.text))
       try {
         const results = options.rerankFn
-          ? await options.rerankFn(q, candidates.map((item) => item.row.text))
+          ? await options.rerankFn(q, candidateTexts)
           : (
               await callRerank(
                 db,
@@ -355,7 +360,7 @@ export async function retrieveKbCore(
                 companyId,
                 rerankModel.id,
                 q,
-                candidates.map((item) => item.row.text),
+                candidateTexts,
                 Math.min(4, topK),
               )
             ).results
@@ -390,7 +395,7 @@ export async function retrieveKbCore(
     collectionName: item.row.collection_name,
     docTitle: item.row.doc_title,
     classification: item.row.classification,
-    text: item.row.text,
+    text: chunkRetrievalText(item.row.meta_json, item.row.text),
     images: imagesOf(item.row),
     keywordRank: item.keywordRank,
     vectorRank: item.vectorRank,

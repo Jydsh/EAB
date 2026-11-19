@@ -1,6 +1,6 @@
 # EAB 企业智能体基座 — 总体架构方案与需求规格
 
-> **版本**：v2026.11.15（日期版本号，与根 `package.json` 的 `version` 一致）
+> **版本**：v2026.11.19（日期版本号，与根 `package.json` 的 `version` 一致）
 > **项目代号**：EAB（Enterprise Agent Base）
 > **文档性质**：架构决策 + 需求规格 + 工程规范，是开发的**唯一上游依据**。代码实现与本文件冲突时，以本文件为准；本文件有错时，先改本文件再改代码。
 > **本次修订**：2026-11-07，在第一版架构草稿基础上补齐「架构再设计分析与决策记录（ADR）」「需求规格说明书（FR/NFR/用例/验收）」「领域模型与数据字典」「接口契约」「工程结构与任务分解」。
@@ -1601,7 +1601,7 @@ interface ModelRoute {
 
 - **能力与端点**：13 项能力（含 `embedding` / `rerank` / `audio` / `video`）与 6 种端点类型 `chat / embeddings / rerank / asr / tts / video`。
 - **适配器现状**：`chat`（OpenAI 兼容 SSE + Anthropic / Gemini / Azure）、`embeddings`（OpenAI 兼容 / Azure / Gemini）、`rerank`（Cohere/Jina/SiliconFlow/vLLM/TEI 形态）已实现；`asr / tts / video` 只留端点类型与调用位。
-- **路由规则**（按优先级）：显式 `model_routes` > 能力 + 优先级自动挑 > 返回 `null`（调用方降级，不报错）。
+- **路由规则**（按优先级）：显式 `model_routes` > 能力 + 优先级自动挑 > 返回 `null`（调用方降级，不报错）。**例外**：`chat.default` 未绑定时走 12.7.3 的真实回复速度自动选模，无速度样本才回到能力 + 优先级。
 - **绑定校验**：向量用途只认 `embedding` / `endpoint_kind=embeddings`；重排只认 `endpoint_kind=rerank`；ASR/TTS 只认 `asr` / `tts`，避免音频对话模型被误当转写模型。
 - **密钥隔离**：密钥按公司存 `secrets` 表（加密后存，密钥来自环境变量或机器密钥文件），**永不返回给前端**，日志脱敏。
 - **流式错误归因**见 11.8，这是路由能否真正容灾的前提。
@@ -1833,10 +1833,20 @@ DSH（`github.com/deepseek-ai/deepseek-harness`，MIT）是官方开源的 Agent
 | 功能闸 1 | 没有 `chat:use` → 连对话入口都不给，页面直接显示拒绝态（含所需 scope） | `/api/chat/messages`、`/api/chat/models` |
 | 功能闸 2 | 没有 `model:use` → 不给任何模型 | 同上 |
 | 模型闸 | 每个模型有"允许角色"清单：空 = 所有能对话的身份；非空 = 只对这些角色出现 | `models` 表（`roles` 列），控制台「模型接入」页可改 |
-| 自动模式 | 在**可用集合**里取 `priority` 最大的那个；下拉第一项显示"自动（X）" | 同上 |
+| 自动模式 | 在**对话端点**里按真实回答的「首字延迟 + 生成 tok/s」综合耗时升序，速度优先于优先级与工具能力；没有任何实测样本时才回落到工具模型 / 最近成功模型 / `priority` | `/api/chat/messages`、`/api/chat/models`、钉钉自动回复 |
 | 越权选择 | 手动指定一个自己无权用的模型 → 403，且区分"模型不存在"和"存在但无权"（后者不能让用户以为模型被删了） | 同上 |
 
 这条"两层过滤"是刻意的：**功能权限**决定"能不能用模型这件事"，**模型可见角色**决定"能用哪几个"。只做前者会把所有模型暴露给所有人；只做后者会让没有对话权限的账号也能调接口。
+
+**自动模式按真实速度选模（不是优先级）**：每次回答已经写入 `chat_messages.meta_json.timing` 与 `.tokens`，自动选模直接复用这些真实样本，不再额外探测上游：
+
+- **回复速度**：首字延迟 `timing.ttftMs`，取最近样本中位数；越小越快。
+- **生成速度**：`tokens.completion / (timing.genMs / 1000)`，取中位数；上游没有返回 usage（例如 Qwen3.8 的 `completion=0`）时，用正文 + 推理文本估算 token，避免把这类模型误判成 0 tok/s。
+- **综合排序**：`预计回复耗时 = ttftMs + 256 / tokensPerSecond × 1000`，按升序选第一个；同时兼顾"多久看到第一个字"和"每秒吐多少 token"。
+- **样本窗口**：每个模型最近 20 条真实回答、最近 30 天；按模型分别取样，避免高频模型把其他模型挤出统计。
+- **候选边界**：只考虑 `endpointKind='chat'`，图片消息再叠加 `vision` 硬能力；普通文本消息按用户要求**速度优先于工具能力**。没有速度样本时才回到"工具模型优先"的冷启动兜底。
+- **兜底**：没有任何实测样本、全部样本过期或读取失败时，保持原来的最近成功模型 / `priority` 顺序，冷启动不会选不出模型。
+- **不变的部分**：用户手动指定模型、`/model` 切换、`chat.default` / `chat.vision` 用途路由仍然优先；**Agent 团队仍由 `agent.model_choice` 的 SystemOne 决策模型分配**，不按速度改；`chooseSubAgentModel` 的能力 / 负载 / 父模型兜底逻辑保持原样。
 
 #### 12.7.4 当前实现到什么程度（不要夸大）
 
@@ -1852,7 +1862,7 @@ DSH（`github.com/deepseek-ai/deepseek-harness`，MIT）是官方开源的 Agent
 
 1. **控制台怎么进？** 已按"**唯一超级管理员账号 + 密码 + 本机限制**"落地：`/admin` 先出账号密码门，账号由 `EAB_ADMIN_USER`（默认 `admin`）决定，密码取 `EAB_ADMIN_PASSWORD`；未配置时启动进程生成一次并写入 `.eab-dev/admin-credentials.txt`，之后**重启沿用同一密码**。会话在进程内存里（httpOnly cookie `eab_console_sid`，8 小时），只接受 loopback 来源（`127.0.0.1` / `::1`），远程必须显式设 `EAB_CONSOLE_ALLOW_REMOTE=1`。进去是**控制台操作员**，不登录任何组织成员，也不继承某个人的角色。剩下要定的不是"要不要账号"，而是：多管理员 / 轮换、登录失败限速与审计、多实例共享会话。~~(a) 首个绑定渠道的人自动成为管理员~~（与"不登录组织成员"冲突，不采用）；(b) 内网限制已作为默认行为落地。
 2. **员工从钉钉机器人进来时，第一次要不要建号？** 建议：渠道 open_id 能对上组织成员就直接用；对不上就落 `pending`，管理员在控制台认领，而不是自动建人。
-3. **"自动选模型"依据什么？** 现在只看优先级；后续建议按问题类型（代码 / 长文档 / 一般问答）+ 模型能力标签匹配，且保留"手动覆盖"。
+3. **"自动选模型"依据什么？** 已按用户要求改为**真实速度优先**：`timing.ttftMs`（回复速度）+ `tokens.completion / genMs`（生成 token 速度）综合排序，不再按 `priority`；没有样本才回退原顺序。手动覆盖和 Agent 团队决策不变（12.7.3）。
 
 #### 12.7.6 工作台版面（对照 DeepSeek / 豆包 / 千问 网页版）
 
@@ -1965,6 +1975,29 @@ EAB 部署在服务器上之后，只有两种人碰它：配置这家公司的�
 | POST | `/providers/:id/test` | 仅对 OpenAI 协议做 `GET {baseUrl}/models` 探测（6 秒超时），其他协议提示"请直接建模型" |
 | GET / POST | `/models` | 列 / 建模型（`name`、`modelKey`、`providerId`、`roles[]`、`priority`、`enabled`） |
 | PATCH / DELETE | `/models/:id` | 改 / 软删 |
+
+**思考档位按模型真实能力配置（对齐 DSH `reasoning.efforts`）**：模型 `config_json.thinking` 不再写死「精简 / 均衡 / 深思」，而是保存完整选项对象：
+
+```json
+{
+  "thinking": {
+    "enabled": true,
+    "strategy": "effort",
+    "defaultEffort": "balanced",
+    "options": [
+      { "id": "light", "label": "精简", "hint": "更少思考，更快回答。", "wire": "low" },
+      { "id": "balanced", "label": "均衡", "hint": "平衡速度与推理深度。", "wire": "medium" },
+      { "id": "deep", "label": "深思", "hint": "模型最高推理档。", "wire": "xhigh" }
+    ]
+  }
+}
+```
+
+- `options` 最多 8 个，保持管理员自定义顺序；每项支持自定义 `id`、`label`、`hint`，以及二选一的下发方式：
+  - `strategy: "effort"`：`wire` 是真正发给 OpenAI 兼容端点的 `reasoning_effort` 线值（`none/minimal/low/medium/high/xhigh/max`）；留空时按内置 ID 兜底。插件模型仍收选项 `id`，不强制改插件协议。
+  - `strategy: "budget"`：`budget` 是该档位的 `max_tokens` 上限，`null` 表示不限制。
+- 控制台模型弹窗提供「常用预设」（Qwen3.8 `low/medium/xhigh`、OpenAI `minimal/low/medium/high`、输出预算三档），套用后仍可逐行增删、改 ID/显示名/说明/上游值/输出预算，并单选默认档。
+- 员工端只消费 `id/label/hint` 渲染菜单；服务端 `thinkingCallPlan` 把选中档位解析成 `effort`（插件用）与 `wireEffort`（OpenAI 用），再交给 `callModelStream` 下发。这样「深思」在 Qwen3.8 上可以显式发 `xhigh`，不再依赖 vLLM 把 `high` 兜底成默认档。
 
 **对话链路已切到这张表**：`GET /api/chat/models` 与 `POST /api/chat/messages` 都从 `models JOIN model_providers` 读（只取 `models.enabled=1` 且供应商 `status='active'`），再按当前身份的角色过滤"可见角色"；开发模式库为空时才回落到 3 个演示模型。**回答仍是演示回声**，还没有按 `provider.kind` 分发到 OpenAI / Anthropic / Gemini 适配器 —— 这是下一阶段（V1）的真调用链路。
 
@@ -3576,7 +3609,7 @@ web-*   ← shared-types（**禁止** import server/runtime/storage）
 | `@eab/workspace` | 路径规范化与穿越防护（`..`、绝对路径、盘符、UNC、scheme、URL 编码穿越、保留设备名、ADS、结尾点、控制字符、长度）、`safeJoin` + `isWithinRoot` 双保险、`toSlug` | 36 |
 | `@eab/storage` | `node:sqlite` 连接（WAL/外键/busy_timeout）、事务、迁移执行器（每文件一事务、幂等）、`0001_init.sql`（11 表 + 索引 + 审计不可改触发器）、`0002_kb.sql`（知识库 3 表）、`0003_org_sync.sql`（组织同步 3 表 + departments/users 缺失计数列 + 渠道唯一索引重建）、`0004_channel_bind.sql`（渠道绑定 4 列 + 租户唯一索引 + `channel_bind_sessions` 会话表）、`0005_plugin.sql`（`plugin_states`：按企业存插件启停）、`0006_models.sql`（模型供应商 / 模型目录，密钥只存环境变量名）、`0007_plugin_lifecycle.sql`（`plugin_installs` 安装记录 + `plugin_events` 生命周期审计）、`0017_plugin_company_install.sql`（`plugin_company_installs`：按公司登记插件安装归属，老记录回填给第一家）、审计哈希链（`EAB-GENESIS` 起点、`sha256(prev|canonicalJson)`、断链检测）、`loadKbCollectionAcls`（JSON 解析 + 坏配置 fail-closed） | 23 |
 | `@eab/channel` | `OrgProvider` 渠道抽象（`verify` + `fetchOrg`）、`mapRemoteOrg` 纯函数（父链重建 path、渠道根不建行、孤儿挂根、兄弟排序、环检测、多部门取主部门）、`applyOrgSync`（幂等 upsert、rename/move/restore 检测、缺失计数 + 连续 2 次才回收、同步报告 + 差异明细、回写渠道配置且不覆盖绑定状态）、`rebuildDeptPaths`（移动后子树 path 与成员 dept_path 一次收敛）、`fetchDingTalkTenant` + 钉钉/飞书/企微 provider、`mockFeishuOrg(1/2/3)` 三份通讯录快照 | 24 |
-| `@eab/server` | Fastify 装配（统一信封、错误处理、`x-trace-id`、版本头）、`loadConfig`（只读环境变量、非法值启动失败、库路径锚定仓库根）、身份解析（**超级管理员账号 + 密码** → 控制台操作员，不登录组织成员；员工 `?as=` 开发预览）、只读接口 `/api/health` `/api/me` `/api/org/tree` `/api/org/members` `/api/kb/collections` `/api/kb/docs` `/api/dev/personas` `/api/dev/kb-matrix`、同步接口 `/api/org/sync-runs` `/api/org/sync-runs/:runId` `/api/dev/org-sync`（**未绑定飞书租户 → 409**）、**渠道绑定接口** `/api/channel/bindings` `/api/channel/bind/start` `/api/channel/bind/:sessionId` `/api/channel/bind/:sessionId/cancel` `/api/channel/bind/:sessionId/mock-scan` `/api/channel/unbind`、内嵌控制台（**顶栏单公司身份牌（无多公司切换）+ 一级导航（悬停展开二级页面）+ 每页自带子导航**：概览 / 组织与权限 / 知识与模型 / 连接与平台 / 运营与审计；令牌+原语三层，无构建步骤；入口在 **`/admin`：先过**管理员账号密码登录页**（默认 `admin` + 自动生成密码，仅本机；`EAB_CONSOLE_TOKEN` 只给脚本）→ 控制台操作员（不登录组织成员）**；员工端口 `/` 302 到 `/chat`，管理端口 `/` 302 到 `/admin`；配套 `/api/console/login` `/api/console/logout` `/api/console/companies`，控制台请求带 `x-eab-console: 1` 与员工身份彻底隔开；新增「角色与权限」「模型接入」两页与 `/api/console/roles` `/api/console/members/:userId/roles` `/api/console/providers` `/api/console/models`）、**员工工作台** `/chat`（左侧账号栏 + 消息流 + 输入框内的模型选择与图片/文件附件 + 未登录登录卡，12.7.6 / 12.7.7）与对话接口 `/api/chat/models` `/api/chat/messages`（`chat:use` + `model:use` + 模型可见角色两层过滤，自动按优先级选模型；附件收名称/大小/文本正文/图片 dataURL，并组装多模态消息）、**插件接口** `/api/plugins` `/api/plugins/:id/state` `/plugins/assets/:id/:file`（清单校验、按企业启停、iframe 沙箱页面）与**服务器侧插件管理器** `/api/console/plugins` `/api/console/plugins/install` `/api/console/plugins/:id/uninstall` `/api/console/plugins/events`（本地目录安装、暂存校验、版本/来源/指纹、`.trash` 卸载、生命周期审计，12.9）、**单公司本地部署**（一套实例只服务配置里的唯一公司；`assertSingleCompany` 拒绝旧多公司账号，控制台只回唯一公司、不提供新建第二家；员工 8787 / 管理 8788 双端口 surface guard） | 50 条 HTTP 冒烟 |
+| `@eab/server` | Fastify 装配（统一信封、错误处理、`x-trace-id`、版本头）、`loadConfig`（只读环境变量、非法值启动失败、库路径锚定仓库根）、身份解析（**超级管理员账号 + 密码** → 控制台操作员，不登录组织成员；员工 `?as=` 开发预览）、只读接口 `/api/health` `/api/me` `/api/org/tree` `/api/org/members` `/api/kb/collections` `/api/kb/docs` `/api/dev/personas` `/api/dev/kb-matrix`、同步接口 `/api/org/sync-runs` `/api/org/sync-runs/:runId` `/api/dev/org-sync`（**未绑定飞书租户 → 409**）、**渠道绑定接口** `/api/channel/bindings` `/api/channel/bind/start` `/api/channel/bind/:sessionId` `/api/channel/bind/:sessionId/cancel` `/api/channel/bind/:sessionId/mock-scan` `/api/channel/unbind`、内嵌控制台（**顶栏单公司身份牌（无多公司切换）+ 一级导航（悬停展开二级页面）+ 每页自带子导航**：概览 / 组织与权限 / 知识与模型 / 连接与平台 / 运营与审计；令牌+原语三层，无构建步骤；入口在 **`/admin`：先过**管理员账号密码登录页**（默认 `admin` + 自动生成密码，仅本机；`EAB_CONSOLE_TOKEN` 只给脚本）→ 控制台操作员（不登录组织成员）**；员工端口 `/` 302 到 `/chat`，管理端口 `/` 302 到 `/admin`；配套 `/api/console/login` `/api/console/logout` `/api/console/companies`，控制台请求带 `x-eab-console: 1` 与员工身份彻底隔开；新增「角色与权限」「模型接入」两页与 `/api/console/roles` `/api/console/members/:userId/roles` `/api/console/providers` `/api/console/models`）、**员工工作台** `/chat`（左侧账号栏 + 消息流 + 输入框内的模型选择与图片/文件附件 + 未登录登录卡，12.7.6 / 12.7.7）与对话接口 `/api/chat/models` `/api/chat/messages`（`chat:use` + `model:use` + 模型可见角色两层过滤，自动按真实回复速度选模型，无样本才回退优先级；附件收名称/大小/文本正文/图片 dataURL，并组装多模态消息）、**插件接口** `/api/plugins` `/api/plugins/:id/state` `/plugins/assets/:id/:file`（清单校验、按企业启停、iframe 沙箱页面）与**服务器侧插件管理器** `/api/console/plugins` `/api/console/plugins/install` `/api/console/plugins/:id/uninstall` `/api/console/plugins/events`（本地目录安装、暂存校验、版本/来源/指纹、`.trash` 卸载、生命周期审计，12.9）、**单公司本地部署**（一套实例只服务配置里的唯一公司；`assertSingleCompany` 拒绝旧多公司账号，控制台只回唯一公司、不提供新建第二家；员工 8787 / 管理 8788 双端口 surface guard） | 50 条 HTTP 冒烟 |
 
 本版**已完成**的验收项：T-01、T-02、T-03、T-07、T-08、T-25（审计链，含 `verifyAuditChain`）、T-27（路径安全 20+ 变体）、7.6.1 知识库可见范围（读侧内核），**T-04 / T-05 / T-06 的"能跑"版本**（服务起在 `http://127.0.0.1:8787`，50 条 HTTP 冒烟含 12 条负向 403 全绿），**CHN-10 全量同步 / CHN-12 同步报告的"模拟渠道版本"**（用 `mockFeishuOrg` 的三份快照把"首次建组织 → 改名移动离职 → 上游消失 → 回收"整条链路跑一遍并回看差异明细），**CHN-13 扫码绑定企业的骨架**（会话状态机 + 租户跨公司唯一 + 绑定后才允许同步 + 解绑不删组织数据，模拟扫码走通），以及 **12.6 控制台信息架构 S1 + S1.5**（顶部一级导航按业务域分组、每页自带子导航（组织=部门树 / 知识库=库列表 / 渠道=小节+渠道状态 / 矩阵=说明图例 / 系统=小节锚点）、渠道绑定与同步合成一页、概览页、令牌/原语层落地；六个页面均已在浏览器目视验证，树上「N 人」改为按 `dept_path` 前缀统计以保证与筛出行数同口径）。
 
@@ -3696,16 +3729,20 @@ web-*   ← shared-types（**禁止** import server/runtime/storage）
 
 ### 22.4 版本号（已定）
 
-**已定：采用日期版本号**，本次为 **v2026.11.07**，与根 `package.json` 的 `version` 字段一致。
+**已定：采用日期版本号**，本次为 **v2026.11.19**，与根 `package.json` 的 `version` 字段一致。
 
 规则：
 
 | 项 | 规则 |
 |---|---|
-| 格式 | `vYYYY.MM.DD`（文档、代码、Release 标签统一） |
-| 同日多次发布 | 追加后缀 `-1`、`-2`（如 `v2026.11.07-2`），不跨日凑版本 |
+| 格式 | `vYYYY.MM.DD`（当天首个版本）或 `vYYYY.MM.DD.NN`（同日追加版本） |
+| 同日序号 | `NN` 为两位数字，范围 `01`–`99`；没有序号视为 `00`，因此 `v2026.11.18` < `v2026.11.18.01` < `v2026.11.18.02` |
+| 排序 | 按“年 → 月 → 日 → 同日序号”四段数字比较；跨日优先于同日序号，例如 `v2026.11.18.99` < `v2026.11.19` |
+| 同日多次发布 | 追加 `.01`、`.02`，不跨日凑版本；不再使用 `-1`、`-2` 后缀 |
 | 变更时点 | 每次发布前由你确认当日版本号；日常提交不改版本号 |
 | 落点 | 文档头、根 `package.json`、`eabd --version`、Release 标题四处必须一致 |
+| 比较实现 | 服务端 `packages/server/src/update.ts` 的 `isNewerVersion()` 与 `scripts/eab.mjs` 的 `isNewer()` 必须使用同一规则；格式不合法时不判定为更新 |
+| 非 semver 说明 | `YYYY.MM.DD.NN` 是四段日期版本，不是标准三段 semver；EAB 更新器按本规则自行比较，不依赖 npm/semver 的版本优先级 |
 | 迁移版本 | 数据库迁移**不跟随产品版本**，用递增文件名（`0001_`、`0002_`），只前进不回退 |
 
 ### 22.5 组织架构同步开工前需要你定的三件事

@@ -39,9 +39,11 @@ import { callTranscription, type ChatMessage as LlmMessage, type LlmContent } fr
 import { shouldAutoRetrieveKb } from './intent.js'
 import {
   acquireTurn,
+  chooseAutoChatModel,
   formatClarifyText,
   buildSystemPrompt,
   bumpUsage,
+  createTurnTimingTracker,
   ensureChannelSession,
   historyOf,
   loadModelCatalogCached,
@@ -53,6 +55,11 @@ import {
   visibleModelsFor,
   type AgentTurnResult,
 } from './routes/chat.js'
+import {
+  invalidateModelSpeedStats,
+  rankModelsBySpeed,
+  readModelSpeedStats,
+} from './model-speed.js'
 import { toolSpecsForAgent } from './routes/tools.js'
 import type { ActiveSpace } from './space.js'
 import { saveUserWorkspaceFile } from './routes/workspace.js'
@@ -1077,11 +1084,21 @@ export async function handleDingTalkMessage(
           (item) => item.id === visionRoute.id && modelSupportsVision(item.tags, item.capabilities),
         )
       : undefined
+    /**
+     * 自动模式按真实对话实测速度选：首字延迟 + 生成 tok/s 综合最快的模型先回复。
+     * 显式 /model 选过的会话模型、用途路由 chat.vision 仍然优先；没有速度样本时
+     * 保持原来的首个可用模型，冷启动不会因为缺样本而选不出模型。
+     */
+    const speedStats = readModelSpeedStats(deps.db, actor.subject.companyId)
+    const hasMeasuredSpeed = availableChatModels.some((item) => speedStats.has(item.id))
+    const visionModels = availableChatModels.filter((item) => modelSupportsVision(item.tags, item.capabilities))
     const autoModel = imageUrls.length > 0
       ? visionRouted ??
-        available.find((item) => modelSupportsVision(item.tags, item.capabilities)) ??
-        available[0]
-      : available[0]
+        (hasMeasuredSpeed ? chooseAutoChatModel(visionModels, speedStats) : visionModels[0]) ??
+        availableChatModels[0]
+      : hasMeasuredSpeed
+        ? chooseAutoChatModel(availableChatModels, speedStats)
+        : availableChatModels[0]
     const model = preferredModel ?? autoModel
     if (!model) {
       return {
@@ -1425,6 +1442,7 @@ export async function handleDingTalkMessage(
     const toolDetails: DingTalkToolRecord[] = []
     let thinkingDone = false
     const turnStartedAt = Date.now()
+    const turnTiming = createTurnTimingTracker(turnStartedAt)
     let thinkingStartedAt = 0
     let thinkingMs = 0
     const pushCard = () => {
@@ -1477,15 +1495,21 @@ export async function handleDingTalkMessage(
         modelSwitchContext.currentModelId = modelId
       },
     }
+    const fallbackCandidates = availableChatModels.filter(
+      (item) => item.id !== model.id &&
+        (imageUrls.length === 0 || modelSupportsVision(item.tags, item.capabilities)),
+    )
+    const fallbackModelIds = (hasMeasuredSpeed
+      ? rankModelsBySpeed(fallbackCandidates, speedStats)
+      : fallbackCandidates
+    ).map((item) => item.id)
     try {
       agentResult = await runAgentTurn({
         deps,
         actor,
         modelId: model.id,
         turnId: agentTurnId,
-        fallbackModelIds: available
-          .filter((item) => item.id !== model.id && (imageUrls.length === 0 || modelSupportsVision(item.tags, item.capabilities)))
-          .map((item) => item.id),
+        fallbackModelIds,
         // 钉钉卡片需要看到真实的逐字输出；缓冲会让所有事件等到模型跑完才一次性刷出，
         // 用户看到的就是“一直转圈、最后突然出全文”。故障转移时在下方的回调里清空旧卡片状态。
         bufferModelEvents: false,
@@ -1515,11 +1539,13 @@ export async function handleDingTalkMessage(
         space: toolSpace,
         emit: (event) => {
           if (event.type === 'reasoning') {
+            turnTiming.token()
             if (!thinkingStartedAt) thinkingStartedAt = Date.now()
             cardState.reasoning += event.text
             pushCard()
             publishDelta('reasoning', event.text)
           } else if (event.type === 'content') {
+            turnTiming.token()
             // 正文开始即代表思考阶段结束：标题切成“已思考 X”，预览行保留首句。
             if (!thinkingDone) {
               thinkingDone = true
@@ -1529,6 +1555,7 @@ export async function handleDingTalkMessage(
             pushCard()
             publishDelta('content', event.text)
           } else if (event.type === 'tool') {
+            turnTiming.boundary()
             // 工具执行期间不是“思考结束”：保持“正在思考中”标题和下方摘要，
             // 只把工具面板切换成“工具调用中”。
             cardState.tool = `正在使用「${event.name}」…`
@@ -1546,6 +1573,7 @@ export async function handleDingTalkMessage(
             publishTool({ type: 'tool', id: event.id, name: event.name, toolId: event.toolId, args: event.args })
             noteTurnProgress()
           } else if (event.type === 'tool_result') {
+            turnTiming.boundary()
             const record = toolDetails.find((tool) => tool.id === event.id)
             if (record) {
               record.status = event.status
@@ -1579,6 +1607,7 @@ export async function handleDingTalkMessage(
           }
         },
       })
+      turnTiming.finish()
       if (agentResult) {
         const usedId = agentResult.usedModelId
         const used = usedId ? available.find((item) => item.id === usedId) : undefined
@@ -1741,6 +1770,7 @@ export async function handleDingTalkMessage(
         source: hit.source ?? 'local',
       })),
       tokens: { prompt: promptTokens, completion: completionTokens },
+      timing: agentResult ? turnTiming.snapshot() : undefined,
       reasoning: (agentResult?.reasoning || cardState.reasoning || '').trim(),
       toolCalls: agentResult?.toolCalls ?? [],
       rounds,
@@ -1780,6 +1810,7 @@ export async function handleDingTalkMessage(
           assistantCreatedAt,
         )
     }
+    invalidateModelSpeedStats(actor.subject.companyId)
     publishChatEvent({
       type: 'message',
       companyId: actor.subject.companyId,

@@ -19,11 +19,43 @@ const CHANNEL_SOURCE_LABEL = {
 }
 
 
-/** 与后端 thinking.ts 对齐的三档；控制台模型弹窗与对话页共用这套文案。 */
+/** 与后端 thinking.ts 对齐的内置档位；控制台只把它当作新增行时的默认文案。 */
 const THINKING_LEVELS = [
-  { id: 'light', label: '精简', hint: '更少思考，更快回答。' },
-  { id: 'balanced', label: '均衡', hint: '默认档位，兼顾速度与质量。' },
-  { id: 'deep', label: '深思', hint: '更充分的推理，输出上限跟随模型。' },
+  { id: 'light', label: '精简', hint: '更少思考，更快回答。', wire: 'low', budget: 2048 },
+  { id: 'balanced', label: '均衡', hint: '默认档位，兼顾速度与质量。', wire: 'medium', budget: 8192 },
+  { id: 'deep', label: '深思', hint: '更充分的推理，输出上限跟随模型。', wire: 'high', budget: null },
+]
+
+/** 常见模型的思考档位预设；只是快速填充，保存前仍可逐行修改。 */
+const THINKING_PRESETS = [
+  {
+    id: 'qwen38',
+    label: 'Qwen3.8（low / medium / xhigh）',
+    options: [
+      { id: 'light', label: '精简', hint: '更少思考，更快回答。', wire: 'low', budget: null },
+      { id: 'balanced', label: '均衡', hint: '平衡速度与推理深度。', wire: 'medium', budget: null },
+      { id: 'deep', label: '深思', hint: '模型最高推理档，默认档位。', wire: 'xhigh', budget: null },
+    ],
+  },
+  {
+    id: 'openai',
+    label: 'OpenAI 四档（minimal / low / medium / high）',
+    options: [
+      { id: 'minimal', label: '极简', hint: '最少推理，优先速度。', wire: 'minimal', budget: null },
+      { id: 'light', label: '低', hint: '较少的推理投入。', wire: 'low', budget: null },
+      { id: 'balanced', label: '中', hint: '适中的推理投入。', wire: 'medium', budget: null },
+      { id: 'deep', label: '高', hint: '较多的推理投入。', wire: 'high', budget: null },
+    ],
+  },
+  {
+    id: 'budget',
+    label: '输出预算三档（2048 / 8192 / 不限）',
+    options: [
+      { id: 'light', label: '精简', hint: '输出上限 2048 tokens。', wire: '', budget: 2048 },
+      { id: 'balanced', label: '均衡', hint: '输出上限 8192 tokens。', wire: '', budget: 8192 },
+      { id: 'deep', label: '深思', hint: '不额外限制输出。', wire: '', budget: null },
+    ],
+  },
 ]
 
 const MODE_LABEL = {
@@ -101,6 +133,8 @@ const state = {
   me: null,
   /** 当前后台身份与页面权限（/api/console/access） */
   access: null,
+  /** 员工对话服务端口；从对话页进入后台时用于生成返回地址 */
+  chatPort: null,
   allowedPages: [],
   managePages: [],
   /** 按页面记录可用写动作：{ org: ['create','edit','delete'], 'channels:sync': ['edit'], ... } */
@@ -238,6 +272,33 @@ function renderFlowRich(value) {
   }
   const splitRow = (line) =>
     String(line ?? '').trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((cell) => cell.trim())
+  const splitTabRow = (line) => String(line ?? '').split('\t').map((cell) => cell.trim())
+  const tableHtml = (header, rows, caption = '') => {
+    const columns = Math.max(header.length, ...rows.map((row) => row.length), 1)
+    const pad = (row) => Array.from({ length: columns }, (_, index) => row[index] ?? '')
+    return `<div class="kb-flow-table"><table>${
+      caption ? `<caption>${inline(caption)}</caption>` : ''
+    }<thead><tr>${pad(header)
+      .map((cell) => `<th>${inline(cell)}</th>`)
+      .join('')}</tr></thead><tbody>${rows
+      .map((row) => `<tr>${pad(row).map((cell) => `<td>${inline(cell)}</td>`).join('')}</tr>`)
+      .join('')}</tbody></table></div>`
+  }
+  const tabTableAt = (start) => {
+    const rows = []
+    let cursor = start
+    while (cursor < lines.length && lines[cursor].includes('\t') && lines[cursor].trim()) {
+      rows.push(splitTabRow(lines[cursor]))
+      cursor += 1
+    }
+    if (!rows.length) return null
+    let caption = ''
+    if (rows.length > 1 && rows[0].filter((cell) => cell.trim()).length === 1) {
+      caption = rows[0].find((cell) => cell.trim()) ?? ''
+      rows.shift()
+    }
+    return { html: tableHtml(rows[0] ?? [], rows.slice(1), caption), cursor }
+  }
   const blockStart = (line) => {
     if (!line.trim()) return true
     if (/^\s{0,3}(#{1,6})\s+/.test(line)) return true
@@ -269,6 +330,14 @@ function renderFlowRich(value) {
       output.push(`<h${level}>${inline(heading[2].trim())}</h${level}>`)
       index += 1
       continue
+    }
+    if (line.includes('\t')) {
+      const tabTable = tabTableAt(index)
+      if (tabTable) {
+        output.push(tabTable.html)
+        index = tabTable.cursor
+        continue
+      }
     }
     if (line.includes('|') && index + 1 < lines.length && isSeparator(lines[index + 1])) {
       const header = splitRow(line)
@@ -770,7 +839,6 @@ function renderCompanyPicker() {
     const empty = state.companies.length === 0
     const only = state.companies[0] ?? current
     picker.innerHTML = `
-      <span class="company-picker-kicker">当前公司</span>
       <div class="company-single${empty ? ' is-empty' : ''}" aria-label="当前公司">
         <span class="company-single-name">
           <strong>${esc(empty ? '未接入公司' : only?.name ?? '未接入公司')}</strong>
@@ -798,7 +866,6 @@ function renderCompanyPicker() {
     .join('')
 
   picker.innerHTML = `
-    <span class="company-picker-kicker">当前公司</span>
     <div class="company-picker-control">
       <button class="company-picker-btn" id="company-picker-btn" type="button" aria-haspopup="listbox" aria-expanded="false">
         <span class="company-picker-current">
@@ -5418,6 +5485,33 @@ async function removeRoleMember(role, member, currentIds, messageHost) {
   }
 }
 
+async function removeRoleMembers(role, members, currentIds, messageHost) {
+  if (!members.length) return false
+  const names = members.map((member) => member.name).filter(Boolean)
+  const preview = names.slice(0, 5).join('、') + (names.length > 5 ? ` 等 ${names.length} 人` : '')
+  const ok = await confirmCard({
+    title: `移除 ${members.length} 名成员？`,
+    message: `将从角色「${role.name}」中移除：${preview}`,
+    detail: '这些成员的其他角色不受影响；移除后仍可在角色成员页重新添加。',
+    confirmText: '移除选中成员',
+    tone: 'warning',
+  })
+  if (!ok) return false
+  if (messageHost) messageHost.textContent = '移除中…'
+  const selectedIds = new Set(members.map((member) => member.id))
+  const userIds = [...currentIds].filter((id) => !selectedIds.has(id))
+  try {
+    const result = await apiPost(`/api/console/roles/${encodeURIComponent(role.code)}/members`, { userIds })
+    await loadRoles()
+    setRoleMemberMessage(result.removed ? `已移除 ${result.removed} 人` : '没有变更')
+    return true
+  } catch (err) {
+    if (messageHost) messageHost.textContent = err.message || '移除失败'
+    else window.alert(err.message || '移除失败')
+    return false
+  }
+}
+
 function memberPickerUnboundCount(node, membersByPath, boundIds) {
   const direct = (membersByPath.get(node.path) || []).filter((member) => !boundIds.has(member.id)).length
   return (node.children || []).reduce(
@@ -5611,7 +5705,19 @@ function roleConsolePermissionTreeHtml(catalog, pages) {
       ${(catalog?.domains || [])
         .map(
           (domain) => `<div class="perm-page-group">
-            <div class="perm-page-domain">${esc(domain.title || domain.label || domain.id)}</div>
+            <div class="perm-page-domain">
+              <span class="perm-page-domain-title">${esc(domain.title || domain.label || domain.id)}</span>
+              ${
+                (domain.pages || []).length
+                  ? `<label class="perm-page-all" title="全选本业务域后台权限">
+                      <input type="checkbox" data-perm-domain-all aria-label="全选${esc(
+                        domain.title || domain.label || domain.id,
+                      )}后台权限" />
+                      <span>全选</span>
+                    </label>`
+                  : ''
+              }
+            </div>
             ${(domain.pages || []).map(pageBlockHtml).join('')}
           </div>`,
         )
@@ -5619,11 +5725,165 @@ function roleConsolePermissionTreeHtml(catalog, pages) {
     </div>`
 }
 
+function setupScopeGroupSelectAll(root) {
+  for (const group of root.querySelectorAll('.scope-group')) {
+    const head = group.querySelector('.scope-group-head')
+    const items = [...group.querySelectorAll('input[data-scope]')]
+    const allBox = head?.querySelector('input[data-scope-all]')
+    if (!head || !allBox || items.length === 0) continue
+    const label = allBox.parentElement?.querySelector('span')
+    const sync = () => {
+      const checked = items.filter((item) => item.checked).length
+      allBox.checked = checked === items.length
+      allBox.indeterminate = checked > 0 && checked < items.length
+      if (label) label.textContent = checked === items.length ? '取消全选' : '全选'
+    }
+    allBox.addEventListener('change', () => {
+      for (const item of items) item.checked = allBox.checked
+      sync()
+    })
+    for (const item of items) item.addEventListener('change', sync)
+    sync()
+  }
+}
+
+function setupConsoleDomainSelectAll(root) {
+  for (const group of root.querySelectorAll('.perm-page-group')) {
+    const allBox = group.querySelector('input[data-perm-domain-all]')
+    const items = [...group.querySelectorAll('input[data-role-page-view], input[data-role-page-action]')]
+    if (!allBox || items.length === 0) continue
+    const label = allBox.parentElement?.querySelector('span')
+    const sync = () => {
+      const checked = items.filter((item) => item.checked).length
+      allBox.checked = checked === items.length
+      allBox.indeterminate = checked > 0 && checked < items.length
+      if (label) label.textContent = checked === items.length ? '取消全选' : '全选'
+    }
+    allBox.addEventListener('change', () => {
+      const on = allBox.checked
+      for (const row of group.querySelectorAll('[data-role-page-row]')) {
+        const viewBox = row.querySelector('[data-role-page-view]')
+        if (viewBox) viewBox.checked = on
+        for (const actionBox of row.querySelectorAll('[data-role-page-action]')) actionBox.checked = on
+      }
+      sync()
+    })
+    for (const item of items) item.addEventListener('change', sync)
+    sync()
+  }
+}
+
+function setupRoleMemberPanel(root, role, allMembers, currentIds) {
+  const rows = [...root.querySelectorAll('[data-role-bound]')]
+  const boxes = rows.map((row) => row.querySelector('[data-role-member-select]')).filter(Boolean)
+  const searchInput = root.querySelector('#role-member-search')
+  const allBox = root.querySelector('#role-member-select-all')
+  const allLabel = root.querySelector('#role-member-select-all-label')
+  const selectedHost = root.querySelector('#role-member-selected')
+  const visibleHost = root.querySelector('#role-member-visible')
+  const bulkButton = root.querySelector('#role-member-bulk-remove')
+  const filterEmpty = root.querySelector('#role-member-filter-empty')
+  const messageHost = root.querySelector('#role-member-msg')
+  let query = ''
+
+  const visibleRows = () => rows.filter((row) => !row.hidden)
+  const selectedRows = () =>
+    rows.filter((row) => row.querySelector('[data-role-member-select]')?.checked === true)
+
+  const sync = () => {
+    const visible = visibleRows()
+    const selected = selectedRows()
+    const visibleSelected = visible.filter(
+      (row) => row.querySelector('[data-role-member-select]')?.checked === true,
+    ).length
+    if (allBox) {
+      allBox.disabled = visible.length === 0
+      allBox.checked = visible.length > 0 && visibleSelected === visible.length
+      allBox.indeterminate = visibleSelected > 0 && visibleSelected < visible.length
+    }
+    if (allLabel) allLabel.textContent = allBox?.checked ? '取消全选' : '全选'
+    if (selectedHost) selectedHost.textContent = `已选 ${selected.length} 人`
+    if (bulkButton) {
+      bulkButton.disabled = selected.length === 0
+      bulkButton.textContent = selected.length ? `移除选中（${selected.length}）` : '移除选中'
+    }
+  }
+
+  const applyFilter = () => {
+    const terms = query.toLowerCase().split(/\s+/).filter(Boolean)
+    let visible = 0
+    for (const row of rows) {
+      const matched = terms.every((term) => (row.dataset.search || '').toLowerCase().includes(term))
+      row.hidden = !matched
+      if (matched) visible += 1
+    }
+    if (visibleHost) visibleHost.textContent = terms.length ? ` · 显示 ${visible} 人` : ''
+    if (filterEmpty) filterEmpty.hidden = !(terms.length > 0 && visible === 0)
+    sync()
+  }
+
+  searchInput?.addEventListener('input', () => {
+    query = searchInput.value.trim()
+    for (const box of boxes) box.checked = false
+    applyFilter()
+  })
+
+  allBox?.addEventListener('change', () => {
+    const on = allBox.checked
+    for (const row of visibleRows()) {
+      const box = row.querySelector('[data-role-member-select]')
+      if (box) box.checked = on
+    }
+    sync()
+  })
+
+  for (const box of boxes) box.addEventListener('change', sync)
+
+  for (const row of rows) {
+    row.addEventListener('click', (event) => {
+      if (event.target.closest('button, input, label, a')) return
+      const box = row.querySelector('[data-role-member-select]')
+      if (!box) return
+      box.checked = !box.checked
+      box.dispatchEvent(new Event('change', { bubbles: true }))
+    })
+  }
+
+  bulkButton?.addEventListener('click', async () => {
+    const selected = selectedRows()
+    if (!selected.length) return
+    const members = selected
+      .map((row) => allMembers.find((member) => member.id === row.dataset.roleBound))
+      .filter(Boolean)
+    if (!members.length) return
+    const restText = bulkButton.textContent
+    bulkButton.disabled = true
+    bulkButton.textContent = '移除中…'
+    const done = await removeRoleMembers(role, members, currentIds, messageHost)
+    if (!done) {
+      bulkButton.disabled = selectedRows().length === 0
+      bulkButton.textContent = restText
+      sync()
+    }
+  })
+
+  applyFilter()
+}
+
 function renderRoleEditor(role, allScopes = [], meta = {}) {
   const view = $('#view')
   const labels = meta.labels || {}
   const scopeGroups = meta.groups || {}
   const allMembers = Array.isArray(meta.members) ? meta.members : []
+  const toolAccess = meta.toolAccess || {}
+  const roleTools = Array.isArray(toolAccess.tools)
+    ? toolAccess.tools.filter((tool) => !tool.personal && tool.mode !== 'owner')
+    : []
+  const roleToolSelected = (tool) => {
+    if (role.code === 'super_admin') return true
+    if (tool.mode === 'all') return true
+    return tool.mode === 'roles' && (tool.roleCodes || []).includes(role.code)
+  }
   const roleMemberIds = new Set(
     allMembers.filter((member) => (member.roles || []).some((item) => item.code === role.code)).map((member) => member.id),
   )
@@ -5638,8 +5898,16 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
   const roleConsoleTree = roleConsoleCatalog
     ? roleConsolePermissionTreeHtml(roleConsoleCatalog, roleConsolePages)
     : '<div class="muted">后台页面目录加载中，刷新后重试。</div>'
+  const roleToolsGranted = roleTools.filter(roleToolSelected).length
   const activeRoleTab =
-    state.roleTab === 'members' ? 'members' : state.roleTab === 'console' ? 'console' : 'permissions'
+    state.roleTab === 'members'
+      ? 'members'
+      : state.roleTab === 'console'
+        ? 'console'
+        : state.roleTab === 'tools'
+          ? 'tools'
+          : 'permissions'
+
   for (const scope of allScopes.length ? allScopes : role.scopes) {
     const prefix = scopeGroups[scope] || scope.split(':')[0] || 'other'
     groups[prefix] = groups[prefix] || []
@@ -5655,6 +5923,9 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
       <button class="role-detail-tab${activeRoleTab === 'console' ? ' is-active' : ''}" type="button" role="tab" aria-selected="${
         activeRoleTab === 'console'
       }" data-role-tab="console">后台权限 <span class="role-tab-count" id="role-console-tab-count">${roleConsoleGrantedPages}</span></button>
+      <button class="role-detail-tab${activeRoleTab === 'tools' ? ' is-active' : ''}" type="button" role="tab" aria-selected="${
+        activeRoleTab === 'tools'
+      }" data-role-tab="tools">可用工具 <span class="role-tab-count" id="role-tools-tab-count">${roleToolsGranted}</span></button>
       <button class="role-detail-tab${activeRoleTab === 'members' ? ' is-active' : ''}" type="button" role="tab" aria-selected="${
         activeRoleTab === 'members'
       }" data-role-tab="members">角色成员 <span class="role-tab-count">${boundMembers.length}</span></button>
@@ -5693,7 +5964,13 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
         ${Object.entries(groups)
           .map(
             ([prefix, list]) => `<div class="scope-group">
-              <div class="scope-group-head mono">${esc(SCOPE_GROUP_LABEL[prefix] || prefix)}</div>
+              <div class="scope-group-head mono">
+                <span class="scope-group-title">${esc(SCOPE_GROUP_LABEL[prefix] || prefix)}</span>
+                <label class="scope-group-all" title="全选本组权限">
+                  <input type="checkbox" data-scope-all aria-label="全选${esc(SCOPE_GROUP_LABEL[prefix] || prefix)}权限" />
+                  <span>全选</span>
+                </label>
+              </div>
               ${list
                 .map(
                   (scope) => `<label class="scope-check" title="${esc(scope)}"><input type="checkbox" data-scope="${esc(scope)}"${
@@ -5733,6 +6010,88 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
         <span class="muted" id="role-console-msg"></span>
       </div>
     </section>
+    <section class="panel role-tools-panel" data-role-pane="tools"${activeRoleTab === 'tools' ? '' : ' hidden'}>
+      <div class="panel-head role-tools-head">
+        <div class="role-tools-title">
+          <h2>可用工具</h2>
+          ${hintBadge(
+            '工具授权',
+            '这里与「知识与模型 · 工具」页的「可用角色」共用同一份配置：任一处保存后，另一处立即看到相同结果。取消勾选某个工具，会把该工具从“所有角色”收窄为“指定角色”，只收回当前角色，不影响其他角色；工具原有 scope 校验仍然生效。平台超管始终拥有全部工具。',
+          )}
+          ${hintBadge(
+            '成员与个人工具',
+            '角色成员绑定该角色后，能看到并调用这里勾选的工具；个人插件工具不进入平台工具目录，仍只在安装人自己的工作台出现。',
+          )}
+        </div>
+        <div class="role-tools-controls">
+          ${
+            !toolAccess.error && roleTools.length > 0
+              ? `<label class="models-search"><span class="models-search-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="6.5"></circle><path d="m16 16 4 4"></path></svg></span><input id="role-tool-search" type="search" placeholder="搜索工具、说明或来源" aria-label="搜索可用工具" autocomplete="off" /></label>`
+              : ''
+          }
+          <span class="muted" id="role-tool-count"></span>
+          <span class="pill" id="role-tools-granted">已授权 ${roleToolsGranted} / ${roleTools.length} 个工具</span>
+        </div>
+      </div>
+      ${
+        toolAccess.error
+          ? `<div class="empty role-tools-empty">工具目录加载失败：${esc(toolAccess.error)}。刷新后重试。</div>`
+          : roleTools.length === 0
+            ? '<div class="empty role-tools-empty">当前公司还没有可配置的内置工具或公司插件工具。</div>'
+            : `<div class="role-tools-table-scroll">
+                <table class="data role-tools-table">
+                  <colgroup><col class="col-tool-check"><col class="col-tool"><col class="col-desc"><col class="col-source"></colgroup>
+                  <thead><tr><th><span class="muted">启用</span></th><th>工具</th><th>说明</th><th>来源 / 当前范围</th></tr></thead>
+                  <tbody>
+                    ${roleTools
+                      .map((tool) => {
+                        const checked = roleToolSelected(tool)
+                        const sourceLabel = tool.source === 'plugin' ? '插件' : '内置'
+                        const sourceClass = tool.source === 'plugin' ? '' : 'ok'
+                        const roleCount = Array.isArray(tool.roleCodes) ? tool.roleCodes.length : 0
+                        const scopeText =
+                          role.code === 'super_admin'
+                            ? '<span class="pill ok">超管始终可用</span>'
+                            : checked && tool.mode === 'all'
+                              ? '<span class="pill ok">所有角色</span>'
+                              : checked
+                                ? `<span class="pill">指定角色 · ${roleCount} 个</span>`
+                                : '<span class="pill warn">不含当前角色</span>'
+                        const searchText = [tool.name, tool.accessId, tool.description, sourceLabel, checked ? '已授权' : '未授权']
+                          .filter(Boolean)
+                          .join(' ')
+                        return `<tr data-role-tool-row data-search="${esc(searchText)}">
+                          <td class="role-tool-check"><label class="check"><input type="checkbox" data-role-tool-access="${esc(
+                            tool.accessId,
+                          )}" aria-label="${esc(tool.name)}"${checked ? ' checked' : ''}${
+                            role.code === 'super_admin' ? ' disabled' : ''
+                          } /></label></td>
+                          <td class="tool-name"><strong>${esc(tool.name)}</strong><div class="desc mono" title="${esc(
+                            tool.accessId,
+                          )}">${esc(tool.accessId)}</div></td>
+                          <td class="tool-desc"><div class="tool-desc-text" title="${esc(tool.description || '')}">${esc(
+                            tool.description || '',
+                          )}</div></td>
+                          <td class="tool-source"><span class="pill ${sourceClass}">${sourceLabel}</span> ${
+                            tool.dangerous ? '<span class="pill warn">需审批</span> ' : ''
+                          }${scopeText}</td>
+                        </tr>`
+                      })
+                      .join('')}
+                    <tr id="role-tool-empty" hidden><td colspan="4" class="tool-empty">没有匹配的工具，换个关键词试试</td></tr>
+                  </tbody>
+                </table>
+              </div>`
+      }
+      <div class="panel-actions">
+        <button class="btn primary" type="button" id="save-role-tools"${
+          toolAccess.error || role.code === 'super_admin' ? ' disabled' : ''
+        }>保存可用工具</button>
+        <span class="muted" id="role-tools-msg">${
+          role.code === 'super_admin' ? '平台超管始终拥有全部工具，无需在这里配置' : ''
+        }</span>
+      </div>
+    </section>
     <section class="panel role-member-panel" data-role-pane="members"${activeRoleTab === 'members' ? '' : ' hidden'}>
       <div class="panel-head">
         <div>
@@ -5745,7 +6104,14 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
         </div>
       </div>
       <div class="role-member-toolbar">
-        <span class="role-member-count">已绑定 <strong id="role-member-count">${boundMembers.length}</strong> 人</span>
+        <span class="role-member-count">已绑定 <strong id="role-member-count">${boundMembers.length}</strong> 人<span id="role-member-visible"></span></span>
+        <input id="role-member-search" type="search" placeholder="搜索姓名、岗位、部门或角色" aria-label="搜索角色成员" />
+        <label class="role-member-select-all" title="全选当前筛选结果">
+          <input id="role-member-select-all" type="checkbox" />
+          <span id="role-member-select-all-label">全选</span>
+        </label>
+        <span class="role-member-selected" id="role-member-selected">已选 0 人</span>
+        <button class="btn sm danger" type="button" id="role-member-bulk-remove" disabled>移除选中</button>
       </div>
       <div class="role-member-list" id="role-member-list">
         ${
@@ -5754,7 +6120,22 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
               const otherRoles = (member.roles || [])
                 .filter((item) => item.code !== role.code)
                 .map((item) => ROLE_LABEL[item.code] || item.name || item.code)
-              return `<div class="role-member-row is-bound" data-role-bound="${esc(member.id)}">
+              const searchText = [
+                member.name,
+                member.title,
+                member.deptName,
+                member.employeeNo,
+                member.email,
+                member.mobile,
+                ...otherRoles,
+              ]
+                .filter(Boolean)
+                .join(' ')
+                .toLowerCase()
+              return `<div class="role-member-row is-bound" data-role-bound="${esc(member.id)}" data-search="${esc(searchText)}">
+                <label class="role-member-select" title="选择成员">
+                  <input type="checkbox" data-role-member-select="${esc(member.id)}" aria-label="选择 ${esc(member.name)}" />
+                </label>
                 <span class="role-member-avatar">${esc(String(member.name || '?').slice(0, 1))}</span>
                 <span class="role-member-main">
                   <strong>${esc(member.name)}</strong>
@@ -5769,11 +6150,16 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
             .join('') ||
           '<div class="empty role-member-empty">该角色还没有成员，点右上角「添加成员」从部门组织架构中选择。</div>'
         }
+        <div class="empty role-member-empty" id="role-member-filter-empty" hidden>没有匹配的成员，换个关键词试试。</div>
       </div>
     </section>`
 
+  setupScopeGroupSelectAll(view)
+  setupRoleMemberPanel(view, role, allMembers, roleMemberIds)
+
   const setRoleTab = (tab) => {
-    state.roleTab = tab === 'members' ? 'members' : tab === 'console' ? 'console' : 'permissions'
+    state.roleTab =
+      tab === 'members' ? 'members' : tab === 'console' ? 'console' : tab === 'tools' ? 'tools' : 'permissions'
     for (const button of view.querySelectorAll('[data-role-tab]')) {
       const active = button.dataset.roleTab === state.roleTab
       button.classList.toggle('is-active', active)
@@ -5805,6 +6191,7 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
       for (const actionBox of row?.querySelectorAll('[data-role-page-action]') || []) actionBox.checked = false
     })
   }
+  setupConsoleDomainSelectAll(view)
 
   const roleConsolePagesPayload = () =>
     [...view.querySelectorAll('[data-role-pane="console"] [data-role-page-row]')].map((row) => ({
@@ -5910,9 +6297,66 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
       if (msg && msg.textContent !== '保存中…') msg.textContent = '有未保存的修改'
     })
   }
+
+  const roleToolsPane = view.querySelector('[data-role-pane="tools"]')
+  const roleToolRows = [...view.querySelectorAll('[data-role-tool-row]')]
+  const roleToolSearch = roleToolsPane?.querySelector('#role-tool-search')
+  const roleToolEmpty = roleToolsPane?.querySelector('#role-tool-empty')
+  const roleToolCount = roleToolsPane?.querySelector('#role-tool-count')
+  const roleToolsMsg = roleToolsPane?.querySelector('#role-tools-msg')
+  const roleToolsGrantedPill = roleToolsPane?.querySelector('#role-tools-granted')
+  const roleToolsTabCount = view.querySelector('#role-tools-tab-count')
+  const refreshRoleToolsGranted = () => {
+    const count = [...view.querySelectorAll('[data-role-tool-access]:checked')].length
+    if (roleToolsGrantedPill) roleToolsGrantedPill.textContent = `已授权 ${count} / ${roleToolRows.length} 个工具`
+    if (roleToolsTabCount) roleToolsTabCount.textContent = String(count)
+  }
+  const applyRoleToolFilter = () => {
+    const tokens = String(roleToolSearch?.value || '').trim().toLowerCase().split(/\s+/).filter(Boolean)
+    let shown = 0
+    for (const row of roleToolRows) {
+      const hit = tokens.every((token) => String(row.dataset.search || '').toLowerCase().includes(token))
+      row.hidden = !hit
+      if (hit) shown += 1
+    }
+    if (roleToolEmpty) roleToolEmpty.hidden = !(roleToolRows.length > 0 && shown === 0)
+    if (roleToolCount) roleToolCount.textContent = tokens.length ? `筛选出 ${shown} / ${roleToolRows.length}` : ''
+  }
+  if (roleToolSearch) {
+    roleToolSearch.addEventListener('input', applyRoleToolFilter)
+    roleToolSearch.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape' || !roleToolSearch.value) return
+      event.stopPropagation()
+      roleToolSearch.value = ''
+      applyRoleToolFilter()
+    })
+  }
+  for (const box of view.querySelectorAll('[data-role-tool-access]')) {
+    box.addEventListener('change', () => {
+      refreshRoleToolsGranted()
+      if (roleToolsMsg && roleToolsMsg.textContent !== '保存中…') roleToolsMsg.textContent = '有未保存的修改'
+      applyRoleToolFilter()
+    })
+  }
+  view.querySelector('#save-role-tools')?.addEventListener('click', async () => {
+    if (role.code === 'super_admin') return
+    if (!roleToolsMsg) return
+    roleToolsMsg.textContent = '保存中…'
+    const selectedTools = [...view.querySelectorAll('[data-role-tool-access]:checked')].map(
+      (box) => box.dataset.roleToolAccess,
+    )
+    try {
+      await apiSend('PUT', `/api/console/roles/${encodeURIComponent(role.code)}/tools`, { tools: selectedTools })
+      showTopToast(`角色「${role.name}」可用工具已保存`)
+      await loadRoles()
+    } catch (err) {
+      roleToolsMsg.textContent = err.message || '保存失败'
+    }
+  })
   view.querySelectorAll('[data-role-member-remove]').forEach((button) => {
     const member = allMembers.find((item) => item.id === button.dataset.roleMemberRemove)
-    button.addEventListener('click', () => {
+    button.addEventListener('click', (event) => {
+      event.stopPropagation()
       if (member) removeRoleMember(role, member, roleMemberIds, view.querySelector('#role-member-msg'))
     })
   })
@@ -5930,10 +6374,11 @@ async function loadRoles() {
   // 角色列表已移入左侧导航「角色管理」的子菜单，页内不再保留二级栏
   setSide('', true)
   try {
-    const [data, scopeData, membersData] = await Promise.all([
+    const [data, scopeData, membersData, toolAccessData] = await Promise.all([
       api('/api/console/roles'),
       api('/api/console/scopes'),
       api('/api/org/members').catch(() => ({ members: [] })),
+      api('/api/console/tools/access').catch((err) => ({ tools: [], roles: [], error: err?.message || '工具目录加载失败' })),
     ])
     const allMembers = membersData?.members ?? []
     // 角色列表的人数按「当前公司仍在职/未删除的成员」重算，避免把已删除成员算进去
@@ -6003,6 +6448,7 @@ async function loadRoles() {
       quotaDefaults: data.quotaDefaults,
       members: allMembers,
       catalog: data.catalog || state.access?.catalog || null,
+      toolAccess: toolAccessData,
     })
     setPageActions(
       `<button class="btn ghost" type="button" id="role-matrix">权限矩阵</button><button class="btn" type="button" id="role-new-top">添加角色</button><button class="btn ghost danger-text" type="button" id="role-delete-top"${
@@ -6777,9 +7223,39 @@ async function openModelModal(model, providers, roles) {
     model?.thinking && model.thinking.enabled && Array.isArray(model.thinking.options)
       ? model.thinking
       : null
-  const initialThinkIds = initialThinking?.options?.map((item) => item.id) || []
+  const initialThinkOptions = initialThinking?.options?.length
+    ? initialThinking.options.map((item) => ({
+        id: String(item.id || ''),
+        label: String(item.label || item.name || item.id || ''),
+        hint: String(item.hint || item.description || ''),
+        wire: String(item.wire || ''),
+        budget: item.budget === null || item.budget === undefined ? null : Number(item.budget),
+      }))
+    : THINKING_LEVELS.map((item) => ({ ...item }))
   const initialThinkDefault = initialThinking?.defaultEffort || 'balanced'
   const initialThinkStrategy = initialThinking?.strategy === 'budget' ? 'budget' : 'effort'
+  const initialThinkDefaultId = initialThinkOptions.some((item) => item.id === initialThinkDefault)
+    ? initialThinkDefault
+    : initialThinkOptions[0]?.id || ''
+  const thinkRowHtml = (option, isDefault) => `<div class="models-think-row" data-think-row>
+    <div class="models-think-row-main">
+      <label class="field"><span>ID</span><input class="mono" data-think-field="id" value="${esc(option.id || '')}" placeholder="例如 low" maxlength="40" /></label>
+      <label class="field"><span>显示名</span><input data-think-field="label" value="${esc(option.label || '')}" placeholder="例如 精简" maxlength="40" /></label>
+      <label class="models-think-default-pick" title="员工打开对话时默认选中的档位">
+        <input type="radio" name="m-think-default"${isDefault ? ' checked' : ''} />
+        <span>默认</span>
+      </label>
+      <button class="btn ghost sm models-think-remove" type="button" data-think-remove>移除</button>
+    </div>
+    <div class="models-think-row-sub">
+      <label class="field"><span>说明</span><input data-think-field="hint" value="${esc(option.hint || '')}" placeholder="展示给员工的说明" maxlength="120" /></label>
+      <label class="field"><span>上游值</span><input class="mono" data-think-field="wire" value="${esc(option.wire || '')}" placeholder="low / medium / xhigh" maxlength="20" /></label>
+      <label class="field"><span>输出预算</span><input data-think-field="budget" type="number" min="1" step="1" value="${option.budget ?? ''}" placeholder="留空不限" /></label>
+    </div>
+  </div>`
+  const initialThinkRowsHtml = initialThinkOptions
+    .map((option, index) => thinkRowHtml(option, option.id === initialThinkDefaultId || (index === 0 && !initialThinkDefaultId)))
+    .join('')
   const overlay = modelModal(`
     <div class="modal-head">
       <div class="models-modal-title">
@@ -6808,7 +7284,7 @@ async function openModelModal(model, providers, roles) {
         </div>
         <div class="form-cols">
           <label class="field"><span>模型标识</span><input id="m-key" class="mono" value="${esc(model?.modelKey ?? '')}" placeholder="例如 deepseek-chat / qwen2.5:7b" /></label>
-          <label class="field"><span>优先级 ${fieldInfo('数字越小越优先被「自动选择」使用。')}</span><input id="m-priority" type="number" value="${model?.priority ?? 10}" /></label>
+          <label class="field"><span>优先级 ${fieldInfo('仅在没有实测速度样本时兜底；数值越大越靠前。对话自动模式优先按真实回复速度选模。')}</span><input id="m-priority" type="number" value="${model?.priority ?? 10}" /></label>
         </div>
       </section>
       <section class="models-form-section">
@@ -6862,32 +7338,28 @@ async function openModelModal(model, providers, roles) {
       <section class="models-form-section">
         <div class="models-form-section-head">
           <strong>思考选项</strong>
-          ${fieldInfo('开放后，员工可以在对话输入框旁按模型切换「精简 / 均衡 / 深思」；档位会真实下发，不是提示词。')}
+          ${fieldInfo('开放后，员工可在对话输入框旁切换档位；每行对应模型真实支持的 reasoning_effort 或输出预算，不是提示词。')}
         </div>
         <label class="check models-think-switch">
           <input id="m-think-enabled" type="checkbox"${initialThinking ? ' checked' : ''} />
           <span>允许员工选择思考档位 ${fieldInfo('仅对话类模型生效；未开放时不显示选择器，也不会向上游发送思考参数。')}</span>
         </label>
         <div class="models-think-fields" id="m-think-fields"${initialThinking ? '' : ' hidden'}>
-          <div class="models-think-grid">
-            ${THINKING_LEVELS.map(
-              (level) => `<label class="models-cap-option models-think-option">
-                <input type="checkbox" data-think-level="${level.id}"${initialThinkIds.includes(level.id) ? ' checked' : ''} />
-                <span><strong>${esc(level.label)}</strong><small>${esc(level.hint)}</small></span>
-              </label>`,
-            ).join('')}
-          </div>
-          <div class="form-cols">
-            <label class="field"><span>默认档位</span><select id="m-think-default">
-              ${THINKING_LEVELS.map(
-                (level) =>
-                  `<option value="${level.id}"${initialThinkDefault === level.id ? ' selected' : ''}>${esc(level.label)}</option>`,
-              ).join('')}
+          <div class="models-think-toolbar">
+            <label class="field models-think-preset-field"><span>常用预设</span><select id="m-think-preset">
+              <option value="">选择后套用，仍可逐行修改</option>
+              ${THINKING_PRESETS.map((preset) => `<option value="${preset.id}">${esc(preset.label)}</option>`).join('')}
             </select></label>
+            <button class="btn ghost sm" type="button" id="m-think-preset-apply">套用预设</button>
+            <button class="btn ghost sm" type="button" id="m-think-add">+ 添加档位</button>
+          </div>
+          <div class="models-think-rows" id="m-think-rows">${initialThinkRowsHtml}</div>
+          <div class="form-cols">
             <label class="field"><span>生效方式 ${fieldInfo('原生思考参数适合直接支持 reasoning_effort / thinking 的供应商；输出预算适合会忽略思考参数的网关。')}</span><select id="m-think-strategy">
               <option value="effort"${initialThinkStrategy === 'effort' ? ' selected' : ''}>原生思考参数</option>
               <option value="budget"${initialThinkStrategy === 'budget' ? ' selected' : ''}>输出预算上限</option>
             </select></label>
+            <div class="models-think-default-state" id="m-think-default-state"></div>
           </div>
           <div class="models-think-note" id="m-think-note"></div>
         </div>
@@ -6947,31 +7419,107 @@ async function openModelModal(model, providers, roles) {
   const roleState = overlay.querySelector('#m-role-state')
   const thinkEnabled = overlay.querySelector('#m-think-enabled')
   const thinkFields = overlay.querySelector('#m-think-fields')
-  const thinkInputs = [...overlay.querySelectorAll('[data-think-level]')]
-  const thinkDefault = overlay.querySelector('#m-think-default')
+  const thinkRowsEl = overlay.querySelector('#m-think-rows')
+  const thinkAdd = overlay.querySelector('#m-think-add')
+  const thinkPreset = overlay.querySelector('#m-think-preset')
+  const thinkPresetApply = overlay.querySelector('#m-think-preset-apply')
   const thinkStrategy = overlay.querySelector('#m-think-strategy')
+  const thinkDefaultState = overlay.querySelector('#m-think-default-state')
   const thinkNote = overlay.querySelector('#m-think-note')
+
+  const readThinkRows = () =>
+    [...thinkRowsEl.querySelectorAll('[data-think-row]')].map((row) => {
+      const field = (name) => row.querySelector(`[data-think-field="${name}"]`)
+      const budgetText = field('budget')?.value.trim() || ''
+      const budgetNumber = budgetText ? Number(budgetText) : null
+      return {
+        row,
+        id: field('id')?.value.trim() || '',
+        label: field('label')?.value.trim() || '',
+        hint: field('hint')?.value.trim() || '',
+        wire: field('wire')?.value.trim().toLowerCase() || '',
+        budget: Number.isFinite(budgetNumber) ? budgetNumber : null,
+        isDefault: Boolean(row.querySelector('input[name="m-think-default"]')?.checked),
+      }
+    })
+
+  const nextThinkId = (rows) => {
+    let index = rows.length + 1
+    while (rows.some((row) => row.id === `level${index}`)) index += 1
+    return `level${index}`
+  }
+
   const syncThinkState = () => {
     thinkFields.hidden = !thinkEnabled.checked
-    const checked = thinkInputs.filter((input) => input.checked).map((input) => input.dataset.thinkLevel)
-    for (const input of thinkInputs) {
-      input.closest('.models-think-option')?.classList.toggle('is-on', input.checked)
+    let rows = readThinkRows()
+    if (rows.length > 0 && !rows.some((row) => row.isDefault)) {
+      rows[0].row.querySelector('input[name="m-think-default"]').checked = true
+      rows = readThinkRows()
     }
-    for (const option of thinkDefault.options) option.disabled = !checked.includes(option.value)
-    if (!checked.includes(thinkDefault.value)) {
-      const first = checked[0] || ''
-      thinkDefault.value = first
+    const budgetMode = thinkStrategy.value === 'budget'
+    for (const row of rows) {
+      const wire = row.row.querySelector('[data-think-field="wire"]')
+      const budget = row.row.querySelector('[data-think-field="budget"]')
+      if (wire) wire.disabled = budgetMode
+      if (budget) budget.disabled = !budgetMode
+      row.row.classList.toggle('is-budget', budgetMode)
     }
-    thinkNote.className = `models-think-note ${checked.length === 0 ? 'is-empty' : ''}`
-    if (checked.length === 0) {
-      thinkNote.innerHTML = '<strong>至少选一个档位</strong><span>未选择档位时无法保存；关闭开关可让该模型不显示思考选择器。</span>'
+    thinkAdd.disabled = rows.length >= 8
+    for (const button of thinkRowsEl.querySelectorAll('[data-think-remove]')) {
+      button.disabled = rows.length <= 1
+    }
+    const defaultRow = rows.find((row) => row.isDefault)
+    thinkDefaultState.textContent = defaultRow
+      ? `默认档位：${defaultRow.label || defaultRow.id || '未命名'}`
+      : '还没有默认档位'
+    thinkDefaultState.classList.toggle('is-empty', !defaultRow)
+    thinkNote.className = `models-think-note ${rows.length === 0 ? 'is-empty' : ''}`
+    if (rows.length === 0) {
+      thinkNote.innerHTML = '<strong>至少添加一个档位</strong><span>没有档位时无法保存；关闭开关可让该模型不显示思考选择器。</span>'
       return
     }
-    thinkNote.innerHTML =
-      thinkStrategy.value === 'budget'
-        ? '<strong>输出预算方式</strong><span>精简 / 均衡分别限制为 2048 / 8192 tokens 输出；深思不额外限制。适合忽略 reasoning_effort 的网关。</span>'
-        : '<strong>原生思考参数</strong><span>精简 / 均衡 / 深思会映射为低 / 中 / 高，交给供应商的 reasoning_effort 或 thinking 预算。</span>'
+    thinkNote.innerHTML = budgetMode
+      ? '<strong>输出预算方式</strong><span>每行填写的「输出预算」会作为该档位的 max_tokens 上限；留空表示不额外限制。适合忽略 reasoning_effort 的网关。</span>'
+      : '<strong>原生思考参数</strong><span>每行的「上游值」会原样发给模型，例如 Qwen3.8 用 low / medium / xhigh，OpenAI 用 minimal / low / medium / high。留空时按档位 ID 兜底。</span>'
+    thinkNote.classList.toggle('is-empty', false)
   }
+
+  thinkEnabled.addEventListener('change', syncThinkState)
+  thinkStrategy.addEventListener('change', syncThinkState)
+  thinkRowsEl.addEventListener('input', syncThinkState)
+  thinkRowsEl.addEventListener('change', syncThinkState)
+  thinkRowsEl.addEventListener('click', (event) => {
+    const remove = event.target.closest('[data-think-remove]')
+    if (!remove) return
+    const row = remove.closest('[data-think-row]')
+    if (!row || readThinkRows().length <= 1) return
+    row.remove()
+    syncThinkState()
+  })
+  thinkAdd.addEventListener('click', () => {
+    const rows = readThinkRows()
+    if (rows.length >= 8) return
+    thinkRowsEl.insertAdjacentHTML(
+      'beforeend',
+      thinkRowHtml({ id: nextThinkId(rows), label: '新档位', hint: '', wire: '', budget: null }, false),
+    )
+    syncThinkState()
+  })
+  thinkPresetApply.addEventListener('click', () => {
+    const preset = THINKING_PRESETS.find((item) => item.id === thinkPreset.value)
+    if (!preset) {
+      thinkNote.className = 'models-think-note is-empty'
+      thinkNote.innerHTML = '<strong>先选择一个预设</strong><span>套用后仍可逐行修改 ID、名称、上游值和预算。</span>'
+      return
+    }
+    const defaultId = preset.options.some((option) => option.id === 'balanced')
+      ? 'balanced'
+      : preset.options[0]?.id || ''
+    thinkRowsEl.innerHTML = preset.options
+      .map((option) => thinkRowHtml(option, option.id === defaultId))
+      .join('')
+    syncThinkState()
+  })
   const syncDimField = () => {
     dimField.hidden = endpoint.value !== 'embeddings'
   }
@@ -7071,17 +7619,6 @@ async function openModelModal(model, providers, roles) {
     syncPreview()
     syncDimField()
   })
-  thinkEnabled.addEventListener('change', () => {
-    if (thinkEnabled.checked && thinkInputs.every((input) => !input.checked)) {
-      const balanced = thinkInputs.find((input) => input.dataset.thinkLevel === 'balanced')
-      if (balanced) balanced.checked = true
-    }
-    if (thinkEnabled.checked && !thinkStrategy.value) thinkStrategy.value = 'effort'
-    syncThinkState()
-  })
-  for (const input of thinkInputs) input.addEventListener('change', syncThinkState)
-  thinkDefault.addEventListener('change', syncThinkState)
-  thinkStrategy.addEventListener('change', syncThinkState)
   for (const input of roleInputs) input.addEventListener('change', syncRoleState)
   roleAll.addEventListener('change', () => {
     for (const input of roleInputs) input.checked = roleAll.checked
@@ -7102,20 +7639,65 @@ async function openModelModal(model, providers, roles) {
   overlay.querySelector('#m-cancel').addEventListener('click', close)
   overlay.querySelector('#m-save').addEventListener('click', async () => {
     const stateEl = overlay.querySelector('#m-state')
-    const thinkIds = thinkInputs.filter((input) => input.checked).map((input) => input.dataset.thinkLevel)
-    if (thinkEnabled.checked && thinkIds.length === 0) {
-      stateEl.className = 'modal-state bad'
-      stateEl.textContent = '思考选项至少选择一个档位，或关闭「允许员工选择思考档位」'
-      return
+    const thinkRows = readThinkRows()
+    if (thinkEnabled.checked) {
+      if (thinkRows.length === 0) {
+        stateEl.className = 'modal-state bad'
+        stateEl.textContent = '思考选项至少添加一个档位，或关闭「允许员工选择思考档位」'
+        return
+      }
+      if (thinkRows.length > 8) {
+        stateEl.className = 'modal-state bad'
+        stateEl.textContent = '最多支持 8 个思考档位'
+        return
+      }
+      const ids = thinkRows.map((row) => row.id)
+      if (ids.some((id) => !id)) {
+        stateEl.className = 'modal-state bad'
+        stateEl.textContent = '每个档位都要填写 ID'
+        return
+      }
+      if (ids.some((id) => id.length > 40)) {
+        stateEl.className = 'modal-state bad'
+        stateEl.textContent = '档位 ID 不能超过 40 个字符'
+        return
+      }
+      if (new Set(ids).size !== ids.length) {
+        stateEl.className = 'modal-state bad'
+        stateEl.textContent = '档位 ID 不能重复'
+        return
+      }
+      if (thinkRows.some((row) => !row.label)) {
+        stateEl.className = 'modal-state bad'
+        stateEl.textContent = '每个档位都要填写显示名'
+        return
+      }
+      if (thinkStrategy.value === 'effort') {
+        const invalidWire = thinkRows.find(
+          (row) => row.wire && !['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(row.wire),
+        )
+        if (invalidWire) {
+          stateEl.className = 'modal-state bad'
+          stateEl.textContent = `档位「${invalidWire.label || invalidWire.id}」的上游值不受支持，请填 none / minimal / low / medium / high / xhigh / max`
+          return
+        }
+      }
     }
     const config = {
       ...(model?.config && typeof model.config === 'object' ? model.config : {}),
     }
     if (thinkEnabled.checked) {
+      const defaultRow = thinkRows.find((row) => row.isDefault) || thinkRows[0]
       config.thinking = {
         enabled: true,
-        options: thinkIds,
-        defaultEffort: thinkIds.includes(thinkDefault.value) ? thinkDefault.value : thinkIds[0],
+        options: thinkRows.map((row) => ({
+          id: row.id,
+          label: row.label,
+          hint: row.hint,
+          ...(row.wire ? { wire: row.wire } : {}),
+          ...(row.budget !== null ? { budget: row.budget } : {}),
+        })),
+        defaultEffort: defaultRow.id,
         strategy: thinkStrategy.value === 'budget' ? 'budget' : 'effort',
       }
     } else {
@@ -7872,7 +8454,7 @@ async function loadModels() {
         const badgeHint = item.boundModelId
           ? '已手动绑定模型，不会随优先级自动变化'
           : item.effectiveModelId
-            ? '未手动绑定，按优先级自动选择'
+            ? '未手动绑定，自动模式选择'
             : '没有可用模型，该用途会降级'
         const tone = item.boundModelId ? 'is-bound' : item.effectiveModelId ? 'is-fallback' : 'is-empty'
         const effectiveName = (item.boundModelId ? item.boundModelName || item.effectiveModelName : item.effectiveModelName) || ''
@@ -7918,7 +8500,7 @@ async function loadModels() {
         <div class="models-panel-head">
           <div>
             <h2>用途路由 <span class="models-panel-count">${boundRouteCount}/${routeItems.length}</span></h2>
-            ${hintBadge('路由说明', '把「这次要做什么」绑定到具体模型；留空则按能力和优先级自动挑。变更立即生效，未配置的用途会降级但不阻断现有对话。插件模型只读，暂不参与显式用途绑定。')}
+            ${hintBadge('路由说明', '把「这次要做什么」绑定到具体模型；对话自动模式按实测回复速度选，其他用途留空时按能力和优先级自动挑。变更立即生效，未配置的用途会降级但不阻断现有对话。插件模型只读，暂不参与显式用途绑定。')}
           </div>
           <span class="models-panel-note">${routeItems.length ? '绑定后立即生效' : '迁移后可用'}</span>
         </div>
@@ -7933,7 +8515,7 @@ async function loadModels() {
             ${hintBadge('能力说明', '按能力管理模型：点击「能力」可直接勾选，保存后立即生效。插件模型要先真实探测通过才会出现在这里；插件停用或卸载后会自动消失。')}
           </div>
           <div class="models-tools">
-            <label class="models-search"><span aria-hidden="true">⌕</span><input id="model-search" type="search" value="${esc(state.modelsSearch)}" placeholder="搜索模型、标识或供应商" autocomplete="off" /></label>
+            <label class="models-search"><span class="models-search-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="6.5"></circle><path d="m16 16 4 4"></path></svg></span><input id="model-search" type="search" value="${esc(state.modelsSearch)}" placeholder="搜索模型、标识或供应商" autocomplete="off" /></label>
             ${writableProviders.length ? '<button class="btn primary" type="button" id="add-model">添加模型</button>' : ''}
           </div>
         </div>
@@ -8221,7 +8803,7 @@ async function loadModels() {
             badge.title = bound
               ? '已手动绑定模型，不会随优先级自动变化'
               : name
-                ? '未手动绑定，按优先级自动选择'
+                ? '未手动绑定，自动模式选择'
                 : '没有可用模型，该用途会降级'
           }
           if (sub) {
@@ -8483,8 +9065,8 @@ function brandingSurfaceCard(key, label, meta, surface) {
     </div>
     <div class="branding-icon-row">
       <div class="branding-icon-actions">
-        <button class="btn sm ghost" type="button" data-brand-upload>上传图标</button>
-        <button class="btn sm ghost" type="button" data-brand-reset>恢复默认</button>
+        <button class="btn sm ghost" type="button" data-brand-upload data-perm-action="edit">上传图标</button>
+        <button class="btn sm ghost" type="button" data-brand-reset data-perm-action="edit">恢复默认</button>
         <input type="file" hidden data-brand-file accept="image/png,image/jpeg,image/webp,image/svg+xml,image/x-icon,image/vnd.microsoft.icon,.ico,.svg,.png,.jpg,.jpeg,.webp" />
       </div>
       <span class="branding-icon-note" data-brand-icon-note>${surface.iconDataUrl ? '已上传自定义图标' : '未上传图标，使用图标内文字生成默认标记'}</span>
@@ -8662,7 +9244,7 @@ function bootPanelHtml(boot) {
     </div>
     <div class="panel-actions boot-config-actions">
       <button class="btn sm primary" type="button" id="boot-save-company">${useGlobal ? '保存为跟随全局' : '保存公司覆盖'}</button>
-      <button class="btn sm ghost" type="button" id="boot-upload">上传 MP4 片源</button>
+      <button class="btn sm ghost" type="button" id="boot-upload" data-perm-action="edit">上传 MP4 片源</button>
       <input type="file" id="boot-upload-file" accept="video/mp4,.mp4" hidden />
       <span class="boot-config-state" id="boot-upload-state"></span>
       <span class="boot-config-state" id="boot-company-state"></span>
@@ -11060,7 +11642,7 @@ async function loadTools() {
       <section class="panel">
         <div class="panel-head"><div><h2>工具注册表</h2><span class="hint">${builtinCount} 个内置工具 + ${pluginCount} 个公司插件工具</span>${hintBadge('工具说明', '这里只展示内置工具与公司插件工具。个人插件工具不进入平台工具注册表，只留在安装人的个人工作台。公司插件工具默认所有角色可用，也可改成指定角色；个人插件工具的角色授权在「插件管理 > 个人插件详情」中单独配置。角色配置是工具原有 scope 校验之外的附加限制，不会跳过 scope。')}</div>
           <div class="tools-panel-tools">
-            <label class="models-search"><span aria-hidden="true">⌕</span><input id="tool-search" type="search" placeholder="搜索工具、说明或角色" aria-label="搜索工具" autocomplete="off" /></label>
+            <label class="models-search"><span class="models-search-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="6.5"></circle><path d="m16 16 4 4"></path></svg></span><input id="tool-search" type="search" placeholder="搜索工具、说明或角色" aria-label="搜索工具" autocomplete="off" /></label>
             <span class="models-panel-note" id="tool-count"></span>
           </div>
         </div>
@@ -16877,6 +17459,16 @@ function actionKindForLabel(label) {
   return null
 }
 
+/**
+ * 按钮可用 data-perm-action 显式声明权限动作。
+ * 上传图标、上传片源这类配置动作不能只凭“上传”两个字判定为新增。
+ */
+function actionKindForControl(target) {
+  const declared = String(target?.closest?.('[data-perm-action]')?.dataset?.permAction || '').trim()
+  if (declared === 'create' || declared === 'edit' || declared === 'delete') return declared
+  return actionKindForLabel(controlLabel(target))
+}
+
 /** 图标按钮只显示“⋯”时，用 aria-label / title 取出它真实表达的动作。 */
 function controlLabel(target) {
   const text = String(target.textContent || '').trim()
@@ -16927,7 +17519,7 @@ function applyPagePermissionMode(page) {
     // 页面入口卡片（例如“模型接入”）只是导航，不按“接入/新增”等文案当成写动作。
     if (target.closest('[data-page], [data-domain], [data-go]')) continue
     const label = controlLabel(target)
-    const kind = actionKindForLabel(label)
+    const kind = actionKindForControl(target)
     const moreActions = !kind && isMoreActionsLabel(label)
     const disabled = isMember && (
       (Boolean(kind) && !canPageAction(page, kind, section || undefined)) ||
@@ -17088,6 +17680,28 @@ async function logoutConsole() {
   location.replace('/admin')
 }
 
+function cameFromChatPage() {
+  if (new URLSearchParams(location.search).get('from') === 'chat') return true
+  try {
+    const ref = new URL(document.referrer)
+    return ref.pathname === '/chat' || ref.pathname.startsWith('/chat/')
+  } catch {
+    return false
+  }
+}
+
+function chatPageUrl() {
+  const target = new URL('/chat', location.href)
+  const chatPort = Number(state.chatPort)
+  if (Number.isInteger(chatPort) && chatPort > 0) {
+    const currentPort = Number(target.port || (target.protocol === 'https:' ? 443 : 80))
+    if (chatPort !== currentPort) target.port = String(chatPort)
+  }
+  const company = state.company || urlCompany
+  if (company) target.searchParams.set('company', company)
+  return target.toString()
+}
+
 async function loadAccountPanel() {
   const meta = $('#account-meta')
   if (!meta) return
@@ -17183,33 +17797,84 @@ function openPasswordModal() {
 function setupAccount() {
   const toggle = $('#account-toggle')
   const pop = $('#account-pop')
+  const account = $('#account')
   if (!toggle || !pop) return
+  let pinned = false
+  let hoverTimer = 0
+  let panelLoaded = false
+  const returnChat = $('#account-return-chat')
+  if (returnChat) returnChat.hidden = !cameFromChatPage()
   const setOpen = (open) => {
     pop.hidden = !open
     toggle.setAttribute('aria-expanded', open ? 'true' : 'false')
   }
-  toggle.addEventListener('click', async (event) => {
+  const clearHoverTimer = () => {
+    if (!hoverTimer) return
+    clearTimeout(hoverTimer)
+    hoverTimer = 0
+  }
+  const openPanel = (options = {}) => {
+    clearHoverTimer()
+    setOpen(true)
+    if (!panelLoaded) {
+      panelLoaded = true
+      void loadAccountPanel()
+    }
+    if (options.pin) pinned = true
+  }
+  const closePanel = () => {
+    clearHoverTimer()
+    pinned = false
+    setOpen(false)
+  }
+  account?.addEventListener('mouseenter', () => {
+    clearHoverTimer()
+    if (!pop.hidden) return
+    hoverTimer = setTimeout(() => openPanel(), 120)
+  })
+  account?.addEventListener('mouseleave', () => {
+    clearHoverTimer()
+    if (pinned || pop.hidden) return
+    // 留一点缓冲，方便从头像移到下方弹层。
+    hoverTimer = setTimeout(() => {
+      if (!pinned) setOpen(false)
+      hoverTimer = 0
+    }, 220)
+  })
+  toggle.addEventListener('click', (event) => {
     event.stopPropagation()
-    const opening = pop.hidden
-    setOpen(opening)
-    if (opening) loadAccountPanel()
+    clearHoverTimer()
+    if (pop.hidden) {
+      openPanel({ pin: true })
+      return
+    }
+    // 悬停已展开时，点击转为固定展开，不误关弹层。
+    if (!pinned) {
+      pinned = true
+      return
+    }
+    closePanel()
   })
   pop.addEventListener('click', (event) => {
     event.stopPropagation()
     const action = event.target.closest('[data-account-action]')
-    if (!action) return
+    if (!action) {
+      pinned = true
+      return
+    }
     const name = action.dataset.accountAction
-    setOpen(false)
     if (name === 'logout') logoutConsole()
     if (name === 'password') openPasswordModal()
+    if (name === 'chat') location.assign(chatPageUrl())
+    closePanel()
   })
   document.addEventListener('click', (event) => {
     if (pop.hidden) return
     if (pop.contains(event.target) || toggle.contains(event.target)) return
-    setOpen(false)
+    closePanel()
   })
   document.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape' && !pop.hidden) setOpen(false)
+    if (event.key === 'Escape' && !pop.hidden) closePanel()
   })
 }
 
@@ -17237,6 +17902,7 @@ async function boot() {
   }
   try {
     const health = await api('/api/health')
+    if (Number(health.chatPort)) state.chatPort = Number(health.chatPort)
     $('#health-dot').classList.add('ok')
     $('#health-dot').title = `服务正常 · v${health.version}`
     $('#health-text').textContent = `v${health.version}`
@@ -17321,7 +17987,7 @@ async function boot() {
     // 页内页签本身只负责切换分区，不按“同步/配置”等文案当成写动作拦截。
     if (sectionOfTab(target)) return
     const section = sectionOfPane(target)
-    const kind = actionKindForLabel(label)
+    const kind = actionKindForControl(target)
     if (kind && canPageAction(state.page, kind, section || undefined)) return
     if (!kind && isMoreActionsLabel(label)) {
       if (canPageAction(state.page, 'edit', section || undefined) || canPageAction(state.page, 'delete', section || undefined)) return

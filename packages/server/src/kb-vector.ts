@@ -17,6 +17,7 @@ import {
   resolveModelForPurpose,
   type ModelCapabilityRecord,
 } from './model-registry.js'
+import { chunkEmbeddingText } from './kb-chunk-text.js'
 
 const DEFAULT_BATCH = 32
 const MAX_BATCH = 64
@@ -48,6 +49,7 @@ interface ChunkRow {
   doc_id: string
   ordinal: number
   text: string
+  meta_json: string | null
 }
 
 interface EmbeddingRow {
@@ -137,7 +139,7 @@ async function indexOneDoc(
 ): Promise<IndexDocResult> {
   const chunks = db
     .prepare(
-      `SELECT id, doc_id, ordinal, text
+      `SELECT id, doc_id, ordinal, text, meta_json
          FROM kb_chunks
         WHERE company_id = ? AND collection_id = ? AND doc_id = ?
         ORDER BY ordinal ASC`,
@@ -153,7 +155,7 @@ async function indexOneDoc(
   try {
     for (let offset = 0; offset < chunks.length; offset += batchSize) {
       const batch = chunks.slice(offset, offset + batchSize)
-      const result = await embed(batch.map((chunk) => chunk.text))
+      const result = await embed(batch.map((chunk) => chunkEmbeddingText(chunk.meta_json, chunk.text)))
       if (result.vectors.length !== batch.length) {
         throw new EabError(EC.UPSTREAM, `向量数量不匹配：期望 ${batch.length}，实际 ${result.vectors.length}`)
       }

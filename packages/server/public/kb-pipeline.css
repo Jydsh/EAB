@@ -720,6 +720,13 @@
   border-collapse: collapse;
   font-size: 11.5px;
 }
+.kb-flow-table caption {
+  padding: 4px 0 6px;
+  color: var(--ink-1);
+  font-size: 12px;
+  font-weight: 600;
+  text-align: left;
+}
 .kb-flow-table th,
 .kb-flow-table td {
   padding: 5px 8px;

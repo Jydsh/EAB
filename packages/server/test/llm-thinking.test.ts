@@ -79,6 +79,25 @@ describe('思考档位真实下发', () => {
     db.close()
   })
 
+  it('自定义上游线值优先于档位 ID 的内置映射', async () => {
+    const context = setup(() =>
+      sse(['{"choices":[{"delta":{"content":"答复"},"finish_reason":"stop"}]}']),
+    )
+    server = context.server
+    const db = await prepare(server)
+    await callModelStream(
+      db,
+      ':memory:',
+      'c1',
+      'm1',
+      [{ role: 'user', content: '你好' }],
+      { reasoningEffort: 'deep', reasoningWireEffort: 'xhigh' },
+      4096,
+    )
+    expect(context.requests[0]?.reasoning_effort).toBe('xhigh')
+    db.close()
+  })
+
   it('输出预算上限下，推理占满预算也不会把精简档翻倍突破', async () => {
     const context = setup(() =>
       sse([

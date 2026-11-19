@@ -386,12 +386,28 @@ async function latestRelease() {
   }
 }
 
+function parseDateVersion(value) {
+  const match = /^(\d{4})\.(\d{2})\.(\d{2})(?:\.(\d{2}))?$/.exec(String(value ?? '').trim().replace(/^v/i, ''))
+  if (!match) return null
+  const year = Number(match[1])
+  const month = Number(match[2])
+  const day = Number(match[3])
+  const sequence = match[4] === undefined ? 0 : Number(match[4])
+  if (month < 1 || month > 12 || day < 1) return null
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0)
+  const daysInMonth = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1]
+  if (day > daysInMonth) return null
+  if (match[4] !== undefined && (sequence < 1 || sequence > 99)) return null
+  return [year, month, day, sequence]
+}
+
 function isNewer(current, latest) {
-  const a = current.split('.').map(Number)
-  const b = latest.split('.').map(Number)
-  for (let i = 0; i < Math.max(a.length, b.length); i += 1) {
-    if ((b[i] ?? 0) > (a[i] ?? 0)) return true
-    if ((b[i] ?? 0) < (a[i] ?? 0)) return false
+  const a = parseDateVersion(current)
+  const b = parseDateVersion(latest)
+  if (!a || !b) return false
+  for (let i = 0; i < 4; i += 1) {
+    if (b[i] === a[i]) continue
+    return b[i] > a[i]
   }
   return false
 }

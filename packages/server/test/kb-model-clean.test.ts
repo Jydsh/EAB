@@ -50,4 +50,32 @@ describe('cleanBlocksWithModel', () => {
     expect(result.blocks).toHaveLength(53)
     expect(result.keptOriginalCount).toBeGreaterThan(0)
   })
+
+  it('表格和代码块不交给模型改写，清洗后原样保留在原有位置', async () => {
+    const input: KbBlock[] = [
+      ...blocks(2),
+      { id: 'table-1', text: '列A\t列B\n奖励\t60', type: 'table', headingPath: [] },
+      { id: 'code-1', text: 'npm run build\n\t--watch', type: 'code', headingPath: [] },
+    ]
+    const result = await cleanBlocksWithModel(null as unknown as Db, ':memory:', 'c1', 'model-clean', input)
+
+    expect(callModelMock).toHaveBeenCalledTimes(1)
+    const body = (callModelMock.mock.calls[0]![4] as Array<{ content: string }>)[1]!.content
+    expect(body).not.toContain('列A')
+    expect(body).not.toContain('npm run build')
+    expect(result.blocks.map((block) => block.type)).toEqual(['paragraph', 'paragraph', 'table', 'code'])
+    expect(result.blocks[2]).toEqual(input[2])
+    expect(result.blocks[3]).toEqual(input[3])
+  })
+
+  it('只有表格/代码/图片时跳过模型，不发起请求', async () => {
+    const input: KbBlock[] = [
+      { id: 'table-1', text: '列A\t列B\n1\t2', type: 'table', headingPath: [] },
+      { id: 'image-1', text: '[图片] 插图', type: 'image', headingPath: [] },
+    ]
+    const result = await cleanBlocksWithModel(null as unknown as Db, ':memory:', 'c1', 'model-clean', input)
+
+    expect(callModelMock).not.toHaveBeenCalled()
+    expect(result.blocks).toEqual(input)
+  })
 })

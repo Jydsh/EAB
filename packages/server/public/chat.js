@@ -630,9 +630,12 @@ async function refreshConsoleEntry() {
     }
     entry.hidden = false
     const company = new URLSearchParams(location.search).get('company')
-    const targetOf = (href) => (company
-      ? `${href || '/admin'}${String(href || '/admin').includes('?') ? '&' : '?'}company=${encodeURIComponent(company)}`
-      : href || '/admin')
+    const targetOf = (href) => {
+      const target = new URL(href || '/admin', location.href)
+      if (company) target.searchParams.set('company', company)
+      target.searchParams.set('from', 'chat')
+      return target.toString()
+    }
     entry.onclick = async () => {
       if (entry.disabled) return
       entry.disabled = true
@@ -1111,6 +1114,8 @@ async function reconcileActiveRunsAfterReconnect() {
         modelName: persisted.modelName || '',
         autoSelected: persisted.meta?.autoSelected === true,
         citations: persisted.meta?.citations,
+        tokens: persisted.meta?.tokens,
+        timing: persisted.meta?.timing,
         createdAt: persisted.createdAt,
         clarify: null,
       })
@@ -1314,6 +1319,8 @@ function setupChatEvents() {
           toolCalls: Array.isArray(meta.toolCalls) ? meta.toolCalls : [],
           teamProgress: meta.teamProgress,
           clarify: meta.clarify,
+          tokens: meta.tokens,
+          timing: meta.timing,
           createdAt: payload.message.createdAt,
         })
         syncMessageActionAvailability()
@@ -3527,6 +3534,8 @@ function syncWorkbenchLayout() {
       collapse.title = collapsed ? '展开右侧工作台' : '收起右侧工作台'
       collapse.setAttribute('aria-label', collapse.title)
     }
+    const close = $('#workbench-close')
+    if (close) close.hidden = !showPerm
   }
 
   const restore = $('#workbench-restore')
@@ -3983,7 +3992,6 @@ function bindPermissionPane() {
     }
     openPermissionPane()
   })
-  $('#perm-pane-close')?.addEventListener('click', closePermissionPane)
   $('#perm-switch')?.addEventListener('click', (event) => {
     const button = event.target.closest('[data-perm-view]')
     if (!button) return
@@ -7240,6 +7248,10 @@ function bindWorkbenchTabs() {
     state.workbenchSplit = !state.workbenchSplit
     syncWorkbenchLayout()
   })
+  $('#workbench-close')?.addEventListener('click', () => {
+    closePermissionPane()
+    $('#perm-entry')?.focus()
+  })
   $('#workbench-collapse')?.addEventListener('click', () => {
     setWorkbenchCollapsed(true)
     $('#workbench-restore')?.focus()
@@ -10202,6 +10214,44 @@ function formatElapsed(ms) {
   return ms < 1000 ? `${Math.max(1, Math.round(ms))}ms` : `${(ms / 1000).toFixed(1)}s`
 }
 
+/** 上游不返回 usage 时，按中英文混排字符估算输出 token；调用方必须标成近似值。 */
+function estimateOutputTokens(text) {
+  const source = String(text || '')
+  if (!source) return 0
+  let tokens = 0
+  let asciiRun = 0
+  const flushAscii = () => {
+    if (asciiRun > 0) tokens += Math.ceil(asciiRun / 4)
+    asciiRun = 0
+  }
+  for (const char of source) {
+    const code = char.codePointAt(0) || 0
+    if (code <= 0x7f) {
+      if (/\s/.test(char)) flushAscii()
+      else asciiRun += 1
+    } else {
+      flushAscii()
+      tokens += 1
+    }
+  }
+  flushAscii()
+  return tokens
+}
+
+/** 模型生成速度：只把纯生成窗口当分母，工具执行和排队时间不算进去。 */
+function tokenSpeedText(tokens, timing, fallbackText = '') {
+  const completion = Number(tokens?.completion ?? tokens?.completionTokens ?? 0)
+  const genMs = Number(timing?.genMs ?? 0)
+  if (!Number.isFinite(genMs) || genMs <= 0) return ''
+  const measured = Number.isFinite(completion) && completion > 0
+  const count = measured ? completion : estimateOutputTokens(fallbackText)
+  if (count <= 0) return ''
+  const speed = count / (genMs / 1000)
+  if (!Number.isFinite(speed) || speed <= 0) return ''
+  const digits = speed >= 100 ? 0 : speed >= 10 ? 1 : 2
+  return `${measured ? '' : '≈ '}${speed.toFixed(digits)} tok/s`
+}
+
 function prettyPayload(value) {
   const text = typeof value === 'string' ? value : JSON.stringify(value, null, 2)
   if (!text) return '（空）'
@@ -11476,15 +11526,18 @@ function clarifyInlineNote() {
   return `<div class="clarify-inline-note"><span class="clarify-mark" aria-hidden="true">?</span><span>需要先确认方向，请选择或补充。</span></div>`
 }
 
-function historyMetaText(meta) {
-  if (!meta) return ''
-  if (typeof meta === 'string' || typeof meta === 'number') return String(meta)
-  if (typeof meta === 'object') {
-    return [meta.modelName, meta.autoSelected ? '自动选择' : '']
-      .filter(Boolean)
-      .join(' · ')
-  }
-  return ''
+function historyMetaText(meta, text = '', rich = {}) {
+  if (!meta && !rich) return ''
+  if (typeof meta === 'number') return String(meta)
+  const source = meta && typeof meta === 'object' ? meta : (rich && typeof rich === 'object' ? rich : {})
+  const modelName = typeof meta === 'string' ? meta : source.modelName
+  return [
+    modelName,
+    tokenSpeedText(source.tokens, source.timing, `${source.reasoning || ''}${text || ''}`),
+    source.autoSelected ? '自动选择' : '',
+  ]
+    .filter(Boolean)
+    .join(' · ')
 }
 
 function historyAiBubble(text, meta, rich, options = {}) {
@@ -11492,7 +11545,7 @@ function historyAiBubble(text, meta, rich, options = {}) {
   const tools = normalizeRecoveredToolCalls(Array.isArray(rich?.toolCalls) ? rich.toolCalls : [])
   const channel = channelTag(rich?.channel)
   const clarify = rich?.clarify && typeof rich.clarify === 'object' ? rich.clarify : null
-  const metaText = historyMetaText(meta)
+  const metaText = historyMetaText(meta, text, rich)
   const progressValue = rich?.teamProgress && typeof rich.teamProgress === 'object'
     ? rich.teamProgress
     : (rich?.progress && typeof rich.progress === 'object' ? rich.progress : null)
@@ -12928,9 +12981,10 @@ function createAiTurn(options = {}) {
         else if (!answer.textContent) answer.textContent = '（没有返回内容）'
       }
       const citations = data.citations && data.citations.length ? ` · 引用 ${data.citations.length} 条` : ''
+      const speed = tokenSpeedText(data.tokens, data.timing, `${data.reasoning || ''}${data.text || ''}`)
       const thinking = think.hidden ? '' : ` · 思考 ${formatElapsed((firstAnswerAt || Date.now()) - (reasoningStartedAt || startedAt))}`
       metaLine.hidden = false
-      metaLine.innerHTML = `${channelTag(data.channel)}${esc(`${data.modelName || ''}${data.autoSelected ? ' · 自动选择' : ''}${thinking}${citations}`)}`
+      metaLine.innerHTML = `${channelTag(data.channel)}${esc(`${data.modelName || ''}${speed ? ` · ${speed}` : ''}${data.autoSelected ? ' · 自动选择' : ''}${thinking}${citations}`)}`
       // 固定模型的会话发生故障转移时，后端已写回接替模型；气泡同步为实际接替模型。
       if (!data.autoSelected && data.fallbackFromModelId && data.modelId) {
         setSelected(data.modelId, { persist: false })

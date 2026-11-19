@@ -152,8 +152,10 @@ export interface ModelCallOptions {
   tools?: ToolSpec[]
   /** 默认 auto；澄清修复时强制模型调用 ask_user。 */
   toolChoice?: ToolChoice
-  /** 已解析的思考档位；由模型配置和会话选择共同决定。 */
+  /** 已解析的思考档位 ID；由模型配置和会话选择共同决定。 */
   reasoningEffort?: string
+  /** OpenAI 兼容协议实际下发的 reasoning_effort 线值；优先于 reasoningEffort 的内置映射。 */
+  reasoningWireEffort?: string
   /** budget 策略下，重试也不得突破的 max_tokens 上限。 */
   maxTokensCap?: number
   /** 单次上游请求超时；批量分析的大输入需要比普通对话更长的等待。 */
@@ -293,11 +295,16 @@ async function callOpenAi(
   maxTokens: number,
   tools: ToolSpec[] = [],
   reasoningEffort?: string,
+  wireEffortOverride?: string,
   timeoutMs = 90_000,
   disableThinking = false,
   signal?: AbortSignal,
 ): Promise<CallResult> {
-  const wireEffort = reasoningEffort ? providerReasoningEffort(reasoningEffort) : undefined
+  const wireEffort = wireEffortOverride
+    ? providerReasoningEffort(reasoningEffort ?? wireEffortOverride, wireEffortOverride)
+    : reasoningEffort
+      ? providerReasoningEffort(reasoningEffort)
+      : undefined
   const timeoutSignal = AbortSignal.timeout(timeoutMs)
   const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal
   const res = await fetchModelWithRetry(`${trimBase(base)}/chat/completions`, {
@@ -516,7 +523,11 @@ async function callOpenAiStream(
 ): Promise<CallResult> {
   const timeout = AbortSignal.timeout(120_000)
   const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout
-  const wireEffort = options.reasoningEffort ? providerReasoningEffort(options.reasoningEffort) : undefined
+  const wireEffort = options.reasoningWireEffort
+    ? providerReasoningEffort(options.reasoningEffort ?? options.reasoningWireEffort, options.reasoningWireEffort)
+    : options.reasoningEffort
+      ? providerReasoningEffort(options.reasoningEffort)
+      : undefined
   const res = await fetchModelWithRetry(`${trimBase(base)}/chat/completions`, {
     method: 'POST',
     headers: {
@@ -737,6 +748,7 @@ export async function callModel(
       tokens,
       options.tools ?? [],
       options.reasoningEffort,
+      options.reasoningWireEffort,
       options.timeoutMs,
       disableThinking,
       options.signal,

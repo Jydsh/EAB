@@ -16,12 +16,26 @@ export interface KbCleanResult {
 const PAGE_NUMBER = /^(?:第\s*\d+\s*页(?:\s*[/／]\s*共\s*\d+\s*页)?|page\s*\d+(?:\s*of\s*\d+)?|-?\s*\d+\s*-?)$/i
 const ZERO_WIDTH = /[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/g
 
-function cleanLine(line: string): string {
-  return line
+function cleanInline(value: string): string {
+  return value
     .replace(ZERO_WIDTH, '')
     .replace(/\u00a0/g, ' ')
     .replace(/[ \t]+/g, ' ')
-    .trimEnd()
+    .trim()
+}
+
+function cleanLine(line: string): string {
+  return cleanInline(line).trimEnd()
+}
+
+/** 表格行必须先按制表符拆列再清洗单元格，否则会把列结构压成一串空格。 */
+function cleanTableLine(line: string): string {
+  return line.split('\t').map(cleanInline).join('\t')
+}
+
+/** 代码块保留缩进和制表符，只去掉不可见字符与行尾空白。 */
+function cleanCodeLine(line: string): string {
+  return line.replace(ZERO_WIDTH, '').replace(/\u00a0/g, ' ').trimEnd()
 }
 
 function shouldDropLine(line: string): boolean {
@@ -34,20 +48,34 @@ export function cleanKbBlocks(blocks: readonly KbBlock[]): KbCleanResult {
   let removedLines = 0
   const cleaned: KbBlock[] = []
   for (const source of blocks) {
-    const lines = source.text.replace(/\r\n/g, '\n').split('\n').map(cleanLine)
+    const preserveWhitespace = source.type === 'table' || source.type === 'code'
+    const lines = source.text
+      .replace(/\r\n/g, '\n')
+      .split('\n')
+      .map((line) => (source.type === 'table' ? cleanTableLine(line) : source.type === 'code' ? cleanCodeLine(line) : cleanLine(line)))
     const kept: string[] = []
     for (const line of lines) {
-      if (shouldDropLine(line)) {
+      if (!preserveWhitespace && shouldDropLine(line)) {
         removedLines += 1
         continue
       }
+      if (source.type === 'table' && !line.trim()) continue
       kept.push(line)
     }
-    let text = kept.join('\n').replace(/\n{3,}/g, '\n\n').trim()
     if (source.type === 'table') {
-      // 表格保留行结构；只压掉全空行，不合并列。
-      text = kept.filter((line) => line.trim().length > 0).join('\n').trim()
+      // 表格保留行、列和空单元格；只压掉全空行，不合并列。
+      const text = kept.join('\n').replace(/\n{3,}/g, '\n\n')
+      if (!text.trim()) continue
+      cleaned.push({ ...source, text })
+      continue
     }
+    if (source.type === 'code') {
+      const text = kept.join('\n').replace(/\n{3,}/g, '\n\n').trimEnd()
+      if (!text.trim()) continue
+      cleaned.push({ ...source, text })
+      continue
+    }
+    const text = kept.join('\n').replace(/\n{3,}/g, '\n\n').trim()
     if (!text) continue
     cleaned.push({ ...source, text })
   }

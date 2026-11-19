@@ -31,9 +31,17 @@ import {
   shouldMarkModelFailure,
   sortModelsForChat,
 } from '../model-health.js'
+import {
+  invalidateModelSpeedStats,
+  pickFastestModel,
+  rankModelsBySpeed,
+  readModelSpeedStats,
+  type ModelSpeedStat,
+} from '../model-speed.js'
 import { resolveModelForPurpose, findModelById, capabilitiesOf, normalizeCapability, DEFAULT_MODEL_MAX_CONTEXT, DEFAULT_MODEL_MAX_OUTPUT } from '../model-registry.js'
 import { classifyChatIntent, intentHintOf, shouldAutoRetrieveKb } from '../intent.js'
 import {
+  providerReasoningEffort,
   resolveThinkingEffort,
   thinkingBudgetCeiling,
   thinkingConfigOf,
@@ -2871,16 +2879,28 @@ function inferSubAgentCapabilities(prompt: string): string[] {
 }
 
 /**
- * 自动选模：优先选具备工具调用能力的对话模型。
- * EAB 的聊天入口默认挂载工具，纯 chat 模型（例如 Qwen3.5-4B）会在
- * office.find / office.replace 这类多步工具任务里漏参数或空回复。
+ * 自动选模：有实测速度样本时，在全部对话模型里直接选预计回复最快的一个；
+ * 没有任何速度样本时，才沿用原来的工具能力优先，保证冷启动和工具任务可用。
+ *
+ * 工具能力不再覆盖速度：用户明确要求自动模式优先回复速度 / 生成 token 速度，
+ * 显式选择工具模型或 Agent 团队分配仍走各自原链路。
  */
-export function chooseAutoChatModel(available: readonly ModelDefinition[]): ModelDefinition | undefined {
-  const toolCapable = available.find((model) => {
+export function chooseAutoChatModel(
+  available: readonly ModelDefinition[],
+  speedStats?: ReadonlyMap<string, ModelSpeedStat>,
+): ModelDefinition | undefined {
+  const chatModels = available.filter((model) => (model.endpointKind ?? 'chat') === 'chat')
+  if (chatModels.length === 0) return undefined
+  const hasCandidateSpeed = chatModels.some((model) => speedStats?.has(model.id))
+  if (hasCandidateSpeed && speedStats) {
+    const fastest = pickFastestModel(chatModels, speedStats)
+    if (fastest) return fastest
+  }
+  const toolCapable = chatModels.find((model) => {
     const caps = [...(model.capabilities ?? []), ...(model.tags ?? [])].map((item) => item.toLowerCase())
     return caps.includes('tool')
   })
-  return toolCapable ?? available[0]
+  return toolCapable ?? chatModels[0]
 }
 
 /**
@@ -5245,12 +5265,14 @@ function thinkingCallPlan(
   config: ThinkingConfig | null,
   requested: string | undefined,
   baseMaxTokens: number,
-): { effort?: string; maxTokens: number; maxTokensCap?: number } {
+): { effort?: string; wireEffort?: string; maxTokens: number; maxTokensCap?: number } {
   const effort = resolveThinkingEffort(config, requested)
   if (!effort) return { maxTokens: baseMaxTokens }
+  const option = config?.options.find((item) => item.id === effort)
+  const wireEffort = option?.wire || providerReasoningEffort(effort)
   if (config?.strategy === 'budget' && effort !== 'disabled') {
-    const ceiling = thinkingBudgetCeiling(effort)
-    if (ceiling) {
+    const ceiling = option?.budget === undefined ? thinkingBudgetCeiling(effort) : option.budget
+    if (ceiling !== null && ceiling !== undefined) {
       return {
         maxTokens: Math.min(baseMaxTokens, ceiling),
         maxTokensCap: ceiling,
@@ -5258,7 +5280,7 @@ function thinkingCallPlan(
     }
     return { maxTokens: baseMaxTokens }
   }
-  return { effort, maxTokens: baseMaxTokens }
+  return { effort, ...(wireEffort ? { wireEffort } : {}), maxTokens: baseMaxTokens }
 }
 
 /**
@@ -5750,6 +5772,7 @@ export async function runAgentTurn(opts: {
           signal: opts.signal,
           ...(round === 0 && safeDirectToolChoice ? { toolChoice: safeDirectToolChoice } : {}),
           ...(callPlan.effort ? { reasoningEffort: callPlan.effort } : {}),
+          ...(callPlan.wireEffort ? { reasoningWireEffort: callPlan.wireEffort } : {}),
           ...(callPlan.maxTokensCap ? { maxTokensCap: callPlan.maxTokensCap } : {}),
           onEvent: (event: ModelStreamEvent) => {
             if (event.type === 'tool_delta') {
@@ -5951,6 +5974,7 @@ export async function runAgentTurn(opts: {
             signal: opts.signal,
             toolChoice: { type: 'function', function: { name: CLARIFY_TOOL_NAME } },
             ...(repairPlan.effort ? { reasoningEffort: repairPlan.effort } : {}),
+            ...(repairPlan.wireEffort ? { reasoningWireEffort: repairPlan.wireEffort } : {}),
             ...(repairPlan.maxTokensCap ? { maxTokensCap: repairPlan.maxTokensCap } : {}),
           }
           const repairMaxContext = repairProfile?.maxContext ?? DEFAULT_MODEL_MAX_CONTEXT
@@ -7121,7 +7145,11 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
     const defaultRoute = resolveModelForPurpose(deps.db, subject.companyId, 'chat.default')
     const preferred = preferredModelId(subject.companyId)
     const preferredModel = preferred ? chatModels.find((model) => model.id === preferred) : undefined
-    const autoModel = preferredModel ?? (defaultRoute ? chatModels.find((model) => model.id === defaultRoute.id) : undefined)
+    const speedStats = readModelSpeedStats(deps.db, subject.companyId)
+    const hasMeasuredSpeed = chatModels.some((model) => speedStats.has(model.id))
+    // 自动模式：有实测速度就按速度选；没有任何样本时保留原来的默认路由 / 最近成功模型。
+    const fastestModel = hasMeasuredSpeed ? chooseAutoChatModel(chatModels, speedStats) : undefined
+    const autoModel = fastestModel ?? preferredModel ?? (defaultRoute ? chatModels.find((model) => model.id === defaultRoute.id) : undefined)
     const firstNativeModel = chatModels.find((model) => !isPluginModelId(model.id))
     /* 语音能力是否可用：只影响前端按钮显隐，未配置时按钮不出现，不影响对话。 */
     const transcribeRoute = resolveModelForPurpose(deps.db, subject.companyId, 'asr.default')
@@ -7147,6 +7175,7 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
         providerName: model.providerName,
         modelKey: model.modelKey,
         thinking: model.thinking ?? null,
+        speed: speedStats.get(model.id) ?? null,
       })),
     })
   })
@@ -8076,6 +8105,8 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
         details: { requiredScope: SC.MODEL_USE },
       })
     }
+    const speedStats = readModelSpeedStats(deps.db, actor.subject.companyId)
+    const hasMeasuredSpeed = available.some((model) => speedStats.has(model.id))
 
     const modelIdProvided = Object.prototype.hasOwnProperty.call(req.body ?? {}, 'modelId')
     const sessionState = req.body?.sessionId
@@ -8115,8 +8146,8 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
     const autoSelected = requested === null
     if (!model) {
       model = hasImageAttachments && imageModels.length
-        ? (visionModel ?? imageModels[0])
-        : chooseAutoChatModel(available)
+        ? (visionModel ?? (hasMeasuredSpeed ? chooseAutoChatModel(imageModels, speedStats) : imageModels[0]))
+        : chooseAutoChatModel(available, speedStats)
     }
     if (!model) throw new EabError(EC.VALIDATION, '当前身份没有可用模型')
     if (hasImageAttachments && !modelSupportsVision(model.tags, model.capabilities)) {
@@ -8131,13 +8162,16 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
       : String(sessionState?.reasoning_effort ?? '').trim()
     const reasoningEffort = resolveThinkingEffort(model.thinking ?? null, requestedEffort)
     const primaryModelId = model.id
-    const fallbackModelIds = available
-      .filter(
-        (item) =>
-          item.id !== primaryModelId &&
-          (!hasImageAttachments || modelSupportsVision(item.tags, item.capabilities)),
-      )
-      .map((item) => item.id)
+    const fallbackCandidates = available.filter(
+      (item) =>
+        item.id !== primaryModelId &&
+        (item.endpointKind ?? 'chat') === 'chat' &&
+        (!hasImageAttachments || modelSupportsVision(item.tags, item.capabilities)),
+    )
+    const fallbackModelIds = (hasMeasuredSpeed
+      ? rankModelsBySpeed(fallbackCandidates, speedStats)
+      : fallbackCandidates
+    ).map((item) => item.id)
     let failoverNote = ''
 
     const capacitySlot = await capacity.acquire(actor.person.id, {
@@ -8571,6 +8605,7 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
         JSON.stringify(meta),
         Date.now(),
       )
+    invalidateModelSpeedStats(actor.subject.companyId)
     if (agent?.runId && parentTeamProgress) {
       linkTeamProgressToParent(deps, sessionId, agent.runId, assistantMessageId)
     }
@@ -8655,6 +8690,8 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
         memoryScope: meta.memoryScope,
         teamProgress: meta.teamProgress,
         clarify: meta.clarify,
+        tokens: meta.tokens,
+        timing: meta.timing,
         // 本地消息先按上传信息渲染；done 再回填服务端生成的 batchId，用户消息里的数据接管卡才完整。
         attachments: attachmentMeta(attachments),
         createdAt: new Date().toISOString(),
@@ -8686,6 +8723,8 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
         memoryHits: meta.memoryHits,
         memoryScope: meta.memoryScope,
         clarify: meta.clarify,
+        tokens: meta.tokens,
+        timing: meta.timing,
         createdAt: new Date().toISOString(),
       },
     })

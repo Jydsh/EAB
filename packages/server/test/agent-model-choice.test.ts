@@ -17,6 +17,49 @@ describe('自动选模', () => {
     const noTool = models.filter((model: any) => !model.capabilities.includes('tool'))
     expect(chooseAutoChatModel(noTool)?.id).toBe('model_fast')
   })
+
+  it('有实测速度时，在工具模型里选预计回复最快的一个，而不是优先级最高的', () => {
+    const toolModels = [
+      { id: 'tool_slow', name: '工具慢模型', capabilities: ['tool'], priority: 100, endpointKind: 'chat' },
+      { id: 'tool_fast', name: '工具快模型', capabilities: ['tool'], priority: 1, endpointKind: 'chat' },
+    ] as any
+    const stats = new Map([
+      ['tool_slow', {
+        modelId: 'tool_slow', modelName: '工具慢模型', samples: 3,
+        ttftMs: 8000, tokensPerSecond: 8, estimatedReplyMs: 40_000, measuredAt: Date.now(),
+      }],
+      ['tool_fast', {
+        modelId: 'tool_fast', modelName: '工具快模型', samples: 1,
+        ttftMs: 1000, tokensPerSecond: 50, estimatedReplyMs: 6120, measuredAt: Date.now(),
+      }],
+    ])
+    expect(chooseAutoChatModel(toolModels, stats)?.id).toBe('tool_fast')
+  })
+
+  it('有实测速度时，速度优先于工具能力；没有速度样本才回到工具优先', () => {
+    const stats = new Map([
+      ['model_fast', {
+        modelId: 'model_fast', modelName: '快速模型', samples: 2,
+        ttftMs: 800, tokensPerSecond: 60, estimatedReplyMs: 5067, measuredAt: Date.now(),
+      }],
+      ['model_code', {
+        modelId: 'model_code', modelName: '代码模型', samples: 2,
+        ttftMs: 6000, tokensPerSecond: 10, estimatedReplyMs: 31_600, measuredAt: Date.now(),
+      }],
+    ])
+    expect(chooseAutoChatModel(models, stats)?.id).toBe('model_fast')
+    expect(chooseAutoChatModel(models)?.id).toBe('model_code')
+  })
+
+  it('速度样本只属于不可见模型时，不把未测模型当成最快模型，仍回到工具兜底', () => {
+    const stats = new Map([
+      ['plugin:other:model', {
+        modelId: 'plugin:other:model', modelName: '不可见插件模型', samples: 2,
+        ttftMs: 200, tokensPerSecond: 900, estimatedReplyMs: 484, measuredAt: Date.now(),
+      }],
+    ])
+    expect(chooseAutoChatModel(models, stats)?.id).toBe('model_code')
+  })
 })
 
 describe('父 Agent 自动分配子 Agent 模型', () => {

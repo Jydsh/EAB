@@ -131,6 +131,11 @@ export function consoleApiRuleFor(method: string, path: string): ConsoleApiRule 
     if (actions.length === 1 && actions[0] === 'view') return { pages: P('org', 'roles'), actions }
     return { pages: P('roles'), actions }
   }
+  // 角色详情的「可用工具」需要读同一份工具目录；只有角色管理权限、
+  // 没有工具页权限的成员也应能加载，否则页签会因目录 403 而整块不可用。
+  if (/^\/api\/console\/tools\/access$/.test(path) && actions.length === 1 && actions[0] === 'view') {
+    return { pages: P('tools', 'roles'), actions }
+  }
   if (/^\/api\/console\/scopes(?:\/|$)/.test(path)) {
     return { pages: P('org', 'roles', 'tools'), actions }
   }

@@ -182,8 +182,15 @@ function splitTableBlock(block: KbBlock, options: KbSplitOptions, out: KbChunk[]
   }
   const rows = block.text.split('\n').map((row) => row.trimEnd()).filter(Boolean)
   if (rows.length === 0) return
-  const header = rows[0]
-  const body = rows.slice(1)
+  const headerCount = Math.max(
+    1,
+    Math.min(rows.length, Math.round(Number(block.meta?.tableHeaderRows ?? 1)) || 1),
+  )
+  const headerRows = rows.slice(0, headerCount)
+  const caption = String(block.meta?.tableCaption ?? '').trim()
+  let header = headerRows.join('\n')
+  if (caption && !headerRows.some((row) => row.includes(caption))) header = `${caption}\n${header}`
+  const body = rows.slice(headerCount)
   const baseStart = block.rowRange?.[0] ?? 1
   if (estimateTokens(block.text) <= options.maxTokens) {
     pushChunk(out, { text: rows.join('\n'), block })

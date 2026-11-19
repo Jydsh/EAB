@@ -13,6 +13,7 @@ import {
   saveConsolePagePermissions,
   saveConsoleRolePagePermissions,
 } from '../src/console-permissions.js'
+import { readToolRoleAccess } from '../src/tool-role-access.js'
 
 const dirs: string[] = []
 const handles: Db[] = []
@@ -601,6 +602,42 @@ describe('console member access', () => {
       payload: { pages: [{ page: 'overview', canView: true }] },
     })
     expect(denied.statusCode).toBe(403)
+  })
+
+  it('lets a role manager configure role tools without the tools page', async () => {
+    const { app, db } = makeApp()
+    db.prepare(
+      `INSERT INTO roles (id, company_id, code, name, data_scope, builtin, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run('r-role-admin', 'c1', 'role_admin', '角色管理员', 'company', 0, Date.now())
+    db.prepare(
+      `INSERT INTO roles (id, company_id, code, name, data_scope, builtin, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run('r-target', 'c1', 'target_role', '目标角色', 'dept', 0, Date.now())
+    db.prepare('INSERT INTO user_roles (user_id, role_id, granted_by, granted_at) VALUES (?, ?, ?, ?)')
+      .run('u1', 'r-role-admin', 'test', Date.now())
+    saveConsoleRolePagePermissions(db, 'c1', 'r-role-admin', [
+      { page: 'roles', canView: true, canEdit: true },
+    ], 'seed')
+
+    const { cookie } = await login(app)
+    const headers = { 'x-eab-console': '1', cookie }
+    const catalog = await app.inject({ method: 'GET', url: '/api/console/tools/access', headers })
+    expect(catalog.statusCode).toBe(200)
+    const ids = (JSON.parse(catalog.body).data.tools as Array<{ accessId: string }>).map((row) => row.accessId)
+    expect(ids).toContain('time.now')
+
+    const save = await app.inject({
+      method: 'PUT',
+      url: '/api/console/roles/target_role/tools',
+      headers,
+      payload: { tools: ['time.now'] },
+    })
+    expect(save.statusCode).toBe(200)
+    const access = readToolRoleAccess(db, 'c1', 'workspace.read')
+    expect(access.mode).toBe('roles')
+    expect(access.roles).toContain('role_admin')
+    expect(access.roles).not.toContain('target_role')
   })
 
   it('keeps platform token at full access', async () => {

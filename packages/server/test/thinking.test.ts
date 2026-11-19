@@ -19,15 +19,42 @@ describe('思考档位配置', () => {
     expect(config?.strategy).toBe('effort')
   })
 
-  it('模型可以只开放部分档位，保存时只落紧凑结构', () => {
+  it('模型可以只开放部分档位，保存时保留完整对象', () => {
     const config = readThinkingConfig({ enabled: true, options: ['balanced', 'deep'], defaultEffort: 'deep', strategy: 'budget' })
     expect(config?.options.map((item) => item.id)).toEqual(['balanced', 'deep'])
     expect(storedThinkingConfig(config)).toEqual({
       enabled: true,
-      options: ['balanced', 'deep'],
+      options: [
+        { id: 'balanced', label: '均衡', hint: '默认档位，兼顾速度与质量。', wire: 'medium', budget: 8192 },
+        { id: 'deep', label: '深思', hint: '更充分的推理，输出上限跟随模型。', wire: 'high', budget: null },
+      ],
       defaultEffort: 'deep',
       strategy: 'budget',
     })
+  })
+
+  it('自定义档位保留显示名、说明、上游线值和输出预算，并按顺序最多 8 个', () => {
+    const config = readThinkingConfig({
+      enabled: true,
+      defaultEffort: 'deep',
+      strategy: 'effort',
+      options: [
+        { id: 'fast', label: '快速', hint: '先给答案。', wire: 'minimal' },
+        { id: 'deep', label: '极深', hint: '完整推理。', wire: 'xhigh', budget: null },
+        ...Array.from({ length: 10 }, (_, index) => ({ id: `extra${index}`, label: `额外${index}` })),
+      ],
+    })
+    expect(config?.options).toHaveLength(8)
+    expect(config?.options[0]).toMatchObject({ id: 'fast', label: '快速', hint: '先给答案。', wire: 'minimal' })
+    expect(config?.options[1]).toMatchObject({ id: 'deep', label: '极深', hint: '完整推理。', wire: 'xhigh', budget: null })
+    expect(config?.defaultEffort).toBe('deep')
+  })
+
+  it('显式上游线值优先于内置 ID 映射', () => {
+    expect(providerReasoningEffort('deep')).toBe('high')
+    expect(providerReasoningEffort('deep', 'xhigh')).toBe('xhigh')
+    expect(providerReasoningEffort('custom', 'low')).toBe('low')
+    expect(providerReasoningEffort('custom', 'unsupported')).toBeUndefined()
   })
 
   it('没有配置或选择过期时按模型默认档位计算', () => {

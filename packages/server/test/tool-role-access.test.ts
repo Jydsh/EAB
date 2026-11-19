@@ -5,6 +5,7 @@ import {
   listCompanyRoleOptions,
   pluginToolAccessId,
   readToolRoleAccess,
+  setRoleToolAccess,
   setToolRoleAccess,
   toolAllowedForRoles,
 } from '../src/tool-role-access.js'
@@ -127,6 +128,40 @@ describe('工具角色可用性', () => {
     expect(() => setToolRoleAccess(db, 'c1', 'time.now', { mode: 'nobody' })).toThrow(EabError)
     expect(listCompanyRoleOptions(db, 'c1').map((role) => role.code)).toContain('member')
   })
+
+  it('角色页保存只改动当前角色，和工具页的白名单双向一致', () => {
+    const { db } = testEnv()
+    const all = ['time.now', 'workspace.read', 'workspace.write']
+    const first = setRoleToolAccess(db, 'c1', 'member', all, ['workspace.read'])
+    expect(first.changed).toEqual(['time.now', 'workspace.write'])
+    expect(readToolRoleAccess(db, 'c1', 'time.now')).toEqual({
+      mode: 'roles',
+      roles: ['auditor', 'company_admin', 'super_admin'],
+    })
+    expect(readToolRoleAccess(db, 'c1', 'workspace.read')).toEqual({ mode: 'all', roles: [] })
+    expect(readToolRoleAccess(db, 'c1', 'workspace.write')).toEqual({
+      mode: 'roles',
+      roles: ['auditor', 'company_admin', 'super_admin'],
+    })
+
+    // 角色页重新勾选全部工具，等价于恢复“所有角色”，不会留下一个包含全部角色的伪指定状态。
+    const second = setRoleToolAccess(db, 'c1', 'member', all, all)
+    expect(second.changed).toEqual(['time.now', 'workspace.write'])
+    expect(readToolRoleAccess(db, 'c1', 'time.now')).toEqual({ mode: 'all', roles: [] })
+    expect(readToolRoleAccess(db, 'c1', 'workspace.write')).toEqual({ mode: 'all', roles: [] })
+  })
+
+  it('工具页配置的指定角色会原样出现在角色页，超管不能通过角色页收回工具', () => {
+    const { db } = testEnv()
+    const all = ['time.now', 'workspace.read']
+    setToolRoleAccess(db, 'c1', 'time.now', { mode: 'roles', roles: ['member', 'auditor'] })
+    const saved = setRoleToolAccess(db, 'c1', 'member', all, ['time.now', 'workspace.read'])
+    expect(saved.changed).toEqual([])
+    expect(readToolRoleAccess(db, 'c1', 'time.now')).toEqual({ mode: 'roles', roles: ['auditor', 'member'] })
+    expect(() => setRoleToolAccess(db, 'c1', 'super_admin', all, [])).toThrow(EabError)
+    expect(() => setRoleToolAccess(db, 'c1', 'missing_role', all, [])).toThrow(EabError)
+  })
+
 
   it('插件工具按 pluginId + 工具名共享角色配置', () => {
     const { db, actor } = testEnv()

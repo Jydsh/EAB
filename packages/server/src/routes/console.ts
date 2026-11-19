@@ -36,6 +36,7 @@ import {
   pluginToolAccessId,
   readToolRoleAccess,
   readToolRoleAccessMap,
+  setRoleToolAccess,
   setToolRoleAccess,
 } from '../tool-role-access.js'
 import { TOOLS } from './tools.js'
@@ -821,6 +822,64 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
     })
     await invalidatePluginToolSpecsEverywhere()
     return ok({ toolId: accessId, name: toolName, mode: access.mode, roleCodes: access.roles })
+  })
+
+  /**
+   * 角色页的「可用工具」保存入口。
+   *
+   * 与 `/api/console/tools/:id/roles` 写同一份工具角色配置，只是方向相反：
+   * 角色页提交该角色应保留的工具集合，服务端换算成每个工具的 all / roles 白名单。
+   * 内置工具和公司插件工具都参与；个人插件工具不进入这个集合。
+   */
+  app.put<{
+    Params: { code: string }
+    Body: { tools?: string[] }
+  }>('/api/console/roles/:code/tools', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const actor = resolveActor(deps.db, deps.config, req, deps.companyId)
+    const roleCode = String(req.params.code ?? '')
+    if (!Array.isArray(req.body?.tools)) {
+      throw new EabError(EC.VALIDATION, 'tools 必须是数组')
+    }
+
+    const seenPluginAccess = new Set<string>()
+    const pluginTools = pluginToolCatalogFor(deps.db, actor, { allCompanyInstances: true, scope: 'company' }).filter(
+      (tool) => {
+        if (tool.personal) return false
+        const accessId = pluginToolAccessId(tool.pluginId, tool.name)
+        if (seenPluginAccess.has(accessId)) return false
+        seenPluginAccess.add(accessId)
+        return true
+      },
+    )
+    const catalog = [
+      ...TOOLS.map((tool) => ({ accessId: tool.id, name: tool.name })),
+      ...pluginTools.map((tool) => ({ accessId: pluginToolAccessId(tool.pluginId, tool.name), name: tool.name })),
+    ]
+    const nameById = new Map(catalog.map((tool) => [tool.accessId, tool.name]))
+    const allToolIds = [...new Set(catalog.map((tool) => tool.accessId))]
+    const allowedToolIds = [...new Set(req.body.tools.map((id) => String(id).trim()).filter(Boolean))]
+
+    const result = setRoleToolAccess(deps.db, companyId, roleCode, allToolIds, allowedToolIds)
+    appendAudit(deps.db, {
+      companyId,
+      actorUserId: actor.subject.userId,
+      action: 'tool.access.role.sync',
+      resourceType: 'role',
+      resourceId: roleCode,
+      result: 'success',
+      detail: {
+        role: roleCode,
+        tools: allowedToolIds.length,
+        changed: result.changed.length,
+        changedTools: result.changed.map((id) => nameById.get(id) ?? id),
+      },
+      ip: req.ip ?? null,
+      channel: 'console',
+    })
+    await invalidatePluginToolSpecsEverywhere()
+    return ok({ roleCode, tools: allowedToolIds, changed: result.changed.length })
   })
 
   app.put<{

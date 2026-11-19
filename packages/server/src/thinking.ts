@@ -17,7 +17,24 @@ export interface ThinkingOption {
   readonly id: string
   readonly label: string
   readonly hint: string
+  /** 原生 reasoning_effort 的线值；留空时按内置 ID 映射。 */
+  readonly wire?: string
+  /** budget 策略下该档位的输出上限；null 表示不限制。 */
+  readonly budget?: number | null
 }
+
+/** OpenAI 兼容网关可接受的 reasoning_effort 线值。 */
+const WIRE_EFFORT_VALUES = new Set([
+  'none',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+])
+
+const MAX_THINKING_OPTIONS = 8
 
 export interface ThinkingConfig {
   readonly enabled: boolean
@@ -79,7 +96,7 @@ export function thinkingHint(id: string): string {
 }
 
 export function thinkingOption(id: string): ThinkingOption {
-  return LEVEL_MAP.get(id) ?? { id, label: id, hint: '上游模型声明的思考档位。' }
+  return builtInOption(id)
 }
 
 /**
@@ -105,22 +122,74 @@ function rawOptionId(value: unknown): string {
   return String(record.id ?? '').trim()
 }
 
-function normalizeOptionList(value: unknown): string[] {
-  if (!Array.isArray(value)) return []
-  return [...new Set(value.map(rawOptionId).filter((id) => id.length > 0 && id.length <= 40))].slice(0, 8)
+function normalizeWireEffort(value: unknown): string | undefined {
+  const wire = String(value ?? '').trim().toLowerCase()
+  return WIRE_EFFORT_VALUES.has(wire) ? wire : undefined
+}
+
+function normalizeBudget(value: unknown): number | null | undefined {
+  if (value === undefined) return undefined
+  if (value === null) return null
+  const text = String(value).trim()
+  if (!text) return null
+  const number = Number(text)
+  if (!Number.isFinite(number) || number <= 0) return undefined
+  return Math.trunc(number)
+}
+
+function builtInOption(id: string): ThinkingOption {
+  const known = LEVEL_MAP.get(id)
+  const wire = normalizeWireEffort(providerReasoningEffort(id))
+  const budget = thinkingBudgetCeiling(id)
+  return {
+    id,
+    label: known?.label ?? id,
+    hint: known?.hint ?? '上游模型声明的思考档位。',
+    ...(wire ? { wire } : {}),
+    ...(budget !== undefined ? { budget } : {}),
+  }
+}
+
+/**
+ * 单个档位既支持旧版字符串（`"light"`），也支持 DSH 风格的完整对象：
+ * `{ id, label/name, hint/description, wire, budget }`。
+ * 自定义 ID 必须显式给 wire（effort 策略）或 budget（budget 策略），否则不会下发。
+ */
+function optionFromRaw(raw: unknown): ThinkingOption | null {
+  if (typeof raw === 'string' || typeof raw === 'number') {
+    const id = rawOptionId(raw)
+    return id ? builtInOption(id) : null
+  }
+  const record = asRecord(raw)
+  const id = rawOptionId(raw)
+  if (!id || id.length > 40) return null
+  const known = LEVEL_MAP.get(id)
+  const label = declaredText(id, record.label ?? record.name, known?.label ?? id).slice(0, 40)
+  const hint = declaredText(id, record.hint ?? record.description, known?.hint ?? '上游模型声明的思考档位。').slice(0, 120)
+  const wire = normalizeWireEffort(record.wire ?? record.reasoningEffort ?? record.reasoning_effort)
+  const budget = normalizeBudget(record.budget ?? record.maxTokens ?? record.max_tokens)
+  const fallbackWire = wire ?? (known ? normalizeWireEffort(providerReasoningEffort(id)) : undefined)
+  const fallbackBudget = budget !== undefined ? budget : known ? thinkingBudgetCeiling(id) : undefined
+  return {
+    id,
+    label: label || id,
+    hint: hint || '上游模型声明的思考档位。',
+    ...(fallbackWire ? { wire: fallbackWire } : {}),
+    ...(fallbackBudget !== undefined ? { budget: fallbackBudget } : {}),
+  }
 }
 
 /**
  * 读取并规范化管理员保存的思考配置。
  *
  * 允许 `true` 作为「开启三档」的简写；其它非法形状一律当作未开启，
- * 避免把半截配置下发给上游。
+ * 避免把半截配置下发给上游。选项保持用户自定义的顺序，最多 8 个。
  */
 export function readThinkingConfig(raw: unknown, source: 'model' | 'plugin' = 'model'): ThinkingConfig | null {
   if (raw === true) {
     return {
       enabled: true,
-      options: THINKING_LEVELS.map(({ id, label, hint }) => ({ id, label, hint })),
+      options: THINKING_LEVELS.map(({ id, label, hint }) => builtInOption(id) ?? { id, label, hint }),
       defaultEffort: 'balanced',
       strategy: 'effort',
       source,
@@ -130,12 +199,23 @@ export function readThinkingConfig(raw: unknown, source: 'model' | 'plugin' = 'm
   if (record.enabled === false) return null
   if (Object.keys(record).length === 0) return null
 
-  const optionIds = normalizeOptionList(record.options ?? record.efforts)
-  if (optionIds.length === 0) return null
-  const options = optionIds.map(thinkingOption)
-  const requestedDefault = String(record.defaultEffort ?? record.default ?? '').trim()
-  const defaultEffort = optionIds.includes(requestedDefault) ? requestedDefault : optionIds[0]
   const strategy: ThinkingStrategy = record.strategy === 'budget' ? 'budget' : 'effort'
+  const rawOptions = record.options ?? record.efforts
+  if (!Array.isArray(rawOptions)) return null
+  const seen = new Set<string>()
+  const options: ThinkingOption[] = []
+  for (const rawOption of rawOptions) {
+    const option = optionFromRaw(rawOption)
+    if (!option || seen.has(option.id)) continue
+    options.push(option)
+    seen.add(option.id)
+    if (options.length >= MAX_THINKING_OPTIONS) break
+  }
+  if (options.length === 0) return null
+
+  const ids = options.map((option) => option.id)
+  const requestedDefault = String(record.defaultEffort ?? record.default ?? '').trim()
+  const defaultEffort = ids.includes(requestedDefault) ? requestedDefault : ids[0]
 
   return {
     enabled: true,
@@ -151,12 +231,18 @@ export function thinkingConfigOf(config: Record<string, unknown> | null | undefi
   return readThinkingConfig(config?.thinking)
 }
 
-/** 输出给控制台保存的紧凑结构。 */
+/** 输出给控制台保存的结构；保留自定义文案、线值和预算，刷新后可直接再编辑。 */
 export function storedThinkingConfig(config: ThinkingConfig | null): Record<string, unknown> | null {
   if (!config?.enabled || config.options.length === 0) return null
   return {
     enabled: true,
-    options: config.options.map((option) => option.id),
+    options: config.options.map((option) => ({
+      id: option.id,
+      label: option.label,
+      hint: option.hint,
+      ...(option.wire ? { wire: option.wire } : {}),
+      ...(option.budget !== undefined ? { budget: option.budget } : {}),
+    })),
     defaultEffort: config.defaultEffort,
     strategy: config.strategy,
   }
@@ -180,15 +266,17 @@ export function thinkingBudgetCeiling(effort: string): number | null {
   return null
 }
 
-/** OpenAI 兼容协议的实际字段值。未知档位不猜，直接不下发。 */
-export function providerReasoningEffort(effort: string): string | undefined {
+/** OpenAI 兼容协议的实际字段值；显式线值优先，未知档位不猜，直接不下发。 */
+export function providerReasoningEffort(effort: string, wire?: string): string | undefined {
+  const explicit = normalizeWireEffort(wire)
+  if (explicit) return explicit
   const mapped: Record<string, string> = {
     light: 'low',
     balanced: 'medium',
     deep: 'high',
   }
-  const wire = mapped[effort] ?? effort
-  return ['low', 'medium', 'high', 'xhigh', 'max', 'none', 'minimal'].includes(wire) ? wire : undefined
+  const mappedWire = mapped[effort] ?? effort
+  return WIRE_EFFORT_VALUES.has(mappedWire) ? mappedWire : undefined
 }
 
 /** Anthropic extended-thinking 预算；必须小于 max_tokens。 */
