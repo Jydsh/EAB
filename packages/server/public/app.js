@@ -21,7 +21,7 @@ const CHANNEL_SOURCE_LABEL = {
 
 /** 与后端 thinking.ts 对齐的内置档位；控制台只把它当作新增行时的默认文案。 */
 const THINKING_LEVELS = [
-  { id: 'light', label: '精简', hint: '更少思考，更快回答。', wire: 'low', budget: 2048 },
+  { id: 'light', label: '精简', hint: '更少思考、更快回答；Qwen/vLLM 下会关闭模板思考。', wire: 'low', budget: 2048 },
   { id: 'balanced', label: '均衡', hint: '默认档位，兼顾速度与质量。', wire: 'medium', budget: 8192 },
   { id: 'deep', label: '深思', hint: '更充分的推理，输出上限跟随模型。', wire: 'high', budget: null },
 ]
@@ -32,7 +32,7 @@ const THINKING_PRESETS = [
     id: 'qwen38',
     label: 'Qwen3.8（low / medium / xhigh）',
     options: [
-      { id: 'light', label: '精简', hint: '更少思考，更快回答。', wire: 'low', budget: null },
+      { id: 'light', label: '精简', hint: '更少思考、更快回答；Qwen/vLLM 下会关闭模板思考。', wire: 'low', budget: null },
       { id: 'balanced', label: '均衡', hint: '平衡速度与推理深度。', wire: 'medium', budget: null },
       { id: 'deep', label: '深思', hint: '模型最高推理档，默认档位。', wire: 'xhigh', budget: null },
     ],

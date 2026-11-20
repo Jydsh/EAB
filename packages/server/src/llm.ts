@@ -543,6 +543,14 @@ interface ToolCallAccumulator {
   arguments: string
 }
 
+/**
+ * vLLM 上的 Qwen 模板支持用 `chat_template_kwargs.enable_thinking=false`
+ * 真正关闭思考；`reasoning_effort` 这类参数会被它忽略。
+ */
+function canToggleThinking(provider: ProviderRow & { modelKey: string }): boolean {
+  return /vllm/i.test(provider.name) || /qwen/i.test(provider.modelKey)
+}
+
 async function callOpenAiStream(
   base: string,
   key: string,
@@ -573,6 +581,8 @@ async function callOpenAiStream(
       temperature: 0.4,
       stream: true,
       ...(wireEffort ? { reasoning_effort: wireEffort } : {}),
+      // vLLM 的 Qwen 模板参数：关闭思考，避免推理 token 把正文预算吃光。
+      ...(options.disableThinking ? { chat_template_kwargs: { enable_thinking: false } } : {}),
       ...(options.tools && options.tools.length > 0
         ? { tools: options.tools, tool_choice: options.toolChoice ?? 'auto' }
         : {}),
@@ -720,34 +730,66 @@ export async function callModelStream(
     if (result?.text) options.onEvent?.({ type: 'content', text: result.text })
     return result
   }
+  const canDisableThinking = canToggleThinking(provider)
+  // Qwen + vLLM 不认 reasoning_effort；选择「精简/关闭」时直接关模板思考，
+  // 否则模型会先长时间 reasoning，正文预算被吃光后只剩一个空答复。
+  const initialOptions: ModelStreamOptions = canDisableThinking
+    && (options.disableThinking || options.reasoningEffort === 'light' || options.reasoningEffort === 'disabled')
+    ? { ...options, disableThinking: true }
+    : options
   try {
     const timeoutMs = streamTimeoutFor(base, options.timeoutMs)
     return await callOpenAiStream(base, key, provider.modelKey, messages, maxTokens, {
-      ...options,
+      ...initialOptions,
       timeoutMs,
     })
   } catch (error) {
     // 推理模型在长任务上可能把预算全用在 thinking 上；本地上游也可能偶发返回
     // 200 但正文为空。这两种结果都不代表模型不可用，先用更大预算重试一次，
-    // 再决定是否故障转移。第二次的 reasoning 事件丢弃，避免前端看到重复思考。
+    // 再决定是否关闭思考或故障转移。重试的 reasoning 事件丢弃，避免前端看到重复思考。
     // budget 策略下不得超过档位上限，否则「精简」会被悄悄放大。
     const reasoningOnly = error instanceof EabError && error.message === '模型只输出了推理内容，没有生成最终答复'
     const emptyContent = error instanceof EabError && error.message === '模型返回了空内容'
-    if (reasoningOnly || emptyContent) {
-      const cap = options.maxTokensCap ?? 16_384
-      const retryTokens = reasoningOnly
-        ? Math.min(maxTokens * 2, 16_384, cap)
-        : maxTokens
-      if (!reasoningOnly || retryTokens > maxTokens) {
-        const timeoutMs = streamTimeoutFor(base, options.timeoutMs)
+    if (!reasoningOnly && !emptyContent) throw error
+    const timeoutMs = streamTimeoutFor(base, options.timeoutMs)
+    const cap = options.maxTokensCap ?? 16_384
+    // 已到上限时不能把预算改小；否则 32768 会被压成 16384，重试只会再次失败。
+    const doubled = Math.min(maxTokens * 2, cap)
+    const retryTokens = reasoningOnly && doubled > maxTokens ? doubled : maxTokens
+    if (reasoningOnly && retryTokens > maxTokens) {
+      try {
         return await callOpenAiStream(base, key, provider.modelKey, messages, retryTokens, {
-          ...options,
+          ...initialOptions,
           timeoutMs,
           onEvent: (event) => {
             if (event.type === 'content') options.onEvent?.(event)
           },
         })
+      } catch (retryError) {
+        // 更大预算仍然只出思考时，继续走关闭思考兜底；其它错误直接交给上层。
+        if (!(retryError instanceof EabError) || retryError.message !== '模型只输出了推理内容，没有生成最终答复') {
+          throw retryError
+        }
       }
+    }
+    if (reasoningOnly && canDisableThinking && !initialOptions.disableThinking) {
+      return await callOpenAiStream(base, key, provider.modelKey, messages, maxTokens, {
+        ...initialOptions,
+        disableThinking: true,
+        timeoutMs,
+        onEvent: (event) => {
+          if (event.type === 'content') options.onEvent?.(event)
+        },
+      })
+    }
+    if (emptyContent) {
+      return await callOpenAiStream(base, key, provider.modelKey, messages, maxTokens, {
+        ...initialOptions,
+        timeoutMs,
+        onEvent: (event) => {
+          if (event.type === 'content') options.onEvent?.(event)
+        },
+      })
     }
     throw error
   }
@@ -779,11 +821,8 @@ export async function callModel(
   if (provider.kind === 'azure_openai') {
     return callAzure(base, key, provider.modelKey, messages, maxTokens, options.reasoningEffort)
   }
-  const disableThinking =
-    Boolean(options.disableThinking) &&
-    provider.kind === 'openai' &&
-    (/vllm/i.test(provider.name) || /qwen/i.test(provider.modelKey))
-  const callOpenAiWithBudget = (tokens: number) =>
+  const disableThinking = Boolean(options.disableThinking) && canToggleThinking(provider)
+  const callOpenAiWithBudget = (tokens: number, withoutThinking = disableThinking) =>
     callOpenAi(
       base,
       key,
@@ -794,7 +833,7 @@ export async function callModel(
       options.reasoningEffort,
       options.reasoningWireEffort,
       options.timeoutMs,
-      disableThinking,
+      withoutThinking,
       options.signal,
     )
   try {
@@ -802,12 +841,12 @@ export async function callModel(
   } catch (error) {
     // 推理模型把输出预算全花在 thinking 上时，content 为空但 reasoning 有内容。
     // 对这类结果用更大预算重试一次，避免小批次清洗被误判成“模型没有返回”。
-    if (
-      error instanceof EabError &&
-      error.message === '模型只输出了推理内容，没有生成最终答复' &&
-      maxTokens < 8192
-    ) {
-      return callOpenAiWithBudget(8192)
+    if (error instanceof EabError && error.message === '模型只输出了推理内容，没有生成最终答复') {
+      if (maxTokens < 8192) return callOpenAiWithBudget(8192)
+      // 预算已经很大仍然只出思考时，加大预算通常无效，直接关模板思考兜底。
+      if (canToggleThinking(provider) && !disableThinking) {
+        return callOpenAiWithBudget(maxTokens, true)
+      }
     }
     throw error
   }

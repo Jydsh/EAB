@@ -31,7 +31,7 @@ import {
 } from '../tool-idempotency.js'
 import { retrieveExternalKb } from '../kb-external.js'
 import { getDocAsset } from '../kb-assets.js'
-import { executePluginTool, pluginToolCatalogFor, pluginToolSpecsFor, prefersPersonalPluginTools, resolvePluginToolByCatalogId, invalidatePluginToolSpecsEverywhere } from '../plugin-tools.js'
+import { executePluginTool, pluginToolCatalogFor, pluginToolSpecsFor, pluginToolSpecsForQuery, prefersPersonalPluginTools, resolvePluginToolByCatalogId, invalidatePluginToolSpecsEverywhere } from '../plugin-tools.js'
 import { refreshPluginHosts } from '../plugin-host.js'
 import { createPluginDevScaffold, installPluginDevBundle, normalizePluginDevId, pluginDevIdFromDir, pluginPreviewLink, PLUGIN_DEV_DIR } from '../plugin-dev.js'
 import { createSkillDevScaffold, installSkillDevBundle, normalizeSkillDevId, skillDevIdFromDir, skillPreviewLink, SKILL_DEV_DIR } from '../skill-dev.js'
@@ -53,6 +53,7 @@ import {
   workspaceCapacity,
   workspaceUsedBytes,
 } from '../workspace-quota.js'
+import { CAPABILITY_TOOL_GROUPS, isSingleFileOfficeEdit, officeToolIdsForQuery, routeCapabilities } from '../capability-route.js'
 import { DINGTALK_OUTBOUND_FILE_LIMIT_BYTES, sendDingTalkFileToUser } from '../dingtalk-outbound.js'
 import { sendDingTalkFileToConversation, uploadFileToUserDrive } from '../dingtalk-drive.js'
 import {
@@ -127,6 +128,7 @@ import {
   readXlsxOutline,
   replyDocxComment,
   replaceDocxText,
+  rewriteDocxElementText,
   replacePptxText,
   replaceXlsxCellText,
   resolveDocxComment,
@@ -491,19 +493,19 @@ export const TOOLS: readonly ToolDef[] = [
     id: 'agent.spawn',
     name: '并行子 Agent',
     description:
-      '把一个复杂任务拆成多个互不依赖的子任务，并行交给多个子 Agent 执行。适合“同时查三份资料”“分别分析几个文件”“多模型各给一版方案”这类可以并行的任务。每个子 Agent 有独立运行记录和会话锁；一个子任务失败不会取消其他子任务。用户不需要说明“用团队模式”，也不需要点名人数或名字：父 Agent 必须自己分析任务、决定编队并直接派发，禁止反问用户“派几个/叫什么/谁负责什么”。能拆分就派 2–4 个独立切片；确实只有一个不可拆主线时派 1 个。复杂工程任务要按互不冲突的文件/模块所有权切片，多个 builder 不能同时改同一文件；拆不出互不冲突的切片时，派 1 个 builder 做完整实现和自测，再派 1 个 critic 独立复跑测试，不要为了凑人数把同一模块拆碎。同一个工程闭环（先创建/实现，再测试/修复）禁止拆成“创建岗 + 测试岗”，否则测试岗会在文件还没创建时先跑。每个 task 的 title 用「名字（职责）」格式，例如“子鼠（资料检索）”“丑牛（接口实现）”“寅虎（回归验收）”，title 是团队面板显示的名字，不要只写“子任务 1”；服务端会按岗位序号统一分配不重名短名（前 12 个用十二生肖，第 13–22 个用十天干，之后自动组合），模型给的名字只用于提取职责。tasks 可以是 JSON 数组，也可以是被 stringify 的 JSON 数组字符串；每项形如 {"key":"research-1","role":"researcher","title":"子鼠（资料检索）","acceptance":"必须给出 3 条可核对结论","prompt":"子任务指令（150 字以内）","modelId":"可选模型 id","retries":1}。key 是团队内的稳定标识（建议英文短名），后续可用 agent_task 凭 key 继续给它派活，复用同一个子 Agent 窗口与会话；固定职责可复用 producer / critic / researcher / builder，同一职责多人并行时用 build-1 / build-2 这类后缀区分。团队每个会话默认最多 8 个活跃岗位；满了会先软注销最老的空闲非固定岗位，仍满会明确报错，不会静默丢任务。超过 agentMaxParallel 的并行任务会直接报错，请拆成多轮。用户明确点名人数时，必须按用户点名的人数拆成对应数量的 task，每人一个独立 key，禁止把所有角色合并成一个 task。不要把整个任务压成一个“总包”子任务来逃避拆分。prompt 控制在 150 字以内，只写目标、输入范围、关键约束和验收标准，具体步骤由子 Agent 自己规划，不要写长篇执行清单。工程类 task 的 acceptance 必须写具体测试/构建命令或可观察结果；子 Agent 需要自己实现、运行测试、失败后修复并复测，系统会校验测试/构建通过证据，没有证据的工程交付会被标为 failed。不要让子任务互相依赖，不要派“等别的子任务产出后再整理 / 汇总 / 写报告”的依赖任务，最终汇总由父 Agent 完成；不要用子 Agent 代替普通的一次工具调用。除非任务明确需要视觉/多模态等专用模型，否则不要给多个子任务填同一个 modelId，留空由系统按能力和并发负载分散分配。前台对话里的实质任务应优先使用 background:true，避免阻塞用户继续提问。派完用一句话写清编队结果，例如“我拆成 3 个角色：子鼠查资料、丑牛做实现、寅虎跑验收；完成后统一汇总”。',
+      '把复杂任务拆成 1–4 个互不依赖的子任务并行执行；能并行的检索、分析、实现/验收优先多派，单主线才派 1 个，不要反问用户派几个。单个文件的小范围读写不要派；文件修改子任务必须包含定位、写入和复读验收，不能只派只读定位。子任务不得互相依赖，父 Agent 统一汇总；工程任务要写具体测试/构建命令并自测。每会话最多 8 个活跃岗位。前台实质任务优先 background:true，派完一句话说明编队。',
     scope: SC.AGENT_TOOL_INVOKE,
     dangerous: false,
     concurrency: 'read',
     input: {
       tasks: {
         type: 'string',
-        description: 'JSON 数组字符串；每项必须包含 prompt，可选 key、role（producer/critic/researcher/builder/worker）、title（团队面板显示的名字，用「名字（职责）」；服务端会按岗位序号统一分配不重名短名）、parentKey、acceptance、pinned、modelId、retries',
+        description: 'JSON 数组字符串；每项必填 prompt（目标/输入/约束/验收，≤150 字），可选 key、role（producer/critic/researcher/builder/worker）、title、parentKey、acceptance、pinned、modelId、retries',
         required: true,
       },
       background: {
         type: 'boolean',
-        description: '可选：true 表示后台执行，立即返回 taskId，父 Agent 可以结束本回合、让用户继续提问；默认 false 同步等待。前台对话中的实质任务应传 true',
+        description: 'true=后台执行并立即返回 taskId，父 Agent 可结束本回合；默认 false 同步等待。前台实质任务传 true',
       },
     },
   },
@@ -761,16 +763,16 @@ export const TOOLS: readonly ToolDef[] = [
     id: 'workspace.edit',
     name: '局部修改工作区文件',
     description:
-      '只修改文件中指定的片段，不整篇覆盖。适用场景：方案只需更新其中一段、表格只需改几个字段、说明文档只替换某一节。先用 workspace.read 读取原文，把要改的原文精确复制到 find，把新内容放到 replace；一次可传多个 edits，按顺序执行，任何一条找不到原文都会整体失败且不写盘。支持 txt/md/csv/json/代码等文本文件。Word .docx、Excel .xlsx/.xlsm、PowerPoint .pptx 请改用 office.find 定位、office.replace 局部替换；不要用 workspace.edit 改 Office 文件。成功后只说明文件名和改动条数，不要重复粘贴文件正文。',
+      '只改文本文件中的指定片段，不整篇覆盖。先 workspace.read 取原文；把原文精确复制到 find，新内容放 replace；多个 edits 顺序执行，任一未命中则整体失败、不写盘。支持 txt/md/csv/json/代码。Office 文件改用 office.find + office.replace。成功后只说文件名和改动条数。',
     scope: SC.WORKSPACE_WRITE,
     dangerous: false,
     concurrency: 'write',
     lockKey: (deps, actor, args) => workspaceFileLockKey(deps, actor, args),
     input: {
-      path: { type: 'string', description: '相对路径，例如 docs/方案.md', required: true },
+      path: { type: 'string', description: '相对路径，如 docs/方案.md', required: true },
       edits: {
         type: 'array',
-        description: '局部替换列表；每项 find 必须与原文完全一致，replace 为新内容',
+        description: '替换列表；每项 find 必须与原文完全一致，replace 为新内容',
         required: true,
         minItems: 1,
         maxItems: 50,
@@ -778,11 +780,11 @@ export const TOOLS: readonly ToolDef[] = [
           type: 'object',
           additionalProperties: false,
           properties: {
-            find: { type: 'string', description: '要替换的原文片段（区分大小写和空白）' },
-            replace: { type: 'string', description: '替换后的新内容，可为空字符串表示删除' },
+            find: { type: 'string', description: '要替换的原文（区分大小写/空白）' },
+            replace: { type: 'string', description: '新内容；空字符串=删除' },
             occurrence: {
               type: 'integer',
-              description: '可选：只替换第几个匹配（从 1 开始）；不传则替换全部匹配',
+              description: '只替换第几个匹配（1 起）；不传=全部',
             },
           },
           required: ['find', 'replace'],
@@ -794,21 +796,21 @@ export const TOOLS: readonly ToolDef[] = [
     id: 'workspace.read',
     name: '读取工作区文件',
     description:
-      '读取云空间里的文本文件。mode=lines（默认）按行读取，和 DSH 的 read 一样单次最多 2000 行、50 KB、单行 2000 字符，超过时返回 nextOffset，用 offset 继续读。mode=analyze 用于“内容太多、需要基于全文统计或总结”：服务端会完整读取整份文件（小文件直接全文返回；大文件由服务端解析全部记录或统计全部行后给出全量概览），不受 2000 行/50 KB 限制，建议传 question 说明关注点；单文件上限 2,000,000 字符。代码或长日志先 workspace.search 定位 path:line，再读取命中行附近。',
+      '读取云空间文本文件。mode=lines（默认）按行读，单次最多 2000 行/50 KB、单行 2000 字符，超出返回 nextOffset，用 offset 续读。mode=analyze 完整读取并统计/总结整份文件，不受行数/字节限制，单文件上限 200 万字符；建议传 question。代码/长日志先 workspace.search 定位 path:line 再读附近。',
     scope: SC.WORKSPACE_READ,
     dangerous: false,
     input: {
-      path: { type: 'string', description: '相对路径，例如 notes/todo.md', required: true },
+      path: { type: 'string', description: '相对路径，如 notes/todo.md', required: true },
       mode: {
         type: 'string',
-        description: 'lines=按行分页读取（默认）；analyze=完整读取并分析整份文件，适用于内容超过 2000 行/50 KB 或需要全文统计的文件',
+        description: 'lines=按行分页（默认）；analyze=完整读取并统计/总结整份文件',
         enum: ['lines', 'analyze'],
       },
-      offset: { type: 'number', description: 'mode=lines 时可选：从第几行开始读取，1 表示第一行；默认 1' },
-      limit: { type: 'number', description: 'mode=lines 时可选：读取多少行，默认 2000，最大 2000；输出超过 50 KB 会在字节上限处提前结束' },
+      offset: { type: 'number', description: 'mode=lines：起始行，默认 1' },
+      limit: { type: 'number', description: 'mode=lines：读取行数，默认/最大 2000' },
       question: {
         type: 'string',
-        description: 'mode=analyze 时建议填写：要基于全文回答的问题，例如“按站点和问题类别统计全部记录并指出异常”；不填则总结整体内容、结构和关键数据',
+        description: 'mode=analyze：要基于全文回答的问题；不填则总结结构和关键数据',
       },
     },
   },
@@ -816,14 +818,14 @@ export const TOOLS: readonly ToolDef[] = [
     id: 'workspace.search',
     name: '搜索工作区文件',
     description:
-      '在云空间文本文件里按关键词或正则搜索，像 DSH 的 grep 一样返回 path、line、column、命中行片段，并给出总命中数 total。query 也可以是文件名：会额外返回 nameMatches，文件名命中时直接用其中的 path。默认最多返回 30 条，单次最多 100 条；命中更多时 truncated=true，可用更精确的 query 或 path 缩小范围。默认递归搜索，30 秒搜索预算，最多扫描 2000 个文件、单文件 2 MB，跳过 node_modules、.git、dist 等目录。先定位 path:line，再用 workspace.read 的 offset/limit 读取上下文。',
+      '在云空间文本文件里按关键词/正则搜索，返回 path、line、column、命中行和 total；query 也是文件名时返回 nameMatches。默认 30 条、最多 100，truncated=true 表示还有更多。默认递归，30 秒/2000 文件/单文件 2 MB，跳过 node_modules、.git、dist；先定位 path:line，再用 workspace.read 读上下文。',
     scope: SC.WORKSPACE_READ,
     dangerous: false,
     input: {
-      query: { type: 'string', description: '要搜索的文本或正则表达式', required: true },
-      path: { type: 'string', description: '可选：相对路径的文件或目录，默认搜索整个工作区' },
-      maxResults: { type: 'number', description: '最多返回多少条命中，默认 30，最大 100' },
-      regex: { type: 'boolean', description: '是否把 query 当正则表达式，默认 false' },
+      query: { type: 'string', description: '要搜索的文本或正则', required: true },
+      path: { type: 'string', description: '可选：相对路径的文件或目录，默认整个工作区' },
+      maxResults: { type: 'number', description: '最多返回几条，默认 30，最大 100' },
+      regex: { type: 'boolean', description: '是否当正则，默认 false' },
       caseSensitive: { type: 'boolean', description: '是否区分大小写，默认 false' },
     },
   },
@@ -945,15 +947,15 @@ export const TOOLS: readonly ToolDef[] = [
     id: 'office.read_range',
     name: '读取 Office 文档范围',
     description:
-      '读取 docx 指定范围的完整文本、run 级格式摘要和表格结构，不截断、不改文件。elementId 支持 pN 段落、tN 整张表、tN-rN 表格行、tN-cN 表格列、tN-rN-cN 表格单元格；start/end 是目标段落或单元格完整文本内的字符偏移，只对 pN 和 tN-rN-cN 有效。返回 text、start/end、totalLength、runs（每段文本的 bold/italic/underline/color/fontSize/fontFamily/style）和表格行列数据。xlsx/pptx 暂未覆盖，会明确报错。只读，不打开 OnlyOffice。',
+      '读取 docx 指定范围完整文本、run 格式和表格结构，不截断/不改文件。elementId 支持 pN、tN、tN-rN、tN-cN、tN-rN-cN；start/end 是 pN 或 tN-rN-cN 的字符偏移。返回 text、runs（bold/italic/underline/color/fontSize/fontFamily/style）和表格数据。xlsx/pptx 暂不支持。',
     scope: SC.AGENT_TOOL_INVOKE,
     dangerous: false,
     input: {
-      fileId: { type: 'string', description: '云空间文件 id；和 path 二选一' },
-      path: { type: 'string', description: '云空间相对路径；和 fileId 二选一' },
+      fileId: { type: 'string', description: '文件 id（与 path 二选一）' },
+      path: { type: 'string', description: '相对路径（与 fileId 二选一）' },
       elementId: { type: 'string', description: 'docx 的 pN、tN、tN-rN、tN-cN 或 tN-rN-cN', required: true },
-      start: { type: 'number', description: '目标段落/单元格完整文本内的起始字符偏移，默认 0' },
-      end: { type: 'number', description: '目标段落/单元格完整文本内的结束字符偏移，默认文本长度' },
+      start: { type: 'number', description: '起始字符偏移，默认 0' },
+      end: { type: 'number', description: '结束字符偏移，默认文本末尾' },
     },
   },
   {
@@ -994,20 +996,43 @@ export const TOOLS: readonly ToolDef[] = [
     id: 'office.replace',
     name: '局部替换 Office 文档文本',
     description:
-      '只替换 docx 指定段落/表格单元格、xlsx/xlsm 指定单元格中的文本，或 pptx 指定幻灯片段落中的文本，不整篇/整表重写，其他内容、样式和结构保持不变。先用 office.find 拿到 docx 的 pN / tN-rN-cN、xlsx 的 sN-rN-cN 或 pptx 的 sN-pM，再把原文精确放到 oldText；省略 oldText 表示替换该元素可见文本。xlsx 空单元格可直接用 sN-rN-cN 写入整格；数字单元格可改成数字或文本；公式单元格只能改成以 = 开头的新公式，不能静默改成静态值。已有缺失行会按行号插入，保持工作表行顺序。pptx 段落跨多个文本 run 时，新文本沿用第一个 run 的格式，其余 run 清空；不支持段落内换行。命中多处时必须指定 occurrence（1 起，0 仅 xlsx 支持）。写入后会自动保存并记录 workspace.file.agent_edit 审计。支持 docx、xlsx、xlsm、pptx。',
+      '只替换指定元素文本，不整篇/整表重写。docx 用 pN/tN-rN-cN，xlsx/xlsm 用 sN-rN-cN，pptx 用 sN-pM；先 office.find 定位。oldText 精确匹配；docx/xlsx 非空目标必须提供命中原文，仅空段落/空单元格可省略。docx 替换范围跨多种 run 格式时拒绝，请把 oldText 收窄到单个 run 内。xlsx 空单元格可直接写入；公式单元格只能改成 = 开头的新公式。多处命中必须指定 occurrence（1 起；0 仅 xlsx=全部）。自动保存并记审计。支持 docx/xlsx/xlsm/pptx；pptx 不支持段内换行。',
     scope: SC.AGENT_TOOL_INVOKE,
     dangerous: false,
     concurrency: 'write',
     lockKey: (deps, actor, args) => workspaceFileLockKey(deps, actor, args),
     input: {
-      elementId: { type: 'string', description: 'office.read_outline / office.find 返回的 pN、tN-rN-cN（docx）、sN-rN-cN（xlsx）或 sN-pM（pptx）；xlsx 空单元格也可直接按该格式指定', required: true },
-      fileId: { type: 'string', description: '云空间文件 id；和 path 二选一' },
-      path: { type: 'string', description: '云空间相对路径；和 fileId 二选一' },
-      oldText: { type: 'string', description: '要替换的原文；省略时替换该元素整段可见文本' },
-      newText: { type: 'string', description: '替换后的新文本；空字符串表示删除', required: true },
-      occurrence: { type: 'number', description: '第几次命中，1 起；0 表示全部（仅 xlsx）；默认 1' },
-      trackChanges: { type: 'boolean', description: 'docx 专用：true 时把旧文本写入 w:del、新文本写入 w:ins，保留修订标记；目标已有修订时先接受或拒绝' },
+      elementId: { type: 'string', description: 'docx pN/tN-rN-cN；xlsx sN-rN-cN；pptx sN-pM（office.find 获取）', required: true },
+      fileId: { type: 'string', description: '文件 id（与 path 二选一）' },
+      path: { type: 'string', description: '相对路径（与 fileId 二选一）' },
+      oldText: { type: 'string', description: '命中原文；docx/xlsx 非空目标必填，仅空段落/空单元格可省略' },
+      newText: { type: 'string', description: '新文本；空=删除', required: true },
+      occurrence: { type: 'number', description: '1 起；0=全部（仅 xlsx）；默认 1' },
+      trackChanges: { type: 'boolean', description: 'docx：true 保留 w:del/w:ins 修订；已有修订先接受/拒绝' },
       author: { type: 'string', description: 'docx 修订作者，默认 EAB Agent' },
+    },
+  },
+  {
+    id: 'office.rewrite',
+    name: '整段重写并统一 docx 格式',
+    description:
+      '仅在用户明确要求把整个 docx 段落/单元格重写成新文本，并同时指定统一格式时使用。不得用于“保留原有格式”的普通替换，也不得替代 office.replace 做局部修改。会一次覆盖目标元素全部可见文本，再把指定格式统一应用到所有 run；不支持 xlsx/pptx。先用 office.find 或 office.read_range 确认 elementId 和原文。至少给一个格式属性。写入后自动保存并记审计。',
+    scope: SC.AGENT_TOOL_INVOKE,
+    dangerous: false,
+    concurrency: 'write',
+    lockKey: (deps, actor, args) => workspaceFileLockKey(deps, actor, args),
+    input: {
+      elementId: { type: 'string', description: 'docx 段落 pN 或表格单元格 tN-rN-cN', required: true },
+      fileId: { type: 'string', description: '文件 id（与 path 二选一）' },
+      path: { type: 'string', description: '相对路径（与 fileId 二选一）' },
+      newText: { type: 'string', description: '整段新文本；空=清空该元素', required: true },
+      bold: { type: 'boolean', description: '统一加粗；false=统一不加粗' },
+      italic: { type: 'boolean', description: '统一斜体；false=统一不斜体' },
+      underline: { type: 'string', description: '统一下划线样式；false=清除' },
+      color: { type: 'string', description: '统一字体颜色，6 位十六进制，例如 FF0000' },
+      fontSize: { type: 'number', description: '统一字号（磅），例如 12' },
+      fontFamily: { type: 'string', description: '统一字体族，例如 宋体、Arial' },
+      align: { type: 'string', description: '段落对齐：left/center/right/justify' },
     },
   },
   {
@@ -1525,7 +1550,7 @@ export function resolveToolByFunctionName(name: string): ToolDef | undefined {
 
 /**
  * Agent 默认常驻的核心工具：高频、低参数、几乎每轮都可能用到。
- * 其余工具（文件发送/改名/删除、容量、定时任务列表、计算、插件等）通过 tool_search 按需加载。
+ * 文件读写/搜索/文件夹、定时任务、计算、插件等通过能力路由或 tool_search 按需加载。
  * 这样工具数量继续增长时，首轮请求不会线性膨胀。
  */
 export const AGENT_CORE_TOOL_IDS: readonly string[] = [
@@ -1537,31 +1562,7 @@ export const AGENT_CORE_TOOL_IDS: readonly string[] = [
   'agent.wait',
   'agent.message',
   'agent.resume',
-  'org.directory',
   'kb.search',
-  'schedule.create',
-  'workspace.list',
-  'workspace.read',
-  'workspace.search',
-  'workspace.write',
-  'workspace.edit',
-  'workspace.folder',
-  'project.exec',
-  'project.job',
-  'plugin.dev',
-  'skill.dev',
-  'office.read_outline',
-  'office.read_range',
-  'office.find',
-  'office.revisions',
-  'office.replace',
-  'office.insert',
-  'office.format',
-  'office.comment',
-  'office.versions',
-  'office.export',
-  'office.gui',
-  'memory.propose',
 ]
 
 export interface ToolSearchHit {
@@ -1621,6 +1622,7 @@ const TOOL_SEARCH_ALIASES: Record<string, string> = {
   'office.find': '文档查找 在文档中找 定位文本 查找段落 查找单元格 查找幻灯片 xlsx pptx Excel PowerPoint find document search cell slide',
   'office.revisions': '读取修订 查看修订 修订记录 插入删除 作者 接受修订 拒绝修订 开启修订 关闭修订 track changes revision accept reject w:ins w:del docx',
   'office.replace': '替换文档文本 改段落 改单元格 修改word 修改Excel 修改PPT xlsx xlsm pptx replace office text update cell formula slide paragraph',
+  'office.rewrite': '整段重写 整段改写 统一格式 统一加粗 统一字号 rewrite paragraph uniform format docx',
   'office.insert': '插入段落 新增段落 插入整行 插入整列 删除整行 删除整列 合并单元格 拆分单元格 删除表格行 删除表格列 xlsx Excel insert delete merge split paragraph row column office',
   'office.format': '设置格式 加粗 斜体 下划线 字体颜色 高亮 填充 数字格式 字号 format bold italic underline color highlight fill numberFormat number format font size xlsx',
   'office.comment': '加批注 批注 评论 单元格批注 工作表批注 Excel批注 回复批注 解决批注 删除批注 批注列表 短语批注 comment annotation note list reply resolve delete xlsx Excel cell comment',
@@ -1701,44 +1703,51 @@ export function searchToolCatalog(
   }
 }
 
-/** Agent 首轮只提交核心工具 + tool_search，其余按需加载。 */
+/** Agent 首轮只提交核心工具 + 当前能力路由命中的工具组；其余按需加载。 */
 export function toolSpecsForAgent(
   db: Db,
   actor: Actor,
   space: ActiveSpace = { kind: 'cloud' },
   query = '',
+  options: { activeFile?: { name?: string | null } } = {},
 ): ChatToolSpec[] {
   const coreNames = new Set(AGENT_CORE_TOOL_IDS.map(toolFunctionName))
-  const specs = toolSpecsForActor(db, actor, space, query)
   /**
-   * 通讯录是核心工具，但只在问题确实在问人/部门/上下级时下发。
-   * 业务数据问题（录入了几条检查整治、台账、统计）里常出现“东环线/工区/站点”
-   * 这类组织名称，模型容易把它当成通讯录查询；按完整问题判断意图后隐藏它，
-   * 能避免截图里“检查整治 → 组织通讯录”的误选。
+   * 能力路由只决定“直接下发哪些工具组”，不绕过角色/空间/权限过滤。
+   * 没命中的工具仍可通过 tool_search 加载，避免每轮把所有 Office/项目/开发工具都塞进上下文。
    */
-  const cleanQuery = String(query || '').trim()
-  const businessIntent =
-    /(检查|整治|台账|记录|录入|统计|数量|几条|多少条|明细|报表|工单|数据|接口|明细|汇总|填报)/.test(
-      cleanQuery,
-    )
-  const wantsOrg =
-    !cleanQuery ||
-    (!businessIntent &&
-      /(通讯录|组织架构|组织关系|部门|科室|班组|小组|组长|副组长|负责人|上级|下级|领导|同事|成员|人名|姓名|工号|岗位|职务|找谁|谁是|有谁|哪些人|人员名单|联系方式|人数|多少人|几个人|几人)/.test(
-        cleanQuery,
-      ))
-  const allowedCore = new Set([...coreNames].filter((name) => wantsOrg || name !== 'org_directory'))
+  const route = routeCapabilities(query, { activeFile: options.activeFile })
+  const routedIds: string[] = []
+  // 没有 query 的调用（定时任务旧入口、内部目录枚举）保持原有文件能力，避免未知上下文丢工具。
+  if (query.trim() === '' || route.workspace) routedIds.push(...CAPABILITY_TOOL_GROUPS.workspace)
+  if (route.office) routedIds.push(...officeToolIdsForQuery(query))
+  if (route.project) routedIds.push(...CAPABILITY_TOOL_GROUPS.project)
+  if (route.pluginDev) routedIds.push(...CAPABILITY_TOOL_GROUPS.pluginDev)
+  if (route.skillDev) routedIds.push(...CAPABILITY_TOOL_GROUPS.skillDev)
+  if (route.schedule) routedIds.push(...CAPABILITY_TOOL_GROUPS.schedule)
+  if (route.org) routedIds.push(...CAPABILITY_TOOL_GROUPS.org)
+  if (route.memoryRule) routedIds.push(...CAPABILITY_TOOL_GROUPS.memoryRule)
+  const allowedCore = new Set([...coreNames, ...routedIds.map(toolFunctionName)])
+  // 单文件局部编辑直接走 office.find → replace/format → read_range，
+  // 不下发团队工具，避免模型把“定位一段”拆成子任务后误以为已经写入。
+  if (isSingleFileOfficeEdit(query, { activeFile: options.activeFile })) {
+    for (const name of allowedCore) {
+      if (name.startsWith('agent_')) allowedCore.delete(name)
+    }
+  }
   /**
    * 插件工具不能只依赖 tool_search：插件通常是业务数据入口，模型按
    * “查工区/班次/某个组织的数据”搜索时，工具名和描述未必命中业务词。
-   * 因此把当前员工已启用插件的工具直接随首轮工具下发；内置工具仍按需加载。
+   * 因此业务意图命中时整包下发；普通闲聊只下发与问题词面相关的插件工具，
+   * 其余插件工具仍可由 tool_search 加载，不再每轮固定携带全部 schema。
    */
   const pluginNames = new Set(
-    pluginToolSpecsFor(db, actor, { preferPersonal: prefersPersonalPluginTools(query) }).map((spec) => {
+    pluginToolSpecsForQuery(db, actor, query, { preferPersonal: prefersPersonalPluginTools(query) }).map((spec) => {
       const fn = spec.function as { name?: unknown } | undefined
       return String(fn?.name ?? '')
     }),
   )
+  const specs = toolSpecsForActor(db, actor, space, query)
   return specs.filter((spec) => allowedCore.has(spec.function.name) || pluginNames.has(spec.function.name))
 }
 
@@ -2949,6 +2958,93 @@ export async function executeTool(
         revisionIds: edit.revisionIds,
         remaining: edit.remaining,
         trackChanges: edit.trackChanges,
+        wrote: true,
+        saved: true,
+        editorSync: false,
+      }
+      break
+    }
+    case 'office.rewrite': {
+      const elementId = String(args.elementId ?? '').trim()
+      if (!elementId) throw new EabError(EC.VALIDATION, 'elementId 不能为空')
+      if (typeof args.newText !== 'string') throw new EabError(EC.VALIDATION, 'newText 必须是字符串')
+      const boolArg = (name: string): boolean | undefined => {
+        const value = args[name]
+        if (value === undefined) return undefined
+        if (typeof value === 'boolean') return value
+        if (value === 'true') return true
+        if (value === 'false') return false
+        throw new EabError(EC.VALIDATION, `${name} 必须是布尔值`)
+      }
+      const bold = boolArg('bold')
+      const italic = boolArg('italic')
+      let underline: boolean | string | undefined
+      if (args.underline !== undefined) {
+        if (typeof args.underline === 'boolean') underline = args.underline
+        else if (typeof args.underline === 'string') {
+          const value = args.underline.trim()
+          underline = value === 'true' || value === 'false' ? value === 'true' : value
+        } else throw new EabError(EC.VALIDATION, 'underline 必须是布尔值或下划线样式')
+      }
+      const color = args.color === undefined ? undefined : String(args.color)
+      const fontFamily = args.fontFamily === undefined ? undefined : String(args.fontFamily)
+      const align = args.align === undefined ? undefined : String(args.align)
+      const fontSize = args.fontSize === undefined ? undefined : Number(args.fontSize)
+      if (fontSize !== undefined && !Number.isFinite(fontSize)) {
+        throw new EabError(EC.VALIDATION, 'fontSize 必须是数字')
+      }
+      if (
+        bold === undefined &&
+        italic === undefined &&
+        underline === undefined &&
+        color === undefined &&
+        fontSize === undefined &&
+        fontFamily === undefined &&
+        align === undefined
+      ) {
+        throw new EabError(EC.VALIDATION, '至少指定一个统一格式属性：bold、italic、underline、color、fontSize、fontFamily 或 align')
+      }
+      const docx = resolveOfficeDocx(deps, actor, args)
+      const operationId = `op_${ulid()}`
+      let edit
+      try {
+        edit = rewriteDocxElementText(docx.buffer, {
+          elementId,
+          newText: args.newText,
+          ...(bold === undefined ? {} : { bold }),
+          ...(italic === undefined ? {} : { italic }),
+          ...(underline === undefined ? {} : { underline }),
+          ...(color === undefined ? {} : { color }),
+          ...(fontSize === undefined ? {} : { fontSize }),
+          ...(fontFamily === undefined ? {} : { fontFamily }),
+          ...(align === undefined ? {} : { align }),
+        })
+      } catch (error) {
+        throw new EabError(EC.VALIDATION, error instanceof Error ? error.message : String(error), {
+          hint: '整段重写只用于用户明确要求覆盖整个段落/单元格并统一格式；保留原格式的局部修改请改用 office.replace 并把 oldText 收窄到单个 run。',
+        })
+      }
+      const saved = editUserWorkspaceFile(deps, actor, docx.fileId, edit.buffer, {
+        baseVersion: Number(docx.version),
+        source: 'office.rewrite',
+        operationId,
+        elementId: edit.elementId,
+        replacements: edit.replacements,
+      })
+      result = {
+        fileId: docx.fileId,
+        name: docx.name,
+        relPath: docx.relPath,
+        version: saved.updatedAt,
+        operationId,
+        kind: 'docx',
+        elementId: edit.elementId,
+        elementKind: edit.kind,
+        previousText: edit.previousText,
+        nextText: edit.nextText,
+        replacements: edit.replacements,
+        applied: edit.applied,
+        runCount: edit.runCount,
         wrote: true,
         saved: true,
         editorSync: false,

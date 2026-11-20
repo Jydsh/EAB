@@ -373,6 +373,59 @@ export function pluginToolSpecsFor(
   return specs
 }
 
+/**
+ * 业务意图词：命中这些词时，插件工具整包下发。
+ *
+ * 插件往往是业务数据入口，工具名不一定包含用户的业务词；因此只要问题落在
+ * 业务域，就不做逐工具相关性裁剪，避免“查工区/班次”找不到插件工具。
+ */
+const PLUGIN_BROAD_INTENT =
+  /(工单|台账|报表|记录|数据|名单|成员|通讯录|邮件|日程|安排|会议|提醒|待办|任务|项目|合同|订单|库存|设备|故障|检查|整治|审批|打卡|考勤|客户|供应商|发票|报销|预算|资产|车辆|班次|工区|组织|部门|员工|文档|文件|表格|excel|word|pdf|ppt|插件|工具|安装|调用|发送|消息|群)/i
+
+/**
+ * 按当前问题裁剪插件工具 schema。
+ *
+ * 判据只决定“本轮直接下发哪些插件工具”，不改变可见性和执行解析：
+ * - 业务意图词命中时整包下发；
+ * - 否则看工具名/描述和插件提示词是否与问题有词面重合；
+ * - 没命中的插件工具仍保留在 tool_search 的搜索范围里，不会被卸载。
+ */
+export function pluginToolSpecsForQuery(
+  db: Db,
+  actor: PluginToolActor,
+  query: string,
+  options: { preferPersonal?: boolean } = {},
+): Array<Record<string, unknown>> {
+  const full = pluginToolSpecsFor(db, actor, options)
+  const clean = String(query ?? '').normalize('NFKC').trim()
+  if (!clean || clean.length < 2 || PLUGIN_BROAD_INTENT.test(clean)) return full
+  const relevant = new Set<string>()
+  for (const instanceKey of actorInstanceKeys(db, actor, options.preferPersonal === true)) {
+    const tools = toolsByInstance.get(instanceKey)
+    if (!tools) continue
+    let promptText = ''
+    for (const prompt of promptsByInstance.get(instanceKey)?.values() ?? []) {
+      try {
+        const text = typeof prompt.text === 'function' ? prompt.text() : prompt.text
+        promptText += `${prompt.name}\n${String(text ?? '')}\n`
+      } catch {
+        // 插件提示词取不到时只按工具自身的名称/描述判定
+      }
+    }
+    const instanceScore = promptRelevance(promptText, clean)
+    for (const tool of tools.values()) {
+      if (instanceScore + promptRelevance(`${tool.name} ${tool.description}`, clean) > 0) {
+        relevant.add(tool.name)
+      }
+    }
+  }
+  if (relevant.size === 0) return []
+  return full.filter((spec) => {
+    const fn = spec.function as { name?: unknown } | undefined
+    return relevant.has(String(fn?.name ?? ''))
+  })
+}
+
 /** 按模型给出的 function 名找当前员工可用的插件工具；默认公司实例优先 */
 export function resolvePluginToolForActor(
   db: Db,
@@ -471,9 +524,34 @@ export async function executePluginTool(
 }
 
 /** 插件给系统提示的贡献；执行时会实时调用 text()，拿到插件当前配置 */
-export function pluginPromptTexts(db: Db, actor: PluginToolActor): string[] {
+const MAX_PLUGIN_PROMPT_CHARS = 3_000
+const MAX_PLUGIN_PROMPT_ITEM_CHARS = 800
+
+function promptRelevance(text: string, query: string): number {
+  const q = query.toLowerCase().trim()
+  if (!q) return 1
+  const t = text.toLowerCase()
+  let score = 0
+  for (const token of q.split(/[^\p{L}\p{N}]+/u)) {
+    if (token.length >= 2 && t.includes(token)) score += token.length * 2
+  }
+  // 中文长句常常没有空格：补两个字一组的滑窗，让“检查整治/业务数据”这类词能命中。
+  const chars = [...q.replace(/[^\p{L}\p{N}]+/gu, '')]
+  for (let i = 0; i + 2 <= chars.length; i += 1) {
+    const pair = `${chars[i]}${chars[i + 1]}`
+    if (pair.length === 2 && t.includes(pair)) score += 1
+  }
+  return score
+}
+
+export function pluginPromptTexts(
+  db: Db,
+  actor: PluginToolActor,
+  options: { query?: string } = {},
+): string[] {
   if (!actor.subject.scopes.has(SC.AGENT_TOOL_INVOKE)) return []
-  const entries: Array<{ order: number; name: string; text: string }> = []
+  const query = String(options.query ?? '').trim()
+  const entries: Array<{ order: number; name: string; text: string; score: number }> = []
   for (const instanceKey of actorInstanceKeys(db, actor)) {
     const prompts = promptsByInstance.get(instanceKey)
     if (!prompts) continue
@@ -484,10 +562,28 @@ export function pluginPromptTexts(db: Db, actor: PluginToolActor): string[] {
       } catch {
         text = ''
       }
-      if (text.trim()) entries.push({ order: entry.order, name: entry.name, text: text.trim() })
+      const trimmed = text.trim()
+      if (!trimmed) continue
+      entries.push({
+        order: entry.order,
+        name: entry.name,
+        text: trimmed,
+        score: promptRelevance(`${entry.name}\n${trimmed}`, query),
+      })
     }
   }
-  return entries.sort((a, b) => a.order - b.order || a.name.localeCompare(b.name)).map((entry) => entry.text)
+  const sorted = entries.sort((a, b) => b.score - a.score || a.order - b.order || a.name.localeCompare(b.name))
+  const out: string[] = []
+  let total = 0
+  for (const entry of sorted) {
+    // 没有命中当前问题的插件说明不注入；插件工具本身由 pluginToolSpecsForQuery 按业务意图裁量，tool_search 也能兜底。
+    if (query && entry.score <= 0) continue
+    const text = entry.text.slice(0, MAX_PLUGIN_PROMPT_ITEM_CHARS)
+    if (total + text.length > MAX_PLUGIN_PROMPT_CHARS) break
+    total += text.length
+    out.push(text)
+  }
+  return out
 }
 
 /** 控制台配置插件工具角色时，需要看到本公司的全部插件工具，而不只是控制台操作者本人安装的实例。 */

@@ -67,7 +67,7 @@ import type { ActiveSpace } from './space.js'
 import { saveUserWorkspaceFile } from './routes/workspace.js'
 import { prepareDshImCompat, syncDshImSession } from './dsh-im-compat.js'
 import { pluginPromptTexts } from './plugin-tools.js'
-import { skillPromptTexts } from './skills.js'
+import { skillCatalogTexts } from './skills.js'
 import { assertChatQuota } from './quota.js'
 import { planChannelModelCommand, planChannelModelPicker, planChannelModelSelection, type ChannelModelOption } from './channel-model-command.js'
 import { SWITCH_CHAT_MODEL_TOOL_SPEC, updateConversationModelPreference, type ModelSwitchContext } from './channel-model-switch.js'
@@ -1384,9 +1384,11 @@ export async function handleDingTalkMessage(
     const toolSpace: ActiveSpace = { kind: 'cloud', channel: card ? 'dingtalk-a2ui' : 'dingtalk-file' }
     const chatTools = toolSpecsForAgent(deps.db, actor, toolSpace, promptText)
     const channelChatTools = [...chatTools, SWITCH_CHAT_MODEL_TOOL_SPEC]
-    const pluginPrompts = pluginPromptTexts(deps.db, actor)
-    const skillPrompts = skillPromptTexts(deps.db, actor)
-    const channelHistory = historyOf(deps.db, sessionId, 16, 'dingtalk', options.resume?.userMessageId)
+    const pluginPrompts = pluginPromptTexts(deps.db, actor, { query: promptText })
+    // 钉钉与网页共用同一套紧凑技能目录：只列摘要，完整步骤由 runAgentTurn 注入的 skill_load 按需加载，
+    // 避免单轮把 20k 技能正文全部塞进系统提示。
+    const skillPrompts = skillCatalogTexts(deps.db, actor)
+    const channelHistory = historyOf(deps.db, sessionId, 8, 'dingtalk', options.resume?.userMessageId)
     const memoryCrossSession = shouldRecallPastConversations(promptText)
     const memoryHits = searchChatMemory({
       db: deps.db,

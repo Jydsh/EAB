@@ -943,6 +943,34 @@ function applyReplacement(nodes: TextNode[], start: number, end: number, replace
   return true
 }
 
+/** 返回替换范围覆盖到的不同 run 格式签名；用于阻止跨格式静默继承第一个 run。 */
+function runFormatsInRange(segmentXml: string, nodes: TextNode[], start: number, end: number): string[] {
+  if (end <= start) return []
+  const runs = runSegmentsOf(segmentXml)
+  const formats = new Set<string>()
+  for (const node of nodes) {
+    if (!node.text || node.textEnd <= start || node.textStart >= end) continue
+    const run = runs.find((item) => node.start >= item.start && node.start < item.end)
+    formats.add(run?.rPr ?? '')
+  }
+  return [...formats]
+}
+
+function assertSingleRunFormat(
+  elementId: string,
+  segmentXml: string,
+  nodes: TextNode[],
+  start: number,
+  end: number,
+): void {
+  const formats = runFormatsInRange(segmentXml, nodes, start, end)
+  if (formats.length <= 1) return
+  throw new Error(
+    `目标 ${elementId} 的替换范围跨 ${formats.length} 种 run 格式，整段覆盖会改变部分文本格式；` +
+      '请把 oldText 收窄到单个 run 内的正文本段，分处替换',
+  )
+}
+
 function insertTextRun(xml: string, text: string, kind: 'paragraph' | 'table_cell'): string {
   if (!text) return xml
   const closeTag = kind === 'paragraph' ? '</w:p>' : '</w:tc>'
@@ -3675,7 +3703,27 @@ export function applyDocxComment(buffer: Buffer, options: OfficeCommentOptions):
   }
 }
 
+export interface OfficeDocxRewriteOptions extends OfficeFormatOptions {
+  /** 新的整段文本；会覆盖目标元素当前全部可见文本。 */
+  newText: string
+}
+
+export interface OfficeDocxRewriteResult extends OfficeReplaceResult {
+  /** 本次实际写入的格式属性。 */
+  applied: string[]
+  /** 受统一格式影响的 run 数量。 */
+  runCount: number
+}
+
 export function replaceDocxText(buffer: Buffer, options: OfficeReplaceOptions): OfficeReplaceResult {
+  return replaceDocxTextCore(buffer, options, false)
+}
+
+function replaceDocxTextCore(
+  buffer: Buffer,
+  options: OfficeReplaceOptions,
+  allowCrossRun: boolean,
+): OfficeReplaceResult {
   let files: Record<string, Uint8Array>
   try {
     files = unzipSync(new Uint8Array(buffer))
@@ -3693,6 +3741,7 @@ export function replaceDocxText(buffer: Buffer, options: OfficeReplaceOptions): 
   let start = 0
   let end = visibleText.length
   let replacements = 1
+  let replacementText = options.newText
 
   if (options.oldText !== undefined) {
     const oldText = options.oldText
@@ -3728,9 +3777,35 @@ export function replaceDocxText(buffer: Buffer, options: OfficeReplaceOptions): 
   } else if (visibleText.length === 0) {
     start = 0
     end = 0
+  } else {
+    // 省略 oldText 时保留新旧文本的公共前缀和后缀，只替换真正变化的中段，
+    // 避免把多 run 段落整段塞进第一个 run、误把正文继承成标题/加粗格式。
+    let prefix = 0
+    const maxPrefix = Math.min(visibleText.length, options.newText.length)
+    while (prefix < maxPrefix && visibleText[prefix] === options.newText[prefix]) prefix += 1
+    let suffix = 0
+    const maxSuffix = Math.min(visibleText.length - prefix, options.newText.length - prefix)
+    while (
+      suffix < maxSuffix &&
+      visibleText[visibleText.length - 1 - suffix] === options.newText[options.newText.length - 1 - suffix]
+    ) {
+      suffix += 1
+    }
+    start = prefix
+    end = visibleText.length - suffix
+    replacementText = options.newText.slice(prefix, options.newText.length - suffix)
   }
 
   if (baseOffset < 0) throw new Error(`目标 ${options.elementId} 的文本偏移异常`)
+  if (options.occurrence !== 0 && !allowCrossRun) {
+    assertSingleRunFormat(
+      options.elementId,
+      segment.xml,
+      nodes,
+      baseOffset + start,
+      baseOffset + end,
+    )
+  }
   let changed = false
   if (options.trackChanges) {
     if (options.occurrence === 0) throw new Error('修订写入暂不支持 occurrence=0；请逐处替换')
@@ -3739,7 +3814,7 @@ export function replaceDocxText(buffer: Buffer, options: OfficeReplaceOptions): 
       segment.xml,
       baseOffset + start,
       baseOffset + end,
-      options.newText,
+      replacementText,
       author,
       new Date().toISOString(),
     )
@@ -3756,13 +3831,22 @@ export function replaceDocxText(buffer: Buffer, options: OfficeReplaceOptions): 
     }
     // 从后往前替换，避免前面的长度变化影响后面的偏移。
     for (const match of [...matches].reverse()) {
+      if (!allowCrossRun) {
+        assertSingleRunFormat(
+          options.elementId,
+          segment.xml,
+          nodes,
+          baseOffset + match,
+          baseOffset + match + options.oldText.length,
+        )
+      }
       changed = applyReplacement(nodes, baseOffset + match, baseOffset + match + options.oldText.length, options.newText) || changed
     }
   } else if (visibleText.length === 0 && nodes.length === 0) {
     segment.xml = insertTextRun(segment.xml, options.newText, kind)
     changed = options.newText.length > 0
   } else {
-    changed = applyReplacement(nodes, baseOffset + start, baseOffset + end, options.newText)
+    changed = applyReplacement(nodes, baseOffset + start, baseOffset + end, replacementText)
   }
 
   if (!changed) throw new Error(`目标 ${options.elementId} 没有产生文本变化`)
@@ -3789,6 +3873,42 @@ export function replaceDocxText(buffer: Buffer, options: OfficeReplaceOptions): 
     nextText,
     replacements,
     ...(options.trackChanges ? { tracked: true } : {}),
+  }
+}
+
+/**
+ * 整段重写并统一格式。仅供显式要求“整段重写 + 统一格式”的专用工具调用；
+ * 普通局部替换仍走 replaceDocxText，跨多种 run 格式时继续拒绝。
+ */
+export function rewriteDocxElementText(
+  buffer: Buffer,
+  options: OfficeDocxRewriteOptions,
+): OfficeDocxRewriteResult {
+  const read = readDocxRange(buffer, { elementId: options.elementId })
+  if (read.elementKind !== 'paragraph' && read.elementKind !== 'table_cell') {
+    throw new Error('整段重写只支持段落或表格单元格，不支持整表/整行/整列')
+  }
+  let nextBuffer = buffer
+  let replacements = 0
+  if (read.text !== options.newText) {
+    const replaced = replaceDocxTextCore(
+      buffer,
+      { elementId: options.elementId, newText: options.newText },
+      true,
+    )
+    nextBuffer = replaced.buffer
+    replacements = 1
+  }
+  const formatted = formatDocxText(nextBuffer, options)
+  return {
+    buffer: formatted.buffer,
+    elementId: options.elementId,
+    kind: read.elementKind,
+    previousText: read.text,
+    nextText: options.newText,
+    replacements,
+    applied: formatted.applied,
+    runCount: formatted.runCount,
   }
 }
 

@@ -1392,9 +1392,11 @@ export function skillPromptText(skill: SkillRecord): string {
 }
 
 /**
- * 系统提示词中的技能目录：只给 id、名称、级别、触发词和声明工具摘要。
+ * 系统提示词中的技能索引：单条压成一行，只给 id、名称、级别、短说明、触发词和声明工具。
  * 完整步骤由模型按需调用 `skill_load` 加载，避免把所有技能正文一次吃进上下文。
  */
+const MAX_SKILL_CATALOG_CHARS = 4_000
+
 export function skillCatalogTexts(
   db: Db,
   actor: { subject: { companyId: string; userId: string; scopes: ReadonlySet<string> } },
@@ -1405,16 +1407,13 @@ export function skillCatalogTexts(
   let total = 0
   const out: string[] = []
   for (const skill of skills) {
-    if (total >= 10_000) break
+    if (total >= MAX_SKILL_CATALOG_CHARS) break
     const line = [
-      `<skill_catalog id="${skill.id}" level="${skill.level}">`,
-      `${sanitizeSkillPromptBody(skill.name)} · v${skill.version}`,
-      `说明：${sanitizeSkillPromptBody(trimPrompt(skill.description, 180))}`,
-      `触发词：${sanitizeSkillPromptBody(skill.triggers.slice(0, 8).join('、') || '无')}`,
-      `声明工具：${skill.tools.slice(0, 12).join('、') || '无'}`,
+      `<skill_catalog id="${skill.id}" level="${skill.level}" name="${sanitizeSkillPromptBody(skill.name)}">`,
+      `说明：${sanitizeSkillPromptBody(trimPrompt(skill.description, 80))}｜触发词：${sanitizeSkillPromptBody(skill.triggers.slice(0, 6).join('、') || '无')}｜工具：${skill.tools.slice(0, 8).join('、') || '无'}`,
       '</skill_catalog>',
-    ].join('\n')
-    if (total + line.length > 10_000) break
+    ].join('')
+    if (total + line.length > MAX_SKILL_CATALOG_CHARS) break
     total += line.length
     out.push(line)
   }

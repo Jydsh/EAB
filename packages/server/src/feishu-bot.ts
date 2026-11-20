@@ -692,7 +692,7 @@ export async function handleFeishuEvent(
     }>
     const chatTools = toolSpecsForAgent(deps.db, actor, { kind: 'none' }, rawText)
     const channelChatTools = [...chatTools, SWITCH_CHAT_MODEL_TOOL_SPEC]
-    const channelHistory = historyOf(deps.db, sessionId, 16, 'feishu')
+    const channelHistory = historyOf(deps.db, sessionId, 8, 'feishu')
     const memoryCrossSession = shouldRecallPastConversations(rawText)
     const memoryHits = searchChatMemory({
       db: deps.db,
@@ -716,7 +716,7 @@ export async function handleFeishuEvent(
       kbMode,
       hits,
       hasAttachments: false,
-      pluginPrompts: pluginPromptTexts(deps.db, actor),
+      pluginPrompts: pluginPromptTexts(deps.db, actor, { query: rawText }),
       availableModels: availableChatModels.map((item) => ({ id: item.id, name: item.name })),
       currentModelId: model.id,
     })

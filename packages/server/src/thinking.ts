@@ -54,7 +54,7 @@ export const THINKING_LEVELS: readonly LevelDefinition[] = [
   {
     id: 'light',
     label: '精简',
-    hint: '更少思考，更快回答。',
+    hint: '更少思考、更快回答；Qwen/vLLM 下会关闭模板思考。',
     budget: 2048,
   },
   {

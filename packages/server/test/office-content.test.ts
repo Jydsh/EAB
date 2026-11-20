@@ -30,6 +30,7 @@ import {
   readXlsxOutline,
   replyDocxComment,
   replaceDocxText,
+  rewriteDocxElementText,
   replacePptxText,
   replaceXlsxCellText,
   resolveDocxComment,
@@ -191,6 +192,69 @@ describe('office-content', () => {
 
     const acrossRuns = replaceDocxText(source, { elementId: 'p2', oldText: '第一段：检查', newText: '第二段：核对' })
     expect(acrossRuns.nextText).toBe('第二段：核对消防设施 & 记录')
+  })
+
+  it('replaces a whole paragraph without merging unchanged prefix into the first run', () => {
+    const source = makeDocx(`
+      <w:p>
+        <w:r><w:rPr><w:b/><w:sz w:val="24"/></w:rPr><w:t>第二段开头：</w:t></w:r>
+        <w:r><w:rPr><w:sz w:val="24"/></w:rPr><w:t>这是旧正文。</w:t></w:r>
+      </w:p>
+    `)
+    const replaced = replaceDocxText(source, {
+      elementId: 'p1',
+      newText: '第二段开头：这是新正文。',
+    })
+    const xml = new TextDecoder().decode(unzipSync(new Uint8Array(replaced.buffer))['word/document.xml'])
+    expect(xml).toContain('<w:r><w:rPr><w:b/><w:sz w:val="24"/></w:rPr><w:t>第二段开头：</w:t></w:r>')
+    expect(xml).toContain('<w:r><w:rPr><w:sz w:val="24"/></w:rPr><w:t>这是新正文。</w:t></w:r>')
+    expect(xml).not.toContain('这是旧正文')
+    expect(replaced.nextText).toBe('第二段开头：这是新正文。')
+  })
+
+  it('rejects whole rewrites across mixed run formats', () => {
+    const source = makeDocx(`
+      <w:p>
+        <w:r><w:rPr><w:b/><w:sz w:val="24"/></w:rPr><w:t>第二段开头：</w:t></w:r>
+        <w:r><w:rPr><w:sz w:val="24"/></w:rPr><w:t>这是旧正文。</w:t></w:r>
+      </w:p>
+    `)
+    expect(() =>
+      replaceDocxText(source, {
+        elementId: 'p1',
+        newText: '完全改成另一段文字。',
+      }),
+    ).toThrow('跨 2 种 run 格式')
+    expect(() =>
+      replaceDocxText(source, {
+        elementId: 'p1',
+        oldText: '第二段开头：这是旧正文。',
+        newText: '完全改成另一段文字。',
+      }),
+    ).toThrow('请把 oldText 收窄到单个 run 内')
+  })
+
+  it('rewrites a mixed-run paragraph and applies one explicit uniform format', () => {
+    const source = makeDocx(`
+      <w:p>
+        <w:r><w:rPr><w:b/><w:sz w:val="24"/></w:rPr><w:t>第二段开头：</w:t></w:r>
+        <w:r><w:rPr><w:sz w:val="24"/></w:rPr><w:t>这是旧正文。</w:t></w:r>
+      </w:p>
+    `)
+    const rewritten = rewriteDocxElementText(source, {
+      elementId: 'p1',
+      newText: '统一重写后的整段文字。',
+      bold: true,
+      fontSize: 12,
+    })
+    const read = readDocxRange(rewritten.buffer, { elementId: 'p1' })
+    expect(rewritten.previousText).toBe('第二段开头：这是旧正文。')
+    expect(rewritten.nextText).toBe('统一重写后的整段文字。')
+    expect(rewritten.applied).toEqual(['bold', 'fontSize'])
+    expect(rewritten.runCount).toBeGreaterThanOrEqual(2)
+    expect(read.text).toBe('统一重写后的整段文字。')
+    expect(read.runs.every((run) => run.format.bold === true && run.format.fontSize === 12)).toBe(true)
+    expect(documentXmlOf(rewritten.buffer)).not.toContain('这是旧正文')
   })
 
   it('reads w:ins / w:del revisions with author and paragraph scope', () => {

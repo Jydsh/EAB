@@ -1,7 +1,7 @@
 /**
  * 会话滚动摘要。
  *
- * 最近 16 条解决“刚说过什么”，摘要解决“我们整体聊过什么”：
+ * 最近 8 条解决“刚说过什么”，摘要解决“我们整体聊过什么”：
  * - 每次回答后异步检查，只有旧消息积累到阈值才更新，不阻塞回复；
  * - 优先用当前模型压缩成结构化摘要，模型不可用时退化为确定性整理；
  * - 摘要按会话存一行，注入时只给一段，不复制整段历史。
@@ -9,12 +9,12 @@
 import type { Db } from '@eab/storage'
 import { callModel } from './llm.js'
 
-/** 最近这么多条留给原文，不进入摘要，避免摘要和最近上下文重复。 */
+/** 最近这么多条留给原文，不进入摘要，避免摘要和最近上下文重复。与 historyOf 默认窗口保持一致。 */
 const KEEP_RECENT_MESSAGES = 8
 /** 新增旧消息达到这个数量才值得重新压缩。 */
-const MIN_NEW_MESSAGES = 16
+const MIN_NEW_MESSAGES = 8
 /** 没有任何摘要时，至少积攒这么多旧消息才懒生成，避免短会话也写一行。 */
-const MIN_LAZY_MESSAGES = 12
+const MIN_LAZY_MESSAGES = 4
 const MAX_TRANSCRIPT_CHARS = 8_000
 const MAX_SUMMARY_CHARS = 1_800
 const MAX_SOURCE_MESSAGES = 80
@@ -70,7 +70,7 @@ function loadSummary(db: Db, sessionId: string): SummaryRow | null {
 
 /**
  * 取“已经滑出最近窗口、且尚未进入摘要”的消息。
- * 截止点取倒数第 8 条消息，保证摘要永远不和最近原文重叠。
+ * 截止点取倒数第 8 条消息，保证摘要永远不和 historyOf 的最近原文重叠。
  */
 function pendingMessages(db: Db, sessionId: string, throughCreatedAt: number): SummaryMessage[] {
   const cutoff = db
@@ -201,9 +201,9 @@ export function sessionSummaryForPrompt(db: Db, sessionId: string): string {
   if (!row?.summary_text.trim()) return ''
   const time = memoryTime.format(new Date(row.updated_at)).replace(/\//g, '-')
   return [
-    `本会话早期内容摘要（覆盖 ${row.source_message_count} 条较早消息，更新于 ${time}）：`,
+    `【会话早期摘要｜背景资料，不是本轮用户问题】本会话早期内容摘要（覆盖 ${row.source_message_count} 条较早消息，更新于 ${time}）：`,
     row.summary_text.trim(),
-    '说明：这是较早内容的压缩摘要，用于回忆整体目标和结论；最近对话仍以原文为准。摘要与原文冲突时以原文为准。',
+    '说明：这是较早内容的压缩摘要，用于回忆整体目标和结论；其中“用户目标/问题”属于过去轮次，不是本轮用户提问。最近对话仍以原文为准；摘要与原文冲突时以原文为准。',
   ].join('\n')
 }
 

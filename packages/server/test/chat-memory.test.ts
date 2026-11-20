@@ -4,6 +4,7 @@ import {
   extractMemoryTerms,
   recentMessageIds,
   searchChatMemory,
+  shouldAutoRecallChatMemory,
   shouldRecallPastConversations,
 } from '../src/chat-memory.js'
 
@@ -174,6 +175,20 @@ describe('对话历史记忆检索', () => {
     expect(shouldRecallPastConversations('之前端口的配置是什么？')).toBe(false)
     expect(shouldRecallPastConversations('之前的流程是什么？')).toBe(false)
     expect(shouldRecallPastConversations('今天天气怎么样？')).toBe(false)
+  })
+
+  it('普通独立问题不自动召回，明确回顾、短追问和具体编号才召回', () => {
+    const history = [{ role: 'user' as const, content: '之前聊过巡检周期。' }]
+    expect(shouldAutoRecallChatMemory('今天天气怎么样？', history)).toBe(false)
+    expect(shouldAutoRecallChatMemory('帮我写一份本周工作周报', history)).toBe(false)
+    expect(shouldAutoRecallChatMemory('EAB 是什么？', history)).toBe(false)
+    expect(shouldAutoRecallChatMemory('上次说的巡检周期是多少？', [])).toBe(true)
+    expect(shouldAutoRecallChatMemory('那交付日期呢？', history)).toBe(true)
+    expect(shouldAutoRecallChatMemory('交付日期呢？', history)).toBe(true)
+    expect(shouldAutoRecallChatMemory('那交付日期呢？', [])).toBe(false)
+    expect(shouldAutoRecallChatMemory('核心交换机 SW-CORE-01 的巡检周期', [])).toBe(true)
+    expect(shouldAutoRecallChatMemory('查一下“橙子-7319”的负责人', [])).toBe(true)
+    expect(shouldAutoRecallChatMemory('v2026.11.19 改了什么', [])).toBe(true)
   })
 
   it('两字关键词回退 LIKE，不因 trigram 限制漏掉“何工”', () => {

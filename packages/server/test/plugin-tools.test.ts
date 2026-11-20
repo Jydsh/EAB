@@ -6,6 +6,7 @@ import {
   clearPluginContributions,
   pluginToolCatalogFor,
   pluginToolSpecsFor,
+  pluginToolSpecsForQuery,
   prefersPersonalPluginTools,
   registerPluginTool,
   resolvePluginToolForActor,
@@ -74,7 +75,7 @@ describe('插件工具按安装/启用状态过滤', () => {
 
     expect(pluginToolSpecsFor(db, actor())).toHaveLength(1)
     expect(resolvePluginToolForActor(db, actor(), 'demo_tool')?.pluginId).toBe('p_tools_test')
-    // 插件工具要随 Agent 首轮工具直接下发，不能只靠 tool_search 按业务词命中
+    // 空 query 时无法判断相关性，仍按首轮全量下发；有 query 时按业务意图/词面相关性裁剪。
     expect(
       toolSpecsForAgent(db, actor() as any, { kind: 'cloud' }).some((spec) => spec.function.name === 'demo_tool'),
     ).toBe(true)
@@ -275,5 +276,33 @@ describe('插件工具按安装/启用状态过滤', () => {
       'personal version',
     )
     expect(resolvePluginToolForActor(db, actor(), 'shared_tool')?.description).toBe('personal version')
+  })
+
+  it('普通闲聊只下发相关插件工具，业务问题整包下发，tool_search 仍可兜底', () => {
+    const db = memoryDb()
+    db.prepare(
+      'INSERT INTO plugin_company_installs (company_id, plugin_id, installed_by, installed_at, updated_at, removed_at) VALUES (?, ?, ?, ?, ?, NULL)',
+    ).run('c1', 'p_tools_test', 'u1', 1, 1)
+    registerDemo('c1', 'p_tools_test', companyScope(), 'demo_tool', 'demo_tool')
+    const fn = (spec: Record<string, unknown>) => String((spec.function as { name?: unknown } | undefined)?.name ?? '')
+    expect(pluginToolSpecsForQuery(db, actor(), '今天天气如何')).toHaveLength(0)
+    expect(pluginToolSpecsForQuery(db, actor(), 'demo_tool 怎么用').map(fn)).toEqual(['demo_tool'])
+    expect(pluginToolSpecsForQuery(db, actor(), '帮我查一下工单数据').map(fn)).toEqual(['demo_tool'])
+    expect(
+      toolSpecsForAgent(db, actor() as any, { kind: 'cloud' }, '今天天气如何').some(
+        (spec) => spec.function.name === 'demo_tool',
+      ),
+    ).toBe(false)
+    expect(
+      toolSpecsForAgent(db, actor() as any, { kind: 'cloud' }, 'demo_tool 怎么用').some(
+        (spec) => spec.function.name === 'demo_tool',
+      ),
+    ).toBe(true)
+    // 不直接下发的插件工具仍在 tool_search 的目录里。
+    expect(
+      searchToolCatalog(db, actor() as any, { kind: 'cloud' }, 'demo_tool 怎么用').tools.some(
+        (tool) => tool.functionName === 'demo_tool',
+      ),
+    ).toBe(true)
   })
 })
