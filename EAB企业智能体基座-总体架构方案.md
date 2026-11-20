@@ -1616,7 +1616,7 @@ interface ContextSource {
 
 **真实双文件编辑先验证了“批量交给团队”，再验证了“两个独立子 Agent 并行”。** 第一条真实请求处理《EAB-真实对话测试.docx》和《EAB-双文件测试.docx》，系统保留团队工具并调 `agent_spawn`，但模型只派了 1 个子任务，子 Agent 串行改完两个文件，主 Agent 汇总成功。为验证真正并行，第二条请求明确要求“两个互不依赖的子任务、每个子 Agent 只改一个文档”；实际派出 `child-a` 与 `child-b` 两个岗位同时运行，前者 4 次工具、后者 9 次工具，两个文件分别落盘并各自 `office_read_range` 复读。第一个子 Agent 写出的文本完全匹配，第二个子 Agent 多写了一个空格，主 Agent 汇总时识别出差异；随后用单文件请求把《EAB-双文件测试.docx》第二段的“双文件双 Agent 并行完成。”改为严格无空格的“双文件双Agent并行完成。”并复读确认。最终两个文件 p2 都是目标文本、`bold=true`、`fontSize=12`，p1/p3 未变。
 
-以上三轮定向测试共 6 个文件 / 104 个用例通过（`capability-route` 10 + `tool-search` 10 + `chat-system-prompt-space` 19 + `office-content` 61 + `chat-finalize-after-tools` 1 + `chat-tool-completion` 3），全量回归 187 个文件 / 1,122 个用例通过，`pnpm typecheck` 通过。临时调试脚本和文档校验目录在本轮收尾时删除，Git 只做本地提交，不自动推送远端。
+以上三轮定向测试共 6 个文件 / 104 个用例通过（`capability-route` 10 + `tool-search` 10 + `chat-system-prompt-space` 19 + `office-content` 61 + `chat-finalize-after-tools` 1 + `chat-tool-completion` 3），全量回归 187 个文件 / 1,122 个用例通过，`pnpm typecheck` 通过。临时调试脚本和文档校验目录在本轮收尾时删除；Git 已在本地提交 `3625c07`，未推送远端。
 
 #### 11.3.3 对话引用的可靠性兜底（已实现）
 
