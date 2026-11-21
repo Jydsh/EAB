@@ -4,8 +4,8 @@ EAB 是一套面向**单公司本地部署**的企业智能体基座：一个进
 
 - 员工入口：`http://127.0.0.1:8787/chat`
 - 管理控制台：`http://127.0.0.1:8788/admin`
-- 当前版本：`2026.11.19`
-- 本版发布说明：[`docs/releases/v2026.11.19.md`](docs/releases/v2026.11.19.md)
+- 当前版本：`2026.11.21`
+- 本版发布说明：[`docs/releases/v2026.11.21.md`](docs/releases/v2026.11.21.md)
 
 > 单公司边界：一个实例只服务一家公司。钉钉、飞书、企业微信、模型供应商、知识库、插件都在控制台里配置。
 
@@ -220,8 +220,8 @@ eab start
 
 EAB 的版本来自 GitHub Release：
 
-- Release tag：`v2026.11.19`
-- Release 资产：源码 zip（`EAB-2026.11.19.zip`）。桌面安装包、`latest.yml`、`.blockmap` 已停止发布。
+- Release tag：`v2026.11.21`
+- Release 资产：源码 zip（`EAB-2026.11.21.zip`）。桌面安装包、`latest.yml`、`.blockmap` 已停止发布。
 
 ### 两种更新方式
 
@@ -289,7 +289,7 @@ pnpm dev                  # 等价于 eab start
 
 1. 改根 `package.json` 的 `version`；
 2. 更新 `README.md` 版本与源码包名；
-3. 提交并打 tag：`git tag v2026.11.19 && git push origin v2026.11.19`；
+3. 提交并打 tag：`git tag v2026.11.21 && git push origin v2026.11.21`；
 4. GitHub Actions 只构建源码 zip 并创建/更新 Release，不再生成桌面安装包；
 5. 控制台/CLI 的版本检查读取该 Release。
 
