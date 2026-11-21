@@ -618,6 +618,54 @@ export function listApprovalWorkflows(db: Db, companyId: string): ApprovalWorkfl
   return rows.map((row) => readWorkflow(db, row))
 }
 
+export interface PublishedApprovalFlow {
+  id: string
+  name: string
+  version: number
+  scopeMode: string
+  roleMode: string
+  flow: ApprovalFlowNode[]
+}
+
+/** 运行时只读已发布版本，避免草稿改动影响已提交申请。 */
+export function listPublishedApprovalFlows(db: Db, companyId: string): PublishedApprovalFlow[] {
+  ensureApprovalWorkflowSeeds(db, companyId)
+  const rows = db
+    .prepare(
+      `SELECT w.id, w.name, w.scope_mode, w.role_mode, v.version, v.flow_json
+         FROM approval_workflows w
+         JOIN approval_workflow_versions v ON v.id = w.published_version_id
+        WHERE w.company_id = ? AND w.deleted_at IS NULL
+          AND w.status = 'published' AND v.status = 'published'
+        ORDER BY w.updated_at DESC, w.created_at ASC`,
+    )
+    .all(companyId) as unknown as Array<{
+    id: string
+    name: string
+    scope_mode: string
+    role_mode: string
+    version: number
+    flow_json: string
+  }>
+  return rows.map((row) => {
+    let flow: ApprovalFlowNode[] = []
+    try {
+      const parsed = JSON.parse(row.flow_json)
+      if (Array.isArray(parsed)) flow = parsed as ApprovalFlowNode[]
+    } catch {
+      flow = []
+    }
+    return {
+      id: row.id,
+      name: row.name,
+      version: Number(row.version) || 0,
+      scopeMode: row.scope_mode || '全部权限点',
+      roleMode: row.role_mode || '全部员工角色',
+      flow,
+    }
+  })
+}
+
 export function getApprovalWorkflow(db: Db, companyId: string, id: string): ApprovalWorkflowView {
   return readWorkflow(db, getWorkflowRow(db, companyId, id))
 }

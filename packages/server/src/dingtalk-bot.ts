@@ -10,7 +10,7 @@
  * 2. 不要求用户先输入姓名，组织问题交给 org.directory 工具从对话推断意图；
  * 3. 机器人可见文案统一用「EAB + 公司名」，不出现第三方项目名。
  */
-import { randomUUID } from 'node:crypto'
+import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
 import { SC, scopeAllows } from '@eab/domain'
 import { appendAudit, type Db } from '@eab/storage'
 import { consumeRobotUserFileSend } from './dingtalk-file-echo.js'
@@ -616,21 +616,64 @@ function pendingFileNote(deps: ServerDeps, sessionId: string): string {
   }
 }
 
+/** 钉钉 HTTP 回调签名：Base64(HMAC-SHA256(timestamp + "\n" + appSecret, appSecret))。 */
+export function verifyDingTalkCallbackSignature(input: {
+  timestamp: string
+  sign: string
+  appSecret: string
+  now?: number
+}): boolean {
+  const timestamp = input.timestamp.trim()
+  const sign = input.sign.trim()
+  if (!/^\d{10,13}$/.test(timestamp) || !sign || !input.appSecret) return false
+  const ts = Number(timestamp)
+  const now = input.now ?? Date.now()
+  const skew = Math.abs(now - ts)
+  if (!Number.isFinite(skew) || skew > 60 * 60 * 1000) return false
+  const expected = createHmac('sha256', input.appSecret).update(`${timestamp}\n${input.appSecret}`).digest('base64')
+  const a = Buffer.from(expected, 'utf8')
+  const b = Buffer.from(sign, 'utf8')
+  return a.length === b.length && timingSafeEqual(a, b)
+}
+
+/**
+ * 钉钉 sessionWebhook 只允许开放平台域名，且必须是 HTTPS、无账号信息。
+ * 机器人 access token 只会发往这里，避免被任意请求体 URL 带走。
+ */
+export function normalizeDingTalkSessionWebhook(raw: string): string {
+  let url: URL
+  try {
+    url = new URL(raw)
+  } catch {
+    throw new Error('sessionWebhook 不是合法 URL')
+  }
+  if (url.protocol !== 'https:') throw new Error('sessionWebhook 必须使用 HTTPS')
+  if (url.username || url.password) throw new Error('sessionWebhook 不允许携带账号信息')
+  const host = url.hostname.toLowerCase()
+  if (host !== 'oapi.dingtalk.com' && host !== 'api.dingtalk.com') {
+    throw new Error(`sessionWebhook 域名不在白名单：${host}`)
+  }
+  if (url.port && url.port !== '443') throw new Error('sessionWebhook 只允许 443 端口')
+  return url.toString()
+}
+
 /** sessionWebhook 回复（HTTP 回调/Stream 消息都带这个地址）。 */
 export async function replySessionWebhook(deps: ServerDeps, webhook: string, text: string): Promise<void> {
+  const target = normalizeDingTalkSessionWebhook(webhook)
   const cfg = dingTalkConfig(deps.db, deps.companyId)
   if (!cfg?.app_id || !cfg.secret_ref) throw new Error('钉钉渠道凭证不完整，无法回复')
   const secret = resolveSecret(deps.config.dbPath, cfg.secret_ref)
   if (!secret) throw new Error('钉钉 AppSecret 未配置或已失效')
   const token = await dingTalkAccessToken(cfg.app_id, secret)
   for (const chunk of splitText(text)) {
-    const response = await fetch(webhook, {
+    const response = await fetch(target, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
         'x-acs-dingtalk-access-token': token,
       },
       body: JSON.stringify({ msgtype: 'text', text: { content: chunk } }),
+      redirect: 'error',
       signal: AbortSignal.timeout(15000),
     })
     if (!response.ok) {

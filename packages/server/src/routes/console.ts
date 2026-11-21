@@ -27,7 +27,14 @@ import { resolveOrgSyncIntervalMs, syncChannelOrg, type ChannelProvider } from '
 import { dispatchPluginRpc } from '../plugin-host.js'
 import { hitRate } from '../backends/coordination.js'
 import { bumpHotVersion } from '../hot-cache.js'
-import { defaultPolicyView, isPermissionAdminRole } from '../permission-approvals.js'
+import {
+  decidePermissionRequest,
+  defaultPolicyView,
+  getPermissionRequest,
+  isPermissionAdminRole,
+  listCompanyPermissionRequests,
+} from '../permission-approvals.js'
+import { refreshPermissionApprovalCards } from '../permission-approval-dingtalk.js'
 import {
   deleteApprovalWorkflow,
   getApprovalWorkflow,
@@ -634,6 +641,76 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
       })),
       defaultPolicy: defaultPolicyView(deps.db, companyId),
     })
+  })
+
+  app.get<{ Querystring: { mode?: string } }>('/api/console/permission-requests', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const rawMode = String(req.query?.mode ?? 'all').toLowerCase()
+    const mode: 'todo' | 'done' | 'all' = rawMode === 'todo' ? 'todo' : rawMode === 'done' ? 'done' : 'all'
+    const registry = SCOPE_REGISTRY as unknown as Record<string, { label?: string }>
+    const requests = listCompanyPermissionRequests(deps.db, companyId, mode).map((view) => {
+      const person = deps.db
+        .prepare(
+          `SELECT u.title, d.name AS dept_name
+             FROM users u
+             LEFT JOIN departments d ON d.id = u.dept_id
+            WHERE u.id = ?
+            LIMIT 1`,
+        )
+        .get(view.requesterUserId) as { title: string | null; dept_name: string | null } | undefined
+      const current = view.steps.find((step) => step.stepNo === view.currentStep) ?? null
+      return {
+        ...view,
+        requesterTitle: person?.title ?? '',
+        requesterDept: person?.dept_name ?? '',
+        currentNode: current ? `第 ${current.stepNo} 步 · ${current.approverName}` : '已完成',
+        scopeLabels: view.scopes.map((scope) => registry[scope]?.label ?? scope),
+      }
+    })
+    return ok({ mode, requests })
+  })
+
+  app.post<{
+    Params: { id: string }
+    Body: { stepNo?: number; decision?: string; comment?: string }
+  }>('/api/console/permission-requests/:id/decide', async (req) => {
+    requireConsole(req, deps)
+    const actor = resolveActor(deps.db, deps.config, req)
+    const companyId = actor.person.companyId
+    const view = getPermissionRequest(deps.db, companyId, req.params.id)
+    if (!view) throw new EabError(EC.NOT_FOUND, '审批申请不存在')
+    const decision = String(req.body?.decision ?? '').toLowerCase()
+    if (decision !== 'approve' && decision !== 'reject') {
+      throw new EabError(EC.VALIDATION, 'decision 只能是 approve / reject')
+    }
+    const platformOverride = actor.person.id === CONSOLE_OPERATOR_ID
+    const stepNo = req.body?.stepNo === undefined ? view.currentStep : Number(req.body.stepNo)
+    const result = decidePermissionRequest(deps.db, actor, {
+      requestId: view.id,
+      stepNo,
+      decision,
+      comment: String(req.body?.comment ?? ''),
+      platformOverride,
+      eventKey: platformOverride
+        ? `console:${view.id}:${stepNo}:${decision}:${String(req.body?.comment ?? '').slice(0, 40)}`
+        : undefined,
+    })
+    appendAudit(deps.db, {
+      companyId,
+      actorUserId: actor.person.id,
+      action: 'permission.request.decide',
+      resourceType: 'permission_request',
+      resourceId: view.id,
+      result: 'success',
+      detail: { decision, stepNo, platformOverride },
+      ip: req.ip ?? null,
+      channel: 'console',
+    })
+    void refreshPermissionApprovalCards(deps, result.id).catch((error) => {
+      console.warn('[eab] 控制台审批后刷新卡片失败：', (error as Error).message)
+    })
+    return ok({ request: result })
   })
 
   app.post<{
@@ -5988,9 +6065,25 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
       const token = String((req.query as { token?: string } | undefined)?.token ?? '')
       if (!token) throw new EabError(EC.FORBIDDEN, '缺少回调 token')
       const row = deps.db
-        .prepare('SELECT callback_token, company_id FROM channel_configs WHERE provider = ? AND callback_token = ?')
-        .get(provider, token) as { callback_token: string; company_id: string } | undefined
+        .prepare('SELECT callback_token, company_id, secret_ref FROM channel_configs WHERE provider = ? AND callback_token = ?')
+        .get(provider, token) as { callback_token: string; company_id: string; secret_ref: string | null } | undefined
       if (!row) throw new EabError(EC.FORBIDDEN, '回调 token 不匹配')
+
+      if (provider === 'dingtalk') {
+        const headerOf = (name: string): string => {
+          const value = req.headers[name]
+          return Array.isArray(value) ? String(value[0] ?? '') : String(value ?? '')
+        }
+        const timestamp = headerOf('timestamp')
+        const sign = headerOf('sign')
+        if (!timestamp || !sign) throw new EabError(EC.FORBIDDEN, '钉钉回调缺少 timestamp/sign 签名')
+        const appSecret = row.secret_ref ? resolveSecret(deps.config.dbPath, row.secret_ref) : ''
+        if (!appSecret) throw new EabError(EC.FORBIDDEN, '钉钉渠道 AppSecret 未配置')
+        const { verifyDingTalkCallbackSignature } = await import('../dingtalk-bot.js')
+        if (!verifyDingTalkCallbackSignature({ timestamp, sign, appSecret })) {
+          throw new EabError(EC.FORBIDDEN, '钉钉回调签名校验失败')
+        }
+      }
 
       const body = req.body ?? {}
       if (provider === 'feishu' && body.type === 'url_verification') {
@@ -6073,10 +6166,19 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
           createAt?: number
         }
         const sessionWebhook = typeof payload.sessionWebhook === 'string' ? payload.sessionWebhook : ''
+        let safeWebhook = ''
+        if (sessionWebhook) {
+          try {
+            const { normalizeDingTalkSessionWebhook } = await import('../dingtalk-bot.js')
+            safeWebhook = normalizeDingTalkSessionWebhook(sessionWebhook)
+          } catch (error) {
+            console.warn('[eab] 钉钉 sessionWebhook 被拒绝：', (error as Error).message)
+          }
+        }
         void import('../dingtalk-bot.js')
           .then(async (bot) => {
             const result = await bot.handleDingTalkMessage(deps, payload, { dedupe: false })
-            if (result.text && sessionWebhook) await bot.replySessionWebhook(deps, sessionWebhook, result.text)
+            if (result.text && safeWebhook) await bot.replySessionWebhook(deps, safeWebhook, result.text)
             return result
           })
           .catch((error) => console.warn('[eab] 钉钉回调处理失败：', (error as Error).message))

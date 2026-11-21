@@ -82,7 +82,7 @@ function externalUserIdOf(deps: ServerDeps, companyId: string, userId: string): 
     .prepare(
       `SELECT external_user_id FROM user_identities
         WHERE provider = 'dingtalk' AND user_id = ?
-        ORDER BY created_at DESC LIMIT 1`,
+        ORDER BY bound_at DESC LIMIT 1`,
     )
     .get(userId) as { external_user_id: string } | undefined
   if (identity?.external_user_id) return identity.external_user_id

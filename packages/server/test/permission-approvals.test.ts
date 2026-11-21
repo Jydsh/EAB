@@ -1,13 +1,15 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import type { Scope } from '@eab/domain'
 import { migrate, openDatabase, type Db } from '@eab/storage'
-import { actorFor } from '../src/session.js'
+import { actorFor, consoleActor } from '../src/session.js'
+import { publishApprovalWorkflow, saveApprovalWorkflow } from '../src/approval-workflows.js'
 import {
   cancelPermissionRequest,
   createPermissionRequest,
   decidePermissionRequest,
   expirePermissionRequests,
   getPermissionRequest,
+  listCompanyPermissionRequests,
   listCurrentRoles,
   listPermissionRequests,
   listRequestableRoles,
@@ -384,5 +386,112 @@ describe('多级权限审批', () => {
     expect(() => createPermissionRequest(db, actorOf(db, 'u1'), {
       scopeCodes: ['kb:admin', 'audit:read'],
     })).toThrow(/审批策略不一致/)
+  })
+
+  it('平台控制台兜底审批按真实审批人落库，并能按公司列出待处理/全部', () => {
+    const db = testDb()
+    const created = createPermissionRequest(db, actorOf(db, 'u1'), { roleCode: 'auditor' })
+    expect(listCompanyPermissionRequests(db, 'c1', 'todo').map((item) => item.id)).toContain(created.id)
+    const decided = decidePermissionRequest(db, consoleActor(db, 'c1'), {
+      requestId: created.id,
+      decision: 'approve',
+      platformOverride: true,
+      eventKey: 'console-test-override',
+    })
+    expect(decided.currentStep).toBe(2)
+    expect(decided.steps[0]?.status).toBe('approved')
+    const decision = db
+      .prepare(`SELECT approver_user_id FROM permission_request_decisions WHERE request_id = ?`)
+      .get(created.id) as { approver_user_id: string }
+    expect(decision.approver_user_id).toBe('u2')
+    expect(listCompanyPermissionRequests(db, 'c1', 'all').map((item) => item.id)).toContain(created.id)
+  })
+
+  it('已发布的自定义流程会按节点顺序生成审批步骤', () => {
+    const db = testDb()
+    const workflow = saveApprovalWorkflow(db, 'c1', 'tester', {
+      name: '导出权限两级审批',
+      scopeMode: '按权限点',
+      roleMode: '全部员工角色',
+      flow: [
+        { id: 'start', kind: 'start', title: '发起申请' },
+        {
+          id: 'a_lead',
+          kind: 'approval',
+          title: '直属负责人',
+          meta: '或签',
+          source: 'members',
+          approvers: [{ id: 'u2', name: 'u2' }],
+        },
+        {
+          id: 'a_owner',
+          kind: 'approval',
+          title: '公司管理员复核',
+          meta: '依次审批',
+          source: 'members',
+          approvers: [{ id: 'u3', name: 'u3' }],
+        },
+        { id: 'end', kind: 'end', title: '结束' },
+      ],
+    })
+    publishApprovalWorkflow(db, 'c1', 'tester', workflow.id)
+
+    const created = createPermissionRequest(db, actorOf(db, 'u1'), {
+      scopeCodes: ['audit:export'],
+      roleCode: 'member',
+    })
+    expect(created.totalSteps).toBe(2)
+    expect(created.steps.map((step) => step.approverUserId)).toEqual(['u2', 'u3'])
+    expect(created.steps.map((step) => step.status)).toEqual(['active', 'pending'])
+  })
+
+  it('自由连线流程按条件出线选择审批分支', () => {
+    const db = testDb()
+    const workflow = saveApprovalWorkflow(db, 'c1', 'tester', {
+      name: '高危权限分流审批',
+      scopeMode: '按权限点',
+      roleMode: '全部员工角色',
+      flow: [
+        { id: 'start', kind: 'start', title: '发起申请', nextIds: ['cond_risk'] },
+        {
+          id: 'cond_risk',
+          kind: 'condition',
+          title: '是否高危',
+          nextIds: ['a_high', 'a_low'],
+          edgeLabels: { a_high: '包含高危权限', a_low: '仅普通权限' },
+          edgeRules: {
+            a_high: { field: 'scopeRisk', op: 'eq', value: 'high' },
+            a_low: { field: 'else', op: 'eq', value: '' },
+          },
+        },
+        {
+          id: 'a_high',
+          kind: 'approval',
+          title: '高危审批',
+          meta: '或签',
+          source: 'members',
+          approvers: [{ id: 'u3', name: 'u3' }],
+          nextIds: ['end'],
+        },
+        {
+          id: 'a_low',
+          kind: 'approval',
+          title: '普通审批',
+          meta: '或签',
+          source: 'members',
+          approvers: [{ id: 'u2', name: 'u2' }],
+          nextIds: ['end'],
+        },
+        { id: 'end', kind: 'end', title: '结束' },
+      ],
+    })
+    publishApprovalWorkflow(db, 'c1', 'tester', workflow.id)
+
+    const created = createPermissionRequest(db, actorOf(db, 'u1'), {
+      scopeCodes: ['audit:export'],
+      roleCode: 'member',
+    })
+    expect(created.totalSteps).toBe(1)
+    expect(created.steps.map((step) => step.approverUserId)).toEqual(['u3'])
   })
 })

@@ -194,6 +194,8 @@ const state = {
   approvalRecordTab: 'todo',
   approvalRecordId: '',
   approvalRecordQuery: '',
+  approvalRecords: [],
+  approvalRecordBusy: '',
   approvalCatalogQuery: '',
   approvalCatalogFilter: 'all',
   /** 插件页：当前选中的插件、详情标签、当前页面 */
@@ -6646,6 +6648,7 @@ const APPROVAL_STATUS_META = {
   approved: { label: '已通过', cls: 'approved' },
   rejected: { label: '已拒绝', cls: 'rejected' },
   expired: { label: '已超时', cls: 'expired' },
+  cancelled: { label: '已撤回', cls: 'cancelled' },
 }
 
 const APPROVAL_NODE_META = {
@@ -8680,44 +8683,74 @@ function approvalDesignHtml() {
   </div>`
 }
 
+function approvalTimeText(value) {
+  const ts = Number(value)
+  if (!Number.isFinite(ts) || ts <= 0) return '—'
+  const date = new Date(ts)
+  const now = new Date()
+  const pad = (n) => String(n).padStart(2, '0')
+  const hm = `${pad(date.getHours())}:${pad(date.getMinutes())}`
+  if (date.toDateString() === now.toDateString()) return `今天 ${hm}`
+  const yesterday = new Date(now.getTime() - 24 * 3600 * 1000)
+  if (date.toDateString() === yesterday.toDateString()) return `昨天 ${hm}`
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${hm}`
+}
+
+function approvalRecordsFromApi(requests) {
+  if (!Array.isArray(requests)) return []
+  return requests.map((item) => ({
+    id: String(item.id ?? ''),
+    requester: String(item.requesterName ?? ''),
+    dept: String(item.requesterDept ?? ''),
+    role: String(item.requesterTitle || (item.requestType === 'role' ? item.roleName : '权限点申请') || ''),
+    scopes: Array.isArray(item.scopeLabels) && item.scopeLabels.length
+      ? item.scopeLabels.map(String)
+      : Array.isArray(item.scopes) ? item.scopes.map(String) : [],
+    status: String(item.status ?? 'pending'),
+    submittedAt: approvalTimeText(item.createdAt),
+    createdAt: Number(item.createdAt) || 0,
+    currentNode: String(item.currentNode ?? ''),
+    progress: Number(item.currentStep) || 0,
+    totalSteps: Number(item.totalSteps) || 0,
+    todo: item.status === 'pending',
+    mine: false,
+    reason: String(item.reason ?? ''),
+    requestType: item.requestType === 'role' ? 'role' : 'scope',
+    roleName: String(item.roleName ?? ''),
+    durationHours: Number(item.durationHours) || 0,
+    requestDeadline: Number(item.requestDeadline) || 0,
+    steps: Array.isArray(item.steps) ? item.steps : [],
+  }))
+}
+
 function approvalRecordsOf() {
-  if (!Array.isArray(state.approvalRecords) || !state.approvalRecords.length) {
-    state.approvalRecords = [
-      { id: 'AP-20261119-014', requester: '张辉权', dept: '技术部', role: '普通员工', scopes: ['知识库导出', '智能体工具调用'], status: 'pending', submittedAt: '今天 10:12', currentNode: '部门负责人审批', progress: 1, todo: true, mine: false },
-      { id: 'AP-20261119-013', requester: '李鹏', dept: '信息中心', role: '公司管理员', scopes: ['成员资料编辑', '角色权限配置'], status: 'pending', submittedAt: '今天 09:48', currentNode: '平台超管复核', progress: 2, todo: false, mine: true },
-      { id: 'AP-20261119-011', requester: '王雪', dept: '市场部', role: '普通员工', scopes: ['知识库导出'], status: 'approved', submittedAt: '今天 08:35', currentNode: '已完成', progress: 3, todo: false, mine: false },
-      { id: 'AP-20261118-008', requester: '陈默', dept: '运维部', role: '部门管理员', scopes: ['外部数据源连接'], status: 'rejected', submittedAt: '昨天 16:20', currentNode: '公司管理员终审', progress: 2, todo: false, mine: false },
-      { id: 'AP-20261118-006', requester: '赵一鸣', dept: '产品部', role: '普通员工', scopes: ['智能体创建', '知识库编辑'], status: 'expired', submittedAt: '昨天 14:02', currentNode: '部门负责人审批超时', progress: 1, todo: false, mine: false },
-      { id: 'AP-20261117-003', requester: '李鹏', dept: '信息中心', role: '公司管理员', scopes: ['审计日志查看'], status: 'approved', submittedAt: '11-17 17:10', currentNode: '已完成', progress: 3, todo: false, mine: true },
-    ]
-  }
-  return state.approvalRecords
+  return Array.isArray(state.approvalRecords) ? state.approvalRecords : []
 }
 
 function approvalRecordsHtml() {
   const records = approvalRecordsOf()
   const tabs = [
-    { id: 'todo', label: '待我审批', count: records.filter((item) => item.todo && item.status === 'pending').length },
-    { id: 'mine', label: '我发起的', count: records.filter((item) => item.mine).length },
+    { id: 'todo', label: '待处理', count: records.filter((item) => item.status === 'pending').length },
+    { id: 'done', label: '已结束', count: records.filter((item) => item.status !== 'pending').length },
     { id: 'all', label: '全部记录', count: records.length },
   ]
   const tab = tabs.find((item) => item.id === state.approvalRecordTab) || tabs[0]
   const filtered = records.filter((item) => {
-    if (tab.id === 'todo') return item.todo && item.status === 'pending'
-    if (tab.id === 'mine') return item.mine
+    if (tab.id === 'todo') return item.status === 'pending'
+    if (tab.id === 'done') return item.status !== 'pending'
     return true
   })
   const selected = filtered.find((item) => item.id === state.approvalRecordId) || null
   const pendingCount = records.filter((item) => item.status === 'pending').length
   const approvedCount = records.filter((item) => item.status === 'approved').length
-  const todayCount = records.filter((item) => String(item.submittedAt).startsWith('今天')).length
+  const todayCount = records.filter((item) => approvalTimeText(item.createdAt).startsWith('今天')).length
   return `<div class="ap-records${selected ? ' has-detail' : ''}">
     <div class="ap-records-main">
       <div class="ap-stat-row">
-        <div class="ap-stat"><span>今日申请</span><strong>${todayCount}</strong><small>较昨日 +2</small></div>
-        <div class="ap-stat"><span>审批中</span><strong>${pendingCount}</strong><small>平均 6.2 小时</small></div>
-        <div class="ap-stat"><span>已通过</span><strong>${approvedCount}</strong><small>本周通过率 82%</small></div>
-        <div class="ap-stat"><span>超时</span><strong>${records.filter((item) => item.status === 'expired').length}</strong><small>自动提醒申请人</small></div>
+        <div class="ap-stat"><span>今日申请</span><strong>${todayCount}</strong><small>创建于今天</small></div>
+        <div class="ap-stat"><span>审批中</span><strong>${pendingCount}</strong><small>当前步骤待处理</small></div>
+        <div class="ap-stat"><span>已通过</span><strong>${approvedCount}</strong><small>含历史通过</small></div>
+        <div class="ap-stat"><span>超时</span><strong>${records.filter((item) => item.status === 'expired').length}</strong><small>系统自动关闭</small></div>
       </div>
       <div class="ap-filter-row">
         <div class="ap-tabs">${tabs.map((item) => `<button type="button" class="ap-tab${tab.id === item.id ? ' is-active' : ''}" data-ap-record-tab="${esc(item.id)}">${esc(item.label)}<span>${item.count}</span></button>`).join('')}</div>
@@ -8738,30 +8771,51 @@ function approvalRecordsHtml() {
           </tbody>
         </table>
       </div>
-      <div class="ap-table-foot"><span>展示 ${filtered.length} 条 · 示例数据</span><span>所有审批结果都会通知申请人</span></div>
+      <div class="ap-table-foot"><span>展示 ${filtered.length} 条 · 共 ${records.length} 条真实审批记录</span><span>${pendingCount ? `${pendingCount} 条待处理` : '没有待处理申请'}</span></div>
     </div>
     ${selected ? approvalRecordDetailHtml(selected) : ''}
   </div>`
 }
 
 function approvalRecordDetailHtml(record) {
-  const step2Done = record.progress >= 2
-  const step2Active = record.status === 'pending' && record.progress === 1
-  const step2Desc = record.status === 'rejected' && !step2Done
-    ? '已拒绝 · 权限范围过大'
-    : record.status === 'expired'
-      ? '已超时 · 系统提醒'
-      : step2Done
-        ? '已通过 · 8 分钟'
-        : step2Active
-          ? '等待审批 · 已等待 3 小时'
-          : '等待上一节点'
+  const showSteps = Array.isArray(record.steps) && record.steps.length
+    ? record.steps.map((step) => ({
+        title: `第 ${step.stepNo} 步 · ${step.approverName || '审批人'}`,
+        desc:
+          step.status === 'approved'
+            ? `已通过${step.decidedAt ? ` · ${approvalTimeText(step.decidedAt)}` : ''}`
+            : step.status === 'rejected'
+              ? '已拒绝'
+              : step.status === 'skipped'
+                ? '已跳过'
+                : step.status === 'active'
+                  ? '等待审批'
+                  : '等待上一节点',
+        done: step.status === 'approved',
+        active: step.status === 'active',
+      }))
+    : []
   const steps = [
-    { title: '提交申请', desc: `${record.requester} · ${record.submittedAt}`, done: true },
-    { title: '部门负责人审批', desc: step2Desc, done: step2Done, active: step2Active },
-    { title: '公司管理员终审', desc: record.progress >= 3 ? '已通过' : record.status === 'rejected' ? '已拒绝' : '等待上一节点', done: record.progress >= 3 },
-    { title: '个人权限生效', desc: record.status === 'approved' ? '已写入本人权限' : '审批通过后写入', done: record.status === 'approved' },
+    { title: '提交申请', desc: `${record.requester} · ${record.submittedAt}`, done: true, active: false },
+    ...showSteps,
+    {
+      title: '个人权限生效',
+      desc: record.status === 'approved' ? '已写入申请人权限' : '审批通过后写入',
+      done: record.status === 'approved',
+      active: false,
+    },
   ]
+  const lastComment = [...(record.steps || [])].reverse().find((step) => String(step.comment || '').trim())
+  const opinion = lastComment
+    ? String(lastComment.comment)
+    : record.status === 'pending'
+      ? '暂无审批意见，等待当前节点处理。'
+      : record.status === 'rejected'
+        ? '申请未通过，申请人可拆分权限后重新提交。'
+        : record.status === 'expired'
+          ? '审批超时，系统已关闭本次申请。'
+          : record.reason || '审批已完成。'
+  const busy = state.approvalRecordBusy === record.id
   return `<aside class="ap-detail">
     <div class="ap-detail-head">
       <div><span>申请详情</span><strong class="ap-mono">${esc(record.id)}</strong></div>
@@ -8769,18 +8823,21 @@ function approvalRecordDetailHtml(record) {
     </div>
     <div class="ap-detail-body">
       <div class="ap-detail-hero">
-        <div><strong>${esc(record.requester)}</strong><span>${esc(record.dept)} · ${esc(record.role)}</span></div>
+        <div><strong>${esc(record.requester)}</strong><span>${esc(record.dept || '未归属部门')} · ${esc(record.role || '公司成员')}</span></div>
         ${approvalStatusPill(record.status)}
       </div>
       <div class="ap-detail-section"><span>申请权限</span><div class="ap-detail-scopes">${record.scopes.map((scope) => `<span>${esc(scope)}</span>`).join('')}</div></div>
-      <div class="ap-detail-section"><span>授权方式</span><div class="ap-detail-note">仅授予申请人本人，不改动角色；有效期 7 天。</div></div>
+      <div class="ap-detail-section"><span>授权方式</span><div class="ap-detail-note">仅授予申请人本人，不改动角色；有效期 ${esc(String(record.durationHours || 0))} 小时。</div></div>
+      <div class="ap-detail-section"><span>申请原因</span><div class="ap-detail-quote">${esc(record.reason || '未填写申请原因。')}</div></div>
       <div class="ap-detail-section"><span>审批进度</span>
         <div class="ap-timeline">${steps.map((step) => `<div class="ap-timeline-step${step.done ? ' is-done' : ''}${step.active ? ' is-active' : ''}"><i></i><div><strong>${esc(step.title)}</strong><small>${esc(step.desc)}</small></div></div>`).join('')}</div>
       </div>
-      <div class="ap-detail-section"><span>审批意见</span><div class="ap-detail-quote">${record.status === 'pending' ? '暂无审批意见，等待当前节点处理。' : record.status === 'rejected' ? '申请范围超出岗位职责，请拆分后重新提交。' : record.status === 'expired' ? '审批超时，系统已通知申请人重新提交。' : '权限用途明确，同意在有效期内使用。'}</div></div>
+      <div class="ap-detail-section"><span>审批意见</span><div class="ap-detail-quote">${esc(opinion)}</div></div>
     </div>
     <div class="ap-detail-foot">
-      ${record.status === 'pending' && record.todo ? `<button type="button" class="btn" data-ap-record-reject>拒绝</button><button type="button" class="btn primary" data-ap-record-approve>同意</button>` : '<span class="muted">该记录已结束</span>'}
+      ${record.status === 'pending' && record.todo
+        ? `<button type="button" class="btn" data-ap-record-reject${busy ? ' disabled' : ''}>${busy ? '处理中…' : '拒绝'}</button><button type="button" class="btn primary" data-ap-record-approve${busy ? ' disabled' : ''}>${busy ? '处理中…' : '同意'}</button>`
+        : '<span class="muted">该记录已结束</span>'}
     </div>
   </aside>`
 }
@@ -9240,13 +9297,23 @@ function bindApprovalPage() {
     if (event.target.closest('[data-ap-record-approve]') || event.target.closest('[data-ap-record-reject]')) {
       const approve = Boolean(event.target.closest('[data-ap-record-approve]'))
       const record = approvalRecordsOf().find((item) => item.id === state.approvalRecordId)
-      if (record) {
-        record.status = approve ? 'approved' : 'rejected'
-        record.currentNode = approve ? '已完成' : '已拒绝'
-        record.progress = approve ? 3 : Math.max(1, record.progress)
-        record.todo = false
+      if (!record || state.approvalRecordBusy) return
+      state.approvalRecordBusy = record.id
+      approvalRerender()
+      try {
+        await apiPost(`/api/console/permission-requests/${encodeURIComponent(record.id)}/decide`, {
+          decision: approve ? 'approve' : 'reject',
+          stepNo: record.progress,
+          comment: '',
+        })
+        await loadApprovalRecords()
+        state.approvalRecordBusy = ''
         approvalRerender()
         showTopToast(approve ? '已同意申请，权限将授予申请人本人' : '已拒绝申请，申请人会收到通知')
+      } catch (err) {
+        state.approvalRecordBusy = ''
+        approvalRerender()
+        alert(err.message)
       }
       return
     }
@@ -9941,20 +10008,26 @@ function bindApprovalPage() {
   if (template) approvalScheduleCanvasView(template)
 }
 
+async function loadApprovalRecords() {
+  const data = await api('/api/console/permission-requests?mode=all')
+  state.approvalRecords = approvalRecordsFromApi(data.requests)
+}
+
 /**
  * 管理端权限审批工作台：流程设计 / 审批记录 / 权限目录。
  *
  * 权限目录、角色、默认审批链、流程模板与版本都来自真实控制台接口；
- * 审批记录仍使用示例数据，等待运行时接入。
+ * 审批记录与同意/拒绝也走真实权限审批接口，不再填充示例数据。
  */
 async function loadPermissionPolicies() {
   const view = $('#view')
   renderLoading(view)
   setSide('', true)
   try {
-    const [data, workflowData] = await Promise.all([
+    const [data, workflowData, recordData] = await Promise.all([
       api('/api/console/permission-policies'),
       api('/api/console/approval-workflows'),
+      api('/api/console/permission-requests?mode=all'),
     ])
     state.approvalData = {
       policies: data.policies ?? [],
@@ -9963,6 +10036,7 @@ async function loadPermissionPolicies() {
       defaultPolicy: data.defaultPolicy ?? null,
     }
     state.approvalTemplates = workflowData.workflows ?? []
+    state.approvalRecords = approvalRecordsFromApi(recordData.requests)
     if (!state.approvalTemplates.some((item) => item.id === state.approvalTemplateId)) {
       state.approvalTemplateId = state.approvalTemplates[0]?.id || ''
     }

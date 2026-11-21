@@ -17,6 +17,7 @@ import { startPermissionApprovalCardRetry } from './permission-approval-dingtalk
 import { refreshFeishuStream, startFeishuStreamMonitor, stopFeishuStream } from './feishu-bot.js'
 import { cleanupTemp } from './routes/workspace.js'
 import { loadConfig } from './config.js'
+import { hardenRuntimeDir } from './runtime-permissions.js'
 import { COMPANY_ID, COMPANY_NAME, ensureDemoData, ensureDemoPasswords, ensureModelCatalog } from './dev-seed.js'
 import {
   applyPendingStorageMigrations,
@@ -249,7 +250,8 @@ console.log('[eab:boot] 演示配置检查完成')
  */
 let adminPassword = config.adminPassword
 let adminPasswordSource: 'env' | 'auto' = adminPassword ? 'env' : 'auto'
-const credentialsPath = join(config.dbDir ?? dirname(config.dbPath), 'admin-credentials.txt')
+const runtimeDir = config.dbDir ?? dirname(config.dbPath)
+const credentialsPath = join(runtimeDir, 'admin-credentials.txt')
 if (!adminPassword && existsSync(credentialsPath)) {
   // 自动生成的密码要跨重启保持不变，否则每次重启运维都得重新找密码
   const text = readFileSync(credentialsPath, 'utf8')
@@ -264,8 +266,17 @@ if (!adminPassword) {
       `username=${config.adminUser}\n` +
       `password=${adminPassword}\n` +
       `# 改密码：设置环境变量 EAB_ADMIN_PASSWORD 后重启；不要让这个文件进版本库\n`,
-    'utf8',
+    { encoding: 'utf8', mode: 0o600 },
   )
+}
+/**
+ * 运行目录里有数据库、密钥、控制台口令和历史日志。Windows 继承 ACL 默认
+ * 允许本机 Users 读取，必须在这里统一收紧；失败不阻断启动，但明确告警。
+ */
+try {
+  hardenRuntimeDir(runtimeDir)
+} catch (error) {
+  console.warn('[eab] 运行目录权限收紧失败：', (error as Error).message)
 }
 
 /** 解析后的口令要进入 config：身份解析（session.ts）靠它识别控制台操作员 */
@@ -558,7 +569,7 @@ if (accessHost !== config.host) {
 }
 console.log(`  控制台账号      →  ${config.adminUser}`)
 if (adminPasswordSource === 'auto') {
-  console.log(`  控制台密码(自动) →  ${adminPassword}  （写在 .eab-dev/admin-credentials.txt）`)
+  console.log('  控制台密码(自动) →  已写入运行目录的 admin-credentials.txt（不再打印明文）')
 } else {
   console.log('  控制台密码      →  来自 EAB_ADMIN_PASSWORD')
 }

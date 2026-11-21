@@ -7,9 +7,10 @@
  * 3. 文件写入用 0600 权限，目录不存在先建；
  * 4. 控制台接口只返回"是否已配置"，不回显值。
  */
-import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
+import { hardenRuntimePath } from './runtime-permissions.js'
 
 type SecretFile = Record<string, string>
 
@@ -47,9 +48,10 @@ function writeSecretFile(file: string, value: SecretFile): void {
   }
   writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
   try {
-    chmodSync(file, 0o600)
+    hardenRuntimePath(file)
+    hardenRuntimePath(backupPath(file))
   } catch {
-    /* Windows 上 chmod 只是尽力而为 */
+    /* 权限收紧失败不应让密钥写入失败；启动时还会再收紧运行目录 */
   }
 }
 

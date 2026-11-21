@@ -14,6 +14,7 @@ import { ulid } from '@eab/domain'
 import { EC, EabError, SCOPE_REGISTRY, isKnownScope, scopeAllows, type Scope } from '@eab/domain'
 import { withTransaction, type Db } from '@eab/storage'
 import { actorFor, roleCodesOf, type RequestActor } from './session.js'
+import { listPublishedApprovalFlows, type ApprovalFlowNode, type PublishedApprovalFlow } from './approval-workflows.js'
 
 const ADMIN_ROLE_CODES = new Set([
   'super_admin',
@@ -472,7 +473,14 @@ function planSteps(
   requester: RequestActor,
   policy: PermissionPolicyView,
   policyRows: PolicyRow[],
+  scopes: string[],
 ): ManagedPerson[] {
+  const workflow = matchPublishedWorkflow(db, companyId, scopes)
+  if (workflow) {
+    const fromFlow = planStepsFromWorkflow(db, companyId, requester, policy, policyRows, workflow, scopes)
+    if (fromFlow.length > 0) return fromFlow
+  }
+
   const chain = managerCandidates(db, companyId, requester, policy, policyRows)
     .slice(0, policy.maxLevels)
   if (chain.length === 0) {
@@ -481,6 +489,251 @@ function planSteps(
     })
   }
   return chain
+}
+
+interface WorkflowMatchContext {
+  sensitive: boolean
+  roleCodes: string[]
+  deptName: string
+}
+
+function workflowContext(db: Db, requester: RequestActor, scopes: string[]): WorkflowMatchContext {
+  return {
+    sensitive: scopes.some((scope) => Boolean(SCOPE_REGISTRY[scope as Scope]?.dangerous)),
+    roleCodes: roleCodesOf(db, requester.person.id),
+    deptName: requester.person.deptName || '',
+  }
+}
+
+/** 没有显式“模板→权限点”映射表时，按模板声明的范围模式做保守匹配。 */
+/** 内置示例模板只用于设计器演示，不参与运行时匹配，避免覆盖现有权限策略链。 */
+const SEED_WORKFLOW_IDS = new Set(['awf_default', 'awf_sensitive', 'awf_dept_custom'])
+
+function matchPublishedWorkflow(db: Db, companyId: string, scopes: string[]): PublishedApprovalFlow | null {
+  const workflows = listPublishedApprovalFlows(db, companyId)
+    .filter((workflow) => !SEED_WORKFLOW_IDS.has(workflow.id))
+  if (workflows.length === 0) return null
+  const sensitive = scopes.some((scope) => Boolean(SCOPE_REGISTRY[scope as Scope]?.dangerous))
+  const preferredScopeMode = sensitive ? '按权限点' : '全部权限点'
+  const matched = workflows.find((workflow) => workflow.scopeMode === preferredScopeMode)
+  if (matched) return matched
+  return workflows.find((workflow) => workflow.scopeMode === '全部权限点') ?? workflows[0] ?? null
+}
+
+function flattenFlowNodes(nodes: ApprovalFlowNode[], out: ApprovalFlowNode[] = []): ApprovalFlowNode[] {
+  for (const node of nodes) {
+    if (!node || typeof node !== 'object') continue
+    out.push(node)
+    if (Array.isArray(node.branches)) {
+      for (const branch of node.branches) {
+        if (Array.isArray(branch?.nodes)) flattenFlowNodes(branch.nodes, out)
+      }
+    }
+  }
+  return out
+}
+
+function ruleMatches(
+  rule: { field?: string; op?: string; value?: string } | undefined,
+  ctx: WorkflowMatchContext,
+): boolean {
+  if (!rule?.field) return false
+  const value = String(rule.value ?? '').trim()
+  if (rule.field === 'else') return true
+  if (rule.field === 'scopeRisk') {
+    if (value === 'high') return ctx.sensitive
+    if (value === 'low') return !ctx.sensitive
+    return false
+  }
+  if (rule.field === 'role') {
+    if (!value) return false
+    return ctx.roleCodes.some((code) => code === value || code.includes(value))
+  }
+  if (rule.field === 'dept') {
+    if (!value) return false
+    return ctx.deptName.includes(value)
+  }
+  return false
+}
+
+function branchMatchesLabel(label: string, ctx: WorkflowMatchContext): boolean {
+  const text = label.trim()
+  if (!text) return false
+  if (/高危|管理类|敏感/.test(text)) return ctx.sensitive
+  if (/普通|低危/.test(text)) return !ctx.sensitive
+  return false
+}
+
+function pickLegacyBranch(node: ApprovalFlowNode, ctx: WorkflowMatchContext): ApprovalFlowNode[] {
+  const branches = Array.isArray(node.branches) ? node.branches : []
+  const byRule = branches.find((branch) => ruleMatches(branch.rule, ctx))
+  if (byRule) return Array.isArray(byRule.nodes) ? byRule.nodes : []
+  const byLabel = branches.find((branch) => branchMatchesLabel(String(branch.label ?? ''), ctx))
+  if (byLabel) return Array.isArray(byLabel.nodes) ? byLabel.nodes : []
+  const fallback = branches.find((branch) => branch.rule?.field === 'else') ?? branches[0]
+  return fallback && Array.isArray(fallback.nodes) ? fallback.nodes : []
+}
+
+function pickExplicitNext(
+  node: ApprovalFlowNode,
+  nodesById: Map<string, ApprovalFlowNode>,
+  ctx: WorkflowMatchContext,
+): string | null {
+  const nextIds = Array.isArray(node.nextIds) ? node.nextIds.map(String).filter(Boolean) : []
+  if (nextIds.length === 0) return null
+  for (const target of nextIds) {
+    const rule = node.edgeRules?.[target]
+    if (rule && ruleMatches(rule, ctx)) return target
+  }
+  for (const target of nextIds) {
+    const label = String(node.edgeLabels?.[target] ?? '')
+    if (label && branchMatchesLabel(label, ctx)) return target
+  }
+  const elseTarget = nextIds.find((target) => node.edgeRules?.[target]?.field === 'else')
+  if (elseTarget) return elseTarget
+  return nodesById.has(nextIds[0]) ? nextIds[0] : null
+}
+
+function collectWorkflowApprovalNodes(
+  workflow: PublishedApprovalFlow,
+  ctx: WorkflowMatchContext,
+): ApprovalFlowNode[] {
+  const all = flattenFlowNodes(workflow.flow)
+  const byId = new Map(all.map((node) => [String(node.id ?? ''), node]))
+  const explicit = all.some((node) => Array.isArray(node.nextIds))
+
+  if (!explicit) {
+    const result: ApprovalFlowNode[] = []
+    const visitList = (nodes: ApprovalFlowNode[]): void => {
+      for (const node of nodes) {
+        if (!node || typeof node !== 'object') continue
+        if (node.kind === 'approval') result.push(node)
+        if (node.kind === 'condition') visitList(pickLegacyBranch(node, ctx))
+        if (node.kind === 'end') break
+      }
+    }
+    visitList(workflow.flow)
+    return result
+  }
+
+  const start = byId.get('start') ?? all.find((node) => node.kind === 'start') ?? all[0]
+  const result: ApprovalFlowNode[] = []
+  const visited = new Set<string>()
+  let current: ApprovalFlowNode | undefined = start
+  while (current && result.length < 40) {
+    const id = String(current.id ?? '')
+    if (visited.has(id)) break
+    visited.add(id)
+    if (current.kind === 'approval') result.push(current)
+    if (current.kind === 'end') break
+    let nextId: string | null = null
+    if (current.kind === 'condition') {
+      nextId = pickExplicitNext(current, byId, ctx)
+    } else if (Array.isArray(current.nextIds)) {
+      nextId = current.nextIds.length > 0 ? String(current.nextIds[0] ?? '') : null
+    }
+    current = nextId ? byId.get(nextId) : undefined
+  }
+  return result
+}
+
+function approversFromMembers(
+  db: Db,
+  companyId: string,
+  requester: RequestActor,
+  node: ApprovalFlowNode,
+): ManagedPerson[] {
+  const ids = (Array.isArray(node.approvers) ? node.approvers : [])
+    .map((approver) => String(approver?.id ?? '').trim())
+    .filter(Boolean)
+  return ids
+    .filter((id) => id !== requester.person.id)
+    .map((id) => currentPersonOf(db, id))
+    .filter((person): person is ManagedPerson => Boolean(person))
+    .filter((person) => canDecideInCompany(db, companyId, person.id))
+}
+
+function directManagerOf(
+  db: Db,
+  companyId: string,
+  requester: RequestActor,
+): ManagedPerson[] {
+  const dept = db
+    .prepare(
+      `SELECT manager_user_id FROM departments
+        WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
+    )
+    .get(requester.person.deptId, companyId) as { manager_user_id: string | null } | undefined
+  const id = dept?.manager_user_id ?? null
+  if (!id || id === requester.person.id || !canDecideInCompany(db, companyId, id)) return []
+  const person = currentPersonOf(db, id)
+  return person ? [person] : []
+}
+
+function companyAdminsOf(db: Db, companyId: string, requester: RequestActor): ManagedPerson[] {
+  const rows = db
+    .prepare(
+      `SELECT u.id, u.name
+         FROM user_roles ur
+         JOIN roles r ON r.id = ur.role_id
+         JOIN users u ON u.id = ur.user_id
+        WHERE r.company_id = ? AND r.code = 'company_admin' AND r.deleted_at IS NULL
+          AND u.company_id = ? AND u.status = 'active' AND u.disabled_at IS NULL
+          AND (ur.expires_at IS NULL OR ur.expires_at > ?)
+        ORDER BY u.created_at, u.id
+        LIMIT 5`,
+    )
+    .all(companyId, companyId, Date.now()) as unknown as ManagedPerson[]
+  return rows.filter((person) => person.id !== requester.person.id && canDecideInCompany(db, companyId, person.id))
+}
+
+function approversForWorkflowNode(
+  db: Db,
+  companyId: string,
+  requester: RequestActor,
+  policy: PermissionPolicyView,
+  policyRows: PolicyRow[],
+  node: ApprovalFlowNode,
+): ManagedPerson[] {
+  const source = String(node.source ?? '').trim()
+  let people: ManagedPerson[]
+  if (source === 'members') {
+    people = approversFromMembers(db, companyId, requester, node)
+  } else if (source === 'manager') {
+    people = directManagerOf(db, companyId, requester)
+  } else if (source === 'company_admin') {
+    people = companyAdminsOf(db, companyId, requester)
+  } else {
+    people = managerCandidates(db, companyId, requester, policy, policyRows).slice(0, policy.maxLevels)
+  }
+
+  const mode = String(node.mode ?? node.meta ?? '')
+  if (mode.includes('或签')) return people.slice(0, 1)
+  return people
+}
+
+function planStepsFromWorkflow(
+  db: Db,
+  companyId: string,
+  requester: RequestActor,
+  policy: PermissionPolicyView,
+  policyRows: PolicyRow[],
+  workflow: PublishedApprovalFlow,
+  scopes: string[],
+): ManagedPerson[] {
+  const ctx = workflowContext(db, requester, scopes)
+  const approvalNodes = collectWorkflowApprovalNodes(workflow, ctx)
+  const steps: ManagedPerson[] = []
+  for (const node of approvalNodes) {
+    const people = approversForWorkflowNode(db, companyId, requester, policy, policyRows, node)
+    if (people.length === 0) {
+      throw new EabError(EC.FORBIDDEN, `审批节点「${node.title || node.id}」没有可用审批人，申请无法提交`, {
+        hint: '请检查流程节点的审批人配置，或先给对应人员分配「审批决定」权限',
+      })
+    }
+    for (const person of people) steps.push(person)
+  }
+  return steps
 }
 
 function stepViewsOf(db: Db, requestId: string): PermissionStepView[] {
@@ -792,7 +1045,7 @@ function createScopePermissionRequest(
     .get(companyId, actor.person.id, anchorRole.id, JSON.stringify(scopes)) as RequestRow | undefined
   if (existing) return requestViewOf(db, existing)
 
-  const steps = planSteps(db, companyId, actor, resolved.policy, resolved.policies)
+  const steps = planSteps(db, companyId, actor, resolved.policy, resolved.policies, scopes)
   return persistPermissionRequest(db, {
     companyId,
     actor,
@@ -850,7 +1103,7 @@ function createRolePermissionRequest(
     .get(companyId, actor.person.id, role.id) as RequestRow | undefined
   if (existing) return requestViewOf(db, existing)
 
-  const steps = planSteps(db, companyId, actor, resolved.policy, resolved.policies)
+  const steps = planSteps(db, companyId, actor, resolved.policy, resolved.policies, scopes)
   return persistPermissionRequest(db, {
     companyId,
     actor,
@@ -890,6 +1143,11 @@ export interface DecidePermissionInput {
   readonly comment?: string
   readonly eventKey?: string
   readonly now?: number
+  /**
+   * 平台控制台超管兜底审批：跳过“当前步骤审批人必须是本人”的身份校验，
+   * 但决策仍落在那位真实审批人身上（用户表外键），控制台另写审计。
+   */
+  readonly platformOverride?: boolean
 }
 
 function activeStepOf(db: Db, request: RequestRow): StepRow | null {
@@ -1013,7 +1271,7 @@ export function decidePermissionRequest(
       details: { currentStep: step.step_no },
     })
   }
-  if (step.approver_user_id !== actor.person.id) {
+  if (!input.platformOverride && step.approver_user_id !== actor.person.id) {
     throw new EabError(EC.FORBIDDEN, '当前步骤的审批人不是你', {
       details: { stepNo: step.step_no, approverUserId: step.approver_user_id },
     })
@@ -1023,7 +1281,10 @@ export function decidePermissionRequest(
     throw new EabError(EC.VALIDATION, '审批决定只能是同意或拒绝')
   }
   const comment = String(input.comment ?? '').trim().slice(0, 500)
-  const eventKey = String(input.eventKey ?? '').trim() || `perm:${request.id}:${step.step_no}:${decision}:${actor.person.id}`
+  const decidedByUserId = input.platformOverride ? step.approver_user_id : actor.person.id
+  const eventKey =
+    String(input.eventKey ?? '').trim() ||
+    `perm:${request.id}:${step.step_no}:${decision}:${decidedByUserId}`
   const stepNo = Number(step.step_no)
 
   withTransaction(db, () => {
@@ -1041,7 +1302,7 @@ export function decidePermissionRequest(
         step.id,
         stepNo,
         companyId,
-        actor.person.id,
+        decidedByUserId,
         decision,
         comment,
         eventKey,
@@ -1053,7 +1314,7 @@ export function decidePermissionRequest(
       `UPDATE permission_approval_steps
           SET status = ?, decided_at = ?, decided_by = ?, comment = ?, updated_at = ?
         WHERE id = ?`,
-    ).run(decision === 'approve' ? 'approved' : 'rejected', now, actor.person.id, comment, now, step.id)
+    ).run(decision === 'approve' ? 'approved' : 'rejected', now, decidedByUserId, comment, now, step.id)
 
     if (decision === 'reject') {
       db.prepare(
@@ -1071,7 +1332,7 @@ export function decidePermissionRequest(
 
     if (stepNo >= Number(request.total_steps)) {
       if (request.request_type === 'scope') {
-        grantScopes(db, request, actor.person.id, now)
+        grantScopes(db, request, decidedByUserId, now)
         db.prepare(
           `UPDATE permission_requests
               SET status = 'approved', current_step = total_steps,
@@ -1079,7 +1340,7 @@ export function decidePermissionRequest(
             WHERE id = ? AND status = 'pending'`,
         ).run(now, now, request.id)
       } else {
-        const grantId = grantRole(db, request, actor.person.id, now)
+        const grantId = grantRole(db, request, decidedByUserId, now)
         db.prepare(
           `UPDATE permission_requests
               SET status = 'approved', current_step = total_steps,
@@ -1239,6 +1500,52 @@ export function listPermissionRequests(
         LIMIT 50`,
     )
     .all(companyId, actor.person.id) as unknown as RequestRow[]
+  return rows.map((row) => requestViewOf(db, row))
+}
+
+/**
+ * 控制台审批记录：平台超管看全公司，不按“我是谁”过滤。
+ * todo = 仍在审批中；done = 已结束；all = 全部。
+ */
+export function listCompanyPermissionRequests(
+  db: Db,
+  companyId: string,
+  mode: 'todo' | 'done' | 'all' = 'all',
+  now = Date.now(),
+): PermissionRequestView[] {
+  expirePermissionRequests(db, companyId, now)
+  let rows: RequestRow[]
+  if (mode === 'todo') {
+    rows = db
+      .prepare(
+        `SELECT pr.* FROM permission_requests pr
+           JOIN permission_approval_steps ps
+             ON ps.request_id = pr.id AND ps.step_no = pr.current_step
+          WHERE pr.company_id = ? AND pr.status = 'pending'
+            AND ps.status = 'active'
+          ORDER BY pr.created_at DESC
+          LIMIT 100`,
+      )
+      .all(companyId) as unknown as RequestRow[]
+  } else if (mode === 'done') {
+    rows = db
+      .prepare(
+        `SELECT * FROM permission_requests
+          WHERE company_id = ? AND status <> 'pending'
+          ORDER BY updated_at DESC
+          LIMIT 100`,
+      )
+      .all(companyId) as unknown as RequestRow[]
+  } else {
+    rows = db
+      .prepare(
+        `SELECT * FROM permission_requests
+          WHERE company_id = ?
+          ORDER BY created_at DESC
+          LIMIT 100`,
+      )
+      .all(companyId) as unknown as RequestRow[]
+  }
   return rows.map((row) => requestViewOf(db, row))
 }
 

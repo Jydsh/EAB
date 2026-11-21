@@ -9405,6 +9405,7 @@ body.is-readonly-page .btn.primary,
 .ap-status.is-pending { background: #fff5e4; color: #9a5b14; }
 .ap-status.is-rejected { background: #fcefee; color: #a23b32; }
 .ap-status.is-expired { background: #f0f2f4; color: #69736f; }
+.ap-status.is-cancelled { background: #f0f2f4; color: #69736f; }
 .ap-status.is-draft { background: #f1f4f3; color: #7b8581; }
 
 /* 流程设计三栏 */

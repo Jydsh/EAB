@@ -221,4 +221,28 @@ describe('钉钉出站文件', () => {
     ).rejects.toThrow(/超过钉钉发送上限/)
     expect(calls).toHaveLength(0)
   })
+
+  it('只有组织同步身份时也能回退 user_identities 发送', async () => {
+    process.env.EAB_TEST_DING_SECRET = 'secret_test'
+    const { db, deps } = testDeps('ding_test_legacy_identity')
+    db.prepare('DELETE FROM channel_identities').run()
+    db.prepare(
+      `INSERT INTO user_identities
+         (id, user_id, provider, external_user_id, union_id, bound_at, bound_by, status)
+       VALUES (?, ?, 'dingtalk', ?, NULL, ?, 'sync', 'active')`,
+    ).run('ui_legacy', 'u_test', 'staff_legacy', Date.now())
+    const calls = mockDingTalk()
+
+    const sent = await sendDingTalkFileToUser(deps, {
+      companyId: 'c1',
+      userId: 'u_test',
+      fileName: '报表.xlsx',
+      mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      buffer: Buffer.from('xlsx-test'),
+    })
+
+    expect(sent.externalUserId).toBe('staff_legacy')
+    const send = calls.find((call) => call.url.includes('/oToMessages/batchSend'))
+    expect(JSON.parse(String(send?.init?.body))).toMatchObject({ userIds: ['staff_legacy'] })
+  })
 })
