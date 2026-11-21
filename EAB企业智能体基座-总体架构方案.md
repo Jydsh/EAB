@@ -1628,6 +1628,20 @@ interface ContextSource {
 
 定向测试 `chat-attachment-document` 9 个 + `chat-attachment-cloud` 7 个共 16 个通过；全量回归 188 个文件 / 1,131 个用例通过；`pnpm typecheck` 通过。仍未做对象存储、病毒/类型检查、扫描版 PDF 的页面渲染 OCR。
 
+第十一轮把这三项缺口补齐，没有改上传通道，只在入口检查、文档解析和持久化三个点加能力。
+
+**附件类型与病毒检查**：新建 `attachment-security.ts`，入口函数 `inspectChatAttachment` 只对 `对话附件/` 生效，避免把普通云空间业务文件一刀切拦掉。直接拒绝可执行文件、脚本、快捷方式、安装包、压缩包、SVG、HTML 等主动内容；按扩展名校验真实魔数（PDF 必须是 `%PDF-`，PNG/JPEG/GIF/WEBP/BMP/TIFF 校验图片头，旧 Office 校验 OLE 头），DOCX/XLSX/XLSM/PPTX 必须是有 `[Content_Types].xml` 和对应主入口的合法 ZIP；OOXML 限 10,000 个条目、解压总量 128 MB、主结构单文件 32 MB，防压缩炸弹；任何扩展名内容命中 MZ、ELF、Mach-O、Java class、7z、RAR、GZip 都拒绝；文本出现 NUL 字节按二进制伪装拒绝；空文件、无扩展名和 EICAR 标准测试串也拒绝。检查接在浏览器上传 `/api/workspace/files`、内部同步写 `saveUserWorkspaceFile` 和读取 `readChatAttachmentFile` 三处，失败返回 `EabError(EC.VALIDATION)` 和可行动提示，不进入模型上下文。它仍是入口级兜底，不等于 ClamAV/企业病毒库扫描。
+
+**扫描 PDF 页面 OCR**：`chat-attachment-document.ts` 新增可选 `ocrPage` 与 `ocrModelId`，把逐页回调透传给 `parseKbFile`，并把模型 ID 放进缓存键，避免同一文件先按“未配置 OCR”缓存提示后不再重试；解析结果新增 `ocrPageCount`。`routes/chat.ts` 每轮解析前用 `resolveModelForPurpose(db, companyId, 'kb.ocr')` 找视觉模型，找到后对每个扫描页渲染 PNG、调用 `ocrImageWithModel`，把 OCR 页数写进附件 meta，附件卡显示“已解析 N 页 · OCR M 页”。`kb-parsers.ts` 改为单页渲染/OCR 失败只记 `ocrFailures` 和提示块，保留其他文本页；只有整份 PDF 都没有可提取文本时才抛 `OCR_REQUIRED`，带最后一次 OCR 失败原因。混合型 PDF 不会因为一页失败而全文不可读。用白底黑字 JPEG 加手写单页 PDF 生成了无文本层夹具 `scanned-note.pdf`，验证无 OCR 时提示、有 OCR 时能读出 `EAB-2026-11-21` 且回调收到 PNG 头。
+
+**对象存储后端**：`config.ts` 新增可选 `objectStorage`，环境变量 `EAB_S3_ENDPOINT` / `EAB_S3_BUCKET` / `EAB_S3_ACCESS_KEY` / `EAB_S3_SECRET_KEY` / `EAB_S3_REGION` / `EAB_S3_PREFIX` / `EAB_S3_FORCE_PATH_STYLE` / `EAB_S3_REQUIRED`；配了 endpoint 但缺桶或密钥会启动失败，未配 endpoint 完全保持原本地磁盘部署。新建 `object-storage.ts`，不引入 AWS SDK，自己实现 S3 SigV4 的 PUT/GET/DELETE，默认 Path-Style，20 秒超时，对象键为 `<prefix>/chat-attachments/<companyId>/<ownerUserId>/<fileId>`，默认 prefix `eab`。上传 `对话附件/` 文件先写本地再镜像对象存储，响应和审计带 `objectStorage: {driver,bucket,key,status}`；默认 `EAB_S3_REQUIRED=0` 时对象写失败保留本地并标 `failed`，设 `1` 时回滚刚写入的本地内容或恢复旧内容并返回 502，元数据不推进。`readChatAttachmentFile` 本地缺失时按 fileId 从对象存储回源并重建本地缓存；删除单文件/文件夹时异步发对象删除，失败只留孤儿对象，不影响本地软删。当前只覆盖 `对话附件/`，不是整个个人/部门/公司云空间的统一对象存储，非对话附件仍只写本地。`/api/health` 增加 `objectStorage` 摘要，只回 driver/bucket/prefix/required，不回 endpoint 与密钥。
+
+本轮定向测试 5 个文件 / 32 个用例通过：`attachment-security` 7 个、`object-storage` 2 个、`chat-attachment-document` 11 个、`chat-attachment-cloud` 8 个、`workspace-attachment-route` 4 个，另有既有工作区测试未回退。全量回归 191 个文件 / 1,147 个用例通过，`pnpm typecheck` 通过。
+
+**真机验收**：重启服务后 `/api/health` 已返回 `objectStorage: null`（未配置 S3 时保持本地模式）。在工作台上传单页扫描件 `scanned-note.pdf` 并问设备编号和提示语，附件 meta 写入 `parseKind=pdf`、`parsePageCount=1`、`parseOcrPageCount=1`、`chars=84`，模型准确回答 `EAB-2026-11-21` 与 `PLEASE ENTER INSPECTION RESULT`；刷新页面后附件卡显示“已解析 1 页 · OCR 1 页”，历史可回放。EICAR、MZ 改名 PDF 与 `EAB_S3_REQUIRED=1` 回滚由 `workspace-attachment-route` 四个路由用例覆盖，真实浏览器上传 EICAR 时页面停在等待态，未拿到可视提示，最终以路由用例和数据库/磁盘无留痕作为拦截证据。
+
+仍有限制：真实 MinIO/S3 未接入验证，虚拟主机模式代码存在但未测试，对象删除是 fire-and-forget；病毒检查不含外部杀毒引擎；扫描 PDF 逐页串行调用视觉模型，未设总超时或页数上限，多页耗时与成本未验证。
+
 #### 11.3.3 对话引用的可靠性兜底（已实现）
 
 **问题**：对话引用只给摘要时，模型会把摘要里的相近字段当成答案。实测把一段 24 条消息的旧对话拖进新会话，问“内部代号是什么”，摘要最近 8 条只有“接口编号 ZX-88421”，真正答案 `ORION-731` 在第 6 条。模型直接答 `ZX-88421`，没有调用 `conversation_read`；在系统提示里加“摘要没有逐字出现就必须先读整段”的硬规则后，同一问句仍未触发工具。结论：提示词只能约束表达，不能保证工具行为，必须有服务端兜底。
@@ -3795,7 +3809,7 @@ web-*   ← shared-types（**禁止** import server/runtime/storage）
 - **真渠道的扫码授权**：现在 `mock-scan` 是开发预览的替身；接飞书要 app_id + 开通二维码登录/应用授权，钉钉要 app_key，企微要 corpid + 服务商授权码。换租户之后的写绑定逻辑完全复用。
 - **控制台写入口不齐**：组织/知识库/渠道/插件已经能配，模型目录（provider / 模型 / 可见角色）已能配，公司重命名/停用/删除已能配；但密钥托管与额度、日志级别、备份触发仍没有页面，只能改库或环境变量。补的时候一律走管理员登录 + 二次确认，不做成员工能碰的开关。
 - **单公司口径（12.10）**：控制台只显示配置里的唯一公司，不提供新建第二家；`POST /api/console/companies` 409，扫码开通在库里已有公司时也拒绝。要换组织先删除唯一公司回到空库，再「钉钉扫码绑定组织」。
-- **附件已落个人云空间并支持正文解析**：图片、文件随消息发送时先保存到个人云空间「对话附件」目录，历史消息按 `workspaceFileId` 回放并显示 active/deleted/forbidden 状态；文本类直接读正文，图片走视觉输入，PDF / DOCX / XLSX / XLSM / PPTX 发送时用 `chat-attachment-document` 调 `kb-parsers` 解析正文，解析结果按文件版本做 LRU 缓存；扫描版 PDF 无文本层、老式 Office 或超大文件只降级提示，不影响文件预览与后续 Office 工具读取。仍未做对象存储、病毒/类型检查、PDF 页面渲染 OCR。
+- **附件已落个人云空间并支持正文解析、扫描 OCR、安全检查和对象存储镜像**：图片、文件随消息发送时先保存到个人云空间「对话附件」目录，历史消息按 `workspaceFileId` 回放并显示 active/deleted/forbidden 状态；文本类直接读正文，图片走视觉输入，PDF / DOCX / XLSX / XLSM / PPTX 发送时用 `chat-attachment-document` 调 `kb-parsers` 解析正文，扫描页经 `kb.ocr` 路由逐页识别，解析结果按文件版本做 LRU 缓存；上传和读取前做危险类型、魔数、OOXML 结构、压缩炸弹与 EICAR 检查；配置 `EAB_S3_*` 后对话附件同步镜像对象存储并支持本地缺失回源。老式 Office、超大文件或单页 OCR 失败只降级提示，不影响文件预览与后续 Office 工具读取。
 - **插件只有页面槽位**：没有插件后端路由、没有进程外隔离、没有热加载与市场/签名。下一步若要"插件能加接口"，必须先定隔离方式（进程内外）再写，否则等于把整台服务器的权限交给插件。
 
 实现期固化下来的口径（正文相应章节已同步）：

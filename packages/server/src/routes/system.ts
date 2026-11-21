@@ -54,6 +54,14 @@ export function registerSystemRoutes(app: FastifyInstance, deps: ServerDeps): vo
       allowRemoteConsole: deps.config.allowRemoteConsole,
       companyId: deps.companyId,
       singleCompany: true,
+      objectStorage: deps.config.objectStorage
+        ? {
+            driver: deps.config.objectStorage.driver,
+            bucket: deps.config.objectStorage.bucket,
+            prefix: deps.config.objectStorage.prefix,
+            required: deps.config.objectStorage.required,
+          }
+        : null,
       backends: deps.backends?.statuses().map((item) => ({ id: item.id, state: item.state })) ?? [],
     }),
   )

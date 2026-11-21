@@ -31,6 +31,11 @@ import { ok, requireScope } from '../http.js'
 import { resolveActor, type RequestActor } from '../session.js'
 import { TEXT_EXTENSIONS, isTextEditableFile } from '../workspace-text.js'
 export { isTextEditableFile }
+import { inspectChatAttachment, isChatAttachmentRelPath } from '../attachment-security.js'
+import {
+  createAttachmentObjectStore,
+  type AttachmentObjectStore,
+} from '../object-storage.js'
 import { publishChatEvent, type WorkspaceChangeReason } from '../chat-events.js'
 import { sendDingTalkFileToUser } from '../dingtalk-outbound.js'
 import {
@@ -124,6 +129,24 @@ export function workspaceRootOf(deps: ServerDeps): string {
   return deps.config.workspacesDir ?? join(dirname(deps.config.dbPath), 'workspaces')
 }
 
+const objectStoreCache = new WeakMap<object, AttachmentObjectStore | null>()
+
+/**
+ * 对话附件的对象存储只在配置 EAB_S3_* 或测试显式注入时存在。
+ * 返回 null 表示纯本地磁盘部署，上传/读取都不增加网络等待。
+ */
+export function attachmentObjectStoreOf(deps: ServerDeps): AttachmentObjectStore | null {
+  if (Object.prototype.hasOwnProperty.call(deps, 'attachmentObjectStore')) {
+    return deps.attachmentObjectStore ?? null
+  }
+  const config = deps.config
+  if (!config.objectStorage) return null
+  if (objectStoreCache.has(config)) return objectStoreCache.get(config) ?? null
+  const store = createAttachmentObjectStore(config.objectStorage)
+  objectStoreCache.set(config, store)
+  return store
+}
+
 function rootOf(deps: ServerDeps): string {
   return workspaceRootOf(deps)
 }
@@ -194,6 +217,20 @@ export function renameUserWorkspaceFile(
 }
 
 /**
+ * 软删时顺带清理对象副本。删除接口不能因为 S3 暂时不可用而失败，
+ * 所以这里异步发出删除；失败只留下孤儿对象，不影响本地回收站与元数据。
+ */
+function dropChatAttachmentObject(deps: ServerDeps, row: Pick<FileRow, 'id' | 'company_id' | 'owner_user_id' | 'rel_path'>): void {
+  if (!isChatAttachmentRelPath(row.rel_path)) return
+  const store = attachmentObjectStoreOf(deps)
+  if (!store) return
+  const key = store.attachmentKey(row.company_id, row.owner_user_id, row.id)
+  void store.delete(key).catch((error) => {
+    console.warn('[workspace] chat attachment object delete failed', { fileId: row.id, error })
+  })
+}
+
+/**
  * 软删单个个人云空间文件：移入 `_recycle/`、写 `deleted_at`、扣减配额。
  * 网页 DELETE 和 agent 的 workspace.delete 共用，避免两套删除语义。
  */
@@ -222,6 +259,7 @@ export function deleteUserWorkspaceFile(
   addUsage(deps, row.company_id, 'user', row.owner_user_id, -row.size)
   addUsage(deps, row.company_id, 'company', row.company_id, -row.size)
   const updated = deps.db.prepare('SELECT * FROM workspace_files WHERE id = ?').get(row.id) as unknown as FileRow
+  dropChatAttachmentObject(deps, row)
   publishWorkspaceFilesChanged(row.company_id, row.owner_user_id, 'deleted', [row.id])
   return { file: publicFile(updated), row: updated, recycled }
 }
@@ -655,6 +693,7 @@ export function deleteUserWorkspaceFolder(
     throw error
   }
 
+  for (const row of rows) dropChatAttachmentObject(deps, row)
   publishWorkspaceFilesChanged(actor.subject.companyId, actor.subject.userId, 'deleted', rows.map((row) => row.id))
   removeEmptyDirectories(folderDir)
   return {
@@ -1541,11 +1580,11 @@ export interface ChatAttachmentFile extends WorkspaceFileContent {
  * 读取消息附件对应的个人云空间文件。
  * 与 readUserWorkspaceFile 的共享语义不同：消息附件只接受本人 user scope，避免共享文件被当成本人附件。
  */
-export function readChatAttachmentFile(
+export async function readChatAttachmentFile(
   deps: ServerDeps,
   actor: RequestActor,
   fileId: string,
-): ChatAttachmentFile {
+): Promise<ChatAttachmentFile> {
   requireEnabled(actor)
   const row = deps.db
     .prepare('SELECT * FROM workspace_files WHERE id = ? AND company_id = ? AND deleted_at IS NULL')
@@ -1559,7 +1598,31 @@ export function readChatAttachmentFile(
     throw new EabError(EC.FORBIDDEN, '只能引用本人云空间里的附件')
   }
   const path = diskPathOf(deps, row)
-  if (!existsSync(path)) throw new EabError(EC.NOT_FOUND, '附件内容已不在磁盘（可能被清理）')
+  let buffer: Buffer | null = null
+  if (existsSync(path)) {
+    buffer = readFileSync(path)
+  } else {
+    // 本地工作副本被清理时，按 fileId 从对象存储回源并重建本地缓存。
+    const store = attachmentObjectStoreOf(deps)
+    if (store) {
+      let remote: Buffer | null = null
+      try {
+        remote = await store.get(store.attachmentKey(row.company_id, row.owner_user_id, row.id))
+      } catch (error) {
+        throw new EabError(EC.UPSTREAM, '附件对象存储读取失败，请稍后重试', {
+          hint: '本地副本也已丢失；如果持续失败，请联系管理员检查 S3/MinIO 连接。',
+          cause: error,
+        })
+      }
+      if (remote) {
+        mkdirSync(dirname(path), { recursive: true })
+        writeFileSync(path, remote)
+        buffer = remote
+      }
+    }
+  }
+  if (!buffer) throw new EabError(EC.NOT_FOUND, '附件内容已不在磁盘（可能被清理）')
+  inspectChatAttachment({ filename: row.name, mime: row.mime, buffer })
   return {
     id: row.id,
     name: row.name,
@@ -1567,7 +1630,7 @@ export function readChatAttachmentFile(
     size: row.size,
     mime: row.mime,
     ownerUserId: row.owner_user_id,
-    buffer: readFileSync(path),
+    buffer,
     updatedAt: Number(row.updated_at) || 0,
     kind: chatAttachmentKindOf(row.name, row.mime),
   }
@@ -2207,6 +2270,9 @@ export function saveUserWorkspaceFile(
   const wanted = basename(String(input.relPath || '').trim())
   if (!wanted) throw new EabError(EC.VALIDATION, '文件名不能为空')
   const relPath = normalizeRelativePath(wanted)
+  if (isChatAttachmentRelPath(relPath)) {
+    inspectChatAttachment({ filename: basename(relPath), mime: input.mime, buffer: input.buffer })
+  }
   const policy = resolveUserWorkspaceQuota(deps.db, actor.subject.companyId, actor.subject.userId)
   const fileLimitBytes = policy.fileLimitBytes
   const buffer = input.buffer
@@ -2787,6 +2853,9 @@ export function registerWorkspaceRoutes(app: FastifyInstance, deps: ServerDeps):
         `文件超过单文件上限（${formatQuotaBytes(fileLimitBytes)}）`,
       )
     }
+    if (isChatAttachmentRelPath(relPath)) {
+      inspectChatAttachment({ filename: basename(relPath), mime: body.mime, buffer })
+    }
     const companyQuota = ensureQuota(deps, actor.subject.companyId, 'company', actor.subject.companyId, DEFAULT_COMPANY_QUOTA)
     if (companyQuota.used + buffer.length > companyQuota.limit) {
       throw new EabError(EC.VALIDATION, `公司空间不足：已用 ${(companyQuota.used / 1024 / 1024).toFixed(1)} MB / ${(companyQuota.limit / 1024 / 1024).toFixed(0)} MB`)
@@ -2824,9 +2893,37 @@ export function registerWorkspaceRoutes(app: FastifyInstance, deps: ServerDeps):
           createdBy: actor.subject.userId,
         })
       : null
+    const previousBuffer = existing && existsSync(target) ? readFileSync(target) : null
     writeFileSync(target, buffer)
     const now = Date.now()
     const id = existing?.id ?? ulid()
+    let objectStorage: { driver: 's3'; bucket: string; key: string; status: 'stored' | 'failed' } | undefined
+    if (isChatAttachmentRelPath(relPath)) {
+      const store = attachmentObjectStoreOf(deps)
+      if (store) {
+        const objectKey = store.attachmentKey(actor.subject.companyId, actor.subject.userId, id)
+        try {
+          await store.put(
+            objectKey,
+            buffer,
+            body.mime || 'application/octet-stream',
+          )
+          objectStorage = { driver: 's3', bucket: store.bucket, key: objectKey, status: 'stored' }
+        } catch (error) {
+          if (deps.config.objectStorage?.required) {
+            // 强一致模式：本次元数据不推进，并恢复本地旧内容，避免“本地新、对象旧”。
+            if (previousBuffer) writeFileSync(target, previousBuffer)
+            else rmSync(target, { force: true })
+            throw new EabError(EC.UPSTREAM, '附件对象存储写入失败，本次上传已回滚', {
+              hint: '请检查 S3/MinIO 地址、桶名和密钥；也可以暂时删除 EAB_S3_ENDPOINT 只用本地磁盘。',
+              cause: error,
+            })
+          }
+          req.log.warn({ err: error, fileId: id }, 'chat attachment object storage mirror failed')
+          objectStorage = { driver: 's3', bucket: store.bucket, key: objectKey, status: 'failed' }
+        }
+      }
+    }
     if (existing) {
       deps.db
         .prepare('UPDATE workspace_files SET name = ?, size = ?, mime = ?, storage_path = ?, updated_at = ? WHERE id = ?')
@@ -2857,9 +2954,10 @@ export function registerWorkspaceRoutes(app: FastifyInstance, deps: ServerDeps):
           snapshotVersion: snapshot?.version ?? null,
         }
         : {}),
+      ...(objectStorage ? { objectStorage } : {}),
     })
     publishWorkspaceFilesChanged(actor.subject.companyId, actor.subject.userId, existing ? 'updated' : 'created', [id])
-    return ok(publicFile(row))
+    return ok({ ...publicFile(row), ...(objectStorage ? { objectStorage } : {}) })
   })
 
   app.get<{ Params: { id: string } }>('/api/workspace/files/:id', async (req) => {

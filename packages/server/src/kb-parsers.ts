@@ -654,7 +654,10 @@ async function parsePdf(
   const images: KbParsedImage[] = []
   const pageCount = Number(doc.numPages ?? 0)
   let emptyPages = 0
+  let textPages = 0
   let ocrPages = 0
+  let ocrFailures = 0
+  let lastOcrError = ''
   let imageCount = 0
   const seenImageHashes = new Set<string>()
   try {
@@ -695,10 +698,15 @@ async function parsePdf(
               continue
             }
           } catch (error) {
-            throw new KbParseError(
-              'OCR_REQUIRED',
-              `PDF 第 ${pageNo} 页是扫描页，OCR 失败：${error instanceof Error ? error.message : String(error)}`,
-            )
+            // 单页 OCR 失败不丢整篇：同文件里的文本页仍可读，失败页保留提示。
+            ocrFailures += 1
+            lastOcrError = error instanceof Error ? error.message : String(error)
+            blocks.push(block(`（第 ${pageNo} 页 OCR 失败：${lastOcrError}）`, 'paragraph', [], {
+              pageNo,
+              meta: { scanned: true, ocrFailed: true },
+            }))
+            page.cleanup?.()
+            continue
           }
         }
         emptyPages += 1
@@ -707,6 +715,7 @@ async function parsePdf(
           meta: { scanned: true },
         }))
       } else {
+        textPages += 1
         blocks.push(block(text, 'paragraph', [], { pageNo }))
         try {
           const pageImages = await extractPdfPageImages(page, pageNo, pdfjs)
@@ -731,13 +740,19 @@ async function parsePdf(
   } finally {
     await doc.destroy?.()
   }
-  if (pageCount > 0 && emptyPages === pageCount) {
-    throw new KbParseError('OCR_REQUIRED', 'PDF 没有可提取的文本层，需要配置 OCR 模型后重试')
+  // 只有整份 PDF 都没有可读正文时才判定为需要 OCR；混合型里失败几页仍保留可读页。
+  if (pageCount > 0 && textPages === 0 && ocrPages === 0) {
+    throw new KbParseError(
+      'OCR_REQUIRED',
+      lastOcrError
+        ? `PDF 没有可提取的文本层，OCR 失败：${lastOcrError}`
+        : 'PDF 没有可提取的文本层，需要配置 OCR 模型后重试',
+    )
   }
   return {
     blocks,
     text: collectText(blocks),
-    meta: { parser: 'pdf', filename, emptyPages, pageCount, ocrPages, images: images.length },
+    meta: { parser: 'pdf', filename, emptyPages, pageCount, ocrPages, ocrFailures, images: images.length },
     pageCount,
     ...(images.length ? { images } : {}),
   }

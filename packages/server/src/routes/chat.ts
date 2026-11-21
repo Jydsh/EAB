@@ -56,6 +56,7 @@ import {
 } from '../thinking.js'
 import { capToolResultText, compactMessagesForModelCall, estimateTokens } from '../context-window.js'
 import { parseChatDocument } from '../chat-attachment-document.js'
+import { ocrImageWithModel } from '../kb-ocr.js'
 import {
   BATCH_ANALYZE_TOOL_NAME,
   BATCH_ANALYZE_TOOL_SPEC,
@@ -1013,6 +1014,7 @@ export interface ChatAttachmentInput {
   /** 文档附件解析结果；text 为空时用 warning 说明为什么没有正文。 */
   parseKind?: string
   parsePageCount?: number
+  parseOcrPageCount?: number
   parseWarning?: string
   parseTruncated?: boolean
 }
@@ -1283,6 +1285,21 @@ async function resolveChatAttachments(
   spaceKind: 'cloud' | 'none',
 ): Promise<ChatAttachmentInput[]> {
   const list: ChatAttachmentInput[] = []
+  // 扫描页 OCR 跟着 model_routes 的 kb.ocr 走；未配置视觉模型时保持“可预览但不能读正文”的降级。
+  const ocrModel = resolveModelForPurpose(deps.db, deps.companyId, 'kb.ocr')
+  const ocrPage = ocrModel
+    ? async (png: Buffer, filename: string, pageNo: number): Promise<string> => {
+        const parsed = await ocrImageWithModel(
+          deps.db,
+          deps.config.dbPath,
+          deps.companyId,
+          ocrModel.id,
+          png,
+          `${filename}-p${pageNo}.png`,
+        )
+        return parsed.text
+      }
+    : undefined
   for (const raw of rawAttachments.slice(0, MAX_CHAT_ATTACHMENTS)) {
     if (!raw || typeof raw !== 'object') throw new EabError(EC.VALIDATION, '附件参数不合法')
     const item = raw as Record<string, unknown>
@@ -1334,7 +1351,7 @@ async function resolveChatAttachments(
     if (workspaceFileId && spaceKind === 'cloud') {
       let file: { id: string; name: string; mime: string | null; relPath: string; buffer: Buffer; updatedAt?: number }
       try {
-        file = readChatAttachmentFile(deps, actor, workspaceFileId)
+        file = await readChatAttachmentFile(deps, actor, workspaceFileId)
       } catch (err) {
         // 文件被删除/移走后，常驻引用跳过本轮，而不是让整个会话每轮都报错。
         if (item.persistent) continue
@@ -1345,6 +1362,7 @@ async function resolveChatAttachments(
       let dataUrl: string | undefined
       let parseKind: string | undefined
       let parsePageCount: number | undefined
+      let parseOcrPageCount: number | undefined
       let parseWarning: string | undefined
       let parseTruncated: boolean | undefined
       if (kind === 'text') {
@@ -1372,11 +1390,13 @@ async function resolveChatAttachments(
           mime: file.mime,
           buffer: file.buffer,
           updatedAt: file.updatedAt,
+          ...(ocrPage ? { ocrPage, ocrModelId: ocrModel?.id } : {}),
         })
         if (parsed) {
           if (parsed.text) text = parsed.text
           parseKind = parsed.parser || 'document'
           parsePageCount = parsed.pageCount
+          parseOcrPageCount = parsed.ocrPageCount || undefined
           parseWarning = parsed.warning
           parseTruncated = parsed.truncated || undefined
         }
@@ -1395,6 +1415,7 @@ async function resolveChatAttachments(
         persistent: Boolean(item.persistent),
         parseKind,
         parsePageCount,
+        parseOcrPageCount,
         parseWarning,
         parseTruncated,
       })
@@ -1488,7 +1509,7 @@ function buildAttachmentText(text: string, list: ChatAttachmentInput[]): string 
         ? `\n\n【附件正文较长，这里只展示前 ${MAX_ATTACHMENT_TEXT} 字符，共 ${item.text.length} 字符】`
         : ''
       const parseLabel = item.parseKind
-        ? `｜已解析${item.parsePageCount ? ` ${item.parsePageCount} 页` : ''}`
+        ? `｜已解析${item.parsePageCount ? ` ${item.parsePageCount} 页` : ''}${item.parseOcrPageCount ? `（OCR ${item.parseOcrPageCount} 页）` : ''}`
         : ''
       const parseNote = item.parseWarning ? `\n\n【解析提示：${item.parseWarning}】` : ''
       chunks.push(`【附件：${item.name}${parseLabel}】\n${visible}${clipped}${parseNote}${attachmentBatchNote(item)}`)

@@ -25,6 +25,7 @@ export interface ChatDocumentParse {
   text: string
   parser: string
   pageCount: number
+  ocrPageCount?: number
   truncated: boolean
   warning?: string
 }
@@ -35,6 +36,10 @@ export interface ChatDocumentParseInput {
   mime?: string | null
   buffer: Buffer
   updatedAt?: number
+  /** 配置了 kb.ocr 时，扫描页渲染成 PNG 后走这个回调；不传则按未配置 OCR 降级。 */
+  ocrPage?: (png: Buffer, filename: string, pageNo: number) => Promise<string>
+  /** 参与缓存键，避免同一文件在“未配置 OCR”时缓存了提示后不再重试。 */
+  ocrModelId?: string
 }
 
 const CACHE_MAX_ENTRIES = 24
@@ -47,7 +52,7 @@ export function isChatDocumentFilename(filename: string): boolean {
 }
 
 function cacheKey(input: ChatDocumentParseInput): string {
-  return `${input.fileId}:${input.updatedAt ?? 0}:${input.buffer.length}`
+  return `${input.fileId}:${input.updatedAt ?? 0}:${input.buffer.length}:${input.ocrPage ? input.ocrModelId ?? 'ocr' : 'no-ocr'}`
 }
 
 function cacheGet(key: string): ChatDocumentParse | undefined {
@@ -78,7 +83,7 @@ function cacheSet(key: string, value: ChatDocumentParse): void {
 function humanParseError(err: unknown): string {
   if (err instanceof KbParseError) {
     if (err.code === 'OCR_REQUIRED') {
-      return 'PDF 没有可提取的文本层，需要配置 OCR 后再读取正文；文件已保存，可直接预览'
+      return `${err.message}；文件已保存，可直接预览`
     }
     return err.message
   }
@@ -114,6 +119,7 @@ export async function parseChatDocument(input: ChatDocumentParseInput): Promise<
       buffer: input.buffer,
       filename: input.filename,
       mime: input.mime || 'application/octet-stream',
+      ...(input.ocrPage ? { ocrPage: input.ocrPage } : {}),
     })
   } catch (err) {
     const result: ChatDocumentParse = {
@@ -142,6 +148,7 @@ export async function parseChatDocument(input: ChatDocumentParseInput): Promise<
     text,
     parser: String(parsed.meta.parser ?? ''),
     pageCount: Math.max(0, Number(parsed.pageCount) || 0),
+    ocrPageCount: Math.max(0, Number(parsed.meta.ocrPages) || 0),
     truncated,
     ...(warning ? { warning } : {}),
   }

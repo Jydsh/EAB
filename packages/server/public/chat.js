@@ -10229,9 +10229,11 @@ function conversationAttachmentHtml(file) {
 function attachmentParseLabel(file) {
   if (!file?.parseKind) return ''
   const pages = Math.max(0, Number(file?.parsePageCount) || 0)
+  const ocrPages = Math.max(0, Number(file?.parseOcrPageCount) || 0)
   const chars = Math.max(0, Number(file?.chars) || 0)
-  if (chars > 0) return pages ? `已解析 ${pages} 页` : '正文已解析'
-  return '未解析正文'
+  const ocr = ocrPages ? ` · OCR ${ocrPages} 页` : ''
+  if (chars > 0) return `${pages ? `已解析 ${pages} 页` : '正文已解析'}${ocr}`
+  return ocrPages ? `OCR ${ocrPages} 页` : '未解析正文'
 }
 
 function attachmentCardHtml(file) {

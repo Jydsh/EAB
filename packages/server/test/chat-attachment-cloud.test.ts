@@ -1,11 +1,12 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { openDatabase, migrate } from '@eab/storage'
 import type { ServerConfig } from '../src/config.js'
 import type { ServerDeps } from '../src/deps.js'
 import type { RequestActor } from '../src/session.js'
+import type { AttachmentObjectStore } from '../src/object-storage.js'
 import {
   chatAttachmentKindOf,
   chatImageMimeOf,
@@ -13,6 +14,12 @@ import {
   resolveWorkspaceFileStates,
   saveUserWorkspaceFile,
 } from '../src/routes/workspace.js'
+
+// 1x1 透明 PNG；附件入口会校验魔数，测试不能用 Buffer.from('png') 冒充。
+const PNG_1X1 = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+  'base64',
+)
 
 const dirs: string[] = []
 
@@ -57,6 +64,24 @@ function testDeps() {
   return { db, deps, actor, other }
 }
 
+function memoryObjectStore(): AttachmentObjectStore {
+  const objects = new Map<string, Buffer>()
+  return {
+    driver: 's3',
+    bucket: 'test-bucket',
+    attachmentKey: (companyId, ownerUserId, fileId) => `chat-attachments/${companyId}/${ownerUserId}/${fileId}`,
+    async put(key, buffer) {
+      objects.set(key, Buffer.from(buffer))
+    },
+    async get(key) {
+      return objects.get(key) ?? null
+    },
+    async delete(key) {
+      objects.delete(key)
+    },
+  }
+}
+
 describe('对话附件类型判定', () => {
   it('只把栅格图当图片附件，SVG 不进入内联预览白名单', () => {
     expect(chatAttachmentKindOf('现场照片.PNG', 'image/png')).toBe('image')
@@ -75,7 +100,7 @@ describe('对话附件类型判定', () => {
 })
 
 describe('消息附件读取个人云空间文件', () => {
-  it('读取本人 user scope 文件并返回真实元数据与文件内容', () => {
+  it('读取本人 user scope 文件并返回真实元数据与文件内容', async () => {
     const { deps, actor } = testDeps()
     const saved = saveUserWorkspaceFile(deps, actor, {
       relPath: '对话附件/2026-11-17/upload-1/记录.txt',
@@ -83,7 +108,7 @@ describe('消息附件读取个人云空间文件', () => {
       mime: 'text/plain',
     })
 
-    const file = readChatAttachmentFile(deps, actor, saved.id)
+    const file = await readChatAttachmentFile(deps, actor, saved.id)
     expect(file).toMatchObject({
       id: saved.id,
       name: '记录.txt',
@@ -95,7 +120,7 @@ describe('消息附件读取个人云空间文件', () => {
     expect(file.buffer.toString('utf8')).toBe('会议记录正文')
   })
 
-  it('拒绝引用他人文件，避免共享文件被当成本人附件', () => {
+  it('拒绝引用他人文件，避免共享文件被当成本人附件', async () => {
     const { deps, actor, other } = testDeps()
     const saved = saveUserWorkspaceFile(deps, actor, {
       relPath: '对话附件/2026-11-17/upload-1/私有.txt',
@@ -103,10 +128,10 @@ describe('消息附件读取个人云空间文件', () => {
       mime: 'text/plain',
     })
 
-    expect(() => readChatAttachmentFile(deps, other, saved.id)).toThrow(/只能引用本人云空间里的附件/)
+    await expect(readChatAttachmentFile(deps, other, saved.id)).rejects.toThrow(/只能引用本人云空间里的附件/)
   })
 
-  it('记录已删除或磁盘内容丢失时返回 404，不把旧消息继续当有效附件', () => {
+  it('记录已删除或磁盘内容丢失时返回 404，不把旧消息继续当有效附件', async () => {
     const { db, deps, actor } = testDeps()
     const saved = saveUserWorkspaceFile(deps, actor, {
       relPath: '对话附件/2026-11-17/upload-1/已删.txt',
@@ -114,7 +139,26 @@ describe('消息附件读取个人云空间文件', () => {
       mime: 'text/plain',
     })
     db.prepare('UPDATE workspace_files SET deleted_at = ? WHERE id = ?').run(Date.now(), saved.id)
-    expect(() => readChatAttachmentFile(deps, actor, saved.id)).toThrow(/附件已从云空间删除/)
+    await expect(readChatAttachmentFile(deps, actor, saved.id)).rejects.toThrow(/附件已从云空间删除/)
+  })
+
+  it('本地副本丢失时从对象存储回源，并重建本地缓存', async () => {
+    const { deps: baseDeps, actor } = testDeps()
+    const store = memoryObjectStore()
+    const deps: ServerDeps = { ...baseDeps, attachmentObjectStore: store }
+    const saved = saveUserWorkspaceFile(deps, actor, {
+      relPath: '对话附件/2026-11-17/upload-1/回源.txt',
+      buffer: Buffer.from('对象里的正文'),
+      mime: 'text/plain',
+    })
+    // 模拟浏览器上传路径的对象镜像（saveUserWorkspaceFile 是同步渠道入口，不写对象）。
+    await store.put(store.attachmentKey('c1', 'u_owner', saved.id), Buffer.from('对象里的正文'), 'text/plain')
+    rmSync(join(saved.root, saved.relPath), { force: true })
+    expect(existsSync(join(saved.root, saved.relPath))).toBe(false)
+
+    const file = await readChatAttachmentFile(deps, actor, saved.id)
+    expect(file.buffer.toString('utf8')).toBe('对象里的正文')
+    expect(existsSync(join(saved.root, saved.relPath))).toBe(true)
   })
 })
 
@@ -123,7 +167,7 @@ describe('历史消息附件状态批量解析', () => {
     const { db, deps, actor } = testDeps()
     const active = saveUserWorkspaceFile(deps, actor, {
       relPath: '对话附件/2026-11-17/upload-1/有效.png',
-      buffer: Buffer.from('png'),
+      buffer: PNG_1X1,
       mime: 'image/png',
     })
     const deleted = saveUserWorkspaceFile(deps, actor, {
@@ -151,7 +195,7 @@ describe('历史消息附件状态批量解析', () => {
       status: 'active',
       name: '有效.png',
       mime: 'image/png',
-      size: 3,
+      size: PNG_1X1.length,
     })
     expect(states.get(deleted.id)).toEqual({ id: deleted.id, status: 'deleted' })
     expect(states.get(foreign.id)).toEqual({ id: foreign.id, status: 'forbidden' })

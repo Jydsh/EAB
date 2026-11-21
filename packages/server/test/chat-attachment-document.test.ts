@@ -107,6 +107,56 @@ describe('对话附件文档解析', () => {
     expect(result?.text).toContain('项目周报')
   })
 
+  it('扫描 PDF 有 OCR 回调时逐页识别，没有 OCR 时提示配置', async () => {
+    const buffer = readFileSync(new URL('./fixtures/chat-attachment/scanned-note.pdf', import.meta.url))
+    const withoutOcr = await parseChatDocument({
+      fileId: 'f_scan_no_ocr',
+      filename: 'scanned-note.pdf',
+      mime: 'application/pdf',
+      buffer,
+      updatedAt: 8,
+    })
+    expect(withoutOcr?.text).toBe('')
+    expect(withoutOcr?.warning).toMatch(/OCR/)
+
+    const seen: Array<{ filename: string; pageNo: number; png: Buffer }> = []
+    const withOcr = await parseChatDocument({
+      fileId: 'f_scan_with_ocr',
+      filename: 'scanned-note.pdf',
+      mime: 'application/pdf',
+      buffer,
+      updatedAt: 8,
+      ocrModelId: 'vision-test',
+      ocrPage: async (png, filename, pageNo) => {
+        seen.push({ png, filename, pageNo })
+        return 'SCAN TEST - EQUIPMENT ID EAB-2026-11-21'
+      },
+    })
+    expect(withOcr).toMatchObject({ parser: 'pdf', pageCount: 1, ocrPageCount: 1 })
+    expect(withOcr?.text).toContain('EAB-2026-11-21')
+    expect(seen).toHaveLength(1)
+    expect(seen[0]?.filename).toBe('scanned-note.pdf')
+    expect(seen[0]?.pageNo).toBe(1)
+    expect(seen[0]?.png.subarray(0, 8).toString('hex')).toBe('89504e470d0a1a0a')
+  })
+
+  it('整份扫描 PDF 的 OCR 全部失败时返回可行动提示，不把失败页提示当正文', async () => {
+    const buffer = readFileSync(new URL('./fixtures/chat-attachment/scanned-note.pdf', import.meta.url))
+    const failed = await parseChatDocument({
+      fileId: 'f_scan_ocr_failed',
+      filename: 'scanned-note.pdf',
+      mime: 'application/pdf',
+      buffer,
+      updatedAt: 9,
+      ocrModelId: 'vision-test',
+      ocrPage: async () => {
+        throw new Error('视觉模型超时')
+      },
+    })
+    expect(failed?.text).toBe('')
+    expect(failed?.warning).toContain('视觉模型超时')
+  })
+
   it('老式 Office 返回可行动提示，不抛错阻断消息', async () => {
     const result = await parseChatDocument({
       fileId: 'f_doc',

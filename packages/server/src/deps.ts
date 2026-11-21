@@ -4,6 +4,7 @@ import type { ChatCapacity } from './chat-capacity.js'
 import type { NetworkApplyResult, NetworkTarget } from './network-settings.js'
 import type { StorageApplyPlan, StorageApplyResult } from './settings.js'
 import type { BackendRuntime } from './backends/runtime.js'
+import type { AttachmentObjectStore } from './object-storage.js'
 
 export interface ServerDeps {
   readonly db: Db
@@ -22,4 +23,9 @@ export interface ServerDeps {
   readonly applyNetwork?: (next: NetworkTarget) => Promise<NetworkApplyResult> | NetworkApplyResult
   /** 控制台保存存储位置后立即复制/切换，不重启；由 main.ts 注入，测试环境没有时退回 pending+重启。 */
   readonly applyStorage?: (plan: StorageApplyPlan) => Promise<StorageApplyResult> | StorageApplyResult
+  /**
+   * 对话附件的可选对象存储；生产按 EAB_S3_* 配置懒创建，
+   * 测试可注入内存替身，不依赖真实 MinIO。
+   */
+  readonly attachmentObjectStore?: AttachmentObjectStore | null
 }

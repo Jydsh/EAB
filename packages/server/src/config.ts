@@ -15,6 +15,19 @@ export const DEFAULT_DATA_DIR = defaultHomeDir()
 /** 默认库位置锚定部署目录，而不是进程 cwd——`pnpm --filter` 会把 cwd 切到包目录 */
 export const DEFAULT_DB_PATH = join(DEFAULT_DATA_DIR, 'eab.db')
 
+export interface ObjectStorageConfig {
+  readonly driver: 's3'
+  readonly endpoint: string
+  readonly bucket: string
+  readonly region: string
+  readonly accessKey: string
+  readonly secretKey: string
+  readonly prefix: string
+  readonly forcePathStyle: boolean
+  /** true 时对象存储写失败会回滚本次上传；false 保留本地副本并返回 failed。 */
+  readonly required: boolean
+}
+
 export interface ServerConfig {
   readonly host: string
   /** 员工对话端口（默认 8787） */
@@ -157,6 +170,11 @@ export interface ServerConfig {
   readonly backendsFromEnv: boolean
   /** 显式要求的外部后端连不上时是否启动失败；默认 false，降级继续跑 */
   readonly backendsStrict: boolean
+  /**
+   * 可选的对象存储：对话附件先落本地缓存，再镜像到 S3/MinIO。
+   * 未配置时完全走本地磁盘，不改变现有部署。
+   */
+  readonly objectStorage?: ObjectStorageConfig
 }
 
 function readInt(raw: string | undefined, fallback: number, name: string): number {
@@ -208,6 +226,32 @@ function normalizeBaseUrl(raw: string | undefined, name: string): string {
     throw new EabError(EC.VALIDATION, `环境变量 ${name} 不能带查询参数或锚点：${value}`)
   }
   return `${url.origin}${url.pathname}`.replace(/\/+$/, '')
+}
+
+function readObjectStorageConfig(env: NodeJS.ProcessEnv): ObjectStorageConfig | undefined {
+  const endpoint = normalizeBaseUrl(env.EAB_S3_ENDPOINT, 'EAB_S3_ENDPOINT')
+  if (!endpoint) return undefined
+  const bucket = (env.EAB_S3_BUCKET ?? '').trim()
+  const accessKey = (env.EAB_S3_ACCESS_KEY ?? '').trim()
+  const secretKey = (env.EAB_S3_SECRET_KEY ?? '').trim()
+  if (!bucket || !accessKey || !secretKey) {
+    throw new EabError(
+      EC.VALIDATION,
+      '已配置 EAB_S3_ENDPOINT，但缺少 S3 桶名或访问密钥',
+      { hint: '请同时配置 EAB_S3_BUCKET、EAB_S3_ACCESS_KEY、EAB_S3_SECRET_KEY，或删除 EAB_S3_ENDPOINT 以继续只用本地磁盘。' },
+    )
+  }
+  return {
+    driver: 's3',
+    endpoint,
+    bucket,
+    region: (env.EAB_S3_REGION ?? 'us-east-1').trim() || 'us-east-1',
+    accessKey,
+    secretKey,
+    prefix: (env.EAB_S3_PREFIX ?? 'eab').trim().replace(/^\/+|\/+$/g, '') || 'eab',
+    forcePathStyle: (env.EAB_S3_FORCE_PATH_STYLE ?? '1') === '1',
+    required: (env.EAB_S3_REQUIRED ?? '0') === '1',
+  }
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
@@ -342,5 +386,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     ),
     backendsFromEnv: (env.EAB_BACKENDS_FROM_ENV ?? '0') === '1',
     backendsStrict: (env.EAB_BACKENDS_STRICT ?? '0') === '1',
+    objectStorage: readObjectStorageConfig(env),
   }
 }
