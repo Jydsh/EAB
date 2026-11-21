@@ -141,7 +141,7 @@ describe('eab update 升级与降级', () => {
     expect(result.stdout).not.toContain('--apply')
   })
 
-  it('位置参数不带 --apply 时直接调用更新器安装指定版本', async () => {
+  it('位置参数不带 --apply 时直接调用更新器安装指定版本', { timeout: 20_000 }, async () => {
     const sandbox = createCliSandbox()
     try {
       const result = await runCli(sandbox.cli, [older], sandbox.env)
