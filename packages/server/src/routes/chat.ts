@@ -55,6 +55,7 @@ import {
   type ThinkingConfig,
 } from '../thinking.js'
 import { capToolResultText, compactMessagesForModelCall, estimateTokens } from '../context-window.js'
+import { parseChatDocument } from '../chat-attachment-document.js'
 import {
   BATCH_ANALYZE_TOOL_NAME,
   BATCH_ANALYZE_TOOL_SPEC,
@@ -1009,6 +1010,11 @@ export interface ChatAttachmentInput {
   /** 附件正文超过单次注入上限时，全文保存为批次，供 batch_read / batch_analyze 使用。 */
   batchId?: string
   batchChars?: number
+  /** 文档附件解析结果；text 为空时用 warning 说明为什么没有正文。 */
+  parseKind?: string
+  parsePageCount?: number
+  parseWarning?: string
+  parseTruncated?: boolean
 }
 
 /** 对话引用作为独立背景资料注入系统提示，不再拼进最后一条 user 消息。 */
@@ -1326,7 +1332,7 @@ async function resolveChatAttachments(
     }
     const workspaceFileId = String(item.workspaceFileId ?? '').trim().slice(0, 120)
     if (workspaceFileId && spaceKind === 'cloud') {
-      let file: { id: string; name: string; mime: string | null; relPath: string; buffer: Buffer }
+      let file: { id: string; name: string; mime: string | null; relPath: string; buffer: Buffer; updatedAt?: number }
       try {
         file = readChatAttachmentFile(deps, actor, workspaceFileId)
       } catch (err) {
@@ -1337,6 +1343,10 @@ async function resolveChatAttachments(
       const kind = chatAttachmentKindOf(file.name, file.mime)
       let text: string | undefined
       let dataUrl: string | undefined
+      let parseKind: string | undefined
+      let parsePageCount: number | undefined
+      let parseWarning: string | undefined
+      let parseTruncated: boolean | undefined
       if (kind === 'text') {
         if (file.buffer.length > MAX_ATTACHMENT_INPUT_CHARS * 4) {
           throw new EabError(EC.VALIDATION, `附件「${file.name}」超过消息正文接收上限`)
@@ -1354,6 +1364,22 @@ async function resolveChatAttachments(
         if (dataUrl.length > MAX_ATTACHMENT_DATA_URL) {
           throw new EabError(EC.VALIDATION, `图片「${file.name}」编码后超过消息图片上限`)
         }
+      } else {
+        // PDF / Word / Excel / PPT 在发送时解析成正文；解析失败只降级提示，不阻断消息。
+        const parsed = await parseChatDocument({
+          fileId: file.id,
+          filename: file.name,
+          mime: file.mime,
+          buffer: file.buffer,
+          updatedAt: file.updatedAt,
+        })
+        if (parsed) {
+          if (parsed.text) text = parsed.text
+          parseKind = parsed.parser || 'document'
+          parsePageCount = parsed.pageCount
+          parseWarning = parsed.warning
+          parseTruncated = parsed.truncated || undefined
+        }
       }
       list.push({
         name: file.name,
@@ -1367,6 +1393,10 @@ async function resolveChatAttachments(
         workspaceKind: 'file',
         workspaceStatus: 'active',
         persistent: Boolean(item.persistent),
+        parseKind,
+        parsePageCount,
+        parseWarning,
+        parseTruncated,
       })
       continue
     }
@@ -1457,14 +1487,19 @@ function buildAttachmentText(text: string, list: ChatAttachmentInput[]): string 
       const clipped = item.text.length > MAX_ATTACHMENT_TEXT
         ? `\n\n【附件正文较长，这里只展示前 ${MAX_ATTACHMENT_TEXT} 字符，共 ${item.text.length} 字符】`
         : ''
-      chunks.push(`【附件：${item.name}】\n${visible}${clipped}${attachmentBatchNote(item)}`)
+      const parseLabel = item.parseKind
+        ? `｜已解析${item.parsePageCount ? ` ${item.parsePageCount} 页` : ''}`
+        : ''
+      const parseNote = item.parseWarning ? `\n\n【解析提示：${item.parseWarning}】` : ''
+      chunks.push(`【附件：${item.name}${parseLabel}】\n${visible}${clipped}${parseNote}${attachmentBatchNote(item)}`)
     } else if (item.dataUrl) {
       chunks.push(`【图片附件：${item.name}】图片已随消息附带，请直接查看图片内容后回答。`)
     } else if (item.workspaceKind === 'folder' && item.workspaceFolderPath) {
       chunks.push(`【云空间文件夹：${item.name}】完整路径=${item.workspaceFolderPath}。用户说“这个文件夹 / 这个目录 / 它”时默认指这个文件夹；查看内容用 workspace.list，删除用 workspace.folder 且 action=delete、path 直接传上面的完整路径，不要重新猜路径或反问是哪个文件夹。`)
     } else if (item.workspaceFileId) {
       const relPath = String(item.workspaceRelPath ?? '').trim()
-      chunks.push(`【附件：${item.name}】已保存到个人云空间，文件ID=${item.workspaceFileId}${relPath ? `，路径=${relPath}` : ''}。需要正文或解析内容时，直接按这个文件ID/路径用 workspace 工具读取；用户说“删除这个”时直接对同一文件调用 workspace.delete，不要再反问是哪个文件。不要假设附件内容。`)
+      const warning = item.parseWarning ? `解析提示：${item.parseWarning}。` : ''
+      chunks.push(`【附件：${item.name}】${warning}已保存到个人云空间，文件ID=${item.workspaceFileId}${relPath ? `，路径=${relPath}` : ''}。需要正文或解析内容时，直接按这个文件ID/路径用 workspace 工具读取；用户说“删除这个”时直接对同一文件调用 workspace.delete，不要再反问是哪个文件。不要假设附件内容。`)
     } else {
       chunks.push(`【附件：${item.name}】这个附件暂时无法读取正文，请明确告诉用户需要转成文本或截图。`)
     }

@@ -1618,6 +1618,16 @@ interface ContextSource {
 
 以上三轮定向测试共 6 个文件 / 104 个用例通过（`capability-route` 10 + `tool-search` 10 + `chat-system-prompt-space` 19 + `office-content` 61 + `chat-finalize-after-tools` 1 + `chat-tool-completion` 3），全量回归 187 个文件 / 1,122 个用例通过，`pnpm typecheck` 通过。临时调试脚本和文档校验目录在本轮收尾时删除；Git 已在本地提交 `3625c07`，未推送远端。
 
+第十轮审计发现，员工聊天附件其实已经在既有链路里完成持久化，缺的是正文解析，因此没有重造上传通道。
+
+**已有持久化链路**：前端发送前按顺序把附件上传到本人云空间 `对话附件/<YYYY-MM-DD>/<uploadId>/<sanitized-name>`，聊天请求只带 `workspaceFileId`；服务端 `readChatAttachmentFile` 只允许读本人 `user` scope 的文件，删除、磁盘丢失、他人文件分别返回 deleted / missing / forbidden；历史消息的 `meta.attachments` 只存文件 ID，打开会话时批量补当前文件状态。真机验证 PDF 与 DOCX 都落到了 `对话附件/2026-11-21/<uploadId>/`，刷新后附件卡仍能回放，数据库里的附件 meta 保留 `workspaceStatus=active`、`parseKind=pdf`、`parsePageCount=2`、`chars=142`。
+
+**新增文档解析**：新建 `chat-attachment-document.ts`，直接复用知识库 `parseKbFile` 解析 PDF 文本层与 DOCX / XLSX / PPTX；`.xlsm` 复用 XLSX 解析。原文件上限 25 MB，单次正文上限 5,000,000 字符，超限只给警告不阻断消息；解析结果按 `fileId + updatedAt + buffer.length` 做 LRU，同一持久附件不重复拆包。`.doc` / `.xls` / `.ppt` 明确要求另存为 OOXML；扫描版 PDF 无文本层时返回 OCR 提示，文件仍可预览。解析失败统一降级为 `text: ''` 加 `parseWarning`，不影响发送。`resolveChatAttachments` 把解析正文注入模型上下文，`buildAttachmentText` 生成“已解析 N 页”标记；前端文件卡显示“已解析 N 页 / 正文已解析 / 未解析正文”。
+
+**真机验收**：上传 2 页 PDF 后提问两个 IP 和一条操作提醒，附件卡显示“已解析 2 页”，模型准确回答交换机 `192.168.1.10`、AP `192.168.1.20` 和“改网络前先备份”；上传 DOCX 后问第二段，附件卡显示“正文已解析”，模型只回答“双文件双Agent并行完成。”。刷新页面后两条附件卡与回答仍在。
+
+定向测试 `chat-attachment-document` 9 个 + `chat-attachment-cloud` 7 个共 16 个通过；全量回归 188 个文件 / 1,131 个用例通过；`pnpm typecheck` 通过。仍未做对象存储、病毒/类型检查、扫描版 PDF 的页面渲染 OCR。
+
 #### 11.3.3 对话引用的可靠性兜底（已实现）
 
 **问题**：对话引用只给摘要时，模型会把摘要里的相近字段当成答案。实测把一段 24 条消息的旧对话拖进新会话，问“内部代号是什么”，摘要最近 8 条只有“接口编号 ZX-88421”，真正答案 `ORION-731` 在第 6 条。模型直接答 `ZX-88421`，没有调用 `conversation_read`；在系统提示里加“摘要没有逐字出现就必须先读整段”的硬规则后，同一问句仍未触发工具。结论：提示词只能约束表达，不能保证工具行为，必须有服务端兜底。
@@ -3785,7 +3795,7 @@ web-*   ← shared-types（**禁止** import server/runtime/storage）
 - **真渠道的扫码授权**：现在 `mock-scan` 是开发预览的替身；接飞书要 app_id + 开通二维码登录/应用授权，钉钉要 app_key，企微要 corpid + 服务商授权码。换租户之后的写绑定逻辑完全复用。
 - **控制台写入口不齐**：组织/知识库/渠道/插件已经能配，模型目录（provider / 模型 / 可见角色）已能配，公司重命名/停用/删除已能配；但密钥托管与额度、日志级别、备份触发仍没有页面，只能改库或环境变量。补的时候一律走管理员登录 + 二次确认，不做成员工能碰的开关。
 - **单公司口径（12.10）**：控制台只显示配置里的唯一公司，不提供新建第二家；`POST /api/console/companies` 409，扫码开通在库里已有公司时也拒绝。要换组织先删除唯一公司回到空库，再「钉钉扫码绑定组织」。
-- **附件正文与图片能读，但没有落盘**：界面已经能选图/选文件、粘贴、预览、随消息发送，文本正文和图片视觉输入都已进模型（12.7.7）；但没有对象存储、病毒/类型检查、历史会话图片回放与知识库摄取，PDF/Word/Excel 也还没有解析库。真正的上传通道属于 V1。
+- **附件已落个人云空间并支持正文解析**：图片、文件随消息发送时先保存到个人云空间「对话附件」目录，历史消息按 `workspaceFileId` 回放并显示 active/deleted/forbidden 状态；文本类直接读正文，图片走视觉输入，PDF / DOCX / XLSX / XLSM / PPTX 发送时用 `chat-attachment-document` 调 `kb-parsers` 解析正文，解析结果按文件版本做 LRU 缓存；扫描版 PDF 无文本层、老式 Office 或超大文件只降级提示，不影响文件预览与后续 Office 工具读取。仍未做对象存储、病毒/类型检查、PDF 页面渲染 OCR。
 - **插件只有页面槽位**：没有插件后端路由、没有进程外隔离、没有热加载与市场/签名。下一步若要"插件能加接口"，必须先定隔离方式（进程内外）再写，否则等于把整台服务器的权限交给插件。
 
 实现期固化下来的口径（正文相应章节已同步）：

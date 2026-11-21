@@ -1461,6 +1461,8 @@ export interface WorkspaceFileContent {
   readonly mime: string | null
   readonly ownerUserId: string
   readonly buffer: Buffer
+  /** 文件版本时间，供附件解析缓存判断内容是否变化。 */
+  readonly updatedAt?: number
 }
 
 /**
@@ -1566,6 +1568,7 @@ export function readChatAttachmentFile(
     mime: row.mime,
     ownerUserId: row.owner_user_id,
     buffer: readFileSync(path),
+    updatedAt: Number(row.updated_at) || 0,
     kind: chatAttachmentKindOf(row.name, row.mime),
   }
 }

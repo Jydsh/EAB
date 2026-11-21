@@ -10226,6 +10226,14 @@ function conversationAttachmentHtml(file) {
   </div>`
 }
 
+function attachmentParseLabel(file) {
+  if (!file?.parseKind) return ''
+  const pages = Math.max(0, Number(file?.parsePageCount) || 0)
+  const chars = Math.max(0, Number(file?.chars) || 0)
+  if (chars > 0) return pages ? `已解析 ${pages} 页` : '正文已解析'
+  return '未解析正文'
+}
+
 function attachmentCardHtml(file) {
   if (file?.conversationId) return conversationAttachmentHtml(file)
   if (file?.workspaceKind === 'folder') return folderAttachmentHtml(file)
@@ -10253,9 +10261,10 @@ function attachmentCardHtml(file) {
       <span class="bubble-attach-caption"><span class="bubble-attach-name">${esc(name)}</span><span class="bubble-attach-meta">${esc(size)} · 点击预览</span></span>
     </button>`
   }
+  const parseLabel = attachmentParseLabel(file)
   return `<button class="bubble-attach is-file" type="button" data-attachment-open="${esc(id)}" data-attachment-file-id="${esc(id)}" data-attachment-name="${esc(name)}" data-attachment-size="${esc(size)}" aria-label="预览文件 ${esc(name)}">
     <span class="bubble-attach-icon" data-kind="${esc(attachmentKindLabel(file))}" aria-hidden="true">${esc(attachmentKindLabel(file))}</span>
-    <span class="bubble-attach-body"><span class="bubble-attach-name">${esc(name)}</span><span class="bubble-attach-meta">${esc(size)} · 已保存到云空间</span></span>
+    <span class="bubble-attach-body"><span class="bubble-attach-name">${esc(name)}</span><span class="bubble-attach-meta">${esc(size)}${parseLabel ? ` · ${esc(parseLabel)}` : ''} · 已保存到云空间</span></span>
     <span class="bubble-attach-open" aria-hidden="true">›</span>
   </button>`
 }

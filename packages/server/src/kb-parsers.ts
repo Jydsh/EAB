@@ -65,7 +65,7 @@ const IMAGE_MIME: Record<string, string> = {
 const TEXT_EXT = new Set(['.txt', '.md', '.markdown', '.csv', '.json', '.html', '.htm', '.log'])
 const IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.webp'])
 const LEGACY_OFFICE = new Set(['.doc', '.xls', '.ppt'])
-const OOXML_EXT = new Set(['.docx', '.xlsx', '.pptx'])
+const OOXML_EXT = new Set(['.docx', '.xlsx', '.xlsm', '.pptx'])
 
 function decodeText(buffer: Buffer): string {
   if (buffer.length === 0) return ''
@@ -1211,7 +1211,7 @@ export async function parseKbFile(input: ParseInput): Promise<KbParseResult> {
   }
   if (ext === '.pdf') return parsePdf(input.buffer, input.filename, input.ocrPage)
   if (ext === '.docx') return parseDocx(input.buffer, input.filename)
-  if (ext === '.xlsx') return parseXlsx(input.buffer, input.filename)
+  if (ext === '.xlsx' || ext === '.xlsm') return parseXlsx(input.buffer, input.filename)
   if (ext === '.pptx') return parsePptx(input.buffer, input.filename)
   if (IMAGE_EXT.has(ext)) return imagePlaceholder(input.buffer, input.filename)
   throw new KbParseError('UNSUPPORTED_TYPE', `不支持的文件类型：${ext || input.mime || '未知'}`)
