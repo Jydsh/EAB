@@ -10238,7 +10238,7 @@ function attachmentParseLabel(file) {
 
 function attachmentCardHtml(file) {
   if (file?.conversationId) return conversationAttachmentHtml(file)
-  if (file?.workspaceKind === 'folder') return folderAttachmentHtml(file)
+  if (file?.workspaceKind === 'folder' && !String(file.workspaceFileId || '').trim()) return folderAttachmentHtml(file)
   const status = String(file?.workspaceStatus || '')
   const id = String(file?.workspaceFileId || '').trim()
   const name = attachmentDisplayName(file)
@@ -10264,9 +10264,12 @@ function attachmentCardHtml(file) {
     </button>`
   }
   const parseLabel = attachmentParseLabel(file)
+  const metaText = file.persistent
+    ? `${size}${parseLabel ? ` · ${parseLabel}` : ''} · 云空间文件`
+    : `${size}${parseLabel ? ` · ${parseLabel}` : ''} · 已保存到云空间`
   return `<button class="bubble-attach is-file" type="button" data-attachment-open="${esc(id)}" data-attachment-file-id="${esc(id)}" data-attachment-name="${esc(name)}" data-attachment-size="${esc(size)}" aria-label="预览文件 ${esc(name)}">
     <span class="bubble-attach-icon" data-kind="${esc(attachmentKindLabel(file))}" aria-hidden="true">${esc(attachmentKindLabel(file))}</span>
-    <span class="bubble-attach-body"><span class="bubble-attach-name">${esc(name)}</span><span class="bubble-attach-meta">${esc(size)}${parseLabel ? ` · ${esc(parseLabel)}` : ''} · 已保存到云空间</span></span>
+    <span class="bubble-attach-body"><span class="bubble-attach-name">${esc(name)}</span><span class="bubble-attach-meta">${esc(metaText)}</span></span>
     <span class="bubble-attach-open" aria-hidden="true">›</span>
   </button>`
 }
@@ -13252,7 +13255,7 @@ function workspaceFolderSummaryText(file) {
 
 function workspaceAttachmentKey(file) {
   if (!file) return ''
-  if (file.workspaceKind === 'folder' || file.workspaceFolderPath) {
+  if (file.workspaceKind === 'folder') {
     return `folder:${workspaceNormalizePath(file.workspaceFolderPath || file.workspaceRelPath)}`
   }
   const id = String(file.workspaceFileId || '').trim()
@@ -13275,7 +13278,7 @@ function persistentReferencePayload(list = state.attachments) {
           conversationTitle: String(file.conversationTitle || file.name || '').trim(),
         }
       }
-      if (file.workspaceKind === 'folder' || file.workspaceFolderPath) {
+      if (file.workspaceKind === 'folder') {
         return {
           name: String(file.name || '').trim(),
           workspaceKind: 'folder',
@@ -13362,46 +13365,47 @@ function attachmentFromSessionReference(ref) {
       uploadId: newUploadId(),
     }
   }
-  const folderPath = workspaceNormalizePath(ref.workspaceFolderPath || ref.workspaceRelPath || '')
-  if (ref.workspaceKind === 'folder' || folderPath) {
-    if (!folderPath) return null
+  const workspaceFileId = String(ref.workspaceFileId || '').trim()
+  if (workspaceFileId) {
+    const type = String(ref.type || ref.workspaceMime || 'application/octet-stream')
+    const isImage = type.startsWith('image/') ||
+      /\.(png|jpe?g|webp|gif|avif|bmp)$/i.test(String(ref.name || ''))
     return {
-      name: String(ref.name || folderPath.split('/').pop() || '云空间文件夹').trim(),
-      size: 0,
-      type: 'inode/directory',
+      name: String(ref.name || '云空间文件').trim(),
+      size: Number(ref.size) || 0,
+      type,
       source: 'workspace',
-      workspaceKind: 'folder',
-      workspaceFolderPath: folderPath,
-      workspaceRelPath: folderPath,
-      workspaceMime: null,
-      workspaceFileCount: Number(ref.workspaceFileCount) || 0,
-      workspaceFolderCount: Number(ref.workspaceFolderCount) || 0,
+      workspaceKind: 'file',
+      workspaceFileId,
+      workspaceRelPath: String(ref.workspaceRelPath || '').trim(),
+      workspaceFolderPath: '',
+      workspaceMime: ref.workspaceMime ?? type,
+      workspaceFileCount: 0,
+      workspaceFolderCount: 0,
       readable: 'workspace',
       persistent: true,
       uploadId: newUploadId(),
+      previewUrl: isImage ? attachmentPreviewUrl({ workspaceFileId: workspaceFileId }) : '',
     }
   }
-  const workspaceFileId = String(ref.workspaceFileId || '').trim()
-  if (!workspaceFileId) return null
-  const type = String(ref.type || ref.workspaceMime || 'application/octet-stream')
-  const isImage = type.startsWith('image/') ||
-    /\.(png|jpe?g|webp|gif|avif|bmp)$/i.test(String(ref.name || ''))
+  // 只有显式 folder 才是文件夹；workspaceRelPath 是文件自身的路径，不能拿它当文件夹路径。
+  if (ref.workspaceKind !== 'folder') return null
+  const folderPath = workspaceNormalizePath(ref.workspaceFolderPath || ref.workspaceRelPath || '')
+  if (!folderPath) return null
   return {
-    name: String(ref.name || '云空间文件').trim(),
-    size: Number(ref.size) || 0,
-    type,
+    name: String(ref.name || folderPath.split('/').pop() || '云空间文件夹').trim(),
+    size: 0,
+    type: 'inode/directory',
     source: 'workspace',
-    workspaceKind: 'file',
-    workspaceFileId,
-    workspaceRelPath: String(ref.workspaceRelPath || '').trim(),
-    workspaceFolderPath: '',
-    workspaceMime: ref.workspaceMime ?? type,
-    workspaceFileCount: 0,
-    workspaceFolderCount: 0,
+    workspaceKind: 'folder',
+    workspaceFolderPath: folderPath,
+    workspaceRelPath: folderPath,
+    workspaceMime: null,
+    workspaceFileCount: Number(ref.workspaceFileCount) || 0,
+    workspaceFolderCount: Number(ref.workspaceFolderCount) || 0,
     readable: 'workspace',
     persistent: true,
     uploadId: newUploadId(),
-    previewUrl: isImage ? attachmentPreviewUrl({ workspaceFileId: workspaceFileId }) : '',
   }
 }
 
@@ -13498,7 +13502,7 @@ function renderAttachments() {
   strip.innerHTML = state.attachments
     .map((file, index) => {
       const isConversation = file.source === 'conversation' || Boolean(file.conversationId)
-      const isFolder = !isConversation && (file.workspaceKind === 'folder' || Boolean(file.workspaceFolderPath))
+      const isFolder = !isConversation && file.workspaceKind === 'folder'
       const isWorkspace = !isConversation && file.source === 'workspace'
       const type = String(file.type || '')
       const isImage = !isConversation && !isFolder && type.startsWith('image/')

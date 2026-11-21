@@ -74,6 +74,21 @@ async function createSession(app: ReturnType<typeof buildApp>, title: string) {
   return (response.json() as { data: { session: { id: string } } }).data.session.id
 }
 
+function insertOwnFile(
+  db: Db,
+  id: string,
+  name: string,
+  relPath: string,
+  mime = 'text/plain',
+) {
+  const now = Date.now()
+  db.prepare(
+    `INSERT INTO workspace_files
+       (id, company_id, scope_type, scope_id, owner_user_id, rel_path, name, size, mime, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(id, 'c1', 'user', 'u1', 'u1', relPath, name, 36, mime, now, now)
+}
+
 describe('chat session references', () => {
   it('把文件夹和对话常驻引用按会话保存，并在打开会话时返回', async () => {
     const { app, db } = makeApp()
@@ -197,5 +212,124 @@ describe('chat session references', () => {
 
     expect(() => normalizeSessionReferences(deps, actor, refs, 'cloud', null)).toThrow()
     expect(normalizeSessionReferences(deps, actor, refs, 'cloud', null, true)).toEqual([])
+  })
+
+  it('把误存成文件夹的文件路径引用纠正为文件引用，并写回会话', async () => {
+    const { app, db } = makeApp()
+    await app.ready()
+    const sessionId = await createSession(app, '文件引用修复')
+    const fileName = '引用检查-20261121-1608.txt'
+    insertOwnFile(db, 'wf_ref_check', fileName, fileName)
+
+    db.prepare('UPDATE chat_sessions SET references_json = ? WHERE id = ?').run(
+      JSON.stringify([
+        {
+          name: fileName,
+          size: 0,
+          type: 'inode/directory',
+          workspaceKind: 'folder',
+          workspaceFolderPath: fileName,
+          workspaceRelPath: fileName,
+          workspaceFileCount: 0,
+          workspaceFolderCount: 0,
+          persistent: true,
+        },
+      ]),
+      sessionId,
+    )
+    const messageId = 'msg_ref_check'
+    const dirtyAttachment = {
+      name: fileName,
+      size: 0,
+      type: 'inode/directory',
+      workspaceKind: 'folder',
+      workspaceFolderPath: fileName,
+      workspaceRelPath: fileName,
+      workspaceFileCount: 0,
+      workspaceFolderCount: 0,
+      persistent: true,
+    }
+    db.prepare(
+      `INSERT INTO chat_messages
+         (id, company_id, session_id, user_id, role, text, meta_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      messageId,
+      'c1',
+      sessionId,
+      'u1',
+      'assistant',
+      '收到',
+      JSON.stringify({ attachments: [dirtyAttachment] }),
+      Date.now(),
+    )
+
+    const open = await app.inject({ method: 'GET', url: `/api/chat/sessions/${sessionId}/messages?as=u1` })
+    expect(open.statusCode).toBe(200)
+    const body = open.json() as {
+      data: {
+        session: {
+          references: Array<{
+            name: string
+            workspaceKind?: string
+            workspaceFileId?: string
+            workspaceRelPath?: string
+            persistent: boolean
+          }>
+        }
+        messages: Array<{
+          id: string
+          meta: { attachments: Array<Record<string, unknown>> }
+        }>
+      }
+    }
+    expect(body.data.session.references).toHaveLength(1)
+    expect(body.data.session.references[0]).toMatchObject({
+      name: fileName,
+      workspaceKind: 'file',
+      workspaceFileId: 'wf_ref_check',
+      workspaceRelPath: fileName,
+      persistent: true,
+    })
+    expect(body.data.messages[0].meta.attachments[0]).toMatchObject({
+      name: fileName,
+      workspaceKind: 'file',
+      workspaceFileId: 'wf_ref_check',
+      workspaceRelPath: fileName,
+      persistent: true,
+    })
+    expect(body.data.messages[0].meta.attachments[0]).not.toHaveProperty('workspaceFolderPath')
+    const stored = db.prepare('SELECT references_json FROM chat_sessions WHERE id = ?').get(sessionId) as {
+      references_json: string
+    }
+    expect(JSON.parse(stored.references_json)[0]).toMatchObject({
+      workspaceKind: 'file',
+      workspaceFileId: 'wf_ref_check',
+    })
+    const storedMessage = db.prepare('SELECT meta_json FROM chat_messages WHERE id = ?').get(messageId) as {
+      meta_json: string
+    }
+    expect(JSON.parse(storedMessage.meta_json).attachments[0]).toMatchObject({
+      workspaceKind: 'file',
+      workspaceFileId: 'wf_ref_check',
+    })
+    expect(JSON.parse(storedMessage.meta_json).attachments[0]).not.toHaveProperty('workspaceFolderPath')
+
+    // 旧页面把同一文件再次按文件夹提交时，保存入口也应纠正，不能把脏引用写回来。
+    const put = await app.inject({
+      method: 'PUT',
+      url: `/api/chat/sessions/${sessionId}/references?as=u1`,
+      payload: {
+        references: [{ name: fileName, workspaceKind: 'folder', workspaceFolderPath: fileName }],
+      },
+    })
+    expect(put.statusCode).toBe(200)
+    const putBody = put.json() as {
+      data: { references: Array<{ workspaceKind?: string; workspaceFileId?: string }> }
+    }
+    expect(putBody.data.references[0]).toMatchObject({
+      workspaceKind: 'file',
+      workspaceFileId: 'wf_ref_check',
+    })
   })
 })

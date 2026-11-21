@@ -1101,6 +1101,121 @@ export function saveSessionReferences(db: Db, sessionId: string, references: Cha
     .run(JSON.stringify(references), sessionId)
 }
 
+interface SessionFileRow {
+  id: string
+  name: string
+  size: number
+  mime: string | null
+  rel_path: string
+}
+
+function sessionFileReference(file: SessionFileRow): ChatSessionReference {
+  return {
+    name: file.name,
+    size: Number(file.size) || 0,
+    type: file.mime || 'application/octet-stream',
+    workspaceFileId: file.id,
+    workspaceRelPath: file.rel_path,
+    workspaceMime: file.mime ?? null,
+    workspaceKind: 'file',
+    persistent: true,
+  }
+}
+
+/** 只查本人 user scope 的精确路径，用于识别“文件夹路径其实是文件”。 */
+function ownWorkspaceFileByPath(
+  deps: ServerDeps,
+  actor: RequestActor,
+  relPath: string,
+): SessionFileRow | undefined {
+  return deps.db
+    .prepare(
+      `SELECT id, name, size, mime, rel_path
+         FROM workspace_files
+        WHERE company_id = ? AND rel_path = ?
+          AND scope_type = 'user' AND scope_id = ? AND owner_user_id = ?
+          AND deleted_at IS NULL
+        ORDER BY created_at DESC
+        LIMIT 1`,
+    )
+    .get(actor.subject.companyId, relPath, actor.person.id, actor.person.id) as
+    | SessionFileRow
+    | undefined
+}
+
+/**
+ * 旧前端曾把文件的 workspaceRelPath 当文件夹路径保存。
+ * 打开/发送会话时按精确路径找回本人文件，避免引用一直被当成文件夹。
+ */
+function repairMisclassifiedSessionReferences(
+  deps: ServerDeps,
+  actor: RequestActor,
+  references: ChatSessionReference[],
+): ChatSessionReference[] {
+  let changed = false
+  const repaired = references.map((item) => {
+    if (item.workspaceFileId || item.workspaceKind !== 'folder' || !item.workspaceFolderPath) return item
+    const folderPath = normalizeWorkspaceFolderPath(item.workspaceFolderPath)
+    if (!folderPath) return item
+    const file = ownWorkspaceFileByPath(deps, actor, folderPath)
+    if (!file) return item
+    changed = true
+    return sessionFileReference(file)
+  })
+  if (!changed) return references
+  const seen = new Set<string>()
+  return repaired
+    .filter((item) => {
+      const key = sessionReferenceKey(item as unknown as Record<string, unknown>)
+      if (!key) return true
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+    .slice(0, MAX_CHAT_ATTACHMENTS)
+}
+
+/**
+ * 旧消息的附件 meta 也可能把文件存成文件夹；打开历史时按精确路径纠正并写回。
+ */
+function repairMisclassifiedAttachmentMeta(
+  deps: ServerDeps,
+  actor: RequestActor,
+  meta: unknown,
+): boolean {
+  if (!meta || typeof meta !== 'object') return false
+  const attachments = (meta as { attachments?: unknown }).attachments
+  if (!Array.isArray(attachments)) return false
+  let changed = false
+  for (const raw of attachments) {
+    if (!raw || typeof raw !== 'object') continue
+    const item = raw as Record<string, unknown>
+    if (item.workspaceFileId || item.workspaceKind !== 'folder') continue
+    const folderPath = normalizeWorkspaceFolderPath(
+      String(item.workspaceFolderPath || item.workspaceRelPath || ''),
+    )
+    if (!folderPath) continue
+    const file = ownWorkspaceFileByPath(deps, actor, folderPath)
+    if (!file) continue
+    const ref = sessionFileReference(file)
+    Object.assign(item, {
+      name: ref.name,
+      size: ref.size,
+      type: ref.type,
+      workspaceKind: 'file',
+      workspaceFileId: ref.workspaceFileId,
+      workspaceRelPath: ref.workspaceRelPath,
+      workspaceMime: ref.workspaceMime,
+      persistent: true,
+    })
+    delete item.workspaceFolderPath
+    delete item.workspaceFileCount
+    delete item.workspaceFolderCount
+    changed = true
+  }
+  return changed
+}
+
 /**
  * 校验并规范化拖入输入区的常驻引用。
  * 只允许云空间文件/文件夹和本人对话，最多 4 个；不接受本地 File、正文和 dataUrl。
@@ -1159,21 +1274,17 @@ export function normalizeSessionReferences(
       }
       const file = deps.db
         .prepare(
-          `SELECT name, size, mime, rel_path, scope_type, scope_id, owner_user_id, deleted_at
+          `SELECT id, name, size, mime, rel_path, scope_type, scope_id, owner_user_id, deleted_at
              FROM workspace_files
             WHERE company_id = ? AND id = ?`,
         )
         .get(actor.subject.companyId, workspaceFileId) as
-        | {
-            name: string
-            size: number
-            mime: string | null
-            rel_path: string
+        | (SessionFileRow & {
             scope_type: string
             scope_id: string
             owner_user_id: string
             deleted_at: number | null
-          }
+          })
         | undefined
       if (
         !file ||
@@ -1188,16 +1299,7 @@ export function normalizeSessionReferences(
       const key = `file:${workspaceFileId}`
       if (seen.has(key)) continue
       seen.add(key)
-      list.push({
-        name: file.name,
-        size: Number(file.size) || 0,
-        type: file.mime || 'application/octet-stream',
-        workspaceFileId,
-        workspaceRelPath: file.rel_path,
-        workspaceMime: file.mime ?? null,
-        workspaceKind: 'file',
-        persistent: true,
-      })
+      list.push(sessionFileReference(file))
       continue
     }
 
@@ -1208,6 +1310,15 @@ export function normalizeSessionReferences(
       }
       const folderPath = normalizeWorkspaceFolderPath(rawFolderPath)
       if (!folderPath) throw new EabError(EC.VALIDATION, '云空间文件夹路径不能为空')
+      // 老前端把文件路径存成了文件夹路径；精确命中本人文件时直接纠正为文件引用。
+      const fileAtPath = ownWorkspaceFileByPath(deps, actor, folderPath)
+      if (fileAtPath) {
+        const fileKey = `file:${fileAtPath.id}`
+        if (seen.has(fileKey)) continue
+        seen.add(fileKey)
+        list.push(sessionFileReference(fileAtPath))
+        continue
+      }
       const key = `folder:${folderPath}`
       if (seen.has(key)) continue
       seen.add(key)
@@ -8135,6 +8246,12 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
     }
     const metas: unknown[] = page.map((row) => (row.meta_json ? JSON.parse(row.meta_json) : null))
       .map((meta) => reconcileCompletedTeamProgress(deps, session.id, meta))
+    metas.forEach((meta, index) => {
+      if (!repairMisclassifiedAttachmentMeta(deps, actor, meta)) return
+      deps.db
+        .prepare('UPDATE chat_messages SET meta_json = ? WHERE id = ?')
+        .run(JSON.stringify(meta), page[index].id)
+    })
     const workspaceFileIds: string[] = []
     for (const meta of metas) {
       if (!meta || typeof meta !== 'object') continue
@@ -8149,10 +8266,15 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
     const workspaceStates = workspaceFileIds.length > 0
       ? resolveWorkspaceFileStates(deps, actor.subject.companyId, actor.person.id, workspaceFileIds)
       : new Map<string, WorkspaceFileState>()
+    const storedSessionReferences = parseSessionReferences(references_json)
+    const references = repairMisclassifiedSessionReferences(deps, actor, storedSessionReferences)
+    if (references !== storedSessionReferences) {
+      saveSessionReferences(deps.db, session.id, references)
+    }
     return ok({
       session: {
         ...sessionBase,
-        references: parseSessionReferences(references_json),
+        references,
         modelId: session.model_id,
         reasoningEffort: session.reasoning_effort,
       },
@@ -8570,7 +8692,11 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
      * - 未传（钉钉/飞书等渠道）：沿用该会话已保存的常驻引用。
      */
     const storedReferences = req.body?.sessionId
-      ? readSessionReferences(deps.db, req.body.sessionId)
+      ? repairMisclassifiedSessionReferences(
+          deps,
+          actor,
+          readSessionReferences(deps.db, req.body.sessionId),
+        )
       : []
     const referenceSnapshot = rawReferences !== undefined
       ? normalizeSessionReferences(deps, actor, rawReferences, spaceKind, req.body?.sessionId, true)
