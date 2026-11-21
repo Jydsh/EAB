@@ -97,7 +97,11 @@ eab stop                       停止本机 EAB 服务
 eab stop server                等价写法（server 可省略）
 eab server                     兼容旧写法，等价 eab start server
 eab update                     检测 GitHub Release 新版本
-eab update --apply             确认更新（下载、备份、替换、重启）
+eab update --list              列出可安装的历史版本（--limit=20 控制数量）
+eab update --version=2026.11.19       只查看指定版本，不执行安装
+eab update --apply             确认更新到最新版本（下载、备份、替换、重启）
+eab update --apply --version=2026.11.19 安装指定版本（支持降级）
+eab update --apply --version=2026.11.21 --force 同版本重装
 eab install-cli                安装 eab 命令并写入用户 PATH
 eab doctor                     检查服务、数据库、凭据
 eab backup                     备份当前数据库
@@ -241,9 +245,15 @@ EAB 的版本来自 GitHub Release：
 **命令更新**
 
 ```bash
-eab update            # 只检测并显示当前/最新版本
-eab update --apply    # 确认更新
+eab update                              # 只检测并显示当前/最新版本
+eab update --list                       # 列出可安装的历史版本
+eab update --version=2026.11.19         # 只查看指定版本
+eab update --apply                      # 更新到最新版本
+eab update --apply --version=2026.11.19 # 安装指定版本，支持降级
+eab update --apply --version=2026.11.21 --force  # 当前版本重装
 ```
+
+指定版本时仍会校验 Release 源码包里的 `package.json` 版本与目标版本一致；同版本重装必须显式加 `--force`。降级和重装都会先停服务、备份代码与运行数据，失败自动回滚。`--version=2026.11.19` 也可以写成 `--version 2026.11.19`。
 
 更新范围只替换代码与根配置（`packages/`、`scripts/`、`package.json`、`pnpm-lock.yaml`、`pnpm-workspace.yaml`、`tsconfig*.json`、`README.md`、`LICENSE`、`.gitignore`），**不会覆盖 `.eab-dev` 数据目录**，也不会覆盖 `docs/`、`demo/`、`EAB使用说明.md`、`EAB企业智能体基座-总体架构方案.md`、`plugins/`、`skills/`、`plans/`。失败会自动回滚代码并恢复依赖；日志在 `.eab-dev/updates/last-update.log`。
 

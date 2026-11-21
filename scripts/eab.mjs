@@ -349,18 +349,29 @@ async function restart(flags) {
   await server(flags)
 }
 
-async function latestRelease() {
-  const repo = (process.env.EAB_UPDATE_REPO ?? 'Jydsh/EAB').trim() || 'Jydsh/EAB'
+const UPDATE_REPO = (process.env.EAB_UPDATE_REPO ?? 'Jydsh/EAB').trim() || 'Jydsh/EAB'
+const UPDATE_API_BASE = (process.env.EAB_UPDATE_API_BASE ?? 'https://api.github.com').replace(/\/+$/, '')
+
+function updateHeaders() {
   const headers = { accept: 'application/vnd.github+json', 'user-agent': 'EAB-CLI' }
   if (process.env.EAB_GITHUB_TOKEN) headers.authorization = `Bearer ${process.env.EAB_GITHUB_TOKEN}`
-  const res = await fetch(`https://api.github.com/repos/${repo}/releases/latest`, {
-    headers,
-    signal: AbortSignal.timeout(8000),
+  return headers
+}
+
+/** 404 返回 null，让“指定版本不存在”和“GitHub 不可用”给出不同提示。 */
+async function githubReleaseApi(pathname) {
+  const res = await fetch(`${UPDATE_API_BASE}/repos/${UPDATE_REPO}${pathname}`, {
+    headers: updateHeaders(),
+    signal: AbortSignal.timeout(15000),
   })
+  if (res.status === 404) return null
   if (!res.ok) throw new Error(`读取 GitHub Release 失败：HTTP ${res.status}`)
-  const body = await res.json()
-  const latest = String(body.tag_name ?? '').replace(/^v/i, '')
-  if (!latest) throw new Error('Release 没有版本号')
+  return res.json()
+}
+
+function releaseFromBody(body) {
+  const version = String(body?.tag_name ?? '').replace(/^v/i, '')
+  if (!version) throw new Error('Release 没有版本号')
   const zips = (body.assets ?? []).filter((item) => {
     const name = String(item.name ?? '').toLowerCase()
     return /\.zip$/i.test(name)
@@ -379,11 +390,141 @@ async function latestRelease() {
     return score(b) - score(a)
   })[0]
   return {
-    latest,
+    version,
     sourceUrl: sourceAsset?.browser_download_url ?? body.zipball_url,
     sourceDigest: sourceAsset?.digest ? String(sourceAsset.digest) : null,
     htmlUrl: body.html_url,
+    publishedAt: body.published_at ?? null,
   }
+}
+
+async function latestRelease() {
+  const body = await githubReleaseApi('/releases/latest')
+  if (!body) throw new Error('GitHub 上还没有可用的 Release')
+  return releaseFromBody(body)
+}
+
+async function releaseByVersion(version) {
+  for (const tag of [`v${version}`, version]) {
+    const body = await githubReleaseApi(`/releases/tags/${encodeURIComponent(tag)}`)
+    if (!body) continue
+    const release = releaseFromBody(body)
+    if (release.version !== version) {
+      throw new Error(`Release ${tag} 的版本是 v${release.version}，不是 v${version}`)
+    }
+    return release
+  }
+  // tag 命名不统一时兜底查最近 100 个 Release，按去掉 v 后的版本号精确匹配。
+  const releases = await githubReleaseApi('/releases?per_page=100')
+  const found = Array.isArray(releases)
+    ? releases.find((item) => String(item?.tag_name ?? '').replace(/^v/i, '') === version)
+    : null
+  if (found) return releaseFromBody(found)
+  throw new Error(`GitHub 上找不到版本 v${version} 的 Release`)
+}
+
+function normalizeReleaseVersion(value) {
+  const version = String(value ?? '').trim().replace(/^v/i, '')
+  const parsed = parseDateVersion(version)
+  if (!parsed) throw new Error('版本号格式应为 vYYYY.MM.DD 或 vYYYY.MM.DD.NN')
+  const [year, month, day, sequence] = parsed
+  const base = `${year}.${String(month).padStart(2, '0')}.${String(day).padStart(2, '0')}`
+  return sequence > 0 ? `${base}.${String(sequence).padStart(2, '0')}` : base
+}
+
+function compareDateVersions(left, right) {
+  const a = parseDateVersion(left)
+  const b = parseDateVersion(right)
+  if (!a || !b) return null
+  for (let i = 0; i < 4; i += 1) {
+    if (a[i] === b[i]) continue
+    return a[i] > b[i] ? 1 : -1
+  }
+  return 0
+}
+
+async function listReleases(flags) {
+  const rawLimit = Number.parseInt(String(flags.limit ?? ''), 10)
+  const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(100, rawLimit)) : 20
+  const body = await githubReleaseApi(`/releases?per_page=${limit}`)
+  if (!Array.isArray(body)) throw new Error('GitHub 返回的 Release 列表格式不正确')
+  const current = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')).version
+  const releases = body
+    .filter((item) => item && item.draft !== true && item.tag_name)
+    .map((item) => releaseFromBody(item))
+  if (releases.length === 0) throw new Error('GitHub 上还没有可用的 Release')
+  console.log(`当前版本：v${current}`)
+  console.log(`可用版本（最多 ${limit} 个）：`)
+  for (const release of releases) {
+    const date = release.publishedAt ? new Date(release.publishedAt).toISOString().slice(0, 10) : '未知日期'
+    const mark = release.version === current ? '  ← 当前版本' : ''
+    console.log(`  v${release.version}  ${date}  ${release.htmlUrl ?? ''}${mark}`)
+  }
+  console.log('\n查看指定版本：eab update --version=<版本>')
+  console.log('安装指定版本：eab update --apply --version=<版本>')
+}
+
+async function update(flags, positional = []) {
+  if (flags.list === true || flags.list === '1' || flags.list === 'true') {
+    await listReleases(flags)
+    return
+  }
+  const current = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')).version
+  if (positional.length > 1) throw new Error('--version 只能指定一个版本号')
+  const positionalVersion = positional[0]?.trim() ?? ''
+  if (flags.version === true && !positionalVersion) throw new Error('--version 需要版本号，例如 --version=2026.11.19')
+  const requestedRaw = typeof flags.version === 'string' ? flags.version.trim() : positionalVersion
+  const requested = requestedRaw ? normalizeReleaseVersion(requestedRaw) : ''
+  const release = requested ? await releaseByVersion(requested) : await latestRelease()
+  const target = release.version
+  const comparison = compareDateVersions(current, target)
+  const same = comparison === 0
+  const newer = comparison !== null && comparison < 0
+  const force = flags.force === true || flags.force === '1' || flags.force === 'true'
+
+  console.log(`当前版本：v${current}`)
+  if (requested) {
+    const relation = same ? '当前版本' : newer ? '升级' : '降级'
+    console.log(`目标版本：v${target}（${relation}）`)
+  } else {
+    console.log(`最新版本：v${target}${newer ? '（有新版本）' : '（已是最新）'}`)
+  }
+  if (release.htmlUrl) console.log(`Release：${release.htmlUrl}`)
+
+  if (!flags.apply || flags.apply !== true) {
+    if (same) {
+      console.log(`\n当前已是 v${target}；如需重装，执行：eab update --apply --version=${target} --force`)
+      return
+    }
+    console.log(`\n确认安装：eab update --apply${requested ? ` --version=${target}` : ''}`)
+    return
+  }
+  if (same && !force) {
+    throw new Error(`当前已是 v${target}；如需重装，请加 --force`)
+  }
+  if (!requested && !newer) return
+  if (!release.sourceUrl) throw new Error('该 Release 没有源码压缩包，无法更新')
+  const action = same ? '重装' : newer ? '升级' : '降级'
+  console.log(`正在停止服务并执行${action}…`)
+  await stopService()
+  const digestArgs = release.sourceDigest ? [`--sha256=${release.sourceDigest}`] : []
+  const code = await new Promise((resolvePromise) => {
+    const child = spawn(
+      process.execPath,
+      [
+        join(ROOT, 'scripts', 'eab-update.mjs'),
+        '--apply',
+        `--url=${release.sourceUrl}`,
+        `--version=${target}`,
+        `--root=${ROOT}`,
+        '--restart=1',
+        ...digestArgs,
+      ],
+      { cwd: ROOT, stdio: 'inherit', env: { ...process.env } },
+    )
+    child.on('exit', (value) => resolvePromise(value ?? 1))
+  })
+  process.exitCode = code
 }
 
 function parseDateVersion(value) {
@@ -399,52 +540,6 @@ function parseDateVersion(value) {
   if (day > daysInMonth) return null
   if (match[4] !== undefined && (sequence < 1 || sequence > 99)) return null
   return [year, month, day, sequence]
-}
-
-function isNewer(current, latest) {
-  const a = parseDateVersion(current)
-  const b = parseDateVersion(latest)
-  if (!a || !b) return false
-  for (let i = 0; i < 4; i += 1) {
-    if (b[i] === a[i]) continue
-    return b[i] > a[i]
-  }
-  return false
-}
-
-async function update(flags) {
-  const current = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')).version
-  const release = await latestRelease()
-  const hasUpdate = isNewer(current, release.latest)
-  console.log(`当前版本：v${current}`)
-  console.log(`最新版本：v${release.latest}${hasUpdate ? '（有新版本）' : '（已是最新）'}`)
-  if (release.htmlUrl) console.log(`Release：${release.htmlUrl}`)
-  if (!flags.apply || flags.apply !== true) {
-    console.log(hasUpdate ? '\n确认更新：eab update --apply' : '\n无需更新。')
-    return
-  }
-  if (!hasUpdate) return
-  if (!release.sourceUrl) throw new Error('该 Release 没有源码压缩包，无法更新')
-  console.log('正在停止服务并执行更新…')
-  await stopService()
-  const digestArgs = release.sourceDigest ? [`--sha256=${release.sourceDigest}`] : []
-  const code = await new Promise((resolvePromise) => {
-    const child = spawn(
-      process.execPath,
-      [
-        join(ROOT, 'scripts', 'eab-update.mjs'),
-        '--apply',
-        `--url=${release.sourceUrl}`,
-        `--version=${release.latest}`,
-        `--root=${ROOT}`,
-        '--restart=1',
-        ...digestArgs,
-      ],
-      { cwd: ROOT, stdio: 'inherit', env: { ...process.env } },
-    )
-    child.on('exit', (value) => resolvePromise(value ?? 1))
-  })
-  process.exitCode = code
 }
 
 function installCli() {
@@ -619,7 +714,11 @@ function help() {
   eab restart [server] [--background]   先停止，再按 start 参数启动
   eab stop [server]                    停止本机 EAB 服务
   eab server                           兼容旧写法，等价 eab start server
-  eab update [--apply]
+  eab update [--apply] [--version=<YYYY.MM.DD[.NN]>] [--force]
+  eab update --list [--limit=20]        列出 GitHub Release 版本
+  eab update --version=<版本>           只查看指定版本
+  eab update --apply --version=<版本>   安装指定版本（可降级）
+  eab update --apply --version=<当前版本> --force 同版本重装
   eab install-cli
   eab init
   eab doctor
@@ -637,7 +736,7 @@ function help() {
 
 const [command, rawSub, ...rest] = process.argv.slice(2)
 const sub = rawSub && !rawSub.startsWith('--') ? rawSub : undefined
-const { flags } = argsOf(process.argv, 3)
+const { flags, positional } = argsOf(process.argv, 3)
 try {
   if (!command || command === 'help' || command === '--help' || command === '-h') help()
   else if (command === 'version' || command === '-v' || command === '--version') version()
@@ -666,7 +765,7 @@ try {
     assertServerSubcommand(sub, 'stop')
     console.log(`服务：${await stopService(flags)}`)
   } else if (command === 'update') {
-    await update(flags)
+    await update(flags, positional)
   } else if (command === 'install-cli') {
     installCli()
   } else {
