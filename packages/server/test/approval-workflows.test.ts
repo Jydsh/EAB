@@ -196,6 +196,54 @@ describe('approval workflows', () => {
     expect(validateWorkflowFlow(fixed)).toEqual({ valid: true, errors: [] })
   })
 
+  it('指定角色审批必须选择角色且固定使用会签', () => {
+    const flow = [
+      { id: 'start', kind: 'start' as const, title: '发起申请' },
+      { id: 'a_role', kind: 'approval' as const, title: '角色审批', meta: '会签', source: 'role', roleCode: '' },
+      { id: 'end', kind: 'end' as const, title: '结束' },
+    ]
+    const missingRole = validateWorkflowFlow(flow)
+    expect(missingRole.valid).toBe(false)
+    expect(missingRole.errors.join(' ')).toContain('必须选择角色')
+
+    const wrongMode = validateWorkflowFlow(
+      flow.map((node) => (node.id === 'a_role' ? { ...node, meta: '或签', mode: '或签', roleCode: 'auditor' } : node)),
+    )
+    expect(wrongMode.valid).toBe(false)
+    expect(wrongMode.errors.join(' ')).toContain('必须使用会签')
+
+    expect(
+      validateWorkflowFlow(
+        flow.map((node) => (node.id === 'a_role' ? { ...node, roleCode: 'auditor', roleName: '审计员' } : node)),
+      ),
+    ).toEqual({ valid: true, errors: [] })
+  })
+
+  it('直属上级 / 部门负责人链支持按节点配置 1–10 级', () => {
+    const flow = [
+      { id: 'start', kind: 'start' as const, title: '发起申请' },
+      {
+        id: 'a_dept',
+        kind: 'approval' as const,
+        title: '部门负责人审批',
+        meta: '依次审批',
+        mode: '依次审批',
+        source: 'dept_chain',
+        maxLevels: 2,
+      },
+      { id: 'end', kind: 'end' as const, title: '结束' },
+    ]
+    expect(validateWorkflowFlow(flow)).toEqual({ valid: true, errors: [] })
+
+    for (const maxLevels of [0, 11, 2.5]) {
+      const invalid = validateWorkflowFlow(
+        flow.map((node) => (node.id === 'a_dept' ? { ...node, maxLevels } : node)),
+      )
+      expect(invalid.valid).toBe(false)
+      expect(invalid.errors.join(' ')).toContain('审批级数必须是 1–10 的整数')
+    }
+  })
+
   it('自由连线按显式出线保存，条件标签与规则随连线持久化', () => {
     const db = testDb()
     const flow = [
@@ -286,6 +334,14 @@ describe('approval workflows', () => {
     ]
     expect(validateWorkflowFlow(base)).toEqual({ valid: true, errors: [] })
 
+    const endToCc = [
+      { id: 'start', kind: 'start' as const, title: '发起申请', nextIds: ['a1'] },
+      { id: 'a1', kind: 'approval' as const, title: '管理员审批', meta: '或签', nextIds: ['end'] },
+      { id: 'end', kind: 'end' as const, title: '结束', nextIds: ['cc'] },
+      { id: 'cc', kind: 'cc' as const, title: '抄送审计员', nextIds: [] },
+    ]
+    expect(validateWorkflowFlow(endToCc)).toEqual({ valid: true, errors: [] })
+
     const cycle = base.map((node) => (node.id === 'a1' ? { ...node, nextIds: ['cond'] } : node))
     const dangling = base.map((node) => (node.id === 'a2' ? { ...node, nextIds: [] } : node))
     const illegal = base.map((node) => {
@@ -303,7 +359,7 @@ describe('approval workflows', () => {
     expect(errors(cycle)).toContain('循环连线')
     expect(errors(dangling)).toContain('没有出线')
     expect(errors(illegal)).toContain('开始节点必须且只能有一条出线')
-    expect(errors(illegal)).toContain('结束节点 end 不能有出线')
+    expect(errors(illegal)).toContain('结束节点 end 只能连接到抄送节点')
     expect(errors(unreachable)).toContain('无法从开始节点到达')
   })
 })

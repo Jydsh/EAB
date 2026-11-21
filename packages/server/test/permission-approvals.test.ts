@@ -14,6 +14,10 @@ import {
   listPermissionRequests,
   listRequestableRoles,
   listRequestableScopes,
+  PERMISSION_URGE_COOLDOWN_MS,
+  planPermissionUrge,
+  previewWorkflowNodeApprovers,
+  recordPermissionUrge,
 } from '../src/permission-approvals.js'
 
 const dbs: Db[] = []
@@ -120,6 +124,56 @@ function testDb(): Db {
 
 function actorOf(db: Db, id: string) {
   return actorFor(db, person(id, id, `d${id === 'u1' ? 2 : id === 'u2' ? 1 : 0}`))
+}
+
+function publishRoleFlow(db: Db, name: string, roleCode: string) {
+  const workflow = saveApprovalWorkflow(db, 'c1', 'tester', {
+    name,
+    scopeMode: '按权限点',
+    roleMode: '全部员工角色',
+    flow: [
+      { id: 'start', kind: 'start', title: '发起申请' },
+      {
+        id: 'a_role',
+        kind: 'approval',
+        title: '角色会签',
+        meta: '会签',
+        mode: '会签',
+        source: 'role',
+        roleCode,
+      },
+      { id: 'end', kind: 'end', title: '结束' },
+    ],
+  })
+  return publishApprovalWorkflow(db, 'c1', 'tester', workflow.id)
+}
+
+function publishDeptChainFlow(
+  db: Db,
+  maxLevels: number,
+  source: 'dept_chain' | 'manager' = 'dept_chain',
+  fallbackAdmin?: boolean,
+) {
+  const workflow = saveApprovalWorkflow(db, 'c1', 'tester', {
+    name: `部门负责人链-${source}-${maxLevels}级-${fallbackAdmin === false ? '无兜底' : '默认兜底'}`,
+    scopeMode: '全部权限点',
+    roleMode: '全部员工角色',
+    flow: [
+      { id: 'start', kind: 'start', title: '发起申请' },
+      {
+        id: 'a_dept',
+        kind: 'approval',
+        title: '部门负责人审批',
+        meta: '依次审批',
+        mode: '依次审批',
+        source,
+        ...(source === 'dept_chain' ? { maxLevels } : {}),
+        ...(fallbackAdmin === undefined ? {} : { fallbackAdmin }),
+      },
+      { id: 'end', kind: 'end', title: '结束' },
+    ],
+  })
+  return publishApprovalWorkflow(db, 'c1', 'tester', workflow.id)
 }
 
 describe('多级权限审批', () => {
@@ -443,6 +497,420 @@ describe('多级权限审批', () => {
     expect(created.totalSteps).toBe(2)
     expect(created.steps.map((step) => step.approverUserId)).toEqual(['u2', 'u3'])
     expect(created.steps.map((step) => step.status)).toEqual(['active', 'pending'])
+    expect(created.steps.map((step) => step.nodeTitle)).toEqual(['直属负责人', '公司管理员复核'])
+  })
+
+  it('部门负责人链一级从申请人上级开始，申请人本人是部门负责人时跳过本人', () => {
+    const db = testDb()
+    publishDeptChainFlow(db, 1)
+    const created = createPermissionRequest(db, actorOf(db, 'u1'), { roleCode: 'kb_admin' })
+    expect(created.totalSteps).toBe(1)
+    expect(created.steps.map((step) => step.approverUserId)).toEqual(['u2'])
+    expect(created.steps[0]?.nodeTitle).toBe('部门负责人审批')
+  })
+
+  it('部门负责人链按节点配置的级数逐级展开', () => {
+    const db = testDb()
+    publishDeptChainFlow(db, 2)
+    const created = createPermissionRequest(db, actorOf(db, 'u1'), { roleCode: 'kb_admin' })
+    expect(created.totalSteps).toBe(2)
+    expect(created.steps.map((step) => step.approverUserId)).toEqual(['u2', 'u3'])
+    expect(created.steps.map((step) => step.status)).toEqual(['active', 'pending'])
+  })
+
+  it('上级部门没有负责人且关闭兜底时跳过该级，继续读取更高层负责人', () => {
+    const withoutFallback = testDb()
+    withoutFallback.prepare(`UPDATE departments SET manager_user_id = NULL WHERE id = 'd1'`).run()
+    publishDeptChainFlow(withoutFallback, 3, 'dept_chain', false)
+    const skipped = createPermissionRequest(withoutFallback, actorOf(withoutFallback, 'u1'), {
+      roleCode: 'kb_admin',
+    })
+    expect(skipped.totalSteps).toBe(1)
+    expect(skipped.steps.map((step) => step.approverUserId)).toEqual(['u3'])
+
+    const withFallback = testDb()
+    withFallback.prepare(`UPDATE departments SET manager_user_id = NULL WHERE id = 'd1'`).run()
+    publishDeptChainFlow(withFallback, 3, 'dept_chain', true)
+    const filled = createPermissionRequest(withFallback, actorOf(withFallback, 'u1'), {
+      roleCode: 'kb_admin',
+    })
+    expect(filled.totalSteps).toBe(2)
+    expect(filled.steps.map((step) => step.approverUserId)).toEqual(['u3', 'u4'])
+
+    const allEmpty = testDb()
+    allEmpty
+      .prepare(`UPDATE departments SET manager_user_id = NULL WHERE id IN ('d0', 'd1', 'd2')`)
+      .run()
+    publishDeptChainFlow(allEmpty, 3, 'dept_chain', false)
+    expect(() =>
+      createPermissionRequest(allEmpty, actorOf(allEmpty, 'u1'), { roleCode: 'kb_admin' }),
+    ).toThrow(/没有可用审批人/)
+  })
+
+  it('设计器实人预览返回真实审批人链，并区分负责人与管理员兜底', () => {
+    const db = testDb()
+    const node = {
+      id: 'a_dept',
+      kind: 'approval' as const,
+      title: '部门负责人审批',
+      source: 'dept_chain' as const,
+      mode: '依次审批',
+      maxLevels: 3,
+      fallbackAdmin: true,
+    }
+    const preview = previewWorkflowNodeApprovers(db, 'c1', node, 'u1')
+    expect(preview.fallbackAdmin).toBe(true)
+    expect(preview.people).toEqual([
+      { id: 'u2', name: '直属负责人', kind: 'manager', deptName: 'd1', level: 2 },
+      { id: 'u3', name: '上级负责人', kind: 'manager', deptName: 'd0', level: 3 },
+      { id: 'u4', name: '公司管理员', kind: 'company_admin', deptName: '', level: 0 },
+    ])
+    expect(preview.skipped).toEqual([
+      { level: 1, deptName: 'd2', name: '申请人', reason: 'self' },
+    ])
+    expect(
+      previewWorkflowNodeApprovers(db, 'c1', { ...node, mode: '或签' }, 'u1').people.map((item) => item.id),
+    ).toEqual(['u2'])
+    expect(
+      previewWorkflowNodeApprovers(db, 'c1', { ...node, fallbackAdmin: false }, 'u1').people.map((item) => item.id),
+    ).toEqual(['u2', 'u3'])
+  })
+
+  it('实人预览会列出部门层级，并标明无负责人/无审批权限的跳过原因', () => {
+    const db = testDb()
+    // 直属部门无负责人，上级部门负责人没有审批权限，最上层负责人可用。
+    db.prepare(`UPDATE departments SET manager_user_id = NULL WHERE id = 'd2'`).run()
+    db.prepare(`UPDATE departments SET manager_user_id = 'u5' WHERE id = 'd1'`).run()
+    const preview = previewWorkflowNodeApprovers(
+      db,
+      'c1',
+      {
+        id: 'a_dept',
+        kind: 'approval',
+        title: '部门负责人审批',
+        source: 'dept_chain',
+        mode: '依次审批',
+        maxLevels: 3,
+        fallbackAdmin: false,
+      },
+      'u1',
+    )
+    expect(preview.people).toEqual([
+      { id: 'u3', name: '上级负责人', kind: 'manager', deptName: 'd0', level: 3 },
+    ])
+    expect(preview.skipped).toEqual([
+      { level: 1, deptName: 'd2', name: null, reason: 'no_manager' },
+      { level: 2, deptName: 'd1', name: '无关成员', reason: 'no_permission' },
+    ])
+  })
+
+  it('未写 source 的旧审批节点按部门负责人链实人预览', () => {
+    const db = testDb()
+    const preview = previewWorkflowNodeApprovers(
+      db,
+      'c1',
+      {
+        id: 'a_legacy',
+        kind: 'approval',
+        title: '旧审批节点',
+        mode: '依次审批',
+        maxLevels: 2,
+      },
+      'u1',
+    )
+    expect(preview.source).toBe('dept_chain')
+    expect(preview.levels).toBe(2)
+    expect(preview.people.map((item) => item.id)).toEqual(['u2', 'u3'])
+  })
+
+  it('旧 manager 来源等价于部门负责人链 1 级', () => {
+    const db = testDb()
+    publishDeptChainFlow(db, 3, 'manager')
+    const created = createPermissionRequest(db, actorOf(db, 'u1'), { roleCode: 'kb_admin' })
+    expect(created.totalSteps).toBe(1)
+    expect(created.steps.map((step) => step.approverUserId)).toEqual(['u2'])
+  })
+
+  it('催办只针对当前节点待处理人，30 分钟内重复催办被拒绝', () => {
+    const db = testDb()
+    const now = Date.now()
+    const created = createPermissionRequest(db, actorOf(db, 'u1'), { roleCode: 'kb_admin', now })
+    const plan = planPermissionUrge(db, actorOf(db, 'u1'), created.id, now)
+    expect(plan.stepNo).toBe(1)
+    expect(plan.nodeTitle).toBe('第 1 级审批')
+    expect(plan.targets.map((target) => target.userId)).toEqual(['u2'])
+
+    recordPermissionUrge(db, {
+      companyId: 'c1',
+      requestId: created.id,
+      stepNo: plan.stepNo,
+      fromUserId: 'u1',
+      toUserIds: plan.targets.map((target) => target.userId),
+      deliveredCount: 1,
+      failedCount: 0,
+      now,
+    })
+    const view = getPermissionRequest(db, 'c1', created.id)!
+    expect(view.urge.count).toBe(1)
+    expect(view.urge.lastAt).toBe(now)
+    expect(view.urge.nextAt).toBe(now + PERMISSION_URGE_COOLDOWN_MS)
+
+    expect(() => planPermissionUrge(db, actorOf(db, 'u1'), created.id, now + 60_000)).toThrow(/刚刚催办过/)
+    // 当前节点只有一位审批人时，审批人自己没有可催的对象。
+    expect(() => planPermissionUrge(db, actorOf(db, 'u2'), created.id, now + 60_000)).toThrow(/只有你一位/)
+    // 无关成员不能催办。
+    expect(() => planPermissionUrge(db, actorOf(db, 'u5'), created.id, now + 60_000)).toThrow(/只有申请人或当前节点审批人/)
+
+    const later = planPermissionUrge(db, actorOf(db, 'u1'), created.id, now + PERMISSION_URGE_COOLDOWN_MS + 1)
+    expect(later.nextUrgeAt).toBe(now + PERMISSION_URGE_COOLDOWN_MS * 2 + 1)
+  })
+
+  it('会签节点审批人可以催同节点其他审批人，但不能催自己', () => {
+    const db = testDb()
+    const now = Date.now()
+    db.prepare(
+      `INSERT INTO user_roles (user_id, role_id, granted_by, granted_at, expires_at)
+       VALUES ('u2', 'r-head', 'seed', ?, NULL)`,
+    ).run(now)
+    db.prepare(
+      `INSERT INTO user_roles (user_id, role_id, granted_by, granted_at, expires_at)
+       VALUES ('u5', 'r-head', 'seed', ?, NULL)`,
+    ).run(now)
+    const workflow = saveApprovalWorkflow(db, 'c1', 'tester', {
+      name: '催办会签流程',
+      scopeMode: '按权限点',
+      roleMode: '全部员工角色',
+      flow: [
+        { id: 'start', kind: 'start', title: '发起申请' },
+        {
+          id: 'a_role',
+          kind: 'approval',
+          title: '角色会签',
+          meta: '会签',
+          mode: '会签',
+          source: 'role',
+          roleCode: 'company_sub_admin',
+        },
+        { id: 'end', kind: 'end', title: '结束' },
+      ],
+    })
+    publishApprovalWorkflow(db, 'c1', 'tester', workflow.id)
+    const created = createPermissionRequest(db, actorOf(db, 'u1'), {
+      scopeCodes: ['audit:export'],
+      roleCode: 'member',
+      now,
+    })
+    expect(created.steps.filter((step) => step.stepNo === 1).map((step) => step.nodeTitle)).toEqual(['角色会签', '角色会签', '角色会签'])
+
+    const plan = planPermissionUrge(db, actorOf(db, 'u2'), created.id, now)
+    expect(plan.targets.map((target) => target.userId)).toEqual(['u3', 'u5'])
+  })
+
+  it('指定角色把全部成员放进同一步骤会签，全部同意后才进入下一节点', () => {
+    const db = testDb()
+    const now = Date.now()
+    const grant = db.prepare(
+      `INSERT INTO user_roles (user_id, role_id, granted_by, granted_at, expires_at)
+       VALUES (?, 'r-head', 'seed', ?, NULL)`,
+    )
+    grant.run('u2', now)
+    grant.run('u5', now)
+    const workflow = saveApprovalWorkflow(db, 'c1', 'tester', {
+      name: '角色会签流程',
+      scopeMode: '按权限点',
+      roleMode: '全部员工角色',
+      flow: [
+        { id: 'start', kind: 'start', title: '发起申请' },
+        {
+          id: 'a_role',
+          kind: 'approval',
+          title: '角色会签',
+          meta: '会签',
+          mode: '会签',
+          source: 'role',
+          roleCode: 'company_sub_admin',
+          roleName: 'company_sub_admin',
+        },
+        {
+          id: 'a_admin',
+          kind: 'approval',
+          title: '管理员复核',
+          meta: '或签',
+          source: 'members',
+          approvers: [{ id: 'u4', name: 'u4' }],
+        },
+        { id: 'end', kind: 'end', title: '结束' },
+      ],
+    })
+    publishApprovalWorkflow(db, 'c1', 'tester', workflow.id)
+
+    const created = createPermissionRequest(db, actorOf(db, 'u1'), {
+      scopeCodes: ['audit:export'],
+      roleCode: 'member',
+    })
+    expect(created.totalSteps).toBe(2)
+    const roleSteps = created.steps.filter((step) => step.stepNo === 1)
+    expect(roleSteps).toHaveLength(3)
+    expect(new Set(roleSteps.map((step) => step.approverUserId))).toEqual(new Set(['u2', 'u3', 'u5']))
+    expect(roleSteps.every((step) => step.status === 'active')).toBe(true)
+    for (const userId of ['u2', 'u3', 'u5']) {
+      expect(listPermissionRequests(db, actorOf(db, userId), 'todo').map((item) => item.id)).toContain(created.id)
+    }
+
+    const first = decidePermissionRequest(db, actorOf(db, 'u2'), {
+      requestId: created.id,
+      stepNo: 1,
+      decision: 'approve',
+      eventKey: 'role-approve-u2',
+    })
+    expect(first.status).toBe('pending')
+    expect(first.currentStep).toBe(1)
+    expect(first.steps.filter((step) => step.stepNo === 1).find((step) => step.approverUserId === 'u2')?.status).toBe('approved')
+    expect(first.steps.filter((step) => step.stepNo === 1).filter((step) => step.status === 'active')).toHaveLength(2)
+    expect(() =>
+      decidePermissionRequest(db, actorOf(db, 'u2'), {
+        requestId: created.id,
+        stepNo: 1,
+        decision: 'approve',
+        eventKey: 'role-approve-u2-again',
+      }),
+    ).toThrow(/等待同节点其他审批人/)
+
+    const second = decidePermissionRequest(db, actorOf(db, 'u3'), {
+      requestId: created.id,
+      stepNo: 1,
+      decision: 'approve',
+      eventKey: 'role-approve-u3',
+    })
+    expect(second.status).toBe('pending')
+    expect(second.currentStep).toBe(1)
+
+    const third = decidePermissionRequest(db, actorOf(db, 'u5'), {
+      requestId: created.id,
+      stepNo: 1,
+      decision: 'approve',
+      eventKey: 'role-approve-u5',
+    })
+    expect(third.status).toBe('pending')
+    expect(third.currentStep).toBe(2)
+    expect(third.steps.filter((step) => step.stepNo === 1).every((step) => step.status === 'approved')).toBe(true)
+    expect(third.steps.find((step) => step.stepNo === 2)?.status).toBe('active')
+
+    const final = decidePermissionRequest(db, actorOf(db, 'u4'), {
+      requestId: created.id,
+      stepNo: 2,
+      decision: 'approve',
+      eventKey: 'role-final-u4',
+    })
+    expect(final.status).toBe('approved')
+    const decisions = db
+      .prepare('SELECT COUNT(*) AS count FROM permission_request_decisions WHERE request_id = ?')
+      .get(created.id) as { count: number }
+    expect(decisions.count).toBe(4)
+    const grants = db
+      .prepare('SELECT COUNT(*) AS count FROM permission_scope_grants WHERE request_id = ?')
+      .get(created.id) as { count: number }
+    expect(grants.count).toBe(1)
+  })
+
+  it('角色会签中任意一人拒绝时整单拒绝，同组和后续步骤跳过', () => {
+    const db = testDb()
+    const now = Date.now()
+    db.prepare(
+      `INSERT INTO user_roles (user_id, role_id, granted_by, granted_at, expires_at)
+       VALUES ('u2', 'r-head', 'seed', ?, NULL)`,
+    ).run(now)
+    const workflow = saveApprovalWorkflow(db, 'c1', 'tester', {
+      name: '角色会签拒绝流程',
+      scopeMode: '按权限点',
+      roleMode: '全部员工角色',
+      flow: [
+        { id: 'start', kind: 'start', title: '发起申请' },
+        {
+          id: 'a_role',
+          kind: 'approval',
+          title: '角色会签',
+          meta: '会签',
+          mode: '会签',
+          source: 'role',
+          roleCode: 'company_sub_admin',
+        },
+        { id: 'end', kind: 'end', title: '结束' },
+      ],
+    })
+    publishApprovalWorkflow(db, 'c1', 'tester', workflow.id)
+
+    const created = createPermissionRequest(db, actorOf(db, 'u1'), {
+      scopeCodes: ['audit:export'],
+      roleCode: 'member',
+    })
+    expect(created.steps).toHaveLength(2)
+    const approved = decidePermissionRequest(db, actorOf(db, 'u2'), {
+      requestId: created.id,
+      stepNo: 1,
+      decision: 'approve',
+      eventKey: 'role-reject-u2',
+    })
+    expect(approved.status).toBe('pending')
+    const rejected = decidePermissionRequest(db, actorOf(db, 'u3'), {
+      requestId: created.id,
+      stepNo: 1,
+      decision: 'reject',
+      eventKey: 'role-reject-u3',
+    })
+    expect(rejected.status).toBe('rejected')
+    expect(rejected.steps.find((step) => step.approverUserId === 'u2')?.status).toBe('approved')
+    expect(rejected.steps.find((step) => step.approverUserId === 'u3')?.status).toBe('rejected')
+    const grants = db
+      .prepare('SELECT COUNT(*) AS count FROM permission_scope_grants WHERE request_id = ?')
+      .get(created.id) as { count: number }
+    expect(grants.count).toBe(0)
+  })
+
+  it('角色不存在、角色为空、仅有申请人和成员缺审批权限时拒绝建单', () => {
+    const cases = [
+      {
+        roleCode: 'missing_role',
+        seed: () => {},
+        message: /角色不存在/,
+      },
+      {
+        roleCode: 'kb_admin',
+        seed: () => {},
+        message: /没有可审批成员/,
+      },
+      {
+        roleCode: 'kb_admin',
+        seed: (db: Db) => {
+          db.prepare(
+            `INSERT INTO user_roles (user_id, role_id, granted_by, granted_at, expires_at)
+             VALUES ('u1', 'r-kb', 'seed', ?, NULL)`,
+          ).run(Date.now())
+        },
+        message: /没有可审批成员/,
+      },
+      {
+        roleCode: 'auditor',
+        seed: (db: Db) => {
+          db.prepare(
+            `INSERT INTO user_roles (user_id, role_id, granted_by, granted_at, expires_at)
+             VALUES ('u5', 'r-auditor', 'seed', ?, NULL)`,
+          ).run(Date.now())
+        },
+        message: /缺少「审批决定」权限/,
+      },
+    ]
+    for (const [index, item] of cases.entries()) {
+      const db = testDb()
+      item.seed(db)
+      publishRoleFlow(db, `角色建单校验 ${index}`, item.roleCode)
+      expect(() =>
+        createPermissionRequest(db, actorOf(db, 'u1'), {
+          scopeCodes: ['audit:export'],
+          roleCode: 'member',
+        }),
+      ).toThrow(item.message)
+    }
   })
 
   it('自由连线流程按条件出线选择审批分支', () => {

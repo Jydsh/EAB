@@ -7,15 +7,16 @@
  * - 回调只读 DB 校验审批人/步骤，不依赖进程内 clarify 登记表。
  */
 import { randomUUID } from 'node:crypto'
-import { EabError } from '@eab/domain'
+import { EabError, SCOPE_REGISTRY, type Scope } from '@eab/domain'
 import type { Db } from '@eab/storage'
 import type { ServerDeps } from './deps.js'
 import { DingTalkAICardStream, type DingTalkRichCardState } from './dingtalk-card.js'
-import { dingTalkRecipientOf } from './dingtalk-outbound.js'
+import { dingTalkRecipientOf, sendDingTalkRichTextToUser } from './dingtalk-outbound.js'
 import { resolveSecret } from './secrets.js'
 import { actorFor, findActivePerson } from './session.js'
 import {
   decidePermissionRequest,
+  type PermissionUrgePlan,
 } from './permission-approvals.js'
 
 interface ChannelRow {
@@ -90,20 +91,43 @@ function requestOf(db: Db, companyId: string, requestId: string): RequestRow | n
     .get(requestId, companyId) as RequestRow | undefined) ?? null
 }
 
-function stepOf(db: Db, requestId: string, stepNo: number): StepRow | null {
-  return (db
-    .prepare('SELECT * FROM permission_approval_steps WHERE request_id = ? AND step_no = ? LIMIT 1')
-    .get(requestId, stepNo) as StepRow | undefined) ?? null
+function stepOf(db: Db, requestId: string, stepNo: number, approverUserId?: string): StepRow | null {
+  const row = approverUserId
+    ? (db
+        .prepare(
+          `SELECT * FROM permission_approval_steps
+            WHERE request_id = ? AND step_no = ? AND approver_user_id = ?
+            LIMIT 1`,
+        )
+        .get(requestId, stepNo, approverUserId) as StepRow | undefined)
+    : (db
+        .prepare('SELECT * FROM permission_approval_steps WHERE request_id = ? AND step_no = ? LIMIT 1')
+        .get(requestId, stepNo) as StepRow | undefined)
+  return row ?? null
 }
 
-function activeStepOf(db: Db, requestId: string): StepRow | null {
-  return (db
-    .prepare(
-      `SELECT * FROM permission_approval_steps
-        WHERE request_id = ? AND status = 'active'
-        ORDER BY step_no LIMIT 1`,
-    )
-    .get(requestId) as StepRow | undefined) ?? null
+function activeStepsAt(
+  db: Db,
+  requestId: string,
+  stepNo: number,
+  approverUserId?: string,
+): StepRow[] {
+  const rows = approverUserId
+    ? (db
+        .prepare(
+          `SELECT * FROM permission_approval_steps
+            WHERE request_id = ? AND step_no = ? AND status = 'active' AND approver_user_id = ?
+            ORDER BY created_at, id`,
+        )
+        .all(requestId, stepNo, approverUserId) as unknown as StepRow[])
+    : (db
+        .prepare(
+          `SELECT * FROM permission_approval_steps
+            WHERE request_id = ? AND step_no = ? AND status = 'active'
+            ORDER BY created_at, id`,
+        )
+        .all(requestId, stepNo) as unknown as StepRow[])
+  return rows
 }
 
 function requesterNameOf(db: Db, userId: string): string {
@@ -133,6 +157,16 @@ function approvalState(
   const progress = `第 ${step.step_no} / ${request.total_steps} 级`
   const requestedScopes = scopesText(request.scopes_json) || '—'
   const isScopeRequest = request.request_type === 'scope'
+  const groupSteps = db
+    .prepare(
+      `SELECT status FROM permission_approval_steps
+        WHERE request_id = ? AND step_no = ?`,
+    )
+    .all(request.id, step.step_no) as Array<{ status: string }>
+  const groupTotal = groupSteps.length
+  const groupApproved = groupSteps.filter((item) => item.status === 'approved').length
+  const groupActive = groupSteps.filter((item) => item.status === 'active').length
+  const isGroup = groupTotal > 1
   const header = [
     '### 权限审批',
     `**申请人**：${requesterNameOf(db, request.requester_user_id)}`,
@@ -147,8 +181,9 @@ function approvalState(
         ]),
     `**有效期**：${daysText(request.duration_hours)}`,
     `**审批进度**：${progress}`,
+    isGroup ? `**审批方式**：会签 · 已通过 ${groupApproved}/${groupTotal} 人` : '',
     request.reason ? `**申请原因**：${request.reason}` : '',
-    `**当前审批人**：${step.approver_name}`,
+    `**当前审批人**：${step.approver_name}${isGroup ? '（会签成员）' : ''}`,
   ].filter(Boolean)
 
   if (mode === 'pending') {
@@ -165,12 +200,16 @@ function approvalState(
           {
             id: 'approve',
             label: '同意',
-            description: step.step_no < request.total_steps ? '通过后进入下一级审批' : (isScopeRequest ? '最后一级通过后授予所选权限' : '最后一级通过后立即授予角色'),
+            description: isGroup
+              ? `会签节点：你的同意会记录，仍需等待同节点其余 ${Math.max(groupTotal - groupApproved - 1, 0)} 人`
+              : step.step_no < request.total_steps
+                ? '通过后进入下一级审批'
+                : (isScopeRequest ? '最后一级通过后授予所选权限' : '最后一级通过后立即授予角色'),
           },
           {
             id: 'reject',
             label: '拒绝',
-            description: '不授予权限，审批流程结束',
+            description: isGroup ? '整单拒绝，未处理成员和后续节点不再审批' : '不授予权限，审批流程结束',
           },
         ],
         kind: 'single',
@@ -182,7 +221,9 @@ function approvalState(
 
   const tail =
     mode === 'approved-wait'
-      ? '本级已同意，正在等待下一级审批。'
+      ? groupActive > 0
+        ? '你的同意已记录，正在等待同节点其他审批人处理。'
+        : '本级会签已全部通过，正在等待下一级审批。'
       : mode === 'approved-final'
         ? (isScopeRequest
             ? `审批已通过，所选权限 **${requestedScopes}** 已授予，到期后自动失效。`
@@ -243,13 +284,90 @@ export async function sendPermissionApprovalCard(
   deps: ServerDeps,
   requestId: string,
   stepNo: number,
+  approverUserId?: string,
 ): Promise<boolean> {
   const companyId = deps.companyId
   const request = requestOf(deps.db, companyId, requestId)
   if (!request || request.status !== 'pending') return false
-  const step = stepOf(deps.db, requestId, stepNo)
-  if (!step || step.status !== 'active') return false
-  const stream = streamFor(deps, companyId, step.approver_user_id)
+  const steps = activeStepsAt(deps.db, requestId, stepNo, approverUserId)
+  if (steps.length === 0) return false
+  let sent = false
+  for (const step of steps) {
+    try {
+      sent = (await deliverPermissionApprovalCard(deps, request, step)) || sent
+    } catch (error) {
+      markCard(deps.db, step, { status: 'failed', error: (error as Error).message.slice(0, 200) })
+    }
+  }
+  return sent
+}
+
+export interface PermissionUrgeDelivery {
+  sent: Array<{ userId: string; name: string }>
+  failed: Array<{ userId: string; name: string; reason: string }>
+}
+
+/**
+ * 给当前节点尚未处理的审批人发送催办。
+ * 不复用审批卡，避免同一节点出现第二张待决策卡；催办只是一条带流程位置的提醒。
+ */
+export async function sendPermissionUrgeNotice(
+  deps: ServerDeps,
+  plan: PermissionUrgePlan,
+): Promise<PermissionUrgeDelivery> {
+  const request = plan.request
+  const scopeLabels = request.requestType === 'scope'
+    ? request.scopes.map((code) => SCOPE_REGISTRY[code as Scope]?.label || code).join('、')
+    : `${request.roleName || request.roleCode}（角色）`
+  const subject = request.requestType === 'scope'
+    ? `权限点：${scopeLabels || '—'}`
+    : scopeLabels
+  const deadline = new Date(request.requestDeadline).toLocaleString('zh-CN', {
+    hour12: false,
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+  const text = [
+    '### 权限审批催办',
+    `**申请人**：${request.requesterName}`,
+    `**申请事项**：${subject}`,
+    `**当前节点**：第 ${plan.stepNo} / ${request.totalSteps} 节点 · ${plan.nodeTitle}`,
+    `**待处理人**：${plan.targets.map((target) => target.name).join('、')}`,
+    request.reason ? `**申请原因**：${request.reason}` : '',
+    `**处理时限**：${deadline}`,
+    '',
+    '请打开 EAB 工作台，在「权限审批 → 待我审批」中处理。',
+  ].filter(Boolean).join('\n')
+
+  const result: PermissionUrgeDelivery = { sent: [], failed: [] }
+  for (const target of plan.targets) {
+    try {
+      await sendDingTalkRichTextToUser(deps, {
+        companyId: deps.companyId,
+        userId: target.userId,
+        title: '权限审批催办',
+        text,
+      })
+      result.sent.push(target)
+    } catch (error) {
+      result.failed.push({
+        userId: target.userId,
+        name: target.name,
+        reason: (error as Error).message.slice(0, 200),
+      })
+    }
+  }
+  return result
+}
+
+async function deliverPermissionApprovalCard(
+  deps: ServerDeps,
+  request: RequestRow,
+  step: StepRow,
+): Promise<boolean> {
+  const stream = streamFor(deps, request.company_id, step.approver_user_id)
   if (!stream) {
     markCard(deps.db, step, { status: 'failed', error: '审批人未绑定钉钉或渠道未就绪' })
     return false
@@ -298,7 +416,7 @@ export function startPermissionApprovalCardRetry(
     try {
       const rows = deps.db
         .prepare(
-          `SELECT s.request_id, s.step_no
+          `SELECT s.request_id, s.step_no, s.approver_user_id
              FROM permission_approval_steps s
              JOIN permission_requests r ON r.id = s.request_id
             WHERE s.company_id = ?
@@ -309,11 +427,15 @@ export function startPermissionApprovalCardRetry(
             ORDER BY s.updated_at
             LIMIT 20`,
         )
-        .all(deps.companyId, Date.now() - staleMs) as Array<{ request_id: string; step_no: number }>
+        .all(deps.companyId, Date.now() - staleMs) as Array<{
+          request_id: string
+          step_no: number
+          approver_user_id: string
+        }>
       for (const row of rows) {
         if (stopped) break
         try {
-          await sendPermissionApprovalCard(deps, row.request_id, row.step_no)
+          await sendPermissionApprovalCard(deps, row.request_id, row.step_no, row.approver_user_id)
         } catch (error) {
           console.warn(
             `[eab] 审批卡后台重发失败 request=${row.request_id} step=${row.step_no}：${(error as Error).message}`,
@@ -371,17 +493,18 @@ export async function refreshPermissionApprovalCards(
   const request = requestOf(deps.db, companyId, requestId)
   if (!request) return
   const steps = deps.db
-    .prepare('SELECT * FROM permission_approval_steps WHERE request_id = ? ORDER BY step_no')
+    .prepare('SELECT * FROM permission_approval_steps WHERE request_id = ? ORDER BY step_no, created_at, id')
     .all(requestId) as unknown as StepRow[]
-  const activeStep = activeStepOf(deps.db, requestId)
 
   for (const step of steps) {
     if (!step.card_out_track_id) {
-      if (step.status === 'active') await sendPermissionApprovalCard(deps, requestId, step.step_no)
+      if (step.status === 'active') {
+        await sendPermissionApprovalCard(deps, requestId, step.step_no, step.approver_user_id)
+      }
       continue
     }
     if (step.status === 'approved') {
-      const final = step.step_no >= Number(request.total_steps)
+      const final = request.status === 'approved'
       await updateStepCard(
         deps,
         step,
@@ -399,8 +522,8 @@ export async function refreshPermissionApprovalCards(
       await updateStepCard(deps, step, approvalState(deps.db, request, step, mode), true)
       continue
     }
-    if (activeStep && step.step_no === activeStep.step_no && step.status === 'active') {
-      await sendPermissionApprovalCard(deps, requestId, step.step_no)
+    if (step.status === 'active') {
+      await sendPermissionApprovalCard(deps, requestId, step.step_no, step.approver_user_id)
     }
   }
 }

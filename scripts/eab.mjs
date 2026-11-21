@@ -460,8 +460,8 @@ async function listReleases(flags) {
     const mark = release.version === current ? '  ← 当前版本' : ''
     console.log(`  v${release.version}  ${date}  ${release.htmlUrl ?? ''}${mark}`)
   }
-  console.log('\n查看指定版本：eab update --version=<版本>')
-  console.log('安装指定版本：eab update --apply --version=<版本>')
+  console.log('\n查看指定版本：eab update <版本> --check')
+  console.log('安装指定版本：eab update <版本>')
 }
 
 async function update(flags, positional = []) {
@@ -470,10 +470,16 @@ async function update(flags, positional = []) {
     return
   }
   const current = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')).version
-  if (positional.length > 1) throw new Error('--version 只能指定一个版本号')
+  if (positional.length > 1) throw new Error('只能指定一个版本号')
   const positionalVersion = positional[0]?.trim() ?? ''
   if (flags.version === true && !positionalVersion) throw new Error('--version 需要版本号，例如 --version=2026.11.19')
-  const requestedRaw = typeof flags.version === 'string' ? flags.version.trim() : positionalVersion
+  const flagVersion = typeof flags.version === 'string' ? flags.version.trim() : ''
+  if (positionalVersion && flagVersion) {
+    const a = normalizeReleaseVersion(positionalVersion)
+    const b = normalizeReleaseVersion(flagVersion)
+    if (a !== b) throw new Error(`版本号只能指定一个：${a} / ${b}`)
+  }
+  const requestedRaw = flagVersion || positionalVersion
   const requested = requestedRaw ? normalizeReleaseVersion(requestedRaw) : ''
   const release = requested ? await releaseByVersion(requested) : await latestRelease()
   const target = release.version
@@ -481,6 +487,8 @@ async function update(flags, positional = []) {
   const same = comparison === 0
   const newer = comparison !== null && comparison < 0
   const force = flags.force === true || flags.force === '1' || flags.force === 'true'
+  const checkOnly = flags.check === true || flags.check === '1' || flags.check === 'true'
+    || flags['dry-run'] === true || flags['dry-run'] === '1' || flags['dry-run'] === 'true'
 
   console.log(`当前版本：v${current}`)
   if (requested) {
@@ -490,21 +498,23 @@ async function update(flags, positional = []) {
     console.log(`最新版本：v${target}${newer ? '（有新版本）' : '（已是最新）'}`)
   }
   if (release.htmlUrl) console.log(`Release：${release.htmlUrl}`)
+  const installCommand = `eab update${requested ? ` ${target}` : ''}${force ? ' --force' : ''}`
 
-  if (!flags.apply || flags.apply !== true) {
-    if (same) {
-      console.log(`\n当前已是 v${target}；如需重装，执行：eab update --apply --version=${target} --force`)
-      return
-    }
-    console.log(`\n确认安装：eab update --apply${requested ? ` --version=${target}` : ''}`)
+  if (same && !force) {
+    console.log(`\n当前已是 v${target}；如需重装，执行：${installCommand} --force`)
     return
   }
-  if (same && !force) {
-    throw new Error(`当前已是 v${target}；如需重装，请加 --force`)
+  if (!requested && !newer && !force) {
+    console.log('\n当前已是最新版本，无需更新')
+    return
   }
-  if (!requested && !newer) return
   if (!release.sourceUrl) throw new Error('该 Release 没有源码压缩包，无法更新')
   const action = same ? '重装' : newer ? '升级' : '降级'
+  if (checkOnly) {
+    console.log(`\n预览：将执行${action}到 v${target}，未安装`)
+    console.log(`执行安装：${installCommand}`)
+    return
+  }
   console.log(`正在停止服务并执行${action}…`)
   await stopService()
   const digestArgs = release.sourceDigest ? [`--sha256=${release.sourceDigest}`] : []
@@ -714,11 +724,13 @@ function help() {
   eab restart [server] [--background]   先停止，再按 start 参数启动
   eab stop [server]                    停止本机 EAB 服务
   eab server                           兼容旧写法，等价 eab start server
-  eab update [--apply] [--version=<YYYY.MM.DD[.NN]>] [--force]
+  eab update                            升级到 GitHub 最新版本
+  eab update <版本>                     升级或降级到指定版本（如 2026.11.19）
+  eab update --version=<版本>           同上，兼容旧写法
+  eab update <版本> --force             同版本重装
   eab update --list [--limit=20]        列出 GitHub Release 版本
-  eab update --version=<版本>           只查看指定版本
-  eab update --apply --version=<版本>   安装指定版本（可降级）
-  eab update --apply --version=<当前版本> --force 同版本重装
+  eab update [<版本>] --check           只检查目标版本，不安装
+  eab update --apply                    兼容旧写法，等同 eab update
   eab install-cli
   eab init
   eab doctor

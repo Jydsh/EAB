@@ -182,6 +182,8 @@ const state = {
   approvalTemplateId: 'default',
   approvalNodeId: 'start',
   approvalMembers: null,
+  /** 当前公司部门层级数，用于限制审批级数不超过真实组织深度 */
+  approvalOrgMaxLevels: 0,
   approvalDrag: null,
   /** 流程画布：缩放、平移和右键菜单 */
   approvalCanvas: null,
@@ -190,6 +192,10 @@ const state = {
   /** 自由连线：当前选中的连线、专注画布 */
   approvalEdgeFrom: '',
   approvalEdgeTo: '',
+  /** 节点复制/粘贴与撤销/重做 */
+  approvalClipboard: null,
+  approvalHistories: {},
+  approvalHistoryRestoring: false,
   approvalFocus: false,
   approvalRecordTab: 'todo',
   approvalRecordId: '',
@@ -6660,10 +6666,100 @@ const APPROVAL_NODE_META = {
 }
 
 const APPROVAL_MODES = ['或签', '会签', '依次审批']
+const APPROVAL_MODE_HINTS = {
+  或签: '同一节点只需一名审批人处理即可完成；同意进入下一节点，拒绝则整单拒绝。',
+  会签: '同一节点全部审批人都同意后才进入下一节点；任意一人拒绝，整单拒绝。',
+  依次审批: '审批人按顺序逐个处理，前一位通过后才轮到下一位；任意一人拒绝，整单拒绝。',
+}
+
+let activeWfApprovalModeTrigger = null
+
+function wfApprovalModeTip() {
+  let tip = document.getElementById('wf-mode-tip')
+  if (!tip) {
+    tip = document.createElement('div')
+    tip.id = 'wf-mode-tip'
+    tip.className = 'wf-mode-tip'
+    tip.setAttribute('role', 'tooltip')
+    tip.setAttribute('aria-hidden', 'true')
+    document.body.appendChild(tip)
+  }
+  return tip
+}
+
+function hideWfApprovalModeTip() {
+  activeWfApprovalModeTrigger = null
+  const tip = document.getElementById('wf-mode-tip')
+  if (!tip) return
+  tip.classList.remove('is-visible', 'is-below')
+  tip.setAttribute('aria-hidden', 'true')
+}
+
+function showWfApprovalModeTip(target) {
+  const text = String(target?.dataset?.wfModeTip ?? '').trim()
+  if (!text) return
+  const tip = wfApprovalModeTip()
+  const rect = target.getBoundingClientRect()
+  activeWfApprovalModeTrigger = target
+  tip.textContent = text
+  tip.style.left = '0px'
+  tip.style.top = '0px'
+  tip.classList.remove('is-below')
+  tip.setAttribute('aria-hidden', 'false')
+  const size = tip.getBoundingClientRect()
+  const margin = 8
+  let left = rect.left + rect.width / 2 - size.width / 2
+  left = Math.max(margin, Math.min(left, window.innerWidth - size.width - margin))
+  let top = rect.top - size.height - margin
+  const below = top < margin
+  if (below) top = rect.bottom + margin
+  if (!below && top + size.height > window.innerHeight - margin) {
+    top = Math.max(margin, window.innerHeight - size.height - margin)
+  }
+  if (below && top + size.height > window.innerHeight - margin) {
+    top = Math.max(margin, rect.top - size.height - margin)
+  }
+  const arrowX = Math.max(12, Math.min(size.width - 12, rect.left + rect.width / 2 - left))
+  tip.style.setProperty('--tip-arrow-x', `${arrowX}px`)
+  tip.style.left = `${left}px`
+  tip.style.top = `${top}px`
+  tip.classList.toggle('is-below', below)
+  tip.classList.add('is-visible')
+}
+
+document.addEventListener('pointerover', (event) => {
+  const target = event.target instanceof Element ? event.target.closest('[data-wf-mode-tip]') : null
+  if (!target) {
+    hideWfApprovalModeTip()
+    return
+  }
+  showWfApprovalModeTip(target)
+})
+document.addEventListener('pointerout', (event) => {
+  const target = event.target instanceof Element ? event.target.closest('[data-wf-mode-tip]') : null
+  if (!target) return
+  const next = event.relatedTarget instanceof Element ? event.relatedTarget.closest('[data-wf-mode-tip]') : null
+  if (next !== target) hideWfApprovalModeTip()
+})
+document.addEventListener('focusin', (event) => {
+  const target = event.target instanceof Element ? event.target.closest('[data-wf-mode-tip]') : null
+  if (target) showWfApprovalModeTip(target)
+})
+document.addEventListener('focusout', (event) => {
+  if (event.target instanceof Element && event.target.closest('[data-wf-mode-tip]')) hideWfApprovalModeTip()
+})
+document.addEventListener('pointerdown', hideWfApprovalModeTip)
+window.addEventListener('scroll', hideWfApprovalModeTip, true)
+window.addEventListener('resize', hideWfApprovalModeTip)
+new MutationObserver(() => {
+  if (activeWfApprovalModeTrigger && !activeWfApprovalModeTrigger.isConnected) hideWfApprovalModeTip()
+}).observe(document.body, { childList: true, subtree: true })
+
 const APPROVAL_SOURCES = {
-  dept_chain: { label: '部门负责人链', short: '部门负责人链' },
+  dept_chain: { label: '直属上级 / 部门负责人链', short: '直属上级 / 部门负责人链' },
   members: { label: '指定成员', short: '指定成员' },
-  manager: { label: '申请人直属上级', short: '申请人直属上级' },
+  role: { label: '指定角色', short: '指定角色' },
+  manager: { label: '申请人直属上级（旧配置）', short: '申请人直属上级' },
   company_admin: { label: '公司管理员', short: '公司管理员' },
 }
 const APPROVAL_BRANCH_RULES = {
@@ -6693,6 +6789,39 @@ function approvalSourceOf(node) {
   return 'dept_chain'
 }
 
+function approvalOrgLevelsOfTree(root) {
+  let levels = 1
+  const walk = (node, level) => {
+    for (const child of node?.children ?? []) {
+      const next = level + 1
+      levels = Math.max(levels, next)
+      walk(child, next)
+    }
+  }
+  walk(root, 1)
+  return Math.min(10, levels)
+}
+
+function approvalOrgLevelLimit() {
+  const value = Number(state.approvalOrgMaxLevels)
+  return Number.isFinite(value) && value >= 1 ? Math.min(10, Math.trunc(value)) : 10
+}
+
+function approvalDefaultLevels() {
+  const value = Number(state.approvalData?.defaultPolicy?.maxLevels)
+  return Number.isFinite(value)
+    ? Math.min(approvalOrgLevelLimit(), Math.max(1, Math.trunc(value)))
+    : Math.min(approvalOrgLevelLimit(), 3)
+}
+
+function approvalLevelsOf(node) {
+  const value = Number(node?.maxLevels)
+  if (Number.isFinite(value) && value >= 1) {
+    return Math.min(approvalOrgLevelLimit(), Math.max(1, Math.trunc(value)))
+  }
+  return approvalDefaultLevels()
+}
+
 function approvalApproversOf(node) {
   if (!Array.isArray(node?.approvers)) return []
   return node.approvers.filter((item) => item && item.id && item.name)
@@ -6705,8 +6834,14 @@ function approvalNodeSummary(node) {
     const count = approvalApproversOf(node).length
     return `指定成员 · ${count ? `${count} 人` : '未选择'} · ${timeout} 小时`
   }
-  if (source === 'dept_chain') return `部门负责人链 · 最多 10 级 · ${timeout} 小时`
-  if (source === 'manager') return `申请人直属上级 · 1 人 · ${timeout} 小时`
+  if (source === 'role') {
+    const roleName = String(node?.roleName || node?.roleCode || '').trim()
+    return `指定角色 · ${roleName || '未选择'} · 全体成员会签 · ${timeout} 小时`
+  }
+  if (source === 'dept_chain') {
+    return `直属上级 / 部门负责人链 · ${approvalLevelsOf(node)} 级 · ${timeout} 小时`
+  }
+  if (source === 'manager') return `直属上级 · 1 级 · ${timeout} 小时`
   return `公司管理员 · 1 人 · ${timeout} 小时`
 }
 
@@ -6720,7 +6855,11 @@ function approvalMakeApprovalNode(title, source = 'dept_chain', mode = '或签')
     source,
     timeoutHours: 72,
     approvers: [],
+    roleCode: '',
+    roleName: '',
   }
+  if (source === 'dept_chain') node.maxLevels = approvalDefaultLevels()
+  if (source === 'manager') node.maxLevels = 1
   node.desc = approvalNodeSummary(node)
   return node
 }
@@ -6800,7 +6939,10 @@ function approvalApplyBranchValue(template, shell, input) {
     const tag = shell.querySelector(`[data-wf-branch-tag="${branch.id}"]`)
     if (tag) tag.textContent = branch.label
   }
-  approvalTouchTemplate(template)
+  approvalTouchTemplate(template, {
+    historyLabel: '修改分支条件',
+    historyKey: `branch-value:${branch.id}`,
+  })
 }
 
 function approvalLocateNode(flow, id) {
@@ -6826,8 +6968,47 @@ function approvalTemplateOf() {
   return templates.find((item) => item.id === state.approvalTemplateId) || templates[0]
 }
 
+function approvalNormalizeLegacySources(flow) {
+  for (const node of flow || []) {
+    if (node?.kind === 'approval' && node.source === 'manager') {
+      node.source = 'dept_chain'
+      if (!Number.isFinite(Number(node.maxLevels)) || Number(node.maxLevels) < 1) node.maxLevels = 1
+      const desc = String(node.desc || '')
+      if (!desc || desc.startsWith('申请人直属上级')) node.desc = approvalNodeSummary(node)
+    } else if (node?.kind === 'approval' && node.source === 'dept_chain') {
+      const desc = String(node.desc || '')
+      if (!desc || desc.startsWith('部门负责人链 · 最多 10 级') || desc.startsWith('负责人链 · 最多 10 级')) {
+        node.desc = approvalNodeSummary(node)
+      }
+    }
+    if (Array.isArray(node?.branches)) {
+      for (const branch of node.branches) approvalNormalizeLegacySources(branch?.nodes)
+    }
+  }
+}
+
+function approvalClampLevels(flow) {
+  for (const node of flow || []) {
+    if (node?.kind === 'approval') {
+      const raw = Number(node.maxLevels)
+      if (Number.isFinite(raw) && raw >= 1) {
+        const clamped = Math.min(approvalOrgLevelLimit(), Math.max(1, Math.trunc(raw)))
+        if (clamped !== raw) {
+          node.maxLevels = clamped
+          node.desc = approvalNodeSummary(node)
+        }
+      }
+    }
+    if (Array.isArray(node?.branches)) {
+      for (const branch of node.branches) approvalClampLevels(branch?.nodes)
+    }
+  }
+}
+
 function approvalApplyWorkflow(workflow) {
   if (!workflow || !workflow.id) return
+  approvalNormalizeLegacySources(workflow.flow)
+  approvalClampLevels(workflow.flow)
   const templates = approvalTemplatesOf()
   const index = templates.findIndex((item) => item.id === workflow.id)
   if (index >= 0) templates[index] = workflow
@@ -6837,6 +7018,7 @@ function approvalApplyWorkflow(workflow) {
   if (!approvalFindNode(workflow.flow, state.approvalNodeId)) {
     state.approvalNodeId = workflow.flow?.[0]?.id || 'start'
   }
+  approvalResetHistory(workflow)
 }
 
 function approvalWorkflowPayload(template) {
@@ -7402,7 +7584,7 @@ function approvalConnectionIssue(template, fromId, toId, ignoreEdge = null) {
   const to = approvalFindNode(flow, toId)
   if (!from || !to) return '节点不存在'
   if (fromId === toId) return '不能连接到节点自身'
-  if (from.kind === 'end') return '结束节点不能再连出线'
+  if (from.kind === 'end' && to.kind !== 'cc') return '结束节点只能连接到抄送节点'
   if (to.kind === 'start') return '开始节点不能作为连线目标'
   const edges = approvalGraphEdges(flow).filter(
     (edge) => !(ignoreEdge && edge.from === ignoreEdge.from && edge.to === ignoreEdge.to),
@@ -7491,7 +7673,7 @@ function approvalConnectNodes(template, fromId, toId, options = {}) {
       to: approvalNormalizePortSide(options.toSide) || auto.to,
     },
   }
-  approvalTouchTemplate(template)
+  approvalTouchTemplate(template, { historyLabel: '新建连线' })
   return { ok: true, message: branch ? `已连接并生成分支「${branch.label}」` : '已创建连线' }
 }
 
@@ -7508,7 +7690,7 @@ function approvalReconnectEdgeTarget(template, fromId, oldToId, newToId, toSide 
   const side = approvalNormalizePortSide(toSide) || approvalNormalizePortSide(oldPorts.to) || approvalAutoPortSides(from, newTo).to
   if (oldToId === newToId) {
     from.edgePorts = { ...(from.edgePorts || {}), [oldToId]: { ...oldPorts, to: side } }
-    approvalTouchTemplate(template)
+    approvalTouchTemplate(template, { historyLabel: '调整连线方向' })
     return { ok: true, message: '已更新连线方向' }
   }
   const label = from.edgeLabels?.[oldToId] || ''
@@ -7534,7 +7716,7 @@ function approvalReconnectEdgeTarget(template, fromId, oldToId, newToId, toSide 
       to: side,
     },
   }
-  approvalTouchTemplate(template)
+  approvalTouchTemplate(template, { historyLabel: '重连连线' })
   return { ok: true, message: branch ? `已重连到「${newTo.title}」，分支「${branch.label}」保留` : `已重连到「${newTo.title}」` }
 }
 
@@ -7551,7 +7733,7 @@ function approvalReconnectEdgeSource(template, oldFromId, toId, newFromId, fromS
   const side = approvalNormalizePortSide(fromSide) || approvalNormalizePortSide(oldPorts.from) || approvalAutoPortSides(newFrom, to).from
   if (oldFromId === newFromId) {
     oldFrom.edgePorts = { ...(oldFrom.edgePorts || {}), [toId]: { ...oldPorts, from: side } }
-    approvalTouchTemplate(template)
+    approvalTouchTemplate(template, { historyLabel: '调整连线方向' })
     return { ok: true, message: '已更新连线方向' }
   }
   const label = oldFrom.edgeLabels?.[toId] || ''
@@ -7579,7 +7761,7 @@ function approvalReconnectEdgeSource(template, oldFromId, toId, newFromId, fromS
       to: approvalNormalizePortSide(oldPorts.to) || approvalAutoPortSides(newFrom, to).to,
     },
   }
-  approvalTouchTemplate(template)
+  approvalTouchTemplate(template, { historyLabel: '重连连线' })
   return { ok: true, message: branch ? `已改由「${newFrom.title}」发起并生成分支「${branch.label}」` : `已改由「${newFrom.title}」发起` }
 }
 
@@ -7594,7 +7776,7 @@ function approvalRemoveEdge(template, fromId, toId) {
   if (from.edgeLabels) delete from.edgeLabels[toId]
   if (from.edgeRules) delete from.edgeRules[toId]
   if (from.edgePorts) delete from.edgePorts[toId]
-  approvalTouchTemplate(template)
+  approvalTouchTemplate(template, { historyLabel: '删除连线' })
   return true
 }
 
@@ -7608,7 +7790,7 @@ function approvalDetachNodeWithLinks(template, nodeId) {
     if (node.edgePorts) delete node.edgePorts[nodeId]
   }
   const removed = approvalDetachNode(template.flow, nodeId)
-  if (removed) approvalTouchTemplate(template)
+  if (removed) approvalTouchTemplate(template, { historyLabel: '删除节点' })
   return removed
 }
 
@@ -7687,7 +7869,7 @@ function approvalAutoLayoutGraph(template) {
       node.y = Math.round(24 + row * APPROVAL_GRAPH_LEVEL_GAP)
     })
   }
-  approvalTouchTemplate(template)
+  approvalTouchTemplate(template, { historyLabel: '自动布局' })
 }
 
 function approvalGraphEdgeDetourSide(from, to, nodes = []) {
@@ -7849,10 +8031,8 @@ function approvalNodeHtml(node, selectedId, portCounts = {}) {
         : meta.label
   const ports = APPROVAL_PORT_SIDES.map((side) => {
     const count = Number(portCounts?.[side] || 0)
-    if (node.kind === 'end') {
-      return `<span class="wf-port is-${side} is-disabled" data-wf-port-side="${side}" aria-hidden="true"><span class="wf-port-dot"></span></span>`
-    }
-    return `<span class="wf-port is-${side}${count > 1 ? ' is-split' : ''}" data-wf-link-after="${esc(node.id)}" data-wf-port-side="${side}" data-wf-link-side="${side}" title="从这里拖出连线；可选任意节点作为目标">
+    const portTitle = node.kind === 'end' ? '结束节点可连接到抄送节点' : '从这里拖出连线；可选任意节点作为目标'
+    return `<span class="wf-port is-${side}${count > 1 ? ' is-split' : ''}" data-wf-link-after="${esc(node.id)}" data-wf-port-side="${side}" data-wf-link-side="${side}" title="${esc(portTitle)}">
       <span class="wf-port-dot"></span>${count > 1 ? `<i class="wf-port-count">${count}</i>` : ''}
     </span>`
   }).join('')
@@ -8004,14 +8184,15 @@ function approvalVisibleWorldRect() {
   }
 }
 
-function approvalInsertFlowNode(template, newNode, anchorId, x, y) {
+function approvalInsertFlowNode(template, newNode, anchorId, x, y, history = {}) {
   const anchor = anchorId ? approvalFindNode(template.flow, anchorId) : null
   const located = anchorId ? approvalLocateNode(template.flow, anchorId) : null
   const explicit = approvalHasExplicitLinks(template.flow)
   let inserted = false
   if (located?.node) {
     if (located.node.kind === 'end') {
-      template.flow.splice(located.index, 0, newNode)
+      const insertAt = newNode.kind === 'cc' ? located.index + 1 : located.index
+      located.nodes.splice(insertAt, 0, newNode)
     } else {
       located.nodes.splice(located.index + 1, 0, newNode)
     }
@@ -8030,14 +8211,33 @@ function approvalInsertFlowNode(template, newNode, anchorId, x, y) {
   const anchorPosition = approvalGraphPosition(anchor)
   const world = approvalVisibleWorldRect()
   const margin = world ? 18 / approvalCanvasState().scale : 0
-  newNode.x = Math.max(0, Number.isFinite(x) ? x : anchorPosition ? anchorPosition.x : 340)
-  newNode.y = Math.max(0, Number.isFinite(y) ? y : anchorPosition ? anchorPosition.y + (anchor.kind === 'end' ? -APPROVAL_GRAPH_LEVEL_GAP : APPROVAL_GRAPH_LEVEL_GAP) : 24)
+  const ccAfterEnd = Boolean(anchor?.kind === 'end' && newNode.kind === 'cc')
+  newNode.x = Math.max(
+    0,
+    ccAfterEnd && anchorPosition
+      ? anchorPosition.x
+      : Number.isFinite(x)
+        ? x
+        : anchorPosition
+          ? anchorPosition.x
+          : 340,
+  )
+  newNode.y = Math.max(
+    0,
+    ccAfterEnd && anchorPosition
+      ? anchorPosition.y + APPROVAL_GRAPH_LEVEL_GAP
+      : Number.isFinite(y)
+        ? y
+        : anchorPosition
+          ? anchorPosition.y + (anchor.kind === 'end' ? -APPROVAL_GRAPH_LEVEL_GAP : APPROVAL_GRAPH_LEVEL_GAP)
+          : 24,
+  )
   if (world) {
     newNode.x = Math.min(Math.max(newNode.x, world.left + margin), Math.max(world.left + margin, world.right - APPROVAL_GRAPH_NODE_W - margin))
     newNode.y = Math.min(Math.max(newNode.y, world.top + margin), Math.max(world.top + margin, world.bottom - APPROVAL_GRAPH_NODE_H - margin))
   }
   if (newNode.kind === 'condition') approvalLayoutConditionBranches(newNode)
-  approvalTouchTemplate(template)
+  approvalTouchTemplate(template, history)
   return newNode
 }
 
@@ -8057,8 +8257,12 @@ function approvalOpenCanvasMenu(template, shell, event) {
   const point = approvalCanvasWorldPoint(event.clientX, event.clientY)
   const anchor = node || approvalNearestGraphNode(template.flow, point.x, point.y)
   const anchorId = anchor?.id || ''
-  const canCreate = !edge && (!node || node.kind !== 'end')
+  const endNode = !edge && node?.kind === 'end'
+  const canCreate = !edge
   const item = (kind, label, note) => `<button type="button" class="wf-menu-item" data-wf-menu-add="${esc(kind)}"><i class="wf-menu-icon">${esc(APPROVAL_NODE_META[kind]?.icon || '＋')}</i><span><strong>${esc(label)}</strong><small>${esc(note)}</small></span></button>`
+  const createItems = endNode
+    ? item('cc', '抄送节点', '结束节点后可追加的旁路通知')
+    : item('approval', '审批节点', '直属上级 / 部门负责人链 · 可配置级数') + item('cc', '抄送节点', '站内通知 + 钉钉机器人') + item('condition', '条件判断', '按权限风险自动分流')
   const menu = document.createElement('div')
   menu.className = 'wf-menu'
   menu.setAttribute('data-wf-canvas-menu', '1')
@@ -8075,7 +8279,7 @@ function approvalOpenCanvasMenu(template, shell, event) {
     headText = `在「${esc(anchor.title)}」附近新建`
   }
   menu.innerHTML = `<div class="wf-menu-head"><span>${headText}</span><small>右键菜单</small></div>
-    ${canCreate ? item('approval', '审批节点', '部门负责人链 · 或签') + item('cc', '抄送节点', '站内通知 + 钉钉机器人') + item('condition', '条件判断', '按权限风险自动分流') : edge ? '<div class="wf-menu-note">连线可单独设置标签或删除</div>' : '<div class="wf-menu-note">结束节点后不能再添加节点</div>'}
+    ${canCreate ? createItems : edge ? '<div class="wf-menu-note">连线可单独设置标签或删除</div>' : '<div class="wf-menu-note">当前位置不能新建节点</div>'}${endNode ? '<div class="wf-menu-note">结束节点后只能追加抄送节点，抄送节点可作为流程末端</div>' : ''}
     ${edge ? `<div class="wf-menu-sep"></div><button type="button" class="wf-menu-item is-danger" data-wf-menu-edge-delete="1"><i class="wf-menu-icon">×</i><span><strong>删除连线</strong><small>${esc(approvalEdgeLabelOf(template, edge.from, edge.to) || '断开这两个节点')}</small></span></button>` : ''}
     ${node && node.kind !== 'start' && node.kind !== 'end' ? '<div class="wf-menu-sep"></div><button type="button" class="wf-menu-item is-danger" data-wf-menu-delete="1"><i class="wf-menu-icon">×</i><span><strong>删除节点</strong><small>同时清理关联连线</small></span></button>' : ''}
     <div class="wf-menu-sep"></div>
@@ -8100,8 +8304,11 @@ function approvalOpenCanvasMenu(template, shell, event) {
   }
 }
 
-function approvalField(label, body, hint = '') {
-  return `<label class="wf-field"><span>${esc(label)}</span>${body}${hint ? `<small>${esc(hint)}</small>` : ''}</label>`
+function approvalField(label, body, hint = '', tip = '') {
+  const tipButton = tip
+    ? `<button type="button" class="wf-mode-help wf-field-help" data-wf-mode-tip="${esc(tip)}" aria-label="${esc(label)}说明">?</button>`
+    : ''
+  return `<label class="wf-field"><span class="wf-field-label">${esc(label)}${tipButton}</span>${body}${hint ? `<small>${esc(hint)}</small>` : ''}</label>`
 }
 
 function approvalReadonly(value, tone = '') {
@@ -8226,17 +8433,97 @@ function approvalEdgeInspectorHtml(template, edge) {
   </aside>`
 }
 
+function approvalRoleOf(node) {
+  const roles = Array.isArray(state.approvalData?.roles) ? state.approvalData.roles : []
+  return roles.find((item) => String(item.code) === String(node?.roleCode || '')) || null
+}
+
+function approvalPreviewMembers() {
+  return Array.isArray(state.approvalMembers) ? state.approvalMembers : []
+}
+
+function approvalPreviewApplicantId() {
+  const members = approvalPreviewMembers()
+  const remembered = String(state.approvalPreviewApplicantId || '')
+  if (remembered && members.some((item) => item.id === remembered)) return remembered
+  const current = String(state.me?.person?.id || '')
+  if (current && members.some((item) => item.id === current)) return current
+  return members[0]?.id || current
+}
+
+function approvalApplicantOptionLabel(member) {
+  const name = String(member?.name || member?.id || '未命名成员')
+  return member?.deptName ? `${name} · ${member.deptName}` : name
+}
+
+function approvalApproverPreviewHtml(node) {
+  const source = approvalSourceOf(node)
+  if (source !== 'dept_chain' && source !== 'manager') return ''
+  const members = approvalPreviewMembers()
+  const applicantId = approvalPreviewApplicantId()
+  const options = members
+    .map(
+      (member) =>
+        `<option value="${esc(member.id)}"${member.id === applicantId ? ' selected' : ''}>${esc(approvalApplicantOptionLabel(member))}</option>`,
+    )
+    .join('')
+  return `<div class="wf-preview" data-wf-approver-preview>
+    <div class="wf-preview-head">
+      <span>实人预览</span>
+      ${
+        members.length
+          ? `<select class="wf-preview-select" data-wf-preview-applicant aria-label="选择预览申请人">${options}</select>`
+          : '<span class="wf-preview-empty">成员数据未加载</span>'
+      }
+    </div>
+    <div class="wf-preview-body" data-wf-preview-body aria-live="polite">
+      <span class="wf-preview-loading">预览中…</span>
+    </div>
+  </div>`
+}
+
 function approvalApproverFieldHtml(node) {
   const source = approvalSourceOf(node)
   const approvers = approvalApproversOf(node)
+  if (source === 'role') {
+    const role = approvalRoleOf(node)
+    const roleName = String(role?.name || node.roleName || node.roleCode || '').trim()
+    const memberCount = role ? Number(role.memberCount) || 0 : 0
+    return `<div class="wf-field">
+      <span>指定角色</span>
+      <div class="wf-approver-list">
+        ${
+          roleName
+            ? `<span class="wf-approver-chip">${esc(roleName)}${role ? ` · ${memberCount} 人` : ''}</span>`
+            : '<div class="wf-rule-empty">还没有选择角色</div>'
+        }
+      </div>
+      <div class="wf-rule-hint">角色内全部在职成员会签，申请人本人除外；提交时按角色成员快照展开。</div>
+      <button type="button" class="btn ghost wf-wide" data-wf-pick-role>${roleName ? '重新选择角色' : '选择角色'}</button>
+    </div>`
+  }
   if (source !== 'members') {
     const sourceText =
       source === 'dept_chain'
-        ? '按申请人所在部门逐级向上，最多 10 级'
+        ? '按申请人所在部门逐级向上取负责人；跳过申请人本人、没有负责人的部门层级和无审批权限的负责人'
         : source === 'manager'
-          ? '只取申请人直属上级'
+          ? '只取申请人直属上级（旧配置）'
           : '固定由公司管理员审批'
-    return `<div class="wf-field"><span>审批人</span>${approvalReadonly(sourceText)}</div>`
+    const levelsField =
+      source === 'dept_chain'
+        ? approvalField(
+            '审批级数',
+            `<span class="wf-number-unit"><input class="wf-input" type="number" min="1" max="${approvalOrgLevelLimit()}" value="${approvalLevelsOf(node)}" data-wf-field="maxLevels"><span class="wf-unit">级</span></span>`,
+            '',
+            `1 级为申请人直属上级；申请人本人是部门负责人时自动从上级部门开始。依次审批按级展开，或签只取第 1 级。本组织实际最多 ${approvalOrgLevelLimit()} 级。`,
+          )
+        : ''
+    return `${approvalField(
+      '审批人',
+      `${source === 'company_admin' ? approvalReadonly('公司管理员') : ''}${approvalApproverPreviewHtml(node)}`,
+      '',
+      sourceText,
+    )}${levelsField}`
   }
   return `<div class="wf-field">
     <span>指定成员</span>
@@ -8276,12 +8563,16 @@ function approvalInspectorHtml(template, node) {
     const mode = approvalModeOf(node)
     body = `${approvalField('节点名称', `<input class="wf-input" data-wf-field="title" value="${esc(node.title)}">`)}
       ${approvalField('审批人来源', `<select class="wf-input" data-wf-field="source">
-        ${Object.entries(APPROVAL_SOURCES).map(([key, item]) => `<option value="${esc(key)}"${source === key ? ' selected' : ''}>${esc(item.label)}</option>`).join('')}
+        ${Object.entries(APPROVAL_SOURCES).filter(([key]) => key !== 'manager').map(([key, item]) => `<option value="${esc(key)}"${source === key ? ' selected' : ''}>${esc(item.label)}</option>`).join('')}
       </select>`)}
       ${approvalApproverFieldHtml(node)}
-      <div class="wf-field"><span>审批方式</span><div class="wf-segment">${modes.map((item) => `<button type="button" class="wf-segment-btn${mode === item ? ' is-active' : ''}" data-wf-mode="${esc(item)}">${esc(item)}</button>`).join('')}</div></div>
+      ${
+        source === 'role'
+          ? `${approvalField('审批方式', approvalReadonly('会签'), '该角色全体成员在同一个节点审批，全部同意后才进入下一节点')}`
+          : `<div class="wf-field"><span>审批方式</span><div class="wf-segment">${modes.map((item) => `<span class="wf-segment-item${mode === item ? ' is-active' : ''}"><button type="button" class="wf-segment-btn" data-wf-mode="${esc(item)}">${esc(item)}</button><button type="button" class="wf-mode-help" data-wf-mode-tip="${esc(APPROVAL_MODE_HINTS[item] || '')}" aria-label="查看${esc(item)}审批方式说明" aria-describedby="wf-mode-tip">?</button></span>`).join('')}</div></div>`
+      }
       <div class="wf-field-row">
-        ${approvalField('处理时限', `<input class="wf-input" type="number" min="1" max="720" value="${Number(node.timeoutHours) || 72}" data-wf-field="timeoutHours"><span class="wf-unit">小时</span>`)}
+        ${approvalField('处理时限', `<span class="wf-number-unit"><input class="wf-input" type="number" min="1" max="720" value="${Number(node.timeoutHours) || 72}" data-wf-field="timeoutHours"><span class="wf-unit">小时</span></span>`)}
         ${approvalField('超时动作', `<select class="wf-input" data-wf-field="timeoutAction">
           <option value="remind"${node.timeoutAction === 'remind' || !node.timeoutAction ? ' selected' : ''}>提醒审批人</option>
           <option value="approve"${node.timeoutAction === 'approve' ? ' selected' : ''}>自动通过</option>
@@ -8291,7 +8582,7 @@ function approvalInspectorHtml(template, node) {
       <div class="wf-toggle-list">
         <label class="wf-toggle"><span>允许审批人转交</span><input type="checkbox" data-wf-toggle="allowTransfer"${node.allowTransfer !== false ? ' checked' : ''}></label>
         <label class="wf-toggle"><span>允许审批人加签</span><input type="checkbox" data-wf-toggle="allowAddSign"${node.allowAddSign !== false ? ' checked' : ''}></label>
-        <label class="wf-toggle"><span>审批人空缺时由公司管理员兜底</span><input type="checkbox" data-wf-toggle="fallbackAdmin"${node.fallbackAdmin !== false ? ' checked' : ''}></label>
+        <label class="wf-toggle" title="取消勾选后，没有负责人的部门层级直接跳过，不追加公司管理员"><span>审批人空缺时由公司管理员兜底</span><input type="checkbox" data-wf-toggle="fallbackAdmin"${approvalNodeFallbackAdmin(node) ? ' checked' : ''}></label>
       </div>
       ${approvalField('节点说明', `<textarea class="wf-input wf-textarea" data-wf-field="desc">${esc(node.desc || '')}</textarea>`)}`
   } else if (node.kind === 'cc') {
@@ -8316,6 +8607,11 @@ function approvalInspectorHtml(template, node) {
       ${node.kind === 'start' || node.kind === 'end' ? '<span class="muted">开始与结束节点不可删除</span>' : '<button type="button" class="btn ghost wf-danger" data-wf-delete>删除节点</button>'}
     </div>
   </aside>`
+}
+
+function approvalNodeFallbackAdmin(node) {
+  if (typeof node?.fallbackAdmin === 'boolean') return node.fallbackAdmin
+  return Boolean(approvalDefaultPolicy().includeCompanyAdmin)
 }
 
 function approvalDefaultPolicy() {
@@ -8391,10 +8687,194 @@ function approvalWorkflowStatusText(template) {
   return '草稿'
 }
 
-function approvalTouchTemplate(template) {
+const APPROVAL_HISTORY_LIMIT = 60
+const APPROVAL_HISTORY_COALESCE_MS = 1200
+
+function approvalFlowCopy(flow) {
+  return JSON.parse(JSON.stringify(flow || []))
+}
+
+function approvalSelectionNow() {
+  return {
+    nodeId: state.approvalNodeId || '',
+    edgeFrom: state.approvalEdgeFrom || '',
+    edgeTo: state.approvalEdgeTo || '',
+  }
+}
+
+function approvalHistoryOf(template, reset = false) {
+  if (!template?.id) return null
+  if (!state.approvalHistories) state.approvalHistories = {}
+  let history = state.approvalHistories[template.id]
+  if (!history || reset) {
+    const flow = approvalFlowCopy(template.flow)
+    history = {
+      undo: [],
+      redo: [],
+      last: flow,
+      lastJson: JSON.stringify(flow),
+      selection: approvalSelectionNow(),
+    }
+    state.approvalHistories[template.id] = history
+  }
+  return history
+}
+
+function approvalResetHistory(template) {
+  approvalHistoryOf(template, true)
+}
+
+function approvalEnsureHistory(template) {
+  const history = approvalHistoryOf(template)
+  if (!history) return
+  history.selection = approvalSelectionNow()
+}
+
+function approvalHistoryRecord(template, meta = {}) {
+  if (state.approvalHistoryRestoring) return
+  const history = approvalHistoryOf(template)
+  if (!history) return
+  const currentJson = JSON.stringify(template.flow || [])
+  if (currentJson === history.lastJson) return
+  const now = Date.now()
+  const label = String(meta.historyLabel || '流程变更')
+  const key = meta.historyKey ? String(meta.historyKey) : ''
+  const top = history.undo[history.undo.length - 1]
+  if (top && key && top.key === key && now - top.at < APPROVAL_HISTORY_COALESCE_MS) {
+    top.at = now
+    top.label = label
+  } else {
+    history.undo.push({
+      flow: approvalFlowCopy(history.last),
+      selection: { ...history.selection },
+      label,
+      key,
+      at: now,
+    })
+    if (history.undo.length > APPROVAL_HISTORY_LIMIT) history.undo.shift()
+  }
+  history.redo = []
+  history.last = approvalFlowCopy(template.flow)
+  history.lastJson = currentJson
+}
+
+function approvalRestoreHistorySelection(template, selection = {}) {
+  const nodeId = String(selection.nodeId || '')
+  const node = nodeId ? approvalFindNode(template.flow, nodeId) : null
+  state.approvalNodeId = node ? nodeId : (template.flow?.[0]?.id || 'start')
+  const edgeFrom = String(selection.edgeFrom || '')
+  const edgeTo = String(selection.edgeTo || '')
+  const edgeExists = Boolean(
+    edgeFrom &&
+      edgeTo &&
+      approvalGraphEdges(template.flow).some((edge) => edge.from === edgeFrom && edge.to === edgeTo),
+  )
+  state.approvalEdgeFrom = edgeExists ? edgeFrom : ''
+  state.approvalEdgeTo = edgeExists ? edgeTo : ''
+}
+
+function approvalStepHistory(template, direction) {
+  const history = approvalHistoryOf(template)
+  if (!history) return { ok: false, message: '当前没有可撤销的流程' }
+  const redo = direction === 'redo'
+  const from = redo ? history.redo : history.undo
+  if (!from.length) return { ok: false, message: redo ? '没有可重做的操作' : '没有可撤销的操作' }
+  const entry = from.pop()
+  const current = {
+    flow: approvalFlowCopy(template.flow),
+    selection: approvalSelectionNow(),
+    label: entry.label,
+    key: entry.key,
+    at: Date.now(),
+  }
+  const to = redo ? history.undo : history.redo
+  to.push(current)
+  if (to.length > APPROVAL_HISTORY_LIMIT) to.shift()
+  state.approvalHistoryRestoring = true
+  template.flow = approvalFlowCopy(entry.flow)
+  template.status = 'draft'
+  template.updatedAt = Date.now()
+  approvalRestoreHistorySelection(template, entry.selection)
+  history.last = approvalFlowCopy(template.flow)
+  history.lastJson = JSON.stringify(template.flow)
+  state.approvalHistoryRestoring = false
+  approvalRerender()
+  return { ok: true, label: entry.label, message: `${redo ? '已重做' : '已撤销'}：${entry.label}` }
+}
+
+function approvalCopySelectedNode(template) {
+  if (!template || state.approvalEdgeFrom) return { ok: false, message: '请先选中一个节点' }
+  const node = approvalFindNode(template.flow, state.approvalNodeId)
+  if (!node) return { ok: false, message: '请先选中一个节点' }
+  if (node.kind === 'start' || node.kind === 'end') {
+    return { ok: false, message: `${APPROVAL_NODE_META[node.kind]?.label || '该'}节点不能复制` }
+  }
+  const copy = JSON.parse(JSON.stringify(node))
+  delete copy.id
+  delete copy.nextIds
+  delete copy.edgeLabels
+  delete copy.edgeRules
+  delete copy.edgePorts
+  delete copy.branches
+  delete copy.x
+  delete copy.y
+  const position = approvalGraphPosition(node)
+  state.approvalClipboard = {
+    node: copy,
+    sourceId: node.id,
+    templateId: template.id,
+    x: position?.x,
+    y: position?.y,
+  }
+  return { ok: true, message: `已复制节点「${node.title}」，按 Ctrl+V 粘贴` }
+}
+
+function approvalPasteNode(template) {
+  const clip = state.approvalClipboard
+  if (!template || !clip?.node) return { ok: false, message: '剪贴板里没有可粘贴的节点' }
+  approvalMaterializeLinks(template)
+  const copy = JSON.parse(JSON.stringify(clip.node))
+  copy.id = approvalUid(copy.kind || 'node')
+  copy.title = `${String(copy.title || '节点').trim() || '节点'} 副本`
+  copy.nextIds = []
+  copy.edgeLabels = {}
+  copy.edgeRules = {}
+  copy.edgePorts = {}
+  if (copy.kind === 'condition') copy.branches = []
+  const sameTemplate = clip.templateId === template.id
+  const source = sameTemplate ? approvalFindNode(template.flow, clip.sourceId) : null
+  const sourcePosition = approvalGraphPosition(source)
+  const world = approvalVisibleWorldRect()
+  const centerX = world ? (world.left + world.right) / 2 - APPROVAL_GRAPH_NODE_W / 2 : 340
+  const centerY = world ? (world.top + world.bottom) / 2 - APPROVAL_GRAPH_NODE_H / 2 : 24
+  const baseX = sourcePosition?.x ?? (sameTemplate && Number.isFinite(clip.x) ? clip.x : centerX)
+  const baseY = sourcePosition?.y ?? (sameTemplate && Number.isFinite(clip.y) ? clip.y : centerY)
+  const margin = world ? 18 / approvalCanvasState().scale : 0
+  copy.x = baseX + 32
+  copy.y = baseY + 32
+  if (world) {
+    copy.x = Math.min(Math.max(copy.x, world.left + margin), Math.max(world.left + margin, world.right - APPROVAL_GRAPH_NODE_W - margin))
+    copy.y = Math.min(Math.max(copy.y, world.top + margin), Math.max(world.top + margin, world.bottom - APPROVAL_GRAPH_NODE_H - margin))
+  }
+  const located = source ? approvalLocateNode(template.flow, source.id) : null
+  if (located?.node) located.nodes.splice(located.index + 1, 0, copy)
+  else template.flow.push(copy)
+  approvalTouchTemplate(template, {
+    historyLabel: '粘贴节点',
+    historyKey: `paste:${copy.id}`,
+  })
+  state.approvalNodeId = copy.id
+  state.approvalEdgeFrom = ''
+  state.approvalEdgeTo = ''
+  approvalRerender()
+  return { ok: true, message: `已粘贴节点「${copy.title}」`, nodeId: copy.id }
+}
+
+function approvalTouchTemplate(template, history = {}) {
   if (!template) return
   template.status = 'draft'
   template.updatedAt = Date.now()
+  approvalHistoryRecord(template, history)
 }
 
 async function loadApprovalMembers() {
@@ -8402,6 +8882,105 @@ async function loadApprovalMembers() {
   const data = await api('/api/org/members')
   state.approvalMembers = Array.isArray(data.members) ? data.members : []
   return state.approvalMembers
+}
+
+let approvalPreviewTimer = 0
+let approvalPreviewRequestSeq = 0
+
+function approvalPreviewPeopleHtml(preview) {
+  const people = Array.isArray(preview?.people) ? preview.people : []
+  const skipped = Array.isArray(preview?.skipped) ? preview.skipped : []
+  if (!people.length && !skipped.length) {
+    return `<div class="wf-preview-empty">没有可用审批人${preview?.fallbackAdmin === false ? '；已关闭公司管理员兜底，提交时会被拒绝' : '，提交时会被拒绝'}</div>`
+  }
+  const skipReasons = {
+    self: '申请人是本级负责人，已跳过',
+    no_manager: '未设置部门负责人，已跳过',
+    no_permission: '未开通“审批决定”权限，已跳过',
+    missing_user: '负责人账号不可用，已跳过',
+  }
+  const rows = [
+    ...people.map((person) => {
+      const role = person.kind === 'company_admin' ? '公司管理员兜底' : person.deptName || '部门负责人'
+      const badge = person.kind === 'company_admin' ? '兜底' : `${Number(person.level) || 1}级负责人`
+      return {
+        level: person.kind === 'company_admin' ? 999 : Number(person.level) || 1,
+        html: `<div class="wf-preview-person">
+          <b>${badge}</b>
+          <span class="wf-preview-name">${esc(person.name)}</span>
+          <span class="wf-preview-role">${esc(role)}</span>
+        </div>`,
+      }
+    }),
+    ...skipped.map((item) => {
+      const level = Number(item.level) || 1
+      const reason = skipReasons[item.reason] || '已跳过'
+      const title = item.name
+        ? `<strong>${esc(item.name)}</strong><span>${esc(item.deptName)}${item.reason === 'no_manager' ? '' : '负责人'}</span>`
+        : `<strong>${esc(item.deptName)}</strong>`
+      return {
+        level,
+        html: `<div class="wf-preview-person is-skipped">
+          <b>${level}级</b>
+          <span class="wf-preview-skip-copy">
+            <span class="wf-preview-skip-title">${title}</span>
+            <span class="wf-preview-skip-reason">${esc(reason)}</span>
+          </span>
+        </div>`,
+      }
+    }),
+  ].sort((left, right) => left.level - right.level)
+  const mode = String(preview?.mode || '依次审批')
+  const skippedCount = skipped.length
+  const more = preview?.hasMore ? `；后面还有审批人，仅显示前 ${preview.levels} 级` : ''
+  const short = people.length < Number(preview?.levels || 0)
+    ? `；配置 ${preview.levels} 级，${skippedCount > 0 ? `已跳过 ${skippedCount} 级` : `实际只有 ${people.length} 人可用`}`
+    : ''
+  return `<div class="wf-preview-chain">${rows.map((row) => row.html).join('')}</div>
+    <div class="wf-preview-meta">${esc(mode)} · ${people.length} 人可用${esc(short)}${esc(more)}</div>`
+}
+
+function approvalScheduleApproverPreview(delay = 0) {
+  window.clearTimeout(approvalPreviewTimer)
+  const seq = ++approvalPreviewRequestSeq
+  approvalPreviewTimer = window.setTimeout(async () => {
+    const root = document.querySelector('[data-wf-approver-preview]')
+    const body = root?.querySelector('[data-wf-preview-body]')
+    const template = approvalTemplateOf()
+    const node = approvalFindNode(template?.flow, state.approvalNodeId)
+    if (!root || !body || !template || node?.kind !== 'approval') return
+    const source = approvalSourceOf(node)
+    if (source !== 'dept_chain' && source !== 'manager') return
+    const applicantUserId = approvalPreviewApplicantId()
+    if (!applicantUserId) {
+      body.innerHTML = '<div class="wf-preview-empty">当前公司还没有可预览的成员</div>'
+      return
+    }
+    body.innerHTML = '<span class="wf-preview-loading">预览中…</span>'
+    try {
+      // 预览不是保存动作，不能复用 apiPost 的保存反馈，避免误提示“正在保存”。
+      const res = await fetch(
+        `/api/console/approval-workflows/${encodeURIComponent(template.id)}/preview-approvers${qs(`/preview-approvers`)}`,
+        {
+          method: 'POST',
+          headers: { accept: 'application/json', 'content-type': 'application/json', 'x-eab-console': '1' },
+          body: JSON.stringify({
+            node: { ...node, maxLevels: approvalLevelsOf(node) },
+            nodeId: node.id,
+            applicantUserId,
+          }),
+        },
+      )
+      const data = await parseResponse(res)
+      if (seq !== approvalPreviewRequestSeq) return
+      const currentBody = document.querySelector('[data-wf-preview-body]')
+      if (currentBody) currentBody.innerHTML = approvalPreviewPeopleHtml(data?.preview)
+    } catch (err) {
+      if (seq !== approvalPreviewRequestSeq) return
+      const currentBody = document.querySelector('[data-wf-preview-body]')
+      if (currentBody) currentBody.innerHTML = `<div class="wf-preview-empty">${esc(err?.message || '预览失败')}</div>`
+    }
+  }, delay)
 }
 
 async function openApprovalApproverPicker() {
@@ -8473,10 +9052,99 @@ async function openApprovalApproverPicker() {
     node.approvers = picked
     node.source = 'members'
     node.desc = approvalNodeSummary(node)
-    approvalTouchTemplate(template)
+    approvalTouchTemplate(template, { historyLabel: '选择审批成员' })
     close()
     approvalRerender()
     showTopToast(`已选择 ${picked.length} 名审批成员`)
+  })
+}
+
+async function openApprovalRolePicker() {
+  const template = approvalTemplateOf()
+  const node = approvalFindNode(template?.flow, state.approvalNodeId)
+  if (!template || node?.kind !== 'approval') return
+  let roles = Array.isArray(state.approvalData?.roles) ? state.approvalData.roles : []
+  if (!roles.length) {
+    try {
+      const data = await api('/api/console/permission-policies')
+      state.approvalData = { ...(state.approvalData || {}), ...(data || {}) }
+      roles = Array.isArray(data?.roles) ? data.roles : []
+    } catch (err) {
+      showTopToast(err?.message || '读取角色失败')
+      return
+    }
+  }
+  const eligible = roles.filter((role) => role.canDecide !== false && Number(role.memberCount) > 0)
+  const selectedCode = String(node.roleCode || '')
+  const roleReason = (role) => {
+    const count = Number(role.memberCount) || 0
+    if (role.canDecide === false && count === 0) return '未开通「审批决定」权限 · 暂无在职成员'
+    if (role.canDecide === false) return '未开通「审批决定」权限，不能作为审批角色'
+    if (count === 0) return '已具备「审批决定」权限 · 暂无在职成员'
+    return `${count} 名在职成员 · 全部会签 · 申请人本人除外`
+  }
+  const roleRows = roles
+    .map((role) => {
+      const usable = role.canDecide !== false && Number(role.memberCount) > 0
+      return `<label class="scope-check wf-member-row${usable ? '' : ' is-disabled'}" data-wf-role-row data-search="${esc(`${role.name} ${role.code}`.toLowerCase())}"${usable ? '' : ' title="该角色暂不能作为审批角色"'}>
+        <input type="radio" name="wf-role" data-wf-role="${esc(role.code)}"${selectedCode === role.code && usable ? ' checked' : ''}${usable ? '' : ' disabled'}>
+        <span class="wf-member-copy"><strong>${esc(role.name)}</strong><small>${esc(roleReason(role))}</small></span>
+      </label>`
+    })
+    .join('')
+  const overlay = modelModal(`
+    <div class="modal-head"><h3>选择审批角色</h3><button class="modal-x" type="button">×</button></div>
+    <div class="ap-search wf-member-search"><span aria-hidden="true">⌕</span><input id="wf-role-query" placeholder="搜索角色名称或编码"></div>
+    <div class="modal-state">仅具备「审批决定」权限且已有在职成员的角色可选；其余角色会灰显并标明原因。选中后该角色全部成员进入同一个会签节点。</div>
+    ${eligible.length ? '' : '<div class="wf-preview-empty">当前没有可直接审批的角色；下方列出全部角色及不可选原因。</div>'}
+    <div class="scope-groups wf-member-groups"><div class="scope-group">${roleRows}</div></div>
+    <div class="modal-actions">
+      <span class="wf-member-count" id="wf-role-count">未选择角色</span>
+      <button class="btn ghost" type="button" id="wf-role-cancel">取消</button>
+      <button class="btn primary" type="button" id="wf-role-save" disabled>确定</button>
+    </div>
+  `)
+  overlay.querySelector('.modal')?.classList.add('wf-member-modal')
+  const close = () => overlay.remove()
+  overlay.querySelector('.modal-x')?.addEventListener('click', close)
+  overlay.querySelector('#wf-role-cancel')?.addEventListener('click', close)
+  const saveButton = overlay.querySelector('#wf-role-save')
+  const countLabel = overlay.querySelector('#wf-role-count')
+  const radios = [...overlay.querySelectorAll('[data-wf-role]')]
+  const pickedRole = () => {
+    const picked = radios.find((radio) => radio.checked)
+    return picked ? eligible.find((role) => role.code === picked.getAttribute('data-wf-role')) || null : null
+  }
+  const sync = () => {
+    const role = pickedRole()
+    if (countLabel) countLabel.textContent = role ? `${role.name} · ${Number(role.memberCount) || 0} 人` : '未选择角色'
+    if (saveButton) {
+      saveButton.disabled = !role
+      saveButton.textContent = role ? '确定 · 全体会签' : '确定'
+    }
+  }
+  for (const radio of radios) radio.addEventListener('change', sync)
+  overlay.querySelector('#wf-role-query')?.addEventListener('input', (event) => {
+    const query = String(event.target.value || '').trim().toLowerCase()
+    for (const row of overlay.querySelectorAll('[data-wf-role-row]')) {
+      row.hidden = Boolean(query) && !String(row.getAttribute('data-search') || '').includes(query)
+    }
+  })
+  sync()
+  saveButton?.addEventListener('click', () => {
+    const role = pickedRole()
+    if (!role) return
+    node.source = 'role'
+    node.roleCode = role.code
+    node.roleName = role.name
+    node.approvers = []
+    node.mode = '会签'
+    node.meta = '会签'
+    node.desc = approvalNodeSummary(node)
+    approvalTouchTemplate(template, { historyLabel: '选择审批角色' })
+    close()
+    approvalRerender()
+    showTopToast(`已选择角色「${role.name}」，该角色全体成员会签`)
   })
 }
 
@@ -8581,7 +9249,7 @@ function openApprovalWorkflowCreateModal() {
         roleMode: '全部员工角色',
         flow: [
           { id: 'start', kind: 'start', title: '发起申请', desc: '全部权限点 · 至少选择 1 项', meta: '申请人本人' },
-          { id: 'a_dept', kind: 'approval', title: '部门负责人审批', desc: '部门负责人链 · 最多 10 级 · 72 小时', meta: '或签', mode: '或签', source: 'dept_chain', timeoutHours: 72 },
+          { id: 'a_dept', kind: 'approval', title: '部门负责人审批', desc: '直属上级 / 部门负责人链 · 3 级 · 72 小时', meta: '或签', mode: '或签', source: 'dept_chain', maxLevels: 3, timeoutHours: 72 },
           { id: 'end', kind: 'end', title: '结束', desc: '通过：个人授权 / 拒绝：通知申请人', meta: '结束' },
         ],
       })
@@ -8666,7 +9334,7 @@ function approvalDesignHtml() {
       </div>
       <div class="wf-viewport" data-wf-viewport>
         <div class="wf-stage" data-wf-stage style="width:${Math.round(stageWidth)}px;height:${Math.round(stageHeight)}px">${approvalFlowHtml(template, selectedEdge ? '' : state.approvalNodeId, selectedEdge)}</div>
-        <div class="wf-canvas-hint"><strong>四向圆点连线 · 选中线拖端点重连</strong><span>右键新建节点 · 滚轮缩放 · 拖到空白删除并可撤销</span></div>
+        <div class="wf-canvas-hint"><strong>四向圆点连线 · 选中线拖端点重连</strong><span>右键新建节点 · 滚轮缩放 · Ctrl+C/V 复制粘贴 · Ctrl+Z 撤销 · Ctrl+Shift+Z 重做</span></div>
         <div class="wf-canvas-dock">
           <div class="wf-zoom-group" aria-label="画布缩放">
             <button type="button" class="wf-zoom-btn" data-wf-zoom="out" title="缩小画布" aria-label="缩小画布">−</button>
@@ -8764,7 +9432,7 @@ function approvalRecordsHtml() {
               <td><strong class="ap-mono">${esc(item.id)}</strong><small>${esc(item.role)}</small></td>
               <td><strong>${esc(item.requester)}</strong><small>${esc(item.dept)}</small></td>
               <td><div class="ap-scope-cell">${item.scopes.slice(0, 2).map((scope) => `<span>${esc(scope)}</span>`).join('')}${item.scopes.length > 2 ? `<em>+${item.scopes.length - 2}</em>` : ''}</div></td>
-              <td>${esc(item.currentNode)}<div class="ap-progress"><span style="width:${Math.min(100, (item.progress / 3) * 100)}%"></span></div></td>
+              <td>${esc(item.currentNode)}<div class="ap-progress"><span style="width:${item.status === 'approved' ? 100 : Math.min(100, (item.progress / Math.max(item.totalSteps, 1)) * 100)}%"></span></div></td>
               <td>${approvalStatusPill(item.status)}</td>
               <td><span class="ap-time">${esc(item.submittedAt)}</span></td>
             </tr>`).join('') || '<tr><td colspan="6" class="ap-empty-cell">当前筛选下没有审批记录</td></tr>'}
@@ -8778,23 +9446,49 @@ function approvalRecordsHtml() {
 }
 
 function approvalRecordDetailHtml(record) {
-  const showSteps = Array.isArray(record.steps) && record.steps.length
-    ? record.steps.map((step) => ({
-        title: `第 ${step.stepNo} 步 · ${step.approverName || '审批人'}`,
-        desc:
-          step.status === 'approved'
-            ? `已通过${step.decidedAt ? ` · ${approvalTimeText(step.decidedAt)}` : ''}`
-            : step.status === 'rejected'
-              ? '已拒绝'
-              : step.status === 'skipped'
-                ? '已跳过'
-                : step.status === 'active'
-                  ? '等待审批'
-                  : '等待上一节点',
-        done: step.status === 'approved',
-        active: step.status === 'active',
-      }))
-    : []
+  const stepGroups = new Map()
+  for (const step of Array.isArray(record.steps) ? record.steps : []) {
+    const key = Number(step.stepNo) || 0
+    const list = stepGroups.get(key) || []
+    list.push(step)
+    stepGroups.set(key, list)
+  }
+  const showSteps = [...stepGroups.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([stepNo, group]) => {
+      const approved = group.filter((step) => step.status === 'approved').length
+      const rejected = group.some((step) => step.status === 'rejected')
+      const active = group.some((step) => step.status === 'active')
+      const skipped = group.every((step) => step.status === 'skipped')
+      const names = group.map((step) => step.approverName || '审批人').join('、')
+      const title = group.length > 1 ? `第 ${stepNo} 步会签 · ${names}` : `第 ${stepNo} 步 · ${names}`
+      const personState = group
+        .map((step) => {
+          const label =
+            step.status === 'approved'
+              ? '已同意'
+              : step.status === 'rejected'
+                ? '已拒绝'
+                : step.status === 'skipped'
+                  ? '已跳过'
+                  : step.status === 'active'
+                    ? '待审批'
+                    : '等待中'
+          return `${step.approverName || '审批人'} ${label}`
+        })
+        .join('；')
+      let desc = personState
+      if (rejected) desc = `已拒绝 · ${personState}`
+      else if (approved === group.length) desc = `全部同意 · ${personState}`
+      else if (active) desc = `会签中 · 已通过 ${approved}/${group.length} · ${personState}`
+      else if (skipped) desc = `已跳过 · ${personState}`
+      return {
+        title,
+        desc,
+        done: approved === group.length && group.length > 0,
+        active,
+      }
+    })
   const steps = [
     { title: '提交申请', desc: `${record.requester} · ${record.submittedAt}`, done: true, active: false },
     ...showSteps,
@@ -8932,6 +9626,9 @@ function approvalRerender() {
 function bindApprovalPage() {
   const shell = document.querySelector('.approval-shell')
   if (!shell) return
+  approvalScheduleApproverPreview(30)
+  const historyTemplate = approvalTemplateOf()
+  if (historyTemplate) approvalEnsureHistory(historyTemplate)
 
   shell.addEventListener('click', async (event) => {
     const menuButton = event.target.closest('[data-wf-canvas-menu] button')
@@ -8945,13 +9642,22 @@ function bindApprovalPage() {
       const addKind = menuButton.getAttribute('data-wf-menu-add')
       if (addKind) {
         const newNode = approvalNewFlowNode(addKind)
-        approvalInsertFlowNode(template, newNode, menu.anchorId, menu.worldX, menu.worldY)
+        approvalInsertFlowNode(template, newNode, menu.anchorId, menu.worldX, menu.worldY, {
+          historyLabel: '新建节点',
+          historyKey: `add:${newNode.id}`,
+        })
         approvalCloseCanvasMenu()
         state.approvalNodeId = newNode.id
         state.approvalEdgeFrom = ''
         state.approvalEdgeTo = ''
         approvalRerender()
-        showTopToast(addKind === 'condition' ? '已创建条件判断，拖动圆点继续连接分支' : '已创建节点，拖动圆点连接上下游')
+        showTopToast(
+          addKind === 'condition'
+            ? '已创建条件判断，拖动圆点继续连接分支'
+            : addKind === 'cc'
+              ? '已创建抄送节点，可从结束节点端口连接'
+              : '已创建节点，拖动圆点连接上下游',
+        )
         return
       }
       if (menuButton.closest('[data-wf-menu-edge-delete]')) {
@@ -9123,10 +9829,19 @@ function bindApprovalPage() {
       const template = approvalTemplateOf()
       if (!template) return
       const newNode = approvalNewFlowNode(kind)
-      approvalInsertFlowNode(template, newNode, state.approvalNodeId)
+      approvalInsertFlowNode(template, newNode, state.approvalNodeId, undefined, undefined, {
+        historyLabel: '新建节点',
+        historyKey: `add:${newNode.id}`,
+      })
       state.approvalNodeId = newNode.id
       approvalRerender()
-      showTopToast(kind === 'condition' ? '已添加条件判断，可继续配置分支' : '已添加节点，记得配置审批人')
+      showTopToast(
+        kind === 'condition'
+          ? '已添加条件判断，可继续配置分支'
+          : kind === 'cc'
+            ? '已添加抄送节点，可作为流程末端'
+            : '已添加节点，记得配置审批人',
+      )
       return
     }
 
@@ -9143,7 +9858,7 @@ function bindApprovalPage() {
       }
       const elseIndex = (node.branches || []).findIndex((item) => approvalBranchRuleKey(item) === 'else')
       node.branches.splice(elseIndex >= 0 ? elseIndex : node.branches.length, 0, branch)
-      approvalTouchTemplate(template)
+      approvalTouchTemplate(template, { historyLabel: '新增条件分支' })
       approvalRerender()
       return
     }
@@ -9163,7 +9878,7 @@ function bindApprovalPage() {
         rule: { ...APPROVAL_BRANCH_RULES.else },
         nodes: [approvalMakeApprovalNode('兜底审批', 'dept_chain', '或签')],
       })
-      approvalTouchTemplate(template)
+      approvalTouchTemplate(template, { historyLabel: '新增否则分支' })
       approvalRerender()
       return
     }
@@ -9179,7 +9894,7 @@ function bindApprovalPage() {
       }
       const branchId = deleteBranchButton.getAttribute('data-wf-branch-del')
       node.branches = node.branches.filter((branch) => branch.id !== branchId)
-      approvalTouchTemplate(template)
+      approvalTouchTemplate(template, { historyLabel: '删除条件分支' })
       approvalRerender()
       return
     }
@@ -9192,9 +9907,14 @@ function bindApprovalPage() {
       const newNode = approvalMakeApprovalNode('新增审批节点', 'dept_chain', '或签')
       branch.nodes = branch.nodes || []
       branch.nodes.push(newNode)
-      approvalTouchTemplate(template)
+      approvalTouchTemplate(template, { historyLabel: '新增分支节点' })
       state.approvalNodeId = newNode.id
       approvalRerender()
+      return
+    }
+
+    if (event.target.closest('[data-wf-pick-role]')) {
+      await openApprovalRolePicker()
       return
     }
 
@@ -9211,7 +9931,7 @@ function bindApprovalPage() {
       const id = removeApprover.getAttribute('data-wf-approver-remove')
       node.approvers = approvalApproversOf(node).filter((item) => item.id !== id)
       node.desc = approvalNodeSummary(node)
-      approvalTouchTemplate(template)
+      approvalTouchTemplate(template, { historyLabel: '移除审批人' })
       approvalRerender()
       return
     }
@@ -9267,7 +9987,7 @@ function bindApprovalPage() {
         node.mode = mode
         node.meta = mode
         node.desc = approvalNodeSummary(node)
-        approvalTouchTemplate(template)
+        approvalTouchTemplate(template, { historyLabel: '切换审批方式' })
         approvalRerender()
       }
       return
@@ -9380,7 +10100,10 @@ function bindApprovalPage() {
       const value = edgeLabelInput.value
       if (value) from.edgeLabels[toId] = value
       else delete from.edgeLabels[toId]
-      approvalTouchTemplate(template)
+      approvalTouchTemplate(template, {
+        historyLabel: '修改连线名称',
+        historyKey: `edge-label:${fromId}:${toId}`,
+      })
       repaintApprovalEdges()
       return
     }
@@ -9392,7 +10115,10 @@ function bindApprovalPage() {
       if (!from || !toId) return
       if (!from.edgeRules) from.edgeRules = {}
       from.edgeRules[toId] = { ...(from.edgeRules[toId] || {}), value: edgeValueInput.value }
-      approvalTouchTemplate(template)
+      approvalTouchTemplate(template, {
+        historyLabel: '修改条件值',
+        historyKey: `edge-value:${fromId}:${toId}`,
+      })
       return
     }
     const branchLabel = event.target.closest('[data-wf-branch-label]')
@@ -9402,7 +10128,10 @@ function bindApprovalPage() {
       branch.label = branchLabel.value
       const tag = shell.querySelector(`[data-wf-branch-tag="${branch.id}"]`)
       if (tag) tag.textContent = branch.label
-      approvalTouchTemplate(template)
+      approvalTouchTemplate(template, {
+        historyLabel: '修改分支名称',
+        historyKey: `branch-label:${branch.id}`,
+      })
       return
     }
     const branchValue = event.target.closest('[data-wf-branch-value]')
@@ -9415,8 +10144,28 @@ function bindApprovalPage() {
     const node = approvalFindNode(template.flow, state.approvalNodeId)
     if (!node) return
     const key = field.getAttribute('data-wf-field')
+    if (key === 'maxLevels') {
+      const limit = approvalOrgLevelLimit()
+      const requested = Math.max(1, Math.trunc(Number(field.value) || 1))
+      const levels = Math.min(limit, requested)
+      if (requested !== levels) {
+        field.value = String(levels)
+        showTopToast(`审批级数不能超过本组织实际层级，最多 ${limit} 级`)
+      }
+      node.maxLevels = levels
+      node.desc = approvalNodeSummary(node)
+      approvalTouchTemplate(template, {
+        historyLabel: '修改审批级数',
+        historyKey: `levels:${node.id}`,
+      })
+      approvalScheduleApproverPreview(120)
+      return
+    }
     node[key] = key === 'timeoutHours' ? Number(field.value) || 72 : field.value
-    approvalTouchTemplate(template)
+    approvalTouchTemplate(template, {
+      historyLabel: key === 'title' ? '修改节点名称' : '修改节点信息',
+      historyKey: `field:${node.id}:${key}`,
+    })
     if (key === 'title') {
       const canvasNode = shell.querySelector(`[data-wf-node="${node.id}"] strong`)
       if (canvasNode) canvasNode.textContent = field.value
@@ -9426,6 +10175,12 @@ function bindApprovalPage() {
   inspector?.addEventListener('change', (event) => {
     const template = approvalTemplateOf()
     if (!template) return
+    const previewApplicant = event.target.closest('[data-wf-preview-applicant]')
+    if (previewApplicant) {
+      state.approvalPreviewApplicantId = String(previewApplicant.value || '')
+      approvalScheduleApproverPreview(0)
+      return
+    }
     const edgeRuleSelect = event.target.closest('[data-wf-edge-rule]')
     if (edgeRuleSelect) {
       const prefix = edgeRuleSelect.getAttribute('data-wf-edge-rule')
@@ -9441,7 +10196,7 @@ function bindApprovalPage() {
       if (!current || /^分支\s+\d+$/.test(current) || current === '其他情况' || Object.values(APPROVAL_BRANCH_RULES).some((item) => current === item.label)) {
         from.edgeLabels[toId] = rule.label
       }
-      approvalTouchTemplate(template)
+      approvalTouchTemplate(template, { historyLabel: '修改分支规则' })
       approvalRerender()
       return
     }
@@ -9461,7 +10216,10 @@ function bindApprovalPage() {
         if (!from.edgeLabels) from.edgeLabels = {}
         from.edgeLabels[toId] = edgeValueInput.value ? `${base} · ${edgeValueInput.value}` : base
       }
-      approvalTouchTemplate(template)
+      approvalTouchTemplate(template, {
+        historyLabel: '修改条件值',
+        historyKey: `edge-value:${fromId}:${toId}`,
+      })
       approvalRerender()
       return
     }
@@ -9480,7 +10238,7 @@ function bindApprovalPage() {
       const rule = APPROVAL_BRANCH_RULES[key] || APPROVAL_BRANCH_RULES.risk_high
       branch.rule = { ...rule }
       branch.label = approvalBranchRuleLabel(key, branch.rule.value)
-      approvalTouchTemplate(template)
+      approvalTouchTemplate(template, { historyLabel: '修改分支规则' })
       approvalRerender()
       return
     }
@@ -9489,8 +10247,24 @@ function bindApprovalPage() {
       const key = field.getAttribute('data-wf-field')
       if (key === 'source') {
         node.source = field.value
+        if (node.source === 'role') {
+          node.mode = '会签'
+          node.meta = '会签'
+          node.approvers = []
+          node.desc = approvalNodeSummary(node)
+          approvalTouchTemplate(template, { historyLabel: '切换审批来源' })
+          approvalRerender()
+          if (!String(node.roleCode || '').trim()) {
+            showTopToast('请选择具体角色')
+            void openApprovalRolePicker()
+          }
+          return
+        }
+        if (node.source === 'dept_chain' && !Number.isFinite(Number(node.maxLevels))) {
+          node.maxLevels = approvalDefaultLevels()
+        }
         node.desc = approvalNodeSummary(node)
-        approvalTouchTemplate(template)
+        approvalTouchTemplate(template, { historyLabel: '切换审批来源' })
         approvalRerender()
         if (node.source === 'members' && !approvalApproversOf(node).length) showTopToast('请选择具体审批成员')
         return
@@ -9499,20 +10273,33 @@ function bindApprovalPage() {
         const value = Math.min(720, Math.max(1, Math.trunc(Number(field.value) || 72)))
         node.timeoutHours = value
         node.desc = approvalNodeSummary(node)
-        approvalTouchTemplate(template)
+        approvalTouchTemplate(template, {
+          historyLabel: '修改处理时限',
+          historyKey: `timeout:${node.id}`,
+        })
+        approvalRerender()
+        return
+      }
+      if (key === 'maxLevels') {
+        node.maxLevels = Math.min(10, Math.max(1, Math.trunc(Number(field.value) || 1)))
+        node.desc = approvalNodeSummary(node)
+        approvalTouchTemplate(template, {
+          historyLabel: '修改审批级数',
+          historyKey: `levels:${node.id}`,
+        })
         approvalRerender()
         return
       }
       if (key === 'timeoutAction') {
         node.timeoutAction = field.value
-        approvalTouchTemplate(template)
+        approvalTouchTemplate(template, { historyLabel: '修改超时处理' })
         return
       }
     }
     const toggle = event.target.closest('[data-wf-toggle]')
     if (toggle) {
       node[toggle.getAttribute('data-wf-toggle')] = Boolean(toggle.checked)
-      approvalTouchTemplate(template)
+      approvalTouchTemplate(template, { historyLabel: '修改节点开关' })
     }
   })
 
@@ -9673,10 +10460,9 @@ function bindApprovalPage() {
         onClick: () => {
           const current = approvalTemplatesOf().find((item) => item.id === templateId)
           if (!current) return
-          current.flow = snapshot
-          approvalTouchTemplate(current)
+          const result = approvalStepHistory(current, 'undo')
           if (current.id === state.approvalTemplateId) approvalRerender()
-          showTopToast('已撤销删除', { tone: 'success' })
+          showTopToast(result.ok ? '已撤销删除' : result.message, result.ok ? { tone: 'success' } : {})
         },
       },
     })
@@ -9696,6 +10482,15 @@ function bindApprovalPage() {
     if (event.button !== 0) return
     const template = approvalTemplateOf()
     if (!template) return
+    const activeElement = document.activeElement
+    if (
+      activeElement &&
+      shell.contains(activeElement) &&
+      activeElement.matches?.('input, textarea, select, [contenteditable="true"]') &&
+      !event.target.closest?.('input, textarea, select, [contenteditable="true"]')
+    ) {
+      activeElement.blur()
+    }
     if (state.approvalCanvasMenu && !event.target.closest('[data-wf-canvas-menu]')) approvalCloseCanvasMenu()
     if (event.target.closest('[data-wf-canvas-menu]')) return
     const edgeHandle = event.target.closest('[data-wf-edge-handle]')
@@ -9862,7 +10657,7 @@ function bindApprovalPage() {
       const node = approvalFindNode(template.flow, sourceId)
       if (!node) return
       state.approvalNodeId = sourceId
-      approvalTouchTemplate(template)
+      approvalTouchTemplate(template, { historyLabel: '移动节点' })
       approvalRerender()
       showTopToast('已移动节点位置')
       return
@@ -9966,6 +10761,34 @@ function bindApprovalPage() {
     if (!shell.isConnected) return
     const focused = document.activeElement
     if (focused && (focused.tagName === 'INPUT' || focused.tagName === 'TEXTAREA' || focused.tagName === 'SELECT' || focused.isContentEditable)) return
+    const shortcutContext =
+      state.approvalCanvasFocus ||
+      Boolean(focused?.closest?.('[data-wf-viewport]')) ||
+      Boolean(event.target?.closest?.('[data-wf-viewport]'))
+    const commandKey = event.ctrlKey || event.metaKey
+    const key = String(event.key || '').toLowerCase()
+    if (commandKey && shortcutContext && ['z', 'y', 'c', 'v'].includes(key)) {
+      const template = approvalTemplateOf()
+      if (key === 'c' && template) {
+        const result = approvalCopySelectedNode(template)
+        if (result.ok) event.preventDefault()
+        showTopToast(result.message)
+        return
+      }
+      if (key === 'v' && template) {
+        const result = approvalPasteNode(template)
+        if (result.ok) event.preventDefault()
+        showTopToast(result.message)
+        return
+      }
+      if ((key === 'z' || key === 'y') && template) {
+        event.preventDefault()
+        const direction = key === 'y' || event.shiftKey ? 'redo' : 'undo'
+        const result = approvalStepHistory(template, direction)
+        showTopToast(result.message)
+        return
+      }
+    }
     if (event.key === 'Escape') {
       if (state.approvalDrag || state.approvalPan) {
         event.preventDefault()
@@ -10024,11 +10847,15 @@ async function loadPermissionPolicies() {
   renderLoading(view)
   setSide('', true)
   try {
-    const [data, workflowData, recordData] = await Promise.all([
+    const [data, workflowData, recordData, membersData, orgTreeData] = await Promise.all([
       api('/api/console/permission-policies'),
       api('/api/console/approval-workflows'),
       api('/api/console/permission-requests?mode=all'),
+      api('/api/org/members').catch(() => ({ members: [] })),
+      api('/api/org/tree').catch(() => null),
     ])
+    if (Array.isArray(membersData.members)) state.approvalMembers = membersData.members
+    if (orgTreeData?.root) state.approvalOrgMaxLevels = approvalOrgLevelsOfTree(orgTreeData.root)
     state.approvalData = {
       policies: data.policies ?? [],
       roles: data.roles ?? [],
@@ -10036,6 +10863,10 @@ async function loadPermissionPolicies() {
       defaultPolicy: data.defaultPolicy ?? null,
     }
     state.approvalTemplates = workflowData.workflows ?? []
+    for (const template of state.approvalTemplates) {
+      approvalNormalizeLegacySources(template.flow)
+      approvalClampLevels(template.flow)
+    }
     state.approvalRecords = approvalRecordsFromApi(recordData.requests)
     if (!state.approvalTemplates.some((item) => item.id === state.approvalTemplateId)) {
       state.approvalTemplateId = state.approvalTemplates[0]?.id || ''
@@ -13407,7 +14238,7 @@ async function loadSys() {
       </section>
       <section class="panel" id="update-panel" data-section-panel="update">
         <div class="panel-head">
-          <div><h2>系统更新</h2>${hintBadge('更新说明', '从 GitHub Release 检测新版本；确认后校验源码包版本与 sha256，备份代码和数据库，再由更新器替换并重启；新版本健康检查失败会自动回滚。命令行方式：eab update（检测） / eab update --apply（确认更新）。数据目录 .eab-dev 不会被整体替换。本页只配置「可见」，可见即可查看版本、检查更新并执行一键更新。')}</div>
+          <div><h2>系统更新</h2>${hintBadge('更新说明', '从 GitHub Release 检测新版本；确认后校验源码包版本与 sha256，备份代码和数据库，再由更新器替换并重启；新版本健康检查失败会自动回滚。命令行方式：eab update（升级最新版本） / eab update <版本>（升级或降级到指定版本） / eab update --check（只检查不安装）。数据目录 .eab-dev 不会被整体替换。本页只配置「可见」，可见即可查看版本、检查更新并执行一键更新。')}</div>
           <div class="panel-actions">
             <span class="pill ${update?.hasUpdate ? 'warn' : 'ok'}" id="update-pill">${update?.hasUpdate ? '发现新版本' : update?.latest ? '已是最新' : '尚未检查'}</span>
           </div>
@@ -14408,7 +15239,7 @@ async function loadSys() {
             updateNow.error
               ? updateNow.error
               : updateNow.hasUpdate
-                ? `发现新版本 v${updateNow.latest}，可以一键更新或执行 eab update --apply`
+                ? `发现新版本 v${updateNow.latest}，可以一键更新或执行 eab update`
                 : `当前已是最新版本 v${updateNow.current}`,
             Boolean(updateNow.error),
           )
@@ -14521,7 +15352,7 @@ async function loadSys() {
     const updateCopy = $('#update-copy')
     if (updateCopy) {
       updateCopy.addEventListener('click', async () => {
-        const command = 'eab update --apply'
+        const command = 'eab update'
         try {
           await navigator.clipboard.writeText(command)
           setUpdateNote(`已复制：${command}`)

@@ -2,7 +2,7 @@
 /**
  * EAB 源码更新器。
  *
- * 由 `eab update --apply` 或控制台「一键更新」启动：
+ * 由 `eab update`、`eab update <版本>` 或控制台「一键更新」启动：
  * 1. 下载 Release 源码 zip；
  * 2. 校验 package.json 版本；
  * 3. 备份当前代码目录（不碰 .eab-dev 数据）；

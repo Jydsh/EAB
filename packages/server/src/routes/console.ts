@@ -33,9 +33,11 @@ import {
   getPermissionRequest,
   isPermissionAdminRole,
   listCompanyPermissionRequests,
+  previewWorkflowNodeApprovers,
 } from '../permission-approvals.js'
 import { refreshPermissionApprovalCards } from '../permission-approval-dingtalk.js'
 import {
+  type ApprovalFlowNode,
   deleteApprovalWorkflow,
   getApprovalWorkflow,
   listApprovalWorkflows,
@@ -609,11 +611,32 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
     }>
     const roleRows = deps.db
       .prepare(
-        `SELECT code, name, requestable, builtin FROM roles
-          WHERE company_id = ? AND deleted_at IS NULL
-          ORDER BY builtin DESC, code ASC`,
+        `SELECT r.code, r.name, r.requestable, r.builtin,
+                EXISTS (
+                  SELECT 1 FROM role_scopes rs
+                   WHERE rs.role_id = r.id AND rs.scope = 'approval:decide'
+                ) AS can_decide,
+                (
+                  SELECT COUNT(DISTINCT u.id)
+                    FROM user_roles ur
+                    JOIN users u ON u.id = ur.user_id
+                   WHERE ur.role_id = r.id
+                     AND u.company_id = ? AND u.status = 'active'
+                     AND u.disabled_at IS NULL AND u.deleted_at IS NULL
+                     AND (ur.expires_at IS NULL OR ur.expires_at > ?)
+                ) AS member_count
+           FROM roles r
+          WHERE r.company_id = ? AND r.deleted_at IS NULL
+          ORDER BY r.builtin DESC, r.code ASC`,
       )
-      .all(companyId) as unknown as Array<{ code: string; name: string; requestable: number; builtin: number }>
+      .all(companyId, Date.now(), companyId) as unknown as Array<{
+      code: string
+      name: string
+      requestable: number
+      builtin: number
+      can_decide: number
+      member_count: number
+    }>
     const registry = SCOPE_REGISTRY as unknown as Record<string, { group?: string; label?: string }>
     return ok({
       policies: policyRows.map((row) => ({
@@ -633,6 +656,8 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
         requestable: Number(row.requestable) === 1,
         builtin: Number(row.builtin) === 1,
         management: isPermissionAdminRole(row.code),
+        canDecide: Number(row.can_decide) === 1,
+        memberCount: Number(row.member_count),
       })),
       scopes: ALL_SCOPES.map((scope) => ({
         scope,
@@ -659,12 +684,19 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
             LIMIT 1`,
         )
         .get(view.requesterUserId) as { title: string | null; dept_name: string | null } | undefined
-      const current = view.steps.find((step) => step.stepNo === view.currentStep) ?? null
+      const currentSteps = view.steps.filter((step) => step.stepNo === view.currentStep)
+      const approvedCount = currentSteps.filter((step) => step.status === 'approved').length
+      const names = currentSteps.map((step) => step.approverName).join('、')
+      let currentNode = '已完成'
+      if (currentSteps.length > 0) {
+        currentNode = `第 ${view.currentStep} 步 · ${names}`
+        if (currentSteps.length > 1) currentNode += `（${approvedCount}/${currentSteps.length} 已批）`
+      }
       return {
         ...view,
         requesterTitle: person?.title ?? '',
         requesterDept: person?.dept_name ?? '',
-        currentNode: current ? `第 ${current.stepNo} 步 · ${current.approverName}` : '已完成',
+        currentNode,
         scopeLabels: view.scopes.map((scope) => registry[scope]?.label ?? scope),
       }
     })
@@ -799,6 +831,28 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
     requireConsole(req, deps)
     const companyId = companyOf(req, deps)
     return ok({ workflow: getApprovalWorkflow(deps.db, companyId, req.params.id) })
+  })
+
+  app.post<{
+    Params: { id: string }
+    Body: { node?: unknown; nodeId?: string; applicantUserId?: string }
+  }>('/api/console/approval-workflows/:id/preview-approvers', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const workflow = getApprovalWorkflow(deps.db, companyId, req.params.id)
+    const body = req.body ?? {}
+    const submittedNode =
+      body.node && typeof body.node === 'object' && !Array.isArray(body.node)
+        ? (body.node as ApprovalFlowNode)
+        : null
+    const nodeId = String(body.nodeId || submittedNode?.id || '').trim()
+    const node = submittedNode || (nodeId ? (workflow.flow.find((item) => item.id === nodeId) ?? null) : null)
+    if (!node) throw new EabError(EC.NOT_FOUND, '审批节点不存在')
+    const applicantUserId = String(body.applicantUserId || '').trim()
+    if (!applicantUserId) throw new EabError(EC.VALIDATION, '请选择预览申请人')
+    return ok({
+      preview: previewWorkflowNodeApprovers(deps.db, companyId, node, applicantUserId),
+    })
   })
 
   app.delete<{ Params: { id: string } }>('/api/console/approval-workflows/:id', async (req) => {

@@ -31,6 +31,9 @@ const DEFAULT_TIMEOUT_HOURS = 72
 const MIN_TIMEOUT_HOURS = 1
 const MAX_TIMEOUT_HOURS = 24 * 30
 
+/** 同一节点催办冷却：避免申请人或会签审批人反复触发钉钉消息。 */
+export const PERMISSION_URGE_COOLDOWN_MS = 30 * 60_000
+
 export type PermissionRequestStatus = 'pending' | 'approved' | 'rejected' | 'cancelled' | 'expired'
 export type PermissionStepStatus = 'pending' | 'active' | 'approved' | 'rejected' | 'skipped' | 'expired'
 export type PermissionDecision = 'approve' | 'reject' | 'cancel' | 'expire'
@@ -93,6 +96,11 @@ interface StepRow {
   decided_at: number | null
   decided_by: string | null
   comment: string
+  node_id: string
+  node_title: string
+  node_mode: string
+  approver_role_code: string
+  approver_role_name: string
   created_at: number
   updated_at: number
 }
@@ -107,6 +115,16 @@ interface DeptRow {
 interface ManagedPerson {
   id: string
   name: string
+}
+
+interface PlannedApprovalStep {
+  people: ManagedPerson[]
+  /** single = 一人一步；all = 同一节点多人会签。 */
+  mode: 'single' | 'all'
+  nodeId?: string
+  nodeTitle?: string
+  roleCode?: string
+  roleName?: string
 }
 
 export interface PermissionPolicyView {
@@ -166,6 +184,22 @@ export interface PermissionStepView {
   decidedAt: number | null
   decidedBy: string | null
   comment: string
+  /** 来源流程节点；旧申请没有节点元数据时为空，前端按“第 N 级审批”兜底。 */
+  nodeId: string
+  nodeTitle: string
+  nodeMode: string
+  approverRoleCode: string
+  approverRoleName: string
+  createdAt: number
+  updatedAt: number
+}
+
+/** 单个流程节点的催办摘要；只统计当前节点。 */
+export interface PermissionUrgeView {
+  count: number
+  lastAt: number | null
+  nextAt: number | null
+  cooldownMs: number
 }
 
 export interface PermissionRequestView {
@@ -188,11 +222,21 @@ export interface PermissionRequestView {
   createdAt: number
   updatedAt: number
   steps: PermissionStepView[]
+  urge: PermissionUrgeView
 }
 
 export interface PermissionRequestListResult {
   mine: PermissionRequestView[]
   todo: PermissionRequestView[]
+}
+
+/** 催办前置校验结果：通知发送层据此决定收件人和消息正文。 */
+export interface PermissionUrgePlan {
+  request: PermissionRequestView
+  stepNo: number
+  nodeTitle: string
+  targets: Array<{ userId: string; name: string }>
+  nextUrgeAt: number
 }
 
 function parseScopes(value: string): string[] {
@@ -240,6 +284,173 @@ function defaultScopePolicyView(policies: PolicyRow[] = []): PermissionPolicyVie
 /** 管理端读取当前生效的默认审批链；没有落库时返回内置默认值。 */
 export function defaultPolicyView(db: Db, companyId: string): PermissionPolicyView {
   return defaultScopePolicyView(policiesOf(db, companyId))
+}
+
+export interface WorkflowApproverPreviewPerson {
+  id: string
+  name: string
+  kind: 'manager' | 'company_admin'
+  deptName: string
+  /** 从申请人所在部门向上的部门层级，1 为直属部门；公司管理员兜底为 0。 */
+  level: number
+}
+
+export interface WorkflowApproverPreviewSkip {
+  level: number
+  deptName: string
+  name: string | null
+  reason: 'self' | 'no_manager' | 'no_permission' | 'missing_user'
+}
+
+export interface WorkflowApproverPreview {
+  source: 'dept_chain' | 'manager'
+  mode: string
+  levels: number
+  fallbackAdmin: boolean
+  people: WorkflowApproverPreviewPerson[]
+  skipped: WorkflowApproverPreviewSkip[]
+  hasMore: boolean
+}
+
+/**
+ * 设计器实人预览：用真实运行时规则解析某个申请人会命中哪些审批人。
+ * 只读取组织数据，不落审批单、不发消息；申请人必须属于当前公司。
+ */
+export function previewWorkflowNodeApprovers(
+  db: Db,
+  companyId: string,
+  node: ApprovalFlowNode,
+  applicantUserId: string,
+): WorkflowApproverPreview {
+  // 旧模板可能没有写 source，运行时按“直属上级 / 部门负责人链”处理，预览必须保持一致。
+  const rawSource = String(node.source ?? '').trim()
+  const source =
+    rawSource === 'manager' ? 'manager' : rawSource === 'dept_chain' || !rawSource ? 'dept_chain' : null
+  if (!source) {
+    throw new EabError(EC.VALIDATION, '当前审批人来源不支持实人预览')
+  }
+  const applicant = db
+    .prepare(
+      `SELECT id, name, dept_id, dept_path, company_id
+         FROM users
+        WHERE id = ? AND company_id = ? AND status = 'active' AND disabled_at IS NULL
+        LIMIT 1`,
+    )
+    .get(applicantUserId, companyId) as
+    | { id: string; name: string; dept_id: string; dept_path: string; company_id: string }
+    | undefined
+  if (!applicant) {
+    throw new EabError(EC.NOT_FOUND, '预览申请人不存在或不属于当前公司')
+  }
+
+  const actor = actorFor(db, {
+    id: applicant.id,
+    name: applicant.name,
+    title: null,
+    avatar: null,
+    deptId: applicant.dept_id,
+    deptPath: applicant.dept_path,
+    deptName: '',
+    companyId: applicant.company_id,
+    companyName: '',
+  })
+  const policy = defaultPolicyView(db, companyId)
+  const mode = String(node.mode || '依次审批')
+  const configuredLevels = source === 'manager' ? 1 : workflowNodeLevels(node, policy)
+  const levels = mode === '或签' ? 1 : configuredLevels
+  const fallbackAdmin = workflowNodeIncludeCompanyAdmin(node, policy)
+
+  // 先单独取负责人链，再取追加管理员后的完整链；前者是后者的稳定前缀。
+  const managerChain = managerChainCandidates(db, companyId, actor, false)
+  const fullChain = fallbackAdmin
+    ? managerChainCandidates(db, companyId, actor, true)
+    : managerChain
+
+  // 给负责人补部门名，并记录每个部门在负责人链里的层级，便于设计器直接看清“谁代表哪个部门、第几级”。
+  const deptNames = new Map<string, string>()
+  const deptSlots: Array<{ level: number; name: string; managerUserId: string | null }> = []
+  let dept = db
+    .prepare(
+      `SELECT id, parent_id, manager_user_id, name
+         FROM departments
+        WHERE id = ? AND company_id = ? AND deleted_at IS NULL
+        LIMIT 1`,
+    )
+    .get(applicant.dept_id, companyId) as { id: string; parent_id: string | null; manager_user_id: string | null; name: string } | undefined
+  const visited = new Set<string>()
+  let deptLevel = 0
+  while (dept && !visited.has(dept.id)) {
+    visited.add(dept.id)
+    deptLevel += 1
+    deptSlots.push({ level: deptLevel, name: dept.name, managerUserId: dept.manager_user_id })
+    if (dept.manager_user_id && !deptNames.has(dept.manager_user_id)) {
+      deptNames.set(dept.manager_user_id, dept.name)
+    }
+    if (!dept.parent_id) break
+    dept = db
+      .prepare(
+        `SELECT id, parent_id, manager_user_id, name
+           FROM departments
+          WHERE id = ? AND company_id = ? AND deleted_at IS NULL
+          LIMIT 1`,
+      )
+      .get(dept.parent_id, companyId) as
+      | { id: string; parent_id: string | null; manager_user_id: string | null; name: string }
+      | undefined
+  }
+  const managerLevels = new Map<string, number>()
+  for (const person of managerChain) {
+    const slot = deptSlots.find((item) => item.managerUserId === person.id)
+    if (slot && !managerLevels.has(person.id)) managerLevels.set(person.id, slot.level)
+  }
+
+  const visible = fullChain.slice(0, levels)
+  const visibleManagerLevels = visible
+    .filter((person) => managerLevels.has(person.id))
+    .map((person) => managerLevels.get(person.id) as number)
+  const maxDisplayLevel =
+    visibleManagerLevels.length > 0
+      ? Math.max(...visibleManagerLevels)
+      : deptSlots.length > 0
+        ? deptSlots[deptSlots.length - 1].level
+        : 0
+  const skipped: WorkflowApproverPreviewSkip[] = []
+  for (const slot of deptSlots) {
+    if (slot.level > maxDisplayLevel) break
+    if (!slot.managerUserId) {
+      skipped.push({ level: slot.level, deptName: slot.name, name: null, reason: 'no_manager' })
+      continue
+    }
+    if (slot.managerUserId === applicant.id) {
+      skipped.push({ level: slot.level, deptName: slot.name, name: applicant.name, reason: 'self' })
+      continue
+    }
+    // 同一负责人兼任多个部门时只在最早一级出现，已可审批的人不再重复展示。
+    if (managerLevels.has(slot.managerUserId)) continue
+    const manager = currentPersonOf(db, slot.managerUserId)
+    skipped.push({
+      level: slot.level,
+      deptName: slot.name,
+      name: manager?.name ?? null,
+      reason: manager ? 'no_permission' : 'missing_user',
+    })
+  }
+
+  return {
+    source,
+    mode,
+    levels,
+    fallbackAdmin,
+    hasMore: fullChain.length > visible.length,
+    people: visible.map((person) => ({
+      id: person.id,
+      name: person.name,
+      kind: managerLevels.has(person.id) ? ('manager' as const) : ('company_admin' as const),
+      deptName: deptNames.get(person.id) || '',
+      level: managerLevels.get(person.id) || 0,
+    })),
+    skipped,
+  }
 }
 
 function policiesOf(db: Db, companyId: string): PolicyRow[] {
@@ -385,34 +596,16 @@ function canDecideInCompany(db: Db, companyId: string, userId: string): boolean 
   return scopeAllows(actor.subject.scopes, 'approval:decide' as Scope)
 }
 
-function managerCandidates(
+/**
+ * 部门负责人链：从申请人所在部门开始逐级向上取 manager_user_id。
+ * 申请人本人是所在部门负责人时跳过本人，第一级自然落到上级部门负责人。
+ */
+function managerChainCandidates(
   db: Db,
   companyId: string,
   requester: RequestActor,
-  policy: PermissionPolicyView,
-  policyRows: PolicyRow[],
+  includeCompanyAdmin: boolean,
 ): ManagedPerson[] {
-  if (policy.approverStrategy === 'fixed_users') {
-    const fixed = policyRows[0]?.fixed_approvers_json
-    let ids: string[] = []
-    try {
-      const parsed = fixed ? JSON.parse(fixed) as unknown : []
-      ids = Array.isArray(parsed) ? parsed.map((value) => String(value)).filter(Boolean) : []
-    } catch {
-      ids = []
-    }
-    if (ids.length === 0) {
-      throw new EabError(EC.VALIDATION, '审批策略是 fixed_users，但没有配置固定审批人', {
-        hint: '让管理员在权限审批策略里补 fixed_approvers_json',
-      })
-    }
-    return ids
-      .filter((id) => id !== requester.person.id)
-      .map((id) => currentPersonOf(db, id))
-      .filter((person): person is ManagedPerson => Boolean(person))
-      .filter((person) => canDecideInCompany(db, companyId, person.id))
-  }
-
   const chain: ManagedPerson[] = []
   const seen = new Set<string>()
   const push = (userId: string | null) => {
@@ -447,7 +640,7 @@ function managerCandidates(
       .get(dept.parent_id, companyId) as DeptRow | undefined
   }
 
-  if (policy.includeCompanyAdmin) {
+  if (includeCompanyAdmin) {
     const admins = db
       .prepare(
         `SELECT u.id, u.name
@@ -467,6 +660,51 @@ function managerCandidates(
   return chain
 }
 
+function managerCandidates(
+  db: Db,
+  companyId: string,
+  requester: RequestActor,
+  policy: PermissionPolicyView,
+  policyRows: PolicyRow[],
+): ManagedPerson[] {
+  if (policy.approverStrategy === 'fixed_users') {
+    const fixed = policyRows[0]?.fixed_approvers_json
+    let ids: string[] = []
+    try {
+      const parsed = fixed ? JSON.parse(fixed) as unknown : []
+      ids = Array.isArray(parsed) ? parsed.map((value) => String(value)).filter(Boolean) : []
+    } catch {
+      ids = []
+    }
+    if (ids.length === 0) {
+      throw new EabError(EC.VALIDATION, '审批策略是 fixed_users，但没有配置固定审批人', {
+        hint: '让管理员在权限审批策略里补 fixed_approvers_json',
+      })
+    }
+    return ids
+      .filter((id) => id !== requester.person.id)
+      .map((id) => currentPersonOf(db, id))
+      .filter((person): person is ManagedPerson => Boolean(person))
+      .filter((person) => canDecideInCompany(db, companyId, person.id))
+  }
+
+  return managerChainCandidates(db, companyId, requester, policy.includeCompanyAdmin)
+}
+
+/** 节点显式兜底开关优先；旧节点没有该字段时沿用默认策略。 */
+function workflowNodeIncludeCompanyAdmin(node: ApprovalFlowNode, policy: PermissionPolicyView): boolean {
+  return typeof node.fallbackAdmin === 'boolean' ? node.fallbackAdmin : policy.includeCompanyAdmin
+}
+
+/** 节点显式配置优先；旧模板没有配置时继续使用默认审批链级数。 */
+function workflowNodeLevels(node: ApprovalFlowNode, policy: PermissionPolicyView): number {
+  const configured = Number(node.maxLevels)
+  if (Number.isFinite(configured) && configured >= 1) {
+    return Math.min(MAX_MAX_LEVELS, Math.max(1, Math.trunc(configured)))
+  }
+  return policy.maxLevels
+}
+
 function planSteps(
   db: Db,
   companyId: string,
@@ -474,10 +712,10 @@ function planSteps(
   policy: PermissionPolicyView,
   policyRows: PolicyRow[],
   scopes: string[],
-): ManagedPerson[] {
+): PlannedApprovalStep[] {
   const workflow = matchPublishedWorkflow(db, companyId, scopes)
   if (workflow) {
-    const fromFlow = planStepsFromWorkflow(db, companyId, requester, policy, policyRows, workflow, scopes)
+    const fromFlow = planStepsFromWorkflow(db, companyId, requester, policy, workflow, scopes)
     if (fromFlow.length > 0) return fromFlow
   }
 
@@ -488,7 +726,7 @@ function planSteps(
       hint: '请先在部门设置负责人，或给公司管理员分配「审批决定」权限',
     })
   }
-  return chain
+  return chain.map((person) => ({ people: [person], mode: 'single' as const }))
 }
 
 interface WorkflowMatchContext {
@@ -653,23 +891,6 @@ function approversFromMembers(
     .filter((person) => canDecideInCompany(db, companyId, person.id))
 }
 
-function directManagerOf(
-  db: Db,
-  companyId: string,
-  requester: RequestActor,
-): ManagedPerson[] {
-  const dept = db
-    .prepare(
-      `SELECT manager_user_id FROM departments
-        WHERE id = ? AND company_id = ? AND deleted_at IS NULL LIMIT 1`,
-    )
-    .get(requester.person.deptId, companyId) as { manager_user_id: string | null } | undefined
-  const id = dept?.manager_user_id ?? null
-  if (!id || id === requester.person.id || !canDecideInCompany(db, companyId, id)) return []
-  const person = currentPersonOf(db, id)
-  return person ? [person] : []
-}
-
 function companyAdminsOf(db: Db, companyId: string, requester: RequestActor): ManagedPerson[] {
   const rows = db
     .prepare(
@@ -687,28 +908,97 @@ function companyAdminsOf(db: Db, companyId: string, requester: RequestActor): Ma
   return rows.filter((person) => person.id !== requester.person.id && canDecideInCompany(db, companyId, person.id))
 }
 
+function roleMembersOf(
+  db: Db,
+  companyId: string,
+  requester: RequestActor,
+  node: ApprovalFlowNode,
+): ManagedPerson[] {
+  const roleCode = String(node.roleCode ?? '').trim()
+  if (!roleCode) {
+    throw new EabError(EC.VALIDATION, `审批节点「${node.title || node.id}」还没有选择角色`, {
+      hint: '在流程设计器里给该节点选择一个具备「审批决定」权限的角色',
+    })
+  }
+  const role = db
+    .prepare(
+      `SELECT id, name FROM roles
+        WHERE company_id = ? AND code = ? AND deleted_at IS NULL
+        LIMIT 1`,
+    )
+    .get(companyId, roleCode) as { id: string; name: string } | undefined
+  if (!role) {
+    throw new EabError(EC.NOT_FOUND, `审批节点指定的角色不存在：${roleCode}`, {
+      hint: '角色可能已删除或改名，请重新选择角色',
+    })
+  }
+  const rows = db
+    .prepare(
+      `SELECT DISTINCT u.id, u.name
+         FROM user_roles ur
+         JOIN roles r ON r.id = ur.role_id
+         JOIN users u ON u.id = ur.user_id
+        WHERE r.company_id = ? AND r.code = ? AND r.deleted_at IS NULL
+          AND u.company_id = ? AND u.status = 'active' AND u.disabled_at IS NULL
+          AND u.deleted_at IS NULL
+          AND (ur.expires_at IS NULL OR ur.expires_at > ?)
+        ORDER BY u.created_at, u.id`,
+    )
+    .all(companyId, roleCode, companyId, Date.now()) as unknown as ManagedPerson[]
+
+  const candidates = rows
+    .filter((person) => person.id !== requester.person.id)
+    .map((person) => currentPersonOf(db, person.id))
+    .filter((person): person is ManagedPerson => Boolean(person))
+  if (candidates.length === 0) {
+    throw new EabError(EC.FORBIDDEN, `角色「${role.name}」没有可审批成员，申请无法提交`, {
+      hint: '请确认角色下已有在职成员，且申请人本人之外至少还有 1 人',
+    })
+  }
+  const blocked = candidates.filter((person) => !canDecideInCompany(db, companyId, person.id))
+  if (blocked.length > 0) {
+    throw new EabError(EC.FORBIDDEN, `角色「${role.name}」有 ${blocked.length} 名成员缺少「审批决定」权限`, {
+      hint: '请先给该角色补充 approval:decide，或改选其他角色',
+      details: { roleCode, blockedUserIds: blocked.map((person) => person.id) },
+    })
+  }
+  return candidates
+}
+
 function approversForWorkflowNode(
   db: Db,
   companyId: string,
   requester: RequestActor,
   policy: PermissionPolicyView,
-  policyRows: PolicyRow[],
   node: ApprovalFlowNode,
 ): ManagedPerson[] {
   const source = String(node.source ?? '').trim()
   let people: ManagedPerson[]
   if (source === 'members') {
     people = approversFromMembers(db, companyId, requester, node)
+  } else if (source === 'role') {
+    people = roleMembersOf(db, companyId, requester, node)
   } else if (source === 'manager') {
-    people = directManagerOf(db, companyId, requester)
+    // 旧模板兼容：manager 等价于“直属上级 / 部门负责人链”的 1 级。
+    people = managerChainCandidates(
+      db,
+      companyId,
+      requester,
+      workflowNodeIncludeCompanyAdmin(node, policy),
+    ).slice(0, 1)
   } else if (source === 'company_admin') {
     people = companyAdminsOf(db, companyId, requester)
   } else {
-    people = managerCandidates(db, companyId, requester, policy, policyRows).slice(0, policy.maxLevels)
+    people = managerChainCandidates(
+      db,
+      companyId,
+      requester,
+      workflowNodeIncludeCompanyAdmin(node, policy),
+    ).slice(0, workflowNodeLevels(node, policy))
   }
 
   const mode = String(node.mode ?? node.meta ?? '')
-  if (mode.includes('或签')) return people.slice(0, 1)
+  if (source !== 'role' && mode.includes('或签')) return people.slice(0, 1)
   return people
 }
 
@@ -717,31 +1007,47 @@ function planStepsFromWorkflow(
   companyId: string,
   requester: RequestActor,
   policy: PermissionPolicyView,
-  policyRows: PolicyRow[],
   workflow: PublishedApprovalFlow,
   scopes: string[],
-): ManagedPerson[] {
+): PlannedApprovalStep[] {
   const ctx = workflowContext(db, requester, scopes)
   const approvalNodes = collectWorkflowApprovalNodes(workflow, ctx)
-  const steps: ManagedPerson[] = []
+  const steps: PlannedApprovalStep[] = []
   for (const node of approvalNodes) {
-    const people = approversForWorkflowNode(db, companyId, requester, policy, policyRows, node)
+    const people = approversForWorkflowNode(db, companyId, requester, policy, node)
     if (people.length === 0) {
       throw new EabError(EC.FORBIDDEN, `审批节点「${node.title || node.id}」没有可用审批人，申请无法提交`, {
         hint: '请检查流程节点的审批人配置，或先给对应人员分配「审批决定」权限',
       })
     }
-    for (const person of people) steps.push(person)
+    const source = String(node.source ?? '').trim()
+    const mode = String(node.mode ?? node.meta ?? '')
+    const common = {
+      nodeId: node.id,
+      nodeTitle: String(node.title || node.id),
+      roleCode: source === 'role' ? String(node.roleCode ?? '') : '',
+      roleName: source === 'role' ? String(node.roleName ?? '') : '',
+    }
+    // 指定角色固定按会签处理；其他节点按配置区分会签、或签和依次审批。
+    if (source === 'role' || mode.includes('会签')) {
+      steps.push({ ...common, people, mode: people.length > 1 ? 'all' : 'single' })
+    } else if (mode.includes('依次')) {
+      for (const person of people) steps.push({ ...common, people: [person], mode: 'single' })
+    } else {
+      steps.push({ ...common, people: [people[0] as ManagedPerson], mode: 'single' })
+    }
   }
   return steps
 }
 
 function stepViewsOf(db: Db, requestId: string): PermissionStepView[] {
+  // 同一节点的会签步骤通常在同一毫秒批量写入，id 带随机尾缀；
+  // rowid 才能稳定保留建单时的审批人顺序。
   const rows = db
     .prepare(
       `SELECT * FROM permission_approval_steps
         WHERE request_id = ?
-        ORDER BY step_no`,
+        ORDER BY step_no, rowid`,
     )
     .all(requestId) as unknown as StepRow[]
   return rows.map((row) => ({
@@ -755,7 +1061,32 @@ function stepViewsOf(db: Db, requestId: string): PermissionStepView[] {
     decidedAt: row.decided_at,
     decidedBy: row.decided_by,
     comment: row.comment,
+    nodeId: row.node_id || '',
+    nodeTitle: row.node_title || '',
+    nodeMode: row.node_mode || 'single',
+    approverRoleCode: row.approver_role_code || '',
+    approverRoleName: row.approver_role_name || '',
+    createdAt: Number(row.created_at),
+    updatedAt: Number(row.updated_at),
   }))
+}
+
+function urgeViewOf(db: Db, requestId: string, stepNo: number): PermissionUrgeView {
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS count, MAX(created_at) AS last_at
+         FROM permission_approval_urges
+        WHERE request_id = ? AND step_no = ?`,
+    )
+    .get(requestId, stepNo) as { count: number; last_at: number | null } | undefined
+  const count = Number(row?.count ?? 0)
+  const lastAt = row?.last_at ? Number(row.last_at) : null
+  return {
+    count,
+    lastAt,
+    nextAt: lastAt === null ? null : lastAt + PERMISSION_URGE_COOLDOWN_MS,
+    cooldownMs: PERMISSION_URGE_COOLDOWN_MS,
+  }
 }
 
 function requesterNameOf(db: Db, userId: string): string {
@@ -784,6 +1115,7 @@ function requestViewOf(db: Db, row: RequestRow): PermissionRequestView {
     createdAt: Number(row.created_at),
     updatedAt: Number(row.updated_at),
     steps: stepViewsOf(db, row.id),
+    urge: urgeViewOf(db, row.id, Number(row.current_step)),
   }
 }
 
@@ -943,7 +1275,7 @@ interface PersistPermissionRequestInput {
   reason: string
   durationHours: number
   resolved: ResolvedPolicy
-  steps: ManagedPerson[]
+  steps: PlannedApprovalStep[]
   now: number
 }
 
@@ -979,21 +1311,29 @@ function persistPermissionRequest(db: Db, input: PersistPermissionRequestInput):
       `INSERT INTO permission_approval_steps
          (id, request_id, company_id, step_no, approver_user_id, approver_name, status,
           card_out_track_id, card_status, card_error, decided_at, decided_by, comment,
+          node_id, node_title, node_mode, approver_role_code, approver_role_name,
           created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'none', '', NULL, NULL, '', ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'none', '', NULL, NULL, '', ?, ?, ?, ?, ?, ?, ?)`,
     )
-    input.steps.forEach((person, index) => {
-      insertStep.run(
-        `pstep_${ulid(input.now)}`,
-        requestId,
-        input.companyId,
-        index + 1,
-        person.id,
-        person.name,
-        index === 0 ? 'active' : 'pending',
-        input.now,
-        input.now,
-      )
+    input.steps.forEach((group, index) => {
+      for (const person of group.people) {
+        insertStep.run(
+          `pstep_${ulid(input.now)}`,
+          requestId,
+          input.companyId,
+          index + 1,
+          person.id,
+          person.name,
+          index === 0 ? 'active' : 'pending',
+          group.nodeId ?? '',
+          group.nodeTitle ?? '',
+          group.mode,
+          group.roleCode ?? '',
+          group.roleName ?? '',
+          input.now,
+          input.now,
+        )
+      }
     })
     return requestId
   })
@@ -1150,16 +1490,15 @@ export interface DecidePermissionInput {
   readonly platformOverride?: boolean
 }
 
-function activeStepOf(db: Db, request: RequestRow): StepRow | null {
-  const row = db
+function stepsAtStep(db: Db, requestId: string, stepNo: number): StepRow[] {
+  // 同毫秒写入的会签步骤用 rowid 保留建单顺序，避免按随机 id 排序。
+  return db
     .prepare(
       `SELECT * FROM permission_approval_steps
-        WHERE request_id = ? AND status = 'active'
-        ORDER BY step_no
-        LIMIT 1`,
+        WHERE request_id = ? AND step_no = ?
+        ORDER BY rowid`,
     )
-    .get(request.id) as StepRow | undefined
-  return row ?? null
+    .all(requestId, stepNo) as unknown as StepRow[]
 }
 
 function grantRole(
@@ -1264,16 +1603,25 @@ export function decidePermissionRequest(
   if (!scopeAllows(actor.subject.scopes, 'approval:decide' as Scope)) {
     throw new EabError(EC.FORBIDDEN, '当前身份没有「审批决定」权限')
   }
-  const step = activeStepOf(db, request)
-  if (!step) throw new EabError(EC.CONFLICT, '审批申请没有可处理的当前步骤')
-  if (input.stepNo !== undefined && Number(input.stepNo) !== Number(step.step_no)) {
+  const currentSteps = stepsAtStep(db, request.id, request.current_step)
+  const activeSteps = currentSteps.filter((item) => item.status === 'active')
+  if (input.stepNo !== undefined && Number(input.stepNo) !== Number(request.current_step)) {
     throw new EabError(EC.CONFLICT, '审批步骤已变化，请刷新后再处理', {
-      details: { currentStep: step.step_no },
+      details: { currentStep: request.current_step },
     })
   }
-  if (!input.platformOverride && step.approver_user_id !== actor.person.id) {
-    throw new EabError(EC.FORBIDDEN, '当前步骤的审批人不是你', {
-      details: { stepNo: step.step_no, approverUserId: step.approver_user_id },
+  const targetSteps = input.platformOverride
+    ? activeSteps
+    : activeSteps.filter((item) => item.approver_user_id === actor.person.id)
+  if (targetSteps.length === 0) {
+    const ownStep = currentSteps.find((item) => item.approver_user_id === actor.person.id)
+    if (!input.platformOverride && ownStep?.status === 'approved') {
+      throw new EabError(EC.CONFLICT, '你已同意当前节点，正在等待同节点其他审批人处理', {
+        details: { stepNo: request.current_step },
+      })
+    }
+    throw new EabError(EC.FORBIDDEN, input.platformOverride ? '当前节点没有待审批成员' : '当前步骤的审批人不是你', {
+      details: { stepNo: request.current_step },
     })
   }
   const decision = input.decision
@@ -1281,52 +1629,85 @@ export function decidePermissionRequest(
     throw new EabError(EC.VALIDATION, '审批决定只能是同意或拒绝')
   }
   const comment = String(input.comment ?? '').trim().slice(0, 500)
-  const decidedByUserId = input.platformOverride ? step.approver_user_id : actor.person.id
-  const eventKey =
-    String(input.eventKey ?? '').trim() ||
-    `perm:${request.id}:${step.step_no}:${decision}:${decidedByUserId}`
-  const stepNo = Number(step.step_no)
+  const stepNo = Number(request.current_step)
+  const primaryStep = targetSteps[0] as StepRow
+  const decidedByUserId = input.platformOverride ? primaryStep.approver_user_id : actor.person.id
+  const eventKeyBase = String(input.eventKey ?? '').trim()
 
   withTransaction(db, () => {
-    // event_key 唯一：重复点击、重复回调都只产生一条决策。
-    const inserted = db
-      .prepare(
-        `INSERT OR IGNORE INTO permission_request_decisions
-           (id, request_id, step_id, step_no, company_id, approver_user_id, decision,
-            comment, event_key, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        `pdec_${ulid(now)}`,
-        request.id,
-        step.id,
-        stepNo,
-        companyId,
-        decidedByUserId,
-        decision,
-        comment,
-        eventKey,
-        now,
-      )
-    if (Number(inserted.changes) === 0) return
-
-    db.prepare(
-      `UPDATE permission_approval_steps
-          SET status = ?, decided_at = ?, decided_by = ?, comment = ?, updated_at = ?
-        WHERE id = ?`,
-    ).run(decision === 'approve' ? 'approved' : 'rejected', now, decidedByUserId, comment, now, step.id)
-
-    if (decision === 'reject') {
+    const insertedSteps: StepRow[] = []
+    for (const targetStep of targetSteps) {
+      const decidedBy = input.platformOverride ? targetStep.approver_user_id : actor.person.id
+      const defaultEventKey = `perm:${request.id}:${stepNo}:${decision}:${decidedBy}`
+      const eventKey =
+        targetSteps.length > 1
+          ? `${eventKeyBase || defaultEventKey}:${targetStep.approver_user_id}`
+          : eventKeyBase || defaultEventKey
+      const inserted = db
+        .prepare(
+          `INSERT OR IGNORE INTO permission_request_decisions
+             (id, request_id, step_id, step_no, company_id, approver_user_id, decision,
+              comment, event_key, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          `pdec_${ulid(now)}`,
+          request.id,
+          targetStep.id,
+          stepNo,
+          companyId,
+          decidedBy,
+          decision,
+          comment,
+          eventKey,
+          now,
+        )
+      if (Number(inserted.changes) === 0) continue
+      insertedSteps.push(targetStep)
       db.prepare(
         `UPDATE permission_approval_steps
-            SET status = 'skipped', updated_at = ?
-          WHERE request_id = ? AND status IN ('pending', 'active') AND id <> ?`,
-      ).run(now, request.id, step.id)
+            SET status = ?, decided_at = ?, decided_by = ?, comment = ?, updated_at = ?
+          WHERE id = ?`,
+      ).run(
+        decision === 'approve' ? 'approved' : 'rejected',
+        now,
+        decidedBy,
+        comment,
+        now,
+        targetStep.id,
+      )
+    }
+    // 重复点击、重复回调已处理过时，不再推进流程。
+    if (insertedSteps.length === 0) return
+
+    if (decision === 'reject') {
+      for (const insertedStep of insertedSteps) {
+        db.prepare(
+          `UPDATE permission_approval_steps
+              SET status = 'skipped', updated_at = ?
+            WHERE request_id = ? AND status IN ('pending', 'active') AND id <> ?`,
+        ).run(now, request.id, insertedStep.id)
+      }
       db.prepare(
         `UPDATE permission_requests
             SET status = 'rejected', decided_at = ?, updated_at = ?
           WHERE id = ? AND status = 'pending'`,
       ).run(now, now, request.id)
+      return
+    }
+
+    const remaining = db
+      .prepare(
+        `SELECT COUNT(*) AS count FROM permission_approval_steps
+          WHERE request_id = ? AND step_no = ? AND status = 'active'`,
+      )
+      .get(request.id, stepNo) as { count: number }
+    if (Number(remaining.count) > 0) {
+      // 会签节点还有成员未处理，申请停留在当前节点。
+      db.prepare(`UPDATE permission_requests SET updated_at = ? WHERE id = ? AND status = 'pending'`).run(
+        now,
+        request.id,
+      )
       return
     }
 
@@ -1351,19 +1732,21 @@ export function decidePermissionRequest(
       return
     }
 
-    const next = db
+    const nextSteps = db
       .prepare(
         `SELECT id FROM permission_approval_steps
           WHERE request_id = ? AND step_no = ? AND status = 'pending'
-          LIMIT 1`,
+          ORDER BY rowid`,
       )
-      .get(request.id, stepNo + 1) as { id: string } | undefined
-    if (!next) {
+      .all(request.id, stepNo + 1) as unknown as Array<{ id: string }>
+    if (nextSteps.length === 0) {
       throw new EabError(EC.INTERNAL, '下一级审批步骤缺失')
     }
-    db.prepare(
-      `UPDATE permission_approval_steps SET status = 'active', updated_at = ? WHERE id = ?`,
-    ).run(now, next.id)
+    for (const next of nextSteps) {
+      db.prepare(
+        `UPDATE permission_approval_steps SET status = 'active', updated_at = ? WHERE id = ?`,
+      ).run(now, next.id)
+    }
     db.prepare(
       `UPDATE permission_requests SET current_step = ?, updated_at = ? WHERE id = ? AND status = 'pending'`,
     ).run(stepNo + 1, now, request.id)
@@ -1470,6 +1853,95 @@ export function getPermissionRequest(
   return row ? requestViewOf(db, row) : null
 }
 
+/**
+ * 催办当前节点前置校验：
+ * - 申请人可以催当前节点全部待处理人；
+ * - 当前节点会签审批人可以催同节点的其他人，不能催自己；
+ * - 同一申请节点 30 分钟内只允许一次，避免重复轰炸钉钉。
+ */
+export function planPermissionUrge(
+  db: Db,
+  actor: RequestActor,
+  requestId: string,
+  now = Date.now(),
+): PermissionUrgePlan {
+  const companyId = actor.person.companyId
+  expirePermissionRequests(db, companyId, now)
+  const row = requestRowOf(db, companyId, requestId)
+  if (!row) throw new EabError(EC.NOT_FOUND, '审批申请不存在')
+  if (row.status !== 'pending') {
+    throw new EabError(EC.CONFLICT, '当前申请已结束，不能再催办', {
+      details: { status: row.status },
+    })
+  }
+  if (Number(row.request_deadline) <= now) {
+    throw new EabError(EC.CONFLICT, '审批已超过处理时限，不能再催办', {
+      details: { requestDeadline: Number(row.request_deadline) },
+    })
+  }
+  const stepNo = Number(row.current_step)
+  const currentSteps = stepsAtStep(db, requestId, stepNo).filter((step) => step.status === 'active')
+  if (currentSteps.length === 0) {
+    throw new EabError(EC.CONFLICT, '当前节点没有待处理的审批人')
+  }
+  const isRequester = row.requester_user_id === actor.person.id
+  const isCurrentApprover = currentSteps.some((step) => step.approver_user_id === actor.person.id)
+  if (!isRequester && !isCurrentApprover) {
+    throw new EabError(EC.FORBIDDEN, '只有申请人或当前节点审批人可以催办')
+  }
+  const targets = currentSteps
+    .filter((step) => step.approver_user_id !== actor.person.id)
+    .map((step) => ({ userId: step.approver_user_id, name: step.approver_name }))
+  if (targets.length === 0) {
+    throw new EabError(EC.CONFLICT, '当前节点只有你一位审批人，无需催办')
+  }
+  const urge = urgeViewOf(db, requestId, stepNo)
+  if (urge.nextAt !== null && urge.nextAt > now) {
+    throw new EabError(EC.RATE_LIMITED, '这个节点刚刚催办过，请稍后再试', {
+      details: { nextUrgeAt: urge.nextAt, retryAfterMs: urge.nextAt - now },
+    })
+  }
+  return {
+    request: requestViewOf(db, row),
+    stepNo,
+    nodeTitle: currentSteps[0]?.node_title || `第 ${stepNo} 级审批`,
+    targets,
+    nextUrgeAt: now + PERMISSION_URGE_COOLDOWN_MS,
+  }
+}
+
+export interface RecordPermissionUrgeInput {
+  companyId: string
+  requestId: string
+  stepNo: number
+  fromUserId: string
+  toUserIds: string[]
+  deliveredCount: number
+  failedCount: number
+  now?: number
+}
+
+/** 记录一次催办尝试；即使部分收件人未绑定钉钉也落一条审计记录。 */
+export function recordPermissionUrge(db: Db, input: RecordPermissionUrgeInput): void {
+  const now = input.now ?? Date.now()
+  db.prepare(
+    `INSERT INTO permission_approval_urges
+       (id, company_id, request_id, step_no, from_user_id, to_user_ids_json,
+        delivered_count, failed_count, channel, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dingtalk', ?)`,
+  ).run(
+    `purg_${ulid(now)}`,
+    input.companyId,
+    input.requestId,
+    Number(input.stepNo),
+    input.fromUserId,
+    JSON.stringify(input.toUserIds),
+    Math.max(0, Number(input.deliveredCount) || 0),
+    Math.max(0, Number(input.failedCount) || 0),
+    now,
+  )
+}
+
 export function listPermissionRequests(
   db: Db,
   actor: RequestActor,
@@ -1481,7 +1953,7 @@ export function listPermissionRequests(
   if (mode === 'todo') {
     const rows = db
       .prepare(
-        `SELECT pr.* FROM permission_requests pr
+        `SELECT DISTINCT pr.* FROM permission_requests pr
            JOIN permission_approval_steps ps
              ON ps.request_id = pr.id AND ps.step_no = pr.current_step
           WHERE pr.company_id = ? AND pr.status = 'pending'
@@ -1518,7 +1990,7 @@ export function listCompanyPermissionRequests(
   if (mode === 'todo') {
     rows = db
       .prepare(
-        `SELECT pr.* FROM permission_requests pr
+        `SELECT DISTINCT pr.* FROM permission_requests pr
            JOIN permission_approval_steps ps
              ON ps.request_id = pr.id AND ps.step_no = pr.current_step
           WHERE pr.company_id = ? AND pr.status = 'pending'

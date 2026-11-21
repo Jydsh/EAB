@@ -3864,10 +3864,178 @@ function permRequestTitle(request) {
   return request?.roleName || request?.roleCode || '角色申请'
 }
 
+/** 同一 stepNo 可能有多名会签审批人；流程节点按 stepNo 聚合展示。 */
+function permStepGroups(request) {
+  const groups = new Map()
+  for (const step of request?.steps || []) {
+    const stepNo = Number(step.stepNo) || 1
+    if (!groups.has(stepNo)) {
+      groups.set(stepNo, {
+        stepNo,
+        nodeTitle: step.nodeTitle || `第 ${stepNo} 级审批`,
+        nodeMode: step.nodeMode || '',
+        roleName: step.approverRoleName || '',
+        steps: [],
+      })
+    }
+    groups.get(stepNo).steps.push(step)
+  }
+  return [...groups.values()]
+    .sort((a, b) => a.stepNo - b.stepNo)
+    .map((group) => {
+      const statuses = group.steps.map((step) => step.status)
+      let status = 'pending'
+      if (statuses.every((value) => value === 'approved')) status = 'approved'
+      else if (statuses.some((value) => value === 'rejected')) status = 'rejected'
+      else if (statuses.some((value) => value === 'active')) status = 'active'
+      else if (statuses.every((value) => value === 'skipped')) status = 'skipped'
+      else if (statuses.every((value) => value === 'expired')) status = 'expired'
+      return {
+        ...group,
+        status,
+        approvedCount: statuses.filter((value) => value === 'approved').length,
+        activeSteps: group.steps.filter((step) => step.status === 'active'),
+        updatedAt: Math.max(0, ...group.steps.map((step) => Number(step.updatedAt) || 0)),
+      }
+    })
+}
+
+function permGroupStatusText(group, request) {
+  if (request?.status === 'cancelled' && group.status !== 'approved') return '已撤回'
+  if (group.status === 'approved') return group.steps.length > 1 ? `会签通过 ${group.steps.length}/${group.steps.length}` : '已通过'
+  if (group.status === 'rejected') return '已拒绝'
+  if (group.status === 'active') {
+    return group.steps.length > 1
+      ? `进行中 ${group.approvedCount}/${group.steps.length}`
+      : '进行中'
+  }
+  if (group.status === 'expired') return '已超时'
+  if (group.status === 'skipped') return '已跳过'
+  return '待开始'
+}
+
+function permCurrentGroup(request) {
+  return permStepGroups(request).find((group) => group.stepNo === Number(request.currentStep)) || null
+}
+
+function permDeadlineText(deadline) {
+  const left = Number(deadline) - Date.now()
+  if (!Number.isFinite(left) || left <= 0) return '已超过处理时限'
+  const hours = Math.ceil(left / 3_600_000)
+  if (hours < 24) return `剩余 ${hours} 小时`
+  return `剩余 ${Math.ceil(hours / 24)} 天`
+}
+
+function permCurrentSummary(request, group, meId) {
+  if (!request) return ''
+  if (request.status === 'approved') {
+    return request.requestType === 'scope' ? '审批已通过，所选权限已授予本人，到期自动失效。' : '审批已通过，角色已授予本人，到期自动失效。'
+  }
+  if (request.status === 'rejected') return '审批已拒绝，未授予任何权限。'
+  if (request.status === 'cancelled') return '申请已撤回，流程已结束。'
+  if (request.status === 'expired') return '审批已超过处理时限，流程已结束。'
+  if (!group) return '流程等待推进。'
+  const meActive = group.activeSteps.find((step) => step.approverUserId === meId)
+  if (meActive) return '轮到你处理，请在下方选择同意或拒绝。'
+  const activeNames = group.activeSteps.map((step) => step.approverName).filter(Boolean)
+  if (!activeNames.length) return `等待进入「${group.nodeTitle}」。`
+  if (group.steps.length > 1) {
+    const others = activeNames.filter((name) => name !== (group.steps.find((step) => step.approverUserId === meId)?.approverName || ''))
+    return `会签节点，已通过 ${group.approvedCount}/${group.steps.length} 人${others.length ? `，等待 ${others.join('、')} 处理` : ''}。`
+  }
+  return `等待 ${activeNames.join('、')} 处理「${group.nodeTitle}」。`
+}
+
+function permFlowNodeHtml(request, group, meId) {
+  const current = request.status === 'pending' && group.stepNo === Number(request.currentStep)
+  const state = group.status === 'approved' ? 'done' : group.status === 'rejected' ? 'rejected' : current ? 'current' : group.status === 'pending' ? 'waiting' : group.status === 'skipped' ? 'skipped' : group.status === 'expired' ? 'expired' : 'current'
+  const people = group.steps.map((step) => {
+    const statusText = step.status === 'approved'
+      ? '已同意'
+      : step.status === 'active'
+        ? '待处理'
+        : PERM_STEP_TEXT[step.status] || step.status
+    return `<span class="perm-flow-person is-${esc(step.status)}"><i aria-hidden="true"></i>${esc(step.approverName)}<small>${esc(statusText)}</small></span>`
+  }).join('')
+  const timeText = group.status === 'approved' || group.status === 'rejected'
+    ? `处理于 ${esc(permTime(Math.max(...group.steps.map((step) => Number(step.decidedAt) || 0)) || group.updatedAt))}`
+    : group.status === 'skipped'
+      ? '流程已结束，本节点未继续'
+      : current && group.updatedAt
+        ? `进入节点于 ${esc(permTime(group.updatedAt))}`
+        : '等待上一节点完成'
+  return `
+    <li class="perm-flow-item is-${state}">
+      <span class="perm-flow-marker" aria-hidden="true">${group.status === 'approved' ? '✓' : group.status === 'rejected' ? '×' : current ? '●' : String(group.stepNo)}</span>
+      <div class="perm-flow-node">
+        <div class="perm-flow-node-head">
+          <span class="perm-flow-node-kicker">节点 ${String(group.stepNo).padStart(2, '0')}${current ? ' · 当前' : ''}</span>
+          <span class="perm-flow-node-state">${esc(permGroupStatusText(group, request))}</span>
+        </div>
+        <strong class="perm-flow-node-title">${esc(group.nodeTitle)}</strong>
+        ${group.steps.length > 1 ? `<span class="perm-flow-node-mode">会签 · 需 ${group.steps.length} 人全部同意${group.roleName ? ` · ${esc(group.roleName)}` : ''}</span>` : group.nodeMode && group.nodeMode !== 'single' ? `<span class="perm-flow-node-mode">${esc(group.nodeMode)}</span>` : ''}
+        <div class="perm-flow-people">${people}</div>
+        <div class="perm-flow-node-sub">${timeText}${group.steps.some((step) => step.comment) ? ` · ${esc(group.steps.find((step) => step.comment)?.comment || '')}` : ''}</div>
+      </div>
+    </li>`
+}
+
+function permFlowHtml(request, meId) {
+  const groups = permStepGroups(request)
+  const done = groups.filter((group) => group.status === 'approved').length
+  const total = Math.max(1, Number(request.totalSteps) || groups.length || 1)
+  const percent = request.status === 'approved' ? 100 : Math.round((done / total) * 100)
+  const current = permCurrentGroup(request)
+  const summary = permCurrentSummary(request, current, meId)
+  return `
+    <section class="perm-flow" aria-label="审批流程">
+      <div class="perm-flow-head">
+        <div>
+          <span class="perm-flow-kicker">审批流程</span>
+          <strong>${request.status === 'pending' ? `当前推进到第 ${Number(request.currentStep)} / ${total} 个节点` : summary}</strong>
+        </div>
+        <span class="perm-flow-fraction">${done}/${total} 节点完成</span>
+      </div>
+      <div class="perm-flow-track"><span class="perm-flow-fill is-${esc(request.status)}" style="width:${percent}%"></span></div>
+      ${request.status === 'pending' ? `<div class="perm-current-note is-${esc(request.status)}">
+        <span class="perm-current-dot" aria-hidden="true"></span>
+        <div><strong>${esc(current?.nodeTitle || '等待流程推进')}</strong><span>${esc(summary)}</span></div>
+      </div>` : ''}
+      <ol class="perm-flow-list">
+        <li class="perm-flow-item is-done is-submit">
+          <span class="perm-flow-marker" aria-hidden="true">✓</span>
+          <div class="perm-flow-node">
+            <div class="perm-flow-node-head"><span class="perm-flow-node-kicker">提交申请</span><span class="perm-flow-node-state">已提交</span></div>
+            <strong class="perm-flow-node-title">${esc(request.requesterName)}</strong>
+            <div class="perm-flow-node-sub">${esc(permTime(request.createdAt))} · ${Number(request.durationHours) / 24 || 1} 天有效期</div>
+          </div>
+        </li>
+        ${groups.map((group) => permFlowNodeHtml(request, group, meId)).join('')}
+        <li class="perm-flow-item ${request.status === 'approved' ? 'is-done' : request.status === 'rejected' ? 'is-rejected' : request.status === 'pending' ? 'is-waiting' : 'is-skipped'} is-end">
+          <span class="perm-flow-marker" aria-hidden="true">${request.status === 'approved' ? '✓' : '■'}</span>
+          <div class="perm-flow-node">
+            <div class="perm-flow-node-head"><span class="perm-flow-node-kicker">授权生效</span><span class="perm-flow-node-state">${request.status === 'approved' ? '已完成' : request.status === 'pending' ? '等待审批' : '未生效'}</span></div>
+            <strong class="perm-flow-node-title">${request.status === 'approved' ? (request.requestType === 'scope' ? '仅授予本人所选权限' : '角色授权本人') : request.status === 'pending' ? (request.requestType === 'scope' ? '仅授予本人所选权限' : '角色授权本人') : '未授予任何权限'}</strong>
+            <div class="perm-flow-node-sub">${request.status === 'approved' ? `已生效 · 到期 ${esc(permTime(request.requestedExpiresAt))}` : request.status === 'pending' ? '最后一级节点通过后生效，到期自动失效' : `流程于 ${esc(permTime(request.decidedAt || request.updatedAt))} 结束`}</div>
+          </div>
+        </li>
+      </ol>
+    </section>`
+}
+
 function permRequestCardHtml(request, activeId) {
   const total = Math.max(1, Number(request.totalSteps) || 1)
-  const done = Math.max(0, Math.min(total, Number(request.currentStep) - 1))
+  const groups = permStepGroups(request)
+  const done = groups.filter((group) => group.status === 'approved').length
   const width = request.status === 'approved' ? 100 : Math.round((done / total) * 100)
+  const current = permCurrentGroup(request)
+  const stageText = request.status === 'pending'
+    ? `当前：${current?.nodeTitle || `第 ${Number(request.currentStep)} 级`}`
+    : request.status === 'approved'
+      ? '流程已完成'
+      : request.status === 'rejected'
+        ? '流程已拒绝'
+        : `流程${{ cancelled: '已撤回', expired: '已超时' }[request.status] || '已结束'}`
   return `
     <button class="perm-card${request.id === activeId ? ' is-active' : ''}" type="button" data-perm-request="${esc(request.id)}">
       <span class="perm-card-top">
@@ -3875,9 +4043,10 @@ function permRequestCardHtml(request, activeId) {
         ${permStatusHtml(request.status)}
       </span>
       <span class="perm-card-meta">${esc(request.requesterName)} · ${esc(permTime(request.createdAt))} · ${Number(request.durationHours) / 24 || 1} 天</span>
+      <span class="perm-card-stage">${esc(stageText)}</span>
       <span class="perm-card-progress">
         <span class="perm-progress-track"><span class="perm-progress-fill" style="width:${width}%"></span></span>
-        <span>${done}/${total} 级</span>
+        <span>${done}/${total} 节点</span>
       </span>
     </button>`
 }
@@ -3885,40 +4054,48 @@ function permRequestCardHtml(request, activeId) {
 function permDetailHtml(request) {
   if (!request) return ''
   const meId = state.me?.person?.id || ''
-  const current = (request.steps || []).find((step) => step.stepNo === Number(request.currentStep))
-  const canDecideHere = request.status === 'pending' && current && current.approverUserId === meId && current.status === 'active'
+  const groups = permStepGroups(request)
+  const current = permCurrentGroup(request)
+  const currentStepMine = (current?.activeSteps || []).find((step) => step.approverUserId === meId)
+  const canDecideHere = request.status === 'pending' && Boolean(currentStepMine)
   const canCancel = request.status === 'pending' && request.requesterUserId === meId
-  const canResend = request.status === 'pending' && current && (current.cardStatus === 'failed' || current.cardStatus === 'sending')
-  const steps = (request.steps || []).map((step, index) => `
-    <div class="perm-step">
-      <div class="perm-step-rail">
-        <span class="perm-step-dot is-${esc(step.status)}" aria-hidden="true"></span>
-        ${index < request.steps.length - 1 ? '<span class="perm-step-line" aria-hidden="true"></span>' : ''}
-      </div>
-      <div class="perm-step-main">
-        <div class="perm-step-title"><span>第 ${step.stepNo} 级 · ${esc(step.approverName)}</span><span>${esc(PERM_STEP_TEXT[step.status] || step.status)}</span></div>
-        <div class="perm-step-sub">${step.decidedAt ? `处理于 ${esc(permTime(step.decidedAt))}` : step.cardStatus === 'failed' ? '审批卡投递失败，可重发' : '等待处理'}${step.comment ? ` · ${esc(step.comment)}` : ''}</div>
-      </div>
-    </div>`).join('')
-  const actionHtml = canDecideHere
-    ? `
-      <div class="perm-comment">
-        <label class="perm-field-label" for="perm-comment">审批意见</label>
-        <textarea class="perm-textarea" id="perm-comment" maxlength="500" placeholder="拒绝时建议写明原因"></textarea>
-      </div>
-      <div class="perm-detail-actions">
-        <button class="btn primary" type="button" data-perm-decide="approve">同意</button>
-        <button class="btn danger" type="button" data-perm-decide="reject">拒绝</button>
-      </div>`
-    : canCancel
-      ? `<div class="perm-detail-actions"><button class="btn ghost" type="button" data-perm-cancel="1">撤回申请</button></div>`
-      : canResend
-        ? `<div class="perm-detail-actions"><button class="btn ghost" type="button" data-perm-resend="1">重发钉钉审批卡</button></div>`
-        : ''
+  const canResend = request.status === 'pending' && current && (current.steps.some((step) => step.cardStatus === 'failed' || step.cardStatus === 'sending'))
+  const activeNames = (current?.activeSteps || []).map((step) => step.approverName).filter(Boolean)
+  const isRequester = request.requesterUserId === meId
+  const canUrgeTargets = isRequester
+    ? activeNames.length > 0
+    : Boolean(currentStepMine) && (current?.activeSteps || []).some((step) => step.approverUserId !== meId)
+  const canUrge = request.status === 'pending' && canUrgeTargets
+  const urgeNextAt = Number(request.urge?.nextAt) || 0
+  const urgeLocked = urgeNextAt > Date.now()
+  const urgeMinutes = urgeLocked ? Math.max(1, Math.ceil((urgeNextAt - Date.now()) / 60_000)) : 0
+  const urgeText = isRequester ? '催办当前审批人' : '催办同节点审批人'
+  const urgeNote = urgeLocked
+    ? `已催办，${urgeMinutes} 分钟后可再次催办`
+    : request.urge?.count
+      ? `上次催办 ${esc(permTime(request.urge.lastAt))} · 共 ${Number(request.urge.count)} 次`
+      : '会通过钉钉提醒当前待处理审批人'
+  const actionButtons = []
+  if (canDecideHere) {
+    actionButtons.push('<button class="btn primary" type="button" data-perm-decide="approve">同意</button>')
+    actionButtons.push('<button class="btn danger" type="button" data-perm-decide="reject">拒绝</button>')
+  } else if (canCancel) {
+    actionButtons.push('<button class="btn ghost" type="button" data-perm-cancel="1">撤回申请</button>')
+  } else if (canResend) {
+    actionButtons.push('<button class="btn ghost" type="button" data-perm-resend="1">重发钉钉审批卡</button>')
+  }
+  if (canUrge) {
+    actionButtons.push(`<button class="btn ghost perm-urge-btn" type="button" data-perm-urge="1"${urgeLocked ? ' disabled' : ''}>${urgeLocked ? `${urgeMinutes} 分钟后可催办` : urgeText}</button>`)
+  }
   const scopeLabels = (request.scopes || []).map((scope) => esc(permScopeLabel(scope))).join('、') || '—'
   const requestTypeText = request.requestType === 'scope'
     ? '权限点（通过后只授予所选权限，不新增角色）'
     : '角色'
+  const deadlineText = `${esc(permTime(request.requestDeadline))} · ${esc(permDeadlineText(request.requestDeadline))}`
+  const currentText = current
+    ? `第 ${Number(request.currentStep)} / ${Number(request.totalSteps)} 节点 · ${esc(current.nodeTitle)}`
+    : request.status === 'pending' ? '等待流程推进' : '流程已结束'
+  const currentPeople = activeNames.length ? activeNames.join('、') : (request.status === 'pending' ? '—' : '已处理')
   return `
     <div class="perm-detail" data-perm-detail="${esc(request.id)}">
       <div class="perm-detail-head">
@@ -3931,17 +4108,24 @@ function permDetailHtml(request) {
           <dt>申请人</dt><dd>${esc(request.requesterName)}</dd>
           <dt>申请类型</dt><dd>${esc(requestTypeText)}</dd>
           <dt>申请权限</dt><dd>${scopeLabels}</dd>
-          <dt>审批进度</dt><dd>第 ${Number(request.currentStep)} / ${Number(request.totalSteps)} 级</dd>
+          <dt>当前节点</dt><dd>${currentText}</dd>
+          <dt>当前处理人</dt><dd>${esc(currentPeople)}</dd>
+          <dt>处理时限</dt><dd>${deadlineText}</dd>
           <dt>有效期</dt><dd>${Number(request.durationHours) / 24 || 1} 天</dd>
           <dt>申请原因</dt><dd>${esc(request.reason || '未填写')}</dd>
           <dt>提交时间</dt><dd>${esc(permTime(request.createdAt))}</dd>
-          <dt>处理时限</dt><dd>${esc(permTime(request.requestDeadline))}</dd>
         </dl>
       </div>
-      <div class="perm-steps">${steps}</div>
+      ${permFlowHtml(request, meId)}
       ${state.permError ? `<div class="perm-error">${esc(state.permError)}</div>` : ''}
       ${state.permSuccess ? `<div class="perm-success">${esc(state.permSuccess)}</div>` : ''}
-      ${actionHtml}
+      ${canDecideHere ? `
+        <div class="perm-comment">
+          <label class="perm-field-label" for="perm-comment">审批意见</label>
+          <textarea class="perm-textarea" id="perm-comment" maxlength="500" placeholder="拒绝时建议写明原因"></textarea>
+        </div>` : ''}
+      ${actionButtons.length ? `<div class="perm-detail-actions">${actionButtons.join('')}</div>` : ''}
+      ${canUrge ? `<div class="perm-urge-note">${urgeNote}</div>` : ''}
     </div>`
 }
 
@@ -4135,6 +4319,25 @@ async function resendPermissionCard(requestId) {
   }
 }
 
+async function urgePermissionFromWeb(requestId) {
+  state.permError = ''
+  state.permSuccess = ''
+  try {
+    const result = await api(`/api/permissions/requests/${encodeURIComponent(requestId)}/urge`, { method: 'POST' })
+    const sent = Number(result.sent) || 0
+    const failed = Number(result.failed) || 0
+    state.permSuccess = sent > 0
+      ? (failed > 0 ? `已向 ${sent} 位审批人发送催办，${failed} 位未能送达（可能未绑定钉钉）。` : `已向 ${sent} 位审批人发送催办。`)
+      : '催办未送达，请确认当前审批人已经绑定钉钉。'
+    state.permSelected = result.request?.id || state.permSelected
+    await loadPermissionData()
+    if (state.permSelected) renderPermissionPane()
+  } catch (error) {
+    state.permError = `${error.message}${error.hint ? `（${error.hint}）` : ''}`
+    renderPermissionPane()
+  }
+}
+
 function bindPermissionPane() {
   $('#perm-entry')?.addEventListener('click', () => {
     if (state.permOpen && state.workbenchTab === 'perm' && !state.workbenchCollapsed) {
@@ -4207,6 +4410,14 @@ function bindPermissionPane() {
     }
     if (event.target.closest('[data-perm-resend]') && state.permSelected) {
       void resendPermissionCard(state.permSelected)
+      return
+    }
+    const urge = event.target.closest('[data-perm-urge]')
+    if (urge && state.permSelected) {
+      if (urge.disabled) return
+      urge.disabled = true
+      urge.textContent = '催办中…'
+      void urgePermissionFromWeb(state.permSelected)
     }
   })
   void refreshPermissionBadge()
@@ -12632,6 +12843,14 @@ function syncMessageActionAvailability() {
   if (thread) thread.dataset.replyBusy = sessionReplyBusy() ? 'true' : 'false'
 }
 
+/**
+ * 云空间引用只作为本轮上下文送进模型，不在用户消息气泡里重复展示文件/文件夹卡片。
+ * 直传图片和普通上传附件没有 workspaceKind，仍按原样显示。
+ */
+function bubbleVisibleAttachments(list) {
+  return (Array.isArray(list) ? list : []).filter((file) => !file?.workspaceKind)
+}
+
 function appendMessage(role, text, meta, attachments, rich, options = {}) {
   setEmptyVisible(false)
   const node = document.createElement('div')
@@ -12645,7 +12864,8 @@ function appendMessage(role, text, meta, attachments, rich, options = {}) {
       createdAt: options.createdAt || new Date().toISOString(),
     }
   }
-  const files = attachments && attachments.length ? `<div class="bubble-files">${attachmentChips(attachments)}</div>` : ''
+  const visibleAttachments = bubbleVisibleAttachments(attachments)
+  const files = visibleAttachments.length ? `<div class="bubble-files">${attachmentChips(visibleAttachments)}</div>` : ''
   const meName = myDisplayName()
   const channel = channelTag(options.channel)
   const footer = messageFooterMarkup(role === 'me' ? 'me' : 'ai')

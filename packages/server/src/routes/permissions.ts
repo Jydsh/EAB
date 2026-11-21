@@ -14,11 +14,14 @@ import {
   listPermissionRequests,
   listRequestableRoles,
   listRequestableScopes,
+  planPermissionUrge,
+  recordPermissionUrge,
   type PermissionRequestView,
 } from '../permission-approvals.js'
 import {
   refreshPermissionApprovalCards,
   sendPermissionApprovalCard,
+  sendPermissionUrgeNotice,
 } from '../permission-approval-dingtalk.js'
 
 function canView(actor: RequestActor, view: PermissionRequestView): boolean {
@@ -268,12 +271,41 @@ export function registerPermissionRoutes(app: FastifyInstance, deps: ServerDeps)
     const view = getPermissionRequest(deps.db, actor.person.companyId, req.params.id)
     if (!view) throw new EabError(EC.NOT_FOUND, '审批申请不存在')
     const stepNo = req.body?.stepNo === undefined ? view.currentStep : Number(req.body.stepNo)
-    const step = view.steps.find((item) => item.stepNo === stepNo)
-    if (!step) throw new EabError(EC.NOT_FOUND, '审批步骤不存在')
-    if (step.approverUserId !== actor.person.id && !scopeAllows(actor.subject.scopes, SC.AUTHZ_GRANT)) {
-      throw new EabError(EC.FORBIDDEN, '只有当前审批人或公司管理员能重发卡片')
-    }
-    const sent = await sendPermissionApprovalCard(deps, view.id, stepNo)
+    const mine = view.steps.find((item) => item.stepNo === stepNo && item.approverUserId === actor.person.id)
+    const canAdmin = scopeAllows(actor.subject.scopes, SC.AUTHZ_GRANT)
+    if (!mine && !canAdmin) throw new EabError(EC.FORBIDDEN, '只有当前审批人或公司管理员能重发卡片')
+    const sent = await sendPermissionApprovalCard(
+      deps,
+      view.id,
+      stepNo,
+      canAdmin ? undefined : actor.person.id,
+    )
     return ok({ sent, request: getPermissionRequest(deps.db, actor.person.companyId, view.id) })
+  })
+
+  /**
+   * 催办当前节点：申请人可催全部待处理审批人；会签审批人可催同节点其他人。
+   * 同一节点 30 分钟内只允许一次，通知走钉钉单聊。
+   */
+  app.post<{ Params: { id: string } }>('/api/permissions/requests/:id/urge', async (req) => {
+    const actor = resolveActor(deps.db, deps.config, req)
+    requireScope(actor.subject, SC.APPROVAL_READ)
+    const plan = planPermissionUrge(deps.db, actor, req.params.id)
+    const delivery = await sendPermissionUrgeNotice(deps, plan)
+    recordPermissionUrge(deps.db, {
+      companyId: actor.person.companyId,
+      requestId: plan.request.id,
+      stepNo: plan.stepNo,
+      fromUserId: actor.person.id,
+      toUserIds: plan.targets.map((target) => target.userId),
+      deliveredCount: delivery.sent.length,
+      failedCount: delivery.failed.length,
+    })
+    return ok({
+      sent: delivery.sent.length,
+      failed: delivery.failed.length,
+      failedTargets: delivery.failed.map((item) => ({ name: item.name, reason: item.reason })),
+      request: getPermissionRequest(deps.db, actor.person.companyId, plan.request.id),
+    })
   })
 }

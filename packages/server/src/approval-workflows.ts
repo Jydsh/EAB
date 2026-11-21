@@ -24,6 +24,13 @@ export type ApprovalFlowNode = {
   mode?: string
   source?: string
   approvers?: Array<{ id: string; name: string }>
+  /** 指定角色审批：提交时按角色解析成员，同一节点会签。 */
+  roleCode?: string
+  roleName?: string
+  /** 直属上级 / 部门负责人链的节点级数，1–10；缺省时使用默认审批链级数。 */
+  maxLevels?: number
+  /** 审批人空缺时是否追加公司管理员兜底；缺省时沿用默认审批策略。 */
+  fallbackAdmin?: boolean
   timeoutHours?: number
   branches?: ApprovalFlowBranch[]
   /** 自由连线模式：出线目标节点 id；一旦出现该字段，整张图按显式连线渲染与校验。 */
@@ -95,7 +102,7 @@ export interface SaveWorkflowInput {
 }
 
 const NODE_KINDS = new Set(['start', 'condition', 'approval', 'cc', 'end'])
-const APPROVER_SOURCES = new Set(['dept_chain', 'members', 'manager', 'company_admin'])
+const APPROVER_SOURCES = new Set(['dept_chain', 'members', 'manager', 'company_admin', 'role'])
 const CONDITION_FIELDS = new Set(['scopeRisk', 'role', 'dept', 'else'])
 const MAX_NODES = 100
 
@@ -136,7 +143,7 @@ const DEFAULT_WORKFLOWS: Array<{
             id: 'branch_normal',
             label: '否 · 普通权限',
             nodes: [
-              { id: 'a_dept', kind: 'approval', title: '部门负责人审批', desc: '负责人链 · 最多 10 级 · 72 小时', meta: '负责人链' },
+              { id: 'a_dept', kind: 'approval', title: '部门负责人审批', desc: '直属上级 / 部门负责人链 · 默认级数 · 72 小时', meta: '负责人链' },
             ],
           },
         ],
@@ -278,8 +285,12 @@ function validateExplicitLinks(nodes: ApprovalFlowNode[], errors: string[]): voi
   if (startOut.length !== 1) errors.push('开始节点必须且只能有一条出线')
   for (const [id, node] of byId) {
     const out = outgoing.get(id) || []
-    if (node.kind === 'end' && out.length) errors.push(`结束节点 ${id} 不能有出线`)
-    if (node.kind !== 'end' && !out.length) errors.push(`节点 ${id || '(空)'} 没有出线，流程会在此中断`)
+    if (node.kind === 'end' && out.some((target) => byId.get(target)?.kind !== 'cc')) {
+      errors.push(`结束节点 ${id} 只能连接到抄送节点`)
+    }
+    if (node.kind !== 'end' && node.kind !== 'cc' && !out.length) {
+      errors.push(`节点 ${id || '(空)'} 没有出线，流程会在此中断`)
+    }
   }
 
   for (const node of nodes) {
@@ -375,10 +386,22 @@ export function validateApprovalFlow(flow: ApprovalFlowNode[], strict = true): F
       if (!String(node.title ?? '').trim()) errors.push(`${path}节点 ${id || '(空)'} 缺少名称`)
       if (kind === 'approval') {
         approvalCount += 1
-        if (!String(node.meta ?? '').trim()) errors.push(`审批节点 ${id || '(空)'} 缺少审批方式`)
+        const mode = String(node.mode ?? node.meta ?? '').trim()
+        if (!mode) errors.push(`审批节点 ${id || '(空)'} 缺少审批方式`)
         const source = String(node.source ?? '').trim()
         if (source && !APPROVER_SOURCES.has(source)) {
           errors.push(`审批节点 ${id || '(空)'} 审批人来源不合法：${source}`)
+        }
+        if (node.maxLevels !== undefined && node.maxLevels !== null) {
+          const levels = Number(node.maxLevels)
+          if (!Number.isInteger(levels) || levels < 1 || levels > 10) {
+            errors.push(`审批节点 ${id || '(空)'} 的审批级数必须是 1–10 的整数`)
+          }
+        }
+        if (source === 'role') {
+          const roleCode = String(node.roleCode ?? '').trim()
+          if (!roleCode) errors.push(`审批节点 ${id || '(空)'} 选择指定角色审批时必须选择角色`)
+          if (!mode.includes('会签')) errors.push(`审批节点 ${id || '(空)'} 的指定角色必须使用会签方式`)
         }
         if (source === 'members') {
           const approvers = Array.isArray(node.approvers) ? node.approvers : []

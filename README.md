@@ -4,8 +4,8 @@ EAB 是一套面向**单公司本地部署**的企业智能体基座：一个进
 
 - 员工入口：`http://127.0.0.1:8787/chat`
 - 管理控制台：`http://127.0.0.1:8788/admin`
-- 当前版本：`2026.11.21`
-- 本版发布说明：[`docs/releases/v2026.11.21.md`](docs/releases/v2026.11.21.md)
+- 当前版本：`2026.11.22`
+- 本版发布说明：[`docs/releases/v2026.11.22.md`](docs/releases/v2026.11.22.md)
 
 > 单公司边界：一个实例只服务一家公司。钉钉、飞书、企业微信、模型供应商、知识库、插件都在控制台里配置。
 
@@ -96,12 +96,12 @@ eab restart --background       停止后后台启动
 eab stop                       停止本机 EAB 服务
 eab stop server                等价写法（server 可省略）
 eab server                     兼容旧写法，等价 eab start server
-eab update                     检测 GitHub Release 新版本
+eab update                     升级到 GitHub 最新版本（下载、备份、替换、重启）
+eab update <版本>              升级或降级到指定版本（如 2026.11.19）
 eab update --list              列出可安装的历史版本（--limit=20 控制数量）
-eab update --version=2026.11.19       只查看指定版本，不执行安装
-eab update --apply             确认更新到最新版本（下载、备份、替换、重启）
-eab update --apply --version=2026.11.19 安装指定版本（支持降级）
-eab update --apply --version=2026.11.21 --force 同版本重装
+eab update <版本> --check      只查看目标版本，不执行安装
+eab update <版本> --force      同版本重装
+eab update --apply             兼容旧写法，等同 eab update
 eab install-cli                安装 eab 命令并写入用户 PATH
 eab doctor                     检查服务、数据库、凭据
 eab backup                     备份当前数据库
@@ -224,8 +224,8 @@ eab start
 
 EAB 的版本来自 GitHub Release：
 
-- Release tag：`v2026.11.21`
-- Release 资产：源码 zip（`EAB-2026.11.21.zip`）。桌面安装包、`latest.yml`、`.blockmap` 已停止发布。
+- Release tag：`v2026.11.22`
+- Release 资产：源码 zip（`EAB-2026.11.22.zip`）。桌面安装包、`latest.yml`、`.blockmap` 已停止发布。
 
 ### 两种更新方式
 
@@ -245,15 +245,14 @@ EAB 的版本来自 GitHub Release：
 **命令更新**
 
 ```bash
-eab update                              # 只检测并显示当前/最新版本
+eab update                              # 升级到最新版本
+eab update 2026.11.19                   # 升级或降级到指定版本
 eab update --list                       # 列出可安装的历史版本
-eab update --version=2026.11.19         # 只查看指定版本
-eab update --apply                      # 更新到最新版本
-eab update --apply --version=2026.11.19 # 安装指定版本，支持降级
-eab update --apply --version=2026.11.21 --force  # 当前版本重装
+eab update 2026.11.19 --check           # 只查看目标版本，不安装
+eab update 2026.11.22 --force           # 当前版本重装
 ```
 
-指定版本时仍会校验 Release 源码包里的 `package.json` 版本与目标版本一致；同版本重装必须显式加 `--force`。降级和重装都会先停服务、备份代码与运行数据，失败自动回滚。`--version=2026.11.19` 也可以写成 `--version 2026.11.19`。
+`eab update` 现在直接执行安装，不再需要 `--apply`；`--apply` 仅保留为旧写法兼容。不带版本号时读取 GitHub 最新 Release，带版本号时按该版本安装，因此同一条命令既可升级也可降级。指定版本时仍会校验 Release 源码包里的 `package.json` 版本与目标版本一致；同版本默认不重装，必须显式加 `--force`。降级和重装都会先停服务、备份代码与运行数据，失败自动回滚。`--version=2026.11.19` 或 `--version 2026.11.19` 仍可用。
 
 更新范围只替换代码与根配置（`packages/`、`scripts/`、`package.json`、`pnpm-lock.yaml`、`pnpm-workspace.yaml`、`tsconfig*.json`、`README.md`、`LICENSE`、`.gitignore`），**不会覆盖 `.eab-dev` 数据目录**，也不会覆盖 `docs/`、`demo/`、`EAB使用说明.md`、`EAB企业智能体基座-总体架构方案.md`、`plugins/`、`skills/`、`plans/`。失败会自动回滚代码并恢复依赖；日志在 `.eab-dev/updates/last-update.log`。
 
@@ -299,7 +298,7 @@ pnpm dev                  # 等价于 eab start
 
 1. 改根 `package.json` 的 `version`；
 2. 更新 `README.md` 版本与源码包名；
-3. 提交并打 tag：`git tag v2026.11.21 && git push origin v2026.11.21`；
+3. 提交并打 tag：`git tag v2026.11.22 && git push origin v2026.11.22`；
 4. GitHub Actions 只构建源码 zip 并创建/更新 Release，不再生成桌面安装包；
 5. 控制台/CLI 的版本检查读取该 Release。
 
