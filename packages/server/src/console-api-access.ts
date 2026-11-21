@@ -150,7 +150,7 @@ export function consoleApiRuleFor(method: string, path: string): ConsoleApiRule 
   if (/^\/api\/console\/scopes(?:\/|$)/.test(path)) {
     return { pages: P('org', 'roles', 'tools'), actions }
   }
-  if (/^\/api\/console\/permission-policies(?:\/|$)/.test(path)) {
+  if (/^\/api\/console\/(?:permission-policies|permission-requests)(?:\/|$)/.test(path)) {
     return { pages: P('approvalPolicies'), actions }
   }
   if (/^\/api\/console\/tools(?:\/|$)/.test(path)) return { pages: P('tools'), actions }

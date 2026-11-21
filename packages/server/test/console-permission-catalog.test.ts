@@ -110,6 +110,25 @@ describe('后台权限目录', () => {
     })
   })
 
+  it('权限审批页的流程、审批记录与决定都只按该页可见放行', () => {
+    expect(consoleApiRuleFor('GET', '/api/console/permission-policies')).toMatchObject({
+      pages: ['approvalPolicies'],
+      actions: ['view'],
+    })
+    expect(consoleApiRuleFor('GET', '/api/console/approval-workflows')).toMatchObject({
+      pages: ['approvalPolicies'],
+      actions: ['view'],
+    })
+    expect(consoleApiRuleFor('GET', '/api/console/permission-requests')).toMatchObject({
+      pages: ['approvalPolicies'],
+      actions: ['view'],
+    })
+    expect(consoleApiRuleFor('POST', '/api/console/permission-requests/req_1/decide')).toMatchObject({
+      pages: ['approvalPolicies'],
+      actions: ['edit'],
+    })
+  })
+
   it('每个页面都归属且只归属一个已登记业务域', () => {
     for (const page of CONSOLE_PAGES) {
       const owners = CONSOLE_DOMAINS.filter((domain) => domain.pages.includes(page.key))
