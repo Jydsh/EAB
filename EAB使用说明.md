@@ -568,7 +568,7 @@ node scripts\eab.mjs doctor
 1. **访客门户 PTL-01~04、移动端 MOB-01~03**：只有 `guest_invites` 表，没有页面与流程。
 2. **企业微信真实回调**：AES 解密未做，当前 501；飞书/钉钉回调链路已打通。
 3. **渠道长连接 / IM 审批卡片**：未做，当前是 HTTP 回调模式。
-4. **知识库**：导入仍只支持纯文本类文件；PDF/Word/Excel 解析未做。向量检索与混合检索已落地（`kb-vector.ts` + `0030_model_routes_and_kb_vectors.sql`），纯文本入库后会走向量索引。
+4. **知识库**：已支持文本类（`txt/md/csv/json/html/log`）、PDF（文本层 + 扫描页 OCR）、`docx/xlsx/xlsm/pptx` 与图片（`png/jpg/jpeg/webp`）；旧版 `doc/xls/ppt` 需先另存为新格式。扫描页与图片识别依赖「模型接入 → 用途路由」中配置 `kb.ocr` 视觉模型，未配置时标记待配置并保留已解析内容。向量检索与混合检索已落地（`kb-vector.ts` + `0030_model_routes_and_kb_vectors.sql`），入库文档会走向量索引。
 5. **升级/回滚 PLG-07、OPS-07**：没有在线升级包与版本回滚，靠备份恢复。
 6. **真实厂商凭证**：仓库 seed 默认只有演示供应商；本机已实测接入 `http://192.168.1.3:8000/v1` 的 vLLM（`Qwen3.8-27B-FP8`）。其他真实飞书/钉钉/企微租户需要你提供 app_id/app_secret/corp_id 与可公网回调地址才能做端到端验收。
 7. **数据库页**：连接注册、真实探测和 PostgreSQL / MySQL / SQLite 只读查询已落地；Redis 只做连通性测试，不开放命令控制台；PostgreSQL 已用真实服务验收，MySQL / MariaDB、Redis 目前只验证了连接拒绝路径，没有真实服务做成功验收。SSL/TLS 当前只支持 PostgreSQL / MySQL 勾选启用，加密但不校验证书，未提供 CA / 客户端证书。
