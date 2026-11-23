@@ -4,8 +4,8 @@ EAB 是一套面向**单公司本地部署**的企业智能体基座：一个进
 
 - 员工入口：`http://127.0.0.1:8787/chat`
 - 管理控制台：`http://127.0.0.1:8788/admin`
-- 当前版本：`2026.11.23`
-- 本版发布说明：[`docs/releases/v2026.11.23.md`](docs/releases/v2026.11.23.md)
+- 当前版本：`2026.11.23.01`
+- 本版发布说明：[`docs/releases/v2026.11.23.01.md`](docs/releases/v2026.11.23.01.md)
 
 > 单公司边界：一个实例只服务一家公司。钉钉、飞书、企业微信、模型供应商、知识库、插件都在控制台里配置。
 
@@ -302,8 +302,8 @@ powershell -File .eab-dev\start-searxng.ps1
 
 EAB 的版本来自 GitHub Release：
 
-- Release tag：`v2026.11.23`
-- Release 资产：源码 zip（`EAB-2026.11.23.zip`）。桌面安装包、`latest.yml`、`.blockmap` 已停止发布。
+- Release tag：`v2026.11.23.01`
+- Release 资产：源码 zip（`EAB-2026.11.23.01.zip`）。桌面安装包、`latest.yml`、`.blockmap` 已停止发布。
 
 ### 两种更新方式
 
@@ -315,7 +315,7 @@ EAB 的版本来自 GitHub Release：
 
 1. 点「检查更新」，读取 GitHub 最新 Release；
 2. 有新版本时「一键更新」按钮可用；
-3. 确认后服务调用更新器：先写 `starting` 状态并等待更新器确认接管 → 下载源码包 → 校验版本与 SHA-256（Release 提供 digest 时）→ 备份代码和数据库/配置 → 替换 → `pnpm install --frozen-lockfile` → `eab restart --background` → 健康检查（版本 + 新进程 pid，确认不是旧进程）→ 失败自动回滚并重新拉起旧版本；
+3. 确认后服务调用更新器：先写 `starting` 状态并等待更新器确认接管 → 下载源码包 → 校验版本与 SHA-256（Release 提供 digest 时）→ 备份代码（跳过 `node_modules`）和数据库/配置 → 替换 → `pnpm install --force --frozen-lockfile` 重建依赖 → `eab restart --background` → 健康检查（版本 + 新进程 pid，确认不是旧进程）→ 失败自动回滚并重新拉起旧版本，回滚后同样强制重建依赖；
 4. 页面按 `/api/console/update/result` 和 `/api/health` 同时跟踪，能区分“成功 / 已回滚 / 失败 / 执行中”；回滚后会立即提示，不再空等 5 分钟；
 5. 更新器启动失败时服务不会被关闭；同一时间只允许一个更新器运行；
 6. 更新结果和健康状态写入 `.eab-dev/updates/last-update.json` 与 `last-update.log`，字段与验收口径见 [docs/EAB一键更新需求与验收.md](docs/EAB一键更新需求与验收.md)。
