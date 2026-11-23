@@ -7,12 +7,20 @@ describe('turnChecklistAnchor', () => {
     expect(anchor).toContain('本轮只回答这最后一条用户消息')
     expect(anchor).toContain('蒋平安本月加班数据分析一下')
     expect(anchor).toContain('不要把上一轮的人名、数字、结论搬过来当答案')
-    expect(anchor).toContain('人名原样传')
+    expect(anchor).toContain('计划只在第一段写一次')
+  })
+
+  it('不再重复取数细则：清单只剩两条，取数规则交给数据回合那 6 条', () => {
+    const anchor = turnChecklistAnchor('蒋平安本月加班数据分析一下')
+    expect(anchor.split('\n').filter((line) => /^\d\. /.test(line))).toHaveLength(2)
+    expect(anchor).not.toContain('人名原样传')
+    expect(anchor).not.toContain('接口清单')
+    expect(anchor.length).toBeLessThan(480)
   })
 
   it('原话过长时保留首尾，避免把整段历史塞进锚点', () => {
     const anchor = turnChecklistAnchor(`${'甲'.repeat(300)}结尾问题`)
-    expect(anchor.length).toBeLessThan(780)
+    expect(anchor.length).toBeLessThan(480)
     expect(anchor).toContain('结尾问题')
   })
 

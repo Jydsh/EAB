@@ -43,11 +43,19 @@ function prompt(userQuestion: string, extra: Partial<Parameters<typeof buildSyst
 }
 
 describe('取数轮的系统提示降级（所有工具通用）', () => {
-  it('数据类问题：写死实时数据规则，并说明记忆不可当数据', () => {
+  it('数据类问题：只出现一份 6 条数据规则，并说明记忆不可当数据', () => {
     const text = prompt('邓骏的本月加班数据')
-    expect(text).toContain('【实时数据硬规则｜对所有工具一视同仁】')
-    expect(text).toContain('知识库检索、数据库查询')
-    expect(text).toContain('都只是线索，不是准确数据')
+    expect(text).toContain('【数据回合规则｜就这 6 条，按顺序执行】')
+    expect(text).toContain('插件、知识库、数据库、文件读取都算')
+    expect(text).toContain('长期记忆、会话摘要、历史回答、上一轮工具结果、模型常识都不算数据')
+    // B2：四套互相覆盖的规则已合并，旧标题不应再出现
+    for (const legacy of ['【实时数据硬规则', '【数值计算硬规则', '【明细表硬规则', '【口径自检】']) {
+      expect(text, legacy).not.toContain(legacy)
+    }
+    // 同一条要求在提示里只出现一次，模型才不会逐条复述
+    expect(text.match(/人名按用户原话原样传/g)).toHaveLength(1)
+    expect(text.match(/rowStats/g)).toHaveLength(1)
+    expect(text.match(/禁止编造、补全/g)).toHaveLength(1)
   })
 
   it('数据类问题：不注入历史对话记忆片段（避免串上一轮数字）', () => {
@@ -64,7 +72,31 @@ describe('取数轮的系统提示降级（所有工具通用）', () => {
   it('非数据问题（写作/闲聊）保留记忆，也不加取数规则', () => {
     const text = prompt('帮我起草一封跟进邮件')
     expect(text).toContain('【历史对话检索｜回忆素材')
-    expect(text).not.toContain('【实时数据硬规则')
+    expect(text).not.toContain('【数据回合规则')
+  })
+
+  it('数据类问题+有 math_eval 与 batch_read：算数与明细要求并入同一条，不另起一段', () => {
+    const text = prompt('邓骏的本月加班数据', {
+      chatTools: [
+        ...tools,
+        { type: 'function', function: { name: 'math_eval', description: '计算', parameters: { type: 'object', properties: {}, required: [] } } },
+        { type: 'function', function: { name: 'batch_read', description: '读批次', parameters: { type: 'object', properties: {}, required: [] } } },
+      ] as unknown as ChatToolSpec[],
+    })
+    expect(text).toContain('必须调 math_eval 把原值按顺序放进 values')
+    expect(text).toContain('先用 batch_read 读到行')
+    expect(text).not.toContain('【数值计算硬规则')
+  })
+
+  it('非数据问题但要用算数：只留一句 math_eval 提示，不注入整套数据规则', () => {
+    const text = prompt('帮我算一下 3.5 加 7.75', {
+      chatTools: [
+        ...tools,
+        { type: 'function', function: { name: 'math_eval', description: '计算', parameters: { type: 'object', properties: {}, required: [] } } },
+      ] as unknown as ChatToolSpec[],
+    })
+    expect(text).toContain('需要合计、平均或占比时调用 math_eval')
+    expect(text).not.toContain('【数据回合规则')
   })
 
   it('数据类问题：长期记忆只能理解意图，不能当本轮答案', () => {
