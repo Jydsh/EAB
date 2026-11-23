@@ -17,7 +17,7 @@
  *   start / restart / stop 启动、重启、停止服务（server 子命令可省略）
  *   server               兼容旧写法，等价 start server
  */
-import { existsSync, readFileSync, mkdirSync, copyFileSync, readdirSync, writeFileSync, cpSync, renameSync, rmSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, mkdirSync, copyFileSync, readdirSync, writeFileSync, cpSync, renameSync, rmSync, statSync, openSync, closeSync } from 'node:fs'
 import { spawn, spawnSync } from 'node:child_process'
 import { createConnection } from 'node:net'
 import { createInterface } from 'node:readline/promises'
@@ -38,6 +38,27 @@ import {
 const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)))
 const DEV_DIR = process.env.EAB_HOME ? resolve(process.env.EAB_HOME) : join(ROOT, '.eab-dev')
 const SETTINGS_FILE = join(DEV_DIR, 'console-settings.json')
+
+/** 后台服务的持久日志路径；控制台/运维文档都按这个路径找。 */
+function serviceLogPath() {
+  return join(DEV_DIR, 'service.log')
+}
+
+/** 打开后台日志句柄：超过 10MB 轮转成 service.log.1，避免无限增长。 */
+function openServiceLog() {
+  try {
+    mkdirSync(DEV_DIR, { recursive: true })
+  } catch {
+    // 目录已存在或没有权限，交给 openSync 报错
+  }
+  const file = serviceLogPath()
+  try {
+    if (existsSync(file) && statSync(file).size > 10 * 1024 * 1024) renameSync(file, `${file}.1`)
+  } catch {
+    // 轮转失败不影响启动
+  }
+  return openSync(file, 'a')
+}
 
 function readNetworkSettings() {
   const defaults = { host: '127.0.0.1', chatPort: 8787, adminPort: 8788 }
@@ -164,7 +185,17 @@ async function doctor() {
     const backups = await api('/api/console/backups', headers)
     add('备份', backups.items.length > 0, `${backups.items.length} 个快照`, 'node scripts/eab.mjs backup')
   } catch (error) {
-    add('控制台接口', false, error.message, '确认服务已启动且本机可访问')
+    const message = error?.message || String(error)
+    // 登录失败锁定（有人连续输错密码）不是“服务没起来”，给出能直接照做的处理方式。
+    const locked = /锁定|次数过多|RATE_LIMITED/.test(message)
+    add(
+      '控制台接口',
+      false,
+      message,
+      locked
+        ? '登录已被临时锁定：等锁定结束，或在服务器本机重启服务立即解除（node scripts/eab.mjs restart server --background）'
+        : '确认服务已启动且本机可访问',
+    )
   }
   console.log('\nEAB doctor\n')
   for (const item of checks) console.log(`${item.ok ? 'OK  ' : 'FAIL'} ${item.name.padEnd(8)} ${item.detail}`)
@@ -340,14 +371,19 @@ async function server(flags) {
   await ensureSearchForStart(searxngPort)
   const childEnv = { ...env, EAB_SEARXNG_AUTO: '0' }
   if (background) {
+    // 后台启动以前用 stdio:'ignore'：进程一崩什么线索都没有，只能猜。
+    // 现在把 stdout/stderr 落到 .eab-dev/service.log（超过 10MB 轮转一次），
+    // 排障至少能看到崩溃栈和启动日志。
+    const logFd = openServiceLog()
     if (process.platform === 'win32') {
-      // `start /b` 让进程脱离当前终端；必须用当前 node 的绝对路径，避免控制台/
-      // 工具进程的 PATH 里没有 node 时后台启动静默失败。
-      const child = spawn('cmd.exe', ['/c', 'start', '', '/b', process.execPath, script, 'server'], {
+      // Windows 下不要走 `cmd /c start /b`：那条路径拿不到转发的 stdout/stderr 句柄，
+      // 日志会是空文件，启动失败也看不到原因。直接 detached 拉 node，
+      // 文件句柄由 spawn 显式继承，父进程退出后子进程继续跑。
+      const child = spawn(process.execPath, [script, 'server'], {
         cwd: ROOT,
         env: childEnv,
         detached: true,
-        stdio: 'ignore',
+        stdio: ['ignore', logFd, logFd],
         windowsHide: true,
       })
       child.unref()
@@ -356,12 +392,19 @@ async function server(flags) {
         cwd: ROOT,
         env: childEnv,
         detached: true,
-        stdio: 'ignore',
+        stdio: ['ignore', logFd, logFd],
       })
       child.unref()
     }
+    // 父进程自己的句柄用完即关；子进程已拿到独立的副本。
+    try {
+      closeSync(logFd)
+    } catch {
+      // 忽略：句柄已随 spawn 复制
+    }
     const ok = await waitForHealth(effective.chatPort)
-    console.log(ok ? `EAB 服务已在后台启动：http://127.0.0.1:${effective.chatPort}/chat` : '后台启动已发出，但 25 秒内没有等到健康检查；查看日志确认。')
+    console.log(ok ? `EAB 服务已在后台启动：http://127.0.0.1:${effective.chatPort}/chat` : '后台启动已发出，但 25 秒内没有等到健康检查；查看 .eab-dev/service.log 确认。')
+    console.log(`后台日志：${serviceLogPath()}`)
     if (!ok) process.exitCode = 1
     return
   }

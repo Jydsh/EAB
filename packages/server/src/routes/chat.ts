@@ -59,6 +59,7 @@ import {
   type ThinkingConfig,
 } from '../thinking.js'
 import { capToolResultText, compactMessagesForModelCall, estimateTokens } from '../context-window.js'
+import { answerFactGateDecision, collectToolFactEvidence, type ToolFactEvidence } from '../answer-facts.js'
 import { parseChatDocument } from '../chat-attachment-document.js'
 import { ocrImageWithModel } from '../kb-ocr.js'
 import {
@@ -591,13 +592,42 @@ export function turnChecklistAnchor(text?: string): string {
   return [
     '【输出前复核｜逐条对照，优先级最高】',
     `本轮只回答这最后一条用户消息：${excerpt}`,
-    '1. 不要把上一轮的人名、数字、结论搬过来当答案；不要重复回答上一轮的问题；不要反问“你想问什么”。',
+    '1. 不要把上一轮的人名、数字、结论搬过来当答案；不要重复回答上一轮的问题；不要反问“你想问什么”。计划只在第一段写一次（最多 3 句），后面直接执行，不要复述规则或重复计划。',
     '2. 只要这条消息要数据或要核实事实（时长、合计、条数、明细、排名、占比、状态、制度条款），必须先用工具取实时数据；插件、知识库、数据库、文件读取都算，长期记忆、会话摘要、历史回答和常识都不算数据。',
     '3. 调用时把用户给的条件全部传进参数：人名原样传（不改字、不翻译、不换成部门），时间范围按用户说的传（没说就传本月 1 日到月末），字段名按工具 schema 写；参数少一个就会查错人。',
     '4. 已知接口 id 就直接调数据接口；不要先查接口清单，再照着清单编数据。',
     '5. 工具返回后核对：姓名/部门/日期与这条消息不符，就是参数错了，改参数重查，不能拿别人的数据交差。',
     '6. 工具确实查不到就如实说查不到，不要用记忆里的旧数字、旧名单补齐，也不要编造推测性原因。',
   ].join('\n')
+}
+
+/**
+ * 思考过程落库上限。
+ *
+ * 实测单轮 reasoning 到过 11,947 字：一轮工具重试就多一段“用户想让我…”，
+ * 历史里逐条重放时页面被思考塞满，答案反而看不见。这里只截断“存储与回放”，
+ * 不影响模型当轮的推理上下文（推理仍按原样参与本轮调用）。
+ */
+export function capReasoningForStorage(reasoning: string, max = 6_000): string {
+  const clean = String(reasoning ?? '')
+  if (clean.length <= max) return clean
+  const head = Math.floor(max * 0.6)
+  const tail = max - head - 60
+  const omitted = clean.length - head - tail
+  return `${clean.slice(0, head)}\n\n…（思考过程过长，省略中间约 ${omitted} 字）…\n\n${clean.slice(-tail)}`
+}
+
+/**
+ * 落库与下发前去掉“只给门禁用”的字段。
+ * `evidence` 里最多 3000 个数字 + 4KB 样本，写进每条消息的 meta_json 会让会话体积翻倍，
+ * 回放历史时也要多传几 MB；门禁在服务端本轮内部已用完，这里必须剥掉。
+ */
+export function tracesForStorage(traces: readonly AgentToolTrace[]): AgentToolTrace[] {
+  return traces.map((trace) => {
+    if (!trace.evidence) return trace
+    const { evidence: _evidence, ...rest } = trace
+    return rest
+  })
 }
 
 /**
@@ -645,18 +675,21 @@ export function isRealtimeDataEvidence(trace: AgentToolTrace): boolean {
   if (trace.status !== 'done') return false
   if (!isRealtimeDataTool(trace.toolId, trace.name)) return false
   const isClock = trace.toolId === 'time.now' || trace.name === 'time_now' || trace.name === 'time.now'
-  if (!isClock) {
-    const args = (trace.args || {}) as Record<string, unknown>
-    const hasArg = Object.entries(args).some(([, value]) => {
-      if (value === undefined || value === null) return false
-      if (typeof value === 'string') return value.trim().length > 0
-      return true
-    })
-    if (!hasArg) return false
-  }
+  if (!isClock && !hasMeaningfulArgs(trace.args)) return false
   return String(trace.summary || '').trim().length > 0
 }
 
+/** 这次调用有没有真的传了筛选条件；零参数就是“查全表”的信号。 */
+export function hasMeaningfulArgs(args: Record<string, unknown> | undefined): boolean {
+  const values = Object.values(args || {})
+  return values.some((value) => {
+    if (value === undefined || value === null) return false
+    if (typeof value === 'string') return value.trim().length > 0
+    if (Array.isArray(value)) return value.length > 0
+    if (typeof value === 'object') return Object.keys(value as Record<string, unknown>).length > 0
+    return true
+  })
+}
 
 /**
  * 插件工具 schema 里的必填参数是否齐全。 * 带着空参数调业务接口，拿回来的往往是全公司/全组数据（实测 105 条整组加班被当成某个人），
@@ -669,6 +702,102 @@ export function missingRequiredParams(schema: Record<string, unknown> | undefine
     const value = args[key]
     return value === undefined || value === null || (typeof value === 'string' && value.trim() === '')
   })
+}
+
+export interface MissingConditionParam {
+  readonly field: string
+  readonly kind: 'person' | 'title' | 'id'
+  readonly expected: string
+}
+
+function schemaPropertyNames(schema: Record<string, unknown> | undefined): string[] {
+  const properties = (schema as { properties?: unknown } | undefined)?.properties
+  if (!properties || typeof properties !== 'object' || Array.isArray(properties)) return []
+  return Object.keys(properties as Record<string, unknown>)
+}
+
+function isBlankArg(value: unknown): boolean {
+  return value === undefined || value === null || (typeof value === 'string' && value.trim() === '')
+}
+
+const PERSON_FIELD_RE = /^(name|username|user_?name|employee|employee_?name|staff|staff_?name|person|person_?name|姓名|员工姓名|人员|员工|用户名)$/i
+const TITLE_FIELD_RE = /^(title|doc_?title|document_?title|公告标题|文档标题|标题)$/i
+const ID_FIELD_RE = /^(id|code|编号|工号|单号|业务编号|单据编号)$/i
+const PERSON_STOPWORDS = new Set([
+  '本月', '这个月', '上个月', '下个月', '今年', '去年', '本周', '上周', '这周',
+  '今天', '昨天', '明天', '全部', '所有', '整个', '公司', '部门', '团队', '我们',
+  '他们', '大家', '员工', '人员', '数据', '记录', '明细', '时长', '加班', '考勤',
+  '工资', '薪酬', '报销', '排班', '班次', '统计', '分析', '查询', '一下', '帮我',
+  '请', '麻烦', '最近', '当前', '目前', '谁是', '哪个',
+])
+
+/**
+ * 从用户原话里认出一个“被点名的对象”。只做保守匹配，宁可漏抓也不乱抓：
+ * 抓到“本月/部门/员工”这类泛词时直接丢弃。
+ */
+function personNameInQuestion(question: string): string {
+  const clean = String(question ?? '').replace(/\s+/g, ' ')
+  const patterns: readonly RegExp[] = [
+    /(?:^|[，。；;、\s])([\u4e00-\u9fa5]{2,4}?)(?:的)?(?:本月|这个月|上个月|下个月|今年|去年|本周|上周|这周|今天|昨天|明天)?(?:的)?(?:加班|考勤|工资|薪酬|报销|数据|记录|明细|时长|排班|班次|报名|问卷|绩效|余额|库存|进度|信息|资料|情况)/,
+    /(?:查|看|找|搜|统计|分析|列出|导出)(?:一下|下)?\s*([\u4e00-\u9fa5]{2,4}?)(?:的|本月|这个月|上个月|这周|今天|昨天)/,
+    /([\u4e00-\u9fa5]{2,4}?)\s*(?:本月|这个月|上个月|今年|去年)?\s*(?:加班|考勤|工资|薪酬|报销|排班|班次)/,
+  ]
+  for (const pattern of patterns) {
+    const name = clean.match(pattern)?.[1]?.trim() ?? ''
+    if (name.length < 2 || name.length > 4) continue
+    if (PERSON_STOPWORDS.has(name)) continue
+    // 人名一般不以这些功能词开头；命中说明抓到的是短语碎片。
+    if (/^(本|这|上|下|全|公|部|团|我|你|他|大|员|数|记|明|时|加|考|工|薪|报|排|班|统|分|查)/.test(name)) continue
+    // 以部门/组织后缀结尾的是部门不是人（采购部、一车间、财务中心…），不能逼模型把人名参数填成部门名。
+    if (/(部|司|组|科|处|中心|团队|公司|车间|项目|小组|事业部|事业部)$/.test(name)) continue
+    return name
+  }
+  return ''
+}
+
+function titleNameInQuestion(question: string): string {
+  const clean = String(question ?? '').replace(/\s+/g, ' ')
+  const quoted = clean.match(/[《“"]([^》”"]{2,60})[》”"]/)?.[1]?.trim() ?? ''
+  if (quoted) return quoted
+  return clean.match(/(?:标题|文档名|公告名|制度名)(?:是|为|叫|：|:)\s*([^，。；;\n]{2,60})/)?.[1]?.trim() ?? ''
+}
+
+function idValueInQuestion(question: string): string {
+  return String(question ?? '').match(/(?:编号|工号|单号|业务号|id|ID|code)\s*[:：]?\s*([A-Za-z0-9_-]{3,})/)?.[1]?.trim() ?? ''
+}
+
+/**
+ * 插件 schema 有些业务过滤字段是可选的；模型一旦不传，接口就会返回全公司/全组数据。
+ * 这里把“用户点名了谁/哪份文档/哪个编号”变成硬条件：schema 里有对应字段就必须传。
+ */
+export function missingConditionParams(opts: {
+  readonly question: string
+  readonly schema: Record<string, unknown> | undefined
+  readonly args: Record<string, unknown>
+}): MissingConditionParam[] {
+  const fields = schemaPropertyNames(opts.schema)
+  if (fields.length === 0) return []
+  const out: MissingConditionParam[] = []
+
+  const person = personNameInQuestion(opts.question)
+  const personFields = fields.filter((field) => PERSON_FIELD_RE.test(field))
+  if (person && personFields.length > 0 && personFields.every((field) => isBlankArg(opts.args[field]))) {
+    out.push({ field: personFields[0], kind: 'person', expected: person })
+  }
+
+  const title = titleNameInQuestion(opts.question)
+  const titleFields = fields.filter((field) => TITLE_FIELD_RE.test(field))
+  if (title && titleFields.length > 0 && titleFields.every((field) => isBlankArg(opts.args[field]))) {
+    out.push({ field: titleFields[0], kind: 'title', expected: title })
+  }
+
+  const id = idValueInQuestion(opts.question)
+  const idFields = fields.filter((field) => ID_FIELD_RE.test(field))
+  if (id && idFields.length > 0 && idFields.every((field) => isBlankArg(opts.args[field]))) {
+    out.push({ field: idFields[0], kind: 'id', expected: id })
+  }
+
+  return out
 }
 
 /**
@@ -707,6 +836,9 @@ const REALTIME_DATA_RULE = [
  * 对全部工具生效（插件 / 知识库 / 数据库 / 文件），只认“成功 + 带参数 + 有返回内容”的调用。
  * 单独抽成纯函数是为了能测——上一版把“业务工具清单”只按公司实例算，个人安装的插件
  * 得不到清单，门禁静默失效，于是出现了“没查就照上一轮数据回答”的情况。
+ *
+ * 2026-11-23 的答案事实校验由 answer-facts.ts 在 buildAgentCompletionGate 里做；
+ * 点名对象却空参查全表则由 missingConditionParams 在插件调用前硬拦。
  */
 export function businessDataGateDecision(opts: {
   question: string
@@ -723,9 +855,46 @@ export function businessDataGateDecision(opts: {
   }
   // 只调“接口清单/目录”这种零参数工具不算取到数：它返回清单而不是数据，
   // 模型很容易接着照清单编。必须是一次带筛选参数且成功的取数调用。
-  if (opts.traces.some(isRealtimeDataEvidence)) return { action: 'finish' }
-  if (opts.forced >= maxForced) return { action: 'finish' }
-  return { action: 'continue', message: FORCE_DATA_MESSAGE }
+  const hasEvidence = opts.traces.some(isRealtimeDataEvidence)
+  if (!hasEvidence) {
+    if (opts.forced >= maxForced) return { action: 'finish' }
+    return { action: 'continue', message: FORCE_DATA_MESSAGE }
+  }
+  return { action: 'finish' }
+}
+
+/**
+ * 前台对话的交付前门禁：先确认数据类问题真的取过数，再确认答案里的统计数字
+ * 能对上本轮工具结果。单独抽出来是为了让真实入口和测试共用同一段逻辑。
+ */
+export function buildAgentCompletionGate(opts: {
+  question: string
+  dataCapableToolNames: ReadonlySet<string>
+}): (state: { text: string; traces: AgentToolTrace[] }) => { action: 'finish'; text?: string } | { action: 'continue'; message: string } {
+  let forced = 0
+  let factForced = 0
+  return ({ text: answer, traces }) => {
+    const decision = businessDataGateDecision({
+      question: opts.question,
+      traces,
+      dataCapableToolNames: opts.dataCapableToolNames,
+      forced,
+    })
+    if (decision.action === 'continue') {
+      forced += 1
+      return decision
+    }
+    // 取数门禁只证明“查过”；这里再证明“答案里的关键数字能在本次结果里找到”。
+    const factDecision = answerFactGateDecision({
+      dataTurn: wantsBusinessDataAnswer(opts.question),
+      answer,
+      traces,
+      forced: factForced,
+    })
+    if (factDecision.action === 'continue') factForced += 1
+    if (factDecision.action === 'finish') return { action: 'finish', text: factDecision.text }
+    return { action: 'continue', message: factDecision.message }
+  }
 }
 
 /**
@@ -1853,6 +2022,8 @@ export interface AgentToolTrace {
   batch?: SavedBatch
   /** 文件读取/搜索的结构化展示信息；只给界面，不把原始 JSON 铺进工具卡。 */
   view?: AgentToolView
+  /** 答案事实账本：工具结果里的数字证据；只给服务端门禁，不进入模型上下文。 */
+  evidence?: ToolFactEvidence
 }
 
 export interface AgentToolReadView {
@@ -6276,7 +6447,7 @@ export async function runAgentTurn(opts: {
     traces: AgentToolTrace[]
     rounds: number
     remainingRounds: number
-  }) => { action: 'finish' } | { action: 'continue'; message: string }
+  }) => { action: 'finish'; text?: string } | { action: 'continue'; message: string }
   /** 外部指定 runId（子 Agent 用）；不传则本次自动生成 */
   runId?: string
   /**
@@ -6435,6 +6606,9 @@ export async function runAgentTurn(opts: {
     // 由下面的工具循环拦截，不会执行真实副作用，也不能被 tool_search 隐藏。
     // 同名插件工具默认公司实例优先；只有用户本轮明确要求个人插件时才切换。
     const turnUserText = lastUserText(opts.messages)
+    // 数据类回合的最终正文先压住，等事实门禁核对完再放给用户；
+    // 否则错误数字已经通过 SSE 流出去，后面再拦也收不回来。
+    const turnDataQuestion = wantsBusinessDataAnswer(turnUserText)
     const preferPersonalPlugins = prefersPersonalPluginTools(turnUserText)
     const skillCatalog = skillCatalogTexts(deps.db, actor)
     const skillTools = skillCatalog.length > 0 ? [SKILL_LOAD_TOOL_SPEC] : []
@@ -6686,7 +6860,11 @@ export async function runAgentTurn(opts: {
       // 上一轮工具失败后，本轮模型很可能直接吐出“请再试一次”。先压住流式正文，
       // 确认它是要收口还是继续调用工具；收口则丢弃这段话并注入恢复指令。
       let heldContent = ''
-      const holdStreamForRecovery = lastToolFailures.length > 0
+      // 只有真的挂了门禁（网页回合）才需要“压住正文等核对”；
+      // 钉钉/飞书/定时任务这些入口没有 completionGate，压住就等于不回话，
+      // 所以这里必须同时判断 opts.completionGate 是否存在。
+      const holdForGate = turnDataQuestion && Boolean(opts.completionGate)
+      const holdStream = lastToolFailures.length > 0 || holdForGate
       let publishHeldContent: ((chunk: string) => void) | null = null
 
       for (const candidateId of candidateIds) {
@@ -6767,7 +6945,7 @@ export async function runAgentTurn(opts: {
               publishEvent({ type: 'reasoning', text: event.text })
             } else {
               text += event.text
-              if (holdStreamForRecovery) {
+              if (holdStream) {
                 heldContent += event.text
                 return
               }
@@ -7082,13 +7260,26 @@ export async function runAgentTurn(opts: {
             messages.push({ role: 'user', content: decision.message })
             continue
           }
+          // 门禁给出了安全答复：丢弃被压住的错误正文，只把安全答复放出去。
+          if (typeof decision.text === 'string') {
+            heldContent = ''
+            text = decision.text
+            publishHeldContent?.(decision.text)
+          } else if (heldContent) {
+            publishHeldContent?.(heldContent)
+            heldContent = ''
+          }
+        } else if (heldContent) {
+          publishHeldContent?.(heldContent)
+          heldContent = ''
         }
         break
       }
 
       // 不是“失败收口”的正文照常补发；如果刚才注入了恢复指令，heldContent 已经在
       // 恢复分支丢弃，不会让用户看到“请再试一次”。
-      if (heldContent) {
+      // 挂了事实门禁的数据类回合不能在这里补发：这段正文还没过门禁，提前发出去错误数字就收不回。
+      if (heldContent && !holdForGate) {
         publishHeldContent?.(heldContent)
         heldContent = ''
       }
@@ -7863,6 +8054,22 @@ export async function runAgentTurn(opts: {
               { details: { toolId: pluginTool.name, missing } },
             )
           }
+          const missingConditions = missingConditionParams({
+            question: turnUserText,
+            schema: pluginTool.parameters,
+            args: args as Record<string, unknown>,
+          })
+          if (missingConditions.length > 0) {
+            throw new EabError(
+              EC.VALIDATION,
+              `用户点名了对象，但本次调用没有传对应的过滤条件：${missingConditions
+                .map((item) => `${item.field}=“${item.expected}”`)
+                .join('、')}。`
+                + '必须把用户原话里的对象原样传给对应字段，不能用空参数查全表；'
+                + '空参结果代表全员/全组，不能当成用户问的那个人或那份文档。',
+              { details: { toolId: pluginTool.name, missingConditions } },
+            )
+          }
           payload = await executePluginTool(
             pluginTool,
             args,
@@ -7963,6 +8170,9 @@ export async function runAgentTurn(opts: {
       })
       stepSeq += 1
       const rowStats = trace.status === 'done' && !toolPayloadFailure && payload ? summarizeRowStats(payload) : null
+      if (trace.status === 'done' && !toolPayloadFailure && payload) {
+        trace.evidence = collectToolFactEvidence(payload, rowStats)
+      }
       const toolResultBody =
         trace.status === 'done'
           ? toolPayloadFailure
@@ -9791,17 +10001,7 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
           )
           // 插件工具名不带 plugin: 前缀，但插件默认都是取数能力，直接并入清单。
           for (const name of pluginToolNames) if (name) dataCapableToolNames.add(name)
-          let forced = 0
-          return ({ traces }: { traces: AgentToolTrace[] }) => {
-            const decision = businessDataGateDecision({
-              question: text,
-              traces,
-              dataCapableToolNames,
-              forced,
-            })
-            if (decision.action === 'continue') forced += 1
-            return decision
-          }
+          return buildAgentCompletionGate({ question: text, dataCapableToolNames })
         })(),
         emit: (event) => {
           if (event.type === 'reasoning' || event.type === 'content') {
@@ -9968,8 +10168,8 @@ export function registerChatRoutes(app: FastifyInstance, deps: ServerDeps): void
         source: hit.source ?? 'local',
       })),
       tokens: agent ? { prompt: agent.promptTokens, completion: agent.completionTokens } : null,
-      reasoning: agent?.reasoning ?? '',
-      toolCalls: agent?.toolCalls ?? [],
+      reasoning: capReasoningForStorage(agent?.reasoning ?? ''),
+      toolCalls: tracesForStorage(agent?.toolCalls ?? []),
       memoryHits: memoryHitsForMeta(memoryHits),
       memoryScope: memoryQuery ? (memoryCrossSession ? 'history' : 'session') : 'off',
       contextLayers: {

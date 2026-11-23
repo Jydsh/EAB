@@ -113,6 +113,7 @@ import {
   verifyAdminCredentials,
 } from '../console-auth.js'
 import { readConsoleMemberSession, revokeConsoleMemberSession } from '../console-member-session.js'
+import { checkLoginGuard, clearLoginFailures, loginGuardKey, recordLoginFailure } from '../console-login-guard.js'
 import { readConsolePagePermissions } from '../console-permissions.js'
 import {
   consoleActionsByPage,
@@ -309,14 +310,60 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
       const password = String(req.body?.password ?? '')
       const token = String(req.body?.token ?? '').trim()
 
+      // 失败计数与锁定：远程控制台只靠口令，必须有闸门，否则就是可枚举的入口。
+      const guardKey = loginGuardKey(req.ip, username)
+      const guardState = checkLoginGuard(guardKey)
+      if (guardState.locked) {
+        const retryAfterSec = Math.max(1, Math.ceil(guardState.retryAfterMs / 1000))
+        appendAudit(deps.db, {
+          companyId: deps.companyId,
+          actorUserId: 'console-operator',
+          action: 'ops.console.login.locked',
+          resourceType: 'console_account',
+          resourceId: username || 'anonymous',
+          result: 'deny',
+          ip: req.ip,
+          channel: 'console',
+          detail: { scope: guardState.scope, retryAfterSec } as never,
+        })
+        reply.header('retry-after', String(retryAfterSec))
+        throw new EabError(
+          EC.RATE_LIMITED,
+          `登录失败次数过多，已临时锁定，请 ${retryAfterSec} 秒后再试`,
+          { hint: '锁定只针对当前来源地址与账号；管理员可在服务器本机重启服务立即解除' },
+        )
+      }
+
       const byPassword = username !== '' && verifyAdminCredentials(deps.config, username, password)
       const byToken = Boolean(deps.config.consoleToken) && token !== '' && token === deps.config.consoleToken
       if (!byPassword && !byToken) {
+        const after = recordLoginFailure(guardKey)
+        appendAudit(deps.db, {
+          companyId: deps.companyId,
+          actorUserId: 'console-operator',
+          action: 'ops.console.login.fail',
+          resourceType: 'console_account',
+          resourceId: username || 'anonymous',
+          result: 'failure',
+          ip: req.ip,
+          channel: 'console',
+          detail: { failures: after.failures, locked: after.locked, scope: after.scope } as never,
+        })
+        if (after.locked) {
+          const retryAfterSec = Math.max(1, Math.ceil(after.retryAfterMs / 1000))
+          reply.header('retry-after', String(retryAfterSec))
+          throw new EabError(
+            EC.RATE_LIMITED,
+            `登录失败次数过多，已临时锁定 ${retryAfterSec} 秒`,
+            { hint: '确认账号和密码；锁定期间同一来源的登录请求都会被拒绝' },
+          )
+        }
         throw new EabError(EC.AUTH_REQUIRED, '账号或密码不正确', {
           hint: '默认超级管理员账号见启动日志 / .eab-dev/admin-credentials.txt',
         })
       }
 
+      clearLoginFailures(guardKey)
       const session = createSession(byPassword ? username : 'service-token', req.ip ?? '')
       reply.header('set-cookie', [clearMemberSessionCookie(), sessionCookie(session)])
       return ok({ user: session.user, expiresAt: new Date(session.expiresAt).toISOString() })

@@ -17,6 +17,7 @@ import { EC, EabError, toEabError } from '@eab/domain'
 import type { ServerDeps } from './deps.js'
 import { createChatCapacity } from './chat-capacity.js'
 import { readVersion } from './http.js'
+import { buildSecurityHeaders, requestIsSecure } from './security-headers.js'
 import { hasConsoleSession, configureConsoleAuth, memberSessionFromRequest } from './console-auth.js'
 import { readConsoleMemberSession } from './console-member-session.js'
 import { hasAnyConsolePagePermission } from './console-permissions.js'
@@ -341,8 +342,12 @@ export function buildApp(deps: ServerDeps, surface: AppSurface = 'all'): Fastify
         }),
       }
 
-  app.addHook('onSend', async (_req: FastifyRequest, reply: FastifyReply) => {
+  app.addHook('onSend', async (req: FastifyRequest, reply: FastifyReply) => {
     reply.header('x-eab-version', readVersion())
+    // 安全头对所有响应生效（含 SSE 与静态资源）：以前只回版本号，
+    // 控制台可被第三方 iframe 套壳、也没有任何注入缓解。
+    const security = buildSecurityHeaders({ secure: requestIsSecure(req.headers as Record<string, unknown>, req.protocol) })
+    for (const [name, value] of Object.entries(security)) reply.header(name, value)
   })
 
   // 两端共用的启动层样式与控制器；只含视觉与状态机，不暴露配置或管理能力。
