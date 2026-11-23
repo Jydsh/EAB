@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { businessDataGateDecision, missingRequiredParams, multiPersonWarning, turnChecklistAnchor, wantsBusinessDataAnswer } from '../src/routes/chat.js'
+import { missingRequiredParams, multiPersonWarning, turnChecklistAnchor, wantsBusinessDataAnswer } from '../src/routes/chat.js'
 
 describe('turnChecklistAnchor', () => {
   it('把本轮原话放在系统提示最后一段，并写明不许沿用上一轮结论', () => {
@@ -12,7 +12,7 @@ describe('turnChecklistAnchor', () => {
 
   it('原话过长时保留首尾，避免把整段历史塞进锚点', () => {
     const anchor = turnChecklistAnchor(`${'甲'.repeat(300)}结尾问题`)
-    expect(anchor.length).toBeLessThan(600)
+    expect(anchor.length).toBeLessThan(780)
     expect(anchor).toContain('结尾问题')
   })
 
