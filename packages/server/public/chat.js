@@ -9213,7 +9213,7 @@ async function showVoiceSettings() {
           <span class="voice-card-check" aria-hidden="true">${activeVoiceId === 'default' ? '✓' : ''}</span>
           <span class="voice-card-copy">
             <strong>系统默认 <span class="voice-badge">内置</span></strong>
-            <em>稳定、清晰，适合日常回答</em>
+            <em>${esc(voiceById('default')?.instructions || '清晰、自然、亲切的中文女声，语速平稳，适合办公助手。')}</em>
           </span>
         </button>
       </div>

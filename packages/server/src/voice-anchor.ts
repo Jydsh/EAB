@@ -11,10 +11,11 @@ import { createHash, randomUUID } from 'node:crypto'
 import { EC, EabError } from '@eab/domain'
 import type { Db } from '@eab/storage'
 import { callSpeech } from './llm.js'
-import type { VoiceProfile } from './voice-profile.js'
+import { DEFAULT_VOICE_INSTRUCTIONS, type VoiceProfile } from './voice-profile.js'
 
 export const ANCHOR_TEXT = '你好，我是 EAB 企业智能助手。接下来，我会用这个声音为你播报。'
-export const DEFAULT_ANCHOR_INSTRUCTION = '清晰、自然、亲切的中文女声，语速平稳，适合办公助手。'
+/** 系统默认音色的固定描述；与员工配置里的默认说明保持同一份文本。 */
+export const DEFAULT_ANCHOR_INSTRUCTION = DEFAULT_VOICE_INSTRUCTIONS
 const MAX_ANCHOR_BYTES = 6 * 1024 * 1024
 
 export interface VoiceAnchor {

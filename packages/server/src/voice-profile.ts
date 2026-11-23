@@ -16,6 +16,8 @@ import type { Db } from '@eab/storage'
 export const DEFAULT_VOICE = 'S0'
 export const DEFAULT_VOICE_ID = 'default'
 export const DEFAULT_VOICE_NAME = '系统默认'
+/** 内置音色的固定描述：所有默认播报都用这一句，不允许被清空或逐次变化。 */
+export const DEFAULT_VOICE_INSTRUCTIONS = '清晰、自然、亲切的中文女声，语速平稳，适合办公助手。'
 export const DEFAULT_VOICE_ENABLED = true
 export const MAX_VOICE_NAME = 40
 export const MAX_VOICE_INSTRUCTIONS = 200
@@ -155,7 +157,7 @@ export function resolveVoiceProfile(db: Db, companyId: string, userId: string): 
   return {
     voice: DEFAULT_VOICE,
     activeVoiceId: preset ? activeVoiceId : DEFAULT_VOICE_ID,
-    instructions: preset?.instructions ?? '',
+    instructions: preset ? preset.instructions : DEFAULT_VOICE_INSTRUCTIONS,
     enabled: row?.enabled == null ? DEFAULT_VOICE_ENABLED : Number(row.enabled) !== 0,
     seed: voiceSeedOf(companyId, userId),
   }
@@ -284,7 +286,7 @@ export function voiceProfileView(profile: VoiceProfile, presets: VoicePreset[] =
     {
       id: DEFAULT_VOICE_ID,
       name: DEFAULT_VOICE_NAME,
-      instructions: '',
+      instructions: DEFAULT_VOICE_INSTRUCTIONS,
       builtin: true,
       active: profile.activeVoiceId === DEFAULT_VOICE_ID,
     },

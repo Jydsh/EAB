@@ -24,6 +24,7 @@ import { resolveModelForPurpose } from '../model-registry.js'
 import {
   DEFAULT_VOICE,
   DEFAULT_VOICE_ID,
+  DEFAULT_VOICE_INSTRUCTIONS,
   MAX_VOICE_INSTRUCTIONS,
   createVoicePreset,
   deleteVoicePreset,
@@ -425,6 +426,8 @@ export function registerSystemRoutes(app: FastifyInstance, deps: ServerDeps): vo
         if (!preset) throw new EabError(EC.VALIDATION, '没有找到这个声音方案')
         instructions = preset.instructions
       }
+      // 系统默认必须用同一句固定描述，试听不能悄悄换脚本。
+      if (!instructions && voiceId === DEFAULT_VOICE_ID) instructions = DEFAULT_VOICE_INSTRUCTIONS
       const tts = resolveModelForPurpose(deps.db, person.companyId, 'tts.default')
       if (!tts) throw new EabError(EC.VALIDATION, '还没有配置语音合成模型 tts.default')
       const profile = resolveVoiceProfile(deps.db, person.companyId, person.id)

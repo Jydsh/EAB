@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { migrate, openDatabase, type Db } from '@eab/storage'
 import {
   DEFAULT_VOICE,
+  DEFAULT_VOICE_INSTRUCTIONS,
   MAX_VOICE_INSTRUCTIONS,
   createVoicePreset,
   deleteVoicePreset,
@@ -47,11 +48,11 @@ describe('voice profile', () => {
   it('没有个人记录时使用唯一的内置系统默认，并开启语音回复', () => {
     const db = testDb()
     const profile = resolveVoiceProfile(db, 'c1', 'u1')
-    expect(profile).toMatchObject({ voice: DEFAULT_VOICE, activeVoiceId: 'default', instructions: '', enabled: true })
+    expect(profile).toMatchObject({ voice: DEFAULT_VOICE, activeVoiceId: 'default', instructions: DEFAULT_VOICE_INSTRUCTIONS, enabled: true })
     expect(voiceProfileView(profile)).toMatchObject({
       enabled: true,
       activeVoiceId: 'default',
-      instructions: '',
+      instructions: DEFAULT_VOICE_INSTRUCTIONS,
       voices: [{ id: 'default', name: '系统默认', builtin: true, active: true }],
     })
   })
@@ -72,7 +73,7 @@ describe('voice profile', () => {
     })
     expect(second.activeVoiceId).not.toBe(first.activeVoiceId)
     expect(listVoicePresets(db, 'c1', 'u1')).toHaveLength(2)
-    expect(resolveVoiceProfile(db, 'c1', 'u2')).toMatchObject({ activeVoiceId: 'default', instructions: '' })
+    expect(resolveVoiceProfile(db, 'c1', 'u2')).toMatchObject({ activeVoiceId: 'default', instructions: DEFAULT_VOICE_INSTRUCTIONS })
   })
 
   it('切换默认、修改描述和删除当前方案都能保持一致', () => {
@@ -82,7 +83,7 @@ describe('voice profile', () => {
       instructions: '温和、清晰的声音',
     })
     const switched = saveVoiceProfile(db, 'c1', 'u1', { activeVoiceId: 'default', enabled: false })
-    expect(switched).toMatchObject({ activeVoiceId: 'default', instructions: '', enabled: false })
+    expect(switched).toMatchObject({ activeVoiceId: 'default', instructions: DEFAULT_VOICE_INSTRUCTIONS, enabled: false })
 
     const updated = updateVoicePreset(db, 'c1', 'u1', created.activeVoiceId, {
       name: '更新后的声音',
@@ -92,7 +93,7 @@ describe('voice profile', () => {
 
     saveVoiceProfile(db, 'c1', 'u1', { activeVoiceId: created.activeVoiceId })
     const removed = deleteVoicePreset(db, 'c1', 'u1', created.activeVoiceId)
-    expect(removed).toMatchObject({ activeVoiceId: 'default', instructions: '' })
+    expect(removed).toMatchObject({ activeVoiceId: 'default', instructions: DEFAULT_VOICE_INSTRUCTIONS })
     expect(listVoicePresets(db, 'c1', 'u1')).toEqual([])
   })
 
