@@ -86,7 +86,7 @@ function testEnv() {
 }
 
 describe('Agent 工具动态加载', () => {
-  it('先搜 tool_search，下一轮才把命中的数学工具加载进 tools', async () => {
+  it('数学工具作为核心工具常驻，tool_search 仍可继续按需加载', async () => {
     state.toolLists.length = 0
     state.messageCalls.length = 0
     const { deps, actor } = testEnv()
@@ -101,9 +101,8 @@ describe('Agent 工具动态加载', () => {
 
     expect(result?.text).toBe('答案是 2')
     expect(state.toolLists[0]).toContain('tool_search')
-    expect(state.toolLists[0]).not.toContain('math_eval')
+    expect(state.toolLists[0]).toContain('math_eval')
     expect(state.toolLists[1]).toContain('math_eval')
-    expect(state.toolLists[1]).toContain('tool_search')
     expect(result?.toolCalls.map((tool) => tool.toolId)).toEqual(['tool.search', 'math.eval'])
     const finalMessages = state.messageCalls[state.messageCalls.length - 1] ?? []
     const toolContents = finalMessages.filter((message) => message.role === 'tool').map((message) => String(message.content))

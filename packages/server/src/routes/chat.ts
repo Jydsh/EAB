@@ -772,6 +772,9 @@ export function buildSystemPrompt(opts: {
     chatTools.length > 0
       ? `你可以调用工具获取实时信息或本企业数据（当前已加载：${chatTools.map((tool) => tool.function.name).join('、')}）。需要精确时间、通讯录或知识库检索时优先调用这些工具，拿到结果再回答；计算等未直接列出的能力先按下面的工具搜索规则加载。不要编造工具结果。`
       : '',
+    chatTools.some((tool) => tool.function.name === 'math_eval')
+      ? '【数值计算硬规则】回答里要出现的合计、总计、平均、占比、跨天或跨零点时长，必须调用 math_eval：把结果里的每一项原值（例如 10.3、7.75、11）按顺序放进 values，回答中的合计数直接引用返回的 sum，不要口算、估算或先四舍五入，也不要漏行；只有单个算式才写 expression。如果原值来自工具结果，逐行收齐后再一次性汇总，不要边看边累加。'
+      : '',
     chatTools.some((tool) => tool.function.name === 'tool_search')
       ? spaceKind === 'cloud'
         ? '当前工具列表只是常用工具，不是全部。需要文件/图片发送、重命名、删除、容量、定时任务列表、计算、插件等未直接列出的能力时，先调用 tool_search；当前在云空间，query 只能写云空间文件/容量相关能力，不要搜本地磁盘工具。工具结果返回后，命中的工具会自动加载为可调用工具，直接继续调用即可。'

@@ -808,11 +808,18 @@ export const TOOLS: readonly ToolDef[] = [
   },
   {
     id: 'math.eval',
-    name: '四则运算',
-    description: '计算 + - * / 与括号，不支持函数与变量',
+    name: '计算与汇总',
+    description:
+      '做四则运算，或对一组数字求和、平均、最小值、最大值。凡是回答里要出现“合计/总计/平均/共多少小时/共多少钱”，必须把每一项原值按顺序放进 values 再调用本工具，禁止心算或先四舍五入；只有单个算式时才用 expression。values 支持数字和“H:MM”“10.3”“10.3小时”这类字符串，时长按小时计算。',
     scope: SC.AGENT_TOOL_INVOKE,
     dangerous: false,
-    input: { expression: { type: 'string', description: '例如 (1200+300)/4', required: true } },
+    input: {
+      expression: { type: 'string', description: '单个算式，例如 (1200+300)/4' },
+      values: {
+        type: 'array',
+        description: '要汇总的一组数值，例如 [10.3, 7.75, 11, 11.4]；时长可写 10.3、10.3小时 或 10:18',
+      },
+    },
   },
   {
     id: 'org.directory',
@@ -1516,6 +1523,47 @@ function evaluate(expression: string): number {
   return result
 }
 
+/**
+ * 汇总一组数值：模型常把时长/金额口头心算，漏行或算错。
+ * 这里统一解析数字与“10.3小时”“10:18”这类时长写法，按小时求和并给出条数。
+ */
+function summarizeValues(raw: unknown[]): { count: number; sum: number; avg: number; min: number; max: number; unit: 'hours' | 'number' } {
+  if (!raw.length) throw new EabError(EC.VALIDATION, 'values 不能为空')
+  if (raw.length > 500) throw new EabError(EC.VALIDATION, 'values 最多 500 项')
+  let unit: 'hours' | 'number' = 'number'
+  const nums = raw.map((item, index) => {
+    if (typeof item === 'number') {
+      if (!Number.isFinite(item)) throw new EabError(EC.VALIDATION, `values[${index}] 不是有效数字`)
+      return item
+    }
+    const text = String(item ?? '').trim()
+    if (!text) throw new EabError(EC.VALIDATION, `values[${index}] 为空`)
+    const clock = text.match(/^(\d{1,3}):(\d{2})(?::(\d{2}))?$/)
+    if (clock) {
+      const minutes = Number(clock[2]) + (clock[3] ? Number(clock[3]) / 60 : 0)
+      if (minutes >= 60) throw new EabError(EC.VALIDATION, `values[${index}] 的分钟数不能超过 59`)
+      unit = 'hours'
+      return Number(clock[1]) + minutes / 60
+    }
+    const hoursSuffix = /(小时|个小时|hours?|hrs?|h)$/i.test(text)
+    const numeric = text.replace(/(小时|个小时|hours?|hrs?|h)$/i, '').trim()
+    const value = Number(numeric)
+    if (!Number.isFinite(value)) throw new EabError(EC.VALIDATION, `values[${index}] 不是有效数字：${text}`)
+    if (hoursSuffix) unit = 'hours'
+    return value
+  })
+  const sum = nums.reduce((total, value) => total + value, 0)
+  const round = (value: number) => Math.round(value * 100) / 100
+  return {
+    count: nums.length,
+    sum: round(sum),
+    avg: round(sum / nums.length),
+    min: round(Math.min(...nums)),
+    max: round(Math.max(...nums)),
+    unit,
+  }
+}
+
 /** 组织通讯录工具：只读，不返回手机号；按 subject 的 dataScope 裁剪可见成员。 */
 function visibleUserIds(db: Db, actor: Actor): string[] | null {
   if (!actor.subject.scopes.has(SC.ORG_MEMBER_READ)) return null
@@ -1732,6 +1780,7 @@ export function resolveToolByFunctionName(name: string): ToolDef | undefined {
 export const AGENT_CORE_TOOL_IDS: readonly string[] = [
   'tool.search',
   'time.now',
+  'math.eval',
   'agent.spawn',
   'agent.task',
   'agent.ask_parent',
@@ -1787,7 +1836,7 @@ const TOOL_SEARCH_ALIASES: Record<string, string> = {
   'schedule.create': '提醒 定时 日程 每天 每周 几点 定时任务 remind schedule timer',
   'schedule.list': '查看定时任务 我的任务 提醒列表 任务状态 schedule list',
   'schedule.delete': '取消定时任务 删除提醒 停止任务 cancel schedule delete',
-  'math.eval': '计算 算一下 四则运算 加减乘除 数学 math calculate calculator',
+  'math.eval': '计算 算一下 四则运算 加减乘除 数学 求和 合计 总计 汇总 平均 平均时长 小时 加班时长 金额合计 math calculate calculator sum total average',
   'org.directory': '通讯录 组织架构 部门 组长 上级 同事 成员 查找人 org directory',
   'org.search': '找人 搜索成员 姓名 工号 岗位 search member',
   'kb.search': '知识库 文档 资料 检索 搜索 制度 流程 kb rag search',
@@ -2498,8 +2547,17 @@ export async function executeTool(
       break
     }
     case 'math.eval': {
-      const expression = String(args.expression ?? '')
-      result = { expression, value: evaluate(expression) }
+      const expression = String(args.expression ?? '').trim()
+      const rawValues = Array.isArray(args.values) ? args.values : []
+      if (!expression && !rawValues.length) {
+        throw new EabError(EC.VALIDATION, '请提供 expression 或 values')
+      }
+      if (rawValues.length) {
+        const summary = summarizeValues(rawValues)
+        result = expression ? { ...summary, expression, value: evaluate(expression) } : summary
+      } else {
+        result = { expression, value: evaluate(expression) }
+      }
       break
     }
     case 'org.directory':
