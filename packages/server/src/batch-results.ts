@@ -935,10 +935,19 @@ export interface RowStatsField {
   max: number
 }
 
+export interface RowStatsLabels {
+  /** 该字段出现的不同取值个数。 */
+  count: number
+  /** 前若干个不同取值，便于模型一眼看出“这批是不是同一个人的”。 */
+  values: string[]
+}
+
 export interface RowStats {
   rows: number
   path: string
   fields: Record<string, RowStatsField>
+  /** 姓名/员工/部门这类身份字段的取值分布；多人时提示筛选条件可能没生效。 */
+  labels?: Record<string, RowStatsLabels>
   note: string
 }
 
@@ -1044,10 +1053,26 @@ export function summarizeRowStats(payload: unknown): RowStats | null {
   const top = fields.sort((a, b) => b.stats.count - a.stats.count).slice(0, ROW_STATS_MAX_FIELDS)
   const statsFields: Record<string, RowStatsField> = {}
   for (const field of top) statsFields[field.name] = field.stats
+  // 身份字段（姓名、员工、部门等）：模型最常见的错不是加错，而是把“整组 105 条”当成
+  // 某个人的 105 条。这里把取值分布一起给出来，让筛选没生效这件事在结果里就能被看见。
+  const labelPattern = /姓名|员工|人名|所属人员|负责人|所在部门|部门|name|user/i
+  const labels: Record<string, RowStatsLabels> = {}
+  for (const key of keys) {
+    if (!labelPattern.test(key)) continue
+    const values = new Set<string>()
+    for (const row of rows) {
+      const raw = row[key]
+      if (typeof raw !== 'string') continue
+      const text = raw.trim()
+      if (text) values.add(text)
+    }
+    if (values.size >= 2) labels[key] = { count: values.size, values: [...values].slice(0, 12) }
+  }
   return {
     rows: found.rows.length,
     path: found.path,
     fields: statsFields,
+    ...(Object.keys(labels).length > 0 ? { labels } : {}),
     note: `服务端对该批 ${found.rows.length} 条记录逐字段精确统计（最多取前 ${ROW_STATS_MAX_ROWS} 条）；合计、平均、条数、最大最小一律引用这里的值，不要再从明细重算。`,
   }
 }
