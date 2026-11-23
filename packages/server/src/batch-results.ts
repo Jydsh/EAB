@@ -919,3 +919,135 @@ export const BATCH_ANALYZE_TOOL_SPEC: ChatToolSpec = {
     },
   },
 }
+
+/**
+ * 服务端为业务工具结果附带的逐字段精确统计。
+ *
+ * 为什么需要：模型拿到十几条带“时长/金额”的记录后会自己心算合计，
+ * 常见漏行、四舍五入或跨行加错（实测 17 条加班时长合计 213.27 被算成 188.55）。
+ * 这里在工具结果进入模型前算出条数/合计/平均/最值，让模型直接引用，不再重算。
+ */
+export interface RowStatsField {
+  count: number
+  sum: number
+  avg: number
+  min: number
+  max: number
+}
+
+export interface RowStats {
+  rows: number
+  path: string
+  fields: Record<string, RowStatsField>
+  note: string
+}
+
+const ROW_STATS_MAX_ROWS = 5_000
+const ROW_STATS_MAX_FIELDS = 12
+const ROW_STATS_MAX_DEPTH = 6
+
+function statNumber(raw: unknown): number | null {
+  if (typeof raw === 'number') return Number.isFinite(raw) ? raw : null
+  if (typeof raw !== 'string') return null
+  const text = raw.trim().replace(/,/g, '')
+  if (!/^-?\d+(?:\.\d+)?$/.test(text)) return null
+  const value = Number(text)
+  return Number.isFinite(value) ? value : null
+}
+
+function round2(value: number): number {
+  return Math.round(value * 100) / 100
+}
+
+function rowObjectSample(value: unknown): Record<string, unknown> | null {
+  if (Array.isArray(value)) return null
+  if (!value || typeof value !== 'object') return null
+  return value as Record<string, unknown>
+}
+
+/** 找到 payload 里最像“数据表”的数组：优先行数最多的对象数组，其次优先带数值字段的。 */
+function findRecordArray(payload: unknown): { rows: Array<Record<string, unknown>>; path: string } | null {
+  let best: { rows: Array<Record<string, unknown>>; path: string; score: number } | null = null
+  const visited = new Set<object>()
+
+  function inspect(value: unknown, path: string, depth: number): void {
+    if (depth > ROW_STATS_MAX_DEPTH || !value || typeof value !== 'object') return
+    if (visited.has(value as object)) return
+    visited.add(value as object)
+    if (Array.isArray(value)) {
+      const objects = value.slice(0, 50).map(rowObjectSample)
+      const sampleRows = objects.filter((row): row is Record<string, unknown> => row !== null)
+      if (objects.length >= 2 && sampleRows.length === objects.length) {
+        const keys = new Set(sampleRows.flatMap((row) => Object.keys(row)))
+        const numeric = [...keys].some((key) => sampleRows.some((row) => statNumber(row[key]) !== null))
+        // 行数优先；同规模时带数值列更像业务数据表。
+        const score = value.length * (numeric ? 3 : 1)
+        if (!best || score > best.score || (numeric && score === best.score)) {
+          best = { rows: value.filter((row): row is Record<string, unknown> => rowObjectSample(row) !== null), path, score }
+        }
+      }
+      value.slice(0, 200).forEach((item, index) => inspect(item, `${path}[${index}]`, depth + 1))
+      return
+    }
+    const record = value as Record<string, unknown>
+    for (const [key, child] of Object.entries(record)) {
+      inspect(child, path ? `${path}.${key}` : key, depth + 1)
+    }
+  }
+
+  inspect(payload, '', 0)
+  // best 只在 inspect 闭包里赋值，TS 的控制流分析会把外层变量窄化成 null，这里显式还原类型。
+  const picked = best as unknown as { rows: Array<Record<string, unknown>>; path: string; score: number } | null
+  return picked ? { rows: picked.rows, path: picked.path || '$' } : null
+}
+
+/** 业务工具结果里的数据表统计；没有对象数组时返回 null。 */
+export function summarizeRowStats(payload: unknown): RowStats | null {
+  let data = payload
+  if (typeof data === 'string' && data.trim().startsWith('{')) {
+    try {
+      data = JSON.parse(data)
+    } catch {
+      return null
+    }
+  }
+  const found = findRecordArray(data)
+  if (!found) return null
+  const rows = found.rows.slice(0, ROW_STATS_MAX_ROWS)
+  const keys = new Set<string>()
+  for (const row of rows) {
+    for (const key of Object.keys(row)) keys.add(key)
+  }
+  const fields: Array<{ name: string; stats: RowStatsField }> = []
+  for (const key of keys) {
+    let count = 0
+    let sum = 0
+    let min = Number.POSITIVE_INFINITY
+    let max = Number.NEGATIVE_INFINITY
+    for (const row of rows) {
+      const value = statNumber(row[key])
+      if (value === null) continue
+      count += 1
+      sum += value
+      if (value < min) min = value
+      if (value > max) max = value
+    }
+    if (count === 0) continue
+    // 数值字段至少覆盖一半行才纳入统计，避免把偶尔出现的编码/序号当成指标。
+    if (count < Math.max(2, Math.ceil(rows.length / 2))) continue
+    fields.push({
+      name: key,
+      stats: { count, sum: round2(sum), avg: round2(sum / count), min: round2(min), max: round2(max) },
+    })
+  }
+  if (fields.length === 0) return null
+  const top = fields.sort((a, b) => b.stats.count - a.stats.count).slice(0, ROW_STATS_MAX_FIELDS)
+  const statsFields: Record<string, RowStatsField> = {}
+  for (const field of top) statsFields[field.name] = field.stats
+  return {
+    rows: found.rows.length,
+    path: found.path,
+    fields: statsFields,
+    note: `服务端对该批 ${found.rows.length} 条记录逐字段精确统计（最多取前 ${ROW_STATS_MAX_ROWS} 条）；合计、平均、条数、最大最小一律引用这里的值，不要再从明细重算。`,
+  }
+}
