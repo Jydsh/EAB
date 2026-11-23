@@ -239,13 +239,22 @@ function sourceRoot(extracted) {
   throw new Error('源码压缩包里没有 package.json')
 }
 
+/**
+ * node_modules 是 pnpm 生成的 junction/软链，cpSync 会把它们解引用成真实目录，
+ * 备份再恢复后依赖内部链接全断（表现为启动时报 ERR_MODULE_NOT_FOUND）。
+ * 所以代码备份/恢复都跳过 node_modules，依赖统一交给 pnpm install 重建。
+ */
+function skipNodeModules(source) {
+  return !String(source).split(/[\\/]/).includes('node_modules')
+}
+
 function backupCode(root, backupDir) {
   for (const relative of CODE_PATHS) {
     const source = join(root, relative)
     if (!existsSync(source)) continue
     const target = join(backupDir, relative)
     mkdirSync(resolve(target, '..'), { recursive: true })
-    cpSync(source, target, { recursive: true })
+    cpSync(source, target, { recursive: true, filter: skipNodeModules })
   }
 }
 
@@ -266,13 +275,14 @@ function restoreCode(root, backupDir) {
     if (!existsSync(from)) continue
     const to = join(root, relative)
     if (existsSync(to)) rmSync(to, { recursive: true, force: true })
-    cpSync(from, to, { recursive: true })
+    cpSync(from, to, { recursive: true, filter: skipNodeModules })
   }
 }
 
-function runPnpm(root) {
+function runPnpm(root, { force = false } = {}) {
+  const args = force ? ['install', '--force', '--frozen-lockfile'] : ['install', '--frozen-lockfile']
   return new Promise((resolvePromise, reject) => {
-    const result = spawnSync('pnpm', ['install', '--frozen-lockfile'], {
+    const result = spawnSync('pnpm', args, {
       cwd: root,
       stdio: 'inherit',
       shell: true,
@@ -404,7 +414,9 @@ async function main() {
     dataBackupDir = backupRuntimeData(backupDir)
     replaceCode(root, source, backupDir)
     log('代码已替换，开始安装依赖')
-    await runPnpm(root)
+    // 整包替换会删掉各包 node_modules；用 --force 保证按锁文件重建软链，
+    // 否则 pnpm 可能认为根装配未变而直接跳过，留下缺链接的 node_modules。
+    await runPnpm(root, { force: true })
     log('依赖安装完成')
     let health = restart ? { ok: false, pid: null, uptime: null, detail: '尚未启动' } : { ok: true, pid: null, uptime: null, detail: '未要求重启' }
     if (restart) {
@@ -430,7 +442,7 @@ async function main() {
         } else {
           if (backupReady) restoreCode(root, backupDir)
           restoreRuntimeData(dataBackupDir)
-          await runPnpm(root)
+          await runPnpm(root, { force: true })
           startServer(root, previousVersion)
           const rollbackHealth = await waitForHealth(chatPort, previousVersion, 30000, oldPid)
           rollbackOk = rollbackHealth.ok
@@ -472,7 +484,7 @@ async function main() {
       if (backupReady) {
         restoreCode(root, backupDir)
         restoreRuntimeData(dataBackupDir)
-        await runPnpm(root)
+        await runPnpm(root, { force: true })
         rollbackOk = true
         log('已回滚代码并恢复依赖')
       }

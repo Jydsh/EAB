@@ -98,8 +98,13 @@ async function login() {
   })
   const body = await res.json().catch(() => null)
   if (!res.ok || !body?.ok) throw new Error(`控制台登录失败：${body?.message ?? res.status}`)
-  const cookie = (res.headers.get('set-cookie') || '').split(';')[0]
-  return { cookie, 'x-eab-console': '1' }
+  // 登录会一次下发多条 Set-Cookie（先清成员会话、再写控制台会话），
+  // 只取第一条会拿到已过期的那条，doctor 就会误报“需要控制台会话”。
+  const rawCookies =
+    typeof res.headers.getSetCookie === 'function' ? res.headers.getSetCookie() : [res.headers.get('set-cookie') || '']
+  const pairs = rawCookies.map((item) => String(item).split(';')[0].trim())
+  const sessionCookie = pairs.find((item) => item.startsWith('eab_console_sid=')) || pairs.find(Boolean) || ''
+  return { cookie: sessionCookie, 'x-eab-console': '1' }
 }
 
 async function api(path, headers, options = {}) {
