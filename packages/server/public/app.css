@@ -2891,9 +2891,8 @@ body {
   border-right: 1px solid var(--line);
   gap: 4px;
 }
-.page { padding: 24px 28px 56px; max-width: 1440px; }
-/* 权限审批画布需要横向空间：宽屏下占满 workspace，不受通用 1440 上限约束。 */
-.page:has(.approval-shell) { max-width: none; }
+/* 内容区跟着窗口宽度自适应：不再封 1440 上限，宽屏下也铺满可视宽度（左右只留统一内边距）。 */
+.page { padding: 24px 28px 56px; }
 .page-head {
   align-items: flex-start;
   margin-bottom: 18px;

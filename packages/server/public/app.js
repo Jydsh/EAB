@@ -14046,7 +14046,7 @@ async function loadSys() {
           <div><span>开发身份切换</span><strong>${health.devAuth ? '<span class="pill warn">开启</span>' : '<span class="pill ok">关闭</span>'}</strong></div>
         </div>
       </section>
-      <section class="panel" data-section-panel="runtime">
+      <section class="panel" data-section-panel="concurrency">
         <div class="panel-head">
           <div><h2>并发与队列</h2>${hintBadge('并发说明', `对话 / 模型 / 工具 / 插件四级闸门；${toolStats?.shared || pluginStats?.shared ? '工具与插件的执行数是 Redis 里的全局计数（跨实例），对话与排队是本进程实时值。' : '数字是当前进程的实时值。'}`)}</div>
           <div class="panel-actions">
