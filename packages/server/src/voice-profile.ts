@@ -19,6 +19,9 @@ export const DEFAULT_VOICE_NAME = '系统默认'
 /** 内置音色的固定描述：所有默认播报都用这一句，不允许被清空或逐次变化。 */
 export const DEFAULT_VOICE_INSTRUCTIONS = '清晰、自然、亲切的中文女声，语速平稳，适合办公助手。'
 export const DEFAULT_VOICE_ENABLED = true
+/** 播报时机：stream=边生成边按句播；whole=整段回答写完再播。 */
+export type VoiceSpeechMode = 'stream' | 'whole'
+export const DEFAULT_VOICE_SPEECH_MODE: VoiceSpeechMode = 'stream'
 export const MAX_VOICE_NAME = 40
 export const MAX_VOICE_INSTRUCTIONS = 200
 
@@ -27,6 +30,7 @@ export interface VoiceProfile {
   readonly activeVoiceId: string
   readonly instructions: string
   readonly enabled: boolean
+  readonly speechMode: VoiceSpeechMode
   /** 只参与 TTS 请求，不落库，也不返回给前端。 */
   readonly seed: number
 }
@@ -34,6 +38,7 @@ export interface VoiceProfile {
 export interface VoiceProfilePatch {
   readonly enabled?: boolean
   readonly activeVoiceId?: string
+  readonly speechMode?: VoiceSpeechMode
 }
 
 export interface VoicePreset {
@@ -52,6 +57,7 @@ export interface VoicePresetInput {
 interface VoiceProfileRow {
   active_voice_id?: string | null
   enabled?: number | null
+  speech_mode?: string | null
 }
 
 interface VoicePresetRow {
@@ -60,6 +66,11 @@ interface VoicePresetRow {
   instructions: string
   created_at: number
   updated_at: number
+}
+
+/** 播报时机只认两个值；库里出现脏数据时回退到边生成边播。 */
+function normalizeSpeechMode(value: unknown): VoiceSpeechMode {
+  return String(value ?? '').trim() === 'whole' ? 'whole' : 'stream'
 }
 
 function cleanInstructions(value: unknown): string {
@@ -146,7 +157,7 @@ function uniqueName(
 export function resolveVoiceProfile(db: Db, companyId: string, userId: string): VoiceProfile {
   const row = db
     .prepare(
-      `SELECT active_voice_id, enabled
+      `SELECT active_voice_id, enabled, speech_mode
          FROM user_voice_profiles
         WHERE company_id = ? AND user_id = ?
         LIMIT 1`,
@@ -159,6 +170,7 @@ export function resolveVoiceProfile(db: Db, companyId: string, userId: string): 
     activeVoiceId: preset ? activeVoiceId : DEFAULT_VOICE_ID,
     instructions: preset ? preset.instructions : DEFAULT_VOICE_INSTRUCTIONS,
     enabled: row?.enabled == null ? DEFAULT_VOICE_ENABLED : Number(row.enabled) !== 0,
+    speechMode: normalizeSpeechMode(row?.speech_mode),
     seed: voiceSeedOf(companyId, userId),
   }
 }
@@ -207,7 +219,19 @@ export function saveVoiceProfile(
     throw new EabError(EC.VALIDATION, '没有找到这个声音方案', { details: { activeVoiceId } })
   }
   const enabled = patch.enabled === undefined ? current.enabled : patch.enabled === true
+  const speechMode =
+    patch.speechMode === undefined ? current.speechMode : normalizeSpeechMode(patch.speechMode)
+  if (patch.speechMode !== undefined && speechMode !== patch.speechMode) {
+    throw new EabError(EC.VALIDATION, 'speechMode 只能是 stream 或 whole', {
+      details: { speechMode: patch.speechMode },
+    })
+  }
   writeProfile(db, companyId, userId, { activeVoiceId, enabled })
+  if (speechMode !== current.speechMode || patch.speechMode !== undefined) {
+    db.prepare(
+      `UPDATE user_voice_profiles SET speech_mode = ? WHERE company_id = ? AND user_id = ?`,
+    ).run(speechMode, companyId, userId)
+  }
   return resolveVoiceProfile(db, companyId, userId)
 }
 
@@ -280,6 +304,7 @@ export function voiceProfileView(profile: VoiceProfile, presets: VoicePreset[] =
   enabled: boolean
   activeVoiceId: string
   instructions: string
+  speechMode: VoiceSpeechMode
   voices: VoiceView[]
 } {
   const voices: VoiceView[] = [
@@ -302,6 +327,7 @@ export function voiceProfileView(profile: VoiceProfile, presets: VoicePreset[] =
     enabled: profile.enabled,
     activeVoiceId: profile.activeVoiceId,
     instructions: profile.instructions,
+    speechMode: profile.speechMode,
     voices,
   }
 }

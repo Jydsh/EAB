@@ -125,6 +125,16 @@ describe('voice profile', () => {
     expect(names).toContain(`${preset.name.slice(0, 38)} 2`)
   })
 
+  it('播报时机可切换并持久化，未知值被拒绝', () => {
+    const db = testDb()
+    expect(resolveVoiceProfile(db, 'c1', 'u1').speechMode).toBe('stream')
+    const saved = saveVoiceProfile(db, 'c1', 'u1', { speechMode: 'whole' })
+    expect(saved.speechMode).toBe('whole')
+    expect(resolveVoiceProfile(db, 'c1', 'u1').speechMode).toBe('whole')
+    expect(saveVoiceProfile(db, 'c1', 'u1', { speechMode: 'stream' }).speechMode).toBe('stream')
+    expect(() => saveVoiceProfile(db, 'c1', 'u1', { speechMode: 'later' as 'stream' })).toThrow(/speechMode/)
+  })
+
   it('员工种子稳定且不同员工不同', () => {
     expect(voiceSeedOf('c1', 'u1')).toBe(voiceSeedOf('c1', 'u1'))
     expect(voiceSeedOf('c1', 'u1')).not.toBe(voiceSeedOf('c1', 'u2'))

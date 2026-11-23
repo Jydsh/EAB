@@ -357,7 +357,7 @@ export function registerSystemRoutes(app: FastifyInstance, deps: ServerDeps): vo
   })
 
   /** 只更新当前员工；activeVoiceId 必须指向系统默认或本人已保存的声音方案。 */
-  app.patch<{ Body: { enabled?: unknown; activeVoiceId?: unknown } }>(
+  app.patch<{ Body: { enabled?: unknown; activeVoiceId?: unknown; speechMode?: unknown } }>(
     '/api/me/voice',
     async (req) => {
       const { person } = resolveActor(deps.db, deps.config, req, deps.companyId)
@@ -365,9 +365,16 @@ export function registerSystemRoutes(app: FastifyInstance, deps: ServerDeps): vo
       if (body.enabled !== undefined && typeof body.enabled !== 'boolean') {
         throw new EabError(EC.VALIDATION, 'enabled 必须是布尔值')
       }
-      const patch: { enabled?: boolean; activeVoiceId?: string } = {}
+      const patch: { enabled?: boolean; activeVoiceId?: string; speechMode?: 'stream' | 'whole' } = {}
       if (body.enabled !== undefined) patch.enabled = body.enabled
       if (body.activeVoiceId !== undefined) patch.activeVoiceId = String(body.activeVoiceId ?? '').trim()
+      if (body.speechMode !== undefined) {
+        const mode = String(body.speechMode ?? '').trim()
+        if (mode !== 'stream' && mode !== 'whole') {
+          throw new EabError(EC.VALIDATION, 'speechMode 只能是 stream 或 whole', { details: { speechMode: mode } })
+        }
+        patch.speechMode = mode
+      }
       const profile = saveVoiceProfile(deps.db, person.companyId, person.id, patch)
       return ok(voiceProfileView(profile, listVoicePresets(deps.db, person.companyId, person.id)))
     },

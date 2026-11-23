@@ -370,6 +370,7 @@ const state = {
     enabled: true,
     activeVoiceId: 'default',
     instructions: '',
+    speechMode: 'stream',
     defaults: { enabled: true, activeVoiceId: 'default' },
     voices: [],
     speechAvailable: false,
@@ -8222,6 +8223,7 @@ async function loadVoiceSettings() {
       enabled: data.enabled !== false,
       activeVoiceId: String(data.activeVoiceId || 'default'),
       instructions: String(data.instructions || ''),
+      speechMode: data.speechMode === 'whole' ? 'whole' : 'stream',
       defaults: data.defaults || { enabled: true, activeVoiceId: 'default' },
       voices,
       speechAvailable: Boolean(data.speechAvailable),
@@ -8262,6 +8264,21 @@ function renderVoiceSettings() {
       button.classList.toggle('is-active', on === voice.enabled)
       button.setAttribute('aria-checked', on === voice.enabled ? 'true' : 'false')
     }
+  }
+  const modeSegment = $('#settings-voice-mode-segment')
+  if (modeSegment) {
+    for (const button of modeSegment.querySelectorAll('[data-voice-mode]')) {
+      const on = button.dataset.voiceMode === (voice.speechMode === 'whole' ? 'whole' : 'stream')
+      button.classList.toggle('is-active', on)
+      button.setAttribute('aria-checked', on ? 'true' : 'false')
+    }
+  }
+  const modeHint = $('#settings-voice-mode-hint')
+  if (modeHint) {
+    modeHint.textContent =
+      voice.speechMode === 'whole'
+        ? '整段播报：回答写完后一次性合成再播'
+        : '边生成边播：第一句说完就开口'
   }
   const hint = $('#settings-voice-hint')
   if (hint) {
@@ -14156,7 +14173,7 @@ async function runClarifyStep(flow, answer, answeredClarify) {
         } else if (event === 'delta') {
           buffered.content += String(data.text || '')
           if (turn) turn.content(String(data.text || ''))
-          if (voiceStream?.active) feedVoiceSpeechStream(String(data.text || ''))
+          if (voiceStream?.active && !voiceSpeechDeferred()) feedVoiceSpeechStream(String(data.text || ''))
         } else if (event === 'tool') {
           buffered.tools.push(data)
           if (turn) turn.tool(data)
@@ -15923,6 +15940,11 @@ function takeVoiceSpeechSentences(buffer) {
   return { sentences, rest: text.slice(start) }
 }
 
+/** 播报时机：whole=等整段回答写完再合成，delta 阶段不入队。 */
+function voiceSpeechDeferred() {
+  return state.voiceSettings.speechMode === 'whole'
+}
+
 /** LLM 每吐出一句完整中文，就入队；上一句还在播时，下一句已经在合成。 */
 function feedVoiceSpeechStream(text) {
   const stream = voiceSpeechStream
@@ -15994,7 +16016,13 @@ function beginVoiceSpeechStream(node, generation) {
     dock.dataset.voiceUnderruns = '0'
     dock.dataset.voiceSampleRate = String(context.sampleRate)
   }
-  setVoiceDockStatus('thinking', '正在生成回答…', '第一句说完就会开始播报，不用等整段回答')
+  setVoiceDockStatus(
+    'thinking',
+    '正在生成回答…',
+    voiceSpeechDeferred()
+      ? '整段播报：回答写完后一次性合成再播放'
+      : '第一句说完就会开始播报，不用等整段回答',
+  )
   return stream
 }
 
@@ -16797,7 +16825,7 @@ async function drainQueue(runtime = currentRuntime()) {
           if (event === 'reasoning') turn.reasoning(data.text)
           else if (event === 'delta') {
             turn.content(data.text)
-            if (voiceStream?.active) feedVoiceSpeechStream(String(data.text || ''))
+            if (voiceStream?.active && !voiceSpeechDeferred()) feedVoiceSpeechStream(String(data.text || ''))
           } else if (event === 'tool') turn.tool(data)
           else if (event === 'tool_delta') turn.toolDelta(data)
           else turn.toolResult(data)
@@ -17023,6 +17051,33 @@ function bindSettings() {
     await setWakeEnabled(next)
   })
   $('#settings-voice').addEventListener('click', showVoiceSettings)
+  $('#settings-voice-mode-segment').addEventListener('click', async (event) => {
+    const button = event.target.closest?.('[data-voice-mode]')
+    if (!button) return
+    const next = button.dataset.voiceMode === 'whole' ? 'whole' : 'stream'
+    if (next === state.voiceSettings.speechMode) return
+    const previous = state.voiceSettings.speechMode
+    state.voiceSettings.speechMode = next
+    renderVoiceSettings()
+    try {
+      const saved = await api('/api/me/voice', {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ speechMode: next }),
+      })
+      state.voiceSettings = {
+        ...state.voiceSettings,
+        ...saved,
+        speechMode: saved.speechMode === 'whole' ? 'whole' : 'stream',
+      }
+      renderVoiceSettings()
+      banner(next === 'whole' ? '已改为整段播报' : '已改为边生成边播', 'ok')
+    } catch (err) {
+      state.voiceSettings.speechMode = previous
+      renderVoiceSettings()
+      banner(err.message || '保存失败，请重试', 'bad')
+    }
+  })
   $('#settings-voice-segment').addEventListener('click', async (event) => {
     const button = event.target.closest?.('[data-voice-enabled]')
     if (!button) return

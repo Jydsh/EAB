@@ -490,6 +490,17 @@
                 <button type="button" data-voice-enabled="false" role="radio" aria-checked="false">关闭</button>
               </div>
             </div>
+            <div class="settings-row is-static" id="settings-voice-mode">
+              <span class="settings-row-icon">≣</span>
+              <span class="settings-row-text">
+                <strong>播报时机</strong>
+                <em id="settings-voice-mode-hint">边生成边播：第一句说完就开口</em>
+              </span>
+              <div class="settings-segment" id="settings-voice-mode-segment" role="radiogroup" aria-label="播报时机">
+                <button type="button" data-voice-mode="stream" role="radio" aria-checked="true">边生成边播</button>
+                <button type="button" data-voice-mode="whole" role="radio" aria-checked="false">整段播报</button>
+              </div>
+            </div>
             <div class="settings-row is-static" id="settings-wake">
               <span class="settings-row-icon">⌁</span>
               <span class="settings-row-text">
