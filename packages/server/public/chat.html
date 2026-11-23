@@ -23,8 +23,8 @@
     </style>
     <script src="/theme.js?v=20261117a" data-surface="chat"></script>
     <script src="/brand.js?v=20261115c" defer></script>
-    <link rel="stylesheet" href="/app.css?v=20261122a" />
-    <link rel="stylesheet" href="/chat.css?v=20261122a" />
+    <link rel="stylesheet" href="/app.css?v=20261122c" />
+    <link rel="stylesheet" href="/chat.css?v=20261123wake" />
     <link rel="stylesheet" href="/theme.css?v=20261115b" />
     <link rel="stylesheet" href="/boot-splash.css?v=20261115i" />
   </head>
@@ -368,6 +368,18 @@
             <span class="remote-live-text" id="remote-live-text"></span>
             <span class="remote-live-open">查看</span>
           </button>
+          <div class="voice-dock" id="voice-dock" role="status" aria-live="polite" hidden>
+            <span class="voice-dock-orb" aria-hidden="true"><i></i><i></i><i></i></span>
+            <div class="voice-dock-copy">
+              <strong id="voice-dock-title">正在聆听</strong>
+              <span id="voice-dock-detail">直接说话，停顿后会自动发送</span>
+            </div>
+            <div class="voice-dock-meter" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
+            <div class="voice-dock-actions">
+              <button class="voice-dock-action" id="voice-dock-action" type="button">结束这句</button>
+              <button class="voice-dock-exit" id="voice-dock-exit" type="button" title="退出语音对话" aria-label="退出语音对话">退出</button>
+            </div>
+          </div>
           <div class="composer-shell">
           <div class="composer-box" id="composer-box">
             <textarea
@@ -377,6 +389,9 @@
             ></textarea>
             <div class="composer-bar">
               <div class="composer-left">
+                <button class="voice-mode-trigger" id="voice-mode" type="button" title="开启语音对话" aria-label="开启语音对话" aria-pressed="false" hidden>
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 10v4M8 7v10M12 4v16M16 8v8M20 11v2" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+                </button>
                 <button class="icon-btn add-trigger" id="pick-add" type="button" title="添加图片或文件" aria-label="添加图片或文件" aria-haspopup="menu" aria-expanded="false" aria-controls="add-menu">
                   <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/></svg>
                 </button>
@@ -460,6 +475,40 @@
                 <button type="button" data-send-mode="interrupt" role="radio" aria-checked="false">打断</button>
               </div>
             </div>
+          </div>
+
+          <div class="settings-group">
+            <div class="settings-group-title">语音</div>
+            <div class="settings-row is-static" id="settings-voice-enabled">
+              <span class="settings-row-icon">◉</span>
+              <span class="settings-row-text">
+                <strong>语音回复</strong>
+                <em id="settings-voice-hint">用语音对话时，回答会自动转成语音</em>
+              </span>
+              <div class="settings-segment" id="settings-voice-segment" role="radiogroup" aria-label="语音回复">
+                <button type="button" data-voice-enabled="true" role="radio" aria-checked="true">开启</button>
+                <button type="button" data-voice-enabled="false" role="radio" aria-checked="false">关闭</button>
+              </div>
+            </div>
+            <div class="settings-row is-static" id="settings-wake">
+              <span class="settings-row-icon">⌁</span>
+              <span class="settings-row-text">
+                <strong>语音唤醒</strong>
+                <em id="settings-wake-hint">开启后说助手名字即可开始语音对话</em>
+              </span>
+              <div class="settings-segment" id="settings-wake-segment" role="radiogroup" aria-label="语音唤醒">
+                <button type="button" data-wake-enabled="true" role="radio" aria-checked="false">开启</button>
+                <button type="button" data-wake-enabled="false" role="radio" aria-checked="true">关闭</button>
+              </div>
+            </div>
+            <button class="settings-row" id="settings-voice" type="button">
+              <span class="settings-row-icon">♪</span>
+              <span class="settings-row-text">
+                <strong>我的音色</strong>
+                <em id="settings-voice-label">系统默认</em>
+              </span>
+              <span class="settings-row-arrow">›</span>
+            </button>
           </div>
 
           <div class="settings-group">
@@ -581,6 +630,6 @@
       }
     </script>
     <script src="/boot-splash.js?v=20261118d" data-surface="chat" defer></script>
-    <script src="/chat.js?v=20261122a" defer></script>
+    <script src="/chat.js?v=20261123audio4" defer></script>
   </body>
 </html>

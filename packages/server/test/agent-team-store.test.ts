@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 import { migrate, openDatabase, type Db } from '@eab/storage'
 import { AgentTeamStore, listRestartRecoveredTasks, recoverInterruptedAgentTasks } from '../src/agent-team.js'
+import { protocolStatusOf } from '../src/agent-protocol.js'
 
 describe('AgentTeamStore 持久化团队', () => {
   let db: Db
@@ -207,5 +208,97 @@ describe('AgentTeamStore 持久化团队', () => {
     expect(s.findWorker('asker')?.status).toBe('idle')
     expect(s.findWorker('asker')?.lastTaskAt).toBe(2000)
     expect(s.findWorker('asker')?.lastText).toContain('服务重启中断')
+  })
+
+  it('任务携带 context、trace、输入和预算，兼容原有 status', () => {
+    const s = store()
+    const task = s.createTask({
+      workerKey: 'a',
+      prompt: '整理材料',
+      parentRunId: 'run-root',
+      contextId: 'ctx-1',
+      traceId: 'trace-1',
+      input: { fileId: 'file-1', mode: 'read' },
+      budget: { maxTokens: 1200, maxRounds: 4, maxCostMicros: -1 },
+      deadlineAt: 9000,
+      now: 1000,
+    })
+
+    expect(task.status).toBe('queued')
+    expect(task.contextId).toBe('ctx-1')
+    expect(task.traceId).toBe('trace-1')
+    expect(task.input).toEqual({ fileId: 'file-1', mode: 'read' })
+    expect(task.budget).toEqual({ maxTokens: 1200, maxRounds: 4 })
+    expect(task.deadlineAt).toBe(9000)
+    expect(task.phase).toBe('none')
+    expect(task.artifacts).toEqual([])
+    expect(s.getTask(task.id)?.contextId).toBe('ctx-1')
+  })
+
+  it('暂停原因与生命周期正交，完成时清空暂停但保留产物', () => {
+    const s = store()
+    const task = s.createTask({ workerKey: 'a', prompt: '写报告', traceId: 'trace-2', now: 1000 })
+    s.markTaskRunning(task.id, 'child-1', 1000)
+    s.markTaskPhase(task.id, 'auth_required', '需要审批导出权限', 1100)
+    expect(s.getTask(task.id)?.status).toBe('running')
+    expect(s.getTask(task.id)?.phase).toBe('auth_required')
+    expect(protocolStatusOf('running', 'auth_required')).toBe('auth-required')
+
+    s.markTaskDone(task.id, '报告已生成', 1200, [{
+      id: 'art-1',
+      name: 'report.docx',
+      mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      size: 12,
+      checksum: 'abc',
+      source: 'workspace',
+      uri: 'workspace://report.docx',
+    }])
+    expect(s.getTask(task.id)?.status).toBe('succeeded')
+    expect(s.getTask(task.id)?.phase).toBe('none')
+    expect(s.getTask(task.id)?.rejectReason).toBe('')
+    expect(s.listArtifacts(task.id)).toHaveLength(1)
+    expect(s.listArtifacts(task.id)[0].name).toBe('report.docx')
+  })
+
+  it('拒绝是独立原因，不伪装成普通失败', () => {
+    const s = store()
+    const task = s.createTask({ workerKey: 'a', prompt: '越权操作', traceId: 'trace-3' })
+    s.markTaskRejected(task.id, '缺少数据权限，不能执行', 2000)
+    const stored = s.getTask(task.id)
+    expect(stored?.status).toBe('failed')
+    expect(stored?.phase).toBe('rejected')
+    expect(stored?.rejectReason).toContain('缺少数据权限')
+    expect(protocolStatusOf(stored!.status, stored!.phase)).toBe('rejected')
+  })
+
+  it('按 trace 找回同一回合的父任务，事件继承任务的上下文', () => {
+    const s = store()
+    const first = s.createTask({ workerKey: 'a', prompt: '第一步', traceId: 'trace-4', now: 1000 })
+    const second = s.createTask({ workerKey: 'b', prompt: '第二步', traceId: 'trace-4', now: 2000 })
+    expect(s.listTasksByTrace('trace-4').map((task) => task.id)).toEqual([first.id, second.id])
+
+    const event = s.recordEvent({
+      workerKey: 'a',
+      kind: 'question',
+      taskId: first.id,
+      payload: { text: '要哪个口径？' },
+      now: 3000,
+    })
+    expect(event.contextId).toBe(first.contextId)
+    expect(event.traceId).toBe('trace-4')
+    expect(s.listPendingEvents(10)[0]).toMatchObject({
+      contextId: first.contextId,
+      traceId: 'trace-4',
+    })
+  })
+
+  it('任务用量单独更新，不覆盖状态和产物', () => {
+    const s = store()
+    const task = s.createTask({ workerKey: 'a', prompt: '长任务', now: 1000 })
+    s.markTaskDone(task.id, '完成', 2000)
+    s.markTaskUsage(task.id, 321, 7, 3000)
+    expect(s.getTask(task.id)?.usedTokens).toBe(321)
+    expect(s.getTask(task.id)?.usedCostMicros).toBe(7)
+    expect(s.getTask(task.id)?.status).toBe('succeeded')
   })
 })

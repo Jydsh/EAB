@@ -63,6 +63,15 @@ export interface ChatLiveSubAgentEvent {
   data: unknown
 }
 
+/** 管理后台修改助手身份：通知同一公司已打开的网页热更新名字、头像和语音唤醒词。 */
+export interface ChatAssistantChangedEvent {
+  type: 'assistant'
+  companyId: string
+  name: string
+  avatarUrl: string
+  revision: number
+}
+
 /** 云空间文件变化原因；只带原因和 ID，不带文件名/路径/正文。 */
 export type WorkspaceChangeReason = 'created' | 'updated' | 'deleted' | 'renamed' | 'restored'
 
@@ -81,6 +90,7 @@ export type ChatLiveEventPayload =
   | ChatLiveToolEvent
   | ChatLiveSubAgentEvent
   | ChatModelsChangedEvent
+  | ChatAssistantChangedEvent
   | ChatWorkspaceFilesEvent
 
 /** 管理后台模型目录发生变化：通知同一公司已打开的网页重新拉取目录。 */
@@ -159,6 +169,7 @@ export function initChatEventBridge(pubsub: PubSubBackend | null): void {
             event.type === 'tool' ||
             event.type === 'subagent' ||
             event.type === 'models' ||
+            event.type === 'assistant' ||
             event.type === 'workspace')
         ) {
           deliverLocal(event)

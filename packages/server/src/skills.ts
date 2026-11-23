@@ -1433,6 +1433,7 @@ const SKILL_HIGH_RISK_TOOL_IDS = new Set([
   'workspace.rename',
   'workspace.send_dingtalk',
   'schedule.delete',
+  'a2a.delegate',
 ])
 
 function isSkillHighRiskTool(tool: { id: string; dangerous: boolean }): boolean {

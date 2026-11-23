@@ -79,6 +79,30 @@ describe('后台权限目录', () => {
     expect(consoleApiRuleFor('POST', '/api/console/update/apply')?.platformOnly).toBeUndefined()
   })
 
+  it('搜索与浏览器连接跟随数据连接页权限，不再要求系统页权限', () => {
+    expect(consoleApiRuleFor('GET', '/api/console/settings/web-services')).toMatchObject({
+      pages: ['databases'],
+      actions: ['view'],
+    })
+    expect(consoleApiRuleFor('PUT', '/api/console/settings/web-search')).toMatchObject({
+      pages: ['databases'],
+      actions: ['edit'],
+    })
+    expect(consoleApiRuleFor('POST', '/api/console/settings/web-search/test')).toMatchObject({
+      pages: ['databases'],
+      actions: ['view'],
+    })
+    expect(consoleApiRuleFor('PUT', '/api/console/settings/browser-network')).toMatchObject({
+      pages: ['databases'],
+      actions: ['edit'],
+    })
+    // 其它系统设置没有被带偏，仍归「系统 → 系统与运维」。
+    expect(consoleApiRuleFor('PUT', '/api/console/settings/branding')).toMatchObject({
+      pages: ['system'],
+      section: 'data',
+    })
+  })
+
   it('成员读写与角色分配都只按成员管理页可见', () => {
     expect(consoleApiRuleFor('GET', '/api/console/members')).toMatchObject({
       pages: ['org'],
@@ -127,6 +151,26 @@ describe('后台权限目录', () => {
       pages: ['approvalPolicies'],
       actions: ['edit'],
     })
+  })
+
+  it('Agent 管理页的 MCP 与 A2A 读写都按 agents 分区可见放行', () => {
+    for (const path of [
+      '/api/console/mcp',
+      '/api/console/mcp/s1/sync',
+      '/api/console/a2a',
+      '/api/console/a2a/inbound',
+      '/api/console/a2a/inbound/token',
+      '/api/console/a2a/p1/sync',
+    ]) {
+      expect(consoleApiRuleFor('GET', path), path).toMatchObject({
+        pages: ['system'],
+        section: 'agents',
+      })
+      expect(consoleApiRuleFor('POST', path), path).toMatchObject({
+        pages: ['system'],
+        section: 'agents',
+      })
+    }
   })
 
   it('每个页面都归属且只归属一个已登记业务域', () => {

@@ -75,14 +75,23 @@ function makeApps() {
   const consoleApp = buildApp(deps, 'console')
   const chatApp = buildApp(deps, 'chat')
   apps.push(consoleApp, chatApp)
-  return { consoleApp, chatApp }
+  return { consoleApp, chatApp, db }
 }
 
 describe('Agent 团队容量控制台配置', () => {
   it('控制台值覆盖环境变量，并让团队状态接口立即使用新上限', async () => {
-    const { consoleApp, chatApp } = makeApps()
+    const { consoleApp, chatApp, db } = makeApps()
     await consoleApp.ready()
     await chatApp.ready()
+
+    const now = Date.now()
+    db.prepare(`INSERT INTO agent_cards
+      (id, company_id, agent_key, kind, name, version, description, skills_json, tools_json, limits_json, endpoint_json, health, enabled, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(
+        'card-build', 'c1', 'builder', 'builtin', '架构实现员', '2', '',
+        '["接口实现"]', '["project.exec"]', '{"maxRounds":30}', '{"kind":"internal"}', 'healthy', 1, now, now,
+      )
 
     const before = await consoleApp.inject({
       method: 'GET',
@@ -90,13 +99,38 @@ describe('Agent 团队容量控制台配置', () => {
       headers: CONSOLE_HEADERS,
     })
     const beforeBody = before.json() as {
-      data: { agentTeam: { maxWorkers: number; source: string; envPresent: boolean } }
+      data: {
+        agentTeam: { maxWorkers: number; source: string; envPresent: boolean }
+        agentCards: Array<{
+          agentKey: string
+          name: string
+          source: string
+          skills: string[]
+          limits: { maxRounds?: number }
+          overridden?: boolean
+        }>
+      }
     }
     expect(beforeBody.data.agentTeam).toMatchObject({
       maxWorkers: 10,
       source: 'env',
       envPresent: true,
     })
+    expect(beforeBody.data.agentCards.map((card) => card.agentKey)).toEqual([
+      'researcher',
+      'builder',
+      'critic',
+      'producer',
+      'worker',
+    ])
+    expect(beforeBody.data.agentCards[1]).toMatchObject({
+      agentKey: 'builder',
+      name: '架构实现员',
+      source: 'company',
+      overridden: true,
+    })
+    expect(beforeBody.data.agentCards[1].skills).toContain('接口实现')
+    expect(beforeBody.data.agentCards[1].limits.maxRounds).toBe(30)
 
     const saved = await consoleApp.inject({
       method: 'PUT',

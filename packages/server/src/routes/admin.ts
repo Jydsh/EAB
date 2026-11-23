@@ -32,6 +32,7 @@ import { companyAssistantView, resolveAssistantDataDir, saveCompanyAssistant } f
 import { refreshDingTalkStream } from '../dingtalk-bot.js'
 import { createRuntimeBackup } from '../runtime-backup.js'
 import { recordSkillApprovalDecision } from '../skills.js'
+import { publishChatEvent } from '../chat-events.js'
 
 function requireConsole(req: FastifyRequest, deps: ServerDeps): void {
   if (!isConsoleRequest(req, deps.config)) {
@@ -1675,7 +1676,16 @@ export function registerAdminRoutes(app: FastifyInstance, deps: ServerDeps): voi
         name: saved.name,
         hasAvatar: Boolean(saved.avatar),
       })
-      return ok({ assistant: companyAssistantView(deps.db, deps.companyId) })
+      const assistant = companyAssistantView(deps.db, deps.companyId)
+      // 助手名字同时是网页语音唤醒词：改名后推给所有在线员工页，不需要刷新。
+      publishChatEvent({
+        type: 'assistant',
+        companyId: deps.companyId,
+        name: assistant.name,
+        avatarUrl: assistant.avatarUrl,
+        revision: Date.now(),
+      })
+      return ok({ assistant })
     },
   )
 

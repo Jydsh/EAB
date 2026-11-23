@@ -56,9 +56,13 @@ function writeSecretFile(file: string, value: SecretFile): void {
 }
 
 /** 解析密钥：环境变量优先，其次本地 secrets.json，最后回退上一版备份。 */
-export function resolveSecret(dbPath: string, ref: string | null | undefined): string {
+export function resolveSecret(
+  dbPath: string,
+  ref: string | null | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
   if (!ref) return ''
-  const fromEnv = process.env[ref]
+  const fromEnv = env[ref]
   if (fromEnv) return fromEnv
   const file = secretsPath(dbPath)
   const current = readFile(file)[ref]
@@ -77,8 +81,12 @@ export function storeSecret(dbPath: string, ref: string | null | undefined, valu
   return name
 }
 
-export function secretConfigured(dbPath: string, ref: string | null | undefined): boolean {
-  return Boolean(resolveSecret(dbPath, ref))
+export function secretConfigured(
+  dbPath: string,
+  ref: string | null | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return Boolean(resolveSecret(dbPath, ref, env))
 }
 
 /** 删除一个引用对应的本地密钥；环境变量里的同名项不会被删除。 */

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { RequestActor } from '../src/session.js'
 import type { ChatToolSpec } from '../src/routes/tools.js'
 import { buildSystemPrompt, sanitizeSubAgentToolSearchPayload } from '../src/routes/chat.js'
+import { agentCardBrief } from '../src/agent-capability-registry.js'
 
 const actor = {
   person: {
@@ -30,7 +31,7 @@ const cloudTools = [
   },
 ] as unknown as ChatToolSpec[]
 
-function prompt(spaceKind: 'cloud' | 'none', spaceLabel: string, chatTools = cloudTools): string {
+function prompt(spaceKind: 'cloud' | 'none', spaceLabel: string, chatTools = cloudTools, agentCapabilities = ''): string {
   return buildSystemPrompt({
     actor,
     chatTools,
@@ -39,6 +40,7 @@ function prompt(spaceKind: 'cloud' | 'none', spaceLabel: string, chatTools = clo
     hasAttachments: false,
     spaceKind,
     spaceLabel,
+    agentCapabilities,
   })
 }
 
@@ -312,7 +314,7 @@ describe('对话系统提示的自主团队编队', () => {
         },
       },
     ] as unknown as ChatToolSpec[]
-    const text = prompt('cloud', '云空间', teamTools)
+    const text = prompt('cloud', '云空间', teamTools, agentCardBrief())
     expect(text).toContain('用户不需要先说明“用团队模式”')
     expect(text).toContain('不需要点名派几个人、叫什么名字')
     expect(text).toContain('由你分析后直接自主编队')
@@ -326,6 +328,11 @@ describe('对话系统提示的自主团队编队', () => {
     expect(text).toContain('不要单独派汇总、整理或总结岗位')
     expect(text).toContain('我拆成 3 个角色')
     expect(text).toContain('不要把子 Agent 的原文当成你的回答')
+    expect(text).toContain('【可用岗位能力卡｜编队参考，不是完整工具清单】')
+    expect(text).toContain('researcher（检索员）')
+    expect(text).toContain('builder（实现员）')
+    expect(text).toContain('实际执行仍按角色、空间和权限过滤')
+    expect(text).not.toContain('parameters')
   })
 })
 

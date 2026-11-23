@@ -1323,7 +1323,7 @@ export async function callTranscription(
     body: form,
     signal: AbortSignal.timeout(60_000),
   })
-  if (!res.ok) throw new EabError(EC.VALIDATION, `语音转写失败：${await readError(res)}`)
+  if (!res.ok) throw new EabError(EC.VALIDATION, `语音转写失败：HTTP ${res.status} ${await readError(res)}`.trim())
   let payload: unknown = null
   try {
     payload = await res.json()
@@ -1340,6 +1340,94 @@ export interface SpeechResult {
   readonly audio: Uint8Array
   readonly mime: string
   readonly modelKey: string
+  /** 供应商明确返回音频时长时透传，用于钉钉语音气泡。 */
+  readonly durationMs?: number
+}
+
+export interface SpeechStreamResult {
+  readonly body: ReadableStream<Uint8Array>
+  readonly mime: string
+  readonly modelKey: string
+  readonly sampleRate: number
+}
+
+/**
+ * 本地 Breeze-TTS-2 官方 API（8110）与 OpenAI 兼容 shim（8100）不是同一套协议：
+ * 官方 API 只接收 multipart 表单的 text/instruction/ref_audio/ref_text，
+ * 播放端只给裸 PCM；shim 才接收 JSON input/voice/instructions。
+ */
+function isBreezeOfficialTts(provider: ProviderRow & { modelKey: string }): boolean {
+  return provider.modelKey === 'breeze-tts-2' && /:8110(?:\/|$)/.test(provider.base_url || '')
+}
+
+/** 把 24kHz 单声道 s16le 裸 PCM 包一层 WAV，便于试听接口和锚点复用。 */
+function pcmToWav(pcm: Uint8Array, sampleRate = 24_000): Uint8Array {
+  const header = Buffer.alloc(44)
+  const data = Buffer.from(pcm)
+  header.write('RIFF', 0)
+  header.writeUInt32LE(36 + data.length, 4)
+  header.write('WAVE', 8)
+  header.write('fmt ', 12)
+  header.writeUInt32LE(16, 16)
+  header.writeUInt16LE(1, 20)
+  header.writeUInt16LE(1, 22)
+  header.writeUInt32LE(sampleRate, 24)
+  header.writeUInt32LE(sampleRate * 2, 28)
+  header.writeUInt16LE(2, 32)
+  header.writeUInt16LE(16, 34)
+  header.write('data', 36)
+  header.writeUInt32LE(data.length, 40)
+  return new Uint8Array(Buffer.concat([header, data]))
+}
+
+interface VoiceAnchorAudio {
+  readonly audio: Uint8Array
+  readonly text: string
+}
+
+function breezeSpeechForm(
+  input: string,
+  options: {
+    instructions?: string
+    seed?: number
+    anchor?: VoiceAnchorAudio
+  },
+): FormData {
+  const form = new FormData()
+  form.append('text', input)
+  if (options.anchor?.audio.byteLength && options.anchor.text) {
+    // Voice Clone：参考音频 + 精确文字稿，锁定说话人；此时不能再叠加 instruction。
+    form.append(
+      'ref_audio',
+      new Blob([Buffer.from(options.anchor.audio)], { type: 'audio/wav' }),
+      'voice-anchor.wav',
+    )
+    form.append('ref_text', options.anchor.text)
+    form.append('cfg_scale', '1')
+  } else {
+    const instructions = String(options.instructions ?? '').trim()
+    if (instructions) form.append('instruction', instructions.slice(0, 200))
+    form.append('cfg_scale', '4')
+  }
+  if (Number.isFinite(options.seed) && Number(options.seed) > 0) {
+    form.append('seed', String(Math.floor(Number(options.seed))))
+  }
+  return form
+}
+
+/** 部分 OpenAI 兼容 TTS 服务把格式写在请求里，响应头却固定 audio/wav；以文件头为准。 */
+function speechMimeFromBytes(bytes: Uint8Array, declared: string, format: string): string {
+  if (bytes.length >= 12) {
+    const ascii = Buffer.from(bytes.subarray(0, 12)).toString('ascii')
+    if (ascii.startsWith('RIFF') && ascii.slice(8, 12) === 'WAVE') return 'audio/wav'
+    if (ascii.startsWith('ID3')) return 'audio/mpeg'
+    if (ascii.startsWith('OggS')) return 'audio/ogg'
+    if (ascii.startsWith('fLaC')) return 'audio/flac'
+  }
+  if (bytes.length >= 2 && bytes[0] === 0xff && (bytes[1] & 0xe0) === 0xe0) return 'audio/mpeg'
+  const clean = String(declared || '').split(';')[0]?.trim().toLowerCase()
+  if (clean && clean !== 'application/octet-stream') return clean
+  return format === 'wav' ? 'audio/wav' : format === 'opus' ? 'audio/ogg' : 'audio/mpeg'
 }
 
 /**
@@ -1352,7 +1440,13 @@ export async function callSpeech(
   companyId: string,
   modelId: string,
   text: string,
-  options: { voice?: string; format?: 'mp3' | 'wav' | 'opus' } = {},
+  options: {
+    voice?: string
+    instructions?: string
+    seed?: number
+    format?: 'mp3' | 'wav' | 'opus'
+    anchor?: VoiceAnchorAudio
+  } = {},
 ): Promise<SpeechResult> {
   const input = text.trim()
   if (!input) throw new EabError(EC.VALIDATION, '合成缺少文本')
@@ -1370,6 +1464,33 @@ export async function callSpeech(
   const base = provider.base_url || DEFAULT_BASE[provider.kind] || ''
   if (!base) throw new EabError(EC.VALIDATION, `供应商「${provider.name}」还没有填写端点`)
   const key = apiKeyOf(provider, dbPath)
+  if (isBreezeOfficialTts(provider)) {
+    const url = `${trimBase(base)}/audio/speech`
+    const headers: Record<string, string> = { accept: 'audio/pcm, audio/*' }
+    if (key) headers.authorization = `Bearer ${key}`
+    const requestOfficial = () =>
+      fetch(url, {
+        method: 'POST',
+        headers,
+        body: breezeSpeechForm(input, options),
+        signal: AbortSignal.timeout(90_000),
+      })
+    let res = await requestOfficial()
+    if (!res.ok && (res.status === 409 || res.status === 429 || res.status >= 500)) {
+      await new Promise((resolve) => setTimeout(resolve, res.status === 409 ? 1_200 : 500))
+      res = await requestOfficial()
+    }
+    if (!res.ok) throw new EabError(EC.VALIDATION, `语音合成失败：HTTP ${res.status} ${await readError(res)}`.trim())
+    const pcm = new Uint8Array(await res.arrayBuffer())
+    if (pcm.byteLength === 0) throw new EabError(EC.VALIDATION, '语音合成返回空音频')
+    const sampleRate = 24_000
+    return {
+      audio: pcmToWav(pcm, sampleRate),
+      mime: 'audio/wav',
+      modelKey: provider.modelKey,
+      durationMs: Math.round((pcm.byteLength / (sampleRate * 2)) * 1000),
+    }
+  }
   const format = options.format ?? 'mp3'
   const url =
     provider.kind === 'azure_openai'
@@ -1382,20 +1503,155 @@ export async function callSpeech(
     if (provider.kind === 'azure_openai') headers['api-key'] = key
     else headers.authorization = `Bearer ${key}`
   }
-  const res = await fetch(url, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({
-      model: provider.modelKey,
-      input: input.slice(0, 1_200),
-      voice: options.voice || 'alloy',
-      response_format: format,
-    }),
-    signal: AbortSignal.timeout(60_000),
-  })
-  if (!res.ok) throw new EabError(EC.VALIDATION, `语音合成失败：${await readError(res)}`)
+  const body: Record<string, unknown> = {
+    model: provider.modelKey,
+    input: input.slice(0, 1_200),
+    voice: options.voice || 'S0',
+    response_format: format,
+  }
+  const instructions = String(options.instructions ?? '').trim()
+  if (instructions) body.instructions = instructions.slice(0, 200)
+  if (Number.isFinite(options.seed) && Number(options.seed) > 0) body.seed = Math.floor(Number(options.seed))
+  const requestSpeech = () =>
+    fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(60_000),
+    })
+  let res = await requestSpeech()
+  // 本地 TTS 在并发/忙碌时会返回 409 Conflict，限流时会返回 429；这类是瞬时冲突，退避后重试一次。
+  // 其它 4xx 是请求本身有问题，不重试。
+  if (!res.ok && (res.status === 409 || res.status === 429 || res.status >= 500)) {
+    await new Promise((resolve) => setTimeout(resolve, res.status === 409 ? 1_200 : 500))
+    res = await requestSpeech()
+  }
+  if (!res.ok) throw new EabError(EC.VALIDATION, `语音合成失败：HTTP ${res.status} ${await readError(res)}`.trim())
   const bytes = new Uint8Array(await res.arrayBuffer())
   if (bytes.byteLength === 0) throw new EabError(EC.VALIDATION, '语音合成返回空音频')
-  const mime = res.headers.get('content-type') || (format === 'wav' ? 'audio/wav' : format === 'opus' ? 'audio/ogg' : 'audio/mpeg')
-  return { audio: bytes, mime, modelKey: provider.modelKey }
+  const mime = speechMimeFromBytes(bytes, res.headers.get('content-type') || '', format)
+  const durationHeader = Number(res.headers.get('x-audio-duration-seconds'))
+  return {
+    audio: bytes,
+    mime,
+    modelKey: provider.modelKey,
+    durationMs: Number.isFinite(durationHeader) && durationHeader > 0 ? Math.round(durationHeader * 1000) : undefined,
+  }
+}
+
+/**
+ * 语音合成流式入口：供应商在几十毫秒内先回头、随后持续推送裸 PCM。
+ * 这里不读取响应体，交给 HTTP 路由边收边转发；客户端断开后取消 body 即可让上游释放推理槽。
+ */
+export async function callSpeechStream(
+  db: Db,
+  dbPath: string,
+  companyId: string,
+  modelId: string,
+  text: string,
+  options: {
+    voice?: string
+    instructions?: string
+    cfgScale?: number
+    seed?: number
+    anchor?: VoiceAnchorAudio
+  } = {},
+): Promise<SpeechStreamResult> {
+  const input = text.trim()
+  if (!input) throw new EabError(EC.VALIDATION, '合成缺少文本')
+  const provider = providerOf(db, companyId, modelId)
+  if (provider.kind === 'demo') {
+    throw new EabError(EC.VALIDATION, '演示模型不提供语音合成能力', {
+      hint: '请接入支持 /audio/speech/stream 的流式 TTS 端点',
+    })
+  }
+  if (provider.kind === 'anthropic' || provider.kind === 'gemini') {
+    throw new EabError(EC.VALIDATION, `供应商「${provider.name}」没有标准的语音合成接口`, {
+      hint: '请选择 OpenAI 兼容的流式 TTS 端点',
+    })
+  }
+  const base = provider.base_url || DEFAULT_BASE[provider.kind] || ''
+  if (!base) throw new EabError(EC.VALIDATION, `供应商「${provider.name}」还没有填写端点`)
+  const key = apiKeyOf(provider, dbPath)
+  const baseUrl = trimBase(base)
+  if (isBreezeOfficialTts(provider)) {
+    const url = `${baseUrl}/audio/speech`
+    const headers: Record<string, string> = { accept: 'audio/pcm, audio/*;q=0.9' }
+    if (key) headers.authorization = `Bearer ${key}`
+    const requestOfficial = () =>
+      fetch(url, {
+        method: 'POST',
+        headers,
+        body: breezeSpeechForm(input, {
+          instructions: options.instructions,
+          seed: options.seed,
+          anchor: options.anchor,
+        }),
+        signal: AbortSignal.timeout(120_000),
+      })
+    let res = await requestOfficial()
+    if (res.status === 409 || res.status === 429) {
+      await new Promise((resolve) => setTimeout(resolve, res.status === 409 ? 1_200 : 500))
+      res = await requestOfficial()
+    }
+    if (!res.ok) throw new EabError(EC.VALIDATION, `流式语音合成失败：HTTP ${res.status} ${await readError(res)}`.trim())
+    if (!res.body) throw new EabError(EC.VALIDATION, '流式语音合成没有返回音频流')
+    const rawSampleRate = Number(
+      res.headers.get('x-audio-sample-rate') ||
+        res.headers.get('x-sample-rate') ||
+        res.headers.get('x-audio-samplerate'),
+    )
+    return {
+      body: res.body,
+      mime: (res.headers.get('content-type') || 'audio/pcm').split(';')[0].trim().toLowerCase() || 'audio/pcm',
+      modelKey: provider.modelKey,
+      sampleRate: Number.isFinite(rawSampleRate) && rawSampleRate > 0 ? Math.round(rawSampleRate) : 24_000,
+    }
+  }
+  const url = /\/audio\/speech\/stream$/i.test(baseUrl)
+    ? baseUrl
+    : /\/audio\/speech$/i.test(baseUrl)
+      ? `${baseUrl}/stream`
+      : `${baseUrl}/audio/speech/stream`
+  const headers: Record<string, string> = {
+    'content-type': 'application/json',
+    accept: 'audio/pcm, audio/*;q=0.9',
+  }
+  if (key) headers.authorization = `Bearer ${key}`
+  const body: Record<string, unknown> = {
+    model: provider.modelKey,
+    input,
+    voice: options.voice || 'S0',
+    // breeze-tts 的流式端点用 cfg_scale 控制韵律；其他 OpenAI 兼容端点会忽略未知字段。
+    cfg_scale: Number.isFinite(options.cfgScale) ? Number(options.cfgScale) : 1,
+  }
+  // 员工选择的“我的声音”在 EAB 里是一段文字描述；非流式路径一直会传 instructions，
+  // 流式路径此前漏传，导致所有自定义音色都退回系统默认。这里补齐同一份配置。
+  const instructions = String(options.instructions ?? '').trim()
+  if (instructions) body.instructions = instructions.slice(0, 200)
+  if (Number.isFinite(options.seed) && Number(options.seed) > 0) body.seed = Math.floor(Number(options.seed))
+  const requestStream = () =>
+    fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(120_000),
+    })
+  let res = await requestStream()
+  // 单推理槽在并发时返回 409；退避后重试一次，避免网页刚上一段播完就切下一段时撞上忙状态。
+  if (res.status === 409) {
+    await new Promise((resolve) => setTimeout(resolve, 1_200))
+    res = await requestStream()
+  }
+  if (!res.ok) throw new EabError(EC.VALIDATION, `流式语音合成失败：HTTP ${res.status} ${await readError(res)}`.trim())
+  if (!res.body) throw new EabError(EC.VALIDATION, '流式语音合成没有返回音频流')
+  const rawSampleRate = Number(
+    res.headers.get('x-audio-sample-rate') || res.headers.get('x-sample-rate') || res.headers.get('x-audio-samplerate'),
+  )
+  return {
+    body: res.body,
+    mime: (res.headers.get('content-type') || 'audio/pcm').split(';')[0].trim().toLowerCase() || 'audio/pcm',
+    modelKey: provider.modelKey,
+    sampleRate: Number.isFinite(rawSampleRate) && rawSampleRate > 0 ? Math.round(rawSampleRate) : 24_000,
+  }
 }

@@ -71,6 +71,7 @@ describe('Agent 工具按需加载', () => {
     const schedule = toolSpecsForAgent(deps.db, actor, { kind: 'cloud' }, '每天九点提醒我提交日报')
 
     expect(weather.some((tool) => tool.function.name.startsWith('office_'))).toBe(false)
+    expect(weather.some((tool) => tool.function.name === 'weather_now')).toBe(true)
     expect(weather.some((tool) => tool.function.name === 'schedule_create')).toBe(false)
     expect(weather.some((tool) => tool.function.name === 'workspace_list')).toBe(false)
     expect(doc.some((tool) => tool.function.name === 'office_replace')).toBe(true)
@@ -163,6 +164,22 @@ describe('Agent 工具按需加载', () => {
     expect(skill.some((tool) => tool.function.name === 'workspace_read')).toBe(true)
   })
 
+  it('网页问题首轮下发搜索和读取网页，普通问答不带', () => {
+    const { deps, actor } = testEnv()
+    const link = toolSpecsForAgent(deps.db, actor, { kind: 'cloud' }, '帮我总结 https://example.com/a')
+    const search = toolSpecsForAgent(deps.db, actor, { kind: 'cloud' }, '联网搜一下重庆两江新区最新规划')
+    const weather = toolSpecsForAgent(deps.db, actor, { kind: 'cloud' }, '今天天气怎么样？')
+    const browser = toolSpecsForAgent(deps.db, actor, { kind: 'cloud' }, '用内置浏览器打开网页并截图')
+
+    expect(link.some((tool) => tool.function.name === 'web_fetch')).toBe(true)
+    expect(link.some((tool) => tool.function.name === 'web_search')).toBe(true)
+    expect(search.some((tool) => tool.function.name === 'web_search')).toBe(true)
+    expect(browser.some((tool) => tool.function.name === 'browser')).toBe(true)
+    expect(weather.some((tool) => tool.function.name === 'web_search')).toBe(false)
+    expect(weather.some((tool) => tool.function.name === 'web_fetch')).toBe(false)
+    expect(weather.some((tool) => tool.function.name === 'browser')).toBe(false)
+  })
+
   it('按中文场景搜索能命中文件发送、定时任务和计算工具', async () => {
     const { deps, actor } = testEnv()
     const send = (await executeTool(deps, actor, 'tool.search', { query: '把文件发到钉钉' })) as {
@@ -177,11 +194,23 @@ describe('Agent 工具按需加载', () => {
     const math = (await executeTool(deps, actor, 'tool.search', { query: '计算' })) as {
       tools: Array<{ functionName: string }>
     }
+    const weather = (await executeTool(deps, actor, 'tool.search', { query: '查一下重庆天气' })) as {
+      tools: Array<{ functionName: string }>
+    }
+    const web = (await executeTool(deps, actor, 'tool.search', { query: '帮我总结这个网页链接' })) as {
+      tools: Array<{ functionName: string }>
+    }
+    const browser = (await executeTool(deps, actor, 'tool.search', { query: '用浏览器打开网页截图' })) as {
+      tools: Array<{ functionName: string }>
+    }
 
     expect(send.tools.some((tool) => tool.functionName === 'workspace_send_dingtalk')).toBe(true)
     expect(sendImage.tools.some((tool) => tool.functionName === 'workspace_send_dingtalk')).toBe(true)
     expect(schedule.tools.some((tool) => tool.functionName === 'schedule_list')).toBe(true)
     expect(math.tools.some((tool) => tool.functionName === 'math_eval')).toBe(true)
+    expect(weather.tools.some((tool) => tool.functionName === 'weather_now')).toBe(true)
+    expect(web.tools.some((tool) => tool.functionName === 'web_fetch')).toBe(true)
+    expect(browser.tools.some((tool) => tool.functionName === 'browser')).toBe(true)
   })
 
   it('搜索结果只返回当前员工和当前空间可用的工具', () => {

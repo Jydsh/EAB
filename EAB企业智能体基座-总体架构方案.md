@@ -189,7 +189,7 @@ EAB = 1 个主控进程（eabd）+ N 个执行进程（eab-worker）+ 1 套 Web 
 
 #### ADR-06 传输：HTTP + SSE 为主链路，WS 只做推送
 
-- **决策**：对话主链路 `POST /conversations/:id/turns` → `text/event-stream` 流式返回；WebSocket 只承担服务端主动推送（审批待办、通知、在线状态、跨端同步）。不把 ACP 作为核心协议，只做可选适配层。
+- **决策**：对话主链路 `POST /conversations/:id/turns` → `text/event-stream` 流式返回；WebSocket 只承担服务端主动推送（审批待办、通知、在线状态、跨端同步）。不把 ACP 作为核心协议，只保留可选适配定位；当前无 IDE 试点，明确不实施。
 - **理由**：SSE 在企业代理、移动网络、断线重连场景比 WS 稳，且天然"一问一答"可幂等；WS 长连接在企微/内网代理下容易被掐。审批这类"服务端主动、可能离线"的场景才需要 WS/长轮询。
 - **代价**：双通道要维护；断点续传需要事件序号。
 
@@ -1865,6 +1865,15 @@ interface ModelRoute {
 | 服务端推送（审批/通知/在线） | WebSocket `/ws`，或长轮询降级 |
 | 文件上传 | `multipart/form-data` + 分片（大文件） |
 | 健康检查 | `GET /healthz`（存活）、`GET /readyz`（依赖就绪） |
+
+#### 12.1.1 Agent 团队的三层协议适配
+
+MCP / A2A / ACP 不替代现有对话与团队链路，只作为边缘适配面；当前交付只实施 MCP 与 A2A，ACP 已明确不做。完整需求见 `docs/EAB Agent团队协议优化需求（MCP-A2A-ACP）.md`，代码级拆分见 `docs/EAB Agent团队协议实现方案.md`。
+
+- **工具层（MCP）**：新增 MCP Client Gateway，把外部 MCP Server 的 Tools 映射进现有工具注册表，统一命名空间、`tool_search`、权限注解、审批、超时、熔断和审计；不重写内置工具与插件 SDK。
+- **团队层（A2A）**：先把内部 `agent_*` 任务语义对齐 A2A 的 Agent Card、任务状态和 Artifact，再做出站/入站适配；主 Agent 仍是唯一编队者，子 Agent 不直接互调，外部 Agent 只走公司允许列表且默认一跳。
+- **工位层（ACP）**：ADR-06 只保留可选适配定位；当前没有真实 IDE 用户，已决策本期不实施 ACP Bridge，不增加 IDE 入口，也不改动网页对话主链路。
+- **统一信封**：任务、消息、产物统一携带 `taskId / contextId / traceId / status / artifacts`；状态补齐 `input-required / auth-required / rejected`，与现有 `queued / running / succeeded / failed / cancelled` 做兼容映射。
 
 ### 12.2 能力清单驱动 UI（ADR-13）
 

@@ -16,6 +16,7 @@ import { appendAudit, type Db } from '@eab/storage'
 import { consumeRobotUserFileSend } from './dingtalk-file-echo.js'
 import { clearDingTalkClarifySync, registerDingTalkClarifySync } from './dingtalk-clarify-sync.js'
 import { handlePermissionApprovalCardCallback } from './permission-approval-dingtalk.js'
+import { sendDingTalkVoiceReply } from './dingtalk-voice.js'
 import {
   adoptLegacyInterruptedTurns,
   beginChannelTurn,
@@ -155,6 +156,12 @@ interface DingTalkResult {
   readonly text: string | null
   readonly sessionId: string | null
   readonly reason: string
+  /** 语音消息触发时，由调用方在文字/卡片发出后补发语音；非语音消息为 undefined。 */
+  readonly voice?: {
+    readonly companyId: string
+    readonly userId: string
+    readonly text: string
+  }
 }
 
 function dingTalkConfig(db: Db, companyId: string): DingTalkChannelRow | null {
@@ -779,6 +786,7 @@ async function rateLimited(externalId: string): Promise<boolean> {
   const verdict = await hitRate(`dingtalk:dm:${externalId}`, RATE_LIMIT_PER_MINUTE, 60)
   return !verdict.allowed
 }
+
 
 /**
  * “有哪些模型/切换模型”不再回一段文字列表，而是直接下发可点击的模型卡。
@@ -1990,7 +1998,16 @@ export async function handleDingTalkMessage(
 
     if (trackedTurnId) finishChannelTurn(deps.db, trackedTurnId, 'completed')
     reactionOk = true
-    return { handled: true, text: replyText, sessionId, reason: 'ok' }
+    return {
+      handled: true,
+      text: replyText,
+      sessionId,
+      reason: 'ok',
+      // 钉钉原生语音条会被客户端强制附上转写文字，和正文卡片必然重复一遍；
+      // 卡片内的 AudioPlayer 又固定是大播放条、不支持自动播放。用户权衡后选择只要文字，
+      // 因此这里不再发语音，voice 保持 undefined。
+      voice: undefined,
+    }
   } catch (error) {
     if (card) await card.fail('处理失败，请稍后重试。').catch(() => undefined)
     if (legacyCard) await legacyCard.fail('处理失败，请稍后重试。').catch(() => undefined)
@@ -3206,8 +3223,18 @@ async function doRefreshDingTalkStream(deps: ServerDeps): Promise<void> {
       try {
         const payload = JSON.parse(res.data) as DingTalkMessage
         const result = await handleDingTalkMessage(deps, payload)
+        let textSent = !result.text
         if (result.text && payload.sessionWebhook) {
           await replySessionWebhook(deps, payload.sessionWebhook, result.text)
+          textSent = true
+        }
+        // 语音是文字后的附加通道；文字没发出去时不要只发一条语音。
+        if (result.voice && textSent) {
+          try {
+            await sendDingTalkVoiceReply(deps, result.voice.companyId, result.voice.userId, result.voice.text)
+          } catch (error) {
+            console.warn('[eab] 钉钉语音回复发送失败：', (error as Error).message)
+          }
         }
       } catch (error) {
         console.warn('[eab] 钉钉 Stream 消息处理失败：', (error as Error).message)

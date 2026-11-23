@@ -4,8 +4,8 @@ EAB 是一套面向**单公司本地部署**的企业智能体基座：一个进
 
 - 员工入口：`http://127.0.0.1:8787/chat`
 - 管理控制台：`http://127.0.0.1:8788/admin`
-- 当前版本：`2026.11.22`
-- 本版发布说明：[`docs/releases/v2026.11.22.md`](docs/releases/v2026.11.22.md)
+- 当前版本：`2026.11.23`
+- 本版发布说明：[`docs/releases/v2026.11.23.md`](docs/releases/v2026.11.23.md)
 
 > 单公司边界：一个实例只服务一家公司。钉钉、飞书、企业微信、模型供应商、知识库、插件都在控制台里配置。
 
@@ -31,6 +31,36 @@ node scripts/eab.mjs server
 ```
 
 > 如果 `pnpm install` 卡住，先确认网络和镜像配置；服务端运行不需要 Electron，也不再有桌面端依赖。
+
+### 联网搜索会自动补齐 SearXNG
+
+首次执行 `eab start` / `eab server` 时，EAB 会先检查控制台保存的搜索配置：
+
+1. 已有可用的 SearXNG（本机或远程）→ 直接复用，不再安装；
+2. 本机没有，但有 Docker + Compose → 用 `searxng/searxng` 官方镜像启动，只监听 `127.0.0.1`；
+3. 没有 Docker，但有 Python 3.10+ → 在 `.eab-dev/searxng-runtime` 下载固定提交的源码、创建虚拟环境并启动；
+4. 两种运行时都没有 → 打印明确提示，EAB 继续启动，搜索保持不可用，不影响其他功能。
+
+安装完成后会自动把 `provider=searxng` 和实际地址写入控制台设置，不需要手工改 `console-settings.json`，也不需要另找一台服务器。常用命令：
+
+```bash
+eab searxng status              # 查看地址、健康状态、Docker/本机 Python
+eab searxng install             # 交互安装：可输入端口，回车自动选空闲端口
+eab searxng install --port=8090 # 指定端口安装；被占用会报错，不会强占
+eab searxng start               # 启动已安装的运行时
+eab searxng restart --port=8090 # 停止旧实例，在新端口启动并写回配置
+eab searxng stop                # 停止 EAB 管理的 SearXNG
+```
+
+首次部署也可以直接在启动命令上指定：
+
+```bash
+eab start --searxng-port=8090
+```
+
+不写 `--searxng-port` 时仍从 8080 开始，被占用自动向后顺延最多 50 个端口；写 `auto` 与省略等价。
+
+不希望 EAB 启动时自动安装，可设置 `EAB_SEARXNG_AUTO=0`；已经使用博查/Tavily/Serper 或远程 SearXNG 时也会自动跳过本机安装。自动安装目录在 `.eab-dev/searxng-runtime`，和业务数据一样不进入发布包。
 
 首次启动会在终端打印员工端、控制台、健康检查地址；控制台账号写入：
 
@@ -197,7 +227,7 @@ EAB_HOST=0.0.0.0 EAB_PORT=8787 EAB_ADMIN_PORT=8788 EAB_CONSOLE_ALLOW_REMOTE=1 ea
 
 ### 可选 PostgreSQL / Redis（不接也能用）
 
-EAB 默认是 **SQLite + 进程内缓存**，不安装 PostgreSQL / Redis 也能完整启动。需要时优先在控制台「平台与运维 → 数据连接」里新增连接：
+EAB 默认是 **SQLite + 进程内缓存**，不安装 PostgreSQL / Redis 也能完整启动。需要时优先在控制台「连接与平台 → 数据连接」里新增连接：
 
 | 组合 | 配置 | 效果 |
 |---|---|---|
@@ -208,7 +238,7 @@ EAB 默认是 **SQLite + 进程内缓存**，不安装 PostgreSQL / Redis 也能
 | 老部署环境变量兼容 | `EAB_BACKENDS_FROM_ENV=1` + `EAB_REDIS_URL` / `EAB_POSTGRES_URL` | 仅在没有对应数据连接时回退到环境变量 |
 
 ```powershell
-# 推荐：打开 http://127.0.0.1:8788/admin → 平台与运维 → 数据连接 → 新增连接
+# 推荐：打开 http://127.0.0.1:8788/admin → 连接与平台 → 数据连接 → ＋ 新增连接
 # 老部署需要沿用环境变量时，显式开启兼容开关：
 $env:EAB_BACKENDS_FROM_ENV = "1"
 $env:EAB_REDIS_URL = "redis://127.0.0.1:6379/0"
@@ -218,14 +248,62 @@ eab start
 
 数据连接是平台后端的实际读取来源：表中没有启用的 Redis/PG 时，不会因为环境变量里还留着旧连接串就去探测。保存、测试、删除连接后会自动热重连，不需要重启服务。外部服务连不上时默认降级继续启动；只有 `EAB_BACKENDS_STRICT=1` 才启动失败。**PostgreSQL 当前承接审计镜像和会话镜像，不替换 SQLite 主库**；审计列表/导出可通过 `EAB_AUDIT_READ` 切到 PG，会话列表可通过 `EAB_CHAT_READ` 切到 PG，镜像未追平或失败会自动回退 SQLite。首次接入 PG 时会自动把 SQLite 已有审计回填到镜像，不会出现“切过去是 0 条”。哈希链校验始终读 SQLite 权威链。Redis 当前用于钉钉 accessToken 共享缓存。完整矩阵、写入模型和排障见 [`docs/EAB可选后端插件与部署.md`](docs/EAB可选后端插件与部署.md)。
 
+### 可选：上网与内置浏览器
+
+EAB 内置 `web.fetch`（读取公网网页）、`web.search`（联网搜索）和 `browser`（无头 Edge/Chrome 打开页面并截图）。不配置也能用 `web.fetch` 和 `browser`；`web.search` 需要先配置一个搜索 provider，否则会明确提示“搜索服务未配置”，不会伪造结果。
+
+| 环境变量 | 作用 |
+|---|---|
+| `EAB_WEB_SEARCH_PROVIDER` | `none` / `searxng` / `bocha` / `tavily` / `serper`；不设置时按 `auto`，`eab start` 会先自动检查/补齐 SearXNG |
+| `EAB_SEARXNG_URL` | 自建 SearXNG 地址，例如 `http://127.0.0.1:8080`；只配它也会自动启用 searxng |
+| `EAB_SEARXNG_AUTO` | 默认 `1`；设为 `0` 时 `eab start` 不自动安装 SearXNG |
+| `EAB_SEARXNG_IMAGE` | 可选：Docker 镜像，默认 `searxng/searxng:latest` |
+| `EAB_SEARXNG_SOURCE_URL` | 可选：源码 tar.gz 地址；内网可指向镜像，默认固定提交 `c6ee3e9` |
+| `EAB_PYTHON` | 可选：没有 Docker 时用于建虚拟环境的 Python 路径，默认自动找 `python` / `python3` |
+| `EAB_BOCHA_API_KEY` | 博查搜索 Key |
+| `EAB_TAVILY_API_KEY` | Tavily 搜索 Key |
+| `EAB_SERPER_API_KEY` | Serper 搜索 Key |
+| `EAB_WEB_ALLOWED_DOMAINS` | 可选：只允许访问这些域名，逗号分隔 |
+| `EAB_WEB_DENIED_DOMAINS` | 可选：禁止访问这些域名，逗号分隔 |
+| `EAB_HTTP_PROXY` | 可选：HTTP/HTTPS 出网代理；也兼容 `HTTPS_PROXY`、`HTTP_PROXY` 及小写形式 |
+| `EAB_NO_PROXY` | 可选：代理旁路列表；也兼容 `NO_PROXY` / `no_proxy` |
+| `EAB_BROWSER_PROXY` | 可选：浏览器独立代理；不填则复用上面的出网代理 |
+| `EAB_WEB_SEARCH_PER_MIN` | 每用户每分钟搜索上限，默认 `10` |
+| `EAB_WEB_FETCH_PER_MIN` | 每用户每分钟读网页上限，默认 `20` |
+| `EAB_BROWSER_PER_MIN` | 每用户每分钟浏览器动作上限，默认 `20` |
+| `EAB_BROWSER_ENABLED` | 默认 `1`；`0` 关闭 `browser` |
+| `EAB_BROWSER_CHANNEL` | `msedge` / `chrome` / `chromium`，Windows 默认 `msedge` |
+| `EAB_BROWSER_EXECUTABLE_PATH` | 浏览器可执行文件的绝对路径，优先于 channel |
+| `EAB_BROWSER_HEADLESS` | 默认 `1`，无头运行 |
+| `EAB_BROWSER_MAX_PAGES` | 全局最多页面数，默认 `4` |
+| `EAB_BROWSER_IDLE_MS` | 空闲回收时长，默认 `300000`（5 分钟） |
+
+`browser` 依赖本机 Edge/Chrome；`playwright-core` 是 `optionalDependencies`，没有浏览器时只会让 `browser` 不可用，不影响服务启动。截图会写入个人云空间，员工端工具卡直接显示。详细边界与安全策略见 [`docs/EAB内置浏览器与上网能力方案.md`](docs/EAB内置浏览器与上网能力方案.md)。
+
+**控制台配置**：`连接与平台 → 数据连接` 用一张统一连接表管理全部外部资源，表体固定分「数据源」和「平台服务」两组：数据源是 PostgreSQL / MySQL / SQLite / Redis，平台服务是联网搜索、内置浏览器和内网访问。右上角「＋ 新增连接」打开接入向导，先选类型，再进入统一的步骤 2 表单；选择数据库也会沿用向导头部、返回和步骤条，不再跳成另一套弹窗。搜索行提供“测试 / 配置”，点“配置”进入步骤 2：先看到 6 张服务卡片（自动 / 关闭搜索 / SearXNG / 博查 / Tavily / Serper），卡片标出“当前 / 已保存 / 未配置”，下方只展开选中那个服务的表单，SearXNG 只填地址、其余只填各自 Key，多套配置分别保留、互不覆盖；“仅保存此配置”只写当前服务不切换生效服务，“设为当前并测试”会立即执行一次真实搜索。`SearXNG 地址`包含端口，可指向任意主机或端口，改完保存即测试，不需要重启 EAB；本地开发实例可用 `.\\.eab-dev\\start-searxng.ps1 -Port 8090` 切换端口，脚本会先停止旧实例。Key 只写入 `.eab-dev/secrets.json`，页面只显示“已配置/未配置”，不回显明文。环境变量优先于控制台配置；控制台状态会标注来源。保存后搜索缓存立即清空，不需要重启。数据库、缓存与平台服务共用筛选计数和刷新状态，不再放在「系统 → 运行与准入」。配置读写权限随「数据连接」页可见放行，页面只调用 `/api/console/settings/web-services` 读取搜索、浏览器和内网三个视图，不再依赖「系统 → 系统与运维」权限。
+
+同一张统一连接表「平台服务」分组的内网访问行点“配置”，可以设置**内置浏览器内网访问**：默认关闭；打开开关后必须填写域名/IP 白名单，只放行名单内目标。公共网站不受影响，`localhost` 和 EAB 自身地址始终拒绝，`web.fetch` 仍只读公网。开关打开但名单为空时后端拒绝保存，避免“一开全通”。保存后下一次浏览器打开或导航立即按新策略校验，子资源同样受控。内网目标当前只支持 80/443 标准网页端口。
+
+**代理**：`web.fetch`、搜索 provider 和 `browser` 共用代理配置。HTTP 目标通过代理发 absolute-form 请求；HTTPS 目标先 `CONNECT` 建隧道，再由本地完成 TLS 握手。`NO_PROXY` 命中的目标仍直连，并保留 DNS 固定 IP 的防重绑定逻辑。代理只支持 http/https，不支持 socks；企业 MITM 证书用 `NODE_EXTRA_CA_CERTS`。代理地址可能带凭据，属于部署基础设施，只在环境变量配置；控制台只读显示当前出口，不提供编辑。
+
+本机开发环境已带一个本地 SearXNG（Bing + Baidu，`http://127.0.0.1:8080`），启动命令：
+
+```powershell
+powershell -File .eab-dev\start-searxng.ps1
+```
+
+源码、虚拟环境和设置都在 `.eab-dev`，不进入发布包。生产部署不需要手工另起 SearXNG：`eab start` 会自动复用已有实例，缺失时优先用 Docker 启动，没有再回退到本机 Python 安装；首次部署可在 `eab start` 上加 `--searxng-port=8090` 指定端口，或运行 `eab searxng install` 按提示输入，回车交给系统自动选择。也可以直接用 `eab searxng install`、`eab searxng status` 管理。没有安装条件时仍可配置博查/Tavily/Serper Key，或在另一台服务器部署后把 `EAB_SEARXNG_URL` 指过去。
+
+**审计与限流**：`web.search`、`web.fetch`、`browser` 的成功和失败都会写审计，动作分别是 `net.web.search`、`net.web.fetch`、`net.browser`；只记搜索词、URL、标题、字符数、动作、截图 fileId、耗时和错误摘要，不记网页正文和密钥。每用户独立限流，默认搜索 10 次/分钟、读网页 20 次/分钟、浏览器动作 20 次/分钟；超出返回 `EAB_RATE_LIMITED`（HTTP 429），不会消耗幂等重放额度。
+
 ---
 
 ## 五、版本发现与更新
 
 EAB 的版本来自 GitHub Release：
 
-- Release tag：`v2026.11.22`
-- Release 资产：源码 zip（`EAB-2026.11.22.zip`）。桌面安装包、`latest.yml`、`.blockmap` 已停止发布。
+- Release tag：`v2026.11.23`
+- Release 资产：源码 zip（`EAB-2026.11.23.zip`）。桌面安装包、`latest.yml`、`.blockmap` 已停止发布。
 
 ### 两种更新方式
 
@@ -249,7 +327,7 @@ eab update                              # 升级到最新版本
 eab update 2026.11.19                   # 升级或降级到指定版本
 eab update --list                       # 列出可安装的历史版本
 eab update 2026.11.19 --check           # 只查看目标版本，不安装
-eab update 2026.11.22 --force           # 当前版本重装
+eab update 2026.11.23 --force           # 当前版本重装
 ```
 
 `eab update` 现在直接执行安装，不再需要 `--apply`；`--apply` 仅保留为旧写法兼容。不带版本号时读取 GitHub 最新 Release，带版本号时按该版本安装，因此同一条命令既可升级也可降级。指定版本时仍会校验 Release 源码包里的 `package.json` 版本与目标版本一致；同版本默认不重装，必须显式加 `--force`。降级和重装都会先停服务、备份代码与运行数据，失败自动回滚。`--version=2026.11.19` 或 `--version 2026.11.19` 仍可用。
@@ -298,7 +376,7 @@ pnpm dev                  # 等价于 eab start
 
 1. 改根 `package.json` 的 `version`；
 2. 更新 `README.md` 版本与源码包名；
-3. 提交并打 tag：`git tag v2026.11.22 && git push origin v2026.11.22`；
+3. 提交并打 tag：`git tag v2026.11.23 && git push origin v2026.11.23`；
 4. GitHub Actions 只构建源码 zip 并创建/更新 Release，不再生成桌面安装包；
 5. 控制台/CLI 的版本检查读取该 Release。
 

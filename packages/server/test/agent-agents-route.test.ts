@@ -58,6 +58,8 @@ function makeApp() {
   })
   const task = team.createTask({ workerKey: 'worker', prompt: '核对 100 条记录', parentRunId: 'parent-1' })
   team.markTaskRunning(task.id, 'child-run-1', now)
+  team.markTaskPhase(task.id, 'input_required', '需要确认统计口径', now)
+  team.markTaskUsage(task.id, 120, 0, now)
   team.recordEvent({ workerKey: 'worker', kind: 'done', taskId: task.id, payload: { text: '完成 60 条' } })
 
   const config = {
@@ -99,8 +101,17 @@ describe('GET /api/chat/agents', () => {
         workers: Array<{ key: string; status: string; role: string; parentKey: string | null }>
         tree: Array<{ key: string; role: string; children: unknown[] }>
         capacity: { active: number; limit: number }
-        tasks: Array<{ key: string; status: string; prompt: string }>
-        events: Array<{ key: string; kind: string }>
+        tasks: Array<{
+          key: string
+          status: string
+          prompt: string
+          protocolStatus: string
+          phase: string
+          traceId: string
+          usedTokens: number
+          artifacts: unknown[]
+        }>
+        events: Array<{ key: string; kind: string; traceId: string }>
       }
     }
     expect(body.ok).toBe(true)
@@ -109,7 +120,16 @@ describe('GET /api/chat/agents', () => {
     expect(body.data.tree[0]?.key).toBe('worker')
     expect(body.data.capacity).toMatchObject({ active: 1, limit: 8 })
     expect(body.data.tasks.some((task) => task.key === 'worker' && task.status === 'running')).toBe(true)
+    const protocolTask = body.data.tasks.find((task) => task.key === 'worker')
+    expect(protocolTask).toMatchObject({
+      protocolStatus: 'input-required',
+      phase: 'input_required',
+      traceId: 'parent-1',
+      usedTokens: 120,
+    })
+    expect(protocolTask?.artifacts).toEqual([])
     expect(body.data.events.some((event) => event.key === 'worker' && event.kind === 'done')).toBe(true)
+    expect(body.data.events.find((event) => event.kind === 'done')?.traceId).toBe('parent-1')
   })
 
   it('读取控制台保存的团队上限，不依赖启动时的 config', async () => {

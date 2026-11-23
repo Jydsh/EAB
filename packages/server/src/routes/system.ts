@@ -18,6 +18,21 @@ import { toolInflightCount, toolInflightSnapshot } from '../tool-inflight.js'
 import { requestCancelAgentRun } from '../realtime-control.js'
 import { capabilityList, ok, readVersion } from '../http.js'
 import { actorFor, listPersonas, resolveActor, roleCodesOf } from '../session.js'
+import { callSpeech } from '../llm.js'
+import { ensureVoiceAnchor } from '../voice-anchor.js'
+import { resolveModelForPurpose } from '../model-registry.js'
+import {
+  DEFAULT_VOICE,
+  DEFAULT_VOICE_ID,
+  MAX_VOICE_INSTRUCTIONS,
+  createVoicePreset,
+  deleteVoicePreset,
+  listVoicePresets,
+  resolveVoiceProfile,
+  saveVoiceProfile,
+  updateVoicePreset,
+  voiceProfileView,
+} from '../voice-profile.js'
 
 /** 只代理钉钉自己的头像域名，避免把 users.avatar 当作任意 URL 去抓。 */
 function isAllowedAvatarUrl(value: string): boolean {
@@ -326,6 +341,114 @@ export function registerSystemRoutes(app: FastifyInstance, deps: ServerDeps): vo
       .run(mode, Date.now(), person.id, person.companyId)
     return ok({ chatSendMode: mode })
   })
+
+  /** 当前员工的语音回复配置；网页与钉钉共用。 */
+  app.get('/api/me/voice', async (req) => {
+    const { person } = resolveActor(deps.db, deps.config, req, deps.companyId)
+    const profile = resolveVoiceProfile(deps.db, person.companyId, person.id)
+    const presets = listVoicePresets(deps.db, person.companyId, person.id)
+    const tts = resolveModelForPurpose(deps.db, person.companyId, 'tts.default')
+    return ok({
+      ...voiceProfileView(profile, presets),
+      defaults: { enabled: true, activeVoiceId: DEFAULT_VOICE_ID },
+      speechAvailable: Boolean(tts),
+    })
+  })
+
+  /** 只更新当前员工；activeVoiceId 必须指向系统默认或本人已保存的声音方案。 */
+  app.patch<{ Body: { enabled?: unknown; activeVoiceId?: unknown } }>(
+    '/api/me/voice',
+    async (req) => {
+      const { person } = resolveActor(deps.db, deps.config, req, deps.companyId)
+      const body = req.body ?? {}
+      if (body.enabled !== undefined && typeof body.enabled !== 'boolean') {
+        throw new EabError(EC.VALIDATION, 'enabled 必须是布尔值')
+      }
+      const patch: { enabled?: boolean; activeVoiceId?: string } = {}
+      if (body.enabled !== undefined) patch.enabled = body.enabled
+      if (body.activeVoiceId !== undefined) patch.activeVoiceId = String(body.activeVoiceId ?? '').trim()
+      const profile = saveVoiceProfile(deps.db, person.companyId, person.id, patch)
+      return ok(voiceProfileView(profile, listVoicePresets(deps.db, person.companyId, person.id)))
+    },
+  )
+
+  /** 新建一段声音描述，并直接设为当前默认。 */
+  app.post<{ Body: { name?: unknown; instructions?: unknown } }>(
+    '/api/me/voice/presets',
+    async (req) => {
+      const { person } = resolveActor(deps.db, deps.config, req, deps.companyId)
+      const body = req.body ?? {}
+      const profile = createVoicePreset(deps.db, person.companyId, person.id, {
+        name: body.name === undefined ? undefined : String(body.name ?? ''),
+        instructions: String(body.instructions ?? ''),
+      })
+      return ok(voiceProfileView(profile, listVoicePresets(deps.db, person.companyId, person.id)))
+    },
+  )
+
+  /** 修改声音名称或描述；若它是当前默认，保存后立即按新描述生效。 */
+  app.patch<{ Params: { id: string }; Body: { name?: unknown; instructions?: unknown } }>(
+    '/api/me/voice/presets/:id',
+    async (req) => {
+      const { person } = resolveActor(deps.db, deps.config, req, deps.companyId)
+      const body = req.body ?? {}
+      const profile = updateVoicePreset(deps.db, person.companyId, person.id, req.params.id, {
+        name: body.name === undefined ? undefined : String(body.name ?? ''),
+        instructions: body.instructions === undefined ? undefined : String(body.instructions ?? ''),
+      })
+      return ok(voiceProfileView(profile, listVoicePresets(deps.db, person.companyId, person.id)))
+    },
+  )
+
+  /** 删除声音方案；删除当前默认时自动回到系统默认。 */
+  app.delete<{ Params: { id: string } }>('/api/me/voice/presets/:id', async (req) => {
+    const { person } = resolveActor(deps.db, deps.config, req, deps.companyId)
+    const profile = deleteVoicePreset(deps.db, person.companyId, person.id, req.params.id)
+    return ok(voiceProfileView(profile, listVoicePresets(deps.db, person.companyId, person.id)))
+  })
+
+  /** 设置页试听：不保存配置，固定文本，最多 200 字描述。 */
+  app.post<{ Body: { voiceId?: unknown; instructions?: unknown } }>(
+    '/api/me/voice/preview',
+    async (req) => {
+      const { person } = resolveActor(deps.db, deps.config, req, deps.companyId)
+      const body = req.body ?? {}
+      const voiceId = String(body.voiceId ?? DEFAULT_VOICE_ID).trim() || DEFAULT_VOICE_ID
+      let instructions = String(body.instructions ?? '').replace(/\u0000/g, '').trim()
+      if (instructions.length > MAX_VOICE_INSTRUCTIONS) {
+        instructions = instructions.slice(0, MAX_VOICE_INSTRUCTIONS)
+      }
+      if (!instructions && voiceId !== DEFAULT_VOICE_ID) {
+        const preset = listVoicePresets(deps.db, person.companyId, person.id).find(
+          (item) => item.id === voiceId,
+        )
+        if (!preset) throw new EabError(EC.VALIDATION, '没有找到这个声音方案')
+        instructions = preset.instructions
+      }
+      const tts = resolveModelForPurpose(deps.db, person.companyId, 'tts.default')
+      if (!tts) throw new EabError(EC.VALIDATION, '还没有配置语音合成模型 tts.default')
+      const profile = resolveVoiceProfile(deps.db, person.companyId, person.id)
+      const anchorProfile =
+        voiceId === profile.activeVoiceId && (!instructions || instructions === profile.instructions)
+          ? profile
+          : null
+      const anchor = anchorProfile
+        ? await ensureVoiceAnchor(deps.db, deps.config.dbPath, person.companyId, person.id, tts.id, anchorProfile)
+        : undefined
+      const result = await callSpeech(
+        deps.db,
+        deps.config.dbPath,
+        person.companyId,
+        tts.id,
+        '你好，我是 EAB 企业智能助手，很高兴为你服务。',
+        { voice: DEFAULT_VOICE, instructions, seed: profile.seed, format: 'mp3', anchor },
+      )
+      return ok({
+        mime: result.mime,
+        audio: `data:${result.mime};base64,${Buffer.from(result.audio).toString('base64')}`,
+      })
+    },
+  )
 
   /**
    * 公司助手头像：只按当前登录人的公司取，避免把任意文件路径带进接口。

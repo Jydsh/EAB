@@ -36,6 +36,9 @@ import { registerChannelRoutes } from './routes/channel.js'
 import { registerChatRoutes } from './routes/chat.js'
 import { registerConsoleRoutes } from './routes/console.js'
 import { registerConsoleDatabaseRoutes } from './routes/console-databases.js'
+import { registerConsoleMcpRoutes } from './routes/console-mcp.js'
+import { registerConsoleA2ARoutes } from './routes/console-a2a.js'
+import { registerA2AInboundRoutes } from './routes/a2a-inbound.js'
 import { registerConsoleOnlyOfficeRoutes } from './routes/console-onlyoffice.js'
 import { registerConsoleScheduleRoutes } from './routes/console-schedules.js'
 import { registerKbRoutes } from './routes/kb.js'
@@ -65,6 +68,7 @@ const CONTENT_TYPES: Record<string, string> = {
   'boot-splash.js': 'text/javascript; charset=utf-8',
   'chat.html': 'text/html; charset=utf-8',
   'chat.js': 'text/javascript; charset=utf-8',
+  'voice-pcm-player-worklet.js': 'text/javascript; charset=utf-8',
   'chat.css': 'text/css; charset=utf-8',
   'plugin-host.html': 'text/html; charset=utf-8',
   'plugin-kernel.html': 'text/html; charset=utf-8',
@@ -356,6 +360,10 @@ export function buildApp(deps: ServerDeps, surface: AppSurface = 'all'): Fastify
     app.get('/chat', async (_req, reply) => servePublic('chat.html', reply))
     app.get('/chat.html', async (_req, reply) => servePublic('chat.html', reply))
     app.get('/chat.js', async (_req, reply) => servePublic('chat.js', reply))
+    // AudioWorklet 模块必须由同源脚本 URL 加载，不能塞进普通 JS 闭包。
+    app.get('/voice-pcm-player-worklet.js', async (_req, reply) =>
+      servePublic('voice-pcm-player-worklet.js', reply),
+    )
     app.get('/chat.css', async (_req, reply) => servePublic('chat.css', reply))
     // 深/浅色主题在聊天页与控制台共用同一份令牌和开关脚本。
     app.get('/theme.css', async (_req, reply) => servePublic('theme.css', reply))
@@ -442,6 +450,8 @@ export function buildApp(deps: ServerDeps, surface: AppSurface = 'all'): Fastify
 
   // ---- API ----
   registerSystemRoutes(app, runtimeDeps)
+  // A2A 入站只挂在员工端口：管理端口不暴露 Agent Card 和外部任务端点。
+  if (surface !== 'console') registerA2AInboundRoutes(app, runtimeDeps)
   registerAuthRoutes(app, deps)
   registerBootRoutes(app, deps)
   registerOrgRoutes(app, deps)
@@ -456,6 +466,8 @@ export function buildApp(deps: ServerDeps, surface: AppSurface = 'all'): Fastify
   registerConsoleAccessRoutes(app, deps)
   registerConsoleRoutes(app, deps)
   registerConsoleDatabaseRoutes(app, deps)
+  registerConsoleMcpRoutes(app, deps)
+  registerConsoleA2ARoutes(app, deps)
   registerConsoleOnlyOfficeRoutes(app, deps)
   registerConsoleScheduleRoutes(app, deps)
   registerAdminRoutes(app, deps)

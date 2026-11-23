@@ -32,6 +32,8 @@ import {
 import { retrieveExternalKb } from '../kb-external.js'
 import { getDocAsset } from '../kb-assets.js'
 import { executePluginTool, pluginToolCatalogFor, pluginToolSpecsFor, pluginToolSpecsForQuery, prefersPersonalPluginTools, resolvePluginToolByCatalogId, invalidatePluginToolSpecsEverywhere } from '../plugin-tools.js'
+import { mcpToolSpecsFor, resolveMcpToolForActor } from '../mcp-registry.js'
+import { hasUsableA2APeers, delegateA2ATask, cancelA2ADelegation } from '../a2a-registry.js'
 import { refreshPluginHosts } from '../plugin-host.js'
 import { createPluginDevScaffold, installPluginDevBundle, normalizePluginDevId, pluginDevIdFromDir, pluginPreviewLink, PLUGIN_DEV_DIR } from '../plugin-dev.js'
 import { createSkillDevScaffold, installSkillDevBundle, normalizeSkillDevId, skillDevIdFromDir, skillPreviewLink, SKILL_DEV_DIR } from '../skill-dev.js'
@@ -54,6 +56,15 @@ import {
   workspaceUsedBytes,
 } from '../workspace-quota.js'
 import { CAPABILITY_TOOL_GROUPS, isSingleFileOfficeEdit, officeToolIdsForQuery, routeCapabilities } from '../capability-route.js'
+import { getWeather } from '../weather.js'
+import { webFetch } from '../web-fetch.js'
+import { searchWeb } from '../web-search.js'
+import { effectiveWebSearchEnv } from '../web-search-config.js'
+import { assertWebToolRateLimit, type WebToolId } from '../web-rate-limit.js'
+import { browserStatus, executeBrowserAction, type BrowserAction } from '../browser-session.js'
+import { browserNetworkSettingsView } from '../browser-network-config.js'
+import { publishAgentArtifact } from '../agent-artifacts.js'
+import type { AgentTeamStore } from '../agent-team.js'
 import { DINGTALK_OUTBOUND_FILE_LIMIT_BYTES, sendDingTalkFileToUser } from '../dingtalk-outbound.js'
 import { sendDingTalkFileToConversation, uploadFileToUserDrive } from '../dingtalk-drive.js'
 import {
@@ -165,6 +176,8 @@ export interface ToolExecutionContext {
   signal?: AbortSignal
   /** 一次用户消息内的 Agent 回合 id；同一回合重复调用按参数去重 */
   turnId?: string
+  /** 当前 Agent run 的 trace id；A2A 远端任务沿用它回写映射 */
+  traceId?: string
   /** 调用方显式提供的幂等键，优先于 turnId */
   idempotencyKey?: string
   /**
@@ -172,6 +185,10 @@ export interface ToolExecutionContext {
    * 避免「明明开着文件还要反问是哪个文件」。
    */
   activeFile?: { id: string; relPath?: string }
+  /** 当前子 Agent 的任务行；只有子 Agent 轮次才有，用于产物登记 */
+  agentTaskId?: string
+  /** 当前会话的团队存储；产物登记和 trace 归属都从这里取 */
+  agentTeam?: AgentTeamStore
 }
 
 /**
@@ -490,6 +507,79 @@ export const TOOLS: readonly ToolDef[] = [
     input: {},
   },
   {
+    id: 'weather.now',
+    name: '查看天气',
+    description:
+      '查询指定城市或区县的当前天气和未来 1–7 天预报；返回温度、体感温度、湿度、降水、风速、天气现象、日出日落，数据来自 Open-Meteo。完整行政区名查不到时会自动回退到上级城市或去掉行政区后缀，并在 note 中说明数据口径；一次调用即可，不要因为第一个区县名没匹配就重复调用。用户没有说明地点时不要猜，先问城市。',
+    scope: SC.AGENT_TOOL_INVOKE,
+    dangerous: false,
+    concurrency: 'read',
+    input: {
+      location: {
+        type: 'string',
+        description: '城市或区县名，如“重庆”“渝北”“北京朝阳”；也支持“纬度,经度”坐标',
+        required: true,
+      },
+      days: {
+        type: 'number',
+        description: '预报天数，默认 3，范围 1–7',
+      },
+    },
+  },
+  {
+    id: 'web.search',
+    name: '搜索互联网',
+    description:
+      '搜索公开互联网，返回标题、链接和摘要，适合“查一下最新政策/新闻/资料”。搜索服务由管理员配置；未配置时会返回明确提示，不要反复重试。搜到结果后如果用户需要原文或准确细节，再用 web.fetch 读取具体链接；不要根据摘要编造正文。',
+    scope: SC.AGENT_TOOL_INVOKE,
+    dangerous: false,
+    concurrency: 'read',
+    input: {
+      query: { type: 'string', description: '搜索关键词，尽量短而具体', required: true },
+      count: { type: 'number', description: '返回条数，默认 5，范围 1–10' },
+      freshness: { type: 'string', description: '时效：all / day / week / month，默认 all' },
+      site: { type: 'string', description: '限定站点域名，例如 gov.cn' },
+    },
+  },
+  {
+    id: 'web.fetch',
+    name: '读取网页',
+    description:
+      '读取一个公开网页或文本链接，提取标题、正文、发布时间和少量链接。用户给出 URL、要求总结链接/公告/文章时优先使用。只支持公网 http/https，不能访问内网、本机、带账号密码的链接，也不携带登录态；需要登录的页面让用户提供公开链接。返回 truncated=true 时可带 start 继续读同一页，不要重新抓一遍。',
+    scope: SC.AGENT_TOOL_INVOKE,
+    dangerous: false,
+    concurrency: 'read',
+    input: {
+      url: { type: 'string', description: '要读取的完整 http/https 链接', required: true },
+      format: { type: 'string', description: 'text 返回正文（默认），html 返回原始 HTML' },
+      maxChars: { type: 'number', description: '单次返回字符数，默认 6000，最大 20000' },
+      start: { type: 'number', description: '从第几个字符继续读，配合 nextStart 使用' },
+    },
+  },
+  {
+    id: 'browser',
+    name: '内置浏览器',
+    description:
+      '用服务端无头浏览器打开需要 JavaScript 渲染或要点击的网页。action=open 打开链接并返回标题、正文和可点击元素 ref；action=snapshot 重新读取当前页；action=click 按 ref 点链接/普通按钮；action=type 只在搜索框/文本框输入；action=screenshot 截图并保存到个人云空间；action=close 关闭页面。不能提交表单、登录、上传下载、支付或执行任意脚本。只看静态正文优先用 web.fetch，更省资源。',
+    scope: SC.AGENT_TOOL_INVOKE,
+    dangerous: false,
+    concurrency: 'write',
+    lockKey: (_deps, actor) => `browser:${actor.subject.companyId}:${actor.subject.userId}`,
+    input: {
+      action: {
+        type: 'string',
+        description: 'open / snapshot / click / type / scroll / back / screenshot / close',
+        required: true,
+      },
+      url: { type: 'string', description: 'action=open 时要打开的完整 http/https 链接' },
+      pageId: { type: 'string', description: 'open 返回的页面 id；除 open 外都要传' },
+      ref: { type: 'string', description: 'snapshot 返回的元素引用，如 e1' },
+      text: { type: 'string', description: 'action=type 时要输入的文字，最多 500 字' },
+      direction: { type: 'string', description: 'action=scroll 方向：down（默认）/ up' },
+      fullPage: { type: 'boolean', description: 'action=screenshot 是否截整页，默认 false' },
+    },
+  },
+  {
     id: 'agent.spawn',
     name: '并行子 Agent',
     description:
@@ -524,6 +614,52 @@ export const TOOLS: readonly ToolDef[] = [
         type: 'boolean',
         description: '可选：true 表示连 running 或 pinned 岗位也强制注销；会取消它当前排队/执行中的任务',
       },
+    },
+  },
+  {
+    id: 'agent.publish_artifact',
+    name: '登记任务产物',
+    description:
+      '子 Agent 专用。把本次任务真正交付给用户的东西登记为产物，父 Agent、团队面板和后续 trace 会看到同一个引用；只登记元数据，不复制文件。工作区文件用 path（相对个人云空间根），已有文件用 fileId，外部 MCP/A2A/网页链接用 uri + name。多个产物分多次调用。登记不会自动发给用户，最终仍要在回报正文里说明哪个产物对应哪项交付。',
+    scope: SC.AGENT_TOOL_INVOKE,
+    dangerous: false,
+    concurrency: 'write',
+    input: {
+      path: { type: 'string', description: '个人云空间内的相对路径，例如 reports/巡检周报.md；与 fileId、uri 三选一' },
+      fileId: { type: 'string', description: '个人云空间文件 id；与 path、uri 三选一' },
+      uri: { type: 'string', description: '外部产物 uri，支持 mcp: / a2a: / https: / http: / eab:；与 path、fileId 三选一' },
+      name: { type: 'string', description: '展示名称；用 uri 登记时必填，文件可省略并用真实文件名' },
+      preview: { type: 'string', description: '可选：一句交付摘要，最多 500 字' },
+    },
+  },
+  {
+    id: 'a2a.delegate',
+    name: '派遣 A2A 远端 Agent',
+    description:
+      '把一个自包含任务交给公司已登记、已同步 Agent Card 的 A2A 远端 Agent，并等待它完成或暂停。只在可用岗位能力卡或 A2A 远端清单里出现 peer 时使用；不要把内部子任务改用远端 Agent，也不要用 agent_spawn 创建远端岗位。peer 原样填卡上的 id；skill 填技能 id，白名单要求时必须指定。远端返回 input-required/auth-required 时要把问题交给用户，不要自己编造答案。完成后按返回的 text 和 artifacts 汇总，不要复述远端内部推理。',
+    scope: SC.AGENT_TOOL_INVOKE,
+    dangerous: false,
+    concurrency: 'write',
+    idempotent: true,
+    lockKey: (_deps, actor, args) => `a2a:${actor.subject.companyId}:${String(args.peer ?? '').slice(0, 120)}`,
+    input: {
+      peer: { type: 'string', description: 'A2A 远端 Agent 的 peer id，可带 a2a: 前缀；来自能力卡或 a2a 清单', required: true },
+      prompt: { type: 'string', description: '完整、自包含的委派目标、输入、约束和验收标准，最多 4000 字', required: true },
+      skill: { type: 'string', description: '要使用的远端技能 id；配置了技能白名单时必填' },
+      contextId: { type: 'string', description: '继续同一个远端上下文时填入上次返回的 contextId' },
+      timeoutSeconds: { type: 'number', description: '最多等待多少秒，默认 120，范围 5–300；超时后任务保留，可再取消' },
+    },
+  },
+  {
+    id: 'a2a.cancel',
+    name: '取消 A2A 远端任务',
+    description:
+      '取消一个 EAB 已派出的 A2A 远端任务。delegationId 用 a2a_delegate 返回的 delegationId；任务已完成、已取消或没有远端 taskId 时直接返回当前状态，不会重复发送取消。远端已经执行了不可逆动作时，取消不保证撤回外部副作用。',
+    scope: SC.AGENT_TOOL_INVOKE,
+    dangerous: false,
+    concurrency: 'write',
+    input: {
+      delegationId: { type: 'string', description: 'a2a_delegate 返回的本地任务 id', required: true },
     },
   },
   {
@@ -1286,6 +1422,46 @@ function audit(deps: ServerDeps, req: FastifyRequest, action: string, detail: Re
   })
 }
 
+/**
+ * 联网工具审计：只记调用动作、目标 URL/搜索词、结果规模，不记网页正文和密钥。
+ * 审计写入失败不能覆盖工具本身的成功或失败结果。
+ */
+function auditWebTool(
+  deps: ServerDeps,
+  actor: Actor,
+  toolId: WebToolId,
+  detail: Record<string, unknown>,
+  result: 'success' | 'failure',
+  startedAt: number,
+  context: ToolExecutionContext,
+  error?: unknown,
+): void {
+  try {
+    appendAudit(deps.db, {
+      companyId: actor.subject.companyId,
+      actorUserId: actor.subject.userId,
+      action: `net.${toolId}`,
+      resourceType: 'network',
+      resourceId: toolId,
+      resourceScope: null,
+      result,
+      detail: {
+        ...detail,
+        toolId,
+        durationMs: Date.now() - startedAt,
+        ...(error ? { error: error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300) } : {}),
+        sessionId: context.sessionId ?? null,
+        channel: context.channel ?? null,
+      },
+      traceId: context.turnId ?? null,
+      ip: null,
+      channel: context.channel === 'dingtalk' ? 'dingtalk' : 'web',
+    })
+  } catch {
+    // 审计存储故障不阻断工具返回
+  }
+}
+
 /** 只允许数字、括号、四则运算；用递归下降，不用 eval */
 function evaluate(expression: string): number {
   const tokens = expression.replace(/\s+/g, '')
@@ -1559,6 +1735,7 @@ export const AGENT_CORE_TOOL_IDS: readonly string[] = [
   'agent.spawn',
   'agent.task',
   'agent.ask_parent',
+  'agent.publish_artifact',
   'agent.wait',
   'agent.message',
   'agent.resume',
@@ -1570,7 +1747,8 @@ export interface ToolSearchHit {
   functionName: string
   name: string
   description: string
-  source: 'builtin' | 'plugin'
+  source: 'builtin' | 'plugin' | 'mcp'
+  serverName?: string
   parameters: Array<{ name: string; type: string; description: string; required: boolean }>
   score: number
 }
@@ -1602,6 +1780,10 @@ function toolSearchTerms(query: string): string[] {
 /** 工具描述之外的可检索同义词：中文口语、英文和常见叫法。 */
 const TOOL_SEARCH_ALIASES: Record<string, string> = {
   'time.now': '时间 现在 几点 日期 今天 星期 time date now clock',
+  'weather.now': '天气 气温 温度 多少度 几度 下雨 降雨 降水 下雪 降雪 预报 冷不冷 热不热 湿度 风力 weather forecast temperature rain snow',
+  'web.search': '上网 联网 搜索 搜一下 查一下 查资料 最新 新闻 公告 网页 网站 链接 互联网 search web internet google baidu bing',
+  'web.fetch': '读取网页 打开链接 总结链接 网页正文 网址 网页内容 公告原文 文章 链接 fetch url webpage article link read',
+  browser: '浏览器 内置浏览器 打开网页 网页截图 点开 点击 页面快照 渲染 动态网页 登录后 网页操作 browser screenshot click snapshot',
   'schedule.create': '提醒 定时 日程 每天 每周 几点 定时任务 remind schedule timer',
   'schedule.list': '查看定时任务 我的任务 提醒列表 任务状态 schedule list',
   'schedule.delete': '取消定时任务 删除提醒 停止任务 cancel schedule delete',
@@ -1658,11 +1840,15 @@ export function searchToolCatalog(
   for (const spec of specs) {
     if (spec.function.name === 'tool_search') continue
     const def = builtinByFunction.get(spec.function.name)
-    const name = def?.name ?? spec.function.name
+    const mcpEntry = !def && spec.function.name.startsWith('mcp_')
+      ? resolveMcpToolForActor(db, actor, spec.function.name)
+      : null
+    const name = def?.name
+      ?? (mcpEntry ? `${mcpEntry.tool.name}（${mcpEntry.server.name}）` : spec.function.name)
     const description = def?.description ?? spec.function.description
-    const id = def?.id ?? spec.function.name
-    const alias = TOOL_SEARCH_ALIASES[id] ?? ''
-    const haystack = `${spec.function.name} ${id} ${name} ${description} ${alias}`.toLowerCase()
+    const id = def?.id ?? mcpEntry?.toolId ?? spec.function.name
+    const alias = TOOL_SEARCH_ALIASES[id] ?? (mcpEntry ? `mcp 外部工具 服务器 ${mcpEntry.server.name} ${mcpEntry.tool.name}` : '')
+    const haystack = `${spec.function.name} ${id} ${name} ${description} ${alias} ${mcpEntry?.server.name ?? ''}`.toLowerCase()
     let score = 0
     if (haystack.includes(clean.toLowerCase())) score += 50
     for (const term of terms) {
@@ -1681,7 +1867,8 @@ export function searchToolCatalog(
       functionName: spec.function.name,
       name,
       description: description.length > 220 ? `${description.slice(0, 220)}…` : description,
-      source: def ? 'builtin' : 'plugin',
+      source: def ? 'builtin' : mcpEntry ? 'mcp' : 'plugin',
+      ...(mcpEntry ? { serverName: mcpEntry.server.name } : {}),
       parameters: Object.entries(spec.function.parameters.properties ?? {}).map(([key, value]) => ({
         name: key,
         type: value.type,
@@ -1726,13 +1913,21 @@ export function toolSpecsForAgent(
   if (route.skillDev) routedIds.push(...CAPABILITY_TOOL_GROUPS.skillDev)
   if (route.schedule) routedIds.push(...CAPABILITY_TOOL_GROUPS.schedule)
   if (route.org) routedIds.push(...CAPABILITY_TOOL_GROUPS.org)
+  if (route.weather) routedIds.push(...CAPABILITY_TOOL_GROUPS.weather)
+  if (route.web) routedIds.push(...CAPABILITY_TOOL_GROUPS.web)
+  if (route.browser) routedIds.push(...CAPABILITY_TOOL_GROUPS.browser)
   if (route.memoryRule) routedIds.push(...CAPABILITY_TOOL_GROUPS.memoryRule)
   const allowedCore = new Set([...coreNames, ...routedIds.map(toolFunctionName)])
+  // A2A 远端 Agent 已同步时，主 Agent 本轮就能直接看见派遣工具；没有可用 Peer 时仍可按需搜索，不占上下文。
+  if (hasUsableA2APeers(db, actor.subject.companyId)) {
+    allowedCore.add(toolFunctionName('a2a.delegate'))
+    allowedCore.add(toolFunctionName('a2a.cancel'))
+  }
   // 单文件局部编辑直接走 office.find → replace/format → read_range，
   // 不下发团队工具，避免模型把“定位一段”拆成子任务后误以为已经写入。
   if (isSingleFileOfficeEdit(query, { activeFile: options.activeFile })) {
     for (const name of allowedCore) {
-      if (name.startsWith('agent_')) allowedCore.delete(name)
+      if (name.startsWith('agent_') || name.startsWith('a2a_')) allowedCore.delete(name)
     }
   }
   /**
@@ -1913,7 +2108,12 @@ export function toolSpecsForActor(
     .map((spec) => spec as unknown as ChatToolSpec)
     // 插件工具不能覆盖 EAB 内置工具的同名 function
     .filter((spec) => !builtinNames.has(spec.function.name))
-  return [...builtin, ...pluginSpecs]
+  const pluginNames = new Set(pluginSpecs.map((spec) => spec.function.name))
+  const mcpSpecs = mcpToolSpecsFor(db, actor)
+    .map((spec) => spec as ChatToolSpec)
+    // MCP 是外部工具源，不能覆盖内置或已安装插件的同名 function
+    .filter((spec) => !builtinNames.has(spec.function.name) && !pluginNames.has(spec.function.name))
+  return [...builtin, ...pluginSpecs, ...mcpSpecs]
 }
 
 /** 执行一个工具。鉴权在本函数内再做一次，调用方仍需自己处理高危审批。 */
@@ -2067,21 +2267,205 @@ export async function executeTool(
     operationId = start.id
   }
 
+  if (tool.id === 'web.search' || tool.id === 'web.fetch' || tool.id === 'browser') {
+    try {
+      assertWebToolRateLimit(actor.subject.companyId, actor.subject.userId, tool.id)
+    } catch (error) {
+      release?.()
+      toolRelease?.()
+      if (operationId) failToolOperation(deps.db, operationId, error)
+      recordToolRun(tool.id, Date.now() - startedAt, 'failed', lockWaitMs)
+      throw error
+    }
+  }
+
   let toolStatus: 'ok' | 'failed' = 'ok'
+  let webAudit: { toolId: WebToolId; detail: Record<string, unknown> } | null = null
   try {
     let result: unknown
     const now = new Date()
     switch (tool.id) {
+    case 'a2a.delegate': {
+      const seconds = args.timeoutSeconds === undefined ? 120 : Number(args.timeoutSeconds)
+      result = await delegateA2ATask({
+        db: deps.db,
+        dbPath: deps.config.dbPath,
+        actor,
+        peer: args.peer,
+        prompt: args.prompt,
+        skill: args.skill,
+        contextId: args.contextId,
+        traceId: context.traceId,
+        timeoutMs: (Number.isFinite(seconds) ? seconds : 120) * 1_000,
+        signal: context.signal,
+      })
+      break
+    }
+    case 'a2a.cancel':
+      result = await cancelA2ADelegation({
+        db: deps.db,
+        dbPath: deps.config.dbPath,
+        actor,
+        delegationId: args.delegationId,
+        timeoutMs: 30_000,
+        signal: context.signal,
+      })
+      break
     case 'agent.spawn':
       throw new EabError(EC.VALIDATION, 'agent.spawn 只能由对话 Agent 调度器执行')
     case 'agent.task':
       throw new EabError(EC.VALIDATION, 'agent.task 只能由对话 Agent 调度器执行')
+    case 'agent.publish_artifact': {
+      if (!context.agentTaskId || !context.agentTeam) {
+        throw new EabError(EC.FORBIDDEN, '只有正在执行的子 Agent 任务可以登记产物')
+      }
+      const artifact = await publishAgentArtifact({
+        db: deps.db,
+        team: context.agentTeam,
+        taskId: context.agentTaskId,
+        companyId: actor.subject.companyId,
+        userId: actor.person.id,
+        workspaceRoot: userScopeDir(deps, actor.subject.companyId, actor.person.id),
+        path: args.path === undefined ? undefined : String(args.path),
+        fileId: args.fileId === undefined ? undefined : String(args.fileId),
+        uri: args.uri === undefined ? undefined : String(args.uri),
+        name: args.name === undefined ? undefined : String(args.name),
+        preview: args.preview === undefined ? undefined : String(args.preview),
+      })
+      result = {
+        ok: true,
+        artifact,
+        taskArtifactCount: context.agentTeam.listArtifacts(context.agentTaskId).length,
+      }
+      break
+    }
     case 'tool.search':
       result = searchToolCatalog(deps.db, actor, space, String(args.query ?? ''), args.limit === undefined ? 8 : Number(args.limit))
       break
     case 'time.now':
       result = { iso: now.toISOString(), local: now.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }) }
       break
+    case 'weather.now':
+      result = await getWeather({
+        location: String(args.location ?? ''),
+        days: args.days === undefined ? undefined : Number(args.days),
+      })
+      break
+    case 'web.search': {
+      const query = String(args.query ?? '')
+      webAudit = {
+        toolId: 'web.search',
+        detail: {
+          query: query.slice(0, 120),
+          site: args.site === undefined ? null : String(args.site).slice(0, 120),
+          requestedCount: args.count === undefined ? null : Number(args.count),
+        },
+      }
+      const searchResult = await searchWeb(
+        {
+          query,
+          count: args.count === undefined ? undefined : Number(args.count),
+          freshness:
+            args.freshness === 'day' || args.freshness === 'week' || args.freshness === 'month'
+              ? args.freshness
+              : 'all',
+          site: args.site === undefined ? undefined : String(args.site),
+        },
+        { env: effectiveWebSearchEnv(deps.config.dbPath) },
+      )
+      result = searchResult
+      webAudit.detail = {
+        ...webAudit.detail,
+        provider: searchResult.provider,
+        configured: searchResult.configured,
+        total: searchResult.total,
+      }
+      break
+    }
+    case 'web.fetch': {
+      const url = String(args.url ?? '')
+      webAudit = {
+        toolId: 'web.fetch',
+        detail: {
+          url: url.slice(0, 2_000),
+          format: args.format === 'html' ? 'html' : 'text',
+        },
+      }
+      const fetched = await webFetch({
+        url,
+        format: args.format === 'html' ? 'html' : 'text',
+        maxChars: args.maxChars === undefined ? undefined : Number(args.maxChars),
+        start: args.start === undefined ? undefined : Number(args.start),
+      })
+      result = fetched
+      webAudit.detail = {
+        ...webAudit.detail,
+        finalUrl: fetched.finalUrl,
+        title: fetched.title,
+        chars: fetched.text.length,
+        truncated: fetched.truncated,
+      }
+      break
+    }
+    case 'browser': {
+      const status = browserStatus()
+      if (!status.enabled) {
+        throw new EabError(EC.VALIDATION, '内置浏览器已关闭', { hint: '让管理员设置 EAB_BROWSER_ENABLED=1' })
+      }
+      webAudit = {
+        toolId: 'browser',
+        detail: {
+          action: String(args.action ?? ''),
+          pageId: args.pageId === undefined ? null : String(args.pageId),
+          url: args.url === undefined ? null : String(args.url).slice(0, 2_000),
+        },
+      }
+      const browserPolicy = browserNetworkSettingsView()
+      const browserResult = await executeBrowserAction(
+        {
+          action: String(args.action ?? '') as BrowserAction,
+          url: args.url === undefined ? undefined : String(args.url),
+          pageId: args.pageId === undefined ? undefined : String(args.pageId),
+          ref: args.ref === undefined ? undefined : String(args.ref),
+          text: args.text === undefined ? undefined : String(args.text),
+          direction: args.direction === 'up' ? 'up' : 'down',
+          fullPage: args.fullPage === true,
+        },
+        {
+          ownerKey: `${actor.subject.companyId}:${actor.subject.userId}`,
+          signal: context.signal,
+          allowPrivateNetwork: browserPolicy.enabled,
+          privateNetworkHosts: browserPolicy.enabled ? browserPolicy.allowedHosts : [],
+          saveScreenshot: (buffer, filename) => {
+            const saved = saveUserWorkspaceFile(deps, actor, {
+              relPath: filename,
+              buffer,
+              mime: 'image/png',
+              channel: context.channel,
+            })
+            return {
+              fileId: saved.id,
+              name: saved.name,
+              relPath: saved.relPath,
+              size: saved.size,
+              mime: saved.mime ?? 'image/png',
+            }
+          },
+        },
+      )
+      result = browserResult
+      webAudit.detail = {
+        ...webAudit.detail,
+        action: browserResult.action,
+        url: browserResult.url,
+        title: browserResult.title,
+        elements: browserResult.elements.length,
+        screenshotFileId: browserResult.screenshot?.fileId ?? null,
+        privateAccess: browserPolicy.enabled,
+        closed: browserResult.closed,
+      }
+      break
+    }
     case 'schedule.create':
       result = createSchedule(
         deps.db,
@@ -4628,10 +5012,16 @@ export async function executeTool(
     default:
       throw new EabError(EC.NOT_FOUND, `未实现的工具: ${tool.id}`)
   }
+    if (webAudit) {
+      auditWebTool(deps, actor, webAudit.toolId, webAudit.detail, 'success', startedAt, context)
+    }
     if (operationId) completeToolOperation(deps.db, operationId, result)
     return result
   } catch (error) {
     toolStatus = 'failed'
+    if (webAudit) {
+      auditWebTool(deps, actor, webAudit.toolId, webAudit.detail, 'failure', startedAt, context, error)
+    }
     if (operationId) failToolOperation(deps.db, operationId, error)
     throw error
   } finally {

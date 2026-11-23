@@ -19,6 +19,12 @@ export interface CapabilityRoute {
   schedule: boolean
   /** 人员、部门、上下级 */
   org: boolean
+  /** 当前天气与天气预报 */
+  weather: boolean
+  /** 搜索互联网、读取公开网页 */
+  web: boolean
+  /** 无头浏览器打开/点击/截图 */
+  browser: boolean
   /** 形成可复用的团队规则 */
   memoryRule: boolean
 }
@@ -46,6 +52,16 @@ const SKILL_DEV_TEXT = /(技能|skill).{0,20}(开发|做|写|改|安装|制作|�
 const SCHEDULE_TEXT = /(提醒|定时|每天|每日|每周|每月|每隔|几点|日程|闹钟|cron|周期任务)/i
 const ORG_TEXT =
   /(通讯录|组织架构|组织关系|部门|科室|班组|小组|组长|副组长|负责人|上级|下级|领导|同事|成员|人名|姓名|工号|岗位|职务|找谁|谁是|有谁|哪些人|人员名单|联系方式|人数|多少人|几个人|几人)/i
+const WEATHER_TEXT =
+  /(天气|气温|温度|多少度|几度|下雨|降雨|降水|下雪|降雪|台风|大风|雾霾|空气质量|湿度|风力|冷不冷|热不热|weather|forecast)/i
+const WEB_TEXT =
+  /(https?:\/\/|www\.|网页|网站|浏览器|上网|联网|互联网|网上|搜一下|搜一搜|搜索一下|查资料|最新消息|最新政策|最近新闻|新闻|公告原文)/i
+/**
+ * 浏览器比 web.fetch 重：只有明确“渲染/点击/截图/内置浏览器”才下发。
+ * “打开这个网页”也命中，因为用户可能要看动态内容；只给 web.fetch 时模型仍可通过 tool_search 加载。
+ */
+const BROWSER_TEXT =
+  /(内置浏览器|浏览器|网页截图|页面截图|页面快照|网页快照|动态网页|需要渲染|渲染后|打开[^。；;]{0,6}(?:页面|网页|链接)|点击[^。；;]{0,6}(?:页面|网页|链接|按钮)|点开[^。；;]{0,6}(?:页面|网页|链接|按钮)|登录后(?:页面|网页)|browser|screenshot|snapshot)/i
 const MEMORY_RULE_TEXT =
   /(以后|今后|从今以后|统一|始终|一律|都按|记住|规则|标准|规范)|(?:不要|别再)[^。；;]{0,12}(?:再|以后|下次|每次|都|统一|一律)/i
 const BUSINESS_TEXT =
@@ -170,6 +186,9 @@ export function routeCapabilities(
     schedule: SCHEDULE_TEXT.test(text),
     // 业务数据问题里常出现“东环线/工区/班组”，不能因为组织名称就带通讯录。
     org: !business && ORG_TEXT.test(text),
+    weather: WEATHER_TEXT.test(text),
+    web: WEB_TEXT.test(text),
+    browser: BROWSER_TEXT.test(text),
     memoryRule: MEMORY_RULE_TEXT.test(text),
   }
 }
@@ -204,5 +223,8 @@ export const CAPABILITY_TOOL_GROUPS = {
   skillDev: ['skill.dev'],
   schedule: ['schedule.create'],
   org: ['org.directory'],
+  weather: ['weather.now'],
+  web: ['web.search', 'web.fetch'],
+  browser: ['browser'],
   memoryRule: ['memory.propose'],
 } as const

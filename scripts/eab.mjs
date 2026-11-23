@@ -20,9 +20,20 @@
 import { existsSync, readFileSync, mkdirSync, copyFileSync, readdirSync, writeFileSync, cpSync, renameSync, rmSync, statSync } from 'node:fs'
 import { spawn, spawnSync } from 'node:child_process'
 import { createConnection } from 'node:net'
+import { createInterface } from 'node:readline/promises'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { disableWindowsQuickEdit } from './windows-console.mjs'
+import {
+  DEFAULT_SEARXNG_URL,
+  ensureSearxng,
+  normalizeBaseUrl,
+  normalizeSearxngPort,
+  startSearxng,
+  statusSearxng,
+  stopSearxng,
+  urlPort,
+} from './searxng.mjs'
 
 const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)))
 const DEV_DIR = process.env.EAB_HOME ? resolve(process.env.EAB_HOME) : join(ROOT, '.eab-dev')
@@ -250,6 +261,25 @@ function parsePort(value, label) {
   return port
 }
 
+/** 首次安装时只在真实终端里询问；回车或 auto 表示交给系统自动选空闲端口。 */
+async function askSearxngPort() {
+  if (!process.stdin?.isTTY || !process.stdout?.isTTY) return null
+  const rl = createInterface({ input: process.stdin, output: process.stdout })
+  try {
+    for (;;) {
+      const answer = (await rl.question('SearXNG 端口（1–65535，直接回车自动选择空闲端口）：')).trim()
+      if (!answer || /^(auto|自动)$/i.test(answer)) return null
+      try {
+        return parsePort(answer, 'SearXNG 端口')
+      } catch (error) {
+        console.log(error.message)
+      }
+    }
+  } finally {
+    rl.close()
+  }
+}
+
 function serverEnv(flags = {}) {
   const network = readNetworkSettings()
   const env = { ...process.env }
@@ -276,6 +306,22 @@ async function waitForHealth(port, timeoutMs = 25000) {
   return false
 }
 
+async function ensureSearchForStart(searxngPort) {
+  if (String(process.env.EAB_SEARXNG_AUTO ?? '1').trim() === '0') {
+    return
+  }
+  try {
+    const result = await ensureSearxng({ settingsFile: SETTINGS_FILE, dataDir: DEV_DIR, port: searxngPort })
+    if (result.installed || !result.ok) {
+      if (result.ok) console.log(result.message)
+      else console.warn(`SearXNG 自动部署未完成：${result.message}`)
+    }
+  } catch (error) {
+    console.warn(`SearXNG 自动部署未完成：${error.message}`)
+    console.warn('EAB 会继续启动；搜索功能将保持“未配置/不可用”，可稍后执行 eab searxng install 重试。')
+  }
+}
+
 async function server(flags) {
   const { env, network } = serverEnv(flags)
   const effective = {
@@ -285,13 +331,16 @@ async function server(flags) {
   }
   const script = fileURLToPath(import.meta.url)
   const background = flags.background === true || flags.background === '1'
+  const searxngPort = flags['searxng-port'] !== undefined ? normalizeSearxngPort(flags['searxng-port']) : undefined
+  await ensureSearchForStart(searxngPort)
+  const childEnv = { ...env, EAB_SEARXNG_AUTO: '0' }
   if (background) {
     if (process.platform === 'win32') {
       // `start /b` 让进程脱离当前终端；必须用当前 node 的绝对路径，避免控制台/
       // 工具进程的 PATH 里没有 node 时后台启动静默失败。
       const child = spawn('cmd.exe', ['/c', 'start', '', '/b', process.execPath, script, 'server'], {
         cwd: ROOT,
-        env,
+        env: childEnv,
         detached: true,
         stdio: 'ignore',
         windowsHide: true,
@@ -300,7 +349,7 @@ async function server(flags) {
     } else {
       const child = spawn(process.execPath, [script, 'server'], {
         cwd: ROOT,
-        env,
+        env: childEnv,
         detached: true,
         stdio: 'ignore',
       })
@@ -711,6 +760,78 @@ function init() {
   if (existsSync(backups)) console.log(`备份目录：${backups}（${readdirSync(backups).length} 个）`)
 }
 
+async function searxngCommand(sub, flags) {
+  const action = sub ?? 'status'
+  const settingsFile = SETTINGS_FILE
+  const dataDir = DEV_DIR
+  const rawPort = flags.port !== undefined ? flags.port : flags['searxng-port']
+  const port = rawPort !== undefined ? normalizeSearxngPort(rawPort) : undefined
+  if (action === 'install' || action === 'ensure') {
+    const chosenPort = port === undefined ? await askSearxngPort() : port
+    const result = await ensureSearxng({ settingsFile, dataDir, port: chosenPort })
+    console.log(result.message)
+    if (!result.ok) process.exitCode = 1
+    return
+  }
+  if (action === 'start') {
+    const result = await startSearxng({ settingsFile, dataDir, port })
+    console.log(result.message)
+    if (!result.ok) process.exitCode = 1
+    return
+  }
+  if (action === 'stop') {
+    const result = await stopSearxng({ dataDir })
+    console.log(result.stopped ? 'SearXNG 已停止' : '没有由 EAB 管理的 SearXNG 在运行')
+    return
+  }
+  if (action === 'restart') {
+    await stopSearxng({ dataDir })
+    const result = await startSearxng({ settingsFile, dataDir, port })
+    console.log(result.message)
+    if (!result.ok) process.exitCode = 1
+    return
+  }
+  if (action === 'status' || action === 'show') {
+    const status = await statusSearxng({ settingsFile, dataDir })
+    const provider = process.env.EAB_WEB_SEARCH_PROVIDER || status.configuredProvider
+    const sameRuntimePort = status.state && Number(status.state.port) === urlPort(status.url)
+    const mode = !sameRuntimePort
+      ? status.healthy
+        ? '已有外部实例（非 EAB 自动安装）'
+        : '未安装（配置指向其它地址）'
+      : status.state?.mode === 'docker'
+        ? 'Docker'
+        : status.state?.mode === 'native'
+          ? '本机 Python'
+          : '未安装'
+    console.log(`provider：${provider}`)
+    console.log(`地址：${status.url}`)
+    console.log(`状态：${status.healthy ? '可用' : '不可用'}`)
+    console.log(`运行时：${mode}`)
+    console.log(`目录：${status.runtime}`)
+    if (flags.verbose === true || flags.verbose === '1') console.log(JSON.stringify(status.state ?? {}, null, 2))
+    return
+  }
+  if (action === 'url') {
+    const config = readSearchConfig()
+    console.log(normalizeBaseUrl(config.searxngUrl || DEFAULT_SEARXNG_URL))
+    return
+  }
+  throw new Error('用法：searxng install|start|restart [--port=8080|auto] | searxng stop|status|url')
+}
+
+function readSearchConfig() {
+  try {
+    const raw = JSON.parse(readFileSync(SETTINGS_FILE, 'utf8'))
+    return {
+      provider: raw.webSearch?.provider ?? 'auto',
+      searxngUrl: raw.webSearch?.searxngUrl ?? '',
+    }
+  } catch {
+    return { provider: 'auto', searxngUrl: '' }
+  }
+}
+
 function version() {
   const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'))
   console.log(`EAB CLI v${pkg.version}`)
@@ -720,7 +841,7 @@ function help() {
   console.log(`EAB CLI
   eab -v, --version    显示当前版本
   eab -h, --help       显示帮助
-  eab start [server] [--background] [--host=0.0.0.0] [--chat-port=8787] [--admin-port=8788]
+  eab start [server] [--background] [--host=0.0.0.0] [--chat-port=8787] [--admin-port=8788] [--searxng-port=8080|auto]
   eab restart [server] [--background]   先停止，再按 start 参数启动
   eab stop [server]                    停止本机 EAB 服务
   eab server                           兼容旧写法，等价 eab start server
@@ -741,6 +862,12 @@ function help() {
   eab audit export
   eab user create --name=张三 --dept=d10 --password=Eab@2026demo --no=U_ZS --roles=member
   eab plugin list
+  eab searxng status          查看自动部署的 SearXNG 地址、状态和运行时
+  eab searxng install [--port=8080|auto]  立即安装/补齐 SearXNG；省略 --port 时终端会询问，回车自动选空闲端口
+  eab searxng start [--port=8080|auto]    启动已安装的运行时
+  eab searxng stop                        停止 EAB 管理的 SearXNG
+  eab searxng restart [--port=8080|auto]  先停止，再在新端口启动
+  eab searxng url             输出当前搜索地址
 
 也可以直接执行：node scripts/eab.mjs <command>
 `)
@@ -765,6 +892,8 @@ try {
   } else if (command === 'plugin') {
     if (sub !== 'list') throw new Error('用法：plugin list')
     await pluginList()
+  } else if (command === 'searxng') {
+    await searxngCommand(sub, flags)
   } else if (command === 'server' || command === 'serve') {
     await server(flags)
   } else if (command === 'start') {

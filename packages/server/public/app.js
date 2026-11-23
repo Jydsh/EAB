@@ -231,7 +231,7 @@ const PAGES = {
   models: { title: '模型接入', sub: '供应商端点、模型目录与用途路由', render: () => loadModels() },
   tools: { title: '工具', sub: '智能体可调用的工具与审批要求', render: () => loadTools() },
   channels: { title: '渠道', sub: '飞书 / 钉钉 / 企业微信接入', render: () => loadSync() },
-  databases: { title: '数据连接', sub: '外部数据库与缓存连接、连通性测试与密钥配置', render: () => loadDatabases() },
+  databases: { title: '数据连接', sub: '数据库、缓存、联网搜索、浏览器与内网访问，统一配置和连通性测试', render: () => loadDatabases() },
   documents: { title: '在线文档', sub: 'OnlyOffice 服务绑定、内部回访与 JWT 校验', render: () => loadOnlyOffice() },
   company: { title: '公司设置', sub: '公司标识、状态与绑定关系', render: () => loadCompanyProfile() },
   usage: { title: '用量', sub: '对话请求与 token 消耗（按天 / 按人）', render: () => loadUsage() },
@@ -537,7 +537,7 @@ function queueTopToast(message, options = {}) {
 const DELETE_ACTION_FEEDBACK = /删除|移除|清空/
 
 /** 保存 / 删除按钮统一成功反馈：只在写请求成功后提示，失败时不误报。 */
-const SAVE_TOAST_SKIP_IDS = new Set(['save-role', 'save-role-console', 'branding-save', 'pm-save', 'oo-save'])
+const SAVE_TOAST_SKIP_IDS = new Set(['save-role', 'save-role-console', 'branding-save', 'pm-save', 'oo-save', 'web-search-save', 'browser-network-save'])
 let pendingSaveFeedback = null
 
 function clearPendingSaveFeedback() {
@@ -901,10 +901,7 @@ function renderCompanyPicker() {
       <div class="company-single${empty ? ' is-empty' : ''}" aria-label="当前公司">
         <span class="company-single-name">
           <strong>${esc(empty ? '未接入公司' : only?.name ?? '未接入公司')}</strong>
-          ${empty ? '' : `<code>${esc(only?.id ?? '')}</code>`}
         </span>
-        ${empty ? '' : `<span class="company-sources" aria-label="渠道来源">${companyChannelSources(only)}</span>`}
-        <span class="company-single-tag${empty ? ' is-waiting' : ''}">${empty ? '待创建' : '唯一组织'}</span>
       </div>`
     picker.onclick = null
     return
@@ -6141,7 +6138,7 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
   view.innerHTML = `
     <div class="role-workbench">
       ${roleRailHtml(allRoles, role.code)}
-      <div class="role-workbench-main">
+      <div class="role-workbench-main role-workbench-editor">
         <div class="role-detail-head">
           <div class="role-detail-identity">
             <span class="role-detail-avatar" aria-hidden="true">${esc(String(roleName).slice(0, 1))}</span>
@@ -6180,6 +6177,7 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
         <div><h2>角色权限</h2><span class="panel-sub">角色名、数据范围与权限点；保存后立即对本角色成员生效</span></div>
         ${hintBadge('角色说明', role.builtin ? '内置角色：改权限点会立即影响该角色下所有人。' : '自定义角色：只影响被授予该角色的成员。')}
       </div>
+      <div class="role-pane-body role-permissions-body">
       <div class="form-grid">
         <label>角色名<input id="role-name" value="${esc(role.name)}" /></label>
         <label>数据范围
@@ -6227,14 +6225,15 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
           )
           .join('')}
       </div>
-      <div class="panel-actions">
+      </div>
+      <div class="panel-actions role-pane-footer">
         <button class="btn primary" type="button" id="save-role">保存角色</button>
         ${
           role.builtin
             ? '<button class="btn ghost danger-text" type="button" id="delete-role" disabled title="内置角色不可删除">删除角色</button>'
             : '<button class="btn ghost danger-text" type="button" id="delete-role">删除角色</button>'
         }
-        <span class="muted" id="role-msg"></span>
+        <span class="muted" id="role-msg" role="status" aria-live="polite"></span>
       </div>
     </section>
     <section class="panel role-console-panel" data-role-pane="console"${activeRoleTab === 'console' ? '' : ' hidden'}>
@@ -6253,10 +6252,10 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
         </div>
         <span class="pill" id="role-console-granted">已授予 ${roleConsoleGrantedPages} 个页面</span>
       </div>
-      ${roleConsoleTree}
-      <div class="panel-actions">
+      <div class="role-pane-body role-console-body">${roleConsoleTree}</div>
+      <div class="panel-actions role-pane-footer">
         <button class="btn primary" type="button" id="save-role-console">保存后台权限</button>
-        <span class="muted" id="role-console-msg"></span>
+        <span class="muted" id="role-console-msg" role="status" aria-live="polite"></span>
       </div>
     </section>
     <section class="panel role-tools-panel" data-role-pane="tools"${activeRoleTab === 'tools' ? '' : ' hidden'}>
@@ -6282,6 +6281,7 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
           <span class="pill" id="role-tools-granted">已授权 ${roleToolsGranted} / ${roleTools.length} 个工具</span>
         </div>
       </div>
+      <div class="role-pane-body role-tools-body">
       ${
         toolAccess.error
           ? `<div class="empty role-tools-empty">工具目录加载失败：${esc(toolAccess.error)}。刷新后重试。</div>`
@@ -6332,7 +6332,8 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
                 </table>
               </div>`
       }
-      <div class="panel-actions">
+      </div>
+      <div class="panel-actions role-pane-footer">
         <button class="btn primary" type="button" id="save-role-tools"${
           toolAccess.error || role.code === 'super_admin' ? ' disabled' : ''
         }>保存可用工具</button>
@@ -6352,6 +6353,7 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
           <span class="muted" id="role-member-msg"></span>
         </div>
       </div>
+      <div class="role-pane-body role-member-pane-body">
       <div class="role-member-toolbar">
         <span class="role-member-count">已绑定 <strong id="role-member-count">${boundMembers.length}</strong> 人<span id="role-member-visible"></span></span>
         <input id="role-member-search" type="search" placeholder="搜索姓名、岗位、部门或角色" aria-label="搜索角色成员" />
@@ -6401,6 +6403,7 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
         }
         <div class="empty role-member-empty" id="role-member-filter-empty" hidden>没有匹配的成员，换个关键词试试。</div>
       </div>
+      </div>
     </section>
       </div>
     </div>`
@@ -6419,6 +6422,10 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
     }
     for (const pane of view.querySelectorAll('[data-role-pane]')) {
       pane.hidden = pane.dataset.rolePane !== state.roleTab
+      if (!pane.hidden) {
+        const body = pane.querySelector('.role-pane-body')
+        if (body) body.scrollTop = 0
+      }
     }
   }
   view.querySelectorAll('[data-role-tab]').forEach((button) => {
@@ -6455,7 +6462,16 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
   }
 
   const save = $('#save-role')
+  let roleSavePending = false
+  const setRoleSaveBusy = (busy) => {
+    roleSavePending = busy
+    save.disabled = busy
+    save.classList.toggle('is-loading', busy)
+    save.setAttribute('aria-busy', busy ? 'true' : 'false')
+    save.textContent = busy ? '保存中…' : '保存角色'
+  }
   save.addEventListener('click', async () => {
+    if (roleSavePending) return
     const msg = $('#role-msg')
     const scopes = [...document.querySelectorAll('[data-scope]:checked')].map((el) => el.dataset.scope)
     const quotaLimitRaw = $('#role-quota-limit').value.trim()
@@ -6476,6 +6492,7 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
         return
       }
     }
+    setRoleSaveBusy(true)
     msg.textContent = '保存中…'
     try {
       await apiSend('PUT', `/api/console/roles/${encodeURIComponent(role.code)}`, {
@@ -6496,17 +6513,31 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
       }
       msg.textContent = '已保存'
       showTopToast(`角色「${role.name}」已保存`)
-      loadRoles()
+      await loadRoles()
     } catch (err) {
       msg.textContent = err.message || '保存失败'
+    } finally {
+      if (save.isConnected) setRoleSaveBusy(false)
     }
   })
-  $('#save-role-console')?.addEventListener('click', async () => {
+  const saveConsole = $('#save-role-console')
+  let roleConsoleSavePending = false
+  const setRoleConsoleSaveBusy = (busy) => {
+    roleConsoleSavePending = busy
+    if (!saveConsole) return
+    saveConsole.disabled = busy
+    saveConsole.classList.toggle('is-loading', busy)
+    saveConsole.setAttribute('aria-busy', busy ? 'true' : 'false')
+    saveConsole.textContent = busy ? '保存中…' : '保存后台权限'
+  }
+  saveConsole?.addEventListener('click', async () => {
+    if (roleConsoleSavePending) return
     const msg = $('#role-console-msg')
     if (!roleConsoleCatalog) {
       msg.textContent = '后台页面目录未加载，刷新后再保存'
       return
     }
+    setRoleConsoleSaveBusy(true)
     msg.textContent = '保存中…'
     try {
       const consolePages = roleConsolePagesPayload()
@@ -6520,6 +6551,8 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
       showTopToast(`角色「${role.name}」后台权限已保存`)
     } catch (err) {
       msg.textContent = err.message || '保存失败'
+    } finally {
+      if (saveConsole.isConnected) setRoleConsoleSaveBusy(false)
     }
   })
 
@@ -13900,6 +13933,8 @@ async function loadSys() {
     const concurrency = await api('/api/console/concurrency').catch(() => null)
     const toolMetrics = await api('/api/console/tool-metrics?days=7').catch(() => null)
     const agentRuns = await api('/api/console/agent-runs?limit=50').catch(() => null)
+    const mcp = await api('/api/console/mcp').catch(() => null)
+    const a2a = await api('/api/console/a2a').catch(() => null)
     const jobs = await api('/api/console/jobs?limit=30').catch(() => null)
     const jobRows = jobs?.jobs ?? []
     const jobStatusText = {
@@ -13950,12 +13985,26 @@ async function loadSys() {
       envPresent: false,
       range: { min: 1, max: 32 },
     }
+    const agentCards = Array.isArray(settings?.agentCards) ? settings.agentCards : []
     const agentTeamSourceLabel =
       agentTeam.source === 'console'
         ? '控制台设置'
         : agentTeam.source === 'env'
           ? '环境变量 EAB_AGENT_MAX_WORKERS'
           : '默认值'
+    const agentCardHealthLabel = { healthy: '健康', degraded: '降级', offline: '离线', unknown: '未知' }
+    const mcpHealthLabel = { healthy: '健康', degraded: '降级', offline: '已停用', unknown: '未同步' }
+    const mcpServers = Array.isArray(mcp?.servers) ? mcp.servers : []
+    const mcpEditor = state.mcpEditor ?? null
+    const a2aHealthLabel = { healthy: '健康', degraded: '降级', offline: '已停用', unknown: '未同步' }
+    const a2aStateLabel = { submitted: '已提交', working: '执行中', 'input-required': '等输入', 'auth-required': '等授权', completed: '已完成', canceled: '已取消', failed: '失败', rejected: '已拒绝', unknown: '未知' }
+    const a2aPeers = Array.isArray(a2a?.peers) ? a2a.peers : []
+    const a2aTasks = Array.isArray(a2a?.tasks) ? a2a.tasks : []
+    const a2aInbound = a2a?.inbound ?? null
+    const a2aInboundTasks = Array.isArray(a2a?.inboundTasks) ? a2a.inboundTasks : []
+    const a2aInboundSkills = Array.isArray(a2aInbound?.effectiveSkills) ? a2aInbound.effectiveSkills : []
+    const a2aInboundToken = state.a2aInboundToken ?? ''
+    const a2aEditor = state.a2aEditor ?? null
     let agentRetentionDays = settings?.agentRetentionDays ?? 0
     let recordRetentionDays = settings?.recordRetentionDays ?? 0
     let workspaceRecycleDays = settings?.workspaceRecycleDays ?? 30
@@ -13997,7 +14046,7 @@ async function loadSys() {
           <div><span>开发身份切换</span><strong>${health.devAuth ? '<span class="pill warn">开启</span>' : '<span class="pill ok">关闭</span>'}</strong></div>
         </div>
       </section>
-      <section class="panel" data-section-panel="concurrency">
+      <section class="panel" data-section-panel="runtime">
         <div class="panel-head">
           <div><h2>并发与队列</h2>${hintBadge('并发说明', `对话 / 模型 / 工具 / 插件四级闸门；${toolStats?.shared || pluginStats?.shared ? '工具与插件的执行数是 Redis 里的全局计数（跨实例），对话与排队是本进程实时值。' : '数字是当前进程的实时值。'}`)}</div>
           <div class="panel-actions">
@@ -14100,6 +14149,233 @@ async function loadSys() {
             <button class="btn sm primary" type="button" id="agent-team-save">保存并生效</button>
             <button class="btn sm ghost" type="button" id="agent-team-reset"${agentTeam.configured === null ? ' disabled' : ''}>恢复环境变量默认</button>
           </div>
+        </div>
+        <div class="agent-manage-block">
+          <div class="panel-head">
+            <div><h3 class="agent-manage-subtitle">能力卡</h3>${hintBadge('能力卡说明', '内置五张岗位卡，公司可在 agent_cards 表覆盖同名岗位或追加远端 A2A 卡；这里只读展示，主 Agent 编队时只拿技能摘要和工具 id。')}</div>
+            <span class="pill">${agentCards.length} 张</span>
+          </div>
+          <div class="table-scroll">
+            <table class="data">
+              <thead><tr><th>岗位 / 名称</th><th>来源</th><th>技能</th><th>工具</th><th>限制</th><th>健康</th></tr></thead>
+              <tbody>
+                ${agentCards.length
+                  ? agentCards.map((card) => {
+                    const healthLabel = agentCardHealthLabel[card.health] ?? '未知'
+                    const healthClass = card.health === 'healthy' ? 'ok' : card.health === 'offline' ? 'warn' : 'warn'
+                    const sourceText = card.source === 'company'
+                      ? (card.overridden ? '公司覆盖' : '公司新增')
+                      : '代码内置'
+                    const limits = card.limits ?? {}
+                    const limitText = [
+                      limits.maxRounds ? `${limits.maxRounds} 轮` : '',
+                      limits.timeoutMs ? `${Math.round(limits.timeoutMs / 1000)} 秒` : '',
+                      limits.maxTokens ? `${limits.maxTokens} tokens` : '',
+                    ].filter(Boolean).join(' / ') || '继承默认'
+                    return `<tr>
+                      <td><span class="mono">${esc(card.agentKey)}</span><div class="desc">${esc(card.name)} · v${esc(card.version)}${card.enabled ? '' : ' · 已停用'}</div></td>
+                      <td>${esc(sourceText)}<div class="desc">${esc(card.kind)}</div></td>
+                      <td>${esc((card.skills ?? []).join('、') || '—')}</td>
+                      <td class="mono" style="max-width:300px;white-space:normal">${esc((card.tools ?? []).join(' / ') || '按任务下发')}</td>
+                      <td>${esc(limitText)}</td>
+                      <td><span class="pill ${healthClass}">${esc(healthLabel)}</span></td>
+                    </tr>`
+                  }).join('')
+                  : '<tr><td colspan="6" class="muted">能力卡未加载；刷新后重试</td></tr>'}
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <div class="agent-manage-block">
+          <div class="panel-head">
+            <div><h3 class="agent-manage-subtitle">MCP 工具</h3>${hintBadge('MCP 说明', '公司级登记 MCP Server，同步后只把 readOnlyHint=true 且未被白名单排除的工具放进模型目录。保存即尝试 tools/list；失败保留旧目录并标记降级。')}</div>
+            <span class="pill ${mcpServers.some((server) => server.health === 'healthy') ? 'ok' : 'warn'}">${mcpServers.length} 个 Server</span>
+          </div>
+          <div class="panel-actions" style="margin-bottom:12px">
+            <button class="btn sm primary" type="button" id="mcp-new">登记 Server</button>
+            <span class="desc">只读工具由 MCP Server 的 annotations 声明；写工具和破坏性工具不会下发。</span>
+          </div>
+          ${mcpEditor ? `<div style="border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:14px;background:var(--panel-2)">
+            <div class="panel-head" style="margin-bottom:10px">
+              <div><h3 class="agent-manage-subtitle">${mcpEditor.id ? '编辑 MCP Server' : '登记 MCP Server'}</h3></div>
+              <button class="btn sm ghost" type="button" id="mcp-cancel">取消</button>
+            </div>
+            <div class="kv-grid kv-2">
+              <label class="field"><span>名称</span><input id="mcp-name" value="${esc(mcpEditor.name ?? '')}" placeholder="例如：Docs Hub" autocomplete="off" /></label>
+              <label class="field"><span>传输</span><select id="mcp-transport">
+                <option value="http"${(mcpEditor.transport ?? 'http') === 'http' ? ' selected' : ''}>HTTP（Streamable HTTP）</option>
+                <option value="sse"${mcpEditor.transport === 'sse' ? ' selected' : ''}>SSE</option>
+              </select></label>
+            </div>
+            <label class="field" style="margin-top:10px"><span>端点</span><input id="mcp-endpoint" value="${esc(mcpEditor.endpoint ?? '')}" placeholder="https://mcp.example.com/mcp" autocomplete="off" /></label>
+            <div class="kv-grid kv-2" style="margin-top:10px">
+              <label class="field"><span>鉴权</span><select id="mcp-auth">
+                <option value="none"${(mcpEditor.authType ?? 'none') === 'none' ? ' selected' : ''}>无</option>
+                <option value="bearer"${mcpEditor.authType === 'bearer' ? ' selected' : ''}>Bearer Token</option>
+                <option value="header"${mcpEditor.authType === 'header' ? ' selected' : ''}>自定义 Header</option>
+              </select></label>
+              <label class="field"><span>密钥${mcpEditor.id ? '（留空保持不变）' : ''}</span><input id="mcp-secret" type="password" placeholder="${mcpEditor.id && mcpEditor.secretConfigured ? '已配置，留空不变' : 'Bearer 填 Token；Header 填「Header-Name: 值」'}" autocomplete="off" /></label>
+            </div>
+            <label class="field" style="margin-top:10px"><span>工具白名单（一行一个，留空=全部只读工具）</span><textarea id="mcp-allowed" rows="2" placeholder="docs.search">${esc((mcpEditor.allowedTools ?? []).join('\n'))}</textarea></label>
+            <div class="panel-actions" style="margin-top:10px;justify-content:flex-start">
+              <label style="display:flex;align-items:center;gap:6px"><input id="mcp-enabled" type="checkbox"${mcpEditor.enabled === false ? '' : ' checked'} /> 启用</label>
+              ${mcpEditor.id ? `<label style="display:flex;align-items:center;gap:6px"><input id="mcp-clear-secret" type="checkbox" /> 清除已保存密钥</label>` : ''}
+              <button class="btn sm primary" type="button" id="mcp-save">${mcpEditor.id ? '保存并同步' : '保存并同步'}</button>
+            </div>
+          </div>` : ''}
+          <div class="table-scroll">
+            <table class="data">
+              <thead><tr><th>Server / 传输</th><th>端点</th><th>鉴权</th><th>工具</th><th>健康</th><th>最近同步</th><th>操作</th></tr></thead>
+              <tbody>
+                ${mcpServers.length
+                  ? mcpServers.map((server) => {
+                    const healthClass = server.health === 'healthy' ? 'ok' : 'warn'
+                    const authText = server.authType === 'none' ? '无' : server.authType === 'bearer' ? 'Bearer' : 'Header'
+                    return `<tr>
+                      <td><strong>${esc(server.name)}</strong><div class="desc">${esc(String(server.transport).toUpperCase())} · ${server.enabled ? '启用' : '停用'}</div></td>
+                      <td class="mono" style="max-width:260px;white-space:normal">${esc(server.endpoint)}</td>
+                      <td>${authText}<div class="desc">${server.secretConfigured ? '已配置' : '未配置'}</div></td>
+                      <td>${server.readOnlyToolCount} / ${server.toolCount}<div class="desc">只读 / 全部</div>
+                        ${(server.tools ?? []).filter((tool) => tool.readOnly).length
+                          ? `<details><summary>只读工具</summary><div class="mono" style="font-size:11px;white-space:normal">${esc((server.tools ?? []).filter((tool) => tool.readOnly).map((tool) => `${tool.name}${tool.enabled ? '' : '（未启用）'}`).join(' / '))}</div></details>`
+                          : ''}
+                      </td>
+                      <td><span class="pill ${healthClass}">${esc(mcpHealthLabel[server.health] ?? '未知')}</span>${server.lastError ? `<div class="desc" title="${esc(server.lastError)}">${esc(server.lastError.slice(0, 70))}</div>` : ''}</td>
+                      <td>${server.lastSyncAt ? fmtDateTime(server.lastSyncAt) : '—'}<div class="desc">失败 ${server.failureCount ?? 0} 次${server.cooldownUntil ? ` · 冷却至 ${fmtDateTime(server.cooldownUntil)}` : ''}</div></td>
+                      <td style="white-space:nowrap">
+                        <button class="btn sm ghost" type="button" data-mcp-edit="${esc(server.id)}">编辑</button>
+                        <button class="btn sm ghost" type="button" data-mcp-sync="${esc(server.id)}">同步</button>
+                        <button class="btn sm ghost" type="button" data-mcp-delete="${esc(server.id)}">删除</button>
+                      </td>
+                    </tr>`
+                  }).join('')
+                  : '<tr><td colspan="7" class="muted">还没有 MCP Server；登记后主 Agent 才能通过 tool_search 发现只读工具</td></tr>'}
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <div class="agent-manage-block">
+          <div class="panel-head">
+            <div><h3 class="agent-manage-subtitle">A2A 远端 Agent</h3>${hintBadge('A2A 说明', '公司级登记远端 Agent，同步 Agent Card 后主 Agent 才能用 a2a_delegate 派遣。Card 必须与端点同源；技能白名单非空时必须指定其中一个技能；连续失败会熔断 60 秒。')}</div>
+            <span class="pill ${a2aPeers.some((peer) => peer.health === 'healthy') ? 'ok' : 'warn'}">${a2aPeers.length} 个 Agent</span>
+          </div>
+          <div class="panel-actions" style="margin-bottom:12px">
+            <button class="btn sm primary" type="button" id="a2a-new">登记 Agent</button>
+            <span class="desc">只登记 Agent Card 和任务映射；远端附件只保存 URI，不复制文件。</span>
+          </div>
+          <div style="border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:14px;background:var(--panel-2)">
+            <div class="panel-head" style="margin-bottom:10px">
+              <div><h3 class="agent-manage-subtitle">EAB 入站端点</h3>${hintBadge('A2A 入站说明', '外部 Agent 通过 /.well-known/agent.json 发现受限技能，用 Bearer 令牌调用 /a2a。第一版只做无工具问答，不读取工作区、知识库、记忆或内部 Agent 工具，也不允许远端继续派活。')}</div>
+              <span class="pill ${a2aInbound?.enabled ? 'ok' : 'warn'}">${a2aInbound?.enabled ? '已启用' : '未启用'}</span>
+            </div>
+            <div class="kv-grid kv-2">
+              <label class="field"><span>对外访问地址 <span class="desc">可选，例如 https://eab.example.com</span></span><input id="a2a-inbound-public-url" value="${esc(a2aInbound?.publicBaseUrl ?? '')}" placeholder="留空按当前请求 Host 生成" autocomplete="off" /></label>
+              <label class="field"><span>入站模型 ID <span class="desc">留空自动选第一个对话模型</span></span><input id="a2a-inbound-model" value="${esc(a2aInbound?.modelId ?? '')}" placeholder="model_general" autocomplete="off" /></label>
+            </div>
+            <label class="field" style="margin-top:10px"><span>技能白名单 <span class="desc">一行一个 id；当前仅 eab.answer</span></span><textarea id="a2a-inbound-skills" rows="2" placeholder="eab.answer">${esc((a2aInbound?.allowedSkills ?? []).join('\n'))}</textarea></label>
+            <div class="kv-grid kv-2" style="margin-top:10px">
+              <div class="field"><span>Agent Card</span><div class="mono" style="font-size:12px;white-space:normal">${esc(a2aInbound?.cardUrl ?? '—')}</div></div>
+              <div class="field"><span>JSON-RPC 端点</span><div class="mono" style="font-size:12px;white-space:normal">${esc(a2aInbound?.endpoint ?? '—')}</div></div>
+            </div>
+            <div class="panel-actions" style="margin-top:12px;justify-content:flex-start;flex-wrap:wrap">
+              <label style="display:flex;align-items:center;gap:6px"><input id="a2a-inbound-enabled" type="checkbox"${a2aInbound?.enabled ? ' checked' : ''} /> 启用入站</label>
+              <button class="btn sm primary" type="button" id="a2a-inbound-save">保存入站设置</button>
+              <button class="btn sm ghost" type="button" id="a2a-inbound-token">${a2aInbound?.tokenConfigured ? '轮换令牌' : '生成令牌'}</button>
+              ${a2aInbound?.tokenConfigured ? `<button class="btn sm ghost" type="button" id="a2a-inbound-token-clear">清除令牌</button>` : ''}
+              <span class="desc">令牌只展示一次；外部调用方用 Authorization: Bearer。</span>
+            </div>
+            ${a2aInboundToken ? `<div style="margin-top:12px;border:1px dashed var(--line);border-radius:8px;padding:10px;background:var(--panel)">
+              <div class="panel-actions" style="justify-content:space-between;margin-bottom:6px"><strong>新令牌（只显示这一次）</strong><button class="btn sm ghost" type="button" id="a2a-inbound-token-copy">复制</button></div>
+              <div class="mono" id="a2a-inbound-token-value" style="font-size:12px;word-break:break-all;user-select:all">${esc(a2aInboundToken)}</div>
+            </div>` : ''}
+          </div>
+          ${a2aEditor ? `<div style="border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:14px;background:var(--panel-2)">
+            <div class="panel-head" style="margin-bottom:10px">
+              <div><h3 class="agent-manage-subtitle">${a2aEditor.id ? '编辑 A2A Agent' : '登记 A2A Agent'}</h3></div>
+              <button class="btn sm ghost" type="button" id="a2a-cancel">取消</button>
+            </div>
+            <div class="kv-grid kv-2">
+              <label class="field"><span>名称</span><input id="a2a-name" value="${esc(a2aEditor.name ?? '')}" placeholder="例如：旅行规划员" autocomplete="off" /></label>
+              <label class="field"><span>鉴权</span><select id="a2a-auth">
+                <option value="none"${(a2aEditor.authType ?? 'none') === 'none' ? ' selected' : ''}>无</option>
+                <option value="bearer"${a2aEditor.authType === 'bearer' ? ' selected' : ''}>Bearer Token</option>
+              </select></label>
+            </div>
+            <label class="field" style="margin-top:10px"><span>A2A JSON-RPC 端点</span><input id="a2a-endpoint" value="${esc(a2aEditor.endpoint ?? '')}" placeholder="https://agent.example.com/a2a" autocomplete="off" /></label>
+            <label class="field" style="margin-top:10px"><span>Agent Card 地址 <span class="desc">留空使用同源 /.well-known/agent.json</span></span><input id="a2a-card-url" value="${esc(a2aEditor.cardUrl ?? '')}" placeholder="https://agent.example.com/.well-known/agent.json" autocomplete="off" /></label>
+            <div class="kv-grid kv-2" style="margin-top:10px">
+              <label class="field"><span>密钥${a2aEditor.id ? '（留空保持不变）' : ''}</span><input id="a2a-secret" type="password" placeholder="${a2aEditor.id && a2aEditor.secretConfigured ? '已配置，留空不变' : 'Bearer Token'}" autocomplete="off" /></label>
+              <label class="field"><span>技能白名单（一行一个 id 或名称，留空=全部）</span><textarea id="a2a-allowed" rows="2" placeholder="travel.plan">${esc((a2aEditor.allowedSkills ?? []).join('\n'))}</textarea></label>
+            </div>
+            <div class="panel-actions" style="margin-top:10px;justify-content:flex-start">
+              <label style="display:flex;align-items:center;gap:6px"><input id="a2a-enabled" type="checkbox"${a2aEditor.enabled === false ? '' : ' checked'} /> 启用</label>
+              ${a2aEditor.id ? `<label style="display:flex;align-items:center;gap:6px"><input id="a2a-clear-secret" type="checkbox" /> 清除已保存密钥</label>` : ''}
+              <button class="btn sm primary" type="button" id="a2a-save">${a2aEditor.id ? '保存并同步' : '保存并同步'}</button>
+            </div>
+          </div>` : ''}
+          <div class="table-scroll">
+            <table class="data">
+              <thead><tr><th>Agent / 端点</th><th>技能</th><th>鉴权</th><th>健康</th><th>最近同步</th><th>操作</th></tr></thead>
+              <tbody>
+                ${a2aPeers.length
+                  ? a2aPeers.map((peer) => {
+                    const healthClass = peer.health === 'healthy' ? 'ok' : 'warn'
+                    return `<tr>
+                      <td><strong>${esc(peer.name)}</strong><div class="desc mono" style="max-width:260px;white-space:normal">${esc(peer.endpoint)}</div><div class="desc">${peer.enabled ? '启用' : '停用'} · peer=${esc(peer.id)}</div></td>
+                      <td style="max-width:300px;white-space:normal">${esc((peer.effectiveSkills ?? []).join('、') || '—')}<div class="desc">白名单 ${esc((peer.allowedSkills ?? []).join('、') || '未限制')}</div></td>
+                      <td>${peer.authType === 'bearer' ? 'Bearer' : '无'}<div class="desc">${peer.secretConfigured ? '已配置' : '未配置'}</div></td>
+                      <td><span class="pill ${healthClass}">${esc(a2aHealthLabel[peer.health] ?? '未知')}</span>${peer.lastError ? `<div class="desc" title="${esc(peer.lastError)}">${esc(peer.lastError.slice(0, 70))}</div>` : ''}</td>
+                      <td>${peer.lastSyncAt ? fmtDateTime(peer.lastSyncAt) : '—'}<div class="desc">失败 ${peer.failureCount ?? 0} 次${peer.cooldownActive ? ` · 冷却至 ${fmtDateTime(peer.cooldownUntil)}` : ''}</div></td>
+                      <td style="white-space:nowrap">
+                        <button class="btn sm ghost" type="button" data-a2a-edit="${esc(peer.id)}">编辑</button>
+                        <button class="btn sm ghost" type="button" data-a2a-sync="${esc(peer.id)}">同步</button>
+                        <button class="btn sm ghost" type="button" data-a2a-delete="${esc(peer.id)}">删除</button>
+                      </td>
+                    </tr>`
+                  }).join('')
+                  : '<tr><td colspan="6" class="muted">还没有 A2A Agent；同步 Card 后主 Agent 才能通过 a2a_delegate 派遣</td></tr>'}
+              </tbody>
+            </table>
+          </div>
+          <details style="margin-top:12px">
+            <summary>最近派遣任务（${a2aTasks.length} 条）</summary>
+            <div class="table-scroll" style="margin-top:8px">
+              <table class="data">
+                <thead><tr><th>任务</th><th>远端 Agent</th><th>状态</th><th>Trace</th><th>创建时间</th></tr></thead>
+                <tbody>
+                  ${a2aTasks.length
+                    ? a2aTasks.map((task) => `<tr>
+                      <td class="mono" style="max-width:220px;white-space:normal">${esc(task.id)}<div class="desc">${esc(task.skillId || '未指定技能')}</div></td>
+                      <td>${esc(task.peerName || task.peerId)}<div class="desc mono">${esc(task.remoteTaskId || '—')}</div></td>
+                      <td>${esc(a2aStateLabel[task.state] ?? task.state)}${task.error ? `<div class="desc" title="${esc(task.error)}">${esc(task.error.slice(0, 70))}</div>` : ''}</td>
+                      <td class="mono">${esc(task.traceId || '—')}</td>
+                      <td>${fmtDateTime(task.createdAt)}</td>
+                    </tr>`).join('')
+                    : '<tr><td colspan="5" class="muted">还没有派遣记录</td></tr>'}
+                </tbody>
+              </table>
+            </div>
+          </details>
+          <details style="margin-top:12px">
+            <summary>最近入站任务（${a2aInboundTasks.length} 条）</summary>
+            <div class="table-scroll" style="margin-top:8px">
+              <table class="data">
+                <thead><tr><th>任务</th><th>技能</th><th>状态</th><th>用量</th><th>创建时间</th><th>结果</th></tr></thead>
+                <tbody>
+                  ${a2aInboundTasks.length
+                    ? a2aInboundTasks.map((task) => `<tr>
+                      <td class="mono" style="max-width:220px;white-space:normal">${esc(task.id)}<div class="desc">context=${esc(task.contextId)}</div></td>
+                      <td>${esc(task.skillId)}</td>
+                      <td>${esc(a2aStateLabel[task.state] ?? task.state)}${task.error ? `<div class="desc" title="${esc(task.error)}">${esc(task.error.slice(0, 70))}</div>` : ''}</td>
+                      <td>${Number(task.promptTokens ?? 0)} + ${Number(task.completionTokens ?? 0)}<div class="desc">输入 / 输出 token</div></td>
+                      <td>${fmtDateTime(task.createdAt)}</td>
+                      <td style="max-width:280px;white-space:normal">${task.resultText ? `<span title="${esc(task.resultText.slice(0, 1000))}">${esc(task.resultText.slice(0, 90))}${task.resultText.length > 90 ? '…' : ''}</span>` : '<span class="muted">—</span>'}</td>
+                    </tr>`).join('')
+                    : '<tr><td colspan="6" class="muted">还没有入站任务</td></tr>'}
+                </tbody>
+              </table>
+            </div>
+          </details>
         </div>
         <div class="agent-manage-block">
           <div class="panel-head">
@@ -14656,6 +14932,256 @@ async function loadSys() {
       })
       reset?.addEventListener('click', async () => {
         await save(null, 'Agent 管理已更新：已恢复环境变量默认；新回合立即生效')
+      })
+    }
+    const mcpNew = $('#mcp-new')
+    if (mcpNew) {
+      mcpNew.addEventListener('click', () => {
+        state.mcpEditor = { id: '', name: '', transport: 'http', endpoint: '', authType: 'none', allowedTools: [], enabled: true }
+        PAGES.system.render()
+      })
+      const cancel = $('#mcp-cancel')
+      cancel?.addEventListener('click', () => {
+        delete state.mcpEditor
+        PAGES.system.render()
+      })
+      view.querySelectorAll('[data-mcp-edit]').forEach((button) => {
+        button.addEventListener('click', () => {
+          const server = mcpServers.find((row) => row.id === button.dataset.mcpEdit)
+          if (!server) return
+          state.mcpEditor = {
+            id: server.id,
+            name: server.name,
+            transport: server.transport,
+            endpoint: server.endpoint,
+            authType: server.authType,
+            allowedTools: server.allowedTools ?? [],
+            enabled: server.enabled,
+            secretConfigured: server.secretConfigured,
+          }
+          PAGES.system.render()
+        })
+      })
+      view.querySelectorAll('[data-mcp-sync]').forEach((button) => {
+        button.addEventListener('click', async () => {
+          button.disabled = true
+          try {
+            const result = await apiPost(`/api/console/mcp/${encodeURIComponent(button.dataset.mcpSync)}/sync`, {})
+            showTopToast(result?.sync?.ok
+              ? `同步完成：${result.sync.readOnlyToolCount} 个只读工具可用`
+              : `同步失败：${result?.sync?.error || 'MCP Server 未返回工具'}`, { tone: result?.sync?.ok ? 'ok' : 'warn' })
+            await PAGES.system.render()
+          } catch (err) {
+            showTopToast(err.message || 'MCP 同步失败', { tone: 'warn' })
+            button.disabled = false
+          }
+        })
+      })
+      view.querySelectorAll('[data-mcp-delete]').forEach((button) => {
+        button.addEventListener('click', async () => {
+          const server = mcpServers.find((row) => row.id === button.dataset.mcpDelete)
+          if (!server) return
+          if (!window.confirm(`删除 MCP Server「${server.name}」？\n\n工具目录和已保存密钥会一起删除，主 Agent 将不再能调用这些只读工具。`)) return
+          button.disabled = true
+          try {
+            await apiSend('DELETE', `/api/console/mcp/${encodeURIComponent(server.id)}`)
+            showTopToast('MCP Server 已删除')
+            await PAGES.system.render()
+          } catch (err) {
+            showTopToast(err.message || '删除失败', { tone: 'warn' })
+            button.disabled = false
+          }
+        })
+      })
+      const save = $('#mcp-save')
+      save?.addEventListener('click', async () => {
+        const name = String($('#mcp-name')?.value ?? '').trim()
+        const endpoint = String($('#mcp-endpoint')?.value ?? '').trim()
+        if (!name) return showTopToast('请填写 MCP Server 名称', { tone: 'warn' })
+        if (!endpoint) return showTopToast('请填写 MCP Server 端点', { tone: 'warn' })
+        const body = {
+          name,
+          transport: String($('#mcp-transport')?.value ?? 'http'),
+          endpoint,
+          authType: String($('#mcp-auth')?.value ?? 'none'),
+          allowedTools: String($('#mcp-allowed')?.value ?? '').split(/[\n,，]+/).map((item) => item.trim()).filter(Boolean),
+          enabled: Boolean($('#mcp-enabled')?.checked),
+        }
+        const secret = String($('#mcp-secret')?.value ?? '').trim()
+        if (secret) body.secret = secret
+        if ($('#mcp-clear-secret')?.checked) body.clearSecret = true
+        save.disabled = true
+        save.textContent = '保存并同步…'
+        try {
+          const result = mcpEditor.id
+            ? await apiSend('PATCH', `/api/console/mcp/${encodeURIComponent(mcpEditor.id)}`, body)
+            : await apiPost('/api/console/mcp', body)
+          const sync = result?.sync
+          showTopToast(sync && !sync.ok
+            ? `Server 已保存，但工具同步失败：${sync.error || '未知错误'}`
+            : `MCP Server 已保存：${sync?.readOnlyToolCount ?? 0} 个只读工具可用`, { tone: sync && !sync.ok ? 'warn' : 'ok' })
+          delete state.mcpEditor
+          await PAGES.system.render()
+        } catch (err) {
+          showTopToast(err.message || 'MCP Server 保存失败', { tone: 'warn' })
+          save.disabled = false
+          save.textContent = mcpEditor.id ? '保存并同步' : '保存并同步'
+        }
+      })
+    }
+    const a2aInboundSave = $('#a2a-inbound-save')
+    if (a2aInboundSave) {
+      a2aInboundSave.addEventListener('click', async () => {
+        const body = {
+          enabled: Boolean($('#a2a-inbound-enabled')?.checked),
+          allowedSkills: String($('#a2a-inbound-skills')?.value ?? '').split(/[\n,，]+/).map((item) => item.trim()).filter(Boolean),
+          modelId: String($('#a2a-inbound-model')?.value ?? '').trim(),
+          publicBaseUrl: String($('#a2a-inbound-public-url')?.value ?? '').trim(),
+        }
+        a2aInboundSave.disabled = true
+        a2aInboundSave.textContent = '保存中…'
+        try {
+          const result = await apiSend('PUT', '/api/console/a2a/inbound', body)
+          showTopToast(result?.inbound?.enabled ? '入站端点已启用' : '入站端点已停用')
+          await PAGES.system.render()
+        } catch (err) {
+          showTopToast(err.message || '入站设置保存失败', { tone: 'warn' })
+          a2aInboundSave.disabled = false
+          a2aInboundSave.textContent = '保存入站设置'
+        }
+      })
+      const rotate = $('#a2a-inbound-token')
+      rotate?.addEventListener('click', async () => {
+        if (a2aInbound?.tokenConfigured && !window.confirm('轮换令牌会让旧令牌立即失效，外部 Agent 需要同步更新。继续？')) return
+        rotate.disabled = true
+        try {
+          const result = await apiPost('/api/console/a2a/inbound/token', {})
+          state.a2aInboundToken = result?.token ?? ''
+          showTopToast('新令牌已生成，只显示这一次')
+          await PAGES.system.render()
+        } catch (err) {
+          showTopToast(err.message || '令牌生成失败', { tone: 'warn' })
+          rotate.disabled = false
+        }
+      })
+      const clearToken = $('#a2a-inbound-token-clear')
+      clearToken?.addEventListener('click', async () => {
+        if (!window.confirm('清除令牌会同时停用入站端点，外部 Agent 将立即无法调用。继续？')) return
+        clearToken.disabled = true
+        try {
+          await apiSend('DELETE', '/api/console/a2a/inbound/token')
+          state.a2aInboundToken = ''
+          showTopToast('入站令牌已清除，端点已停用')
+          await PAGES.system.render()
+        } catch (err) {
+          showTopToast(err.message || '清除令牌失败', { tone: 'warn' })
+          clearToken.disabled = false
+        }
+      })
+      const copyToken = $('#a2a-inbound-token-copy')
+      copyToken?.addEventListener('click', async () => {
+        try {
+          await navigator.clipboard.writeText(a2aInboundToken)
+          copyToken.textContent = '已复制'
+          setTimeout(() => { copyToken.textContent = '复制' }, 1200)
+        } catch {
+          showTopToast('复制失败，请手动选择令牌文本', { tone: 'warn' })
+        }
+      })
+    }
+    const a2aNew = $('#a2a-new')
+    if (a2aNew) {
+      a2aNew.addEventListener('click', () => {
+        state.a2aEditor = { id: '', name: '', endpoint: '', cardUrl: '', authType: 'none', allowedSkills: [], enabled: true }
+        PAGES.system.render()
+      })
+      const cancel = $('#a2a-cancel')
+      cancel?.addEventListener('click', () => {
+        delete state.a2aEditor
+        PAGES.system.render()
+      })
+      view.querySelectorAll('[data-a2a-edit]').forEach((button) => {
+        button.addEventListener('click', () => {
+          const peer = a2aPeers.find((row) => row.id === button.dataset.a2aEdit)
+          if (!peer) return
+          state.a2aEditor = {
+            id: peer.id,
+            name: peer.name,
+            endpoint: peer.endpoint,
+            cardUrl: peer.cardUrl,
+            authType: peer.authType,
+            allowedSkills: peer.allowedSkills ?? [],
+            enabled: peer.enabled,
+            secretConfigured: peer.secretConfigured,
+          }
+          PAGES.system.render()
+        })
+      })
+      view.querySelectorAll('[data-a2a-sync]').forEach((button) => {
+        button.addEventListener('click', async () => {
+          button.disabled = true
+          try {
+            const result = await apiPost(`/api/console/a2a/${encodeURIComponent(button.dataset.a2aSync)}/sync`, {})
+            showTopToast(result?.sync?.ok
+              ? `同步完成：${result.sync.skillCount} 个技能可用`
+              : `同步失败：${result?.sync?.error || 'Agent Card 不可用'}`, { tone: result?.sync?.ok ? 'ok' : 'warn' })
+            await PAGES.system.render()
+          } catch (err) {
+            showTopToast(err.message || 'A2A 同步失败', { tone: 'warn' })
+            button.disabled = false
+          }
+        })
+      })
+      view.querySelectorAll('[data-a2a-delete]').forEach((button) => {
+        button.addEventListener('click', async () => {
+          const peer = a2aPeers.find((row) => row.id === button.dataset.a2aDelete)
+          if (!peer) return
+          if (!window.confirm(`删除 A2A Agent「${peer.name}」？\n\nAgent Card、派遣记录入口和已保存密钥会一起删除，主 Agent 将不再能派遣到它。`)) return
+          button.disabled = true
+          try {
+            await apiSend('DELETE', `/api/console/a2a/${encodeURIComponent(peer.id)}`)
+            showTopToast('A2A Agent 已删除')
+            await PAGES.system.render()
+          } catch (err) {
+            showTopToast(err.message || '删除失败', { tone: 'warn' })
+            button.disabled = false
+          }
+        })
+      })
+      const save = $('#a2a-save')
+      save?.addEventListener('click', async () => {
+        const name = String($('#a2a-name')?.value ?? '').trim()
+        const endpoint = String($('#a2a-endpoint')?.value ?? '').trim()
+        if (!name) return showTopToast('请填写 A2A Agent 名称', { tone: 'warn' })
+        if (!endpoint) return showTopToast('请填写 A2A JSON-RPC 端点', { tone: 'warn' })
+        const body = {
+          name,
+          endpoint,
+          cardUrl: String($('#a2a-card-url')?.value ?? '').trim(),
+          authType: String($('#a2a-auth')?.value ?? 'none'),
+          allowedSkills: String($('#a2a-allowed')?.value ?? '').split(/[\n,，]+/).map((item) => item.trim()).filter(Boolean),
+          enabled: Boolean($('#a2a-enabled')?.checked),
+        }
+        const secret = String($('#a2a-secret')?.value ?? '').trim()
+        if (secret) body.secret = secret
+        if ($('#a2a-clear-secret')?.checked) body.clearSecret = true
+        save.disabled = true
+        save.textContent = '保存并同步…'
+        try {
+          const result = a2aEditor.id
+            ? await apiSend('PATCH', `/api/console/a2a/${encodeURIComponent(a2aEditor.id)}`, body)
+            : await apiPost('/api/console/a2a', body)
+          const sync = result?.sync
+          showTopToast(sync && !sync.ok
+            ? `Agent 已保存，但 Card 同步失败：${sync.error || '未知错误'}`
+            : `A2A Agent 已保存：${sync?.skillCount ?? 0} 个技能可用`, { tone: sync && !sync.ok ? 'warn' : 'ok' })
+          delete state.a2aEditor
+          await PAGES.system.render()
+        } catch (err) {
+          showTopToast(err.message || 'A2A Agent 保存失败', { tone: 'warn' })
+          save.disabled = false
+          save.textContent = a2aEditor.id ? '保存并同步' : '保存并同步'
+        }
       })
     }
     const retentionSave = $('#retention-save')
@@ -17073,6 +17599,12 @@ const WEEKDAY_LABEL = ['周日', '周一', '周二', '周三', '周四', '周五
 const DB_STATUS_LABEL = { untested: '未检测', ok: '可用', error: '连接失败' }
 const DB_STATUS_PILL = { untested: '', ok: 'ok', error: 'danger' }
 const DB_CATEGORY_LABEL = { relational: '关系型数据库', file: '文件数据库', cache: '键值缓存' }
+const DB_DRIVER_FALLBACK = [
+  { id: 'postgres', label: 'PostgreSQL', category: 'relational', categoryLabel: '关系型数据库', defaultPort: 5432, supportsSsl: true, supportsTls: true, supportsQuery: true, notes: '关系型数据库：主机、端口、数据库名、账号；可选 TLS。' },
+  { id: 'mysql', label: 'MySQL / MariaDB', category: 'relational', categoryLabel: '关系型数据库', defaultPort: 3306, supportsSsl: true, supportsTls: true, supportsQuery: true, notes: '关系型数据库：主机、端口、数据库名、账号；MySQL 8 默认使用 caching_sha2_password。' },
+  { id: 'sqlite', label: 'SQLite', category: 'file', categoryLabel: '文件数据库', defaultPort: null, supportsSsl: false, supportsTls: false, supportsQuery: true, notes: '文件数据库：填写服务器上的绝对路径；探测只读打开，不会创建新文件。' },
+  { id: 'redis', label: 'Redis', category: 'cache', categoryLabel: '键值缓存', defaultPort: 6379, supportsSsl: true, supportsTls: true, supportsQuery: false, notes: '键值缓存：主机、端口、DB 编号、可选 ACL 账号；探针执行 PING，不开放 SQL 查询。' },
+]
 
 function databaseStatusPill(item) {
   if (!item.enabled) return '<span class="pill">已停用</span>'
@@ -17122,6 +17654,862 @@ function databaseRowActions(item) {
     <button class="link-btn" type="button" data-db-edit="${id}">编辑</button>
     <button class="link-btn danger-link" type="button" data-db-delete="${id}">删除</button>
   </div>`
+}
+
+/* ---------------- 数据连接：搜索与浏览器接入 ---------------- */
+
+const WEB_SEARCH_PROVIDER_LABEL = {
+  none: '未配置',
+  searxng: 'SearXNG',
+  bocha: '博查',
+  tavily: 'Tavily',
+  serper: 'Serper',
+}
+
+const WEB_SEARCH_SOURCE_LABEL = {
+  env: '环境变量',
+  console: '控制台设置',
+  default: '未配置',
+}
+
+const WEB_SEARCH_PROVIDER_ORDER = ['auto', 'none', 'searxng', 'bocha', 'tavily', 'serper']
+
+const WEB_SEARCH_PROVIDER_META = {
+  auto: { title: '自动', icon: 'AU', desc: '环境变量优先', iconClass: 'db-category-api' },
+  none: { title: '关闭搜索', icon: '—', desc: '不调用搜索', iconClass: 'db-category-policy' },
+  searxng: { title: 'SearXNG', icon: 'SE', desc: '自建、免 Key', iconClass: 'db-category-api' },
+  bocha: { title: '博查', icon: '博', desc: '中文搜索 API', iconClass: 'db-category-api' },
+  tavily: { title: 'Tavily', icon: 'TV', desc: '面向 Agent 的搜索', iconClass: 'db-category-api' },
+  serper: { title: 'Serper', icon: 'SR', desc: 'Google 搜索 API', iconClass: 'db-category-api' },
+}
+
+function webSearchInitialProvider(webSearch) {
+  if (webSearch.configuredProvider) return webSearch.configuredProvider
+  if (webSearch.provider && webSearch.provider !== 'none') return webSearch.provider
+  return 'auto'
+}
+
+function webSearchProviderState(webSearch, id) {
+  if (id === 'auto') return webSearch.providerSource === 'env' ? '跟随环境' : '自动'
+  if (id === 'none') return webSearch.provider === 'none' ? '当前' : '关闭'
+  if (webSearch.provider === id) return '当前'
+  if (id === 'searxng') return webSearch.searxngUrl || webSearch.effectiveSearxngUrl ? '已保存' : '未配置'
+  return webSearch.keys?.[id] ? '已保存' : '未配置'
+}
+
+function webSearchProviderTone(state) {
+  if (state === '未配置') return 'warn'
+  if (state === '关闭') return ''
+  return 'ok'
+}
+
+const BROWSER_CHANNEL_LABEL = {
+  msedge: 'Edge',
+  chrome: 'Chrome',
+  chromium: 'Chromium',
+}
+
+function webServicesDefaults(settings) {
+  return {
+    webSearch: settings?.webSearch ?? {
+      provider: 'none',
+      configured: false,
+      detail: '未配置搜索服务',
+      configuredProvider: null,
+      searxngUrl: '',
+      effectiveSearxngUrl: null,
+      searxngUrlSource: 'none',
+      providerSource: 'default',
+      keys: { bocha: false, tavily: false, serper: false },
+    },
+    browserCap: settings?.browser ?? {
+      enabled: false,
+      available: false,
+      channel: '—',
+      detail: '状态未读取',
+      proxy: null,
+    },
+    browserNetwork: settings?.browserNetwork ?? {
+      allowPrivateNetwork: false,
+      allowedHosts: [],
+      enabled: false,
+      missingHosts: false,
+    },
+  }
+}
+
+function webSearchServiceState(webSearch, probe) {
+  if (probe && !probe.ok) {
+    return { label: '连接失败', tone: 'danger', detail: probe.error || '搜索测试未通过' }
+  }
+  if (probe?.ok) {
+    return { label: '可用', tone: 'ok', detail: `测试通过 · ${Number(probe.latencyMs || 0)} ms` }
+  }
+  if (webSearch.configured) return { label: '未检测', tone: '', detail: '已配置，可点“测试”验证' }
+  return { label: '未配置', tone: 'warn', detail: webSearch.detail || '未配置搜索服务' }
+}
+
+function webSearchLastTest(probe) {
+  if (!probe) return '<span class="muted">尚未测试</span>'
+  const count = Array.isArray(probe.results) ? probe.results.length : 0
+  return `${esc(fmtTime(probe.at))}<div class="desc">${probe.ok ? `${count} 条结果` : '测试失败'}</div>`
+}
+
+function webServiceEntries(settings) {
+  if (!settings) return []
+  const { webSearch, browserCap, browserNetwork } = webServicesDefaults(settings)
+  const probe = state.netSearchProbe ?? null
+  const searchState = webSearchServiceState(webSearch, probe)
+  const searchStatusKey = probe ? (probe.ok ? 'ok' : 'error') : 'untested'
+  const searchProvider = WEB_SEARCH_PROVIDER_LABEL[webSearch.provider] ?? webSearch.provider
+  const searchAddress = String(webSearch.effectiveSearxngUrl || webSearch.searxngUrl || '').trim()
+  const searchTarget =
+    webSearch.provider === 'searxng' && searchAddress
+      ? searchAddress
+      : webSearch.provider === 'none'
+        ? '—'
+        : '厂商 API 端点'
+  const searchTransport =
+    webSearch.provider === 'none'
+      ? '—'
+      : webSearch.provider === 'searxng'
+        ? searchAddress.startsWith('https://')
+          ? 'HTTPS'
+          : searchAddress.startsWith('http://')
+            ? 'HTTP'
+            : 'API'
+        : 'API'
+  const searchSource = WEB_SEARCH_SOURCE_LABEL[webSearch.providerSource] ?? '未配置'
+  const searchRow = `<tr class="db-service-row" data-service-row="search">
+    <td class="name-cell">
+      <button class="link-btn db-title" type="button" data-net-edit="search">联网搜索</button>
+      <div class="desc"><span class="db-kind-badge">${esc(searchProvider)}</span><span class="db-category-tag db-category-api">搜索 API</span></div>
+    </td>
+    <td><span class="mono db-target">${esc(searchTarget)}</span><div class="desc">${esc(searchSource)}</div></td>
+    <td class="db-transport"><span class="pill">${esc(searchTransport)}</span></td>
+    <td id="net-search-status"><span class="pill ${searchState.tone}">${esc(searchState.label)}</span><div class="desc">${esc(searchState.detail)}</div></td>
+    <td class="desc" id="net-search-last">${webSearchLastTest(probe)}</td>
+    <td><div class="row-actions">
+      <button class="link-btn accent" type="button" data-net-test="search">测试</button>
+      <button class="link-btn" type="button" data-net-edit="search">配置</button>
+    </div></td>
+  </tr>`
+
+  const browserReady = browserCap.enabled && browserCap.available
+  const browserStatusKey = browserReady ? 'ok' : browserCap.enabled ? 'error' : 'untested'
+  const browserChannelLabel = BROWSER_CHANNEL_LABEL[browserCap.channel] ?? browserCap.channel
+  const browserTarget =
+    browserCap.detail && browserCap.detail !== 'EAB_BROWSER_ENABLED=0' ? browserCap.detail : '—'
+  const browserRow = `<tr class="db-service-row" data-service-row="browser">
+    <td class="name-cell">
+      <button class="link-btn db-title" type="button" data-net-edit="browser">内置浏览器</button>
+      <div class="desc"><span class="db-kind-badge">${esc(browserChannelLabel)}</span><span class="db-category-tag db-category-browser">本机浏览器</span></div>
+    </td>
+    <td><span class="mono db-target">${esc(browserTarget)}</span><div class="desc">${browserReady ? '可执行文件已就绪' : browserCap.enabled ? '未找到可执行文件' : '已由环境变量关闭'}</div></td>
+    <td class="db-transport"><span class="desc">本机进程</span></td>
+    <td>${browserReady ? '<span class="pill ok">可用</span>' : `<span class="pill ${browserCap.enabled ? 'danger' : ''}">${browserCap.enabled ? '不可用' : '已关闭'}</span>`}<div class="desc">${browserCap.proxy ? `出口：代理 ${esc(browserCap.proxy)}` : '出口：直连'}</div></td>
+    <td class="desc">页面加载时探测<div class="desc">首次打开页面时启动</div></td>
+    <td><div class="row-actions"><button class="link-btn" type="button" data-net-edit="browser">查看</button></div></td>
+  </tr>`
+
+  const networkHosts = Array.isArray(browserNetwork.allowedHosts) ? browserNetwork.allowedHosts : []
+  const hostCount = networkHosts.length
+  const networkStatusKey = browserNetwork.enabled ? (browserNetwork.missingHosts ? 'error' : 'ok') : 'untested'
+  const networkTarget = hostCount
+    ? `${networkHosts.slice(0, 2).join('、')}${hostCount > 2 ? ` 等 ${hostCount} 个` : ''}`
+    : '未配置目标'
+  const networkStateLabel = browserNetwork.missingHosts
+    ? '名单为空'
+    : browserNetwork.enabled
+      ? '已开启'
+      : '已关闭'
+  const networkTone = browserNetwork.enabled ? (browserNetwork.missingHosts ? 'danger' : 'warn') : ''
+  const networkLast = state.networkSavedAt
+    ? `${esc(fmtTime(state.networkSavedAt))}<div class="desc">本次会话保存</div>`
+    : '<span class="muted">策略实时生效</span>'
+  const networkRow = `<tr class="db-service-row" data-service-row="network">
+    <td class="name-cell">
+      <button class="link-btn db-title" type="button" data-net-edit="network">内网访问</button>
+      <div class="desc"><span class="db-kind-badge">访问策略</span><span class="db-category-tag db-category-policy">浏览器准入</span></div>
+    </td>
+    <td><span class="mono db-target">${esc(networkTarget)}</span><div class="desc">${hostCount ? `共 ${hostCount} 个域名 / IP` : '默认拒绝所有内网目标'}</div></td>
+    <td class="db-transport"><span class="desc">内网 80 / 443</span></td>
+    <td><span class="pill ${networkTone}">${esc(networkStateLabel)}</span><div class="desc">${browserNetwork.missingHosts ? '开关已打开但名单为空，未生效' : browserNetwork.enabled ? '只放行名单内目标' : '公共网站不受影响'}</div></td>
+    <td class="desc">${networkLast}</td>
+    <td><div class="row-actions"><button class="link-btn" type="button" data-net-edit="network">配置</button></div></td>
+  </tr>`
+
+  return [
+    { key: 'search', statusKey: searchStatusKey, row: searchRow },
+    { key: 'browser', statusKey: browserStatusKey, row: browserRow },
+    { key: 'network', statusKey: networkStatusKey, row: networkRow },
+  ]
+}
+
+function openWebServiceModal(kind, settings) {
+  return openConnectionWizard(settings, kind)
+}
+
+function connectionWizardDrivers() {
+  const source = state.databaseDrivers.length ? state.databaseDrivers : DB_DRIVER_FALLBACK
+  return source.map((driver) => ({
+    ...driver,
+    category: driver.category || (driver.id === 'sqlite' ? 'file' : driver.id === 'redis' ? 'cache' : 'relational'),
+    categoryLabel: driver.categoryLabel || DB_CATEGORY_LABEL[driver.category] || '数据连接',
+  }))
+}
+
+function connectionWizardServiceCards(settings) {
+  const { webSearch, browserCap, browserNetwork } = webServicesDefaults(settings)
+  const searchProvider = WEB_SEARCH_PROVIDER_LABEL[webSearch.provider] ?? webSearch.provider
+  const browserReady = browserCap.enabled && browserCap.available
+  const networkHosts = Array.isArray(browserNetwork.allowedHosts) ? browserNetwork.allowedHosts.length : 0
+  const cards = [
+    {
+      id: 'search',
+      icon: 'SE',
+      iconClass: 'db-category-api',
+      title: '联网搜索',
+      desc: 'SearXNG、博查、Tavily 等搜索 API',
+      state: webSearch.configured ? `已配置 · ${searchProvider}` : '未配置',
+      tone: webSearch.configured ? 'is-ok' : 'is-warn',
+    },
+    {
+      id: 'browser',
+      icon: 'BR',
+      iconClass: 'db-category-browser',
+      title: '内置浏览器',
+      desc: '本机 Edge / Chrome 打开页面',
+      state: browserReady ? '可用' : browserCap.enabled ? '不可用' : '已关闭',
+      tone: browserReady ? 'is-ok' : browserCap.enabled ? 'is-bad' : '',
+    },
+    {
+      id: 'network',
+      icon: 'NW',
+      iconClass: 'db-category-policy',
+      title: '内网访问',
+      desc: '浏览器访问内网 / OA 的白名单',
+      state: browserNetwork.enabled ? `${networkHosts} 个目标` : '未开启',
+      tone: browserNetwork.enabled ? 'is-warn' : '',
+    },
+  ]
+  return cards
+    .map(
+      (card) => `<button class="conn-type-card" type="button" data-conn-service="${card.id}">
+        <span class="conn-type-icon ${card.iconClass}">${card.icon}</span>
+        <span class="conn-type-main">
+          <span class="conn-type-title">${esc(card.title)}</span>
+          <span class="conn-type-desc">${esc(card.desc)}</span>
+        </span>
+        <span class="conn-type-state ${card.tone}">${esc(card.state)}</span>
+        <span class="conn-type-go" aria-hidden="true">→</span>
+      </button>`,
+    )
+    .join('')
+}
+
+function connectionWizardPickerHtml(settings) {
+  const drivers = connectionWizardDrivers()
+  const driverCards = drivers
+    .map((driver) => {
+      const short = { postgres: 'PG', mysql: 'MY', sqlite: 'SQ', redis: 'RD' }[driver.id] || driver.id.slice(0, 2).toUpperCase()
+      return `<button class="conn-type-card" type="button" data-conn-kind="${esc(driver.id)}">
+        <span class="conn-type-icon db-category-${esc(driver.category)}">${esc(short)}</span>
+        <span class="conn-type-main">
+          <span class="conn-type-title">${esc(driver.label)}</span>
+          <span class="conn-type-desc">${esc(driver.categoryLabel)}${driver.defaultPort ? ` · 默认 :${Number(driver.defaultPort)}` : ' · 文件路径'}</span>
+        </span>
+        <span class="conn-type-go" aria-hidden="true">→</span>
+      </button>`
+    })
+    .join('')
+  return `<div class="modal-head conn-wizard-head">
+      <div class="conn-wizard-title"><h3>新增连接</h3><p>选择资源类型，再填写连接参数</p></div>
+      <button class="modal-x" type="button" aria-label="关闭">×</button>
+    </div>
+    <div class="conn-wizard-steps" aria-label="接入步骤">
+      <span class="conn-wizard-step is-active"><b>1</b>选择类型</span>
+      <span class="conn-wizard-line" aria-hidden="true"></span>
+      <span class="conn-wizard-step"><b>2</b>配置连接</span>
+    </div>
+    <div class="conn-wizard-body">
+      <section class="conn-type-section">
+        <div class="conn-type-head"><h4>数据源</h4><span>关系型数据库、SQLite 文件库和 Redis 缓存</span></div>
+        <div class="conn-type-grid">${driverCards}</div>
+      </section>
+      <section class="conn-type-section">
+        <div class="conn-type-head"><h4>平台服务</h4><span>搜索、浏览器与内网访问，平台级能力集中在这里接入</span></div>
+        <div class="conn-type-grid">${connectionWizardServiceCards(settings)}</div>
+      </section>
+      <div class="conn-wizard-footnote">数据库密码、API Key 只写入服务器密钥文件，页面不回显。平台服务配置立即生效。</div>
+    </div>`
+}
+
+function openConnectionWizard(settings, initialKind = null) {
+  for (const stale of document.querySelectorAll('.modal-overlay')) {
+    if (stale.querySelector('.conn-wizard-head, .conn-wizard-steps')) stale.remove()
+  }
+  const overlay = modelModal('')
+  const modal = overlay.querySelector('.modal')
+  let currentSettings = settings
+  const close = () => overlay.remove()
+
+  const stepMeta = {
+    search: { title: '配置联网搜索', subtitle: '联网搜索 · 搜索 API', icon: 'SE', iconClass: 'db-category-api' },
+    browser: { title: '内置浏览器状态', subtitle: '内置浏览器 · 本机浏览器', icon: 'BR', iconClass: 'db-category-browser' },
+    network: { title: '配置内网访问', subtitle: '内网访问 · 浏览器准入', icon: 'NW', iconClass: 'db-category-policy' },
+  }
+
+  const bindClose = () => {
+    modal.querySelector('.modal-x')?.addEventListener('click', close)
+  }
+
+  const showPicker = () => {
+    modal.innerHTML = connectionWizardPickerHtml(currentSettings)
+    bindClose()
+    for (const card of modal.querySelectorAll('[data-conn-kind]')) {
+      card.addEventListener('click', () => {
+        const kind = card.dataset.connKind
+        const wizardSettings = currentSettings
+        close()
+        openDatabaseModal(null, {
+          kind,
+          fromWizard: true,
+          onBack: () => openConnectionWizard(wizardSettings),
+        })
+      })
+    }
+    for (const card of modal.querySelectorAll('[data-conn-service]')) {
+      card.addEventListener('click', () => showStep(card.dataset.connService))
+    }
+    modal.querySelector('[data-conn-kind]')?.focus()
+  }
+
+  const showStep = (kind) => {
+    const meta = stepMeta[kind]
+    if (!meta) return
+    modal.innerHTML = `<div class="modal-head conn-wizard-head">
+        <div class="conn-wizard-title conn-step-title">
+          <button class="conn-wizard-back" type="button" id="conn-wizard-back" aria-label="返回选择类型">←</button>
+          <span class="conn-type-icon ${meta.iconClass}">${meta.icon}</span>
+          <div><h3>${esc(meta.title)}</h3><p>${esc(meta.subtitle)}</p></div>
+        </div>
+        <button class="modal-x" type="button" aria-label="关闭">×</button>
+      </div>
+      <div class="conn-wizard-steps" aria-label="接入步骤">
+        <span class="conn-wizard-step is-done"><b>✓</b>选择类型</span>
+        <span class="conn-wizard-line is-done" aria-hidden="true"></span>
+        <span class="conn-wizard-step is-active"><b>2</b>配置连接</span>
+      </div>
+      <div class="conn-step-body" id="conn-step-body"></div>`
+    bindClose()
+    modal.querySelector('#conn-wizard-back')?.addEventListener('click', showPicker)
+    const body = modal.querySelector('#conn-step-body')
+    if (kind === 'search') {
+      body.innerHTML = webSearchConfigHtml(currentSettings)
+      bindWebSearchConfig(body, {
+        settings: currentSettings,
+        close: showPicker,
+        onSaved: async () => {
+          close()
+          await loadDatabases(state.databaseStatus)
+        },
+        onSavedQuiet: async () => {
+          await loadDatabases(state.databaseStatus)
+        },
+      })
+    } else if (kind === 'browser') {
+      body.innerHTML = browserStatusConfigHtml(currentSettings, { closeLabel: '返回类型' })
+      bindBrowserStatusConfig(body, {
+        close: showPicker,
+        refresh: async () => {
+          try {
+            const fresh = await api('/api/console/settings/web-services')
+            currentSettings = fresh
+            showStep('browser')
+            showTopToast('内置浏览器状态已重新读取')
+          } catch (err) {
+            showTopToast(err.message || '重新读取失败')
+          }
+        },
+      })
+    } else {
+      body.innerHTML = browserNetworkConfigHtml(currentSettings, { closeLabel: '返回类型' })
+      bindBrowserNetworkConfig(body, {
+        close: showPicker,
+        onSaved: async () => {
+          close()
+          await loadDatabases(state.databaseStatus)
+        },
+      })
+    }
+    body.querySelector('input, select, textarea')?.focus()
+  }
+
+  if (initialKind && stepMeta[initialKind]) showStep(initialKind)
+  else showPicker()
+}
+
+function webSearchProviderCardsHtml(webSearch, selected) {
+  return WEB_SEARCH_PROVIDER_ORDER.map((id) => {
+    const meta = WEB_SEARCH_PROVIDER_META[id]
+    const state = webSearchProviderState(webSearch, id)
+    const tone = webSearchProviderTone(state)
+    return `<button class="search-provider-card${id === selected ? ' is-selected' : ''}" type="button" data-search-provider="${id}" aria-pressed="${id === selected}">
+      <span class="search-provider-icon ${meta.iconClass}">${meta.icon}</span>
+      <span class="search-provider-main">
+        <span class="search-provider-title">${meta.title}</span>
+        <span class="search-provider-desc">${meta.desc}</span>
+      </span>
+      <span class="search-provider-state ${tone}" id="search-card-state-${id}">${state}</span>
+    </button>`
+  }).join('')
+}
+
+function webSearchPanelShell(id, title, desc, state, body, hidden) {
+  const tone = webSearchProviderTone(state)
+  return `<section class="search-provider-panel" data-search-panel="${id}"${hidden ? ' hidden' : ''}>
+    <div class="search-panel-head">
+      <div><h4>${title}</h4><p>${desc}</p></div>
+      <span class="pill ${tone}" id="search-panel-state-${id}">${state}</span>
+    </div>
+    <div class="search-panel-body">${body}</div>
+  </section>`
+}
+
+function webSearchConfigHtml(settings) {
+  const { webSearch } = webServicesDefaults(settings)
+  const selected = webSearchInitialProvider(webSearch)
+  const searchProvider = WEB_SEARCH_PROVIDER_LABEL[webSearch.provider] ?? webSearch.provider
+  const searchSource = WEB_SEARCH_SOURCE_LABEL[webSearch.providerSource] ?? '未配置'
+  const currentAddress = String(webSearch.effectiveSearxngUrl || webSearch.searxngUrl || '').trim()
+
+  const autoBody = `<div class="search-provider-empty">
+    <p>按部署环境变量 <span class="mono">EAB_WEB_SEARCH_PROVIDER</span> 和 <span class="mono">EAB_SEARXNG_URL</span> 决定；控制台不覆盖。</p>
+    <p class="desc">当前生效：${esc(searchProvider)} · ${esc(searchSource)}${currentAddress ? ` · ${esc(currentAddress)}` : ''}</p>
+  </div>`
+
+  const noneBody = `<div class="search-provider-empty">
+    <p>关闭后 <span class="mono">web.search</span> 返回未配置，不会调用任何搜索 API，也不影响其他工具。</p>
+    <p class="desc">需要恢复时重新选择其他服务并保存即可。</p>
+  </div>`
+
+  const searxngBody = `<div class="db-form-grid">
+    <label class="field field-wide">
+      <span>SearXNG 地址（含端口） <span class="desc">${webSearch.effectiveSearxngUrl ? `当前：${esc(webSearch.effectiveSearxngUrl)}` : '未配置'}</span></span>
+      <input id="web-search-searxng-url" class="mono" type="url" placeholder="http://127.0.0.1:8080" value="${esc(webSearch.searxngUrl)}" autocomplete="off" />
+    </label>
+  </div>`
+
+  const keyBody = (id) => {
+    const meta = WEB_SEARCH_PROVIDER_META[id]
+    const configured = Boolean(webSearch.keys?.[id])
+    return `<div class="db-form-grid">
+      <label class="field field-wide">
+        <span>${meta.title} API Key <span class="pill ${configured ? 'ok' : 'warn'}">${configured ? '已配置' : '未配置'}</span></span>
+        <input id="web-search-key-${id}" type="password" placeholder="${configured ? '已配置，留空不修改' : '填写后保存到密钥文件'}" autocomplete="off" spellcheck="false" />
+      </label>
+    </div>
+    <label class="check db-key-clear"><input id="web-search-clear-${id}" type="checkbox" /> 清除已保存的 ${meta.title} Key</label>
+    <div class="search-config-tip">密钥只写入服务器密钥文件，页面不回显；保存这个服务不会清空其他服务的 Key。</div>`
+  }
+
+  const keyPanels = ['bocha', 'tavily', 'serper'].map((id) =>
+    webSearchPanelShell(
+      id,
+      `${WEB_SEARCH_PROVIDER_META[id].title} 配置`,
+      '使用厂商 API Key 出网；可与其他搜索服务同时保留',
+      webSearchProviderState(webSearch, id),
+      keyBody(id),
+      id !== selected,
+    ),
+  ).join('')
+
+  return `${hintNote('连接说明', 'web.search 支持保留多套搜索服务配置，但同一时间只有一个生效。所选服务的配置单独展示，保存其他服务不会覆盖已有配置。')}
+    <div class="search-provider-section">
+      <div class="search-provider-head"><h4>搜索服务</h4></div>
+      <div class="search-provider-grid" id="web-search-provider-cards">${webSearchProviderCardsHtml(webSearch, selected)}</div>
+    </div>
+    <div class="db-driver-note"><span class="pill db-driver-category db-category-api">搜索 API</span><span>当前生效：${esc(searchProvider)} · ${esc(searchSource)}。${esc(webSearch.detail || '')}${currentAddress ? ` · ${esc(currentAddress)}` : ''}</span></div>
+    <form class="db-form" id="web-search-form" autocomplete="off" novalidate>
+      ${webSearchPanelShell('auto', '自动选择', '跟随部署环境变量，不在控制台覆盖', webSearchProviderState(webSearch, 'auto'), autoBody, selected !== 'auto')}
+      ${webSearchPanelShell('none', '关闭搜索', '不调用任何搜索 API', webSearchProviderState(webSearch, 'none'), noneBody, selected !== 'none')}
+      ${webSearchPanelShell('searxng', 'SearXNG 配置', '自建搜索，免 API Key', webSearchProviderState(webSearch, 'searxng'), searxngBody, selected !== 'searxng')}
+      ${keyPanels}
+    </form>
+    <div class="modal-actions db-modal-actions conn-form-actions">
+      <div>
+        <button class="btn ghost" type="button" id="web-search-cancel">返回类型</button>
+        <button class="btn ghost" type="button" id="web-search-save-only">仅保存此配置</button>
+        <button class="btn primary" type="button" id="web-search-save">设为当前并测试</button>
+      </div>
+    </div>`
+}
+
+function bindWebSearchConfig(root, options = {}) {
+  const close = options.close ?? (() => {})
+  const onSaved = options.onSaved ?? (async () => {})
+  const onSavedQuiet = options.onSavedQuiet ?? (async () => {})
+  const webSearch = webServicesDefaults(options.settings).webSearch
+  let selected = webSearchInitialProvider(webSearch)
+  let saving = false
+
+  const saveButton = root.querySelector('#web-search-save')
+  const saveOnlyButton = root.querySelector('#web-search-save-only')
+  const form = root.querySelector('#web-search-form')
+  let stateEl = root.querySelector('#web-search-state')
+  // 状态行按需出现：没有消息时不占位，有消息时插在操作栏上方。
+  const setState = (text, tone = '') => {
+    if (!text) {
+      stateEl?.remove()
+      stateEl = null
+      return
+    }
+    if (!stateEl || !stateEl.isConnected) {
+      stateEl = document.createElement('div')
+      stateEl.id = 'web-search-state'
+      root.insertBefore(stateEl, root.querySelector('.conn-form-actions'))
+    }
+    stateEl.className = `modal-state ${tone}`.trim()
+    stateEl.textContent = text
+  }
+
+  const syncSelection = () => {
+    for (const card of root.querySelectorAll('[data-search-provider]')) {
+      const active = card.dataset.searchProvider === selected
+      card.classList.toggle('is-selected', active)
+      card.setAttribute('aria-pressed', String(active))
+    }
+    for (const panel of root.querySelectorAll('[data-search-panel]')) {
+      panel.hidden = panel.dataset.searchPanel !== selected
+    }
+    if (saveOnlyButton) saveOnlyButton.hidden = selected === 'auto' || selected === 'none'
+    if (saveButton) {
+      saveButton.textContent = selected === 'none' ? '关闭搜索' : selected === 'auto' ? '保存并测试' : '设为当前并测试'
+    }
+  }
+
+  const selectProvider = (id) => {
+    selected = id
+    setState('')
+    syncSelection()
+    const panel = root.querySelector(`[data-search-panel="${id}"]`)
+    ;(panel?.querySelector('input, select, textarea') ?? root.querySelector(`[data-search-provider="${id}"]`))?.focus()
+  }
+
+  const refreshBadge = (id) => {
+    const state = webSearchProviderState(webSearch, id)
+    const tone = webSearchProviderTone(state)
+    for (const el of [root.querySelector(`#search-card-state-${id}`), root.querySelector(`#search-panel-state-${id}`)]) {
+      if (!el) continue
+      el.textContent = state
+      el.classList.remove('ok', 'warn', 'danger')
+      if (tone) el.classList.add(tone)
+    }
+  }
+
+  const refreshAllBadges = () => {
+    for (const id of WEB_SEARCH_PROVIDER_ORDER) refreshBadge(id)
+  }
+
+  const beginBusy = (target, label) => {
+    saving = true
+    saveButton.disabled = true
+    saveOnlyButton.disabled = true
+    target.textContent = label
+  }
+
+  const endBusy = () => {
+    saving = false
+    if (saveButton.isConnected) saveButton.disabled = false
+    if (saveOnlyButton.isConnected) saveOnlyButton.disabled = false
+    syncSelection()
+  }
+
+  const buildPayload = (activate) => {
+    const body = {}
+    if (activate) body.provider = selected
+    if (selected === 'searxng') body.searxngUrl = root.querySelector('#web-search-searxng-url')?.value ?? ''
+    if (selected === 'bocha' || selected === 'tavily' || selected === 'serper') {
+      const input = root.querySelector(`#web-search-key-${selected}`)
+      const clear = root.querySelector(`#web-search-clear-${selected}`)
+      if (clear?.checked) body.keys = { [selected]: null }
+      else if (input?.value.trim()) body.keys = { [selected]: input.value.trim() }
+    }
+    return body
+  }
+
+  const applyLocalSave = () => {
+    if (selected === 'searxng') {
+      webSearch.searxngUrl = root.querySelector('#web-search-searxng-url')?.value.trim() ?? ''
+    } else if (selected === 'bocha' || selected === 'tavily' || selected === 'serper') {
+      const input = root.querySelector(`#web-search-key-${selected}`)
+      const clear = root.querySelector(`#web-search-clear-${selected}`)
+      if (clear?.checked) webSearch.keys[selected] = false
+      else if (input?.value.trim()) webSearch.keys[selected] = true
+    }
+  }
+
+  root.querySelector('#web-search-cancel')?.addEventListener('click', close)
+
+  for (const card of root.querySelectorAll('[data-search-provider]')) {
+    card.addEventListener('click', () => selectProvider(card.dataset.searchProvider))
+  }
+
+  saveOnlyButton?.addEventListener('click', async () => {
+    if (saving) return
+    const payload = buildPayload(false)
+    if ((selected === 'bocha' || selected === 'tavily' || selected === 'serper') && !payload.keys) {
+      setState('没有新的 Key 需要保存；已配置时可留空，直接切换即可。')
+      return
+    }
+    beginBusy(saveOnlyButton, '保存中…')
+    setState('正在保存当前服务配置…')
+    try {
+      await apiSend('PUT', '/api/console/settings/web-search', payload)
+      applyLocalSave()
+      refreshBadge(selected)
+      setState('已保存此配置；当前搜索服务未切换。', 'ok')
+      showTopToast('搜索配置已保存')
+      try {
+        await onSavedQuiet()
+      } catch {}
+    } catch (err) {
+      setState(`保存失败 · ${err.message || '未知错误'}`, 'bad')
+    } finally {
+      endBusy()
+    }
+  })
+
+  const saveAndTest = async () => {
+    if (saving) return
+    if (selected === 'searxng') {
+      const url = root.querySelector('#web-search-searxng-url')?.value.trim() ?? ''
+      if (!url) {
+        setState('先填写 SearXNG 地址，再设为当前服务。', 'bad')
+        root.querySelector('#web-search-searxng-url')?.focus()
+        return
+      }
+    }
+    if (selected === 'bocha' || selected === 'tavily' || selected === 'serper') {
+      const key = root.querySelector(`#web-search-key-${selected}`)?.value.trim() ?? ''
+      if (!key && !webSearch.keys?.[selected]) {
+        setState(`先填写 ${WEB_SEARCH_PROVIDER_META[selected].title} API Key，再设为当前服务；已有 Key 时可直接切换。`, 'bad')
+        root.querySelector(`#web-search-key-${selected}`)?.focus()
+        return
+      }
+    }
+    beginBusy(saveButton, '保存中…')
+    setState(selected === 'none' ? '正在关闭联网搜索…' : '正在保存搜索配置…')
+    try {
+      await apiSend('PUT', '/api/console/settings/web-search', buildPayload(true))
+      applyLocalSave()
+      webSearch.provider = selected
+      webSearch.configuredProvider = selected === 'auto' ? null : selected
+      if (selected === 'none') {
+        state.netSearchProbe = null
+        showTopToast('联网搜索已关闭')
+        await onSaved()
+        return
+      }
+      saveButton.textContent = '测试中…'
+      setState('配置已保存，正在执行真实搜索…')
+      const probe = await apiPost('/api/console/settings/web-search/test', {})
+      state.netSearchProbe = { ...probe, at: Date.now() }
+      if (probe.ok) {
+        showTopToast('搜索服务测试通过')
+        await onSaved()
+        return
+      }
+      webSearch.provider = probe.provider || selected
+      refreshAllBadges()
+      setState(`搜索测试未通过 · ${probe.error || '未知错误'}${probe.hint ? `\n${probe.hint}` : ''}`, 'bad')
+    } catch (err) {
+      state.netSearchProbe = { ok: false, error: err.message || '搜索测试请求失败', at: Date.now() }
+      setState(`保存失败 · ${err.message || '未知错误'}`, 'bad')
+    } finally {
+      endBusy()
+    }
+  }
+
+  saveButton?.addEventListener('click', () => void saveAndTest())
+  form?.addEventListener('submit', (event) => {
+    event.preventDefault()
+    void saveAndTest()
+  })
+
+  syncSelection()
+}
+
+function browserStatusConfigHtml(settings, options = {}) {
+  const { browserCap } = webServicesDefaults(settings)
+  const ready = browserCap.enabled && browserCap.available
+  const channel = BROWSER_CHANNEL_LABEL[browserCap.channel] ?? browserCap.channel
+  const executable = browserCap.detail && browserCap.detail !== 'EAB_BROWSER_ENABLED=0' ? browserCap.detail : '—'
+  const closeLabel = options.closeLabel || '关闭'
+  return `${hintNote('运行说明', '内置浏览器用于 browser 工具打开页面并截图。浏览器通道、可执行文件、代理和开关都由部署环境变量控制，控制台只读。')}
+    <form class="db-form" autocomplete="off">
+      <div class="db-form-grid">
+        <label class="field"><span>运行状态</span><input value="${ready ? '可用' : browserCap.enabled ? '不可用' : '已关闭'}" disabled /></label>
+        <label class="field"><span>浏览器通道</span><input value="${esc(channel)}" disabled /></label>
+        <label class="field field-wide"><span>可执行文件</span><input class="mono" value="${esc(executable)}" disabled /></label>
+        <label class="field"><span>当前出口</span><input value="${browserCap.proxy ? `代理 ${esc(browserCap.proxy)}` : '直连'}" disabled /></label>
+        <label class="field"><span>启动方式</span><input value="首次打开页面时按需启动" disabled /></label>
+      </div>
+    </form>
+    <div class="modal-state ${ready ? 'good' : browserCap.enabled ? 'bad' : ''}">${ready ? '浏览器可执行文件已就绪' : browserCap.enabled ? '未找到可执行文件，请检查 Edge / Chrome 安装或 EAB_BROWSER_EXECUTABLE_PATH' : 'EAB_BROWSER_ENABLED=0，浏览器工具已关闭'}</div>
+    <div class="modal-actions db-modal-actions conn-form-actions">
+      <button class="btn ghost" type="button" id="net-browser-refresh">重新读取</button>
+      <button class="btn primary" type="button" id="net-browser-close">${esc(closeLabel)}</button>
+    </div>`
+}
+
+function bindBrowserStatusConfig(root, options = {}) {
+  const close = options.close ?? (() => {})
+  const refresh = options.refresh ?? close
+  root.querySelector('#net-browser-close')?.addEventListener('click', close)
+  root.querySelector('#net-browser-refresh')?.addEventListener('click', refresh)
+}
+
+function browserNetworkConfigHtml(settings, options = {}) {
+  const { browserNetwork } = webServicesDefaults(settings)
+  const networkHosts = Array.isArray(browserNetwork.allowedHosts) ? browserNetwork.allowedHosts : []
+  const closeLabel = options.closeLabel || '取消'
+  return `${hintNote('策略说明', '默认拒绝所有内网目标。打开开关后只放行名单内的域名 / IP；公共网站不受影响，localhost 和 EAB 自身地址始终拒绝。策略只应用于内置浏览器，web.fetch 仍只读公网。')}
+    <form class="db-form" id="browser-network-form" autocomplete="off">
+      <label class="check db-enabled-row"><input id="browser-network-enabled" type="checkbox"${browserNetwork.allowPrivateNetwork ? ' checked' : ''} /><span>允许内置浏览器访问下列内网 / OA 目标</span></label>
+      <label class="field field-wide"><span>域名或 IP 白名单 <span class="desc">每行一个；支持 *.example.com 子域，不填协议和路径</span></span>
+        <textarea id="browser-network-hosts" rows="5" spellcheck="false" placeholder="oa.example.com&#10;10.20.30.40">${esc(networkHosts.join('\n'))}</textarea>
+      </label>
+    </form>
+    <div class="modal-state" id="browser-network-state"></div>
+    <div class="modal-actions db-modal-actions conn-form-actions">
+      <span class="desc">只支持 80 / 443 标准网页端口。</span>
+      <div>
+        <button class="btn ghost" type="button" id="browser-network-cancel">${esc(closeLabel)}</button>
+        <button class="btn primary" type="button" id="browser-network-save">保存策略</button>
+      </div>
+    </div>`
+}
+
+function bindBrowserNetworkConfig(root, options = {}) {
+  const close = options.close ?? (() => {})
+  const onSaved = options.onSaved ?? (async () => {})
+  root.querySelector('#browser-network-cancel')?.addEventListener('click', close)
+  const saveButton = root.querySelector('#browser-network-save')
+  const stateEl = root.querySelector('#browser-network-state')
+  const setState = (text, tone = '') => {
+    stateEl.className = `modal-state ${tone}`.trim()
+    stateEl.textContent = text
+  }
+  let saving = false
+  saveButton.addEventListener('click', async () => {
+    if (saving) return
+    const enabled = Boolean(root.querySelector('#browser-network-enabled')?.checked)
+    const hosts = String(root.querySelector('#browser-network-hosts')?.value ?? '')
+      .split(/\n+/)
+      .map((item) => item.trim())
+      .filter(Boolean)
+    if (enabled && hosts.length === 0) {
+      setState('开启内网访问前，至少填写一个域名或 IP。', 'bad')
+      return
+    }
+    saving = true
+    saveButton.disabled = true
+    const original = saveButton.textContent
+    saveButton.textContent = '保存中…'
+    setState('正在保存内网访问策略…')
+    try {
+      const result = await apiSend('PUT', '/api/console/settings/browser-network', {
+        allowPrivateNetwork: enabled,
+        allowedHosts: hosts,
+      })
+      const policy = result?.browserNetwork ?? {}
+      state.networkSavedAt = Date.now()
+      showTopToast(
+        policy.enabled
+          ? `内网访问已开启 · ${policy.allowedHosts?.length ?? hosts.length} 个目标`
+          : '内网访问已关闭',
+      )
+      await onSaved()
+    } catch (err) {
+      setState(`保存失败 · ${err.message || '未知错误'}`, 'bad')
+    } finally {
+      saving = false
+      if (saveButton.isConnected) {
+        saveButton.disabled = false
+        saveButton.textContent = original
+      }
+    }
+  })
+}
+
+function bindWebServicesPanel(view, settings) {
+  const $panel = (selector) => view.querySelector(selector)
+  view.querySelector('#db-refresh')?.addEventListener('click', () => {
+    loadDatabases(state.databaseStatus)
+  })
+  if (!settings) return
+  const { webSearch } = webServicesDefaults(settings)
+
+  const updateSearchRow = (probe) => {
+    const next = webSearchServiceState(webSearch, probe)
+    const status = $panel('#net-search-status')
+    if (status) status.innerHTML = `<span class="pill ${next.tone}">${esc(next.label)}</span><div class="desc">${esc(next.detail)}</div>`
+    const last = $panel('#net-search-last')
+    if (last) last.innerHTML = webSearchLastTest(probe)
+  }
+  const adjustFilterCount = (key, delta) => {
+    const count = $panel(`[data-db-count="${key}"]`)
+    if (!count) return
+    count.textContent = String(Math.max(0, Number(count.textContent || 0) + delta))
+  }
+
+  for (const button of view.querySelectorAll('[data-net-edit]')) {
+    button.addEventListener('click', () => openWebServiceModal(button.dataset.netEdit, settings))
+  }
+
+  const searchTest = $panel('[data-net-test="search"]')
+  if (searchTest) {
+    searchTest.addEventListener('click', async () => {
+      const stateEl = $panel('#db-page-state')
+      searchTest.disabled = true
+      const original = searchTest.textContent
+      searchTest.textContent = '测试中…'
+      if (stateEl) {
+        stateEl.className = 'inline-note'
+        stateEl.textContent = '正在用已保存的搜索配置执行真实查询…'
+      }
+      try {
+        const previousStatusKey = state.netSearchProbe ? (state.netSearchProbe.ok ? 'ok' : 'error') : 'untested'
+        const probe = await apiPost('/api/console/settings/web-search/test', {})
+        const record = { ...probe, at: Date.now() }
+        state.netSearchProbe = record
+        const nextStatusKey = probe.ok ? 'ok' : 'error'
+        if (previousStatusKey !== nextStatusKey) {
+          adjustFilterCount(previousStatusKey, -1)
+          adjustFilterCount(nextStatusKey, 1)
+        }
+        updateSearchRow(record)
+        if (stateEl) {
+          const titles = (probe.results ?? []).map((item) => item.title).filter(Boolean)
+          stateEl.className = `inline-note ${probe.ok ? 'db-result-ok' : 'db-result-bad'}`
+          stateEl.textContent = probe.ok
+            ? `搜索可用 · ${WEB_SEARCH_PROVIDER_LABEL[probe.provider] ?? probe.provider} · ${Number(probe.latencyMs || 0)} ms · ${probe.results.length} 条结果${titles.length ? `\n${titles.join('；')}` : ''}`
+            : `搜索测试未通过 · ${probe.error || '未知错误'}${probe.hint ? `\n${probe.hint}` : ''}`
+        }
+        showTopToast(probe.ok ? '搜索服务测试通过' : '搜索服务测试未通过')
+      } catch (err) {
+        if (stateEl) {
+          stateEl.className = 'inline-note db-result-bad'
+          stateEl.textContent = `测试失败 · ${err.message || '未知错误'}`
+        }
+      } finally {
+        searchTest.disabled = false
+        searchTest.textContent = original
+      }
+    })
+  }
 }
 
 function onlyOfficeSourceText(source, fallback = '未配置') {
@@ -17287,10 +18675,24 @@ async function loadDatabases(status = state.databaseStatus || 'all') {
   setSide('', true)
   setPageActions('')
   try {
-    const data = await api(`/api/console/databases?status=${encodeURIComponent(status)}`)
+    const [data, settings] = await Promise.all([
+      api(`/api/console/databases?status=${encodeURIComponent(status)}`),
+      api('/api/console/settings/web-services').catch(() => null),
+    ])
     state.databaseDrivers = Array.isArray(data.drivers) ? data.drivers : []
-    const counts = data.counts || {}
+    const baseCounts = data.counts || {}
     const items = Array.isArray(data.items) ? data.items : []
+    const serviceEntries = webServiceEntries(settings)
+    const counts = {
+      all: Number(baseCounts.all || 0),
+      ok: Number(baseCounts.ok || 0),
+      error: Number(baseCounts.error || 0),
+      untested: Number(baseCounts.untested || 0),
+    }
+    for (const entry of serviceEntries) {
+      counts.all += 1
+      counts[entry.statusKey] += 1
+    }
     const filters = [
       ['all', '全部'],
       ['ok', '可用'],
@@ -17299,10 +18701,13 @@ async function loadDatabases(status = state.databaseStatus || 'all') {
     ]
       .map(
         ([key, label]) =>
-          `<button class="${state.databaseStatus === key ? 'active' : ''}" type="button" data-db-status="${key}">${esc(label)} <span class="muted">${Number(counts[key] || 0)}</span></button>`,
+          `<button class="${state.databaseStatus === key ? 'active' : ''}" type="button" data-db-status="${key}">${esc(label)} <span class="muted" data-db-count="${key}">${Number(counts[key] || 0)}</span></button>`,
       )
       .join('')
-    const shown = state.databaseStatus === 'all' ? Number(data.total || 0) : items.length
+    const visibleServices = serviceEntries.filter(
+      (entry) => state.databaseStatus === 'all' || entry.statusKey === state.databaseStatus,
+    )
+    const shown = state.databaseStatus === 'all' ? counts.all : items.length + visibleServices.length
     const driverStrip = (state.databaseDrivers || [])
       .map(
         (driver) =>
@@ -17317,6 +18722,18 @@ async function loadDatabases(status = state.databaseStatus || 'all') {
       '连接类型说明',
       'db-driver-summary',
     )
+    const services = webServicesDefaults(settings)
+    const searchChip = services.webSearch.configured
+      ? `<span class="db-driver is-ok"><strong>联网搜索</strong><span>${esc(WEB_SEARCH_PROVIDER_LABEL[services.webSearch.provider] ?? services.webSearch.provider)}</span></span>`
+      : '<span class="db-driver is-warn"><strong>联网搜索</strong><span>未配置</span></span>'
+    const browserChip =
+      services.browserCap.enabled && services.browserCap.available
+        ? '<span class="db-driver is-ok"><strong>内置浏览器</strong><span>可用</span></span>'
+        : `<span class="db-driver ${services.browserCap.enabled ? 'is-warn' : ''}"><strong>内置浏览器</strong><span>${services.browserCap.enabled ? '不可用' : '已关闭'}</span></span>`
+    const networkChip = services.browserNetwork.enabled
+      ? `<span class="db-driver is-warn"><strong>内网访问</strong><span>${services.browserNetwork.allowedHosts.length} 个目标</span></span>`
+      : '<span class="db-driver"><strong>内网访问</strong><span>禁止</span></span>'
+    const serviceStrip = settings ? `${searchChip}${browserChip}${networkChip}` : ''
 
     const rows = items
       .map((item) => {
@@ -17335,33 +18752,59 @@ async function loadDatabases(status = state.databaseStatus || 'all') {
         </tr>`
       })
       .join('')
+    const serviceRows = visibleServices.map((entry) => entry.row).join('')
+    const hasAnyRows = Boolean(items.length || visibleServices.length)
+    const emptyText =
+      state.databaseStatus === 'all'
+        ? '还没有数据库或缓存连接。点右上角“＋ 新增连接”接入 PostgreSQL、MySQL、SQLite、Redis，或配置下方的平台服务。'
+        : '没有符合当前筛选的连接。'
+    const databaseEmptyText =
+      state.databaseStatus === 'all'
+        ? '还没有数据库或缓存连接，可点右上角“＋ 新增连接”接入。'
+        : '没有符合当前筛选的数据库或缓存连接。'
+    const showDatabaseGroup = state.databaseStatus === 'all' || items.length > 0
+    const databaseBlock = showDatabaseGroup
+      ? `<tr class="db-group-row"><td colspan="6"><div class="db-group-title"><span class="db-group-label">数据源</span><span class="db-group-count">${items.length}</span></div></td></tr>${
+          items.length ? rows : `<tr class="db-group-empty"><td colspan="6">${esc(databaseEmptyText)}</td></tr>`
+        }`
+      : ''
+    const serviceBlock = visibleServices.length
+      ? `<tr class="db-group-row"><td colspan="6"><div class="db-group-title"><span class="db-group-label">平台服务</span><span class="db-group-count">${visibleServices.length}</span></div></td></tr>${serviceRows}`
+      : ''
+    const bodyRows = hasAnyRows ? `${databaseBlock}${serviceBlock}` : `<tr><td colspan="6" class="empty">${esc(emptyText)}</td></tr>`
 
     view.innerHTML = `
       <section class="panel">
         <div class="panel-head">
           <div>
             <h2>数据连接 <span class="muted">${shown}</span></h2>
-            ${hintBadge('连接说明', '这里管理外部数据连接：关系型数据库、文件数据库与键值缓存，统一做配置、真实连通性测试和停用/删除。连接按公司隔离；密码只写入 secrets.json 或环境变量，页面不回显。PostgreSQL、MySQL / SQLite 支持只读查询，Redis 只做 PING 连通性测试。单公司部署下，已启用的 PostgreSQL / Redis 会自动接入平台后端（审计/会话镜像、缓存），环境变量优先，不需要手动配置。')}
+            ${hintBadge('连接说明', '这里统一管理平台接入的外部资源连接：关系型数据库、文件数据库、键值缓存，以及联网搜索、内置浏览器和内网访问。数据库与缓存可按公司新增、编辑、测试、查询和停用/删除；平台服务是固定 3 项，通过“新增连接”选择类型后配置。密码只写入 secrets.json 或环境变量，页面不回显。PostgreSQL、MySQL / SQLite 支持只读查询，Redis 只做 PING 连通性测试。单公司部署下，已启用的 PostgreSQL / Redis 会自动接入平台后端（审计/会话镜像、缓存），环境变量优先。')}
           </div>
           <div class="panel-actions">
             <div class="segmented">${filters}</div>
+            <button class="btn sm ghost" type="button" id="db-refresh">刷新状态</button>
             <button class="btn primary" type="button" id="db-new">＋ 新增连接</button>
           </div>
         </div>
-        <div class="db-driver-strip">${driverStrip}${driverSummary}</div>
+        <div class="db-driver-strip">
+          ${settings ? `<span class="db-driver-group-label">平台服务</span>${serviceStrip}<span class="db-driver-sep" aria-hidden="true"></span>` : ''}
+          <span class="db-driver-group-label">数据源</span>${driverStrip}${driverSummary}
+        </div>
         <div class="table-scroll">
           <table class="data db-table">
             <thead><tr><th>连接</th><th>地址 / 目标</th><th>传输</th><th>状态</th><th>最近检测</th><th>操作</th></tr></thead>
-            <tbody>${rows || '<tr><td colspan="6" class="empty">还没有数据连接。添加关系型数据库、SQLite 文件库或 Redis 缓存后，可在这里测试连通性。</td></tr>'}</tbody>
+            <tbody>${bodyRows}</tbody>
           </table>
         </div>
-        <div class="inline-note" id="db-page-state"></div>
+        <div class="inline-note${settings ? '' : ' is-warn'}" id="db-page-state">${settings ? '' : '搜索与浏览器状态读取失败，平台服务暂不可配置；数据库连接仍可正常管理。'}</div>
       </section>`
+
+    bindWebServicesPanel(view, settings)
 
     for (const button of view.querySelectorAll('[data-db-status]')) {
       button.addEventListener('click', () => loadDatabases(button.dataset.dbStatus || 'all'))
     }
-    view.querySelector('#db-new')?.addEventListener('click', () => openDatabaseModal(null))
+    view.querySelector('#db-new')?.addEventListener('click', () => openConnectionWizard(settings))
     for (const button of view.querySelectorAll('[data-db-edit]')) {
       button.addEventListener('click', () => {
         const item = items.find((row) => row.id === button.dataset.dbEdit)
@@ -17540,14 +18983,8 @@ function openDatabaseQuery(item) {
   input.setSelectionRange(input.value.length, input.value.length)
 }
 
-function openDatabaseModal(item = null) {
-  const fallbackDrivers = [
-    { id: 'postgres', label: 'PostgreSQL', category: 'relational', categoryLabel: '关系型数据库', defaultPort: 5432, supportsSsl: true, supportsTls: true, supportsQuery: true, notes: '关系型数据库：主机、端口、数据库名、账号；可选 TLS。' },
-    { id: 'mysql', label: 'MySQL / MariaDB', category: 'relational', categoryLabel: '关系型数据库', defaultPort: 3306, supportsSsl: true, supportsTls: true, supportsQuery: true, notes: '关系型数据库：主机、端口、数据库名、账号；MySQL 8 默认使用 caching_sha2_password。' },
-    { id: 'sqlite', label: 'SQLite', category: 'file', categoryLabel: '文件数据库', defaultPort: null, supportsSsl: false, supportsTls: false, supportsQuery: true, notes: '文件数据库：填写服务器上的绝对路径；探测只读打开，不会创建新文件。' },
-    { id: 'redis', label: 'Redis', category: 'cache', categoryLabel: '键值缓存', defaultPort: 6379, supportsSsl: true, supportsTls: true, supportsQuery: false, notes: '键值缓存：主机、端口、DB 编号、可选 ACL 账号；探针执行 PING，不开放 SQL 查询。' },
-  ]
-  const drivers = (state.databaseDrivers.length ? state.databaseDrivers : fallbackDrivers).map((driver) => {
+function openDatabaseModal(item = null, options = {}) {
+  const drivers = (state.databaseDrivers.length ? state.databaseDrivers : DB_DRIVER_FALLBACK).map((driver) => {
     const category = driver.category || (driver.id === 'sqlite' ? 'file' : driver.id === 'redis' ? 'cache' : 'relational')
     return {
       ...driver,
@@ -17558,17 +18995,11 @@ function openDatabaseModal(item = null) {
     }
   })
   const driverOf = (kindValue) => drivers.find((entry) => entry.id === kindValue) || drivers[0]
-  const kind = item?.kind && drivers.some((driver) => driver.id === item.kind) ? item.kind : drivers[0].id
-  const categoryOrder = ['relational', 'file', 'cache']
-  const kindOptions = categoryOrder
-    .map((category) => {
-      const choices = drivers.filter((driver) => driver.category === category)
-      if (!choices.length) return ''
-      return `<optgroup label="${esc(DB_CATEGORY_LABEL[category] || category)}">${choices
-        .map((driver) => `<option value="${esc(driver.id)}"${driver.id === kind ? ' selected' : ''}>${esc(driver.label)}</option>`)
-        .join('')}</optgroup>`
-    })
-    .join('')
+  const requestedKind = item?.kind || options.kind
+  const kind = requestedKind && drivers.some((driver) => driver.id === requestedKind) ? requestedKind : drivers[0].id
+  const fromWizard = Boolean(options.fromWizard && !item)
+  const driverShort = (driver) =>
+    ({ postgres: 'PG', mysql: 'MY', sqlite: 'SQ', redis: 'RD' })[driver?.id] || String(driver?.id || 'DB').slice(0, 2).toUpperCase()
   const initialDriver = driverOf(kind)
   const initialDraft = {
     host: item?.host || '127.0.0.1',
@@ -17584,12 +19015,27 @@ function openDatabaseModal(item = null) {
       : '未设置密码；可留空'
     : '可留空；写入 secrets.json，不回显'
   const overlay = modelModal(`
-    <div class="modal-head"><h3>${item ? '编辑数据连接' : '新增数据连接'}</h3><button class="modal-x" type="button" aria-label="关闭">×</button></div>
+    ${
+      fromWizard
+        ? `<div class="modal-head conn-wizard-head">
+            <div class="conn-wizard-title conn-step-title">
+              <button class="conn-wizard-back" type="button" id="db-wizard-back" aria-label="返回选择类型">←</button>
+              <span class="conn-type-icon db-category-${esc(initialDriver?.category || 'relational')}" id="db-wizard-icon">${esc(driverShort(initialDriver))}</span>
+              <div><h3>新增连接</h3><p id="db-wizard-subtitle">数据源 · ${esc(initialDriver?.label || '数据连接')}</p></div>
+            </div>
+            <button class="modal-x" type="button" aria-label="关闭">×</button>
+          </div>
+          <div class="conn-wizard-steps" aria-label="接入步骤">
+            <span class="conn-wizard-step is-done"><b>✓</b>选择类型</span>
+            <span class="conn-wizard-line is-done" aria-hidden="true"></span>
+            <span class="conn-wizard-step is-active"><b>2</b>配置连接</span>
+          </div>`
+        : `<div class="modal-head"><h3>${item ? '编辑数据连接' : '新增数据连接'}</h3><button class="modal-x" type="button" aria-label="关闭">×</button></div>`
+    }
     ${hintNote('连接说明', '关系型数据库填写主机、端口、数据库名与账号；SQLite 只填写服务器上的文件路径；Redis 填写主机、端口、DB 编号和可选 ACL 账号。测试连接会真实建立连接；保存只写配置与 secret_ref，不写密码明文。')}
     <form class="db-form" id="db-form" autocomplete="off">
       <div class="db-form-grid">
-        <label class="field"><span>连接名称</span><input id="db-name" required maxlength="60" value="${esc(item?.name || '')}" placeholder="例如 生产报表库" /></label>
-        <label class="field"><span>连接类型</span><select id="db-kind">${kindOptions}</select></label>
+        <label class="field field-wide"><span>连接名称</span><input id="db-name" required maxlength="60" value="${esc(item?.name || '')}" placeholder="例如 生产报表库" /></label>
       </div>
       <div class="db-driver-note" id="db-driver-note"><span class="pill db-driver-category" id="db-category-pill"></span><span id="db-driver-notes"></span></div>
       <div class="db-form-grid" id="db-server-fields">
@@ -17616,10 +19062,14 @@ function openDatabaseModal(item = null) {
       </div>
     </div>`)
   const close = () => overlay.remove()
+  const backToPicker = () => {
+    close()
+    if (typeof options.onBack === 'function') options.onBack()
+  }
   overlay.querySelector('.modal-x').addEventListener('click', close)
-  overlay.querySelector('#db-cancel').addEventListener('click', close)
+  overlay.querySelector('#db-wizard-back')?.addEventListener('click', backToPicker)
+  overlay.querySelector('#db-cancel').addEventListener('click', fromWizard ? backToPicker : close)
 
-  const kindSelect = overlay.querySelector('#db-kind')
   const portInput = overlay.querySelector('#db-port')
   const hostInput = overlay.querySelector('#db-host')
   const serverFields = overlay.querySelector('#db-server-fields')
@@ -17639,39 +19089,10 @@ function openDatabaseModal(item = null) {
     stateEl.className = `modal-state ${tone}`.trim()
     stateEl.textContent = text
   }
-  let activeKind = kind
-  const drafts = { [kind]: { ...initialDraft } }
-
-  const defaultDraft = (kindValue) => {
-    const driver = driverOf(kindValue)
-    return {
-      host: '127.0.0.1',
-      port: driver?.defaultPort ? String(driver.defaultPort) : '',
-      database: kindValue === 'redis' ? '0' : '',
-      username: '',
-      filePath: '',
-      ssl: false,
-    }
-  }
-  const readDraft = () => ({
-    host: hostInput.value.trim(),
-    port: portInput.value,
-    database: databaseInput.value.trim(),
-    username: userInput.value.trim(),
-    filePath: fileInput.value.trim(),
-    ssl: sslInput.checked,
-  })
-  const applyDraft = (draft) => {
-    hostInput.value = draft.host || ''
-    portInput.value = draft.port === null || draft.port === undefined ? '' : String(draft.port)
-    databaseInput.value = draft.database || ''
-    userInput.value = draft.username || ''
-    fileInput.value = draft.filePath || ''
-    sslInput.checked = Boolean(draft.ssl)
-  }
+  const activeKind = kind
 
   const syncFields = () => {
-    const kindValue = kindSelect.value
+    const kindValue = activeKind
     const driver = driverOf(kindValue)
     const isSqlite = kindValue === 'sqlite'
     const isRedis = kindValue === 'redis'
@@ -17702,24 +19123,17 @@ function openDatabaseModal(item = null) {
     userLabel.textContent = isRedis ? 'ACL 用户名（可选）' : '用户名'
     userInput.placeholder = isRedis ? '默认用户可留空' : '例如 postgres'
     categoryPill.className = `pill db-driver-category db-category-${driver?.category || ''}`.trim()
-    categoryPill.textContent = driver?.categoryLabel || ''
+    categoryPill.textContent = driver?.label || driver?.categoryLabel || ''
     noteText.textContent = driver?.notes || ''
     portInput.placeholder = driver?.defaultPort ? `默认 ${Number(driver.defaultPort)}` : 'SQLite 不需要端口'
   }
-  kindSelect.addEventListener('change', () => {
-    drafts[activeKind] = readDraft()
-    activeKind = kindSelect.value
-    applyDraft(drafts[activeKind] || defaultDraft(activeKind))
-    setState('')
-    syncFields()
-  })
   syncFields()
   overlay.querySelector('#db-form').addEventListener('input', () => {
     if (stateEl.textContent) setState('')
   })
 
   const payload = () => {
-    const kindValue = kindSelect.value
+    const kindValue = activeKind
     const body = {
       name: overlay.querySelector('#db-name').value.trim(),
       kind: kindValue,

@@ -66,6 +66,7 @@ function createCliSandbox() {
     fileURLToPath(new URL('../../../scripts/windows-console.mjs', import.meta.url)),
     join(sandbox, 'scripts', 'windows-console.mjs'),
   )
+  copyFileSync(fileURLToPath(new URL('../../../scripts/searxng.mjs', import.meta.url)), join(sandbox, 'scripts', 'searxng.mjs'))
   writeFileSync(join(sandbox, 'package.json'), JSON.stringify({ name: 'eab', version: current }))
   const marker = join(sandbox, 'updater-args.json')
   writeFileSync(

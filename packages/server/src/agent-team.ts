@@ -15,6 +15,15 @@
  */
 import type { Db } from '@eab/storage'
 import { randomUUID } from 'node:crypto'
+import {
+  normalizeTaskPhase,
+  parseAgentArtifactJson,
+  parseAgentArtifacts,
+  parseTaskBudget,
+  type AgentArtifactRef,
+  type TaskBudget,
+  type TaskPhase,
+} from './agent-protocol.js'
 
 export interface TeamMessage {
   role: 'user' | 'assistant'
@@ -91,6 +100,23 @@ export interface AgentTeamTask {
   finishedAt: number | null
   /** 父 Agent 是否已因这条任务被唤醒 */
   wakeAt: number | null
+  /** 会话级上下文；同一会话的所有任务共享，后续 A2A contextId 直接复用 */
+  contextId: string
+  /** 用户回合级追踪 id；父 Agent、子 Agent、工具和外部协议共用 */
+  traceId: string
+  /** 与 status 正交的暂停/拒绝原因，不改变原有生命周期判断 */
+  phase: TaskPhase
+  rejectReason: string
+  /** 结构化任务输入，例如文件引用、上游产物、业务参数 */
+  input: Record<string, unknown>
+  /** 子 Agent 登记的最终产物引用；文件本体不重复存储 */
+  artifacts: AgentArtifactRef[]
+  /** 本轮任务的 token/费用/时长约束 */
+  budget: TaskBudget
+  /** 任务级截止时间；与配置的全局超时共同生效 */
+  deadlineAt: number | null
+  usedTokens: number
+  usedCostMicros: number
   createdAt: number
   updatedAt: number
 }
@@ -102,6 +128,8 @@ export interface AgentTeamEvent {
   taskId: string | null
   kind: string
   payload: unknown
+  contextId: string
+  traceId: string
   createdAt: number
 }
 
@@ -478,6 +506,16 @@ interface TaskRow {
   started_at: number | null
   finished_at: number | null
   wake_at: number | null
+  context_id: string | null
+  trace_id: string | null
+  phase: string | null
+  reject_reason: string | null
+  input_json: string | null
+  artifacts_json: string | null
+  budget_json: string | null
+  deadline_at: number | null
+  used_tokens: number | null
+  used_cost_micros: number | null
   created_at: number
   updated_at: number
 }
@@ -489,6 +527,8 @@ interface EventRow {
   task_id: string | null
   kind: string
   payload_json: string
+  context_id: string | null
+  trace_id: string | null
   created_at: number
 }
 
@@ -499,6 +539,13 @@ function parseJson(value: string | null): unknown {
   } catch {
     return null
   }
+}
+
+function parseRecord(value: string | null): Record<string, unknown> {
+  const parsed = parseJson(value)
+  return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+    ? parsed as Record<string, unknown>
+    : {}
 }
 
 function toTask(row: TaskRow): AgentTeamTask {
@@ -516,6 +563,16 @@ function toTask(row: TaskRow): AgentTeamTask {
     startedAt: row.started_at,
     finishedAt: row.finished_at,
     wakeAt: row.wake_at,
+    contextId: row.context_id ?? '',
+    traceId: row.trace_id ?? '',
+    phase: normalizeTaskPhase(row.phase),
+    rejectReason: row.reject_reason ?? '',
+    input: parseRecord(row.input_json),
+    artifacts: parseAgentArtifactJson(row.artifacts_json),
+    budget: parseTaskBudget(parseJson(row.budget_json)),
+    deadlineAt: row.deadline_at === null || row.deadline_at === undefined ? null : Number(row.deadline_at),
+    usedTokens: Number(row.used_tokens) || 0,
+    usedCostMicros: Number(row.used_cost_micros) || 0,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   }
@@ -529,6 +586,8 @@ function toEvent(row: EventRow): AgentTeamEvent {
     taskId: row.task_id,
     kind: row.kind,
     payload: parseJson(row.payload_json),
+    contextId: row.context_id ?? '',
+    traceId: row.trace_id ?? '',
     createdAt: row.created_at,
   }
 }
@@ -964,15 +1023,25 @@ export class AgentTeamStore {
     prompt: string
     parentRunId?: string | null
     modelId?: string
+    contextId?: string
+    traceId?: string
+    input?: Record<string, unknown>
+    budget?: TaskBudget
+    deadlineAt?: number | null
     now?: number
   }): AgentTeamTask {
     const id = input.id ?? `task_${randomUUID()}`
     const now = input.now ?? Date.now()
+    const defaultContextId = this.teamId.startsWith('session:')
+      ? this.teamId.slice('session:'.length)
+      : this.teamId
     this.db.prepare(
       `INSERT INTO agent_tasks
          (id, team_id, company_id, user_id, worker_key, parent_run_id, child_run_id, status,
-          prompt, result_text, error, model_id, started_at, finished_at, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, NULL, 'queued', ?, '', '', ?, NULL, NULL, ?, ?)`,
+          prompt, result_text, error, model_id, started_at, finished_at, created_at, updated_at,
+          context_id, trace_id, phase, input_json, artifacts_json, budget_json, deadline_at)
+       VALUES (?, ?, ?, ?, ?, ?, NULL, 'queued', ?, '', '', ?, NULL, NULL, ?, ?,
+               ?, ?, 'none', ?, '[]', ?, ?)`,
     ).run(
       id,
       this.teamId,
@@ -984,6 +1053,11 @@ export class AgentTeamStore {
       input.modelId ?? '',
       now,
       now,
+      (input.contextId ?? defaultContextId).trim().slice(0, 256),
+      (input.traceId ?? input.parentRunId ?? '').trim().slice(0, 256),
+      JSON.stringify(input.input ?? {}),
+      JSON.stringify(parseTaskBudget(input.budget)),
+      input.deadlineAt ?? null,
     )
     return this.getTask(id) as AgentTeamTask
   }
@@ -995,31 +1069,78 @@ export class AgentTeamStore {
     ).run(childRunId, now, now, id)
   }
 
-  markTaskDone(id: string, resultText: string, now = Date.now()): void {
+  markTaskDone(id: string, resultText: string, now = Date.now(), artifacts?: AgentArtifactRef[]): void {
+    // 完成时清掉暂停原因，但不动 status 的既有语义；artifacts 不传则保留原值。
+    const normalizedArtifacts = artifacts === undefined ? null : JSON.stringify(parseAgentArtifacts(artifacts))
+    if (normalizedArtifacts === null) {
+      this.db.prepare(
+        `UPDATE agent_tasks SET status = 'succeeded', result_text = ?, error = '', phase = 'none',
+           reject_reason = '', finished_at = ?, updated_at = ?
+          WHERE id = ?`,
+      ).run(resultText.slice(0, 4000), now, now, id)
+      return
+    }
     this.db.prepare(
-      `UPDATE agent_tasks SET status = 'succeeded', result_text = ?, error = '', finished_at = ?, updated_at = ?
+      `UPDATE agent_tasks SET status = 'succeeded', result_text = ?, error = '', phase = 'none',
+         reject_reason = '', artifacts_json = ?, finished_at = ?, updated_at = ?
         WHERE id = ?`,
-    ).run(resultText.slice(0, 4000), now, now, id)
+    ).run(resultText.slice(0, 4000), normalizedArtifacts, now, now, id)
+  }
+
+  /** 只改暂停/拒绝原因，不改变原有 status；父 Agent 答复后传 none 复位。 */
+  markTaskPhase(id: string, phase: TaskPhase, reason = '', now = Date.now()): void {
+    const normalized = normalizeTaskPhase(phase)
+    this.db.prepare(
+      `UPDATE agent_tasks SET phase = ?, reject_reason = ?, updated_at = ?
+        WHERE team_id = ? AND id = ?`,
+    ).run(normalized, normalized === 'rejected' ? reason.slice(0, 500) : '', now, this.teamId, id)
+  }
+
+  /** 子 Agent 明确拒绝执行：失败是结果，拒绝是原因，不能伪装成超时/失败。 */
+  markTaskRejected(id: string, reason: string, now = Date.now()): void {
+    this.db.prepare(
+      `UPDATE agent_tasks SET status = 'failed', phase = 'rejected', reject_reason = ?,
+         error = ?, finished_at = ?, updated_at = ?
+        WHERE team_id = ? AND id = ?`,
+    ).run(reason.slice(0, 500), reason.slice(0, 500), now, now, this.teamId, id)
   }
 
   markTaskFailed(id: string, error: string, now = Date.now()): void {
     this.db.prepare(
-      `UPDATE agent_tasks SET status = 'failed', error = ?, finished_at = ?, updated_at = ?
+      `UPDATE agent_tasks SET status = 'failed', phase = 'none', reject_reason = '',
+         error = ?, finished_at = ?, updated_at = ?
         WHERE id = ?`,
     ).run(error.slice(0, 500), now, now, id)
   }
 
   markTaskCancelled(id: string, reason = '已取消', now = Date.now()): void {
     this.db.prepare(
-      `UPDATE agent_tasks SET status = 'cancelled', error = ?, finished_at = ?, updated_at = ?
+      `UPDATE agent_tasks SET status = 'cancelled', error = ?, phase = 'none', reject_reason = '',
+         finished_at = ?, updated_at = ?
         WHERE id = ?`,
     ).run(reason.slice(0, 500), now, now, id)
+  }
+
+  /** 任务实际用量；费用由调用方按模型单价换算后传入，团队层不猜价格。 */
+  markTaskUsage(id: string, tokens: number, costMicros = 0, now = Date.now()): void {
+    this.db.prepare(
+      `UPDATE agent_tasks SET used_tokens = ?, used_cost_micros = ?, updated_at = ?
+        WHERE team_id = ? AND id = ?`,
+    ).run(
+      Math.max(0, Math.floor(Number(tokens) || 0)),
+      Math.max(0, Math.floor(Number(costMicros) || 0)),
+      now,
+      this.teamId,
+      id,
+    )
   }
 
   getTask(id: string): AgentTeamTask | undefined {
     const row = this.db.prepare(
       `SELECT id, team_id, worker_key, parent_run_id, child_run_id, status, prompt, result_text,
-              error, model_id, started_at, finished_at, wake_at, created_at, updated_at
+              error, model_id, started_at, finished_at, wake_at, context_id, trace_id, phase,
+              reject_reason, input_json, artifacts_json, budget_json, deadline_at, used_tokens,
+              used_cost_micros, created_at, updated_at
          FROM agent_tasks WHERE team_id = ? AND id = ?`,
     ).get(this.teamId, id) as TaskRow | undefined
     return row ? toTask(row) : undefined
@@ -1028,11 +1149,51 @@ export class AgentTeamStore {
   listTasks(limit = 20): AgentTeamTask[] {
     const rows = this.db.prepare(
       `SELECT id, team_id, worker_key, parent_run_id, child_run_id, status, prompt, result_text,
-              error, model_id, started_at, finished_at, wake_at, created_at, updated_at
+              error, model_id, started_at, finished_at, wake_at, context_id, trace_id, phase,
+              reject_reason, input_json, artifacts_json, budget_json, deadline_at, used_tokens,
+              used_cost_micros, created_at, updated_at
          FROM agent_tasks WHERE team_id = ?
          ORDER BY created_at DESC LIMIT ?`,
     ).all(this.teamId, Math.max(1, Math.min(100, limit))) as unknown as TaskRow[]
     return rows.map(toTask)
+  }
+
+  /** 按 trace 查同一用户回合下的父子任务，供团队面板和审计还原链路。 */
+  listTasksByTrace(traceId: string, limit = 20): AgentTeamTask[] {
+    const clean = traceId.trim()
+    if (!clean) return []
+    const rows = this.db.prepare(
+      `SELECT id, team_id, worker_key, parent_run_id, child_run_id, status, prompt, result_text,
+              error, model_id, started_at, finished_at, wake_at, context_id, trace_id, phase,
+              reject_reason, input_json, artifacts_json, budget_json, deadline_at, used_tokens,
+              used_cost_micros, created_at, updated_at
+         FROM agent_tasks WHERE team_id = ? AND trace_id = ?
+         ORDER BY created_at ASC LIMIT ?`,
+    ).all(this.teamId, clean.slice(0, 256), Math.max(1, Math.min(100, limit))) as unknown as TaskRow[]
+    return rows.map(toTask)
+  }
+
+  listArtifacts(taskId: string): AgentArtifactRef[] {
+    return this.getTask(taskId)?.artifacts ?? []
+  }
+
+  /**
+   * 登记一条产物引用，按 id / uri 去重后整体写回 `artifacts_json`。
+   *
+   * 只写任务上的引用列表，不复制文件本体；同一个产物被重新发布时替换旧引用，
+   * 以便 size / checksum / preview 跟着文件更新。
+   */
+  appendTaskArtifact(taskId: string, ref: AgentArtifactRef, now = Date.now()): AgentArtifactRef[] {
+    const task = this.getTask(taskId)
+    if (!task) throw new Error(`任务不存在：${taskId}`)
+    const next = [
+      ...task.artifacts.filter((item) => item.id !== ref.id && item.uri !== ref.uri),
+      ref,
+    ].slice(-50)
+    this.db.prepare(
+      'UPDATE agent_tasks SET artifacts_json = ?, updated_at = ? WHERE id = ?',
+    ).run(JSON.stringify(next), now, taskId)
+    return next
   }
 
   /**
@@ -1047,7 +1208,9 @@ export class AgentTeamStore {
       : ''
     const rows = this.db.prepare(
       `SELECT t.id, t.team_id, t.worker_key, t.parent_run_id, t.child_run_id, t.status, t.prompt,
-              t.result_text, t.error, t.model_id, t.started_at, t.finished_at, t.wake_at, t.created_at, t.updated_at
+              t.result_text, t.error, t.model_id, t.started_at, t.finished_at, t.wake_at,
+              t.context_id, t.trace_id, t.phase, t.reject_reason, t.input_json, t.artifacts_json,
+              t.budget_json, t.deadline_at, t.used_tokens, t.used_cost_micros, t.created_at, t.updated_at
          FROM agent_tasks t
         WHERE t.team_id = ?${idClause} AND t.wake_at IS NULL
           AND (
@@ -1088,14 +1251,20 @@ export class AgentTeamStore {
     kind: string
     payload?: unknown
     taskId?: string | null
+    contextId?: string
+    traceId?: string
     now?: number
   }): AgentTeamEvent {
     const now = input.now ?? Date.now()
     const id = `evt_${randomUUID()}`
+    const task = input.taskId ? this.getTask(input.taskId) : undefined
+    const contextId = (input.contextId ?? task?.contextId ?? '').trim().slice(0, 256)
+    const traceId = (input.traceId ?? task?.traceId ?? '').trim().slice(0, 256)
     this.db.prepare(
       `INSERT INTO agent_events
-         (id, team_id, company_id, user_id, worker_key, task_id, kind, payload_json, created_at, consumed_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+         (id, team_id, company_id, user_id, worker_key, task_id, kind, payload_json, created_at, consumed_at,
+          context_id, trace_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
     ).run(
       id,
       this.teamId,
@@ -1106,6 +1275,8 @@ export class AgentTeamStore {
       input.kind,
       JSON.stringify(input.payload ?? {}),
       now,
+      contextId,
+      traceId,
     )
     // 同一个任务可能先提问、后完成：新事件必须重新获得唤醒资格，
     // 否则上一次 question 唤醒会把这条任务的 wake_at 永久写死。
@@ -1122,6 +1293,8 @@ export class AgentTeamStore {
       taskId: input.taskId ?? null,
       kind: input.kind,
       payload: input.payload ?? {},
+      contextId,
+      traceId,
       createdAt: now,
     }
   }
@@ -1131,7 +1304,7 @@ export class AgentTeamStore {
       ? ` AND kind IN (${kinds.map(() => '?').join(', ')})`
       : ''
     const row = this.db.prepare(
-      `SELECT id, team_id, worker_key, task_id, kind, payload_json, created_at
+      `SELECT id, team_id, worker_key, task_id, kind, payload_json, context_id, trace_id, created_at
          FROM agent_events
         WHERE team_id = ? AND consumed_at IS NULL${kindFilter}
         ORDER BY created_at ASC, rowid ASC LIMIT 1`,
@@ -1143,7 +1316,7 @@ export class AgentTeamStore {
 
   listPendingEvents(limit = 20): AgentTeamEvent[] {
     const rows = this.db.prepare(
-      `SELECT id, team_id, worker_key, task_id, kind, payload_json, created_at
+      `SELECT id, team_id, worker_key, task_id, kind, payload_json, context_id, trace_id, created_at
          FROM agent_events
         WHERE team_id = ? AND consumed_at IS NULL
         ORDER BY created_at ASC, rowid ASC LIMIT ?`,

@@ -6232,7 +6232,19 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
         void import('../dingtalk-bot.js')
           .then(async (bot) => {
             const result = await bot.handleDingTalkMessage(deps, payload, { dedupe: false })
-            if (result.text && safeWebhook) await bot.replySessionWebhook(deps, safeWebhook, result.text)
+            let textSent = !result.text
+            if (result.text && safeWebhook) {
+              await bot.replySessionWebhook(deps, safeWebhook, result.text)
+              textSent = true
+            }
+            if (result.voice && textSent) {
+              try {
+                const { sendDingTalkVoiceReply } = await import('../dingtalk-voice.js')
+                await sendDingTalkVoiceReply(deps, result.voice.companyId, result.voice.userId, result.voice.text)
+              } catch (error) {
+                console.warn('[eab] 钉钉语音回复发送失败：', (error as Error).message)
+              }
+            }
             return result
           })
           .catch((error) => console.warn('[eab] 钉钉回调处理失败：', (error as Error).message))

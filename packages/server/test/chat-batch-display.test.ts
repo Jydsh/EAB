@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import {
+  buildBrowserToolView,
   buildWorkspaceToolView,
   summarizeBatchToolResult,
+  summarizeWebToolResult,
   summarizeWorkspaceFileToolResult,
   summarizeWorkspaceReadToolResult,
 } from '../src/routes/chat.js'
@@ -195,5 +197,30 @@ describe('文件工具的结构化展示视图', () => {
     expect(view.total).toBe(120)
     expect(view.matches).toHaveLength(8)
     expect(view.matches[7].text).toBe('needle-8')
+  })
+})
+
+describe('联网和浏览器工具卡', () => {
+  it('浏览器工具卡给出标题、网址、元素数量和截图文件', () => {
+    const view = buildBrowserToolView('browser', {
+      action: 'screenshot',
+      pageId: 'bp_1',
+      title: '示例页面',
+      url: 'https://example.com/',
+      text: '正文'.repeat(200),
+      elements: [{ ref: 'e1' }, { ref: 'e2' }],
+      screenshot: { fileId: 'wf_1', name: '浏览器截图.png', relPath: '浏览器截图.png', size: 100, mime: 'image/png' },
+    })
+    expect(view?.kind).toBe('browser')
+    if (!view || view.kind !== 'browser') return
+    expect(view.title).toBe('示例页面')
+    expect(view.elementCount).toBe(2)
+    expect(view.screenshot?.fileId).toBe('wf_1')
+    expect(view.textPreview.length).toBe(300)
+  })
+
+  it('未配置搜索时摘要明确提示，不伪装成空结果', () => {
+    expect(summarizeWebToolResult('web_search', { configured: false, query: '重庆', results: [] })).toContain('未配置')
+    expect(summarizeWebToolResult('web_fetch', { title: '示例', url: 'https://example.com/', text: 'abc' })).toContain('3 字')
   })
 })

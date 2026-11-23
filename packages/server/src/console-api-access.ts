@@ -185,6 +185,14 @@ export function consoleApiRuleFor(method: string, path: string): ConsoleApiRule 
   if (/^\/api\/console\/(?:backups|backup-jobs|runtime-backups?)(?:\/|$)/.test(path)) {
     return { pages: P('system'), section: 'data', actions }
   }
+  // 搜索与浏览器连接已经迁到「数据连接」页，读写都随该页可见权限；
+  // 其它系统设置仍留在「系统 → 系统与运维」。
+  if (/^\/api\/console\/settings\/web-services(?:\/|$)/.test(path)) {
+    return { pages: P('databases'), actions }
+  }
+  if (/^\/api\/console\/settings\/(?:web-search|browser-network)(?:\/|$)/.test(path)) {
+    return { pages: P('databases'), actions }
+  }
   if (/^\/api\/console\/(?:settings|system|backends)(?:\/|$)/.test(path)) {
     return { pages: P('system'), section: 'data', actions }
   }
@@ -195,6 +203,10 @@ export function consoleApiRuleFor(method: string, path: string): ConsoleApiRule 
     return { pages: P('system'), section: 'concurrency', actions }
   }
   if (/^\/api\/console\/agent-runs(?:\/|$)/.test(path)) {
+    return { pages: P('system'), section: 'agents', actions }
+  }
+  // MCP Server 与 A2A Peer / 入站端点都放在「Agent 管理」页，按该二级页可见放行。
+  if (/^\/api\/console\/(?:mcp|a2a)(?:\/|$)/.test(path)) {
     return { pages: P('system'), section: 'agents', actions }
   }
   if (/^\/api\/console\/jobs(?:\/|$)/.test(path)) {

@@ -12,6 +12,9 @@ describe('本轮能力路由', () => {
       skillDev: false,
       schedule: false,
       org: false,
+      weather: true,
+      web: false,
+      browser: false,
       memoryRule: false,
     })
   })
@@ -106,6 +109,23 @@ describe('本轮能力路由', () => {
     expect(routeCapabilities('读取 docs/方案.md 的前两段').workspace).toBe(true)
     expect(routeCapabilities('把结果导出成 csv').workspace).toBe(true)
     expect(routeCapabilities('查看今天天气').workspace).toBe(false)
+    expect(routeCapabilities('查看今天天气').weather).toBe(true)
+    expect(routeCapabilities('明天重庆下雨吗').weather).toBe(true)
+    expect(routeCapabilities('把这个月报表导出').weather).toBe(false)
+    expect(routeCapabilities('把这个月报表导出').web).toBe(false)
+  })
+
+  it('网页、链接和明确联网意图命中上网工具，普通业务查询不命中', () => {
+    expect(routeCapabilities('帮我总结 https://example.com/a').web).toBe(true)
+    expect(routeCapabilities('打开这个网页看看最新公告').web).toBe(true)
+    expect(routeCapabilities('联网搜一下重庆两江新区最新规划').web).toBe(true)
+    expect(routeCapabilities('查看今天天气').web).toBe(false)
+    expect(routeCapabilities('读取 docs/方案.md 的前两段').web).toBe(false)
+    expect(routeCapabilities('东环线班组最近录入了多少条检查整治记录').web).toBe(false)
+    expect(routeCapabilities('用内置浏览器打开网页并截图').browser).toBe(true)
+    expect(routeCapabilities('打开这个网页看看最新公告').browser).toBe(true)
+    expect(routeCapabilities('联网搜一下重庆两江新区最新规划').browser).toBe(false)
+    expect(routeCapabilities('帮我总结 https://example.com/a').browser).toBe(false)
   })
 
   it('工程/定时/插件开发/组织问题分别命中对应工具组', () => {

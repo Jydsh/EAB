@@ -363,6 +363,52 @@ const state = {
   activeRunSnapshots: new Map(),
   /** queue=按顺序排队；interrupt=新消息打断当前回复 */
   chatSendMode: 'queue',
+  /** 语音链路：模型是否可用 + 当前员工自己的语音配置。 */
+  transcribeAvailable: false,
+  speechAvailable: false,
+  voiceSettings: {
+    enabled: true,
+    activeVoiceId: 'default',
+    instructions: '',
+    defaults: { enabled: true, activeVoiceId: 'default' },
+    voices: [],
+    speechAvailable: false,
+  },
+  /** 当前正在播放的语音，避免连续回答叠加播放。 */
+  activeVoiceAudio: null,
+  /** 停止播放时要触发的收尾回调（用于语音对话在播报结束后续听）。 */
+  activeVoiceReset: null,
+  /** 连续语音对话：入口在网页，转写和合成沿用现有 ASR/TTS 接口。 */
+  voiceConversation: {
+    active: false,
+    phase: 'idle',
+    sessionId: null,
+    generation: 0,
+    resumeTimer: 0,
+    turnStartedAt: 0,
+    speechStarted: false,
+    speechMs: 0,
+    silenceMs: 0,
+    level: 0,
+    threshold: 0.012,
+    calibrating: true,
+    calibrationUntil: 0,
+    calibrationSamples: [],
+    maxMs: 30_000,
+    noSpeechTimeout: 10_000,
+    stopReason: '',
+  },
+  /**
+   * 语音唤醒：只在用户显式开启后占用麦克风。页面打开期间持续采集，
+   * 识别到助手名字才进入语音对话；关掉页面/退出对话/播报时立即停。
+   */
+  wake: {
+    enabled: false,
+    active: false,
+    phase: 'idle',
+    generation: 0,
+    lastError: '',
+  },
   attachments: [],
   personas: [],
   sessionId: null,
@@ -1353,6 +1399,17 @@ function setupChatEvents() {
   source.addEventListener('models', () => {
     void refreshModelCatalog()
   })
+  // 管理后台改了助手名字/头像：名字同时是语音唤醒词，立即更新，不需要刷新页面。
+  source.addEventListener('assistant', (event) => {
+    let payload = null
+    try {
+      payload = JSON.parse(event.data || '{}')
+    } catch {
+      payload = null
+    }
+    if (!payload?.name) return
+    applyAssistantIdentity(payload.name, payload.avatarUrl)
+  })
   // 云空间文件变化：列表主动刷新；删除事件同时就地更新消息卡片。
   source.addEventListener('workspace', (event) => {
     let payload = null
@@ -1727,6 +1784,7 @@ async function loadPersistedAgentTeam(sessionId, seq) {
         status,
         text: lastText || previous.text || '',
         thread,
+        artifacts: Array.isArray(latestTask?.artifacts) ? latestTask.artifacts : (Array.isArray(previous.artifacts) ? previous.artifacts : []),
         error: previous.error || latestTask?.error || '',
         updatedAt: Date.now(),
       })
@@ -1750,6 +1808,7 @@ function startAgentTeamPolling(sessionId) {
 }
 
 async function openSession(sessionId) {
+  if (state.voiceConversation.active) exitVoiceConversation({ silent: true, reason: '切换会话后，语音对话已结束' })
   clearRemoteLive()
   hideSettings()
   setChatMode('chat')
@@ -1844,6 +1903,8 @@ async function openSession(sessionId) {
 
 function newSession() {
   hideSettings()
+  // 新建对话等于换上下文：连续语音不能沿用旧会话的收听状态与播报归属。
+  if (state.voiceConversation.active) exitVoiceConversation({ silent: true })
   setChatMode('chat')
   if (state.messageEdit) cancelMessageEdit({ clearInput: true, silent: true })
   state.openSeq += 1
@@ -4506,6 +4567,7 @@ function updateAgentEvent(data) {
       : (data.error || previous.error || ''),
     durationMs: Number(data.durationMs) || previous.durationMs || 0,
     toolCount: Number.isFinite(Number(data.toolCount)) ? Number(data.toolCount) : (previous.toolCount || 0),
+    artifacts: Array.isArray(data.artifacts) ? data.artifacts : (Array.isArray(previous.artifacts) ? previous.artifacts : []),
     updatedAt: Date.now(),
     retireTimer: previous.retireTimer,
   }
@@ -5033,6 +5095,29 @@ function onAgentThreadScroll(event) {
   updateAgentScrollBottomButton(childId)
 }
 
+/** 子 Agent 交付的产物：只显示元数据，点击文件类产物复用右侧文件预览。 */
+function agentArtifactsHtml(run) {
+  const artifacts = Array.isArray(run.artifacts) ? run.artifacts.filter((item) => item && item.name) : []
+  if (artifacts.length === 0) return ''
+  const sourceLabel = { workspace: '工作区', cloud: '云空间', inline: '链接', mcp: 'MCP', a2a: 'A2A' }
+  const rows = artifacts.slice(-8).map((artifact) => {
+    const fileId = String(artifact.fileId || '')
+    const meta = [sourceLabel[artifact.source] || artifact.source || '', fmtSize(Number(artifact.size) || 0)]
+      .filter(Boolean).join(' · ')
+    return `<button class="agent-artifact${fileId ? '' : ' is-plain'}" type="button"${fileId ? ` data-agent-artifact-open="${esc(fileId)}"` : ' disabled'} title="${esc(artifact.preview || artifact.uri || artifact.name)}">
+      <span class="agent-artifact-icon" aria-hidden="true">◇</span>
+      <span class="agent-artifact-body">
+        <span class="agent-artifact-name">${esc(artifact.name)}</span>
+        <span class="agent-artifact-meta">${esc(meta)}</span>
+      </span>
+    </button>`
+  }).join('')
+  return `<div class="agent-chat-artifacts" aria-label="任务产物">
+    <span class="agent-chat-facts-label">产物 ${artifacts.length}</span>
+    <div class="agent-chat-artifact-list">${rows}</div>
+  </div>`
+}
+
 /** 右侧预览：一个子 Agent 与父 Agent 的对话流，父右子左。 */
 function agentDetailHtml(run) {
   const status = run.status || 'running'
@@ -5060,6 +5145,7 @@ function agentDetailHtml(run) {
       <span class="agent-chat-state"><span class="agent-status-dot" aria-hidden="true"></span>${agentStatusText(status)}</span>
     </header>
     <div class="agent-chat-facts">${facts}</div>
+    ${agentArtifactsHtml(run)}
     <div class="agent-chat-thread" role="log" aria-live="polite">
       ${thread || `<p class="agent-chat-placeholder">${status === 'running' ? '等待子 Agent 的第一条消息…' : '还没有对话记录。'}</p>`}
     </div>
@@ -5155,6 +5241,13 @@ function agentDetailRenderSignature(run) {
     entry.summary || '',
     String(entry.text || '').length,
   ].join(':')).join('|')
+  const artifacts = (Array.isArray(run.artifacts) ? run.artifacts : []).map((artifact) => [
+    artifact.id || '',
+    artifact.name || '',
+    Number(artifact.size) || 0,
+    artifact.checksum || '',
+    artifact.fileId || '',
+  ].join(':')).join('|')
   return [
     run.childId,
     run.title || '',
@@ -5168,6 +5261,7 @@ function agentDetailRenderSignature(run) {
     String(run.text || '').length,
     thread.length,
     entries,
+    artifacts,
   ].join('~')
 }
 
@@ -5318,6 +5412,8 @@ let workspacePreviewTextLoaded = false
 let workspacePreviewOriginalText = ''
 let workspaceDiffVisible = false
 let workspacePreviewObjectUrl = ''
+/** 云空间图片走中央大图，不复用右栏预览；连续点图时只保留最后一次。 */
+let workspaceImagePreviewToken = 0
 let workspacePreviewSaving = false
 let workspacePreviewToken = 0
 /** PDF 降级预览状态；只对当前打开的 PDF 文件有效。 */
@@ -6761,6 +6857,26 @@ function activePreviewFilePayload() {
   }
 }
 
+/** 云空间图片直接打开中央聚焦预览，不创建右侧文件面板。 */
+async function openWorkspaceImagePreview(file) {
+  const token = ++workspaceImagePreviewToken
+  try {
+    const response = await fetch(workspaceFileUrl(file), { credentials: 'same-origin' })
+    if (response.status === 401) {
+      redirectToLogin()
+      return waitForLoginRedirect()
+    }
+    if (!response.ok) throw new Error(`读取图片失败（HTTP ${response.status}）`)
+    const blob = await response.blob()
+    if (token !== workspaceImagePreviewToken) return
+    const objectUrl = URL.createObjectURL(blob)
+    openImageLightbox(objectUrl, file.name, { objectUrl: true })
+  } catch (err) {
+    if (token !== workspaceImagePreviewToken) return
+    banner(`图片预览失败：${err.message}`, 'bad')
+  }
+}
+
 async function openWorkspaceFile(id, options = {}) {
   let file = state.files.find((item) => item.id === id)
   if (!file) {
@@ -6777,6 +6893,16 @@ async function openWorkspaceFile(id, options = {}) {
   if (!file) {
     banner('文件已不存在，可能已从云空间删除', 'bad')
     await loadWorkspaceFiles()
+    return
+  }
+  if (isImageLike(file)) {
+    const capability = await fetchPreviewCapability(file)
+    const kind = capability?.kind || previewKindForFile(file)
+    if (kind === 'none') {
+      banner(capability?.reason || `《${file.name}》暂不支持在线预览，请下载后查看。`, 'warn')
+      return
+    }
+    await openWorkspaceImagePreview(file)
     return
   }
   const requestSeq = ++workspacePreviewToken
@@ -6883,15 +7009,6 @@ async function openWorkspaceFile(id, options = {}) {
         setFilePaneBody(pre)
       }
       $('#file-pane-edit').hidden = !owner
-      return
-    }
-    if (isImageLike(file)) {
-      workspacePreviewObjectUrl = URL.createObjectURL(blob)
-      const image = document.createElement('img')
-      image.className = 'file-image-view'
-      image.alt = file.name
-      image.src = workspacePreviewObjectUrl
-      setFilePaneBody(image)
       return
     }
     if (isPdfLike(file)) {
@@ -7648,6 +7765,13 @@ function bindWorkbenchTabs() {
     if (!row) return
     selectAgentChild(row.getAttribute('data-agent-select') || '')
   })
+  // 子 Agent 产物：文件类直接在右侧预览打开，和云空间文件走同一条链路。
+  $('#team-detail')?.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-agent-artifact-open]')
+    if (!button) return
+    event.preventDefault()
+    void openWorkspaceFile(String(button.getAttribute('data-agent-artifact-open') || ''))
+  })
   // 子 Agent 的思考/工具入口：和主对话一样单行折叠，点一下展开完整内容。
   $('#team-detail')?.addEventListener('click', (event) => {
     const block = event.target.closest('[data-agent-cot-toggle], .agent-cot-block .tool-head')?.closest('.agent-cot-block')
@@ -8057,6 +8181,17 @@ function aiWhoMarkup() {
   }</div>`
 }
 
+/** 管理后台改名/换头像后，已经渲染的 AI 消息身份区和语音唤醒词一起热更新。 */
+function applyAssistantIdentity(name, avatarUrl) {
+  state.assistant = {
+    name: String(name || '').trim() || 'AI',
+    avatarUrl: String(avatarUrl || ''),
+  }
+  for (const node of [...document.querySelectorAll('.who-ai')]) node.outerHTML = aiWhoMarkup()
+  renderWakeSettings()
+  renderVoiceControls()
+}
+
 function renderSideUser(me) {
   $('#side-user').hidden = false
   const sideAvatar = $('#user-avatar')
@@ -8077,6 +8212,1190 @@ function renderSideUser(me) {
   $('#user-roles').innerHTML = (me.roles || [])
     .map((role) => `<span class="pill">${esc(ROLE_LABEL[role] || role)}</span>`)
     .join('')
+}
+
+async function loadVoiceSettings() {
+  try {
+    const data = await api('/api/me/voice', { cache: 'no-store' })
+    const voices = Array.isArray(data.voices) ? data.voices : []
+    state.voiceSettings = {
+      enabled: data.enabled !== false,
+      activeVoiceId: String(data.activeVoiceId || 'default'),
+      instructions: String(data.instructions || ''),
+      defaults: data.defaults || { enabled: true, activeVoiceId: 'default' },
+      voices,
+      speechAvailable: Boolean(data.speechAvailable),
+    }
+  } catch {
+    // 语音配置读不到不阻断文字对话；按钮保持隐藏/默认。
+  }
+  renderVoiceControls()
+  renderVoiceSettings()
+}
+
+function renderVoiceControls() {
+  const modeButton = $('#voice-mode')
+  if (modeButton) {
+    modeButton.hidden = !state.transcribeAvailable || !voiceSupported()
+    modeButton.classList.toggle('is-active', state.voiceConversation.active)
+    modeButton.classList.toggle(
+      'is-wake-armed',
+      state.wake.enabled && state.wake.active && !state.voiceConversation.active,
+    )
+    modeButton.setAttribute('aria-pressed', state.voiceConversation.active ? 'true' : 'false')
+    const title = state.voiceConversation.active
+      ? '退出语音对话'
+      : state.wake.enabled
+        ? `开启语音对话（也可说“${wakeNameShort()}”唤醒）`
+        : '开启语音对话'
+    modeButton.title = title
+    modeButton.setAttribute('aria-label', title)
+  }
+}
+
+function renderVoiceSettings() {
+  const voice = state.voiceSettings
+  const segment = $('#settings-voice-segment')
+  if (segment) {
+    for (const button of segment.querySelectorAll('[data-voice-enabled]')) {
+      const on = button.dataset.voiceEnabled === 'true'
+      button.classList.toggle('is-active', on === voice.enabled)
+      button.setAttribute('aria-checked', on === voice.enabled ? 'true' : 'false')
+    }
+  }
+  const hint = $('#settings-voice-hint')
+  if (hint) {
+    hint.textContent = !voice.speechAvailable
+      ? '还没有配置语音合成模型，暂时只回复文字'
+      : voice.enabled
+        ? '用语音对话时，回答会自动转成语音'
+        : '已关闭：语音对话只回复文字'
+  }
+  const label = $('#settings-voice-label')
+  if (label) {
+    const active = voice.voices.find((item) => item.id === voice.activeVoiceId)
+    label.textContent = !active || active.builtin ? '系统默认' : `我的声音 · ${active.name}`
+  }
+}
+
+/** 语音唤醒词就是管理后台的助手名字；展示时截断，匹配时用完整名字。 */
+function wakeName() {
+  return assistantIdentity().name
+}
+
+function wakeNameShort() {
+  const name = wakeName()
+  return name.length > 16 ? `${name.slice(0, 16)}…` : name
+}
+
+/** NFKC + 去空白/标点，兼顾“E A B”“EAB”“小易，”这类 ASR 结果。 */
+function normalizeWakeText(value) {
+  return String(value || '')
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[\s\p{P}\p{S}]+/gu, '')
+}
+
+/**
+ * 单字母名字被 ASR 写成中文同音字时，用真实同音字表匹配，而不是放开任意 1 字差异。
+ * 例如“小E”可命中“小艺/小易/小依”，但不会把“小爱”这种不同读音也算进来。
+ */
+const WAKE_LATIN_HOMOPHONES = {
+  a: ['诶', '欸', '艾', '哎'],
+  b: ['比', '必', '毕', '碧', '币', '笔'],
+  c: ['西', '希', '熙', '溪', '喜'],
+  d: ['迪', '帝', '弟', '地', '蒂', '笛'],
+  e: ['伊', '一', '艺', '易', '依', '衣', '亿', '忆', '医', '姨', '义', '意'],
+  f: ['弗', '夫', '福'],
+  g: ['吉', '基', '几', '机', '姬'],
+  h: ['奇', '棋', '希'],
+  i: ['爱', '艾', '哎', '矮'],
+  j: ['杰', '洁', '结', '姐', '捷'],
+  k: ['开', '凯', '恺'],
+  l: ['勒', '乐'],
+  m: ['姆', '木'],
+  n: ['恩', '嗯'],
+  o: ['欧', '偶', '鸥', '藕'],
+  p: ['皮', '匹', '批'],
+  q: ['丘', '秋', '求', '球'],
+  r: ['阿', '啊'],
+  s: ['斯', '思', '丝'],
+  t: ['提', '蒂', '题', '体'],
+  u: ['优', '尤', '悠', '有', '友'],
+  v: ['维', '薇', '威', '为'],
+  w: ['吴', '无', '伍'],
+  x: ['克', '西', '克斯'],
+  y: ['歪', '外'],
+  z: ['泽', '兹', '资', '子'],
+}
+
+function wakeLatinNameVariants(value) {
+  const text = String(value || '')
+  if (!/[a-z]/.test(text)) return [text]
+  const queue = [text]
+  const output = new Set([text])
+  for (let index = 0; index < queue.length && output.size < 200; index++) {
+    const current = queue[index]
+    for (let position = 0; position < current.length; position++) {
+      const letter = current[position]
+      const homophones = WAKE_LATIN_HOMOPHONES[letter]
+      if (!homophones) continue
+      for (const homophone of homophones) {
+        const variant = current.slice(0, position) + homophone + current.slice(position + 1)
+        if (output.has(variant)) continue
+        output.add(variant)
+        queue.push(variant)
+      }
+    }
+  }
+  return [...output].filter(Boolean)
+}
+
+/**
+ * 名字里带空格/分隔符时，用户通常只喊第一段（例如“EAB 企业智能助手”只喊 EAB）。
+ * 全名始终保留；额外加入 2 字以上的分段，避免长名字必须一字不差。
+ */
+function wakeAliases() {
+  const raw = wakeName()
+  const aliases = new Set()
+  const full = normalizeWakeText(raw)
+  if (full) aliases.add(full)
+  for (const token of raw.split(/[\s·•\-_/|]+/u)) {
+    const normalized = normalizeWakeText(token)
+    if (normalized.length >= 2) aliases.add(normalized)
+  }
+  const expanded = new Set()
+  for (const alias of aliases) {
+    for (const variant of wakeLatinNameVariants(alias)) expanded.add(variant)
+  }
+  return [...expanded].filter(Boolean).sort((a, b) => b.length - a.length)
+}
+
+/** 只在转写开头匹配唤醒词，避免普通回答里出现同音词就误唤醒。 */
+function wakeEditDistance(left, right) {
+  const a = String(left || '')
+  const b = String(right || '')
+  let previous = Array.from({ length: b.length + 1 }, (_, index) => index)
+  for (let i = 1; i <= a.length; i++) {
+    const current = [i]
+    for (let j = 1; j <= b.length; j++) {
+      current[j] = Math.min(
+        previous[j] + 1,
+        current[j - 1] + 1,
+        previous[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1),
+      )
+    }
+    previous = current
+  }
+  return previous[b.length]
+}
+
+/**
+ * 名字是“小E”时，ASR 很可能写成“小艺/小易”；这些由同音字表提前展开，按精确前缀匹配。
+ * 纯中文名字在开头同长度窗口允许 1 个字差异，但 2 字名字不放宽，避免“小爱”这类不同名字误唤醒。
+ */
+function wakeLeadingMatch(spoken, alias) {
+  if (spoken.startsWith(alias)) return { length: alias.length, exact: true }
+  if (alias.length < 3 || /[a-z]/.test(alias)) return null
+  const window = spoken.slice(0, alias.length)
+  if (window.length !== alias.length) return null
+  return wakeEditDistance(window, alias) <= 1 ? { length: alias.length, exact: false } : null
+}
+
+const WAKE_COMMAND_PREFIX = /^(帮我|帮忙|请|麻烦|打开|关掉|关闭|查|搜索|找|发|写|做|生成|总结|翻译|提醒|今天|现在|给我|把|我想|我要|你能|能否|多少|怎么|什么|为什么|谁|哪里|几点|计算|安排|预约)/
+const WAKE_GREETING = /^(你好|您好|在吗|在不在|早上好|下午好|晚上好|嗨)/
+
+function matchWakePhrase(text) {
+  let spoken = normalizeWakeText(text)
+  if (!spoken) return null
+  spoken = spoken.replace(/^(嗯+|喂+|你好|您好|请问)+/u, '')
+  for (const alias of wakeAliases()) {
+    if (!alias) continue
+    const hit = wakeLeadingMatch(spoken, alias)
+    if (!hit) continue
+    let rest = spoken.slice(hit.length)
+    while (rest.startsWith(alias)) rest = rest.slice(alias.length)
+    rest = rest.replace(WAKE_GREETING, '')
+    rest = rest.replace(/^(请|帮我|帮忙|麻烦|然后|就是)+/u, '')
+    // 近音匹配只接受明确的指令开头；只喊名字/打招呼时直接进入聆听，不误发消息。
+    if (!hit.exact && rest && !WAKE_COMMAND_PREFIX.test(rest)) rest = ''
+    return { alias, exact: hit.exact, command: rest }
+  }
+  return null
+}
+
+function renderWakeSettings() {
+  const wake = state.wake
+  const segment = $('#settings-wake-segment')
+  if (segment) {
+    for (const button of segment.querySelectorAll('[data-wake-enabled]')) {
+      const on = button.dataset.wakeEnabled === 'true'
+      button.classList.toggle('is-active', on === wake.enabled)
+      button.setAttribute('aria-checked', on === wake.enabled ? 'true' : 'false')
+      button.disabled = !state.transcribeAvailable || !voiceSupported()
+    }
+  }
+  const hint = $('#settings-wake-hint')
+  if (hint) {
+    if (!state.transcribeAvailable) hint.textContent = '还没有配置语音转写模型，暂时不能语音唤醒'
+    else if (!voiceSupported()) hint.textContent = '当前浏览器不支持录音，暂时不能语音唤醒'
+    else if (!wake.enabled) hint.textContent = `开启后说“${wakeNameShort()}”即可开始语音对话`
+    else if (wake.lastError) hint.textContent = `麦克风未启动：${wake.lastError}`
+    else if (wake.active) hint.textContent = `正在听，说“${wakeNameShort()}”开始对话（页面打开时持续使用麦克风）`
+    else if (state.voiceConversation.active) hint.textContent = `语音对话进行中；退出对话后会自动恢复“${wakeNameShort()}”唤醒`
+    else if (wake.phase === 'processing') hint.textContent = '正在识别刚才那句话…'
+    else hint.textContent = `已开启，但麦克风暂未运行；点“开启”重新启用`
+  }
+  const modeButton = $('#voice-mode')
+  if (modeButton) {
+    const on = wake.enabled && wake.active && !state.voiceConversation.active
+    modeButton.classList.toggle('is-wake-armed', on)
+    if (!state.voiceConversation.active) {
+      const title = wake.enabled
+        ? `开启语音对话（也可说“${wakeNameShort()}”唤醒）`
+        : '开启语音对话'
+      modeButton.title = title
+      modeButton.setAttribute('aria-label', title)
+    }
+  }
+}
+
+function persistWakePreference(enabled) {
+  try {
+    if (enabled) localStorage.setItem(WAKE_PREF_KEY, '1')
+    else localStorage.removeItem(WAKE_PREF_KEY)
+  } catch {
+    // 隐私模式或存储被禁用时，只在本次页面内生效。
+  }
+}
+
+function stopWakeVad() {
+  window.clearInterval(wakeVadTimer)
+  wakeVadTimer = 0
+  wakeAnalyser = null
+  wakeVadData = null
+  wakeSpeechFrames = 0
+  const context = wakeAudioContext
+  wakeAudioContext = null
+  if (context && context.state !== 'closed') void context.close().catch(() => {})
+}
+
+function resetWakeTurns() {
+  window.clearInterval(wakeTimer)
+  wakeTimer = 0
+  wakeStartedAt = 0
+  wakeSpeechStarted = false
+  wakeSpeechMs = 0
+  wakeSilenceMs = 0
+  wakeNoSpeechMs = 0
+  wakeThreshold = 0.012
+  wakeCalibrating = true
+  wakeCalibrationUntil = 0
+  wakeCalibrationSamples = []
+  wakeSpeechFrames = 0
+  wakeChunks = []
+  wakeDiscounted = false
+}
+
+function cleanupWakeCapture() {
+  stopWakeVad()
+  for (const track of wakeStream?.getTracks?.() || []) track.stop()
+  wakeStream = null
+  wakeRecorder = null
+}
+
+function stopWakeListener(options = {}) {
+  const wake = state.wake
+  wake.generation += 1
+  const recorder = wakeRecorder
+  wakeRecorder = null
+  wakeDiscounted = true
+  if (recorder) {
+    recorder.onstop = null
+    try {
+      recorder.stop()
+    } catch {
+      // 已经停止时忽略
+    }
+  }
+  cleanupWakeCapture()
+  resetWakeTurns()
+  wake.active = false
+  wake.phase = 'idle'
+  if (!options.keepEnabled) {
+    wake.enabled = false
+    persistWakePreference(false)
+  }
+  renderWakeSettings()
+  renderVoiceControls()
+}
+
+function scheduleWakeRestart(delay = 350) {
+  const wake = state.wake
+  window.clearTimeout(wakeTimer)
+  wakeTimer = 0
+  if (!wake.enabled || wake.active || state.voiceConversation.active || document.hidden) return
+  if (wakePlaybackAudible()) {
+    // 助手正在播报：先把唤醒采集停住，播完再自动恢复，避免转录到自己的声音。
+    wakeTimer = window.setTimeout(() => scheduleWakeRestart(600), 600)
+    return
+  }
+  const generation = wake.generation
+  wakeTimer = window.setTimeout(() => {
+    if (!wake.enabled || wake.active || generation !== wake.generation) return
+    if (state.voiceConversation.active || document.hidden) return
+    void startWakeListener({ quiet: true })
+  }, Math.max(0, delay))
+}
+
+/** 助手自己的播报声不能被当成唤醒词，否则回答里提到名字就会自我唤醒。 */
+function wakePlaybackAudible() {
+  const audio = state.activeVoiceAudio
+  if (audio && !audio.paused && !audio.ended) return true
+  return Boolean(voiceSpeechStream?.active)
+}
+
+async function startWakeListener(options = {}) {
+  const wake = state.wake
+  if (!wake.enabled || wake.active || state.voiceConversation.active || document.hidden) return false
+  if (wakeRecorder || wakeTranscribing) return false
+  if (!state.transcribeAvailable || !voiceSupported()) {
+    wake.lastError = '当前环境不支持语音唤醒'
+    renderWakeSettings()
+    return false
+  }
+  const generation = wake.generation + 1
+  wake.generation = generation
+  wake.phase = 'starting'
+  wake.lastError = ''
+  try {
+    wakeStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    })
+  } catch {
+    wake.lastError = '没有拿到麦克风权限'
+    wake.phase = 'error'
+    renderWakeSettings()
+    return false
+  }
+  if (!wake.enabled || generation !== wake.generation || state.voiceConversation.active || document.hidden) {
+    for (const track of wakeStream?.getTracks?.() || []) track.stop()
+    wakeStream = null
+    return false
+  }
+  const preferred = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4']
+  const mime = preferred.find((type) => window.MediaRecorder.isTypeSupported?.(type)) || ''
+  try {
+    wakeRecorder = new MediaRecorder(wakeStream, mime ? { mimeType: mime } : undefined)
+  } catch {
+    cleanupWakeCapture()
+    wake.lastError = '当前浏览器无法启动唤醒录音'
+    wake.phase = 'error'
+    renderWakeSettings()
+    return false
+  }
+  resetWakeTurns()
+  wakeStartedAt = Date.now()
+  wakeCalibrationUntil = wakeStartedAt + 650
+  wakeRecorder.ondataavailable = (event) => {
+    if (event.data?.size) wakeChunks.push(event.data)
+  }
+  wakeRecorder.onstop = () => {
+    const chunks = wakeChunks.slice()
+    const type = wakeRecorder?.mimeType || wakeStream?.getAudioTracks?.()[0]?.getSettings?.()?.mimeType || 'audio/webm'
+    const discounted = wakeDiscounted
+    wakeChunks = []
+    cleanupWakeCapture()
+    resetWakeTurns()
+    wake.active = false
+    if (generation !== state.wake.generation || !state.wake.enabled) return
+    if (discounted || !chunks.length) {
+      wake.phase = 'idle'
+      renderWakeSettings()
+      scheduleWakeRestart(280)
+      return
+    }
+    wake.phase = 'processing'
+    renderWakeSettings()
+    void transcribeWakeAudio(new Blob(chunks, { type }), generation)
+  }
+  wakeRecorder.start()
+  wake.active = true
+  wake.phase = 'listening'
+  startWakeVad(wakeStream, generation)
+  wakeTimer = window.setInterval(() => {
+    if (!wakeRecorder) return
+    if (Date.now() - wakeStartedAt >= WAKE_MAX_SEGMENT_MS) stopWakeSegment('max')
+  }, 1000)
+  renderWakeSettings()
+  renderVoiceControls()
+  if (!options.quiet) {
+    banner(`语音唤醒已开启：页面打开期间会持续使用麦克风，说“${wakeNameShort()}”开始语音对话。`, 'ok')
+  }
+  return true
+}
+
+function stopWakeSegment(reason) {
+  if (!wakeRecorder) return
+  stopWakeVad()
+  wakeDiscounted = reason !== 'speech'
+  try {
+    wakeRecorder.stop()
+  } catch {
+    cleanupWakeCapture()
+    resetWakeTurns()
+    scheduleWakeRestart(300)
+  }
+}
+
+function startWakeVad(stream, generation) {
+  stopWakeVad()
+  const wake = state.wake
+  const AudioContextCtor = window.AudioContext || window.webkitAudioContext
+  if (!AudioContextCtor) return
+  try {
+    wakeAudioContext = new AudioContextCtor()
+    const source = wakeAudioContext.createMediaStreamSource(stream)
+    wakeAnalyser = wakeAudioContext.createAnalyser()
+    wakeAnalyser.fftSize = 1024
+    wakeAnalyser.smoothingTimeConstant = 0.45
+    source.connect(wakeAnalyser)
+    wakeVadData = new Uint8Array(wakeAnalyser.fftSize)
+    void wakeAudioContext.resume().catch(() => {})
+  } catch {
+    stopWakeVad()
+    return
+  }
+  wakeVadTimer = window.setInterval(() => {
+    if (!wakeAnalyser || !wakeVadData) return
+    if (generation !== wake.generation || !wake.enabled || !wake.active) return
+    if (state.voiceConversation.active || document.hidden) {
+      stopWakeSegment('suspend')
+      return
+    }
+    // 播报期间不能把助手自己的声音送进 ASR，等播完再重新开一段唤醒采集。
+    if (wakePlaybackAudible()) {
+      stopWakeSegment('playback')
+      return
+    }
+    const now = Date.now()
+    if (now - wakeStartedAt >= WAKE_MAX_SEGMENT_MS) {
+      stopWakeSegment('max')
+      return
+    }
+    wakeAnalyser.getByteTimeDomainData(wakeVadData)
+    let sum = 0
+    for (const value of wakeVadData) {
+      const centered = (value - 128) / 128
+      sum += centered * centered
+    }
+    const rms = Math.sqrt(sum / wakeVadData.length)
+    if (wakeCalibrating) {
+      wakeCalibrationSamples.push(rms)
+      if (now >= wakeCalibrationUntil || wakeCalibrationSamples.length >= 8) {
+        const average = wakeCalibrationSamples.reduce((total, value) => total + value, 0) /
+          Math.max(1, wakeCalibrationSamples.length)
+        wakeThreshold = Math.max(0.01, Math.min(0.06, average * 2.6))
+        wakeCalibrating = false
+      }
+      return
+    }
+    if (!wakeSpeechStarted) {
+      wakeNoSpeechMs += 90
+      if (rms > wakeThreshold && rms > 0.016) wakeSpeechFrames += 1
+      else wakeSpeechFrames = 0
+      if (wakeSpeechFrames >= 3) {
+        wakeSpeechStarted = true
+        wakeSpeechMs = 240
+        wakeSilenceMs = 0
+        wakeNoSpeechMs = 0
+      } else if (wakeNoSpeechMs >= WAKE_IDLE_RESTART_MS) {
+        stopWakeSegment('idle')
+      }
+      return
+    }
+    wakeSpeechMs += 90
+    if (rms > Math.max(0.012, wakeThreshold * 0.72)) wakeSilenceMs = 0
+    else wakeSilenceMs += 90
+    if (wakeSpeechMs >= 600 && wakeSilenceMs >= 1_050) stopWakeSegment('speech')
+  }, 90)
+}
+
+async function transcribeWakeAudio(blob, generation) {
+  const wake = state.wake
+  if (!wake.enabled || generation !== wake.generation || state.voiceConversation.active) return
+  if (blob.size < 600) {
+    scheduleWakeRestart(260)
+    return
+  }
+  wakeTranscribing = true
+  try {
+    const rawDataUrl = await blobToDataUrl(blob)
+    const baseType = (blob.type || 'audio/webm').split(';')[0].toLowerCase()
+    const dataUrl = rawDataUrl.replace(/^data:(audio\/[^;,]+)(?:;[^;,]*)*;base64,/i, `data:${baseType};base64,`)
+    const result = await api('/api/chat/transcribe', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ dataUrl }),
+    })
+    if (!wake.enabled || generation !== wake.generation || state.voiceConversation.active) return
+    const text = String(result?.text || '').trim()
+    if (!text) {
+      scheduleWakeRestart(320)
+      return
+    }
+    const hit = matchWakePhrase(text)
+    if (!hit) {
+      scheduleWakeRestart(220)
+      return
+    }
+    const command = hit.command
+    // 已经命中名字：先停唤醒采集，再进入正式语音对话；有后半句就直接发送。
+    stopWakeListener({ keepEnabled: true })
+    await enterVoiceConversation({ wake: true, command })
+  } catch (err) {
+    if (!wake.enabled || generation !== state.wake.generation || state.voiceConversation.active) return
+    wake.lastError = String(err?.message || '语音识别失败')
+    renderWakeSettings()
+    scheduleWakeRestart(900)
+  } finally {
+    wakeTranscribing = false
+  }
+}
+
+async function setWakeEnabled(enabled, options = {}) {
+  const wake = state.wake
+  const next = Boolean(enabled)
+  wake.enabled = next
+  persistWakePreference(next)
+  renderWakeSettings()
+  if (!next) {
+    stopWakeListener({ keepEnabled: true })
+    if (!options.quiet) banner('已关闭语音唤醒', 'ok')
+    return
+  }
+  if (wake.active) {
+    renderVoiceControls()
+    if (!options.quiet) {
+      banner(`语音唤醒已开启：页面打开期间会持续使用麦克风，说“${wakeNameShort()}”开始语音对话。`, 'ok')
+    }
+    return
+  }
+  const started = await startWakeListener(options)
+  if (!started) {
+    wake.enabled = false
+    persistWakePreference(false)
+    renderWakeSettings()
+    if (!options.quiet) {
+      banner(wake.lastError || '语音唤醒没有启动，请检查麦克风权限后重试', 'warn')
+    }
+  }
+}
+
+function restoreWakePreference() {
+  let saved = false
+  try {
+    saved = localStorage.getItem(WAKE_PREF_KEY) === '1'
+  } catch {
+    saved = false
+  }
+  state.wake.enabled = saved
+  renderWakeSettings()
+  if (saved) {
+    void startWakeListener({ quiet: true }).then((started) => {
+      if (started) return
+      state.wake.enabled = false
+      persistWakePreference(false)
+      renderWakeSettings()
+    })
+  }
+}
+
+function stopActiveVoice() {
+  const audio = state.activeVoiceAudio
+  const reset = state.activeVoiceReset
+  state.activeVoiceReset = null
+  if (audio) {
+    try {
+      audio.pause()
+      audio.currentTime = 0
+    } catch {
+      // 音频对象被浏览器回收时忽略
+    }
+  }
+  state.activeVoiceAudio = null
+  reset?.({ ok: true, paused: true })
+}
+
+function voiceButtonState(node, text, disabled = false) {
+  const button = node?.querySelector?.('.msg-voice')
+  if (!button) return
+  button.hidden = false
+  button.disabled = disabled
+  const label = button.querySelector('span')
+  if (label) label.textContent = text
+}
+
+/**
+ * 本地 TTS 端点通常只允许一个合成任务；把所有合成请求串起来，避免并发触发上游 409。
+ * 队列只保证“请求不并发”，播放本身仍可自行重叠（例如用户快速重播上一条）。
+ */
+let voiceSpeakChain = Promise.resolve()
+
+function speakAnswer(node, text, options = {}) {
+  const run = () => speakAnswerNow(node, text, options)
+  const queued = voiceSpeakChain.then(run, run)
+  voiceSpeakChain = queued.then(
+    () => undefined,
+    () => undefined,
+  )
+  return queued
+}
+
+async function speakAnswerNow(node, text, options = {}) {
+  if (!state.speechAvailable || !state.voiceSettings.enabled) {
+    options.onDone?.({ ok: false, reason: 'unavailable' })
+    return
+  }
+  const clean = String(text || '').trim()
+  if (!clean) {
+    options.onDone?.({ ok: false, reason: 'empty' })
+    return
+  }
+  const button = node?.querySelector('.msg-voice')
+  if (button && button.dataset.speaking === 'true') {
+    // 同一回答正在播/正在合成：再点一次就暂停。
+    if (state.activeVoiceAudio && !state.activeVoiceAudio.paused) stopActiveVoice()
+    return
+  }
+  if (button) button.dataset.speaking = 'true'
+  voiceButtonState(node, '生成语音…', true)
+  try {
+    const limit = Math.max(1, Math.min(600, Number(options.maxChars) || 240))
+    let spoken = clean
+    if (clean.length > limit) {
+      const head = clean.slice(0, limit)
+      const cut = Math.max(
+        head.lastIndexOf('。'),
+        head.lastIndexOf('！'),
+        head.lastIndexOf('？'),
+        head.lastIndexOf('；'),
+        head.lastIndexOf('\n'),
+        head.lastIndexOf('，'),
+      )
+      spoken = cut >= Math.floor(limit * 0.5) ? head.slice(0, cut + 1) : `${head}…`
+    }
+    const data = await api('/api/chat/speech', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text: spoken }),
+    })
+    if (!data?.audio) throw new Error('语音合成没有返回音频')
+    // 合成期间用户可能已经退出语音对话或切换会话；这里再确认一次，避免退出后突然播报。
+    if (options.isStale?.()) {
+      if (button) button.dataset.speaking = 'false'
+      voiceButtonState(node, '播放语音')
+      return
+    }
+    stopActiveVoice()
+    const audio = new Audio(String(data.audio))
+    state.activeVoiceAudio = audio
+    let settled = false
+    const finish = (result) => {
+      if (settled) return
+      settled = true
+      if (state.activeVoiceAudio === audio) state.activeVoiceAudio = null
+      if (state.activeVoiceReset === finish) state.activeVoiceReset = null
+      if (button) button.dataset.speaking = 'false'
+      voiceButtonState(node, '播放语音')
+      options.onDone?.(result)
+    }
+    const reset = () => finish({ ok: true, ended: true })
+    state.activeVoiceReset = finish
+    audio.addEventListener('ended', reset, { once: true })
+    audio.addEventListener('error', () => finish({ ok: false, reason: 'audio-error' }), { once: true })
+    if (button) {
+      button.onclick = () => {
+        if (audio.paused) {
+          state.activeVoiceAudio = audio
+          void audio.play().then(() => voiceButtonState(node, '暂停语音')).catch(() => voiceButtonState(node, '点此播放'))
+        } else {
+          stopActiveVoice()
+        }
+      }
+    }
+    voiceButtonState(node, '播放语音')
+    if (options.auto !== false) {
+      try {
+        await audio.play()
+        // 播放启动是异步的：如果 play() 尚未 resolve 时已被打断，不能再把按钮写回“暂停语音”。
+        if (settled || state.activeVoiceAudio !== audio || audio.paused) return
+        voiceButtonState(node, '暂停语音')
+        options.onStart?.()
+      } catch {
+        // 浏览器自动播放策略拦截时，按钮已经在，用户点一下即可。
+        voiceButtonState(node, '点此播放')
+        finish({ ok: false, reason: 'autoplay-blocked' })
+      }
+    }
+  } catch (err) {
+    if (button) button.dataset.speaking = 'false'
+    voiceButtonState(node, '语音生成失败')
+    if (options.auto !== false) banner(err.message || '语音回复生成失败，文字回答已保留', 'warn')
+    options.onDone?.({ ok: false, reason: 'error', error: err })
+  }
+}
+
+function renderVoiceDockActions() {
+  const vm = state.voiceConversation
+  const button = $('#voice-dock-action')
+  if (!button) return
+  const labels = {
+    listening: ['结束这句', false],
+    speaking: ['打断', false],
+    transcribing: ['处理中', true],
+    thinking: ['处理中', true],
+    paused: ['继续聆听', false],
+    error: ['重试', false],
+  }
+  const entry = labels[vm.phase]
+  if (!entry) {
+    button.hidden = true
+    return
+  }
+  button.hidden = false
+  button.disabled = entry[1]
+  button.textContent = entry[0]
+}
+
+function setVoiceDockStatus(phase, title, detail) {
+  const vm = state.voiceConversation
+  vm.phase = phase
+  const dock = $('#voice-dock')
+  if (dock) {
+    dock.hidden = false
+    dock.classList.remove('is-listening', 'is-transcribing', 'is-thinking', 'is-speaking', 'is-error')
+    if (phase === 'listening') dock.classList.add('is-listening')
+    else if (phase === 'transcribing') dock.classList.add('is-transcribing')
+    else if (phase === 'thinking') dock.classList.add('is-thinking')
+    else if (phase === 'speaking') dock.classList.add('is-speaking')
+    else if (phase === 'error') dock.classList.add('is-error')
+  }
+  const titleEl = $('#voice-dock-title')
+  const detailEl = $('#voice-dock-detail')
+  if (titleEl) titleEl.textContent = title
+  if (detailEl) detailEl.textContent = detail
+  renderVoiceDockActions()
+}
+
+function scheduleVoiceConversationListen(delay = 350, force = false) {
+  const vm = state.voiceConversation
+  window.clearTimeout(vm.resumeTimer)
+  vm.resumeTimer = 0
+  if (!vm.active) return
+  const generation = vm.generation
+  vm.resumeTimer = window.setTimeout(() => {
+    if (!vm.active || generation !== vm.generation) return
+    void startVoiceConversationListening(force)
+  }, Math.max(0, delay))
+}
+
+async function startVoiceConversationListening(force = false) {
+  const vm = state.voiceConversation
+  if (!vm.active) return false
+  // 手动重试或定时续听重叠时，先取消尚未触发的续听，避免重复开麦。
+  window.clearTimeout(vm.resumeTimer)
+  vm.resumeTimer = 0
+  if (voiceRecorder || voiceTranscribing) return false
+  // 用户开口打断播报时，即使模型还在生成后半段，也要立刻回到聆听；
+  // 新一句话会进入发送队列，等当前回答收尾后再发出去。
+  if (!force && sessionReplyBusy()) {
+    setVoiceDockStatus('thinking', '回答还在生成', '回答结束后会自动继续聆听')
+    return false
+  }
+  setVoiceDockStatus('listening', '正在打开麦克风…', '稍等，马上就绪')
+  const started = await startVoiceRecording()
+  if (!started && vm.active && vm.phase !== 'error') {
+    setVoiceDockStatus('error', '麦克风没有启动', '点“重试”重新开启麦克风，或退出语音对话')
+  }
+  return started
+}
+
+async function enterVoiceConversation(options = {}) {
+  const vm = state.voiceConversation
+  if (vm.active) {
+    exitVoiceConversation()
+    return
+  }
+  if (!state.transcribeAvailable) {
+    banner('还没有配置语音转写模型，暂时不能使用语音对话', 'warn')
+    return
+  }
+  if (!voiceSupported()) {
+    banner('当前浏览器不支持录音，请换用 Chrome、Edge 或钉钉内置浏览器', 'warn')
+    return
+  }
+  if (voiceTranscribing) {
+    banner('正在识别上一条语音，请稍候再开启语音对话', 'warn')
+    return
+  }
+  if (voiceRecorder) stopVoiceRecording(true, { reason: 'cancel' })
+  // 正式对话和唤醒采集互斥；唤醒偏好保留，退出对话后再自动恢复。
+  stopWakeListener({ keepEnabled: true })
+  stopActiveVoice()
+  abortVoiceSpeechStream({ quiet: true })
+  voicePlayback()
+  vm.active = true
+  vm.generation += 1
+  vm.sessionId = state.sessionId
+  vm.resumeTimer = 0
+  renderVoiceControls()
+  renderWakeSettings()
+  const dock = $('#voice-dock')
+  if (dock) dock.hidden = false
+  setVoiceDockStatus('listening', '正在连接麦克风…', '首次使用需要允许浏览器使用麦克风')
+  if (!state.speechAvailable) banner('还没有配置语音合成模型，回答只会显示文字，播报后不会自动续听', 'warn')
+  else if (!state.voiceSettings.enabled) banner('语音回复已关闭：回答只会显示文字，播报后不会自动续听', 'warn')
+  const command = String(options.command || '').trim()
+  if (command) {
+    const input = $('#input')
+    input.value = command
+    input.style.height = '44px'
+    updateSendState()
+    setVoiceDockStatus(
+      'thinking',
+      '正在思考回答…',
+      `通过“${wakeNameShort()}”唤醒：${command.length > 24 ? `${command.slice(0, 24)}…` : command}`,
+    )
+    await send({ voiceInput: true, voiceConversation: true })
+    return
+  }
+  await startVoiceConversationListening()
+}
+
+function exitVoiceConversation(options = {}) {
+  const vm = state.voiceConversation
+  if (!vm.active && options.silent !== true) return
+  vm.active = false
+  vm.generation += 1
+  window.clearTimeout(vm.resumeTimer)
+  vm.resumeTimer = 0
+  if (voiceRecorder) stopVoiceRecording(true, { reason: 'cancel' })
+  stopActiveVoice()
+  abortVoiceSpeechStream({ quiet: true })
+  stopVoiceBargeInMonitor()
+  closeVoicePlayback()
+  voiceDiscount = false
+  setVoiceDockStatus('idle', '语音对话已结束', '')
+  const dock = $('#voice-dock')
+  if (dock) dock.hidden = true
+  renderVoiceControls()
+  renderWakeSettings()
+  if (!options.silent) banner(options.reason || '已退出语音对话', 'warn')
+  // 用户显式开过语音唤醒时，退出对话后恢复待唤醒；否则保持静默。
+  if (state.wake.enabled) scheduleWakeRestart(300)
+}
+
+function interruptVoiceConversation() {
+  const vm = state.voiceConversation
+  if (!vm.active) return
+  abortVoiceSpeechStream({ quiet: true })
+  stopActiveVoice()
+  stopVoiceBargeInMonitor()
+  setVoiceDockStatus('listening', '已打断播报', '现在可以直接说话')
+  scheduleVoiceConversationListen(180, true)
+}
+
+function handleVoiceConversationAnswer(node, text) {
+  const vm = state.voiceConversation
+  if (!vm.active) return
+  const generation = vm.generation
+  const readable = String(text || '').trim()
+  if (!readable) {
+    scheduleVoiceConversationListen(300)
+    return
+  }
+  if (!state.speechAvailable || !state.voiceSettings.enabled) {
+    setVoiceDockStatus('paused', '回答已生成，未自动播报', '没有可用的语音合成，或语音回复已关闭')
+    return
+  }
+  // 正常路径由 delta 边生成边播；这里兜底处理“只有最终文本、没有增量”的模型。
+  const stream = voiceSpeechStream
+  if (stream) {
+    endVoiceSpeechStream(stream, readable)
+    return
+  }
+  const next = beginVoiceSpeechStream(node, generation)
+  if (!next) {
+    setVoiceDockStatus('paused', '语音合成未启动', '文字回答已保留；可点“继续聆听”继续语音对话')
+    return
+  }
+  feedVoiceSpeechStream(readable)
+  endVoiceSpeechStream(next, readable)
+}
+
+function handleVoiceDockAction() {
+  const vm = state.voiceConversation
+  if (!vm.active) return
+  if (vm.phase === 'speaking') {
+    interruptVoiceConversation()
+    return
+  }
+  if (vm.phase === 'listening') {
+    stopVoiceRecording(false, { reason: 'manual' })
+    return
+  }
+  if (vm.phase === 'paused' || vm.phase === 'error') {
+    void startVoiceConversationListening()
+  }
+}
+
+async function showVoiceSettings() {
+  await loadVoiceSettings()
+  const current = state.voiceSettings
+  const overlay = document.createElement('div')
+  overlay.className = 'modal-overlay'
+  let voices = current.voices.slice()
+  let activeVoiceId = current.activeVoiceId
+  let draft = null
+  let preview = null
+  overlay.innerHTML = `<div class="modal voice-modal">
+    <div class="modal-head"><h3>我的音色</h3><button class="modal-x" type="button" aria-label="关闭">×</button></div>
+    <div class="hint">默认使用系统音色。也可以创建自己的声音；EAB 会按你写的描述生成声音，不会采集或保存你的本人录音。</div>
+    <div class="voice-body" id="voice-body"></div>
+  </div>`
+  document.body.appendChild(overlay)
+  const body = overlay.querySelector('#voice-body')
+
+  const close = () => {
+    stopActiveVoice()
+    preview = null
+    overlay.remove()
+  }
+  const stopPreview = () => {
+    stopActiveVoice()
+    preview = null
+  }
+  const setNote = (text, bad = false) => {
+    const note = overlay.querySelector('#voice-note')
+    if (!note) return
+    note.className = bad ? 'voice-note bad' : 'voice-note'
+    note.textContent = text
+  }
+  const voiceById = (id) => voices.find((item) => item.id === id)
+
+  const renderList = () => {
+    const custom = voices.filter((item) => !item.builtin)
+    const cards = custom
+      .map((item) => {
+        const active = item.id === activeVoiceId
+        return `<div class="voice-card${active ? ' is-active' : ''}">
+          <button class="voice-card-pick" type="button" data-voice-pick="${esc(item.id)}" aria-pressed="${active ? 'true' : 'false'}">
+            <span class="voice-card-check" aria-hidden="true">${active ? '✓' : ''}</span>
+            <span class="voice-card-copy">
+              <strong>${esc(item.name)}</strong>
+              <em>${esc(item.instructions)}</em>
+            </span>
+          </button>
+          <div class="voice-card-tools">
+            <button type="button" data-voice-edit="${esc(item.id)}">编辑</button>
+            <button type="button" data-voice-delete="${esc(item.id)}">删除</button>
+          </div>
+        </div>`
+      })
+      .join('')
+    body.innerHTML = `
+      <div class="voice-section-head">
+        <span class="voice-section-title">内置音色</span>
+      </div>
+      <div class="voice-card${activeVoiceId === 'default' ? ' is-active' : ''}">
+        <button class="voice-card-pick" type="button" data-voice-pick="default" aria-pressed="${activeVoiceId === 'default' ? 'true' : 'false'}">
+          <span class="voice-card-check" aria-hidden="true">${activeVoiceId === 'default' ? '✓' : ''}</span>
+          <span class="voice-card-copy">
+            <strong>系统默认 <span class="voice-badge">内置</span></strong>
+            <em>稳定、清晰，适合日常回答</em>
+          </span>
+        </button>
+      </div>
+      <div class="voice-section-head">
+        <span class="voice-section-title">我的声音</span>
+        <button class="voice-add" id="voice-add" type="button">＋ 新建声音</button>
+      </div>
+      ${cards || '<div class="voice-empty">还没有自己的声音。新建时写一段描述，保存后就可以选择使用。</div>'}
+      <div class="voice-note" id="voice-note">${current.speechAvailable ? '选中后点“保存”，下一轮回答就会使用这个声音。' : '还没有配置语音合成模型，声音可以先保存，配置完成后再生效。'}</div>
+      <div class="modal-actions">
+        <button class="btn ghost" type="button" data-voice-cancel>取消</button>
+        <button class="btn primary" type="button" id="voice-save-active">保存</button>
+      </div>`
+  }
+
+  const renderEditor = () => {
+    const isNew = !draft.id
+    body.innerHTML = `
+      <button class="voice-back" type="button" data-voice-back>← 返回我的声音</button>
+      <div class="voice-section-title voice-editor-title">${isNew ? '新建声音' : '编辑声音'}</div>
+      <label class="field voice-field"><span>名称</span><input id="voice-name" maxlength="40" placeholder="例如：稳重技术同事" value="${esc(draft.name || '')}" /></label>
+      <label class="field voice-field"><span>声音描述</span><textarea id="voice-instructions" rows="4" maxlength="200" placeholder="例如：低沉、沉稳的男声，语速稍慢，像可靠的技术同事">${esc(draft.instructions || '')}</textarea></label>
+      <div class="voice-count" id="voice-count">${draft.instructions.trim().length}/200</div>
+      <div class="voice-note" id="voice-note">${current.speechAvailable ? '可以先试听，再保存并使用。' : '还没有配置语音合成模型，保存后等配置完成即可生效。'}</div>
+      <div class="modal-actions">
+        <button class="btn ghost" type="button" id="voice-preview" ${current.speechAvailable ? '' : 'disabled'}>试听</button>
+        <button class="btn ghost" type="button" data-voice-back>取消</button>
+        <button class="btn primary" type="button" id="voice-save-preset">${isNew ? '保存并使用' : '保存修改'}</button>
+      </div>`
+  }
+
+  overlay.addEventListener('click', (event) => {
+    if (event.target === overlay) {
+      close()
+      return
+    }
+    const pick = event.target.closest?.('[data-voice-pick]')
+    if (pick) {
+      stopPreview()
+      activeVoiceId = pick.dataset.voicePick || 'default'
+      renderList()
+      return
+    }
+    if (event.target.closest?.('#voice-add')) {
+      stopPreview()
+      draft = { id: '', name: '', instructions: '' }
+      renderEditor()
+      return
+    }
+    const edit = event.target.closest?.('[data-voice-edit]')
+    if (edit) {
+      const voice = voiceById(edit.dataset.voiceEdit)
+      if (!voice) return
+      stopPreview()
+      draft = { id: voice.id, name: voice.name, instructions: voice.instructions }
+      renderEditor()
+      return
+    }
+    if (event.target.closest?.('[data-voice-back]')) {
+      stopPreview()
+      draft = null
+      renderList()
+      return
+    }
+    if (event.target.closest?.('[data-voice-cancel]')) {
+      close()
+      return
+    }
+    if (event.target.closest?.('.modal-x')) {
+      close()
+      return
+    }
+  })
+
+  overlay.addEventListener('input', (event) => {
+    if (!draft) return
+    if (event.target.id === 'voice-name') draft.name = String(event.target.value || '').slice(0, 40)
+    if (event.target.id === 'voice-instructions') {
+      draft.instructions = String(event.target.value || '').slice(0, 200)
+      const count = overlay.querySelector('#voice-count')
+      if (count) count.textContent = `${draft.instructions.trim().length}/200`
+    }
+  })
+
+  overlay.addEventListener('click', async (event) => {
+    if (event.target.closest?.('#voice-preview')) {
+      const button = overlay.querySelector('#voice-preview')
+      if (!draft || !button) return
+      button.disabled = true
+      setNote('正在生成试听…')
+      try {
+        stopPreview()
+        const data = await api('/api/me/voice/preview', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            voiceId: draft.id || 'default',
+            instructions: draft.instructions.trim(),
+          }),
+        })
+        if (!data?.audio) throw new Error('试听没有返回音频')
+        preview = new Audio(String(data.audio))
+        state.activeVoiceAudio = preview
+        await preview.play()
+        setNote('正在播放试听。')
+      } catch (err) {
+        setNote(err.message || '试听失败', true)
+      } finally {
+        button.disabled = false
+      }
+      return
+    }
+    if (event.target.closest?.('#voice-save-preset')) {
+      if (!draft) return
+      if (!draft.instructions.trim()) {
+        setNote('请先填写声音描述。', true)
+        return
+      }
+      const button = overlay.querySelector('#voice-save-preset')
+      button.disabled = true
+      try {
+        const path = draft.id ? `/api/me/voice/presets/${encodeURIComponent(draft.id)}` : '/api/me/voice/presets'
+        const saved = await api(path, {
+          method: draft.id ? 'PATCH' : 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ name: draft.name.trim(), instructions: draft.instructions.trim() }),
+        })
+        state.voiceSettings = { ...state.voiceSettings, ...saved, speechAvailable: current.speechAvailable }
+        voices = state.voiceSettings.voices
+        activeVoiceId = state.voiceSettings.activeVoiceId
+        draft = null
+        renderList()
+        renderVoiceSettings()
+        banner('声音已保存并使用，下一轮生效', 'ok')
+      } catch (err) {
+        setNote(err.message || '保存失败', true)
+        button.disabled = false
+      }
+      return
+    }
+    if (event.target.closest?.('#voice-save-active')) {
+      const button = overlay.querySelector('#voice-save-active')
+      button.disabled = true
+      try {
+        const saved = await api('/api/me/voice', {
+          method: 'PATCH',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ activeVoiceId }),
+        })
+        state.voiceSettings = { ...state.voiceSettings, ...saved, speechAvailable: current.speechAvailable }
+        renderVoiceSettings()
+        close()
+        banner('已切换声音，下一轮生效', 'ok')
+      } catch (err) {
+        setNote(err.message || '保存失败', true)
+        button.disabled = false
+      }
+      return
+    }
+    const remove = event.target.closest?.('[data-voice-delete]')
+    if (remove) {
+      const id = remove.dataset.voiceDelete
+      const voice = voiceById(id)
+      if (!voice) return
+      if (!window.confirm(`删除“${voice.name}”？删除后如果它正在使用，会自动回到系统默认。`)) return
+      remove.disabled = true
+      try {
+        const saved = await api(`/api/me/voice/presets/${encodeURIComponent(id)}`, { method: 'DELETE' })
+        state.voiceSettings = { ...state.voiceSettings, ...saved, speechAvailable: current.speechAvailable }
+        voices = state.voiceSettings.voices
+        activeVoiceId = state.voiceSettings.activeVoiceId
+        renderList()
+        renderVoiceSettings()
+        banner('声音方案已删除', 'ok')
+      } catch (err) {
+        setNote(err.message || '删除失败', true)
+        remove.disabled = false
+      }
+    }
+  })
+
+  renderList()
 }
 
 async function showMemories() {
@@ -10097,6 +11416,11 @@ async function refreshModelCatalog() {
     state.models = data.models
     state.autoModelId = data.autoModelId ?? null
     state.canChat = Boolean(data.canChat && data.canUseModel)
+    state.transcribeAvailable = Boolean(data.transcribe?.available)
+    state.speechAvailable = Boolean(data.speech?.available)
+    state.voiceSettings.speechAvailable = state.speechAvailable
+    renderVoiceControls()
+    renderVoiceSettings()
     if (state.selected && !state.models.some((model) => model.id === state.selected)) {
       state.selected = ''
     }
@@ -10500,11 +11824,90 @@ function attachmentChips(list) {
 }
 
 let imageLightboxReturnFocus = null
+let imageLightboxObjectUrl = ''
+let imageLightboxScale = 1
+let imageLightboxX = 0
+let imageLightboxY = 0
+let imageLightboxDrag = null
+const IMAGE_LIGHTBOX_MIN_SCALE = 1
+const IMAGE_LIGHTBOX_MAX_SCALE = 4
+
+function releaseImageLightboxObjectUrl() {
+  if (!imageLightboxObjectUrl) return
+  URL.revokeObjectURL(imageLightboxObjectUrl)
+  imageLightboxObjectUrl = ''
+}
+
+function imageLightboxElements() {
+  const overlay = document.getElementById('image-lightbox')
+  if (!overlay) return null
+  return {
+    overlay,
+    body: overlay.querySelector('.image-lightbox-body'),
+    image: overlay.querySelector('.image-lightbox-body img'),
+    value: overlay.querySelector('[data-image-zoom-value]'),
+    zoomOut: overlay.querySelector('[data-image-zoom-out]'),
+    zoomIn: overlay.querySelector('[data-image-zoom-in]'),
+  }
+}
+
+function clampImageLightboxPan() {
+  const parts = imageLightboxElements()
+  if (!parts?.body || !parts.image) return
+  const maxX = Math.max(0, (parts.image.clientWidth * imageLightboxScale - parts.body.clientWidth) / 2)
+  const maxY = Math.max(0, (parts.image.clientHeight * imageLightboxScale - parts.body.clientHeight) / 2)
+  imageLightboxX = Math.min(maxX, Math.max(-maxX, imageLightboxX))
+  imageLightboxY = Math.min(maxY, Math.max(-maxY, imageLightboxY))
+}
+
+function applyImageLightboxTransform() {
+  const parts = imageLightboxElements()
+  if (!parts?.image) return
+  parts.image.style.transform = `translate3d(${imageLightboxX}px, ${imageLightboxY}px, 0) scale(${imageLightboxScale})`
+  parts.overlay.classList.toggle('is-zoomed', imageLightboxScale > IMAGE_LIGHTBOX_MIN_SCALE + 0.001)
+  if (parts.value) parts.value.textContent = `${Math.round(imageLightboxScale * 100)}%`
+  if (parts.zoomOut) parts.zoomOut.disabled = imageLightboxScale <= IMAGE_LIGHTBOX_MIN_SCALE + 0.001
+  if (parts.zoomIn) parts.zoomIn.disabled = imageLightboxScale >= IMAGE_LIGHTBOX_MAX_SCALE - 0.001
+}
+
+function resetImageLightboxZoom() {
+  imageLightboxScale = 1
+  imageLightboxX = 0
+  imageLightboxY = 0
+  imageLightboxDrag = null
+  applyImageLightboxTransform()
+}
+
+function setImageLightboxScale(nextScale, anchorX = null, anchorY = null) {
+  const parts = imageLightboxElements()
+  if (!parts?.body) return
+  const next = Math.min(IMAGE_LIGHTBOX_MAX_SCALE, Math.max(IMAGE_LIGHTBOX_MIN_SCALE, Number(nextScale) || 1))
+  if (Math.abs(next - imageLightboxScale) < 0.001) return
+  if (anchorX == null || anchorY == null) {
+    const ratio = next / imageLightboxScale
+    imageLightboxX *= ratio
+    imageLightboxY *= ratio
+  } else {
+    const rect = parts.body.getBoundingClientRect()
+    const centerX = anchorX - (rect.left + rect.width / 2)
+    const centerY = anchorY - (rect.top + rect.height / 2)
+    const ratio = next / imageLightboxScale
+    imageLightboxX = imageLightboxX * ratio + centerX * (1 - ratio)
+    imageLightboxY = imageLightboxY * ratio + centerY * (1 - ratio)
+  }
+  imageLightboxScale = next
+  clampImageLightboxPan()
+  applyImageLightboxTransform()
+}
 
 function closeImageLightbox() {
   const overlay = document.getElementById('image-lightbox')
+  releaseImageLightboxObjectUrl()
   if (!overlay || overlay.hidden) return
   overlay.hidden = true
+  overlay.classList.remove('is-panning')
+  imageLightboxDrag = null
+  resetImageLightboxZoom()
   document.body.classList.remove('is-image-lightbox-open')
   if (imageLightboxReturnFocus && typeof imageLightboxReturnFocus.focus === 'function') {
     imageLightboxReturnFocus.focus()
@@ -10512,7 +11915,74 @@ function closeImageLightbox() {
   imageLightboxReturnFocus = null
 }
 
-function openImageLightbox(src, name = '图片') {
+function bindImageLightboxGestures(overlay) {
+  const parts = imageLightboxElements()
+  if (!parts?.body || !parts.image) return
+  parts.overlay.querySelector('[data-image-zoom-out]')?.addEventListener('click', () => {
+    setImageLightboxScale(imageLightboxScale - 0.25)
+  })
+  parts.overlay.querySelector('[data-image-zoom-in]')?.addEventListener('click', () => {
+    setImageLightboxScale(imageLightboxScale + 0.25)
+  })
+  parts.overlay.querySelector('[data-image-zoom-reset]')?.addEventListener('click', resetImageLightboxZoom)
+
+  parts.body.addEventListener(
+    'wheel',
+    (event) => {
+      event.preventDefault()
+      const step = event.deltaY < 0 ? 0.2 : -0.2
+      setImageLightboxScale(imageLightboxScale + step, event.clientX, event.clientY)
+    },
+    { passive: false },
+  )
+
+  parts.body.addEventListener('pointerdown', (event) => {
+    if (event.button !== 0 || imageLightboxScale <= IMAGE_LIGHTBOX_MIN_SCALE + 0.001) return
+    event.preventDefault()
+    imageLightboxDrag = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      originX: imageLightboxX,
+      originY: imageLightboxY,
+    }
+    try {
+      parts.body.setPointerCapture(event.pointerId)
+    } catch {
+      // 某些浏览器不支持 pointer capture，仍可继续拖动。
+    }
+    parts.overlay.classList.add('is-panning')
+  })
+
+  parts.body.addEventListener('pointermove', (event) => {
+    if (!imageLightboxDrag || event.pointerId !== imageLightboxDrag.pointerId) return
+    imageLightboxX = imageLightboxDrag.originX + event.clientX - imageLightboxDrag.startX
+    imageLightboxY = imageLightboxDrag.originY + event.clientY - imageLightboxDrag.startY
+    clampImageLightboxPan()
+    applyImageLightboxTransform()
+  })
+
+  const endDrag = (event) => {
+    if (!imageLightboxDrag || event.pointerId !== imageLightboxDrag.pointerId) return
+    imageLightboxDrag = null
+    parts.overlay.classList.remove('is-panning')
+    try {
+      parts.body.releasePointerCapture(event.pointerId)
+    } catch {
+      // 指针已经释放时忽略。
+    }
+  }
+  parts.body.addEventListener('pointerup', endDrag)
+  parts.body.addEventListener('pointercancel', endDrag)
+
+  parts.image.addEventListener('dblclick', (event) => {
+    event.preventDefault()
+    if (imageLightboxScale > IMAGE_LIGHTBOX_MIN_SCALE + 0.001) resetImageLightboxZoom()
+    else setImageLightboxScale(2, event.clientX, event.clientY)
+  })
+}
+
+function openImageLightbox(src, name = '图片', options = {}) {
   const url = String(src || '').trim()
   if (!url) return
   let overlay = document.getElementById('image-lightbox')
@@ -10526,16 +11996,42 @@ function openImageLightbox(src, name = '图片') {
         <span class="image-lightbox-name"></span>
         <button class="image-lightbox-close" type="button" data-image-lightbox-close aria-label="关闭图片预览">×</button>
       </div>
-      <div class="image-lightbox-body"><img alt=""></div>
+      <div class="image-lightbox-body"><img alt="" draggable="false"></div>
+      <div class="image-lightbox-foot">
+        <span class="image-lightbox-hint">滚轮缩放 · 拖动平移 · 双击切换</span>
+        <div class="image-lightbox-zoom" role="group" aria-label="图片缩放">
+          <button type="button" data-image-zoom-out aria-label="缩小图片">−</button>
+          <span class="image-lightbox-zoom-value" data-image-zoom-value aria-live="polite">100%</span>
+          <button type="button" data-image-zoom-in aria-label="放大图片">＋</button>
+          <button type="button" class="image-lightbox-fit" data-image-zoom-reset>适应窗口</button>
+        </div>
+      </div>
     </div>`
     overlay.addEventListener('click', (event) => {
       if (event.target === overlay || event.target.closest('[data-image-lightbox-close]')) closeImageLightbox()
     })
     document.addEventListener('keydown', (event) => {
-      if (event.key === 'Escape' && !overlay.hidden) closeImageLightbox()
+      if (overlay.hidden) return
+      if (event.key === 'Escape') {
+        closeImageLightbox()
+        return
+      }
+      if (event.key === '+' || event.key === '=') {
+        event.preventDefault()
+        setImageLightboxScale(imageLightboxScale + 0.25)
+      } else if (event.key === '-') {
+        event.preventDefault()
+        setImageLightboxScale(imageLightboxScale - 0.25)
+      } else if (event.key === '0') {
+        event.preventDefault()
+        resetImageLightboxZoom()
+      }
     })
     document.body.appendChild(overlay)
+    bindImageLightboxGestures(overlay)
   }
+  if (imageLightboxObjectUrl && imageLightboxObjectUrl !== url) releaseImageLightboxObjectUrl()
+  imageLightboxObjectUrl = options.objectUrl ? url : ''
   const image = overlay.querySelector('img')
   const title = overlay.querySelector('.image-lightbox-name')
   if (image) {
@@ -10543,6 +12039,7 @@ function openImageLightbox(src, name = '图片') {
     image.alt = name
   }
   if (title) title.textContent = name
+  resetImageLightboxZoom()
   imageLightboxReturnFocus = document.activeElement
   overlay.hidden = false
   document.body.classList.add('is-image-lightbox-open')
@@ -10715,7 +12212,21 @@ function toolDisplayName(name) {
   if (raw === 'project_job' || raw === 'project.job' || raw === '项目后台任务') return '后台任务'
   if (raw === 'plugin_dev' || raw === 'plugin.dev' || raw === '自开发插件') return '自开发插件'
   if (raw === 'skill_dev' || raw === 'skill.dev' || raw === '自开发技能') return '自开发技能'
+  if (raw === 'web_fetch' || raw === 'web.fetch' || raw === '读取网页') return '读取网页'
+  if (raw === 'web_search' || raw === 'web.search' || raw === '搜索互联网') return '搜索互联网'
+  if (raw === 'browser' || raw === '内置浏览器') return '内置浏览器'
   return raw
+}
+
+const BROWSER_ACTION_LABEL = {
+  open: '打开网页',
+  snapshot: '网页快照',
+  click: '点击后浏览',
+  type: '输入后浏览',
+  scroll: '滚动浏览',
+  back: '后退',
+  screenshot: '网页截图',
+  close: '关闭页面',
 }
 
 /** 批次与文件工具只占一行：显示范围、命中或批次数，而不是原始 JSON。 */
@@ -10729,6 +12240,13 @@ function toolInlineLabel(trace) {
     const title = String(trace.view.title || trace.view.skillId || '').trim()
     const version = String(trace.view.version || '').trim()
     return ['已热安装技能', title, version ? `v${version}` : ''].filter(Boolean).join(' · ')
+  }
+  if (trace?.view && trace.view.kind === 'browser') {
+    const view = trace.view
+    const label = BROWSER_ACTION_LABEL[view.action] || '浏览网页'
+    const target = String(view.title || view.url || '').trim()
+    const shot = view.screenshot ? ' · 已截图' : ''
+    return [label, target, `${formatCount(view.elementCount || 0)} 个可操作元素`].filter(Boolean).join(' · ') + shot
   }
   const summary = String(trace.summary || '').split('\n')[0]
   if (!summary) return toolDisplayName(trace.name)
@@ -10942,8 +12460,7 @@ function toolPluginCardHtml(trace) {
   </div>`
 }
 
-function toolSkillCardHtml(trace) {
-  const view = trace?.view && trace.view.kind === 'skill' ? trace.view : null
+function toolSkillCardHtml(trace) {  const view = trace?.view && trace.view.kind === 'skill' ? trace.view : null
   if (!view || !view.previewPath) return ''
   let preview = String(view.previewPath)
   if (currentAs()) {
@@ -10979,6 +12496,37 @@ function toolSkillCardHtml(trace) {
   </div>`
 }
 
+function toolBrowserCardHtml(trace) {
+  const view = trace?.view && trace.view.kind === 'browser' ? trace.view : null
+  if (!view) return ''
+  const actionLabel = BROWSER_ACTION_LABEL[view.action] || '浏览网页'
+  const target = String(view.title || view.url || '').trim()
+  const url = String(view.url || '').trim()
+  const preview = view.screenshot?.fileId
+    ? `/api/workspace/files/${encodeURIComponent(view.screenshot.fileId)}/preview${qs()}`
+    : ''
+  const shot = preview
+    ? `<a class="tool-browser-shot" href="${esc(preview)}" target="_blank" rel="noopener">
+        <img src="${esc(preview)}" alt="${esc(view.screenshot?.name || '网页截图')}" loading="lazy">
+      </a>`
+    : ''
+  const text = String(view.textPreview || '').trim()
+  const meta = [
+    `${formatCount(view.elementCount || 0)} 个可操作元素`,
+    view.pageId ? `页面 ${view.pageId}` : '',
+  ].filter(Boolean).join(' · ')
+  return `<div class="tool-browser" role="group" aria-label="${esc(actionLabel)} ${esc(target)}">
+    <div class="tool-browser-head">
+      <span class="tool-browser-badge">内置浏览器 · ${esc(actionLabel)}</span>
+      <strong class="tool-browser-title">${esc(target || '网页')}</strong>
+    </div>
+    ${url ? `<a class="tool-browser-url" href="${esc(url)}" target="_blank" rel="noopener">${esc(url)}</a>` : ''}
+    ${shot}
+    ${text ? `<pre class="tool-browser-text">${esc(text)}</pre>` : preview || view.action === 'close' ? '' : '<div class="tool-browser-empty">当前页面没有可读正文，可直接看截图。</div>'}
+    <div class="tool-browser-foot"><span>${esc(meta)}</span>${preview ? '<span>截图已保存到个人云空间</span>' : ''}</div>
+  </div>`
+}
+
 function toolDetailHtml(trace) {
   const diffHtml = toolDiffHtml(trace.diff)
   const result = parseToolSummaryObject(trace) || {}
@@ -10988,6 +12536,7 @@ function toolDetailHtml(trace) {
   const batchHtml = batchCardHtml(trace.batch, { name: batchSource })
   const readHtml = trace.status === 'error' ? '' : toolReadCardHtml(trace)
   const searchHtml = trace.status === 'error' ? '' : toolSearchCardHtml(trace)
+  const browserHtml = trace.status === 'error' ? '' : toolBrowserCardHtml(trace)
   const fileOpHtml = trace.status === 'error' ? '' : (!readHtml && !searchHtml ? fileOperationCardHtml(trace) : '')
   const pluginHtml = trace.status === 'error' ? '' : toolPluginCardHtml(trace)
   const skillHtml = trace.status === 'error' ? '' : toolSkillCardHtml(trace)
@@ -10997,7 +12546,7 @@ function toolDetailHtml(trace) {
         ? `<div class="tool-row"><span>${trace.status === 'error' ? '错误' : '结果'}</span><pre>${esc(prettyPayload(trace.summary))}</pre></div>`
         : ''
     }`
-  const structuredHtml = readHtml || searchHtml || fileOpHtml
+  const structuredHtml = readHtml || searchHtml || browserHtml || fileOpHtml
   const primaryHtml = diffHtml || pluginHtml || skillHtml || structuredHtml || batchHtml || rawHtml
   return `<div class="tool-detail ${trace.status === 'error' ? 'is-error' : ''}" data-tool-detail="${esc(trace.id)}">
     <div class="tool-detail-head">
@@ -12502,6 +14051,7 @@ function advanceClarifyFlow(answer, options = {}) {
   flow.modelId = flow.modelId || state.selected || null
   flow.reasoningEffort = flow.reasoningEffort || state.reasoningEffort || null
   flow.answers.push({ question: String(clarify.question || ''), answer: text })
+  flow.voiceConversation = options.voiceConversation === true
   flow.busy = true
   flow.lastAuto = options.auto === true
   if (flow.sessionId) {
@@ -12544,6 +14094,15 @@ async function runClarifyStep(flow, answer, answeredClarify) {
     scrollThreadToBottomInstant()
   }
   const turnStartedLive = Boolean(turn)
+  const voiceStream =
+    turn &&
+    flow.voiceConversation &&
+    state.voiceConversation.active &&
+    (targetSessionId
+      ? targetSessionId === state.voiceConversation.sessionId || state.voiceConversation.sessionId === null
+      : state.voiceConversation.sessionId === null)
+      ? beginVoiceSpeechStream(turn.node, state.voiceConversation.generation)
+      : null
   const buffered = { reasoning: '', content: '', tools: [], toolResults: [], done: null, clarify: null, messageId: '' }
   let streamError = null
   let sawDone = false
@@ -12597,6 +14156,7 @@ async function runClarifyStep(flow, answer, answeredClarify) {
         } else if (event === 'delta') {
           buffered.content += String(data.text || '')
           if (turn) turn.content(String(data.text || ''))
+          if (voiceStream?.active) feedVoiceSpeechStream(String(data.text || ''))
         } else if (event === 'tool') {
           buffered.tools.push(data)
           if (turn) turn.tool(data)
@@ -12658,6 +14218,10 @@ async function runClarifyStep(flow, answer, answeredClarify) {
         }
         turn.finish({ ...doneData, text: questionText, clarify: null })
         if (messageId) state.liveTurns.delete(messageId)
+        if (flow.voiceConversation && questionText) {
+          if (voiceStream) endVoiceSpeechStream(voiceStream, questionText)
+          else handleVoiceConversationAnswer(turn.node, questionText)
+        }
       }
       showClarifyDock(buffered.clarify, { step: nextStep, auto: true })
       loadSessions()
@@ -12693,6 +14257,12 @@ async function runClarifyStep(flow, answer, answeredClarify) {
       for (const event of buffered.toolResults) turn.toolResult(event)
     }
     if (turn) turn.finish(buffered.done || { text: buffered.content })
+    if (flow.voiceConversation && turn) {
+      const replyText = String(buffered.done?.text || buffered.content || '').trim()
+      if (voiceStream) endVoiceSpeechStream(voiceStream, replyText)
+      else if (replyText) handleVoiceConversationAnswer(turn.node, replyText)
+      else setVoiceDockStatus('paused', '回答已完成', '没有可播报的文本，点“继续聆听”继续语音对话')
+    }
     if (messageId) state.liveTurns.delete(messageId)
     if (messageId) {
       state.historyMessageIds.add(messageId)
@@ -12703,6 +14273,7 @@ async function runClarifyStep(flow, answer, answeredClarify) {
     updateSendState()
   } catch (err) {
     const aborted = controller.signal.aborted
+    if (voiceStream) abortVoiceSpeechStream({ quiet: true })
     if (turn) {
       if (aborted) turn.stop()
       else turn.fail(`引导续跑失败：${err.message}`)
@@ -12717,6 +14288,9 @@ async function runClarifyStep(flow, answer, answeredClarify) {
       } else {
         showClarifyDock(answeredClarify, { step: flow.step })
         banner(`引导续跑失败：${err.message}`, 'warn')
+      }
+      if (flow.voiceConversation && state.voiceConversation.active) {
+        setVoiceDockStatus('error', '这轮回答失败', '文字错误已保留；点“重试”重新开始语音对话')
       }
     }
   } finally {
@@ -12809,11 +14383,15 @@ function messageFooterMarkup(role) {
          <button type="button" class="msg-action is-danger" data-message-act="delete" title="删除" aria-label="删除">${MESSAGE_ACTION_ICONS.delete}</button>`
       : `<button type="button" class="msg-action is-danger" data-message-act="delete" title="删除回答" aria-label="删除回答">${MESSAGE_ACTION_ICONS.delete}</button>`
   const actionsBlock = `<div class="msg-actions" role="group" aria-label="消息操作" hidden>${actions}</div>`
+  const speech =
+    role === 'ai'
+      ? '<button class="msg-voice" type="button" title="播放语音" aria-label="播放语音" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 10v4h3l4 3V7l-4 3H5Z" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M15 9.5a3.5 3.5 0 0 1 0 5M17.5 7a7 7 0 0 1 0 10" fill="none" stroke="currentColor" stroke-width="1.5"/></svg><span>播放语音</span></button>'
+      : ''
   const time = '<time class="msg-time"></time>'
   const blocks =
     role === 'me'
       ? `${actionsBlock}${time}`
-      : `${time}${actionsBlock}`
+      : `${speech}${time}${actionsBlock}`
   return `<div class="msg-footer">
     ${blocks}
   </div>`
@@ -13089,10 +14667,12 @@ function createAiTurn(options = {}) {
     if (lastFileTrace) updateFileActivity(lastFileTrace)
   }
   // 流式阶段也按 Markdown 渲染；合并到 ~30fps，避免长回答逐 token 反复解析整段 Markdown。
+  // 语音播报期间降到 ~20fps：音频已经由 AudioWorklet 独立播放，正文渲染不必和声卡抢主线程。
   const renderStreamingAnswer = () => {
     if (answerRenderQueued) return
     answerRenderQueued = true
     const generation = renderGeneration
+    const interval = voiceSpeechStream?.active || state.voiceConversation.active ? 50 : 28
     answerRenderTimer = setTimeout(() => {
       answerRenderTimer = 0
       requestAnimationFrame(() => {
@@ -13101,7 +14681,7 @@ function createAiTurn(options = {}) {
         answer.innerHTML = renderAnswer(rawAnswer, { omitCodeBlocks: writtenFileContentBlocks(toolTraces) })
         scroll()
       })
-    }, 28)
+    }, interval)
   }
   let turn = null
   const hideWaiting = () => {
@@ -14120,7 +15700,816 @@ function mergeDoneAttachments(local, server) {
   })
 }
 
-async function send() {
+let voiceRecorder = null
+let voiceChunks = []
+let voiceStartedAt = 0
+let voiceTimer = 0
+let voiceStream = null
+let voiceDiscount = false
+let voiceTranscribing = false
+let voiceAudioContext = null
+let voiceAnalyser = null
+let voiceVadTimer = 0
+let voiceVadData = null
+let voiceSpeechFrames = 0
+
+/** 语音唤醒独立采集链，和正式对话录音互斥，避免同时抢麦克风。 */
+let wakeRecorder = null
+let wakeChunks = []
+let wakeStream = null
+let wakeStartedAt = 0
+let wakeSpeechStarted = false
+let wakeSpeechMs = 0
+let wakeSilenceMs = 0
+let wakeNoSpeechMs = 0
+let wakeThreshold = 0.012
+let wakeCalibrating = true
+let wakeCalibrationUntil = 0
+let wakeCalibrationSamples = []
+let wakeSpeechFrames = 0
+let wakeDiscounted = false
+let wakeTranscribing = false
+let wakeTimer = 0
+let wakeAudioContext = null
+let wakeAnalyser = null
+let wakeVadTimer = 0
+let wakeVadData = null
+const WAKE_PREF_KEY = 'eab.voiceWake.enabled'
+const WAKE_MAX_SEGMENT_MS = 15_000
+const WAKE_IDLE_RESTART_MS = 20_000
+
+/** 连续语音的流式播报：文本边生成边按句合成 PCM，Web Audio 按时间轴排队播放。 */
+let voiceSpeechStream = null
+let voicePlaybackContext = null
+let voiceWorkletNode = null
+let voiceWorkletContext = null
+let voiceWorkletReady = null
+let voiceWorkletFilter = null
+let voiceWorkletFailed = false
+let voiceBargeStream = null
+let voiceBargeContext = null
+let voiceBargeTimer = 0
+let voiceBargeData = null
+const VOICE_PCM_SAMPLE_RATE = 24_000
+// 首块到达后先攒一小段再起播，吸收网络与上游合成的抖动；后续句子沿用同一条时间轴。
+// 长句按约 60 字切开，保证单次合成时长不超过 11 秒，避免上游 RTF>1 把缓冲吃穿。
+const VOICE_PREBUFFER_SECONDS = 0.9
+const VOICE_REBUFFER_SECONDS = 0.2
+
+function voicePlayback() {
+  if (voicePlaybackContext && voicePlaybackContext.state !== 'closed') {
+    if (voicePlaybackContext.state === 'suspended') void voicePlaybackContext.resume().catch(() => {})
+    return voicePlaybackContext
+  }
+  const AudioContextCtor = window.AudioContext || window.webkitAudioContext
+  if (!AudioContextCtor) return null
+  // 直接按 24kHz 建上下文，避免每个 PCM 块都被浏览器单独重采样。
+  try {
+    voicePlaybackContext = new AudioContextCtor({
+      // 语音播报优先连续、少爆音；交互延迟由预缓冲兜住，不需要 audio thread 的最小延迟。
+      latencyHint: 'playback',
+      sampleRate: VOICE_PCM_SAMPLE_RATE,
+    })
+  } catch {
+    voicePlaybackContext = new AudioContextCtor({ latencyHint: 'playback' })
+  }
+  // 换了 AudioContext 后旧 worklet 节点失效；下一次播放会重新加载模块。
+  voiceWorkletNode = null
+  voiceWorkletContext = null
+  voiceWorkletFilter = null
+  voiceWorkletReady = null
+  voiceWorkletFailed = false
+  void voicePlaybackContext.resume().catch(() => {})
+  return voicePlaybackContext
+}
+
+function closeVoicePlayback() {
+  const context = voicePlaybackContext
+  voicePlaybackContext = null
+  voiceWorkletNode = null
+  voiceWorkletContext = null
+  voiceWorkletFilter = null
+  voiceWorkletReady = null
+  if (context && context.state !== 'closed') void context.close().catch(() => {})
+}
+
+function stopVoiceBargeInMonitor() {
+  window.clearInterval(voiceBargeTimer)
+  voiceBargeTimer = 0
+  voiceBargeData = null
+  const context = voiceBargeContext
+  voiceBargeContext = null
+  if (context && context.state !== 'closed') void context.close().catch(() => {})
+  for (const track of voiceBargeStream?.getTracks?.() || []) track.stop()
+  voiceBargeStream = null
+}
+
+/**
+ * 播报期间单独监测麦克风：用户一开口就停播并回到聆听。
+ * echoCancellation 让同一台机器外放的 TTS 尽量不被当成用户语音。
+ */
+async function startVoiceBargeInMonitor(generation) {
+  if (voiceBargeStream) return
+  const vm = state.voiceConversation
+  if (!vm.active || generation !== vm.generation) return
+  try {
+    voiceBargeStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    })
+  } catch {
+    return
+  }
+  if (!vm.active || generation !== vm.generation || vm.phase !== 'speaking') {
+    for (const track of voiceBargeStream?.getTracks?.() || []) track.stop()
+    voiceBargeStream = null
+    return
+  }
+  const AudioContextCtor = window.AudioContext || window.webkitAudioContext
+  if (!AudioContextCtor) {
+    stopVoiceBargeInMonitor()
+    return
+  }
+  try {
+    voiceBargeContext = new AudioContextCtor()
+    const source = voiceBargeContext.createMediaStreamSource(voiceBargeStream)
+    const analyser = voiceBargeContext.createAnalyser()
+    analyser.fftSize = 1024
+    analyser.smoothingTimeConstant = 0.45
+    source.connect(analyser)
+    voiceBargeData = new Uint8Array(analyser.fftSize)
+    void voiceBargeContext.resume().catch(() => {})
+    const startedAt = Date.now()
+    let baseline = []
+    let threshold = 0.03
+    let frames = 0
+    voiceBargeTimer = window.setInterval(() => {
+      if (!analyser || !voiceBargeData) return
+      if (!vm.active || generation !== vm.generation) {
+        stopVoiceBargeInMonitor()
+        return
+      }
+      analyser.getByteTimeDomainData(voiceBargeData)
+      let sum = 0
+      for (const value of voiceBargeData) {
+        const centered = (value - 128) / 128
+        sum += centered * centered
+      }
+      const rms = Math.sqrt(sum / voiceBargeData.length)
+      const now = Date.now()
+      // 刚开播的前 350ms 用来校准外放回声与房间底噪。
+      if (now - startedAt < 350) {
+        baseline.push(rms)
+        if (baseline.length > 6) baseline.shift()
+        const average = baseline.reduce((total, value) => total + value, 0) / Math.max(1, baseline.length)
+        threshold = Math.max(0.014, Math.min(0.06, average * 2.5))
+        return
+      }
+      if (rms > threshold && rms > 0.012) frames += 1
+      else frames = 0
+      // 连续 4 帧（约 360ms）才打断：既能及时接话，又不因咳嗽或短促回声误触发。
+      if (frames >= 4) {
+        frames = 0
+        stopVoiceBargeInMonitor()
+        abortVoiceSpeechStream({ quiet: true })
+        setVoiceDockStatus('listening', '检测到你说话，已停止播报', '继续说，停顿约 1 秒后会自动发送')
+        scheduleVoiceConversationListen(140, true)
+      }
+    }, 90)
+  } catch {
+    stopVoiceBargeInMonitor()
+  }
+}
+
+function cleanSpeechSegment(text) {
+  return String(text || '')
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/^\s*\|.*\|\s*$/gm, ' ')
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/<[^>]+>/g, '')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/^\s{0,3}#{1,6}\s+/gm, '')
+    .replace(/^\s{0,3}>\s?/gm, '')
+    .replace(/^\s*[-*+]\s+/gm, '')
+    .replace(/^\s*\d+[.)、]\s+/gm, '')
+    .replace(/[*_~]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+/**
+ * 从流式文本里切出已经说完的句子。
+ * 只在句末标点/换行处切，避免把“3.14”或“2026.11”拆成两段；
+ * 极长无标点段落超过 600 字时硬切，防止单句请求过大。
+ */
+function takeVoiceSpeechSentences(buffer) {
+  const text = String(buffer || '')
+  const sentences = []
+  let start = 0
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index]
+    if ('。！？!?；;\n'.includes(char)) {
+      const piece = text.slice(start, index + 1).trim()
+      if (piece) sentences.push(piece)
+      start = index + 1
+      continue
+    }
+    if (index - start >= 600) {
+      const piece = text.slice(start, index + 1).trim()
+      if (piece) sentences.push(piece)
+      start = index + 1
+    }
+  }
+  return { sentences, rest: text.slice(start) }
+}
+
+/** LLM 每吐出一句完整中文，就入队；上一句还在播时，下一句已经在合成。 */
+function feedVoiceSpeechStream(text) {
+  const stream = voiceSpeechStream
+  if (!stream || !stream.active) return
+  const piece = String(text || '')
+  stream.received += piece
+  stream.pending += piece
+  const { sentences, rest } = takeVoiceSpeechSentences(stream.pending)
+  stream.pending = rest
+  let added = 0
+  for (const sentence of sentences) {
+    const cleaned = cleanSpeechSegment(sentence)
+    if (!cleaned) continue
+    stream.queue.push(cleaned)
+    added += 1
+  }
+  if (added && !stream.startedAudio) {
+    setVoiceDockStatus('thinking', '正在准备第一句…', '回答边生成边播报，后面的句子会在播放时继续合成')
+  }
+  if (added) void pumpVoiceSpeechStream(stream)
+}
+
+function stopVoiceSpeechSources(stream) {
+  for (const source of stream.sources) {
+    try {
+      source.stop()
+    } catch {
+      // 已经自然结束的 source 再 stop 会抛 InvalidStateError
+    }
+  }
+  stream.sources.clear()
+}
+
+function beginVoiceSpeechStream(node, generation) {
+  const vm = state.voiceConversation
+  if (!state.speechAvailable || !state.voiceSettings.enabled) return null
+  const previous = voiceSpeechStream
+  if (previous) abortVoiceSpeechStream({ quiet: true })
+  const context = voicePlayback()
+  if (!context) return null
+  const stream = {
+    active: true,
+    node,
+    generation,
+    controller: new AbortController(),
+    received: '',
+    pending: '',
+    queue: [],
+    pumping: false,
+    textComplete: false,
+    startedAudio: false,
+    audioStarted: false,
+    useWorklet: false,
+    workletChecked: false,
+    workletDrained: true,
+    nextStart: 0,
+    underruns: 0,
+    sources: new Set(),
+    context,
+    failed: false,
+    prebuffer: VOICE_PREBUFFER_SECONDS,
+  }
+  voiceSpeechStream = stream
+  if (voiceWorkletNode && voiceWorkletContext === context) {
+    voiceWorkletNode.port.postMessage({ type: 'reset' })
+  }
+  const dock = document.querySelector('#voice-dock')
+  if (dock) {
+    dock.dataset.voiceUnderruns = '0'
+    dock.dataset.voiceSampleRate = String(context.sampleRate)
+  }
+  setVoiceDockStatus('thinking', '正在生成回答…', '第一句说完就会开始播报，不用等整段回答')
+  return stream
+}
+
+function maybeFinishVoiceSpeech(stream) {
+  if (!stream.active || !stream.textComplete || stream.pumping || stream.queue.length) return
+  if (stream.sources.size) return
+  if (stream.useWorklet && !stream.workletDrained) return
+  stream.active = false
+  stopVoiceBargeInMonitor()
+  if (voiceSpeechStream === stream) voiceSpeechStream = null
+  const vm = state.voiceConversation
+  if (!vm.active || stream.generation !== vm.generation) return
+  setVoiceDockStatus('listening', '回答播报完毕', '继续说话即可开始下一轮')
+  scheduleVoiceConversationListen(260)
+}
+
+function abortVoiceSpeechStream(options = {}) {
+  const stream = voiceSpeechStream
+  if (!stream) return
+  stream.active = false
+  stream.controller.abort()
+  stopVoiceSpeechSources(stream)
+  stream.queue.length = 0
+  stream.pending = ''
+  if (stream.useWorklet && voiceWorkletNode && voiceWorkletContext === stream.context) {
+    voiceWorkletNode.port.postMessage({ type: 'reset' })
+  }
+  stopVoiceBargeInMonitor()
+  if (voiceSpeechStream === stream) voiceSpeechStream = null
+  if (options.quiet) return
+  if (state.voiceConversation.active) {
+    setVoiceDockStatus('paused', '语音播报中断', '文字回答已保留；点“继续聆听”继续语音对话')
+  }
+}
+
+function handleVoiceWorkletMessage(event) {
+  const stream = voiceSpeechStream
+  if (!stream || !stream.active || !stream.useWorklet) return
+  const type = event?.data?.type
+  if (type === 'started') {
+    markVoiceAudioStarted(stream)
+    return
+  }
+  if (type === 'underrun') {
+    stream.underruns = (stream.underruns || 0) + 1
+    const dock = document.querySelector('#voice-dock')
+    if (dock) dock.dataset.voiceUnderruns = String(stream.underruns)
+    return
+  }
+  if (type === 'drained') {
+    stream.workletDrained = true
+    maybeFinishVoiceSpeech(stream)
+  }
+}
+
+/**
+ * 用 AudioWorklet 在音频线程里持续消费 PCM。
+ * 旧实现每 80ms 新建一个 AudioBufferSourceNode，块边界反复起停既会咔哒，也会被主线程渲染拖累。
+ */
+async function ensureVoiceWorklet(context) {
+  if (voiceWorkletFailed || !context?.audioWorklet || context.sampleRate !== VOICE_PCM_SAMPLE_RATE) return null
+  if (voiceWorkletNode && voiceWorkletContext === context) return voiceWorkletNode
+  if (!voiceWorkletReady) {
+    voiceWorkletReady = context.audioWorklet
+      .addModule('/voice-pcm-player-worklet.js?v=20261123audio4')
+      .then(() => {
+        const node = new AudioWorkletNode(context, 'eab-voice-pcm-player', {
+          numberOfInputs: 0,
+          numberOfOutputs: 1,
+          outputChannelCount: [1],
+          processorOptions: {
+            sourceRate: VOICE_PCM_SAMPLE_RATE,
+            prebufferSeconds: 0.8,
+            fadeSeconds: 0.006,
+          },
+        })
+        node.port.onmessage = handleVoiceWorkletMessage
+        // 60Hz 高通去掉低频嗡声/直流偏置；语音主频远高于这里，不会削弱清晰度。
+        const filter = context.createBiquadFilter()
+        filter.type = 'highpass'
+        filter.frequency.value = 60
+        filter.Q.value = 0.7
+        node.connect(filter)
+        filter.connect(context.destination)
+        voiceWorkletNode = node
+        voiceWorkletContext = context
+        voiceWorkletFilter = filter
+        const dock = document.querySelector('#voice-dock')
+        if (dock) dock.dataset.voiceEngine = 'worklet'
+        return node
+      })
+      .catch(() => {
+        voiceWorkletFailed = true
+        return null
+      })
+  }
+  return voiceWorkletReady
+}
+
+function scheduleWorkletPcmChunk(stream, bytes) {
+  if (!voiceWorkletNode || voiceWorkletContext !== stream.context) return
+  const copy = new Uint8Array(bytes.byteLength)
+  copy.set(bytes)
+  stream.workletDrained = false
+  stream.startedAudio = true
+  voiceWorkletNode.port.postMessage({ type: 'pcm', buffer: copy.buffer }, [copy.buffer])
+}
+
+function schedulePcmChunk(stream, bytes) {
+  if (!stream.active || bytes.byteLength < 2) return
+  if (stream.useWorklet) {
+    scheduleWorkletPcmChunk(stream, bytes)
+    return
+  }
+  scheduleLegacyPcmChunk(stream, bytes)
+}
+
+function markVoiceAudioStarted(stream) {
+  if (stream.audioStarted) return
+  stream.audioStarted = true
+  const vm = state.voiceConversation
+  if (!vm.active || stream.generation !== vm.generation) return
+  setVoiceDockStatus('speaking', '正在同步播报…', '回答还在生成，语音已按句跟上')
+  void startVoiceBargeInMonitor(stream.generation)
+}
+
+function scheduleLegacyPcmChunk(stream, bytes) {
+  const context = stream.context
+  if (!context || context.state === 'closed') return
+  const frames = Math.floor(bytes.byteLength / 2)
+  if (!frames) return
+  const buffer = context.createBuffer(1, frames, VOICE_PCM_SAMPLE_RATE)
+  const channel = buffer.getChannelData(0)
+  for (let index = 0; index < frames; index += 1) {
+    const offset = index * 2
+    const value = (bytes[offset] | (bytes[offset + 1] << 8)) << 16 >> 16
+    channel[index] = value / 32768
+  }
+  if (context.state === 'suspended') void context.resume().catch(() => {})
+  const source = context.createBufferSource()
+  source.buffer = buffer
+  source.connect(context.destination)
+  const now = context.currentTime
+  // 播放时间轴已经落后于当前时间，说明上一段缓冲被网络抖动吃完；重新攒一小段再继续，
+  // 否则每一块都会以“已过期”的时间起播，听起来就是连续卡顿。
+  if (stream.nextStart && stream.nextStart < now + 0.03) {
+    stream.nextStart = now + VOICE_REBUFFER_SECONDS
+    stream.underruns = (stream.underruns || 0) + 1
+    const dock = document.querySelector('#voice-dock')
+    if (dock) dock.dataset.voiceUnderruns = String(stream.underruns)
+  }
+  const lead = stream.startedAudio ? 0.16 : stream.prebuffer || VOICE_PREBUFFER_SECONDS
+  const when = Math.max(now + lead, stream.nextStart)
+  stream.nextStart = when + buffer.duration
+  stream.sources.add(source)
+  source.onended = () => {
+    stream.sources.delete(source)
+    maybeFinishVoiceSpeech(stream)
+  }
+  try {
+    source.start(when)
+  } catch {
+    stream.sources.delete(source)
+  }
+  if (!stream.startedAudio) {
+    stream.startedAudio = true
+    // 旧路径没有音频线程回调，按首个 source 的真实起播时间再标记，避免预缓冲期间就启动打断监听。
+    const delay = Math.max(0, (when - now) * 1000)
+    window.setTimeout(() => {
+      if (stream.active) markVoiceAudioStarted(stream)
+    }, delay)
+  }
+}
+
+async function playVoiceSpeechSegment(stream, text) {
+  const response = await fetch(`/api/chat/speech/stream${qs()}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ text }),
+    signal: stream.controller.signal,
+  })
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null)
+    throw new Error(payload?.error?.message || payload?.message || `HTTP ${response.status}`)
+  }
+  if (!response.body) throw new Error('流式语音没有返回音频')
+  const sampleRate = Number(response.headers.get('x-audio-sample-rate')) || VOICE_PCM_SAMPLE_RATE
+  if (sampleRate !== VOICE_PCM_SAMPLE_RATE) {
+    throw new Error(`流式语音采样率 ${sampleRate}Hz，当前播放器只支持 ${VOICE_PCM_SAMPLE_RATE}Hz`)
+  }
+  if (!stream.workletChecked) {
+    stream.workletChecked = true
+    const node = await ensureVoiceWorklet(stream.context)
+    if (!stream.active) return
+    if (node) {
+      stream.useWorklet = true
+      stream.workletDrained = true
+    } else {
+      const dock = document.querySelector('#voice-dock')
+      if (dock) dock.dataset.voiceEngine = 'legacy'
+    }
+  }
+  const reader = response.body.getReader()
+  let carry = new Uint8Array(0)
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (!stream.active) {
+        void reader.cancel().catch(() => {})
+        return
+      }
+      let chunk = value
+      if (carry.byteLength) {
+        const merged = new Uint8Array(carry.byteLength + value.byteLength)
+        merged.set(carry)
+        merged.set(value, carry.byteLength)
+        chunk = merged
+      }
+      const usable = chunk.byteLength - (chunk.byteLength % 2)
+      if (usable > 0) schedulePcmChunk(stream, chunk.subarray(0, usable))
+      carry = usable < chunk.byteLength ? chunk.subarray(usable) : new Uint8Array(0)
+    }
+  } finally {
+    reader.releaseLock()
+  }
+  if (stream.useWorklet && voiceWorkletNode && voiceWorkletContext === stream.context) {
+    voiceWorkletNode.port.postMessage({ type: 'end' })
+  }
+}
+
+async function pumpVoiceSpeechStream(stream) {
+  if (stream.pumping) return
+  stream.pumping = true
+  try {
+    while (stream.active && stream.queue.length) {
+      const segment = stream.queue.shift()
+      if (!segment) continue
+      await playVoiceSpeechSegment(stream, segment)
+    }
+  } catch (err) {
+    if (!stream.active || err?.name === 'AbortError') return
+    stream.failed = true
+    stream.active = false
+    stopVoiceSpeechSources(stream)
+    stopVoiceBargeInMonitor()
+    if (voiceSpeechStream === stream) voiceSpeechStream = null
+    if (state.voiceConversation.active) {
+      setVoiceDockStatus('paused', '语音播放失败', err.message || '文字回答已保留；可点“继续聆听”')
+    }
+  } finally {
+    stream.pumping = false
+    maybeFinishVoiceSpeech(stream)
+  }
+}
+
+function endVoiceSpeechStream(stream, fullText) {
+  if (!stream) return
+  const vm = state.voiceConversation
+  if (!vm.active || stream.generation !== vm.generation) {
+    abortVoiceSpeechStream({ quiet: true })
+    return
+  }
+  const text = String(fullText || '').trim()
+  if (!stream.received && text) feedVoiceSpeechStream(text)
+  else if (text && text.length > stream.received.length && text.startsWith(stream.received)) {
+    feedVoiceSpeechStream(text.slice(stream.received.length))
+  }
+  stream.textComplete = true
+  // 最后一段可能没有句末标点（例如列表项），收尾时补入队；每一句仍然复用同一个锚点。
+  const tail = cleanSpeechSegment(stream.pending)
+  stream.pending = ''
+  if (tail) stream.queue.push(tail)
+  if (!stream.startedAudio && stream.queue.length) {
+    setVoiceDockStatus('thinking', '正在准备语音…', '按句合成，第一句马上开始播报')
+  }
+  void pumpVoiceSpeechStream(stream)
+  maybeFinishVoiceSpeech(stream)
+}
+
+function stopVoiceVad() {
+  window.clearInterval(voiceVadTimer)
+  voiceVadTimer = 0
+  voiceAnalyser = null
+  voiceVadData = null
+  voiceSpeechFrames = 0
+  const context = voiceAudioContext
+  voiceAudioContext = null
+  if (context) void context.close().catch(() => {})
+}
+
+function voiceSupported() {
+  return Boolean(navigator.mediaDevices?.getUserMedia && window.MediaRecorder)
+}
+
+function resetVoiceUi() {
+  window.clearInterval(voiceTimer)
+  voiceTimer = 0
+  stopVoiceVad()
+  for (const track of voiceStream?.getTracks?.() || []) track.stop()
+  voiceStream = null
+  renderVoiceControls()
+}
+
+async function startVoiceRecording() {
+  const generation = state.voiceConversation.generation
+  if (voiceRecorder || voiceTranscribing) return false
+  if (!voiceSupported()) {
+    setVoiceDockStatus('error', '当前浏览器不支持录音', '请换用 Chrome、Edge 或钉钉内置浏览器')
+    return false
+  }
+  try {
+    voiceStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    })
+  } catch {
+    setVoiceDockStatus('error', '没有拿到麦克风权限', '请在浏览器设置里允许录音后点“重试”')
+    return false
+  }
+  if (!state.voiceConversation.active || generation !== state.voiceConversation.generation) {
+    for (const track of voiceStream?.getTracks?.() || []) track.stop()
+    voiceStream = null
+    return false
+  }
+  const preferred = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4']
+  const mime = preferred.find((type) => window.MediaRecorder.isTypeSupported?.(type)) || ''
+  try {
+    voiceRecorder = new MediaRecorder(voiceStream, mime ? { mimeType: mime } : undefined)
+  } catch {
+    resetVoiceUi()
+    setVoiceDockStatus('error', '当前浏览器无法启动录音', '请换用 Chrome 或 Edge 后重试')
+    return false
+  }
+  const vm = state.voiceConversation
+  vm.stopReason = ''
+  vm.turnStartedAt = Date.now()
+  vm.speechStarted = false
+  vm.speechMs = 0
+  vm.silenceMs = 0
+  vm.level = 0
+  vm.threshold = 0.012
+  vm.calibrating = true
+  vm.calibrationUntil = vm.turnStartedAt + 650
+  vm.calibrationSamples = []
+  voiceSpeechFrames = 0
+  voiceChunks = []
+  voiceStartedAt = Date.now()
+  voiceDiscount = false
+  voiceRecorder.ondataavailable = (event) => {
+    if (event.data?.size) voiceChunks.push(event.data)
+  }
+  voiceRecorder.onstop = () => {
+    const chunks = voiceChunks.slice()
+    const type = voiceRecorder?.mimeType || 'audio/webm'
+    const stopReason = state.voiceConversation.stopReason
+    voiceRecorder = null
+    voiceChunks = []
+    resetVoiceUi()
+    if (voiceDiscount) return
+    if (!state.voiceConversation.active) return
+    if (stopReason === 'no-speech' || !chunks.length) {
+      setVoiceDockStatus('listening', '没有听到声音', '再说一遍，或点“退出”结束语音对话')
+      scheduleVoiceConversationListen(500)
+      return
+    }
+    void transcribeVoice(new Blob(chunks, { type }), { generation })
+  }
+  voiceRecorder.start()
+  setVoiceDockStatus('listening', '正在聆听', '直接说话，停顿约 1 秒后会自动发送')
+  startVoiceVad(voiceStream, generation)
+  const maxMs = vm.maxMs
+  voiceTimer = window.setInterval(() => {
+    if (!voiceRecorder) return
+    if (Date.now() - voiceStartedAt >= maxMs) stopVoiceRecording(false, { reason: 'max' })
+  }, 1000)
+  return true
+}
+
+/** 用 Web Audio 的 RMS 做轻量 VAD：检测开口、停顿自动断句并更新状态条音量。 */
+function startVoiceVad(stream, generation) {
+  stopVoiceVad()
+  const vm = state.voiceConversation
+  const AudioContextCtor = window.AudioContext || window.webkitAudioContext
+  if (!AudioContextCtor) return
+  try {
+    voiceAudioContext = new AudioContextCtor()
+    const source = voiceAudioContext.createMediaStreamSource(stream)
+    voiceAnalyser = voiceAudioContext.createAnalyser()
+    voiceAnalyser.fftSize = 1024
+    voiceAnalyser.smoothingTimeConstant = 0.45
+    source.connect(voiceAnalyser)
+    voiceVadData = new Uint8Array(voiceAnalyser.fftSize)
+    // 录音授权通常已允许音频上下文运行；仍主动 resume 一次，避免个别浏览器把新建上下文停在 suspended。
+    void voiceAudioContext.resume().catch(() => {})
+  } catch {
+    stopVoiceVad()
+    return
+  }
+  voiceVadTimer = window.setInterval(() => {
+    if (!voiceAnalyser || !voiceVadData) return
+    if (generation !== vm.generation || !vm.active) return
+    voiceAnalyser.getByteTimeDomainData(voiceVadData)
+    let sum = 0
+    for (const value of voiceVadData) {
+      const centered = (value - 128) / 128
+      sum += centered * centered
+    }
+    const rms = Math.sqrt(sum / voiceVadData.length)
+    vm.level = Math.min(1, rms * 6)
+    const dock = $('#voice-dock')
+    if (dock) dock.style.setProperty('--voice-level', vm.level.toFixed(3))
+    const now = Date.now()
+    if (vm.calibrating) {
+      vm.calibrationSamples.push(rms)
+      if (now >= vm.calibrationUntil || vm.calibrationSamples.length >= 8) {
+        const average = vm.calibrationSamples.reduce((total, value) => total + value, 0) / Math.max(1, vm.calibrationSamples.length)
+        vm.threshold = Math.max(0.01, Math.min(0.06, average * 2.6))
+        vm.calibrating = false
+      }
+      return
+    }
+    if (!vm.speechStarted) {
+      if (rms > vm.threshold && rms > 0.016) voiceSpeechFrames += 1
+      else voiceSpeechFrames = 0
+      if (voiceSpeechFrames >= 3) {
+        vm.speechStarted = true
+        vm.speechMs = 240
+        vm.silenceMs = 0
+        setVoiceDockStatus('listening', '听到了，请继续', '说完后停顿约 1 秒，我会自动发送')
+      } else if (now - vm.turnStartedAt >= vm.noSpeechTimeout) {
+        stopVoiceRecording(false, { reason: 'no-speech' })
+      }
+      return
+    }
+    vm.speechMs += 90
+    if (rms > Math.max(0.012, vm.threshold * 0.72)) vm.silenceMs = 0
+    else vm.silenceMs += 90
+    if (vm.speechMs >= 800 && vm.silenceMs >= 1_150) {
+      stopVoiceRecording(false, { reason: 'silence' })
+    }
+  }, 90)
+}
+
+function stopVoiceRecording(discount = false, meta = {}) {
+  // 续听定时器可能在“没有听到声音”后的 500ms 空档里等待触发，用户点“结束这句”时要一并取消。
+  window.clearTimeout(state.voiceConversation.resumeTimer)
+  state.voiceConversation.resumeTimer = 0
+  voiceDiscount = Boolean(discount)
+  state.voiceConversation.stopReason = String(meta.reason || (discount ? 'cancel' : 'manual'))
+  if (!voiceRecorder) {
+    resetVoiceUi()
+    return
+  }
+  try {
+    voiceRecorder.stop()
+  } catch {
+    resetVoiceUi()
+  }
+}
+
+function blobToDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result || ''))
+    reader.onerror = () => reject(reader.error || new Error('读取录音失败'))
+    reader.readAsDataURL(blob)
+  })
+}
+
+async function transcribeVoice(blob, options = {}) {
+  const generation = Number(options.generation ?? state.voiceConversation.generation)
+  if (!state.voiceConversation.active || generation !== state.voiceConversation.generation) return
+  if (blob.size < 600) {
+    setVoiceDockStatus('listening', '没有听清', '请再说一遍，停顿后会自动发送')
+    scheduleVoiceConversationListen(400)
+    return
+  }
+  voiceTranscribing = true
+  renderVoiceControls()
+  setVoiceDockStatus('transcribing', '正在识别语音…', '识别完成后会直接发送')
+  const input = $('#input')
+  try {
+    const rawDataUrl = await blobToDataUrl(blob)
+    // MediaRecorder 的 blob.type 会带 codecs 参数；上传前收敛成基础 MIME，避免服务端把参数当成文件名/类型。
+    const baseType = (blob.type || 'audio/webm').split(';')[0].toLowerCase()
+    const dataUrl = rawDataUrl.replace(/^data:(audio\/[^;,]+)(?:;[^;,]*)*;base64,/i, `data:${baseType};base64,`)
+    const result = await api('/api/chat/transcribe', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ dataUrl }),
+    })
+    const text = String(result?.text || '').trim()
+    if (!text) throw new Error('没有识别出文字，请再说一遍')
+    if (!state.voiceConversation.active || generation !== state.voiceConversation.generation) return
+    input.value = text
+    input.style.height = '44px'
+    updateSendState()
+    state.voiceConversation.phase = 'thinking'
+    setVoiceDockStatus('thinking', '正在思考回答…', `已识别：“${text.length > 26 ? `${text.slice(0, 26)}…` : text}”`)
+    if (state.clarifyFlow && state.pendingClarify) {
+      advanceClarifyFlow(text, { voiceConversation: true })
+      return
+    }
+    await send({ voiceInput: true, voiceConversation: true })
+  } catch (err) {
+    if (!state.voiceConversation.active || generation !== state.voiceConversation.generation) return
+    setVoiceDockStatus('error', '语音识别失败', err.message || '请再说一遍，或退出语音对话')
+  } finally {
+    voiceTranscribing = false
+    renderVoiceControls()
+  }
+}
+
+async function send(options = {}) {
+  if (!options.voiceInput && state.voiceConversation.active) exitVoiceConversation({ silent: true })
   const input = $('#input')
   const text = input.value.trim()
   if (!text && state.attachments.length === 0) return
@@ -14137,7 +16526,7 @@ async function send() {
     input.value = ''
     input.style.height = '44px'
     updateSendState()
-    advanceClarifyFlow(text)
+    advanceClarifyFlow(text, { voiceConversation: options.voiceConversation === true })
     return
   }
   // 只要用户真正发了消息（包括带附件），底部澄清就完成使命。
@@ -14227,6 +16616,8 @@ async function send() {
     spaceKind,
     sessionId: state.sessionId,
     runtimeKey: runtime.key,
+    voiceInput: Boolean(options.voiceInput),
+    voiceConversation: Boolean(options.voiceConversation),
     createdAt: Date.now(),
     node: null,
   }
@@ -14292,6 +16683,14 @@ async function drainQueue(runtime = currentRuntime()) {
   let sawDone = false
   let messageId = ''
   const createdSession = !item.sessionId
+  const voiceTurn = Boolean(
+    item.voiceConversation &&
+      state.voiceConversation.active &&
+      (item.sessionId
+        ? item.sessionId === state.voiceConversation.sessionId
+        : state.voiceConversation.sessionId === null),
+  )
+  const voiceStream = voiceTurn ? beginVoiceSpeechStream(turn.node, state.voiceConversation.generation) : null
 
   try {
     const references = await buildAttachmentPayload(item.pending.filter(isPersistentAttachment))
@@ -14374,6 +16773,10 @@ async function drainQueue(runtime = currentRuntime()) {
             }
             markSessionActive(data.sessionId)
             renderSessions()
+            // 新会话首轮语音：把连续语音的归属从“尚未落库”更新到真实会话 id，下一轮才能继续收听。
+            if (state.voiceConversation.active && !state.voiceConversation.sessionId) {
+              state.voiceConversation.sessionId = data.sessionId
+            }
           }
           if (!isCurrentRun && turn.node.isConnected) {
             // 发送瞬间还在当前会话，meta 回来前已经切走；保留在后台，不删节点。
@@ -14392,8 +16795,10 @@ async function drainQueue(runtime = currentRuntime()) {
            * “正在思考中…”，刷新后才从历史消息恢复。
            */
           if (event === 'reasoning') turn.reasoning(data.text)
-          else if (event === 'delta') turn.content(data.text)
-          else if (event === 'tool') turn.tool(data)
+          else if (event === 'delta') {
+            turn.content(data.text)
+            if (voiceStream?.active) feedVoiceSpeechStream(String(data.text || ''))
+          } else if (event === 'tool') turn.tool(data)
           else if (event === 'tool_delta') turn.toolDelta(data)
           else turn.toolResult(data)
         } else if (event === 'agent') {
@@ -14444,6 +16849,19 @@ async function drainQueue(runtime = currentRuntime()) {
             updateAttachmentCards(item.node, merged)
           }
           turn.finish(data)
+          const voiceReplyText = String(data?.text || '').trim() || String(data?.clarify?.question || '').trim()
+          if (
+            item.voiceInput &&
+            (isCurrentRun || runtime.sessionId === state.sessionId)
+          ) {
+            if (item.voiceConversation) {
+              if (voiceStream) endVoiceSpeechStream(voiceStream, voiceReplyText)
+              else if (voiceReplyText) handleVoiceConversationAnswer(turn.node, voiceReplyText)
+              else setVoiceDockStatus('paused', '回答已完成', '没有可播报的文本，点“继续聆听”继续语音对话')
+            } else if (!data?.clarify && voiceReplyText) {
+              void speakAnswer(turn.node, voiceReplyText, { auto: true })
+            }
+          }
           syncMessageActionAvailability()
           if (isCurrentRun || runtime.sessionId === state.sessionId) {
             notifySessionRead(runtime.sessionId)
@@ -14462,6 +16880,7 @@ async function drainQueue(runtime = currentRuntime()) {
     if (streamError) throw streamError
     if (!sawDone && !controller.signal.aborted) throw new Error('回答流意外中断，请重试')
   } catch (err) {
+    if (voiceStream) abortVoiceSpeechStream({ quiet: true })
     if (controller.signal.aborted) {
       turn.stop()
       if (messageId) {
@@ -14471,6 +16890,9 @@ async function drainQueue(runtime = currentRuntime()) {
     } else {
       turn.fail(`${err.message}${err.code ? `\n（${err.code}）` : ''}`, err.traceId ? `traceId ${err.traceId}` : '请求失败')
       if (messageId) state.localLiveMessageIds.delete(messageId)
+      if (item.voiceConversation && state.voiceConversation.active) {
+        setVoiceDockStatus('error', '这轮回答失败', '文字错误已保留；点“重试”重新开始语音对话')
+      }
     }
   } finally {
     runtime.sending = false
@@ -14560,6 +16982,8 @@ function showSettings() {
   persistChatLocation()
   renderSettingsProfile()
   renderChatSendModeSetting()
+  renderVoiceSettings()
+  void loadVoiceSettings()
 }
 
 function hideSettings() {
@@ -14591,6 +17015,37 @@ function bindSettings() {
   $('#settings-back').addEventListener('click', hideSettings)
   $('#settings-memories').addEventListener('click', showMemories)
   $('#settings-caps').addEventListener('click', showMyCaps)
+  $('#settings-wake-segment').addEventListener('click', async (event) => {
+    const button = event.target.closest?.('[data-wake-enabled]')
+    if (!button || button.disabled) return
+    const next = button.dataset.wakeEnabled === 'true'
+    if (next === state.wake.enabled && (next ? state.wake.active : !state.wake.active)) return
+    await setWakeEnabled(next)
+  })
+  $('#settings-voice').addEventListener('click', showVoiceSettings)
+  $('#settings-voice-segment').addEventListener('click', async (event) => {
+    const button = event.target.closest?.('[data-voice-enabled]')
+    if (!button) return
+    const next = button.dataset.voiceEnabled === 'true'
+    if (next === state.voiceSettings.enabled) return
+    const previous = state.voiceSettings.enabled
+    state.voiceSettings.enabled = next
+    renderVoiceSettings()
+    try {
+      const saved = await api('/api/me/voice', {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ enabled: next }),
+      })
+      state.voiceSettings = { ...state.voiceSettings, ...saved }
+      renderVoiceSettings()
+      banner(next ? '已开启语音回复' : '已关闭语音回复，语音对话仍会转成文字', 'ok')
+    } catch (err) {
+      state.voiceSettings.enabled = previous
+      renderVoiceSettings()
+      banner(err.message || '保存失败，请重试', 'bad')
+    }
+  })
   $('#settings-password').addEventListener('click', showPasswordModal)
   $('#settings-logout').addEventListener('click', logout)
   $('#settings-send-segment').addEventListener('click', async (event) => {
@@ -15595,6 +18050,12 @@ async function boot() {
     state.models = models.models
     state.autoModelId = models.autoModelId
     state.canChat = models.canChat && models.canUseModel
+    state.transcribeAvailable = Boolean(models.transcribe?.available)
+    state.speechAvailable = Boolean(models.speech?.available)
+    renderVoiceControls()
+    renderWakeSettings()
+    void loadVoiceSettings()
+    restoreWakePreference()
     if (!state.canChat) {
       renderDenied(new Error('当前账号没有对话 / 使用模型的权限（chat:use、model:use）'))
       endBoot('权限校验完成…')
@@ -15667,6 +18128,22 @@ async function boot() {
   })
   $('#queue-stop').addEventListener('click', stopCurrentReply)
   $('#queue-send').addEventListener('click', () => send())
+  $('#voice-mode')?.addEventListener('click', () => {
+    if (state.voiceConversation.active) exitVoiceConversation()
+    else void enterVoiceConversation()
+  })
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      if (!state.voiceConversation.active) stopWakeListener({ keepEnabled: true })
+      return
+    }
+    if (state.wake.enabled && !state.voiceConversation.active) scheduleWakeRestart(120)
+  })
+  window.addEventListener('pagehide', () => {
+    if (!state.voiceConversation.active) stopWakeListener({ keepEnabled: true })
+  })
+  $('#voice-dock-action')?.addEventListener('click', handleVoiceDockAction)
+  $('#voice-dock-exit')?.addEventListener('click', () => exitVoiceConversation())
   $('#input').addEventListener('keydown', (event) => {
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault()

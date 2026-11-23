@@ -302,6 +302,28 @@ export interface AgentTeamSettings {
   maxWorkers: number | null
 }
 
+/**
+ * 控制台配置的联网搜索端点。
+ *
+ * provider 为 null 表示没有控制台覆盖，继续读环境变量；searxngUrl 只存普通地址，
+ * 博查 / Tavily / Serper 的密钥按固定引用名写 secrets.json，页面只显示是否已配置。
+ */
+export interface WebSearchSettings {
+  provider: 'searxng' | 'bocha' | 'tavily' | 'serper' | 'none' | null
+  searxngUrl: string | null
+}
+
+/**
+ * 浏览器内网访问策略。
+ *
+ * 默认关闭；只有管理员打开开关并显式列出域名/IP 后，内置浏览器才允许访问这些内网目标。
+ * 公共域名不受 allowedHosts 限制，仍走正常公网校验。
+ */
+export interface BrowserNetworkSettings {
+  allowPrivateNetwork: boolean
+  allowedHosts: string[]
+}
+
 export interface ConsoleSettings extends NetworkSettings {
   /** 总存储位置；null 表示就用部署目录下的 .eab-dev */
   dataDir: string | null
@@ -329,6 +351,10 @@ export interface ConsoleSettings extends NetworkSettings {
   bootAnimation: BootAnimationSettings
   /** Agent 团队运行策略；控制台显式值优先于环境变量 */
   agentTeam: AgentTeamSettings
+  /** 联网搜索服务；控制台显式值优先于环境变量 */
+  webSearch: WebSearchSettings
+  /** 内置浏览器内网访问；默认关闭 */
+  browserNetwork: BrowserNetworkSettings
   lastCleanupAt: string | null
   lastCleanupStats: Record<string, number> | null
 }
@@ -351,6 +377,8 @@ const DEFAULTS: ConsoleSettings = {
   branding: BRANDING_DEFAULTS,
   bootAnimation: DEFAULT_BOOT_ANIMATION,
   agentTeam: { maxWorkers: null },
+  webSearch: { provider: null, searxngUrl: null },
+  browserNetwork: { allowPrivateNetwork: false, allowedHosts: [] },
   lastCleanupAt: null,
   lastCleanupStats: null,
   host: null,
@@ -367,6 +395,8 @@ function defaultSettings(): ConsoleSettings {
     branding: cloneBranding(BRANDING_DEFAULTS),
     bootAnimation: cloneBootAnimation(DEFAULT_BOOT_ANIMATION),
     agentTeam: { ...DEFAULTS.agentTeam },
+    webSearch: { ...DEFAULTS.webSearch },
+    browserNetwork: { ...DEFAULTS.browserNetwork, allowedHosts: [] },
   }
 }
 
@@ -382,6 +412,51 @@ function readAgentTeam(raw: unknown): AgentTeamSettings {
         : Number.isInteger(maxWorkers) && maxWorkers >= 1 && maxWorkers <= 32
           ? maxWorkers
           : null,
+  }
+}
+
+function readWebSearch(raw: unknown): WebSearchSettings {
+  const source = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {}
+  const provider = source.provider
+  const url = readText(source.searxngUrl)
+  let safeUrl: string | null = null
+  if (url) {
+    try {
+      const parsed = new URL(url)
+      if ((parsed.protocol === 'http:' || parsed.protocol === 'https:') && !parsed.username && !parsed.password) {
+        parsed.hash = ''
+        safeUrl = parsed.href
+      }
+    } catch {
+      safeUrl = null
+    }
+  }
+  return {
+    provider:
+      provider === 'searxng' || provider === 'bocha' || provider === 'tavily' || provider === 'serper' || provider === 'none'
+        ? provider
+        : null,
+    searxngUrl: safeUrl,
+  }
+}
+
+function readBrowserNetwork(raw: unknown): BrowserNetworkSettings {
+  const source = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {}
+  const rawHosts = Array.isArray(source.allowedHosts) ? source.allowedHosts : []
+  const allowedHosts = rawHosts
+    .map((item) => (typeof item === 'string' ? item.trim().toLowerCase() : ''))
+    .filter(
+      (item, index, list) =>
+        item.length > 0 &&
+        item.length <= 253 &&
+        !/[\/@?#\s]/.test(item) &&
+        list.indexOf(item) === index,
+    )
+    .slice(0, 200)
+  return {
+    // 开关只有在白名单非空时才真正生效；空名单等同于全部关闭，避免“一开全通”。
+    allowPrivateNetwork: source.allowPrivateNetwork === true && allowedHosts.length > 0,
+    allowedHosts,
   }
 }
 
@@ -526,6 +601,8 @@ export function readConsoleSettings(): ConsoleSettings {
       branding: readBranding(raw.branding),
       bootAnimation: readBootAnimation(raw.bootAnimation),
       agentTeam: readAgentTeam(raw.agentTeam),
+      webSearch: readWebSearch(raw.webSearch),
+      browserNetwork: readBrowserNetwork(raw.browserNetwork),
       lastCleanupAt: typeof raw.lastCleanupAt === 'string' ? raw.lastCleanupAt : null,
       lastCleanupStats: raw.lastCleanupStats && typeof raw.lastCleanupStats === 'object' ? raw.lastCleanupStats : null,
       host: readText(raw.host),
@@ -555,6 +632,13 @@ export function writeConsoleSettings(patch: Partial<ConsoleSettings>): ConsoleSe
   }
   if (patch.pendingMigrations) next.pendingMigrations = patch.pendingMigrations
   if (patch.agentTeam) next.agentTeam = { ...current.agentTeam, ...patch.agentTeam }
+  if (patch.webSearch) next.webSearch = { ...current.webSearch, ...patch.webSearch }
+  if (patch.browserNetwork) {
+    next.browserNetwork = {
+      allowPrivateNetwork: patch.browserNetwork.allowPrivateNetwork,
+      allowedHosts: [...patch.browserNetwork.allowedHosts],
+    }
+  }
   const file = settingsPath()
   mkdirSync(dirname(file), { recursive: true })
   const tmp = `${file}.tmp`

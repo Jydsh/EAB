@@ -39,6 +39,14 @@ import {
   effectiveAgentTeamSettings,
   normalizeAgentMaxWorkers,
 } from '../agent-team-settings.js'
+import { listAgentCards } from '../agent-capability-registry.js'
+import {
+  probeWebSearch,
+  saveWebSearchSettings,
+  webSearchSettingsView,
+} from '../web-search-config.js'
+import { browserStatus } from '../browser-session.js'
+import { browserNetworkSettingsView, saveBrowserNetworkSettings } from '../browser-network-config.js'
 
 function requireConsole(req: FastifyRequest, deps: ServerDeps): void {
   if (!isConsoleRequest(req, deps.config)) {
@@ -405,6 +413,17 @@ export function registerSettingsRoutes(app: FastifyInstance, deps: ServerDeps): 
     return ok({ branding: readConsoleSettings().branding })
   })
 
+  // 数据连接页只需要搜索/浏览器这三个只读视图；单独返回，避免把系统设置整体
+  // 暴露给只有「数据连接」页权限的成员。
+  app.get('/api/console/settings/web-services', async (req) => {
+    requireConsole(req, deps)
+    return ok({
+      webSearch: webSearchSettingsView(deps.config.dbPath),
+      browser: browserStatus(),
+      browserNetwork: browserNetworkSettingsView(),
+    })
+  })
+
   app.get('/api/console/settings', async (req) => {
     requireConsole(req, deps)
     const settings = readConsoleSettings()
@@ -426,6 +445,10 @@ export function registerSettingsRoutes(app: FastifyInstance, deps: ServerDeps): 
       auditRetentionDays: settings.auditRetentionDays,
       agentRetentionDays: settings.agentRetentionDays,
       agentTeam: agentTeamSettingsView(deps.config),
+      agentCards: listAgentCards(deps.db, deps.companyId),
+      webSearch: webSearchSettingsView(deps.config.dbPath),
+      browser: browserStatus(),
+      browserNetwork: browserNetworkSettingsView(),
       recordRetentionDays: settings.recordRetentionDays,
       workspaceRecycleDays: settings.workspaceRecycleDays,
       kbTestRetentionDays: settings.kbTestRetentionDays,
@@ -591,6 +614,79 @@ export function registerSettingsRoutes(app: FastifyInstance, deps: ServerDeps): 
       applied: true,
       scope: 'global',
     })
+  })
+
+  app.put<{
+    Body: {
+      provider?: unknown
+      searxngUrl?: unknown
+      keys?: Record<string, unknown>
+    }
+  }>('/api/console/settings/web-search', async (req) => {
+    requireConsole(req, deps)
+    const before = webSearchSettingsView(deps.config.dbPath)
+    const body = req.body ?? {}
+    const keys =
+      body.keys && typeof body.keys === 'object' && !Array.isArray(body.keys)
+        ? (body.keys as Record<string, unknown>)
+        : {}
+    const after = saveWebSearchSettings(deps.config.dbPath, {
+      provider: body.provider,
+      searxngUrl: body.searxngUrl,
+      keys: {
+        ...(keys.bocha !== undefined ? { bocha: keys.bocha } : {}),
+        ...(keys.tavily !== undefined ? { tavily: keys.tavily } : {}),
+        ...(keys.serper !== undefined ? { serper: keys.serper } : {}),
+      },
+    })
+    audit(deps, req, 'ops.settings.web-search', {
+      before: {
+        provider: before.provider,
+        configured: before.configured,
+        providerSource: before.providerSource,
+      },
+      after: {
+        provider: after.provider,
+        configured: after.configured,
+        configuredProvider: after.configuredProvider,
+        searxngUrl: after.searxngUrl,
+        keys: after.keys,
+      },
+    })
+    return ok({ webSearch: after, applied: true })
+  })
+
+  app.put<{
+    Body: {
+      allowPrivateNetwork?: unknown
+      allowedHosts?: unknown
+    }
+  }>('/api/console/settings/browser-network', async (req) => {
+    requireConsole(req, deps)
+    const before = browserNetworkSettingsView()
+    const after = saveBrowserNetworkSettings({
+      allowPrivateNetwork: req.body?.allowPrivateNetwork,
+      allowedHosts: req.body?.allowedHosts,
+    })
+    audit(deps, req, 'ops.settings.browser-network', {
+      before: { enabled: before.enabled, hosts: before.allowedHosts },
+      after: { enabled: after.enabled, hosts: after.allowedHosts },
+    })
+    return ok({ browserNetwork: after, applied: true })
+  })
+
+  app.post('/api/console/settings/web-search/test', async (req) => {
+    requireConsole(req, deps)
+    const result = await probeWebSearch(deps.config.dbPath)
+    audit(deps, req, 'ops.settings.web-search.test', {
+      provider: result.provider,
+      configured: result.configured,
+      ok: result.ok,
+      latencyMs: result.latencyMs,
+      results: result.results.length,
+      error: result.error,
+    })
+    return ok(result)
   })
 
   app.post('/api/console/settings/retention/run', async (req) => {

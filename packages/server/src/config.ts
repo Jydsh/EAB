@@ -108,6 +108,8 @@ export interface ServerConfig {
   readonly pluginToolMaxConcurrent?: number
   /** 插件工具执行超时毫秒；默认 60 秒 */
   readonly pluginToolTimeoutMs?: number
+  /** MCP 工具执行超时毫秒；默认 30 秒 */
+  readonly mcpToolTimeoutMs?: number
   /** 一次 agent.spawn 最多并行几个子 Agent；默认 4 */
   readonly agentMaxParallel?: number
   /** 子 Agent 最大嵌套深度（根为 0）；默认 2 */
@@ -339,6 +341,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     toolTimeoutMs: readInt(env.EAB_TOOL_TIMEOUT_MS, 30_000, 'EAB_TOOL_TIMEOUT_MS'),
     pluginToolMaxConcurrent: readInt(env.EAB_PLUGIN_TOOL_MAX_CONCURRENT, 4, 'EAB_PLUGIN_TOOL_MAX_CONCURRENT'),
     pluginToolTimeoutMs: readInt(env.EAB_PLUGIN_TOOL_TIMEOUT_MS, 60_000, 'EAB_PLUGIN_TOOL_TIMEOUT_MS'),
+    mcpToolTimeoutMs: readInt(env.EAB_MCP_TOOL_TIMEOUT_MS, 30_000, 'EAB_MCP_TOOL_TIMEOUT_MS'),
     agentMaxParallel: readInt(env.EAB_AGENT_MAX_PARALLEL, 4, 'EAB_AGENT_MAX_PARALLEL'),
     agentMaxDepth: readInt(env.EAB_AGENT_MAX_DEPTH, 2, 'EAB_AGENT_MAX_DEPTH'),
     agentMaxRetries: readInt(env.EAB_AGENT_MAX_RETRIES, 3, 'EAB_AGENT_MAX_RETRIES'),

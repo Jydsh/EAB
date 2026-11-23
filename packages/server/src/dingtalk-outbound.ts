@@ -44,6 +44,12 @@ export interface DingTalkFileSendResult {
   readonly mediaType: 'file' | 'image'
 }
 
+export interface DingTalkVoiceSendResult {
+  readonly mediaId: string
+  readonly externalUserId: string
+  readonly durationMs: number
+}
+
 function outboundConfig(deps: ServerDeps, companyId: string): DingTalkOutboundConfig {
   const row = deps.db
     .prepare(
@@ -106,7 +112,7 @@ function isImage(fileName: string, mime: string | null): boolean {
 
 async function uploadMedia(
   token: string,
-  input: { fileName: string; mime: string | null; buffer: Buffer; mediaType: 'file' | 'image' },
+  input: { fileName: string; mime: string | null; buffer: Buffer; mediaType: 'file' | 'image' | 'voice' },
 ): Promise<string> {
   const form = new FormData()
   form.append('type', input.mediaType)
@@ -325,4 +331,35 @@ export async function sendDingTalkFileToUser(
   }
 
   return { mediaId, externalUserId, fileName, fileType, mediaType }
+}
+
+/**
+ * 把已经转成 OGG/Opus 的语音发成钉钉原生语音气泡。
+ * 钉钉要求 media/upload 的 type=voice，发送模板用 sampleAudio。
+ */
+export async function sendDingTalkVoiceToUser(
+  deps: ServerDeps,
+  input: { companyId: string; userId: string; buffer: Buffer; mime: string; durationMs: number; fileName?: string },
+): Promise<DingTalkVoiceSendResult> {
+  const mime = String(input.mime || '').toLowerCase()
+  if (!mime.includes('audio/ogg') && !mime.includes('audio/amr')) {
+    throw new EabError(EC.VALIDATION, '钉钉语音只支持 OGG 或 AMR 格式', { details: { mime: input.mime } })
+  }
+  const durationMs = Math.max(1000, Math.round(Number(input.durationMs) || 0))
+  const config = outboundConfig(deps, input.companyId)
+  const externalUserId = externalUserIdOf(deps, input.companyId, input.userId)
+  const token = await dingTalkAccessToken(config.appId, config.secret)
+  const mediaId = await uploadMedia(token, {
+    fileName: input.fileName || (mime.includes('amr') ? 'EAB语音.amr' : 'EAB语音.ogg'),
+    mime,
+    buffer: input.buffer,
+    mediaType: 'voice',
+  })
+  await batchSendMessage(token, {
+    robotCode: config.robotCode,
+    externalUserId,
+    msgKey: 'sampleAudio',
+    msgParam: { mediaId, duration: String(durationMs) },
+  })
+  return { mediaId, externalUserId, durationMs }
 }
