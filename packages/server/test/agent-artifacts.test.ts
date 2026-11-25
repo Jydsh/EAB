@@ -95,7 +95,29 @@ describe('Agent 产物登记', () => {
     expect(team.listArtifacts(taskId)).toHaveLength(1)
   })
 
-  it('外部 uri 只存元数据，按协议识别 source', async () => {
+  it('外部 uri 只存元数据，并生成稳定引用指纹和可读预览', async () => {
+    const withoutPreview = await publishAgentArtifact({
+      db,
+      team,
+      taskId,
+      companyId: 'c1',
+      userId: 'u1',
+      workspaceRoot: root,
+      uri: 'a2a://travel-agent/tasks/42/artifacts/plan',
+      name: '东京行程单.pdf',
+      mimeType: 'application/pdf',
+    })
+    expect(withoutPreview).toMatchObject({
+      name: '东京行程单.pdf',
+      source: 'a2a',
+      uri: 'a2a://travel-agent/tasks/42/artifacts/plan',
+      size: 0,
+      mimeType: 'application/pdf',
+    })
+    expect(withoutPreview.checksum).toMatch(/^ref-sha256:/)
+    expect(withoutPreview.preview).toContain('外部产物：东京行程单.pdf')
+    expect(withoutPreview.preview).toContain('application/pdf')
+
     const artifact = await publishAgentArtifact({
       db,
       team,
@@ -112,7 +134,38 @@ describe('Agent 产物登记', () => {
       source: 'a2a',
       uri: 'a2a://travel-agent/tasks/42/artifacts/plan',
       size: 0,
+      preview: '三天两晚',
     })
+    expect(artifact.checksum).toMatch(/^ref-sha256:/)
+  })
+
+  it('不传 preview 时，文本文件自动截取开头，二进制文件生成元数据摘要', async () => {
+    const text = await publishAgentArtifact({
+      db,
+      team,
+      taskId,
+      companyId: 'c1',
+      userId: 'u1',
+      workspaceRoot: root,
+      path: 'reports/巡检周报.md',
+    })
+    expect(text.preview).toContain('巡检周报')
+    expect(text.preview).toContain('本周正常')
+
+    writeFileSync(join(root, 'reports', '照片.pdf'), Buffer.from([0x25, 0x50, 0x44, 0x46, 0x00, 0x01, 0x02]))
+    const binary = await publishAgentArtifact({
+      db,
+      team,
+      taskId,
+      companyId: 'c1',
+      userId: 'u1',
+      workspaceRoot: root,
+      path: 'reports/照片.pdf',
+    })
+    expect(binary.mimeType).toBe('application/pdf')
+    expect(binary.preview).toContain('文件：照片.pdf')
+    expect(binary.preview).toContain('application/pdf')
+    expect(binary.preview).toContain('B')
   })
 
   it('拒绝越界路径、别人的 fileId 和已结束任务', async () => {

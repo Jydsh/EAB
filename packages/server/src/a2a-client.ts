@@ -8,7 +8,7 @@
  *
  * 端点来自公司级登记，不由模型直接提供；鉴权头只在请求时解析，不进入错误和审计。
  */
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { EC, EabError } from '@eab/domain'
 
 const DEFAULT_TIMEOUT_MS = 30_000
@@ -557,8 +557,16 @@ export function summarizeA2ATask(task: A2ATask): {
     .trim() ?? ''
   const artifacts: ReturnType<typeof summarizeA2ATask>['artifacts'] = []
   const parts: string[] = []
+  const sizeLabel = (size: number): string => {
+    if (!Number.isFinite(size) || size <= 0) return '大小未知'
+    if (size < 1024) return `${size} B`
+    if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`
+    return `${(size / (1024 * 1024)).toFixed(1)} MB`
+  }
+  const referenceDigest = (uri: string, name: string, mimeType: string): string =>
+    `ref-sha256:${createHash('sha256').update(`${task.id}\n${uri}\n${name}\n${mimeType}`).digest('hex')}`
   for (const artifact of task.artifacts) {
-    for (const part of artifact.parts) {
+    for (const [index, part] of artifact.parts.entries()) {
       if (part.kind === 'text') {
         parts.push(part.text)
         continue
@@ -567,22 +575,51 @@ export function summarizeA2ATask(task: A2ATask): {
         parts.push(JSON.stringify(part.data))
         continue
       }
-      if (part.kind === 'file' && part.file.uri) {
-        artifacts.push({
-          id: artifact.artifactId,
-          name: artifact.name || part.file.name || artifact.artifactId,
-          mimeType: part.file.mimeType ?? '',
-          size: 0,
-          checksum: '',
-          source: 'a2a',
-          uri: part.file.uri,
-          preview: part.file.name ? `A2A 文件：${part.file.name}` : undefined,
-        })
-        continue
+      if (part.kind !== 'file') continue
+      const name = artifact.name || part.file.name || artifact.artifactId
+      const mimeType = part.file.mimeType || 'application/octet-stream'
+      const uri = part.file.uri ||
+        `a2a:artifact/${encodeURIComponent(task.id)}/${encodeURIComponent(artifact.artifactId)}/${index}`
+      let size = 0
+      let checksum = ''
+      let contentPreview = ''
+      if (part.file.bytes) {
+        try {
+          const buffer = Buffer.from(part.file.bytes, 'base64')
+          if (buffer.length > 0) {
+            size = buffer.length
+            checksum = `sha256:${createHash('sha256').update(buffer).digest('hex')}`
+            if (/^text\//i.test(mimeType) || /(?:json|xml|csv|markdown|yaml)/i.test(mimeType)) {
+              contentPreview = buffer.subarray(0, Math.min(512, buffer.length)).toString('utf8')
+                .replace(/^\uFEFF/, '')
+                .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '')
+                .replace(/\s+/g, ' ')
+                .trim()
+                .slice(0, 240)
+            }
+          }
+        } catch {
+          // 坏 base64 不阻断任务摘要，退化为引用指纹。
+        }
       }
-      if (part.kind === 'file' && part.file.name) {
-        parts.push(`[远端文件：${part.file.name}${part.file.mimeType ? `（${part.file.mimeType}）` : ''}，未提供下载地址]`)
-      }
+      if (!checksum) checksum = referenceDigest(uri, name, mimeType)
+      const location = part.file.uri
+        ? '有下载地址'
+        : part.file.bytes
+          ? '内联内容'
+          : '未提供下载地址'
+      artifacts.push({
+        id: artifact.parts.length > 1 ? `${artifact.artifactId}:${index}` : artifact.artifactId,
+        name,
+        mimeType,
+        size,
+        checksum,
+        source: 'a2a',
+        uri,
+        preview: contentPreview
+          ? `${name}（${mimeType}，${sizeLabel(size)}）：${contentPreview}`
+          : `A2A 文件：${name}（${mimeType}，${sizeLabel(size)}，${location}）`,
+      })
     }
   }
   const resultText = [statusText, ...parts].filter(Boolean).join('\n').trim().slice(0, 8_000)

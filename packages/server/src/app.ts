@@ -35,6 +35,7 @@ import { registerAuthRoutes } from './routes/auth.js'
 import { registerBootRoutes } from './routes/boot.js'
 import { registerChannelRoutes } from './routes/channel.js'
 import { registerChatRoutes } from './routes/chat.js'
+import { registerContentRoutes } from './routes/content.js'
 import { registerConsoleRoutes } from './routes/console.js'
 import { registerConsoleDatabaseRoutes } from './routes/console-databases.js'
 import { registerConsoleMcpRoutes } from './routes/console-mcp.js'
@@ -109,7 +110,7 @@ function isPath(path: string, prefixes: string[]): boolean {
 function installSurfaceGuard(app: FastifyInstance, surface: AppSurface): void {
   if (surface === 'all') return
   const consoleOnly = ['/admin', '/admin.html', '/app.js', '/api/console']
-  const chatOnly = ['/chat', '/chat.html', '/chat.js', '/chat.css', '/api/chat', '/api/memories', '/api/workspace', '/api/schedules', '/api/auth']
+  const chatOnly = ['/chat', '/chat.html', '/chat.js', '/chat.css', '/api/chat', '/api/content', '/api/memories', '/api/workspace', '/api/schedules', '/api/auth']
   app.addHook('onRequest', async (req, reply) => {
     const path = (req.raw.url ?? '').split('?')[0] ?? ''
     if (surface === 'chat' && isPath(path, consoleOnly)) {
@@ -353,6 +354,16 @@ export function buildApp(deps: ServerDeps, surface: AppSurface = 'all'): Fastify
   // 两端共用的启动层样式与控制器；只含视觉与状态机，不暴露配置或管理能力。
   app.get('/boot-splash.css', async (_req, reply) => servePublic('boot-splash.css', reply))
   app.get('/boot-splash.js', async (_req, reply) => servePublic('boot-splash.js', reply))
+  // 两端共用的动效语言：token、组件协议与按需运行时。
+  app.get('/ui-motion.css', async (_req, reply) => servePublic('ui-motion.css', reply))
+  app.get('/ui-motion.js', async (_req, reply) => servePublic('ui-motion.js', reply))
+  app.get('/ui-motion-lab.html', async (_req, reply) => servePublic('ui-motion-lab.html', reply))
+  app.get('/ui-motion-lab.css', async (_req, reply) => servePublic('ui-motion-lab.css', reply))
+  // 两端共用的浮层语言：Toast 语气/暂停态与锚定 Popconfirm。
+  app.get('/ui-overlay.css', async (_req, reply) => servePublic('ui-overlay.css', reply))
+  app.get('/ui-overlay.js', async (_req, reply) => servePublic('ui-overlay.js', reply))
+  app.get('/ui-overlay-lab.html', async (_req, reply) => servePublic('ui-overlay-lab.html', reply))
+  app.get('/ui-overlay-lab.css', async (_req, reply) => servePublic('ui-overlay-lab.css', reply))
 
   // ---- 页面 ----
   /**
@@ -465,6 +476,7 @@ export function buildApp(deps: ServerDeps, surface: AppSurface = 'all'): Fastify
   registerPermissionRoutes(app, deps)
   registerKbRoutes(app, deps)
   registerChatRoutes(app, runtimeDeps)
+  if (surface !== 'console') registerContentRoutes(app, runtimeDeps)
   registerMemoryRoutes(app, deps)
   registerPluginRoutes(app, deps)
   registerSkillRoutes(app, deps)

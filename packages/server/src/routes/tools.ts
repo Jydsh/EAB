@@ -24,6 +24,16 @@ import { KeyedMutex, KeyedSemaphore, LockAbortedError, LockTimeoutError, Semapho
 import { acquireCoordinationSlot, coordinationStatus, readCapacityCount } from '../backends/coordination.js'
 import { beginToolInflight } from '../tool-inflight.js'
 import {
+  ensureToolApproval,
+  requiresToolApprovalForArgs,
+  toolApprovalPolicy,
+  toolRisk,
+  type ToolApprovalMode,
+  type ToolApprovalPolicy,
+  type ToolApprovalRequest,
+  type ToolRisk,
+} from '../tool-approval.js'
+import {
   beginToolOperation,
   completeToolOperation,
   failToolOperation,
@@ -64,7 +74,26 @@ import { assertWebToolRateLimit, type WebToolId } from '../web-rate-limit.js'
 import { browserStatus, executeBrowserAction, type BrowserAction } from '../browser-session.js'
 import { browserNetworkSettingsView } from '../browser-network-config.js'
 import { publishAgentArtifact } from '../agent-artifacts.js'
+import {
+  AGENT_PLAN_MAX_STEPS,
+  updateAgentPlanStep,
+  writeAgentPlan,
+  type AgentPlanStepInput,
+  type AgentPlanStepStatus,
+} from '../agent-plan.js'
 import type { AgentTeamStore } from '../agent-team.js'
+import {
+  MEMORY_TYPE_LABELS,
+  embedMemoryRow,
+  findMemoryDuplicateOrConflict,
+  findStructuredFactConflict,
+  memoryLooksSensitive,
+  memoryStatus,
+  normalizeFactKey,
+  normalizeMemoryType,
+  type MemoryType,
+} from '../memory-os.js'
+import { memoryAutoConfirmEnabled, personalMemoryAutoActivates, structuredFactFromContent } from '../memory-extractor.js'
 import { DINGTALK_OUTBOUND_FILE_LIMIT_BYTES, sendDingTalkFileToUser } from '../dingtalk-outbound.js'
 import { sendDingTalkFileToConversation, uploadFileToUserDrive } from '../dingtalk-drive.js'
 import {
@@ -96,6 +125,7 @@ import {
   workspaceFolderSummaries,
   type WorkspaceTextEdit,
 } from './workspace.js'
+import { generateImageToWorkspace } from './content.js'
 import { countTextLines, readTextFileRange, searchWorkspaceText, type TextRangeResult, type TextSearchResult } from '../workspace-text.js'
 import { saveTextBatch } from '../batch-results.js'
 import { analyzeWorkspaceFile } from '../workspace-analyze.js'
@@ -103,6 +133,8 @@ import {
   assertProjectExecEnabled,
   killProjectJob,
   listProjectJobs,
+  parseProjectCommandAllowlist,
+  projectSandboxCapability,
   readProjectJob,
   resolveProjectExecMode,
   runProjectCommand,
@@ -156,6 +188,13 @@ export interface ToolDef {
   input: Record<string, Omit<ToolParameterSchema, 'required'> & { required?: boolean }>
   /** 并发属性：read 只读；write 按资源键互斥；exclusive 全局/公司级互斥。默认 read */
   concurrency?: 'read' | 'write' | 'exclusive'
+  /**
+   * 风险分级。不填时按 id / dangerous / concurrency 推导：
+   * project.exec 等为 exec，删除/发消息/改密码为 irreversible，普通写入为 write。
+   */
+  risk?: ToolRisk
+  /** 显式覆盖审批策略；高危工具默认 always，普通工具 never。 */
+  approval?: ToolApprovalPolicy
   /** 互斥资源键；返回 null 表示该次调用不需要加锁 */
   lockKey?: (
     deps: ServerDeps,
@@ -189,6 +228,18 @@ export interface ToolExecutionContext {
   agentTaskId?: string
   /** 当前会话的团队存储；产物登记和 trace 归属都从这里取 */
   agentTeam?: AgentTeamStore
+  /**
+   * 工具审批模式：
+   * wait=网页聊天，生成待办后推送卡片并等待；defer=返回待办 id；
+   * bypass=已由入口完成权限校验的内部路径。默认 defer（测试环境为 bypass）。
+   */
+  approval?: ToolApprovalMode
+  /** 直接工具 API 在管理员审批后带回的审批 id。 */
+  approvalId?: string
+  /** 当前 assistant 消息 id；审批卡片用它定位聊天气泡。 */
+  messageId?: string
+  /** 审批待办产生时回调，聊天入口用它发布 SSE。 */
+  onApprovalPending?: (request: ToolApprovalRequest) => void
 }
 
 /**
@@ -580,6 +631,79 @@ export const TOOLS: readonly ToolDef[] = [
     },
   },
   {
+    id: 'plan.write',
+    name: '写任务计划',
+    description:
+      '复杂任务先写一份可跟踪的计划，最多 7 步，一步一个可验收动作。第一次调用省略 planKey 即创建；执行中要改计划时传上次返回的 planKey，系统会保留旧版本并生成新版本。单步问答、简单查询、单个小文件读写不要调用。',
+    scope: SC.AGENT_TOOL_INVOKE,
+    dangerous: false,
+    concurrency: 'write',
+    lockKey: (_deps, actor, args) => `plan:${actor.subject.companyId}:${String(args.planKey ?? 'new').slice(0, 64)}`,
+    input: {
+      planKey: {
+        type: 'string',
+        description: '可选。改写已有计划时传上次返回的 planKey；新计划留空',
+      },
+      title: {
+        type: 'string',
+        description: '计划标题，例如“核对本月加班并出表”；最多 120 字',
+      },
+      steps: {
+        type: 'array',
+        description: `步骤数组，1–${AGENT_PLAN_MAX_STEPS} 项；每项含 title，可选 detail、owner、status`,
+        required: true,
+        minItems: 1,
+        maxItems: AGENT_PLAN_MAX_STEPS,
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            title: { type: 'string', description: '这一步做什么，动词开头，最多 120 字' },
+            detail: { type: 'string', description: '可选补充：输入、约束或验收标准' },
+            owner: { type: 'string', description: '可选：负责的 Agent 角色或团队 key' },
+            status: {
+              type: 'string',
+              description: '可选：初始状态，默认 pending',
+              enum: ['pending', 'running', 'done', 'failed', 'skipped'],
+            },
+          },
+          required: ['title'],
+        },
+      },
+    },
+  },
+  {
+    id: 'plan.step',
+    name: '更新计划步骤',
+    description:
+      '执行中更新某一步的状态。每完成、失败或跳过一步就更新，不要都留到最后补。planKey 用 plan_write 返回的值，seq 从 1 开始；状态只允许 pending / running / done / failed / skipped，note 写一句结果或失败原因。',
+    scope: SC.AGENT_TOOL_INVOKE,
+    dangerous: false,
+    concurrency: 'write',
+    lockKey: (_deps, actor, args) => `plan:${actor.subject.companyId}:${String(args.planKey ?? 'latest').slice(0, 64)}`,
+    input: {
+      planKey: {
+        type: 'string',
+        description: '可选。默认取当前会话最新计划；多计划并存时传 plan_write 返回的 planKey',
+      },
+      seq: {
+        type: 'number',
+        description: '要更新的步骤序号，从 1 开始',
+        required: true,
+      },
+      status: {
+        type: 'string',
+        description: '新状态',
+        required: true,
+        enum: ['pending', 'running', 'done', 'failed', 'skipped'],
+      },
+      note: {
+        type: 'string',
+        description: '可选：一句结果摘要或失败原因，最多 500 字',
+      },
+    },
+  },
+  {
     id: 'agent.spawn',
     name: '并行子 Agent',
     description:
@@ -590,7 +714,7 @@ export const TOOLS: readonly ToolDef[] = [
     input: {
       tasks: {
         type: 'string',
-        description: 'JSON 数组字符串；每项必填 prompt（目标/输入/约束/验收，≤150 字），可选 key、role（producer/critic/researcher/builder/worker）、title、parentKey、acceptance、pinned、modelId、retries',
+        description: 'JSON 数组字符串；每项必填 prompt（目标/输入/约束/验收，≤150 字），可选 key、role（producer/critic/researcher/builder/worker）、title、parentKey、acceptance、pinned、modelId、retries、budget（{maxTokens,maxDurationMs,maxRounds}，只能收紧岗位卡上限）',
         required: true,
       },
       background: {
@@ -629,7 +753,37 @@ export const TOOLS: readonly ToolDef[] = [
       fileId: { type: 'string', description: '个人云空间文件 id；与 path、uri 三选一' },
       uri: { type: 'string', description: '外部产物 uri，支持 mcp: / a2a: / https: / http: / eab:；与 path、fileId 三选一' },
       name: { type: 'string', description: '展示名称；用 uri 登记时必填，文件可省略并用真实文件名' },
-      preview: { type: 'string', description: '可选：一句交付摘要，最多 500 字' },
+      mimeType: { type: 'string', description: '可选：外部 uri 的媒体类型；不传时按文件扩展名推断，仍未知则记为 text/uri-list' },
+      preview: { type: 'string', description: '可选：交付摘要，最多 500 字；不传时文本文件自动截取开头、二进制文件自动生成元数据摘要' },
+    },
+  },
+  {
+    id: 'review.verdict',
+    name: '提交独立验收结论',
+    description:
+      '独立验收员专用。读完实现员交付和真实证据后，用本工具提交 approve 或 reject；只有 approve 且证据充分，任务状态机才会把实现任务标记成功。不要用正文口头通过代替本工具。',
+    scope: SC.AGENT_TOOL_INVOKE,
+    dangerous: false,
+    concurrency: 'write',
+    input: {
+      verdict: {
+        type: 'string',
+        description: 'approve=验收通过；reject=验收不通过，必须说明缺口',
+        required: true,
+      },
+      reason: {
+        type: 'string',
+        description: '通过或不通过的关键依据，最多 2000 字',
+        required: true,
+      },
+      evidence: {
+        type: 'array',
+        description: '实际检查过的证据，至少 1 条；每项写清命令、文件路径或测试结果',
+        required: true,
+        minItems: 1,
+        maxItems: 8,
+        items: { type: 'string', description: '一条具体证据，最多 600 字' },
+      },
     },
   },
   {
@@ -810,14 +964,20 @@ export const TOOLS: readonly ToolDef[] = [
     id: 'math.eval',
     name: '计算与汇总',
     description:
-      '做四则运算，或对一组数字求和、平均、最小值、最大值。凡是回答里要出现“合计/总计/平均/共多少小时/共多少钱”，必须把每一项原值按顺序放进 values 再调用本工具，禁止心算或先四舍五入；只有单个算式时才用 expression。values 支持数字和“H:MM”“10.3”“10.3小时”这类字符串，时长按小时计算。',
+      '做四则运算，或对一组数字求和、平均、最小值、最大值。凡是回答里要出现“合计/总计/平均/共多少小时/共多少钱”，必须把每一项原值按顺序放进 values 再调用本工具，禁止心算或先四舍五入；只有单个算式时才用 expression。values 至少 3 项，两项数字的运算（如 总时长/人数）必须用 expression。values 只收一维数组，元素必须是数字或数字字符串（如 10.3、“10.3小时”、“10:18”）；不要传 [{label,value}] 这类带标签的对象数组，分组标签留在图表数据里，不要塞进 values。',
     scope: SC.AGENT_TOOL_INVOKE,
     dangerous: false,
     input: {
       expression: { type: 'string', description: '单个算式，例如 (1200+300)/4' },
       values: {
         type: 'array',
-        description: '要汇总的一组数值，例如 [10.3, 7.75, 11, 11.4]；时长可写 10.3、10.3小时 或 10:18',
+        description: '要汇总的一维数值数组，例如 [10.3, 7.75, 11, 11.4]；时长可写 10.3、10.3小时 或 10:18。不要传 {label,value} 对象',
+        items: {
+          type: 'string',
+          description: '单个数字或时长字符串，例如 10.3、10.3小时、10:18；不要对象',
+        },
+        minItems: 3,
+        maxItems: 500,
       },
     },
   },
@@ -855,16 +1015,46 @@ export const TOOLS: readonly ToolDef[] = [
   },
   {
     id: 'memory.propose',
-    name: '提交团队学习',
+    name: '记住偏好或团队规则',
     description:
-      '成员在对话里明确说“以后都这样/让团队也按这个规则/把这条经验分享给大家/记住这个规范”时，把可复用的规则提炼成一条不超过 1000 字的团队记忆候选，提交给管理员审核。审核通过后会自动进入全公司所有成员的对话上下文，实现跨成员学习扩散。只提交提炼后的规则，不要提交原始聊天、密码、手机号、身份证号、客户隐私或一次性任务内容。',
+      '把用户明确表达的长期记忆提炼成候选。用户说“记住我的偏好/以后给我这样回复/我习惯用这个格式”时，scopeType=user，写当前成员的个人记忆，高置信且不冲突会直接生效，不需要用户再去设置里确认，也不会共享给团队；只有与旧记忆冲突时才停下等本人确认。用户说“让团队都按这个规则/把这条经验分享给大家/记住这个规范”时，scopeType=company，提交管理员审核，通过后进入全公司上下文。只提交提炼后的规则，不要提交原始聊天、密码、手机号、身份证号、客户隐私或一次性任务内容。',
     scope: SC.MEMORY_WRITE,
     dangerous: false,
     input: {
       content: {
         type: 'string',
-        description: '提炼后的可复用规则或经验，一句话到一小段，最多 1000 字',
+        description: '提炼后的可复用偏好、事实、规则或经验，一句话到一小段，最多 1000 字',
         required: true,
+      },
+      scopeType: {
+        type: 'string',
+        enum: ['user', 'company'],
+        description: '记忆范围：user 只记到当前用户个人记忆，需本人确认；company 作为团队规则候选，需管理员确认。用户说“记住我/以后给我”用 user，说“让团队/大家”用 company',
+      },
+      memoryType: {
+        type: 'string',
+        enum: ['preference', 'fact', 'decision', 'episode'],
+        description: '记忆类型：preference 偏好、fact 事实、decision 决策/口径、episode 一次任务情景；个人记忆默认 preference，团队规则默认 decision',
+      },
+      factKey: {
+        type: 'string',
+        description: '稳定事实键，仅当 memoryType=fact 时使用，例如 user.name、user.fear、project.eab.owner。同一范围同一 factKey 只保留一条有效事实；不同值会进入冲突确认，不静默覆盖',
+      },
+      subject: {
+        type: 'string',
+        description: '事实主语，例如“我”“张三”“EAB 项目”，最多 80 字',
+      },
+      predicate: {
+        type: 'string',
+        description: '事实谓词/属性，例如“姓名”“害怕”“负责人”，最多 80 字',
+      },
+      object: {
+        type: 'string',
+        description: '事实值，例如“小张”“狗”，最多 200 字；与 content 一起写入',
+      },
+      confidence: {
+        type: 'number',
+        description: '置信度 0–1；用户亲口明确说的事实用 0.95–1，模型推断不要提交',
       },
     },
   },
@@ -885,6 +1075,19 @@ export const TOOLS: readonly ToolDef[] = [
     scope: SC.WORKSPACE_READ,
     dangerous: false,
     input: {},
+  },
+  {
+    id: 'content.generate_image',
+    name: '生成图片',
+    description:
+      '按文字描述生成一张图片并保存到个人云空间，返回文件名、大小和下载地址。仅当用户明确要求画图、生成图片、做海报/插画/配图/头像时才调用；不要在普通问答、数据整理或文档写作中主动配图。生成不进入对话主链路，也不会把图片塞进模型上下文。支持 PNG/JPEG/WEBP/GIF。',
+    scope: SC.WORKSPACE_WRITE,
+    dangerous: false,
+    concurrency: 'write',
+    input: {
+      prompt: { type: 'string', description: '图片描述，写清主体、风格、构图、配色和需要的文字', required: true },
+      size: { type: 'string', description: '可选尺寸，格式 宽x高，例如 1024x1024、1024x1536；不填由模型默认' },
+    },
   },
   {
     id: 'workspace.write',
@@ -976,9 +1179,11 @@ export const TOOLS: readonly ToolDef[] = [
     id: 'project.exec',
     name: '执行项目命令',
     description:
-      '在项目工作区执行一条 shell 命令，和 DSH 的 bash 工具一样每次调用都是全新 shell，不保留 cd 或环境变量。cwd 是相对项目工作区的目录，不能跳出工作区；默认 120 秒、最多 600 秒，超时会杀整个进程树。返回 stdout、stderr、exitCode、timedOut、durationMs；非零退出是结果而不是工具错误。输出各保留 64 KB 尾部，超出时完整输出保存为文本批次并返回 batchId。npm install、构建、测试、启动 dev server 等长命令用 runInBackground=true，然后 project.job 查看或终止。Windows 走 PowerShell，Linux/macOS 走 bash。',
+      '在项目工作区执行一条 shell 命令，和 DSH 的 bash 工具一样每次调用都是全新 shell，不保留 cd 或环境变量。cwd 是相对项目工作区的目录，不能跳出工作区；默认 120 秒、最多 600 秒，超时会杀整个进程树。返回 stdout、stderr、exitCode、timedOut、durationMs、enforcement、sandboxMode、network；非零退出是结果而不是工具错误。输出各保留 64 KB 尾部，超出时完整输出保存为文本批次并返回 batchId。npm install、构建、测试、启动 dev server 等长命令用 runInBackground=true，然后 project.job 查看或终止。Windows 走 PowerShell，Linux/macOS 走 bash；EAB_PROJECT_EXEC=strict 时只通过 Docker/bwrap 沙箱执行，并要求配置 EAB_PROJECT_COMMAND_ALLOWLIST，网络默认拒绝。',
     scope: SC.WORKSPACE_WRITE,
     dangerous: false,
+    risk: 'exec',
+    approval: 'always',
     input: {
       description: {
         type: 'string',
@@ -998,6 +1203,8 @@ export const TOOLS: readonly ToolDef[] = [
       '管理 project.exec 用 runInBackground=true 启动的后台任务。action=list 列出当前用户的任务；output 读取某个任务的 stdout/stderr/状态；kill 终止任务树。任务只在内存保留 30 分钟，服务重启后不会恢复。前台命令不要用它，直接看 project.exec 的返回。',
     scope: SC.WORKSPACE_WRITE,
     dangerous: false,
+    risk: 'exec',
+    approval: 'always',
     input: {
       action: {
         type: 'string',
@@ -1373,6 +1580,7 @@ export const TOOLS: readonly ToolDef[] = [
     scope: SC.WORKSPACE_WRITE,
     dangerous: false,
     concurrency: 'write',
+    approval: 'always',
     lockKey: (_deps, actor) => `workspace:folder:${actor.subject.companyId}:${actor.subject.userId}`,
     idempotent: true,
     input: {
@@ -1527,16 +1735,36 @@ function evaluate(expression: string): number {
  * 汇总一组数值：模型常把时长/金额口头心算，漏行或算错。
  * 这里统一解析数字与“10.3小时”“10:18”这类时长写法，按小时求和并给出条数。
  */
+function summaryValueAt(item: unknown, index: number, depth = 0): unknown {
+  if (item && typeof item === 'object') {
+    if (Array.isArray(item) || depth >= 2) {
+      throw new EabError(
+        EC.VALIDATION,
+        `values[${index}] 必须是数字或时长字符串，不能是数组/嵌套对象。请传纯数值，例如 [65.15, 55.2, 57.43]`,
+      )
+    }
+    const record = item as Record<string, unknown>
+    // 兼容模型把“周标签 + 数值”包成 {label, value}；只取 value，标签不参与计算。
+    if ('value' in record) return summaryValueAt(record.value, index, depth + 1)
+    throw new EabError(
+      EC.VALIDATION,
+      `values[${index}] 不是有效数字：收到对象但不含 value。values 只收纯数字或 {value: 数字}；标签请留在图表数据里`,
+    )
+  }
+  return item
+}
+
 function summarizeValues(raw: unknown[]): { count: number; sum: number; avg: number; min: number; max: number; unit: 'hours' | 'number' } {
   if (!raw.length) throw new EabError(EC.VALIDATION, 'values 不能为空')
   if (raw.length > 500) throw new EabError(EC.VALIDATION, 'values 最多 500 项')
   let unit: 'hours' | 'number' = 'number'
   const nums = raw.map((item, index) => {
-    if (typeof item === 'number') {
-      if (!Number.isFinite(item)) throw new EabError(EC.VALIDATION, `values[${index}] 不是有效数字`)
-      return item
+    const valueItem = summaryValueAt(item, index)
+    if (typeof valueItem === 'number') {
+      if (!Number.isFinite(valueItem)) throw new EabError(EC.VALIDATION, `values[${index}] 不是有效数字`)
+      return valueItem
     }
-    const text = String(item ?? '').trim()
+    const text = String(valueItem ?? '').trim()
     if (!text) throw new EabError(EC.VALIDATION, `values[${index}] 为空`)
     const clock = text.match(/^(\d{1,3}):(\d{2})(?::(\d{2}))?$/)
     if (clock) {
@@ -1781,6 +2009,8 @@ export const AGENT_CORE_TOOL_IDS: readonly string[] = [
   'tool.search',
   'time.now',
   'math.eval',
+  'plan.write',
+  'plan.step',
   'agent.spawn',
   'agent.task',
   'agent.ask_parent',
@@ -1840,7 +2070,8 @@ const TOOL_SEARCH_ALIASES: Record<string, string> = {
   'org.directory': '通讯录 组织架构 部门 组长 上级 同事 成员 查找人 org directory',
   'org.search': '找人 搜索成员 姓名 工号 岗位 search member',
   'kb.search': '知识库 文档 资料 检索 搜索 制度 流程 kb rag search',
-  'memory.propose': '团队学习 共享记忆 记住 规范 以后都这样 扩散 经验 沉淀 team memory learn share',
+  'memory.propose': '团队学习 共享记忆 记住 规范 以后都这样 扩散 经验 沉淀 个人偏好 我的偏好 记住我的 我的格式 以后给我 我习惯 team memory learn share preference personal',
+  'content.generate_image': '生成图片 画图 画一张 插图 插画 海报 配图 头像 文生图 image generate draw picture poster illustration',
   'workspace.list': '文件 列表 我的文件 云空间 workspace file list',
   'workspace.capacity': '容量 空间 剩余 配额 满了吗 capacity quota space',
   'workspace.write': '写文件 保存 新建文件 文本 整篇 write file save',
@@ -1945,9 +2176,23 @@ export function toolSpecsForAgent(
   actor: Actor,
   space: ActiveSpace = { kind: 'cloud' },
   query = '',
-  options: { activeFile?: { name?: string | null } } = {},
+  options: {
+    activeFile?: { name?: string | null }
+    allowPlanTools?: boolean
+    /** 独立验收员专用：把 review.verdict 放进本轮工具目录 */
+    allowReviewTools?: boolean
+    /** 岗位卡硬 allowlist：卡里登记的工具必须直接可见，不能等能力路由命中 */
+    toolIdAllowlist?: readonly string[]
+  } = {},
 ): ChatToolSpec[] {
-  const coreNames = new Set(AGENT_CORE_TOOL_IDS.map(toolFunctionName))
+  // 计划是主 Agent 的编排对象；子 Agent 的 sessionId 是隔离的 agent:* 会话，
+  // 让它写计划只会污染计划表并让前端看不到，所以默认不给子 Agent。
+  const coreNames = new Set(
+    AGENT_CORE_TOOL_IDS
+      .filter((id) => options.allowPlanTools !== false || !id.startsWith('plan.'))
+      .map(toolFunctionName),
+  )
+  if (options.allowReviewTools) coreNames.add(toolFunctionName('review.verdict'))
   /**
    * 能力路由只决定“直接下发哪些工具组”，不绕过角色/空间/权限过滤。
    * 没命中的工具仍可通过 tool_search 加载，避免每轮把所有 Office/项目/开发工具都塞进上下文。
@@ -1966,7 +2211,13 @@ export function toolSpecsForAgent(
   if (route.web) routedIds.push(...CAPABILITY_TOOL_GROUPS.web)
   if (route.browser) routedIds.push(...CAPABILITY_TOOL_GROUPS.browser)
   if (route.memoryRule) routedIds.push(...CAPABILITY_TOOL_GROUPS.memoryRule)
+  if (route.content) routedIds.push(...CAPABILITY_TOOL_GROUPS.content)
   const allowedCore = new Set([...coreNames, ...routedIds.map(toolFunctionName)])
+  // 岗位卡工具是硬合同：只要卡里登记且空间/权限允许，就直接进入工具表，
+  // 不要求任务的提问文本一定命中 workspace/project/office 路由关键词。
+  if (options.toolIdAllowlist) {
+    for (const id of options.toolIdAllowlist) allowedCore.add(toolFunctionName(id))
+  }
   // A2A 远端 Agent 已同步时，主 Agent 本轮就能直接看见派遣工具；没有可用 Peer 时仍可按需搜索，不占上下文。
   if (hasUsableA2APeers(db, actor.subject.companyId)) {
     allowedCore.add(toolFunctionName('a2a.delegate'))
@@ -2028,6 +2279,33 @@ function toolAllowedInSpace(toolId: string, space: ActiveSpace): boolean {
   if (toolId.startsWith('workspace.') || toolId.startsWith('office.')) return space.kind === 'cloud'
   if (toolId.startsWith('project.') && resolveProjectExecMode() === 'off') return false
   return true
+}
+
+/** 模型有时把 steps 作为 JSON 字符串传；两种都接住，非法输入在写库前就报清楚。 */
+function parsePlanStepsArgument(raw: unknown): AgentPlanStepInput[] {
+  let value: unknown = raw
+  if (typeof raw === 'string') {
+    try {
+      value = JSON.parse(raw)
+    } catch {
+      throw new EabError(EC.VALIDATION, 'plan.write 的 steps 必须是 JSON 数组，或按 schema 直接传数组')
+    }
+  }
+  if (!Array.isArray(value)) {
+    throw new EabError(EC.VALIDATION, 'plan.write 的 steps 必须是数组')
+  }
+  return value.map((step, index) => {
+    if (!step || typeof step !== 'object') {
+      throw new EabError(EC.VALIDATION, `plan.write 第 ${index + 1} 步必须是对象`)
+    }
+    const record = step as Record<string, unknown>
+    return {
+      title: String(record.title ?? ''),
+      detail: record.detail === undefined ? undefined : String(record.detail),
+      owner: record.owner === undefined ? undefined : String(record.owner),
+      status: record.status === undefined ? undefined : String(record.status) as AgentPlanStepStatus,
+    }
+  })
 }
 
 interface OfficeFileRef {
@@ -2212,6 +2490,26 @@ export async function executeTool(
     throw new EabError(EC.FORBIDDEN, `工具 ${tool.id} 不属于当前文件空间`)
   }
 
+  // 高危工具先过审批门禁，再抢并发名额和资源锁：等待审批时不能占着工具槽位，
+  // 否则一个没人点的审批会把整类工具卡死。
+  if (requiresToolApprovalForArgs(tool, args)) {
+    const mode: ToolApprovalMode =
+      context.approval ?? (process.env.NODE_ENV === 'test' ? 'bypass' : 'defer')
+    await ensureToolApproval(deps.db, actor.subject, tool, args, {
+      mode,
+      approvalId: context.approvalId,
+      toolName: tool.name,
+      messageId: context.messageId,
+      sessionId: context.sessionId,
+      runId: context.traceId,
+      turnId: context.turnId,
+      channel: context.channel,
+      traceId: context.traceId,
+      signal: context.signal,
+      onPending: context.onApprovalPending,
+    })
+  }
+
   const startedAt = Date.now()
   let toolRelease: (() => void) | null = null
   try {
@@ -2360,6 +2658,64 @@ export async function executeTool(
         signal: context.signal,
       })
       break
+    case 'review.verdict': {
+      if (!context.sessionId?.startsWith('agent:critic:')) {
+        throw new EabError(EC.FORBIDDEN, '验收结论只能由独立验收员会话提交')
+      }
+      const verdict = String(args.verdict ?? '').trim().toLowerCase()
+      if (verdict !== 'approve' && verdict !== 'reject') {
+        throw new EabError(EC.VALIDATION, '验收结论必须是 approve 或 reject')
+      }
+      const reason = String(args.reason ?? '').replace(/\s+/g, ' ').trim()
+      if (!reason) throw new EabError(EC.VALIDATION, '验收结论必须写明理由')
+      const evidence = (Array.isArray(args.evidence) ? args.evidence : [])
+        .map((item) => String(item ?? '').replace(/\s+/g, ' ').trim())
+        .filter(Boolean)
+        .slice(0, 8)
+      if (evidence.length === 0) throw new EabError(EC.VALIDATION, '验收结论至少需要 1 条具体证据')
+      result = {
+        accepted: true,
+        verdict,
+        reason: reason.slice(0, 2_000),
+        evidence: evidence.map((item) => item.slice(0, 600)),
+      }
+      break
+    }
+    case 'plan.write': {
+      if (!context.sessionId || context.sessionId.startsWith('agent:')) {
+        throw new EabError(EC.VALIDATION, '任务计划只能由主 Agent 在用户对话会话内维护')
+      }
+      result = writeAgentPlan(deps.db, {
+        companyId: actor.subject.companyId,
+        userId: actor.person.id,
+        sessionId: context.sessionId,
+        traceId: context.traceId ?? null,
+        planKey: args.planKey === undefined ? null : String(args.planKey),
+        title: args.title === undefined ? null : String(args.title),
+        steps: parsePlanStepsArgument(args.steps),
+      })
+      break
+    }
+    case 'plan.step': {
+      if (!context.sessionId || context.sessionId.startsWith('agent:')) {
+        throw new EabError(EC.VALIDATION, '任务计划只能由主 Agent 在用户对话会话内维护')
+      }
+      const status = String(args.status ?? '')
+      if (!['pending', 'running', 'done', 'failed', 'skipped'].includes(status)) {
+        throw new EabError(EC.VALIDATION, `计划步骤状态不合法: ${status || '空'}`)
+      }
+      result = updateAgentPlanStep(deps.db, {
+        companyId: actor.subject.companyId,
+        userId: actor.person.id,
+        sessionId: context.sessionId,
+        traceId: context.traceId ?? null,
+        planKey: args.planKey === undefined ? null : String(args.planKey),
+        seq: Number(args.seq),
+        status: status as AgentPlanStepStatus,
+        note: args.note === undefined ? null : String(args.note),
+      })
+      break
+    }
     case 'agent.spawn':
       throw new EabError(EC.VALIDATION, 'agent.spawn 只能由对话 Agent 调度器执行')
     case 'agent.task':
@@ -2379,6 +2735,7 @@ export async function executeTool(
         fileId: args.fileId === undefined ? undefined : String(args.fileId),
         uri: args.uri === undefined ? undefined : String(args.uri),
         name: args.name === undefined ? undefined : String(args.name),
+        mimeType: args.mimeType === undefined ? undefined : String(args.mimeType),
         preview: args.preview === undefined ? undefined : String(args.preview),
       })
       result = {
@@ -2553,6 +2910,11 @@ export async function executeTool(
         throw new EabError(EC.VALIDATION, '请提供 expression 或 values')
       }
       if (rawValues.length) {
+        // 两项数字的“汇总”几乎都是把合计/条数又当成了两条记录（实测 [195.86,20] 被加成 215.86）；
+        // 两项运算一律走 expression，values 只接受真正的明细序列。
+        if (rawValues.length < 3) {
+          throw new EabError(EC.VALIDATION, 'values 至少要有 3 个数；两项数字的运算请改用 expression，例如 195.86/20')
+        }
         const summary = summarizeValues(rawValues)
         result = expression ? { ...summary, expression, value: evaluate(expression) } : summary
       } else {
@@ -2582,6 +2944,11 @@ export async function executeTool(
           title: hit.docTitle,
           text: hit.text,
           source: 'source' in hit ? hit.source : 'local',
+          docId: 'docId' in hit ? hit.docId ?? null : null,
+          chunkId: 'chunkId' in hit ? hit.chunkId ?? null : null,
+          layout: 'layout' in hit ? hit.layout ?? null : null,
+          freshness: 'freshness' in hit ? hit.freshness ?? null : null,
+          images: 'images' in hit ? hit.images ?? [] : [],
         })),
         externalCount: external.length,
       }
@@ -4859,35 +5226,124 @@ export async function executeTool(
       })
     }
     case 'memory.propose': {
-      const content = String(args.content ?? '').trim()
-      if (!content) throw new EabError(EC.VALIDATION, '团队学习内容不能为空')
-      if (content.length > 1000) throw new EabError(EC.VALIDATION, '单条团队学习最多 1000 字')
-      const duplicate = deps.db
-        .prepare(
-          `SELECT id, confirmed FROM memories
-            WHERE company_id = ? AND scope_type = 'company' AND scope_id = ? AND deleted_at IS NULL AND content = ?
-            LIMIT 1`,
-        )
-        .get(actor.subject.companyId, actor.subject.companyId, content) as { id: string; confirmed: number } | undefined
-      if (duplicate) {
+      let content = String(args.content ?? '').trim()
+      if (!content) throw new EabError(EC.VALIDATION, '记忆内容不能为空')
+      if (content.length > 1000) throw new EabError(EC.VALIDATION, '单条记忆最多 1000 字')
+      const requestedScope = args.scopeType === undefined ? 'company' : String(args.scopeType).trim().toLowerCase()
+      if (requestedScope !== 'user' && requestedScope !== 'company') {
+        throw new EabError(EC.VALIDATION, 'scopeType 只能是 user 或 company')
+      }
+      const scopeType: 'user' | 'company' = requestedScope
+      const defaultType: MemoryType = scopeType === 'user' ? 'preference' : 'decision'
+      const requestedType = args.memoryType === undefined ? defaultType : String(args.memoryType).trim().toLowerCase()
+      const memoryType: MemoryType =
+        requestedType === 'preference' || requestedType === 'fact' || requestedType === 'decision' || requestedType === 'episode'
+          ? requestedType
+          : normalizeMemoryType(requestedType, defaultType)
+      const scopeId = scopeType === 'user' ? actor.person.id : actor.subject.companyId
+      const subject = String(args.subject ?? '').replace(/\s+/g, ' ').trim().slice(0, 80)
+      const predicate = String(args.predicate ?? '').replace(/\s+/g, ' ').trim().slice(0, 80)
+      const objectText = String(args.object ?? '').replace(/\s+/g, ' ').trim().slice(0, 200)
+      const factKey = memoryType === 'fact' ? normalizeFactKey(args.factKey) : ''
+      const derived = memoryType === 'fact' && !factKey ? structuredFactFromContent(content) : null
+      const resolvedSubject = subject || derived?.subject || ''
+      const resolvedPredicate = predicate || derived?.predicate || ''
+      const resolvedObject = objectText || derived?.objectText || ''
+      const resolvedFactKey = factKey || derived?.factKey || ''
+      const resolvedConfidence = Number.isFinite(Number(args.confidence))
+        ? Math.max(0, Math.min(1, Number(args.confidence)))
+        : derived?.confidence ?? 1
+      if (resolvedFactKey && !resolvedObject) {
+        content = content || [resolvedSubject, resolvedPredicate].filter(Boolean).join(' ')
+      }
+      if (resolvedObject && !content.includes(resolvedObject)) {
+        content = [content, resolvedObject].filter(Boolean).join('：')
+      }
+      if (memoryLooksSensitive(content) || (resolvedObject && memoryLooksSensitive(resolvedObject))) {
+        throw new EabError(EC.VALIDATION, '这条内容包含敏感凭证或隐私信息，不能写入长期记忆')
+      }
+      const existing = resolvedFactKey
+        ? findStructuredFactConflict(deps.db, {
+            companyId: actor.subject.companyId,
+            scopeType,
+            scopeId,
+            factKey: resolvedFactKey,
+            objectText: resolvedObject || content,
+          })
+        : findMemoryDuplicateOrConflict(deps.db, {
+            companyId: actor.subject.companyId,
+            scopeType,
+            scopeId,
+            memoryType,
+            content,
+          })
+      if (existing?.kind === 'duplicate') {
         result = {
-          id: duplicate.id,
-          scopeType: 'company',
-          confirmed: duplicate.confirmed === 1,
-          status: duplicate.confirmed === 1 ? 'active' : 'pending',
+          id: existing.memory.id,
+          scopeType,
+          memoryType,
+          memoryTypeLabel: MEMORY_TYPE_LABELS[memoryType],
+          factKey: (existing.memory.factKey ?? resolvedFactKey) || null,
+          confirmed: existing.memory.confirmed === 1,
+          status: memoryStatus({
+            confirmed: existing.memory.confirmed,
+            conflict_with: existing.memory.conflict_with ?? null,
+          }),
           duplicate: true,
-          note: duplicate.confirmed === 1 ? '这条团队记忆已经生效' : '这条团队学习已经在待审核队列里，无需重复提交',
+          note: scopeType === 'user'
+            ? existing.memory.confirmed === 1
+              ? '这条个人记忆已经生效'
+              : '这条个人记忆已在你的待确认区，无需重复提交'
+            : existing.memory.confirmed === 1
+              ? '这条团队记忆已经生效'
+              : '这条团队学习已经在待审核队列里，无需重复提交',
         }
         break
       }
       const id = `mem_${ulid()}`
       const now = Date.now()
+      const conflictWith = existing?.kind === 'conflict' ? existing.memory.id : null
+      // 用户明确让记住的个人事实/偏好/决策，高置信且不冲突就直接生效；团队记忆始终待管理员审核。
+      const autoActivate =
+        memoryAutoConfirmEnabled() &&
+        scopeType === 'user' &&
+        !conflictWith &&
+        personalMemoryAutoActivates(memoryType, resolvedConfidence)
       deps.db
         .prepare(
-          `INSERT INTO memories (id, company_id, scope_type, scope_id, user_id, content, confirmed, created_at)
-           VALUES (?, ?, 'company', ?, ?, ?, 0, ?)`,
+          `INSERT INTO memories
+             (id, company_id, scope_type, scope_id, user_id, content, memory_type, confirmed,
+              conflict_with, subject, predicate, object_text, fact_key, confidence,
+              valid_from, importance, sensitivity, extraction_source, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'normal', 'tool', ?)`,
         )
-        .run(id, actor.subject.companyId, actor.subject.companyId, actor.person.id, content, now)
+        .run(
+          id,
+          actor.subject.companyId,
+          scopeType,
+          scopeId,
+          actor.person.id,
+          content,
+          memoryType,
+          autoActivate ? 1 : 0,
+          conflictWith,
+          resolvedSubject || null,
+          resolvedPredicate || null,
+          resolvedObject || null,
+          resolvedFactKey || null,
+          resolvedConfidence,
+          now,
+          memoryType === 'fact' ? 0.7 : 0.6,
+          now,
+        )
+      await embedMemoryRow(deps.db, deps.config.dbPath, actor.subject.companyId, {
+        id,
+        content,
+        memory_type: memoryType,
+        confirmed: autoActivate ? 1 : 0,
+        conflict_with: conflictWith,
+        created_at: now,
+      })
       appendAudit(deps.db, {
         companyId: actor.subject.companyId,
         actorUserId: actor.person.id,
@@ -4895,16 +5351,62 @@ export async function executeTool(
         resourceType: 'memory',
         resourceId: id,
         result: 'success',
-        detail: { scopeType: 'company', length: content.length },
+        detail: {
+          scopeType,
+          memoryType,
+          length: content.length,
+          autoActivated: autoActivate,
+          ...(conflictWith ? { conflictWith } : {}),
+        },
         ip: null,
         channel: 'web',
       })
       result = {
         id,
-        scopeType: 'company',
-        confirmed: false,
-        status: 'pending',
-        note: '已提交团队学习候选，待管理员审核通过后对全公司所有智能体生效',
+        scopeType,
+        memoryType,
+        memoryTypeLabel: MEMORY_TYPE_LABELS[memoryType],
+        ...(resolvedFactKey
+          ? {
+              factKey: resolvedFactKey,
+              subject: resolvedSubject || null,
+              predicate: resolvedPredicate || null,
+              object: resolvedObject || null,
+            }
+          : {}),
+        confirmed: autoActivate,
+        status: conflictWith ? 'conflict' : autoActivate ? 'active' : 'pending',
+        conflictWith,
+        note: scopeType === 'user'
+          ? conflictWith
+            ? '这条个人记忆与你已确认的旧记忆高度相近，已标为冲突待确认；你在“我的记忆”里确认替换后才会生效'
+            : autoActivate
+              ? '已记住并自动生效，仅用于你个人的对话上下文，不会共享给团队；可随时在“我的记忆”里删除'
+              : '已记为你的个人记忆候选，待你在“我的记忆”确认后生效；不会自动共享给团队'
+          : conflictWith
+            ? '这条团队学习与已确认的旧记忆高度相近，已标为冲突待确认；管理员确认后才会替换旧记忆'
+            : '已提交团队学习候选，待管理员审核通过后对全公司所有智能体生效',
+      }
+      break
+    }
+    case 'content.generate_image': {
+      const prompt = String(args.prompt ?? '').trim()
+      if (!prompt) throw new EabError(EC.VALIDATION, 'prompt 不能为空')
+      const asset = await generateImageToWorkspace(deps, actor, {
+        prompt,
+        size: typeof args.size === 'string' ? args.size : undefined,
+        channel: context.channel ?? 'agent',
+        traceId: context.traceId ?? null,
+      })
+      result = {
+        fileId: asset.file.id,
+        name: asset.file.name,
+        relPath: asset.file.relPath,
+        size: asset.file.size,
+        mime: asset.file.mime,
+        downloadUrl: asset.downloadUrl,
+        modelKey: asset.modelKey,
+        note: `已生成图片「${asset.file.name}」并保存到个人云空间；下载地址 ${asset.downloadUrl}`,
       }
       break
     }
@@ -5089,6 +5591,46 @@ export async function executeTool(
   }
 }
 
+function projectExecStatus(): {
+  mode: ReturnType<typeof resolveProjectExecMode>
+  backend: string | null
+  backendDetail: string
+  network: 'unrestricted' | 'denied'
+  strictReady: boolean
+  allowlistRules: number
+  allowlistError: string | null
+} {
+  const mode = resolveProjectExecMode()
+  let allowlistRules = 0
+  let allowlistError: string | null = null
+  try {
+    allowlistRules = parseProjectCommandAllowlist(process.env.EAB_PROJECT_COMMAND_ALLOWLIST).length
+  } catch (error) {
+    allowlistError = (error as Error).message
+  }
+  if (mode !== 'strict') {
+    return {
+      mode,
+      backend: null,
+      backendDetail: mode === 'local' ? '本地执行：仅路径锁和危险命令黑名单，没有 OS 隔离' : '未启用项目命令执行',
+      network: 'unrestricted',
+      strictReady: true,
+      allowlistRules,
+      allowlistError,
+    }
+  }
+  const capability = projectSandboxCapability()
+  return {
+    mode,
+    backend: capability.backend,
+    backendDetail: capability.detail,
+    network: capability.backend ? 'denied' : 'unrestricted',
+    strictReady: Boolean(capability.backend) && !allowlistError && allowlistRules > 0,
+    allowlistRules,
+    allowlistError,
+  }
+}
+
 export function registerToolRoutes(app: FastifyInstance, deps: ServerDeps): void {
   app.get('/api/tools', async (req) => {
     const actor = resolveActor(deps.db, deps.config, req)
@@ -5096,12 +5638,15 @@ export function registerToolRoutes(app: FastifyInstance, deps: ServerDeps): void
     requireScope(actor.subject, SC.AGENT_TOOL_LIST)
     const roleAccess = readToolRoleAccessMap(deps.db, actor.subject.companyId)
     return ok({
+      projectExec: projectExecStatus(),
       tools: [
         ...TOOLS.map((tool) => ({
           id: tool.id,
           name: tool.name,
           description: tool.description,
           dangerous: tool.dangerous,
+          risk: toolRisk(tool),
+          approval: toolApprovalPolicy(tool),
           available:
             actor.subject.scopes.has(tool.scope) &&
             toolAllowedForRoles(roleAccess.get(tool.id), actor.subject.roles ?? []),
@@ -5170,78 +5715,12 @@ export function registerToolRoutes(app: FastifyInstance, deps: ServerDeps): void
       }
       requireScope(actor.subject, tool.scope)
 
-      if (tool.dangerous) {
-        const approvalId = req.body?.approvalId
-        const approval = approvalId
-          ? (deps.db
-              .prepare('SELECT * FROM approvals WHERE id = ? AND company_id = ? AND requester_user_id = ? AND action = ?')
-              .get(approvalId, actor.subject.companyId, actor.subject.userId, `tool:${tool.id}`) as
-              | { id: string; status: string; expires_at: number | null }
-              | undefined)
-          : undefined
-        if (!approval || approval.status !== 'approved' || (approval.expires_at && approval.expires_at < Date.now())) {
-          const now = Date.now()
-          const resourceId = String(args.userId ?? '')
-          // 先把已经过期的 pending 标成 expired，避免它继续占着唯一索引。
-          deps.db
-            .prepare(
-              `UPDATE approvals
-                  SET status = 'expired', decided_by = 'system:expired', decided_at = ?
-                WHERE company_id = ? AND requester_user_id = ? AND action = ? AND resource_id = ?
-                  AND status = 'pending' AND expires_at IS NOT NULL AND expires_at <= ?`,
-            )
-            .run(now, actor.subject.companyId, actor.subject.userId, `tool:${tool.id}`, resourceId, now)
-          const existing = deps.db
-            .prepare(
-              `SELECT id FROM approvals WHERE company_id = ? AND requester_user_id = ? AND action = ? AND status = 'pending'
-                 AND resource_id = ? AND (expires_at IS NULL OR expires_at > ?) ORDER BY created_at DESC LIMIT 1`,
-            )
-            .get(actor.subject.companyId, actor.subject.userId, `tool:${tool.id}`, resourceId, now) as
-            | { id: string }
-            | undefined
-          let id = existing?.id
-          if (!id) {
-            const candidate = ulid()
-            try {
-              deps.db
-                .prepare(
-                  `INSERT INTO approvals (id, company_id, requester_user_id, action, resource_type, resource_id, payload_json, status, created_at, expires_at)
-                   VALUES (?, ?, ?, ?, 'user', ?, ?, 'pending', ?, ?)`,
-                )
-                .run(
-                  candidate,
-                  actor.subject.companyId,
-                  actor.subject.userId,
-                  `tool:${tool.id}`,
-                  resourceId,
-                  JSON.stringify({ tool: tool.id, args: { userId: args.userId } }),
-                  now,
-                  now + 30 * 60 * 1000,
-                )
-              id = candidate
-            } catch (error) {
-              // 唯一索引冲突说明另一个并发请求刚插入了同一条待办，读回它的 id。
-              const raced = deps.db
-                .prepare(
-                  `SELECT id FROM approvals WHERE company_id = ? AND requester_user_id = ? AND action = ? AND status = 'pending'
-                     AND resource_id = ? ORDER BY created_at DESC LIMIT 1`,
-                )
-                .get(actor.subject.companyId, actor.subject.userId, `tool:${tool.id}`, resourceId) as
-                | { id: string }
-                | undefined
-              if (!raced) throw error
-              id = raced.id
-            }
-          }
-          throw new EabError(EC.APPROVAL_REQUIRED, `「${tool.name}」需要审批，已生成待办`, {
-            details: { approvalId: id, toolId: tool.id },
-            hint: '让拥有审批权限的管理员在控制台「审批」页通过后，再带 approvalId 调用一次',
-          })
-        }
-      }
-
       const result = await executeTool(deps, actor, tool.id, args, { kind: 'cloud' }, {
         idempotencyKey: typeof req.body?.idempotencyKey === 'string' ? req.body.idempotencyKey : undefined,
+        // 直接 API 不阻塞等审批：没有可用审批就生成待办并返回 202，
+        // 管理员在控制台通过后，调用方带 approvalId 重试。
+        approval: 'defer',
+        approvalId: typeof req.body?.approvalId === 'string' ? req.body.approvalId : undefined,
       })
       audit(deps, req, `tool.invoke.${tool.id}`, { toolId: tool.id, args: tool.id === 'admin.password.reset' ? { userId: args.userId } : args })
       return ok({ toolId: tool.id, result })

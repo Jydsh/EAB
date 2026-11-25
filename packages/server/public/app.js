@@ -152,6 +152,8 @@ const state = {
   quotaScope: 'company',
   quotaMonth: '',
   taskStatus: 'all',
+  /** 任务中心当前在右侧抽屉里打开的任务 id（用于列表行高亮） */
+  taskOpen: '',
   databaseStatus: 'all',
   databaseDrivers: [],
   deptFilter: null,
@@ -197,7 +199,7 @@ const state = {
   approvalHistories: {},
   approvalHistoryRestoring: false,
   approvalFocus: false,
-  approvalRecordTab: 'todo',
+  approvalRecordTab: 'all',
   approvalRecordId: '',
   approvalRecordQuery: '',
   approvalRecords: [],
@@ -237,7 +239,7 @@ const PAGES = {
   usage: { title: '用量', sub: '对话请求与 token 消耗（按天 / 按人）', render: () => loadUsage() },
   quota: { title: '额度', sub: '公司 / 部门 / 成员三级月度上限', render: () => loadQuota() },
   audit: { title: '审计', sub: '追加写入、哈希链可校验的操作记录', render: () => loadAudit() },
-  tasks: { title: '任务中心', sub: '定时任务、最近执行与事件时间线', render: () => loadTasks() },
+  tasks: { title: '任务中心', sub: '定时任务与多步骤流程编排', render: () => loadTasks() },
   approvals: { title: '审批', sub: '高危动作的待办与决定', render: () => loadApprovals() },
   system: { title: '系统', sub: '运行状态与系统更新', render: () => loadSys() },
   extra: { title: '插件管理', sub: '安装、启停、页面与工具', render: () => loadPlugins() },
@@ -262,7 +264,13 @@ function mountSectionNav(root, key, fallback, onChange) {
       button.classList.toggle('is-active', active)
       button.setAttribute('aria-selected', active ? 'true' : 'false')
     }
-    for (const panel of panels) panel.hidden = panel.dataset.sectionPanel !== target
+    for (const panel of panels) {
+      panel.hidden = panel.dataset.sectionPanel !== target
+      // 兼容切换前已经挂上 reveal 的旧 DOM：显示时直接跳过，不让它卡在 opacity:0。
+      if (!panel.hidden && panel.dataset.motion?.includes('reveal') && !panel.classList.contains('is-motion-in')) {
+        panel.classList.add('is-motion-skip')
+      }
+    }
     onChange?.(target)
   }
   for (const button of buttons) {
@@ -438,6 +446,15 @@ function renderFlowRich(value) {
   return output.join('') || '<p class="kb-flow-rich-empty">（暂无内容）</p>'
 }
 
+/** 系统更新说明按 Markdown 文档展示，不直接把源码塞进 pre。 */
+function renderUpdateNotesHtml(notes, latest) {
+  const text = String(notes ?? '').trim()
+  if (!text) return ''
+  return `<details class="update-notes" style="margin-top:10px"><summary>查看 v${esc(
+    latest ?? '',
+  )} 更新说明</summary><div class="kb-flow-rich update-notes-md">${renderFlowRich(text)}</div></details>`
+}
+
 /** 把长说明收成小角标；完整文案挂在 data-tip，由统一浮层按需展示。 */
 function hintBadge(label, tip, ariaLabel, extraClass = '', id = '') {
   const cls = extraClass ? `hint-badge ${extraClass}` : 'hint-badge'
@@ -454,6 +471,7 @@ const TOP_TOAST_KEY = 'eab_top_toast'
 
 /** 顶部浮动提示：成功类反馈不阻塞页面，自动消失。 */
 function showTopToast(message, options = {}) {
+  if (window.EABOverlay?.toast) return window.EABOverlay.toast(message, options)
   const tone = options.tone || 'success'
   const duration = Number(options.duration) > 0 ? Number(options.duration) : 4500
   let host = document.querySelector('.top-toast-host')
@@ -833,7 +851,7 @@ async function apiUpload(path, formData) {
 
 function renderDenied(container, err) {
   container.innerHTML = `
-    <div class="denied">
+    <div class="denied" role="alert">
       <h2>${esc(err.message || '请求被拒绝')}</h2>
       <span class="code">${esc(err.code || 'EAB_INTERNAL')}${err.status ? ` · HTTP ${err.status}` : ''}</span>
       <div class="muted">${esc(err.hint || '这是 PDP 的判定结果——当前身份不具备该动作所需的权限。')}</div>
@@ -842,7 +860,69 @@ function renderDenied(container, err) {
     </div>`
 }
 
-function renderLoading(container, text = '加载中…') {
+/** 统一的空/错误状态块；表格内用 compact，避免把行撑成整屏。 */
+function stateBlockHtml({
+  tone = 'neutral',
+  title,
+  body = '',
+  actionLabel = '',
+  action = '',
+  compact = false,
+} = {}) {
+  const role = tone === 'error' ? 'alert' : 'status'
+  const actionClass = compact ? 'link-btn' : 'btn sm ghost'
+  return `<div class="${compact ? 'table-state' : 'state-block'} is-${tone}" role="${role}">
+    <div class="state-copy">
+      <strong>${esc(title || '')}</strong>
+      ${body ? `<p>${esc(body)}</p>` : ''}
+    </div>
+    ${actionLabel ? `<button class="${actionClass}" type="button" data-state-action="${esc(action)}">${esc(actionLabel)}</button>` : ''}
+  </div>`
+}
+
+function isPermissionError(err) {
+  const status = Number(err?.status || 0)
+  if (status === 401 || status === 403) return true
+  return /pdp|permission|forbidden|denied|unauthorized/i.test(String(err?.code || ''))
+}
+
+/** 统一把网络类错误本地化，页面级错误块和详情弹层共用同一套文案。 */
+function consoleErrorText(err) {
+  const rawMessage = String(err?.message || '')
+  if (/failed to fetch|networkerror|network error|network request failed/i.test(rawMessage)) {
+    return '网络连接失败，请确认服务正在运行后重试。'
+  }
+  return rawMessage || '请求没有完成，请稍后重试。'
+}
+
+/** 权限拒绝保留 PDP 说明；网络/5xx 给“加载失败 + 重试”，不把两类错误混在一起。 */
+function renderConsoleError(container, err, retry) {
+  if (isPermissionError(err)) {
+    renderDenied(container, err)
+    return
+  }
+  const message = consoleErrorText(err)
+  container.innerHTML = stateBlockHtml({
+    tone: 'error',
+    title: '加载失败',
+    body: message,
+    actionLabel: typeof retry === 'function' ? '重试' : '',
+    action: 'state-retry',
+  })
+  container.querySelector('[data-state-action="state-retry"]')?.addEventListener('click', () => {
+    if (typeof retry === 'function') retry()
+  })
+}
+
+function renderLoading(container, text = '加载中…', options = {}) {
+  if (options.skeleton) {
+    const rows = Math.max(2, Math.min(8, Number(options.rows) || 5))
+    container.innerHTML = `<div class="state-skeleton" role="status" aria-label="${esc(text)}" aria-live="polite">${Array.from(
+      { length: rows },
+      () => '<span class="state-skeleton-line" aria-hidden="true"></span>',
+    ).join('')}</div>`
+    return
+  }
   container.innerHTML = `<div class="loading">${esc(text)}</div>`
 }
 
@@ -1219,7 +1299,10 @@ async function loadTree() {
   try {
     const { roots, deptTotal } = await refreshOrgRoots()
     const count = $('#dept-count')
-    if (count) count.textContent = `${roots.length} 家公司 · ${deptTotal} 个部门`
+    if (count) {
+      count.textContent = `${roots.length} 家公司 · ${deptTotal} 个业务部门`
+      count.title = '业务部门数量不含公司根部门'
+    }
     for (const node of roots) renderTree(node, 0, container, null)
   } catch (err) {
     const count = $('#dept-count')
@@ -1241,7 +1324,7 @@ function aclText(acl) {
 
 async function loadKb() {
   const view = $('#view')
-  renderLoading(view)
+  renderLoading(view, '正在读取知识库', { skeleton: true, rows: 4 })
   setSide(`<div class="side-head">知识库</div><div class="side-note muted">加载中…</div>`)
   try {
     const data = await api('/api/kb/collections')
@@ -1268,6 +1351,16 @@ async function loadKb() {
     }
     state.kb = data
     renderKbSide(data)
+    if (data.collections.length === 0) {
+      view.innerHTML = `<div id="kb-docs">${stateBlockHtml({
+        title: '还没有知识库',
+        body: '新建一个知识库后，可以上传文件、接入外部来源，并在对话里引用。',
+        actionLabel: '新建知识库',
+        action: 'kb-empty-new',
+      })}</div>`
+      $('#kb-docs')?.querySelector('[data-state-action="kb-empty-new"]')?.addEventListener('click', () => openKbModal(null))
+      return
+    }
     view.innerHTML = `<div id="kb-docs"><section class="panel"><div class="empty">从左侧选择一个知识库，或新建一个</div></section></div>`
 
     const keep =
@@ -1282,7 +1375,7 @@ async function loadKb() {
     }
   } catch (err) {
     setSide('', true)
-    renderDenied(view, err)
+    renderConsoleError(view, err, () => loadKb())
   }
 }
 
@@ -3485,7 +3578,7 @@ async function loadDocs(collectionId, options = {}) {
   }
   const page = Math.max(1, Number(state.kbDocPage) || 1)
   const pageSize = [10, 20, 50].includes(Number(state.kbDocPageSize)) ? Number(state.kbDocPageSize) : 10
-  renderLoading(host, '加载文档…')
+  renderLoading(host, '正在读取文档', { skeleton: true, rows: 4 })
   try {
     const data = await api(
       `/api/console/kb/collections/${encodeURIComponent(collectionId)}/docs?page=${page}&pageSize=${pageSize}`,
@@ -3579,6 +3672,15 @@ async function loadDocs(collectionId, options = {}) {
       if (end < pagination.totalPages - 1) pageNumbers.push('…')
       pageNumbers.push(pagination.totalPages)
     }
+    const emptyDocsState = stateBlockHtml({
+      compact: true,
+      title: external ? '上游还没有返回文档' : '还没有文档',
+      body: external
+        ? `当前没有从 ${sourceLabel} 返回文档。请检查 API Key 是否有 dataset:read 权限，或稍后重新读取。`
+        : '上传 PDF、Word、Markdown 或纯文本；上传后会进入解析、清洗、切片和索引流水线。',
+      actionLabel: external ? '重新读取' : '上传文件',
+      action: external ? 'kb-docs-reload' : 'kb-docs-add',
+    })
     const pager = `<div class="kb-doc-pager">
       <span class="kb-doc-pager-total">共 <strong>${pagination.total}</strong> 篇文档</span>
       <div class="kb-doc-pager-controls">
@@ -3675,20 +3777,24 @@ async function loadDocs(collectionId, options = {}) {
 
       <section class="panel kb-doc-panel">
         <div class="panel-head">
-          <div><h2>文档</h2>${hintBadge(external ? '来源说明' : '文档说明', docsHint)}</div>
+          <div class="kb-doc-title"><h2>文档</h2>${hintBadge(external ? '来源说明' : '文档说明', docsHint)}</div>
           <span class="pill">${pagination.total} 篇</span>
         </div>
         <table class="data">
           <thead><tr><th>文档</th><th>密级</th><th>索引状态</th><th>操作</th></tr></thead>
-          <tbody>${docs || `<tr><td colspan="4" class="empty">${
-            external ? '上游还没有返回文档' : '还没有文档，点上方添加文档'
-          }</td></tr>`}</tbody>
+          <tbody>${docs || `<tr><td colspan="4">${emptyDocsState}</td></tr>`}</tbody>
         </table>
         ${pager}
       </section>`
 
     host.querySelector('#kb-edit')?.addEventListener('click', () => {
       if (collection) openKbModal(collection)
+    })
+    host.querySelector('[data-state-action="kb-docs-add"]')?.addEventListener('click', () => {
+      openKbDocModal(collectionId, data.collection.aclMode)
+    })
+    host.querySelector('[data-state-action="kb-docs-reload"]')?.addEventListener('click', () => {
+      loadDocs(collectionId)
     })
     host.querySelector('#kb-add-doc')?.addEventListener('click', () => openKbDocModal(collectionId, data.collection.aclMode))
     host.querySelector('#kb-retrieval-test')?.addEventListener('click', () => {
@@ -3836,7 +3942,7 @@ async function loadDocs(collectionId, options = {}) {
       state.kbPollTimer = setTimeout(() => loadDocs(collectionId), 2500)
     }
   } catch (err) {
-    renderDenied(host, err)
+    renderConsoleError(host, err, () => loadDocs(collectionId))
   }
 }
 
@@ -3845,7 +3951,8 @@ async function loadDocs(collectionId, options = {}) {
 async function loadOrg() {
   const view = $('#view')
   setSide('', true)
-  view.innerHTML = `<div id="org-members"><section class="panel"><div class="panel-head"><h2>成员</h2></div><div class="loading">加载中…</div></section></div>`
+  view.innerHTML = '<div id="org-members"></div>'
+  renderLoading($('#org-members'), '正在读取成员', { skeleton: true, rows: 5 })
   try {
     await refreshOrgRoots()
     const currentRoot = currentCompanyRoot()
@@ -3855,7 +3962,7 @@ async function loadOrg() {
     }
     await loadMembers($('#org-members'))
   } catch (err) {
-    renderDenied(view, err)
+    renderConsoleError(view, err, () => loadOrg())
   }
 }
 
@@ -3916,15 +4023,16 @@ function renderDeptDetail(node) {
           <span class="hint">${isRoot ? '公司根部门' : parent ? `上级 · ${esc(parent.name)}` : '部门'}</span>
         </div>
         <div class="panel-actions">
-          ${isRoot ? '' : `<button class="btn sm danger" type="button" data-dept-detail-delete>删除</button>`}
+          <button class="btn sm ghost" type="button" data-dept-detail-manager>${node.managerName ? '更换负责人' : '设置负责人'}</button>
           <button class="btn sm" type="button" data-dept-detail-edit>编辑部门</button>
+          ${isRoot ? '' : `<button class="btn sm danger" type="button" data-dept-detail-delete>删除</button>`}
         </div>
       </div>
       <div class="dept-detail-stats">
         <div><strong>${direct}</strong><span>直属成员</span></div>
         <div><strong>${total}</strong><span>含下级成员</span></div>
         <div><strong>${children.length}</strong><span>下级部门</span></div>
-        <div><strong>${esc(node.managerName || '未设置')}</strong><span>负责人 <button class="link-btn accent dept-manager-link" type="button" data-dept-detail-manager>${node.managerName ? '更换' : '去设置'}</button></span></div>
+        <div><strong>${esc(node.managerName || '未设置')}</strong><span>负责人</span></div>
       </div>
       <div class="dept-detail-path mono">${esc(node.path)}</div>
       <div class="dept-detail-section">
@@ -3978,10 +4086,16 @@ function refreshOrgAfterTreeChange() {
 async function loadMembers(container) {
   const host = container || $('#view')
   if (!state.deptFilter) {
-    host.innerHTML = `<section class="panel"><div class="panel-head"><h2>成员</h2></div><div class="empty">这个公司还没有可显示的部门，请先在「部门管理」中创建部门</div></section>`
+    host.innerHTML = `<section class="panel"><div class="panel-head"><h2>成员</h2></div>${stateBlockHtml({
+      title: '这个公司还没有可显示的部门',
+      body: '先在「部门管理」中创建部门，成员会按部门显示。',
+      actionLabel: '去部门管理',
+      action: 'member-goto-depts',
+    })}</section>`
+    host.querySelector('[data-state-action="member-goto-depts"]')?.addEventListener('click', () => navigate('departments'))
     return
   }
-  renderLoading(host)
+  renderLoading(host, '正在读取成员', { skeleton: true, rows: 5 })
   try {
     const data = await api('/api/org/members')
     const companyRoot = `/${state.company}/`
@@ -4049,6 +4163,20 @@ async function loadMembers(container) {
     const roleChips = [...roleCounts.entries()]
       .map(([code, count]) => `<span class="chip accent">${esc(ROLE_LABEL[code] || code)} · ${count} 人</span>`)
       .join(' ')
+    const memberEmptyState = stateBlockHtml({
+      compact: true,
+      title: '该部门及下级还没有成员',
+      body: '可以新建成员，或切换到其他部门查看。',
+      actionLabel: '新建成员',
+      action: 'member-new',
+    })
+    const memberSearchEmptyState = stateBlockHtml({
+      compact: true,
+      title: '没有匹配的成员',
+      body: '调整搜索词，或清除搜索查看全部成员。',
+      actionLabel: '清除搜索',
+      action: 'member-clear-search',
+    })
 
     host.innerHTML = `
       <section class="panel">
@@ -4071,8 +4199,8 @@ async function loadMembers(container) {
             <thead><tr><th>姓名</th><th>部门</th><th>角色</th><th>状态</th><th>操作</th></tr></thead>
             <tbody>${
               rows
-                ? `${rows}<tr id="member-search-empty" hidden><td colspan="5" class="empty">没有匹配的成员</td></tr>`
-                : '<tr><td colspan="5" class="empty">该部门及下级没有成员</td></tr>'
+                ? `${rows}<tr id="member-search-empty" hidden><td colspan="5">${memberSearchEmptyState}</td></tr>`
+                : `<tr><td colspan="5">${memberEmptyState}</td></tr>`
             }</tbody>
           </table>
         </div>
@@ -4193,12 +4321,19 @@ async function loadMembers(container) {
     })
     const newMember = host.querySelector('#member-new')
     if (newMember) newMember.addEventListener('click', () => openMemberCreate(state.deptFilter))
+    host.querySelector('[data-state-action="member-new"]')?.addEventListener('click', () => newMember?.click())
+    host.querySelector('[data-state-action="member-clear-search"]')?.addEventListener('click', () => {
+      state.memberSearch = ''
+      if (searchInput) searchInput.value = ''
+      applyMemberSearch()
+      searchInput?.focus()
+    })
     const bulk = host.querySelector('#member-bulk')
     if (bulk) bulk.addEventListener('click', () => openBulkGrant(members))
     const exportBtn = host.querySelector('#member-export')
     if (exportBtn) exportBtn.addEventListener('click', () => downloadConsoleFile('/api/console/members/export', '成员清单.csv'))
   } catch (err) {
-    renderDenied(host, err)
+    renderConsoleError(host, err, () => loadMembers(host))
   }
 }
 
@@ -5210,8 +5345,8 @@ async function loadOverviewMember() {
   view.innerHTML = `
     <div class="stats overview-stats">
       <div class="stat"><div class="stat-label">服务状态</div><div class="stat-value">${health ? '运行中' : '异常'}<span class="stat-unit">${health ? `v${esc(health.version)}` : ''}</span></div></div>
-      <div class="stat"><div class="stat-label">组织规模</div><div class="stat-value">${counts.members ?? 0}<span class="stat-unit">成员 · ${counts.departments ?? 0} 部门</span></div></div>
-      <div class="stat"><div class="stat-label">知识与模型</div><div class="stat-value">${counts.kbCollections ?? 0}<span class="stat-unit">库 · ${counts.models ?? 0} 模型</span></div></div>
+      <div class="stat"><div class="stat-label">组织规模</div><div class="stat-value"><span data-motion="count" data-count-to="${Number(counts.members ?? 0)}" data-count-duration="1100">${counts.members ?? 0}</span><span class="stat-unit">成员 · ${counts.departments ?? 0} 部门</span></div></div>
+      <div class="stat"><div class="stat-label">知识与模型</div><div class="stat-value"><span data-motion="count" data-count-to="${Number(counts.kbCollections ?? 0)}" data-count-duration="1100">${counts.kbCollections ?? 0}</span><span class="stat-unit">库 · ${counts.models ?? 0} 模型</span></div></div>
       <div class="stat"><div class="stat-label">接入完成度</div><div class="stat-value">${bound}<span class="stat-unit">/ ${channels.length} 渠道已启用 · ${counts.plugins ?? 0} 插件</span></div></div>
     </div>
 
@@ -5246,7 +5381,7 @@ async function loadOverviewMember() {
                 <div class="quick-grid">
                   ${quickLinks
                     .map(
-                      (item) => `<button class="quick-link" type="button" data-go="${item.key}">
+                      (item) => `<button class="quick-link" type="button" data-motion="lift" data-go="${item.key}">
                         <span>${esc(item.title)}</span>
                         <small>${esc(item.meta)}</small>
                         <i aria-hidden="true">→</i>
@@ -5274,6 +5409,9 @@ async function loadOverviewMember() {
   // 成员概览没有页内选择器，必须收起 page-body 的 264px 侧栏列；
   // 否则登录后内容会被这列空白推到右边，看起来像“侧边栏还在”。
   setSide('', true)
+  for (const button of document.querySelectorAll('#view [data-go]')) {
+    button.addEventListener('click', () => navigate(button.dataset.go))
+  }
 }
 
 async function loadOverview() {
@@ -5327,8 +5465,8 @@ async function loadOverview() {
   view.innerHTML = `
     <div class="stats overview-stats">
       <div class="stat"><div class="stat-label">服务状态</div><div class="stat-value">${health ? '运行中' : '异常'}<span class="stat-unit">${health ? `v${esc(health.version)}` : ''}</span></div></div>
-      <div class="stat"><div class="stat-label">组织规模</div><div class="stat-value">${memberCount}<span class="stat-unit">成员 · ${deptCount} 部门</span></div></div>
-      <div class="stat"><div class="stat-label">知识与模型</div><div class="stat-value">${kbCount}<span class="stat-unit">库 · ${modelCount} 模型</span></div></div>
+      <div class="stat"><div class="stat-label">组织规模</div><div class="stat-value"><span data-motion="count" data-count-to="${memberCount}" data-count-duration="1100">${memberCount}</span><span class="stat-unit">成员 · ${deptCount} 部门</span></div></div>
+      <div class="stat"><div class="stat-label">知识与模型</div><div class="stat-value"><span data-motion="count" data-count-to="${kbCount}" data-count-duration="1100">${kbCount}</span><span class="stat-unit">库 · ${modelCount} 模型</span></div></div>
       <div class="stat"><div class="stat-label">接入完成度</div><div class="stat-value"><span data-ov="channels-num">${boundChannels}</span><span class="stat-unit" data-ov="channels-unit">/ ${channelTotal} 渠道已绑定 · ${pluginCount} 插件</span></div></div>
     </div>
 
@@ -5361,7 +5499,7 @@ async function loadOverview() {
           <div class="quick-grid">
             ${quickLinks
               .map(
-                (item) => `<button class="quick-link" type="button" data-go="${item.key}">
+                (item) => `<button class="quick-link" type="button" data-motion="lift" data-go="${item.key}">
                   <span>${esc(item.title)}</span>
                   <small data-ov="${esc(item.key)}-link">${esc(item.meta)}</small>
                   <i aria-hidden="true">→</i>
@@ -5485,7 +5623,29 @@ function setRoleMemberMessage(text) {
   if (host) host.textContent = text
 }
 
-async function removeRoleMember(role, member, currentIds, messageHost) {
+async function removeRoleMember(role, member, currentIds, messageHost, trigger) {
+  const runRemove = async () => {
+    if (messageHost) messageHost.textContent = '移除中…'
+    const userIds = [...currentIds].filter((id) => id !== member.id)
+    const result = await apiPost(`/api/console/roles/${encodeURIComponent(role.code)}/members`, { userIds })
+    await loadRoles()
+    setRoleMemberMessage(result.removed ? '已移除 1 人' : '没有变更')
+    return result
+  }
+
+  if (window.EABOverlay?.popconfirm && trigger) {
+    return window.EABOverlay.popconfirm(trigger, {
+      title: '移除成员？',
+      message: `将「${member.name}」从角色「${role.name}」中移除。`,
+      detail: '该成员的其他角色不受影响；移除后仍可在角色成员页重新添加。',
+      confirmText: '移除',
+      tone: 'warning',
+      loadingText: '移除中…',
+      failureMessage: '移除失败，请重试',
+      onConfirm: runRemove,
+    })
+  }
+
   const ok = await confirmCard({
     title: '移除成员？',
     message: `将「${member.name}」从角色「${role.name}」中移除。`,
@@ -5494,12 +5654,8 @@ async function removeRoleMember(role, member, currentIds, messageHost) {
     tone: 'warning',
   })
   if (!ok) return
-  if (messageHost) messageHost.textContent = '移除中…'
-  const userIds = [...currentIds].filter((id) => id !== member.id)
   try {
-    const result = await apiPost(`/api/console/roles/${encodeURIComponent(role.code)}/members`, { userIds })
-    await loadRoles()
-    setRoleMemberMessage(result.removed ? '已移除 1 人' : '没有变更')
+    await runRemove()
   } catch (err) {
     if (messageHost) messageHost.textContent = err.message || '移除失败'
     else window.alert(err.message || '移除失败')
@@ -5695,27 +5851,21 @@ function consolePermissionTreeHtml(catalog, pages, options = {}) {
       <strong>${esc(title)}</strong>
       ${actionsHtml(perm, hideView)}
     </div>`
-  const pageBlockHtml = (page, collapsePageName = false) => {
+  const pageBlockHtml = (page) => {
     const meta = pageMetaMap.get(page)
     const perm = permissionMap.get(page)
     const sections = Array.isArray(meta?.sections) ? meta.sections : []
     const pageTitle = meta?.title || page
     if (sections.length === 0) {
-      return `<div class="perm-page-block is-single${collapsePageName ? ' is-domain-only' : ''}" ${rowAttr}="${esc(
+      return `<div class="perm-page-block is-single" ${rowAttr}="${esc(
         page,
       )}" aria-label="${esc(pageTitle)}页面权限">
-        <div class="perm-page-name">${
-          collapsePageName ? '<span class="perm-page-note">页面权限</span>' : `<strong>${esc(pageTitle)}</strong>`
-        }</div>
+        <div class="perm-page-name"><strong>${esc(pageTitle)}</strong></div>
         ${actionsHtml(perm)}
       </div>`
     }
     const hasSectionRows = sections.some((section) => permissionMap.has(`${page}:${section.key}`))
     return `<div class="perm-page-block has-sections">
-      <div class="perm-page-name">
-        <strong>${esc(pageTitle)}</strong>
-        <span class="perm-page-note">${sections.length} 个二级页 · 分别勾选可见</span>
-      </div>
       <div class="perm-page-content">
         ${sections
           .map((section) => {
@@ -5734,17 +5884,16 @@ function consolePermissionTreeHtml(catalog, pages, options = {}) {
           (domain) => {
             const domainTitle = domain.title || domain.label || domain.id
             const domainPages = domain.pages || []
-            const onlyPage = domainPages.length === 1 ? pageMetaMap.get(domainPages[0]) : null
-            const collapsePageName =
-              domainPages.length === 1 &&
-              (onlyPage?.sections || []).length === 0 &&
-              (onlyPage?.title || domainPages[0]) === domainTitle
+            const domainSections = domainPages.reduce(
+              (total, page) => total + ((pageMetaMap.get(page)?.sections || []).length || 1),
+              0,
+            )
             return `<div class="perm-page-group">
             <div class="perm-page-domain">
               <div class="perm-page-domain-title">
                 <span class="perm-domain-mark" aria-hidden="true"></span>
                 <strong>${esc(domainTitle)}</strong>
-                <span class="perm-domain-count">${domainPages.length} 个页面</span>
+                <span class="perm-domain-count">${domainSections} 个页面</span>
               </div>
               ${
                 domainPages.length
@@ -5756,7 +5905,7 @@ function consolePermissionTreeHtml(catalog, pages, options = {}) {
               }
             </div>
             <div class="perm-page-list">${domainPages
-              .map((page) => pageBlockHtml(page, collapsePageName))
+              .map((page) => pageBlockHtml(page))
               .join('')}</div>
           </div>`
           },
@@ -6623,7 +6772,7 @@ function renderRoleEditor(role, allScopes = [], meta = {}) {
     const member = allMembers.find((item) => item.id === button.dataset.roleMemberRemove)
     button.addEventListener('click', (event) => {
       event.stopPropagation()
-      if (member) removeRoleMember(role, member, roleMemberIds, view.querySelector('#role-member-msg'))
+      if (member) removeRoleMember(role, member, roleMemberIds, view.querySelector('#role-member-msg'), button)
     })
   })
   view.querySelector('#role-member-add')?.addEventListener('click', () => {
@@ -8632,7 +8781,7 @@ function approvalInspectorHtml(template, node) {
 
   return `<aside class="wf-inspector">
     <div class="wf-inspector-head">
-      <div><span>节点属性</span><strong>${esc(meta.label)}</strong></div>
+      <div><span>节点属性 · ${esc(meta.label)}</span><strong>${esc(node.title || meta.label)}</strong></div>
       <span class="wf-kind-dot is-${esc(node.kind)}"></span>
     </div>
     <div class="wf-inspector-body">${body}</div>
@@ -9639,7 +9788,7 @@ function renderApprovalPage() {
     : tab === 'records'
       ? '<button type="button" class="btn ghost" data-ap-export>导出记录</button>'
       : `<button type="button" class="btn ghost" data-ap-catalog-refresh>同步权限目录</button>`
-  view.innerHTML = `<section class="approval-shell">
+  view.innerHTML = `<section class="approval-shell${tab === 'records' ? ' is-records' : ''}">
     <div class="approval-top">
       <div class="ap-tabs is-main" role="tablist">
         ${tabs.map((item) => `<button type="button" class="ap-tab${tab === item.id ? ' is-active' : ''}" data-ap-tab="${esc(item.id)}" role="tab" aria-selected="${tab === item.id}">${esc(item.label)}${item.count ? `<span>${item.count}</span>` : ''}</button>`).join('')}
@@ -11037,6 +11186,7 @@ function endpointKindLabel(kind) {
     rerank: '重排',
     asr: '语音转写',
     tts: '语音合成',
+    image: '图片生成',
     video: '视频理解',
     audio: '语音',
   }
@@ -11070,6 +11220,7 @@ function modelSupportsRoutePurpose(model, purpose) {
   if (purpose === 'kb.rerank') return endpointKind === 'rerank'
   if (purpose === 'asr.default') return endpointKind === 'asr'
   if (purpose === 'tts.default') return endpointKind === 'tts'
+  if (purpose === 'image.default') return endpointKind === 'image'
   if (purpose === 'video.analyze') return endpointKind === 'video' || capabilities.includes('video')
   return false
 }
@@ -11100,7 +11251,8 @@ function capabilityChipsHtml(tags = [], limit = 3) {
   )
 }
 
-function modelFormType(tags = []) {
+function modelFormType(tags = [], endpointKind = '') {
+  if (endpointKind === 'image') return 'image'
   const keys = modelCapabilitySummary(tags).keys
   if (keys.includes('rerank')) return 'rerank'
   if (keys.includes('embedding')) return 'embedding'
@@ -11143,6 +11295,7 @@ function confirmCard({
   requireHint = '',
 } = {}) {
   return new Promise((resolve) => {
+    const previousFocus = document.activeElement
     const overlay = document.createElement('div')
     overlay.className = 'modal-overlay confirm-overlay'
     const toneClass = tone === 'warning' ? ' is-warning' : tone === 'brand' ? ' is-brand' : ' is-danger'
@@ -11170,6 +11323,7 @@ function confirmCard({
       </div>
     </div>`
     document.body.appendChild(overlay)
+    document.body.classList.add('eab-modal-open')
     const finish = (value) => {
       if (value) {
         const actionText = DELETE_ACTION_FEEDBACK.test(confirmText) ? confirmText : title
@@ -11177,16 +11331,33 @@ function confirmCard({
       }
       document.removeEventListener('keydown', onKey)
       overlay.remove()
+      document.body.classList.remove('eab-modal-open')
+      if (previousFocus instanceof HTMLElement && previousFocus.isConnected && !previousFocus.closest('[hidden]')) {
+        previousFocus.focus({ preventScroll: true })
+      }
       resolve(value)
     }
     const onKey = (event) => {
       if (event.key === 'Escape') {
         event.preventDefault()
         finish(false)
+        return
+      }
+      if (event.key !== 'Tab') return
+      const focusables = [...overlay.querySelectorAll('button:not([disabled]), input:not([disabled])')]
+      if (!focusables.length) return
+      const first = focusables[0]
+      const last = focusables[focusables.length - 1]
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault()
+        last.focus()
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault()
+        first.focus()
       }
     }
     overlay.addEventListener('click', (event) => {
-      if (event.target === overlay) finish(false)
+      if (event.target === overlay && tone !== 'danger') finish(false)
     })
     overlay.querySelector('[data-confirm-cancel]').addEventListener('click', () => finish(false))
     const okButton = overlay.querySelector('[data-confirm-ok]')
@@ -11219,6 +11390,177 @@ function modelModal(html) {
     if (event.target === overlay) overlay.remove()
   })
   return overlay
+}
+
+function agentRunStatus(status) {
+  return {
+    succeeded: { text: '成功', className: 'ok' },
+    failed: { text: '失败', className: 'warn' },
+    cancelled: { text: '已取消', className: 'warn' },
+    suspended: { text: '挂起 · 等后台工具', className: 'warn' },
+  }[status] ?? { text: '运行中', className: 'warn' }
+}
+
+function agentDuration(ms) {
+  const seconds = Math.max(0, Math.round((Number(ms) || 0) / 1000))
+  if (seconds < 60) return `${seconds} 秒`
+  const minutes = Math.floor(seconds / 60)
+  const rest = seconds % 60
+  if (minutes < 60) return rest ? `${minutes} 分 ${rest} 秒` : `${minutes} 分`
+  const hours = Math.floor(minutes / 60)
+  const minuteRest = minutes % 60
+  return minuteRest ? `${hours} 小时 ${minuteRest} 分` : `${hours} 小时`
+}
+
+function agentRunDetailHtml(detail) {
+  const runs = Array.isArray(detail?.runs) ? detail.runs : []
+  const selected = runs.find((run) => run.selected) ?? runs[0] ?? null
+  const stats = detail?.stats ?? {}
+  const selectedStatus = selected ? agentRunStatus(selected.status) : { text: '—', className: '' }
+  const nodes = runs.map((run) => {
+    const status = agentRunStatus(run.status)
+    const steps = Array.isArray(run.steps) ? run.steps : []
+    const formation = run.formation && typeof run.formation === 'object' ? run.formation : null
+    const formationLabel = formation
+      ? formation.applied
+        ? '已强制编队'
+        : formation.force
+          ? '判定可编队，但被运行时条件拦截'
+          : '未强制编队'
+      : ''
+    const formationMeta = formation
+      ? [
+        formation.spawnedAgents === undefined ? '' : `实际派出 ${formation.spawnedAgents} 个`,
+        formation.blockedBy?.length ? `拦截条件：${formation.blockedBy.join('、')}` : '',
+      ].filter(Boolean).join(' · ')
+      : ''
+    const stepHtml = steps.length
+      ? steps.map((step) => {
+        const args = step.args === null || step.args === undefined
+          ? ''
+          : typeof step.args === 'string'
+            ? step.args
+            : JSON.stringify(step.args, null, 2)
+        return `<div class="agent-run-step">
+          <div class="agent-run-step-head">
+            <span class="agent-run-step-index">${step.seq + 1}</span>
+            <strong>${esc(step.name ?? step.toolId ?? step.kind)}</strong>
+            <span class="pill ${step.status === 'done' ? 'ok' : step.status === 'error' ? 'warn' : ''}">${esc(step.status)}</span>
+            <span class="desc">${esc(step.kind)}${step.toolId ? ` · ${esc(step.toolId)}` : ''} · ${agentDuration(step.durationMs)}</span>
+          </div>
+          ${args ? `<div class="agent-run-step-io"><span>参数</span><pre class="agent-run-code">${esc(args)}</pre></div>` : ''}
+          ${step.resultSummary ? `<div class="agent-run-step-io"><span>结果</span><pre class="agent-run-code">${esc(step.resultSummary)}</pre></div>` : ''}
+        </div>`
+      }).join('')
+      : '<div class="agent-run-empty">这个 Agent 还没有记录工具或模型步骤。</div>'
+    return `<article class="agent-run-node${run.selected ? ' is-selected' : ''}" style="--agent-depth:${Math.max(0, Math.min(20, Number(run.depth) || 0))}">
+      <div class="agent-run-node-main">
+        <div class="agent-run-node-title">
+          <span class="agent-run-branch">${run.depth ? '↳' : '●'}</span>
+          <div>
+            <strong>${esc(run.title ?? run.agentId)}</strong>
+            <div class="desc">${esc(run.agentId)} · run ${esc(run.id)} · ${esc(run.modelId ?? '未记录模型')}</div>
+          </div>
+        </div>
+        <div class="agent-run-node-meta">
+          <span class="pill ${status.className}">${status.text}</span>
+          <span>${agentDuration((run.endedAt ?? Date.now()) - run.startedAt)}</span>
+          <span>${fmtNum(run.spentTokens ?? 0)}${run.budget ? ` / ${fmtNum(run.budget)}` : ''} token</span>
+          <span>${steps.length} 步</span>
+        </div>
+      </div>
+      ${run.error ? `<div class="agent-run-error"><strong>失败原因</strong><span>${esc(run.error)}</span></div>` : ''}
+      ${formation ? `<div class="agent-run-formation${formation.applied ? ' is-on' : ''}">
+        <div class="agent-run-formation-head"><strong>编队门禁 · ${esc(formationLabel)}</strong>${formationMeta ? `<span>${esc(formationMeta)}</span>` : ''}</div>
+        <p>${esc(formation.detail || '未记录编队理由')}</p>
+        ${formation.signals?.length ? `<div class="agent-run-formation-signals">${formation.signals.map((signal) => `<span>${esc(signal)}</span>`).join('')}</div>` : ''}
+      </div>` : ''}
+      <details class="agent-run-steps"${run.selected ? ' open' : ''}>
+        <summary>${steps.length ? `${steps.length} 步工具 / 模型轨迹` : '暂无步骤'}</summary>
+        ${stepHtml}
+      </details>
+    </article>`
+  }).join('')
+
+  return `<div class="agent-run-detail-head">
+    <div>
+      <span class="agent-run-detail-kicker">任务详情</span>
+      <strong>${esc(selected?.title ?? '运行详情')}</strong>
+      <div class="desc">根任务 ${esc(detail?.rootId ?? '—')}${detail?.truncated ? ' · 记录超过 200 条，只展示前 200 条' : ''}</div>
+    </div>
+    <div class="agent-run-detail-actions">
+      <span class="pill ${selectedStatus.className}">${selectedStatus.text}</span>
+      <button class="btn sm ghost" type="button" id="agent-run-detail-refresh">刷新</button>
+    </div>
+  </div>
+  <div class="agent-run-summary">
+    <div><span>父子运行</span><strong>${fmtNum(stats.totalRuns ?? runs.length)} 个</strong><span class="desc">运行中 ${fmtNum(stats.activeRuns ?? 0)} · 失败 ${fmtNum(stats.failedRuns ?? 0)}</span></div>
+    <div><span>总墙钟</span><strong>${agentDuration(stats.wallMs ?? 0)}</strong><span class="desc">各 Agent 耗时合计 ${agentDuration(stats.totalDurationMs ?? 0)}</span></div>
+    <div><span>总 Token</span><strong>${fmtNum(stats.totalTokens ?? 0)}</strong><span class="desc">父子树合计</span></div>
+    <div><span>工具 / 模型步</span><strong>${fmtNum(stats.totalSteps ?? 0)} 步</strong><span class="desc">参数、结果摘要与耗时都在下面</span></div>
+  </div>
+  ${!runs.length ? '<div class="agent-run-empty">没有找到这棵运行树。</div>' : `<div class="agent-run-tree">${nodes}</div>`}`
+}
+
+async function openAgentRunDetail(runId) {
+  if (!runId) return
+  const trigger = document.activeElement
+  document.querySelectorAll('.modal-overlay.agent-run-detail-overlay').forEach((node) => node.remove())
+  const overlay = modelModal(`<div class="modal-head">
+    <div><h3>运行详情</h3><div class="desc" id="agent-run-detail-sub">父任务 → 子 Agent → 工具轨迹</div></div>
+    <button class="modal-x" type="button" aria-label="关闭运行详情">×</button>
+  </div>
+  <div class="agent-run-detail-body" id="agent-run-detail-body" aria-live="polite">
+    <div class="agent-run-empty">正在读取运行详情…</div>
+  </div>`)
+  overlay.classList.add('agent-run-detail-overlay')
+  overlay.setAttribute('role', 'dialog')
+  overlay.setAttribute('aria-modal', 'true')
+  overlay.setAttribute('aria-label', '运行详情')
+  overlay.querySelector('.modal').classList.add('agent-run-detail-modal')
+  const body = overlay.querySelector('#agent-run-detail-body')
+  let generation = 0
+
+  const restoreFocus = () => {
+    if (trigger && typeof trigger.focus === 'function' && trigger.isConnected) trigger.focus()
+  }
+  const close = () => {
+    generation += 1
+    overlay.remove()
+    restoreFocus()
+  }
+  overlay.querySelector('.modal-x')?.addEventListener('click', close)
+  overlay.addEventListener('click', (event) => {
+    if (event.target === overlay) restoreFocus()
+  })
+  document.addEventListener('keydown', function onKey(event) {
+    if (!overlay.isConnected) {
+      document.removeEventListener('keydown', onKey)
+      return
+    }
+    if (event.key === 'Escape') close()
+  })
+
+  async function load() {
+    const current = ++generation
+    try {
+      const detail = await api(`/api/console/agent-runs/${encodeURIComponent(runId)}`)
+      if (current !== generation || !overlay.isConnected) return
+      body.innerHTML = agentRunDetailHtml(detail)
+      body.querySelector('#agent-run-detail-refresh')?.addEventListener('click', () => {
+        body.innerHTML = '<div class="agent-run-empty">正在刷新运行详情…</div>'
+        void load()
+      })
+    } catch (error) {
+      if (current !== generation || !overlay.isConnected) return
+      renderConsoleError(body, error, () => {
+        body.innerHTML = '<div class="agent-run-empty">正在重新读取运行详情…</div>'
+        void load()
+      })
+    }
+  }
+  void load()
+  overlay.querySelector('.modal-x')?.focus()
 }
 
 function fieldInfo(text) {
@@ -11566,6 +11908,7 @@ async function openModelModal(model, providers, roles) {
             <option value="embedding">向量模型</option>
             <option value="rerank">重排序模型</option>
             <option value="audio">语音模型（ASR / TTS）</option>
+            <option value="image">图片生成模型</option>
             <option value="video">视频理解模型</option>
             <option value="custom">自定义能力</option>
           </select></label>
@@ -11576,6 +11919,7 @@ async function openModelModal(model, providers, roles) {
             <option value="rerank">重排 / rerank</option>
             <option value="asr">语音转写 / ASR</option>
             <option value="tts">语音合成 / TTS</option>
+            <option value="image">图片生成 / images generations</option>
             <option value="video">视频理解 / video</option>
           </select></label>
         </div>
@@ -11670,7 +12014,7 @@ async function openModelModal(model, providers, roles) {
   const type = overlay.querySelector('#m-type')
   const typeHint = overlay.querySelector('#m-type-hint')
   const endpoint = overlay.querySelector('#m-endpoint')
-  type.value = modelFormType(initialTags)
+  type.value = modelFormType(initialTags, model?.endpointKind || '')
   const defaultEndpoint = (tags) => {
     if (tags.includes('rerank')) return 'rerank'
     if (tags.includes('embedding')) return 'embeddings'
@@ -11806,6 +12150,7 @@ async function openModelModal(model, providers, roles) {
     embedding: '只做向量化，不参与对话生成；端点类型会自动切到 embeddings。',
     rerank: '重排序模型用于知识库检索后的二次排序；端点类型会自动切到 rerank，请求发往 POST /rerank。',
     audio: '语音链路：ASR 负责把语音转文字，TTS 负责把回答合成语音；务必在「端点类型」里选准。',
+    image: '图片生成：独立内容工具，按文字生成图片并存入个人云空间，不进入对话主链路；端点必须是 OpenAI 兼容的 /images/generations。',
     video: '视频理解：异步抽帧、音轨转写与画面描述；端点类型会自动切到 video。',
     custom: '只按下面勾选的能力工作，不套用预设。',
   }
@@ -11816,6 +12161,7 @@ async function openModelModal(model, providers, roles) {
     embedding: ['embedding'],
     rerank: ['rerank'],
     audio: ['audio'],
+    image: ['chat'],
     video: ['video'],
   }
   const capInputs = [...overlay.querySelectorAll('.models-cap-grid input')]
@@ -11873,6 +12219,7 @@ async function openModelModal(model, providers, roles) {
     if (type.value === 'embedding') endpoint.value = 'embeddings'
     else if (type.value === 'rerank') endpoint.value = 'rerank'
     else if (type.value === 'video') endpoint.value = 'video'
+    else if (type.value === 'image') endpoint.value = 'image'
     else if (type.value === 'audio') endpoint.value = endpoint.value === 'tts' ? 'tts' : 'asr'
     else if (type.value === 'decision') {
       // 决策模型既可能是普通推理，也可能是 SystemOne；切类型时不要粗暴覆盖用户已选的 SystemOne。
@@ -12644,6 +12991,10 @@ async function loadModels() {
       providers
         .map((provider) => {
           const pluginChannel = provider.source === 'plugin'
+          const providerKeyText = provider.apiKeyEnv
+            ? `${provider.apiKeyEnv} ${provider.keyPresent ? '已注入' : '未注入'}`
+            : ''
+          const providerKeyState = provider.apiKeyEnv ? (provider.keyPresent ? '已注入' : '未注入') : ''
           return `<tr>
             <td>
               <div class="models-provider-cell">
@@ -12656,13 +13007,13 @@ async function loadModels() {
               </div>
             </td>
             <td class="mono models-endpoint">${esc(pluginChannel ? '随插件宿主注入' : (provider.baseUrl || '—'))}</td>
-            <td>${
+            <td class="models-secret-cell">${
               pluginChannel
-                ? '<span class="pill ok">插件托管</span>'
+                ? '<span class="pill ok"><span class="models-secret-text">插件托管</span></span>'
                 : provider.apiKeyEnv
-                  ? `<span class="pill ${provider.keyPresent ? 'ok' : 'warn'}">${esc(provider.apiKeyEnv)} ${
-                      provider.keyPresent ? '已注入' : '未注入'
-                    }</span>`
+                  ? `<span class="pill ${provider.keyPresent ? 'ok' : 'warn'}" title="${esc(providerKeyText)}"><span class="models-secret-text">${esc(
+                      provider.apiKeyEnv,
+                    )}</span><span class="models-secret-state">${providerKeyState}</span></span>`
                   : '<span class="muted">不需要</span>'
             }</td>
             <td><span class="models-count">${provider.models}</span></td>
@@ -12743,7 +13094,7 @@ async function loadModels() {
     const providerPanel = `
       <section class="panel models-panel" data-section-panel="providers">
         <div class="models-panel-head">
-          <div>
+          <div class="models-title-line">
             <h2>供应商与端点</h2>
             ${hintBadge('端点说明', '接入端点后会自动读取模型清单；读不到也可以手动添加模型。密钥只保存在服务端，不会回到浏览器。')}
           </div>
@@ -12764,7 +13115,7 @@ async function loadModels() {
     const routePanel = `
       <section class="panel models-panel models-route-panel" data-section-panel="routes">
         <div class="models-panel-head">
-          <div>
+          <div class="models-title-line">
             <h2>用途路由 <span class="models-panel-count">${boundRouteCount}/${routeItems.length}</span></h2>
             ${hintBadge('路由说明', '把「这次要做什么」绑定到具体模型；对话自动模式按实测回复速度选，其他用途留空时按能力和优先级自动挑。变更立即生效，未配置的用途会降级但不阻断现有对话。插件模型只读，暂不参与显式用途绑定。')}
           </div>
@@ -12776,7 +13127,7 @@ async function loadModels() {
     const catalogPanel = `
       <section class="panel models-panel models-catalog-panel" data-section-panel="catalog">
         <div class="models-panel-head">
-          <div>
+          <div class="models-title-line">
             <h2>模型目录 <span class="models-panel-count" id="model-count">${models.length}</span></h2>
             ${hintBadge('能力说明', '按能力管理模型：点击「能力」可直接勾选，保存后立即生效。插件模型要先真实探测通过才会出现在这里；插件停用或卸载后会自动消失。')}
           </div>
@@ -13551,7 +13902,7 @@ function brandingSurfaceCard(key, label, meta, surface) {
 function brandingPanelHtml(branding) {
   return `<section class="panel branding-panel" data-section-panel="data">
     <div class="panel-head">
-      <div><h2>品牌与标签页</h2>${hintBadge('品牌说明', '分别设置管理控制台和员工对话的浏览器标签图标、标签文字、应用内品牌名称；图标会同时用于侧栏 Logo。上传图标后，图标内文字作为未上传时的默认标记保留。保存后控制台立即更新，对话页在刷新或切回标签页时更新。')}</div>
+      <div class="panel-title-line"><h2>品牌与标签页</h2>${hintBadge('品牌说明', '分别设置管理控制台和员工对话的浏览器标签图标、标签文字、应用内品牌名称；图标会同时用于侧栏 Logo。上传图标后，图标内文字作为未上传时的默认标记保留。保存后控制台立即更新，对话页在刷新或切回标签页时更新。')}${hintBadge('图标规范', '支持 PNG / JPEG / WebP / SVG / ICO，单张不超过 256KB；建议使用正方形、透明背景或与主题色接近的图标。保存只改品牌外观，不影响登录、权限或公司信息。')}</div>
       <span class="pill ok">控制台 + 员工对话</span>
     </div>
     <div class="branding-grid">
@@ -13562,7 +13913,6 @@ function brandingPanelHtml(branding) {
       <button class="btn sm primary" type="button" id="branding-save">保存品牌设置</button>
       <span class="branding-state" id="branding-state"></span>
     </div>
-    ${hintNote('图标规范', '支持 PNG / JPEG / WebP / SVG / ICO，单张不超过 256KB；建议使用正方形、透明背景或与主题色接近的图标。保存只改品牌外观，不影响登录、权限或公司信息。')}
   </section>`
 }
 
@@ -13649,7 +13999,6 @@ function bootPanelHtml(boot) {
           ${hintBadge('启动说明', '管理端固定使用全局配置；员工端先读全局默认，公司覆盖开启后按公司自己的片源、文案和规则播放。片源只允许从媒体库选择，不能填任意 URL。')}
           <span id="boot-global-state" class="boot-surface-badge is-state${global.enabled ? '' : ' is-off'}" data-boot-rev="${esc(String(global.revision))}">${global.enabled ? '已启用' : '已停用'} · rev ${esc(String(global.revision))}</span>
         </div>
-        <p class="boot-hero-desc">登录成功后作为页面加载过渡播放；首屏就绪即淡出，不固定等待。关闭全局启用后两端都不播，公司覆盖也不能单独打开；管理端固定用全局，员工端按公司覆盖播放。电影片头按片长播放，可配置跳过。</p>
       </div>
       <div class="boot-hero-controls">
         <label class="boot-switch">
@@ -13698,7 +14047,6 @@ function bootPanelHtml(boot) {
           <h2>公司覆盖</h2>
           <span class="boot-surface-badge">当前公司：${esc(boot?.companyId ?? '—')}</span>
         </div>
-        <p class="boot-hero-desc">为当前公司单独设置员工端片头；管理控制台始终使用上方全局配置。</p>
       </div>
       <label class="boot-switch">
         <span class="boot-switch-copy">
@@ -13923,19 +14271,28 @@ function bindBootConfigPanel() {
 
 async function loadSys() {
   const view = $('#view')
-  renderLoading(view)
+  renderLoading(view, '正在读取系统状态')
   setSide('', true)
   try {
     const health = await api('/api/health')
-    const settings = await api('/api/console/settings').catch(() => null)
-    const boot = await api('/api/console/boot').catch(() => null)
-    const update = await api('/api/console/update').catch(() => null)
-    const concurrency = await api('/api/console/concurrency').catch(() => null)
-    const toolMetrics = await api('/api/console/tool-metrics?days=7').catch(() => null)
-    const agentRuns = await api('/api/console/agent-runs?limit=50').catch(() => null)
-    const mcp = await api('/api/console/mcp').catch(() => null)
-    const a2a = await api('/api/console/a2a').catch(() => null)
-    const jobs = await api('/api/console/jobs?limit=30').catch(() => null)
+    const sysErrors = []
+    const optional = async (label, path) => {
+      try {
+        return await api(path)
+      } catch (err) {
+        sysErrors.push({ label, error: err })
+        return null
+      }
+    }
+    const settings = await optional('控制台设置', '/api/console/settings')
+    const boot = await optional('启动状态', '/api/console/boot')
+    const update = await optional('系统更新', '/api/console/update')
+    const concurrency = await optional('并发与队列', '/api/console/concurrency')
+    const toolMetrics = await optional('工具指标', '/api/console/tool-metrics?days=7')
+    const agentRuns = await optional('Agent 运行', '/api/console/agent-runs?limit=50')
+    const mcp = await optional('MCP 工具', '/api/console/mcp')
+    const a2a = await optional('A2A 任务', '/api/console/a2a')
+    const jobs = await optional('后台作业', '/api/console/jobs?limit=30')
     const jobRows = jobs?.jobs ?? []
     const jobStatusText = {
       queued: '排队中',
@@ -14031,12 +14388,22 @@ async function loadSys() {
     const updateReadonlyNote = canUseSystemUpdate
       ? ''
       : '当前没有「系统更新」页面可见权限；勾选角色或成员「后台权限」中的「系统更新 → 可见」后即可检查并一键更新。'
+    const sysErrorBanner = sysErrors.length
+      ? stateBlockHtml({
+          tone: 'error',
+          title: '部分系统数据读取失败',
+          body: `${sysErrors.map((item) => item.label).join('、')}没有读取成功；对应面板中的 0 或空列表不代表真实状态。`,
+          actionLabel: '重新读取',
+          action: 'sys-retry',
+        })
+      : ''
     view.innerHTML = `
+      ${sysErrorBanner}
       <div class="section-panels">
       ${brandingPanelHtml(branding)}
       ${bootPanelHtml(boot)}
       <section class="panel" data-section-panel="runtime">
-        <div class="panel-head"><div><h2>运行状态</h2>${hintBadge('运行说明', '本机服务与版本；网络设置保存后即时生效，监听地址与端口会自动切换，不用重启服务。')}${hintBadge('部署说明', '这是只给部署方看的运行视图；组织成员不会进入控制台。监听地址与端口可在「网络与访问入口」保存，环境变量优先。')}</div></div>
+        <div class="panel-head"><div class="panel-title-line"><h2>运行状态</h2>${hintBadge('运行说明', '本机服务与版本；网络设置保存后即时生效，监听地址与端口会自动切换，不用重启服务。')}${hintBadge('部署说明', '这是只给部署方看的运行视图；组织成员不会进入控制台。监听地址与端口可在「网络与访问入口」保存，环境变量优先。')}</div></div>
         <div class="kv-grid">
           <div><span>服务</span><strong>正常运行</strong></div>
           <div><span>版本</span><strong class="mono">v${esc(health.version)}</strong></div>
@@ -14048,7 +14415,7 @@ async function loadSys() {
       </section>
       <section class="panel" data-section-panel="concurrency">
         <div class="panel-head">
-          <div><h2>并发与队列</h2>${hintBadge('并发说明', `对话 / 模型 / 工具 / 插件四级闸门；${toolStats?.shared || pluginStats?.shared ? '工具与插件的执行数是 Redis 里的全局计数（跨实例），对话与排队是本进程实时值。' : '数字是当前进程的实时值。'}`)}</div>
+          <div class="panel-title-line"><h2>并发与队列</h2>${hintBadge('并发说明', `对话 / 模型 / 工具 / 插件四级闸门；${toolStats?.shared || pluginStats?.shared ? '工具与插件的执行数是 Redis 里的全局计数（跨实例），对话与排队是本进程实时值。' : '数字是当前进程的实时值。'}`)}</div>
           <div class="panel-actions">
             <span class="pill ${(cap?.queued ?? 0) + (toolStats?.queued ?? 0) + (pluginStats?.queued ?? 0) > 0 ? 'warn' : 'ok'}">
               ${(cap?.queued ?? 0) + (toolStats?.queued ?? 0) + (pluginStats?.queued ?? 0) > 0 ? '有请求排队' : '当前无排队'}
@@ -14085,7 +14452,7 @@ async function loadSys() {
           </table>
         </div>
         <div class="panel-head" style="margin-top:18px">
-          <div><h2>正在执行（实时）</h2>${hintBadge('实时执行', '这是此刻真的占用名额、还没返回的工具调用；「已耗时」从占到名额起算。卡住的回合在这里最直观，不用等它跑完才有记录。')}</div>
+          <div class="panel-title-line"><h2>正在执行（实时）</h2>${hintBadge('实时执行', '这是此刻真的占用名额、还没返回的工具调用；「已耗时」从占到名额起算。卡住的回合在这里最直观，不用等它跑完才有记录。')}</div>
           <div class="panel-actions">
             <span class="pill ${inflightRows.length ? 'warn' : 'ok'}">
               ${inflightRows.length
@@ -14105,7 +14472,7 @@ async function loadSys() {
           </table>
         </div>
         <div class="panel-head" style="margin-top:18px">
-          <div><h2>工具耗时（近 ${toolMetrics?.days ?? 7} 天）</h2>${hintBadge('耗时口径', `只看真实工具步骤（模型与子 Agent 步骤不计）；p50 / p95 是分位耗时，超过 ${Math.round((toolMetrics?.thresholdMs ?? 8000) / 1000)} 秒记为慢工具。这张表就是判断「要不要做对话后台化」的依据。`)}</div>
+          <div class="panel-title-line"><h2>工具耗时（近 ${toolMetrics?.days ?? 7} 天）</h2>${hintBadge('耗时口径', `只看真实工具步骤（模型与子 Agent 步骤不计）；p50 / p95 是分位耗时，超过 ${Math.round((toolMetrics?.thresholdMs ?? 8000) / 1000)} 秒记为慢工具。这张表就是判断「要不要做对话后台化」的依据。`)}</div>
           <div class="panel-actions">
             <span class="pill ${(toolMetrics?.totalSlowCalls ?? 0) > 0 ? 'warn' : 'ok'}">
               ${(toolMetrics?.totalSlowCalls ?? 0) > 0 ? `慢工具 ${fmtNum(toolMetrics.totalSlowCalls)} 次` : '无慢工具'}
@@ -14127,7 +14494,7 @@ async function loadSys() {
       </section>
       <section class="panel" data-section-panel="agents">
         <div class="panel-head">
-          <div><h2>Agent 管理</h2>${hintBadge('管理说明', '容量与运行树放在同一页：上限保存后立即生效；运行树展示父任务、子 Agent 和工具轨迹。')}${hintBadge('生效边界', '新回合、新派发、团队状态接口立即生效；正在执行中的单轮保持回合开始时的上限快照。调低上限不会取消 running / waiting / pinned 岗位，团队面板会显示实际活跃数与新上限。')}</div>
+          <div class="panel-title-line"><h2>Agent 管理</h2>${hintBadge('管理说明', '容量与运行树放在同一页：上限保存后立即生效；运行树展示父任务、子 Agent 和工具轨迹。')}${hintBadge('生效边界', '新回合、新派发、团队状态接口立即生效；正在执行中的单轮保持回合开始时的上限快照。调低上限不会取消 running / waiting / pinned 岗位，团队面板会显示实际活跃数与新上限。')}</div>
           <div class="panel-actions">
             <span class="pill ${(agentRuns?.active ?? 0) > 0 ? 'warn' : 'ok'}">${(agentRuns?.active ?? 0) > 0 ? `运行中 ${agentRuns.active}` : '无运行中任务'}</span>
             <button class="btn sm ghost" type="button" id="agents-refresh">刷新</button>
@@ -14135,7 +14502,7 @@ async function loadSys() {
         </div>
         <div class="agent-manage-block">
           <div class="panel-head">
-            <div><h3 class="agent-manage-subtitle">团队容量</h3>${hintBadge('容量说明', `每个会话同时保留的活跃岗位上限。控制台值优先于环境变量；保存后新回合、新派发和团队状态接口立即使用新上限，不需要重启。已运行的团队不会因调低上限被强制缩容，下一次派发会先回收空闲非固定岗位，仍超限才明确报错。`)}</div>
+            <div class="panel-title-line"><h3 class="agent-manage-subtitle">团队容量</h3>${hintBadge('容量说明', `每个会话同时保留的活跃岗位上限。控制台值优先于环境变量；保存后新回合、新派发和团队状态接口立即使用新上限，不需要重启。已运行的团队不会因调低上限被强制缩容，下一次派发会先回收空闲非固定岗位，仍超限才明确报错。`)}</div>
             <span class="pill ok">${agentTeam.maxWorkers} 个 / 会话</span>
           </div>
           <div class="kv-grid kv-2">
@@ -14152,7 +14519,7 @@ async function loadSys() {
         </div>
         <div class="agent-manage-block">
           <div class="panel-head">
-            <div><h3 class="agent-manage-subtitle">能力卡</h3>${hintBadge('能力卡说明', '内置五张岗位卡，公司可在 agent_cards 表覆盖同名岗位或追加远端 A2A 卡；这里只读展示，主 Agent 编队时只拿技能摘要和工具 id。')}</div>
+            <div class="panel-title-line"><h3 class="agent-manage-subtitle">能力卡</h3>${hintBadge('能力卡说明', '内置五张岗位卡，公司可在 agent_cards 表覆盖同名岗位或追加远端 A2A 卡；这里只读展示，主 Agent 编队时只拿技能摘要和工具 id。')}</div>
             <span class="pill">${agentCards.length} 张</span>
           </div>
           <div class="table-scroll">
@@ -14188,12 +14555,11 @@ async function loadSys() {
         </div>
         <div class="agent-manage-block">
           <div class="panel-head">
-            <div><h3 class="agent-manage-subtitle">MCP 工具</h3>${hintBadge('MCP 说明', '公司级登记 MCP Server，同步后只把 readOnlyHint=true 且未被白名单排除的工具放进模型目录。保存即尝试 tools/list；失败保留旧目录并标记降级。')}</div>
-            <span class="pill ${mcpServers.some((server) => server.health === 'healthy') ? 'ok' : 'warn'}">${mcpServers.length} 个 Server</span>
-          </div>
-          <div class="panel-actions" style="margin-bottom:12px">
-            <button class="btn sm primary" type="button" id="mcp-new">登记 Server</button>
-            <span class="desc">只读工具由 MCP Server 的 annotations 声明；写工具和破坏性工具不会下发。</span>
+            <div class="panel-title-line"><h3 class="agent-manage-subtitle">MCP 工具</h3>${hintBadge('MCP 说明', '公司级登记 MCP Server，同步后只把 readOnlyHint=true 且未被白名单排除的工具放进模型目录。保存即尝试 tools/list；失败保留旧目录并标记降级。')}${hintBadge('只读边界', '只读工具由 MCP Server 的 annotations 声明；写工具和破坏性工具不会下发。')}</div>
+            <div class="panel-actions">
+              <span class="pill ${mcpServers.some((server) => server.health === 'healthy') ? 'ok' : 'warn'}">${mcpServers.length} 个 Server</span>
+              <button class="btn sm primary" type="button" id="mcp-new">登记 Server</button>
+            </div>
           </div>
           ${mcpEditor ? `<div style="border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:14px;background:var(--panel-2)">
             <div class="panel-head" style="margin-bottom:10px">
@@ -14256,16 +14622,15 @@ async function loadSys() {
         </div>
         <div class="agent-manage-block">
           <div class="panel-head">
-            <div><h3 class="agent-manage-subtitle">A2A 远端 Agent</h3>${hintBadge('A2A 说明', '公司级登记远端 Agent，同步 Agent Card 后主 Agent 才能用 a2a_delegate 派遣。Card 必须与端点同源；技能白名单非空时必须指定其中一个技能；连续失败会熔断 60 秒。')}</div>
-            <span class="pill ${a2aPeers.some((peer) => peer.health === 'healthy') ? 'ok' : 'warn'}">${a2aPeers.length} 个 Agent</span>
-          </div>
-          <div class="panel-actions" style="margin-bottom:12px">
-            <button class="btn sm primary" type="button" id="a2a-new">登记 Agent</button>
-            <span class="desc">只登记 Agent Card 和任务映射；远端附件只保存 URI，不复制文件。</span>
+            <div class="panel-title-line"><h3 class="agent-manage-subtitle">A2A 远端 Agent</h3>${hintBadge('A2A 说明', '公司级登记远端 Agent，同步 Agent Card 后主 Agent 才能用 a2a_delegate 派遣。Card 必须与端点同源；技能白名单非空时必须指定其中一个技能；连续失败会熔断 60 秒。')}${hintBadge('登记边界', '只登记 Agent Card 和任务映射；远端附件只保存 URI，不复制文件。')}</div>
+            <div class="panel-actions">
+              <span class="pill ${a2aPeers.some((peer) => peer.health === 'healthy') ? 'ok' : 'warn'}">${a2aPeers.length} 个 Agent</span>
+              <button class="btn sm primary" type="button" id="a2a-new">登记 Agent</button>
+            </div>
           </div>
           <div style="border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:14px;background:var(--panel-2)">
             <div class="panel-head" style="margin-bottom:10px">
-              <div><h3 class="agent-manage-subtitle">EAB 入站端点</h3>${hintBadge('A2A 入站说明', '外部 Agent 通过 /.well-known/agent.json 发现受限技能，用 Bearer 令牌调用 /a2a。第一版只做无工具问答，不读取工作区、知识库、记忆或内部 Agent 工具，也不允许远端继续派活。')}</div>
+              <div class="panel-title-line"><h3 class="agent-manage-subtitle">EAB 入站端点</h3>${hintBadge('A2A 入站说明', '外部 Agent 通过 /.well-known/agent.json 发现受限技能，用 Bearer 令牌调用 /a2a。第一版只做无工具问答，不读取工作区、知识库、记忆或内部 Agent 工具，也不允许远端继续派活。')}</div>
               <span class="pill ${a2aInbound?.enabled ? 'ok' : 'warn'}">${a2aInbound?.enabled ? '已启用' : '未启用'}</span>
             </div>
             <div class="kv-grid kv-2">
@@ -14379,11 +14744,11 @@ async function loadSys() {
         </div>
         <div class="agent-manage-block">
           <div class="panel-head">
-            <div><h3 class="agent-manage-subtitle">运行树</h3>${hintBadge('运行树说明', '父任务和 agent.spawn 派生的子 Agent；点开「步骤」看每个子 Agent 的工具轨迹。')}</div>
+            <div class="panel-title-line"><h3 class="agent-manage-subtitle">运行树</h3>${hintBadge('运行树说明', '父任务和 agent.spawn 派生的子 Agent；点开「步骤」看每个子 Agent 的工具轨迹。')}${hintBadge('隔离说明', '子 Agent 使用独立 runId 和独立会话锁；父任务取消会级联取消子任务。共享云空间文件仍由 P0-1 的资源锁串行化。')}</div>
           </div>
           <div class="table-scroll">
             <table class="data">
-              <thead><tr><th>任务 / Agent</th><th>模型</th><th>状态</th><th>耗时</th><th>步骤</th><th>工具轨迹</th></tr></thead>
+              <thead><tr><th>任务 / Agent</th><th>模型</th><th>状态</th><th>耗时</th><th>Token</th><th>步骤</th><th>工具轨迹</th><th></th></tr></thead>
               <tbody>
                 ${(agentRuns?.runs ?? []).length
                   ? (agentRuns.runs).map((row) => {
@@ -14396,20 +14761,21 @@ async function loadSys() {
                       <td class="mono">${esc(row.modelId ?? '—')}</td>
                       <td><span class="pill ${statusClass}">${statusText}</span></td>
                       <td>${duration} 秒</td>
+                      <td>${fmtNum(row.spentTokens ?? 0)}</td>
                       <td>${steps.length}</td>
                       <td>${steps.length ? `<details><summary>${steps.length} 步</summary><div style="margin-top:6px">${steps.map((step) => `<div style="margin-bottom:6px">${step.seq + 1}. ${esc(step.name ?? step.toolId ?? step.kind)} · ${esc(step.status)} · ${step.durationMs} ms${step.resultSummary ? `<div class="desc">${esc(step.resultSummary)}</div>` : ''}</div>`).join('')}</div></details>` : '<span class="muted">暂无步骤</span>'}</td>
+                      <td><button class="btn sm ghost" type="button" data-agent-run-detail="${esc(row.id)}">详情</button></td>
                     </tr>`
                   }).join('')
-                  : '<tr><td colspan="6" class="muted">还没有 Agent 运行记录；发起一次对话后这里会出现根任务和子 Agent</td></tr>'}
+                  : '<tr><td colspan="8" class="muted">还没有 Agent 运行记录；发起一次对话后这里会出现根任务和子 Agent</td></tr>'}
               </tbody>
             </table>
           </div>
-          ${hintNote('隔离说明', '子 Agent 使用独立 runId 和独立会话锁；父任务取消会级联取消子任务。共享云空间文件仍由 P0-1 的资源锁串行化。')}
         </div>
       </section>
       <section class="panel" data-section-panel="jobs">
         <div class="panel-head">
-          <div><h2>后台作业</h2>${hintBadge('作业说明', '控制台触发的慢操作（插件通道刷新、模型批量探测）提交后在这里排队执行；状态存在库里，多实例下任何一台都能回读。没配 Redis 时 worker 按 1.5 秒轮询，配了 Redis 则提交后即时唤醒。')}</div>
+          <div class="panel-title-line"><h2>后台作业</h2>${hintBadge('作业说明', '控制台触发的慢操作（插件通道刷新、模型批量探测）提交后在这里排队执行；状态存在库里，多实例下任何一台都能回读。没配 Redis 时 worker 按 1.5 秒轮询，配了 Redis 则提交后即时唤醒。')}${hintBadge('租约说明', '执行中的作业带 5 分钟租约，实例崩溃后租约过期会被放回队列重跑；只有还在排队的作业可以取消。')}</div>
           <div class="panel-actions">
             <span class="pill ${jobRows.some((job) => job.status === 'queued' || job.status === 'running') ? 'warn' : 'ok'}">
               ${jobRows.some((job) => job.status === 'queued' || job.status === 'running')
@@ -14447,11 +14813,10 @@ async function loadSys() {
             </tbody>
           </table>
         </div>
-        ${hintNote('租约说明', '执行中的作业带 5 分钟租约，实例崩溃后租约过期会被放回队列重跑；只有还在排队的作业可以取消。')}
       </section>
       <section class="panel" data-section-panel="runtime">
         <div class="panel-head">
-          <div><h2>网络与访问入口</h2>${hintBadge('端口说明', '局域网开关切换即生效；监听地址与端口保存后自动重建监听，不用重启服务。本机访问填 127.0.0.1；局域网访问填 0.0.0.0，并确认服务器防火墙已放行两个端口。环境变量 EAB_HOST / EAB_PORT / EAB_ADMIN_PORT 优先于这里。')}</div>
+          <div class="panel-title-line"><h2>网络与访问入口</h2>${hintBadge('端口说明', '局域网开关切换即生效；监听地址与端口保存后自动重建监听，不用重启服务。本机访问填 127.0.0.1；局域网访问填 0.0.0.0，并确认服务器防火墙已放行两个端口。环境变量 EAB_HOST / EAB_PORT / EAB_ADMIN_PORT 优先于这里。')}</div>
           <span class="pill ${network.allowRemoteConsole ? 'warn' : 'ok'}" id="net-access-pill">${network.allowRemoteConsole ? '允许局域网登录控制台' : '控制台仅本机登录'}</span>
         </div>
         <div class="kv-grid kv-2">
@@ -14514,7 +14879,7 @@ async function loadSys() {
       </section>
       <section class="panel" id="update-panel" data-section-panel="update">
         <div class="panel-head">
-          <div><h2>系统更新</h2>${hintBadge('更新说明', '从 GitHub Release 检测新版本；确认后校验源码包版本与 sha256，备份代码和数据库，再由更新器替换并重启；新版本健康检查失败会自动回滚。命令行方式：eab update（升级最新版本） / eab update <版本>（升级或降级到指定版本） / eab update --check（只检查不安装）。数据目录 .eab-dev 不会被整体替换。本页只配置「可见」，可见即可查看版本、检查更新并执行一键更新。')}</div>
+          <div class="panel-title-line"><h2>系统更新</h2>${hintBadge('更新说明', '从 GitHub Release 检测新版本；确认后校验源码包版本与 sha256，备份代码和数据库，再由更新器替换并重启；新版本健康检查失败会自动回滚。命令行方式：eab update（升级最新版本） / eab update <版本>（升级或降级到指定版本） / eab update --check（只检查不安装）。数据目录 .eab-dev 不会被整体替换。本页只配置「可见」，可见即可查看版本、检查更新并执行一键更新。')}</div>
           <div class="panel-actions">
             <span class="pill ${update?.hasUpdate ? 'warn' : 'ok'}" id="update-pill">${update?.hasUpdate ? '发现新版本' : update?.latest ? '已是最新' : '尚未检查'}</span>
           </div>
@@ -14527,7 +14892,7 @@ async function loadSys() {
         </div>
         <div class="inline-note bad-text" id="update-error" style="margin-top:10px" ${update?.error ? '' : 'hidden'}>${esc(update?.error ?? '')}</div>
         <div class="inline-note" id="update-result" style="margin-top:10px"></div>
-        <div id="update-notes-wrap">${update?.notes ? `<details class="update-notes" style="margin-top:10px"><summary>查看 v${esc(update.latest ?? '')} 更新说明</summary><pre style="white-space:pre-wrap;margin:8px 0 0;max-height:240px;overflow:auto">${esc(update.notes)}</pre></details>` : ''}</div>
+        <div id="update-notes-wrap">${renderUpdateNotesHtml(update?.notes, update?.latest)}</div>
         <div class="panel-actions" style="margin-top:12px">
           <button class="btn sm ghost" type="button" id="update-check"${canCheckSystemUpdate ? '' : ' disabled'}>检查更新</button>
           <button class="btn sm ${canApplySystemUpdate ? 'primary' : 'ghost'}" type="button" id="update-apply" ${canApplySystemUpdate && update?.hasUpdate && update?.sourceUrl ? '' : 'disabled'}>一键更新</button>
@@ -14536,7 +14901,7 @@ async function loadSys() {
         <div class="inline-note" id="update-state" style="margin-top:10px">${updateReadonlyNote}</div>
       </section>
       <section class="panel" data-section-panel="runtime">
-        <div class="panel-head"><div><h2>准入与安全</h2>${hintBadge('准入说明', '控制台不是员工入口，只有服务器本机或部署方账号能进；远程访问需部署侧显式开启。')}</div></div>
+        <div class="panel-head"><div class="panel-title-line"><h2>准入与安全</h2>${hintBadge('准入说明', '控制台不是员工入口，只有服务器本机或部署方账号能进；远程访问需部署侧显式开启。')}</div></div>
         <div class="kv-grid">
           <div><span>登录账号</span><strong class="mono">admin</strong></div>
           <div><span>登录方式</span><strong>超级管理员账号 + 密码</strong></div>
@@ -14548,7 +14913,7 @@ async function loadSys() {
       </section>
       <section class="panel" data-section-panel="data">
         <div class="panel-head">
-          <div><h2>存储位置</h2>${hintBadge('路径规则', '每个分类都可以单独指定绝对路径；没单独配置时跟随总存储位置。点击「选择目录…」选择服务器上的目录，保存后立即复制/切换，不需要重启；旧目录保留。目标目录已有数据时不会自动覆盖。')}</div>
+          <div class="panel-title-line"><h2>存储位置</h2>${hintBadge('路径规则', '每个分类都可以单独指定绝对路径；没单独配置时跟随总存储位置。点击「选择目录…」选择服务器上的目录，保存后立即复制/切换，不需要重启；旧目录保留。目标目录已有数据时不会自动覆盖。')}</div>
           <span class="pill ${storagePending.length > 0 ? 'warn' : 'ok'}">${storagePending.length > 0 ? '待重启迁移' : '保存后即时切换'}</span>
         </div>
         <div class="storage-rows" id="storage-rows">
@@ -14579,7 +14944,7 @@ async function loadSys() {
       </section>
       <section class="panel" data-section-panel="data">
         <div class="panel-head">
-          <div><h2>日志、审计与数据保留</h2>${hintBadge('清理说明', '同步记录、渠道事件、登录失败、插件事件按日志保留天数清理；会话与消息、云空间历史版本、工具/技能/团队/计划/异步任务记录按项目记录天数清理（默认永久，设天数后生效）；知识库召回测试记录按测试记录天数清理，作用于所有知识库；审计按独立天数，只从最老一端连续删除，被删段最后一行会留作链锚点，所以清理本身不会造成断链。数据连接的外部库内容始终只读，EAB 不自动写删；连接产生的同步记录和查询审计分别随日志/审计清理。回收区到期后物理副本与元数据一并删除。后台每 6 小时检查一次。')}</div>
+          <div class="panel-title-line"><h2>日志、审计与数据保留</h2>${hintBadge('清理说明', '同步记录、渠道事件、登录失败、插件事件按日志保留天数清理；会话与消息、云空间历史版本、工具/技能/团队/计划/异步任务记录按项目记录天数清理（默认永久，设天数后生效）；知识库召回测试记录按测试记录天数清理，作用于所有知识库；审计按独立天数，只从最老一端连续删除，被删段最后一行会留作链锚点，所以清理本身不会造成断链。数据连接的外部库内容始终只读，EAB 不自动写删；连接产生的同步记录和查询审计分别随日志/审计清理。回收区到期后物理副本与元数据一并删除。后台每 6 小时检查一次。')}</div>
           <span class="pill">日志 ${retentionDays > 0 ? `${retentionDays} 天` : '永久'} · 审计 ${auditRetentionDays > 0 ? `${auditRetentionDays} 天` : '永久'} · Agent 轨迹 ${agentRetentionDays > 0 ? `${agentRetentionDays} 天` : '永久'} · 项目记录 ${recordRetentionDays > 0 ? `${recordRetentionDays} 天` : '永久'} · 测试记录 ${kbTestRetentionDays} 天 · 回收区 ${workspaceRecycleDays > 0 ? `${workspaceRecycleDays} 天` : '永久'}</span>
         </div>
         <div class="kv-grid">
@@ -14622,7 +14987,7 @@ async function loadSys() {
         <div class="inline-note" id="retention-state" style="margin-top:10px"></div>
       </section>
       <section class="panel" data-section-panel="runtime">
-        <div class="panel-head"><div><h2>配置边界</h2>${hintBadge('边界说明', '哪些东西在这里配，哪些不在这里配；进程托管、日志级别、环境变量与防火墙属于部署侧。')}</div></div>
+        <div class="panel-head"><div class="panel-title-line"><h2>配置边界</h2>${hintBadge('边界说明', '哪些东西在这里配，哪些不在这里配；进程托管、日志级别、环境变量与防火墙属于部署侧。')}</div></div>
         <div class="mini-list">
           <div class="mini-row"><span>在这里配置</span><div><span class="chip accent">组织与成员</span><span class="chip accent">角色权限</span><span class="chip accent">知识库</span><span class="chip accent">模型供应商</span><span class="chip accent">渠道凭证</span><span class="chip accent">插件</span></div></div>
           <div class="mini-row"><span>不在这里配置</span><div><span class="chip">进程托管</span><span class="chip">日志级别</span><span class="chip">环境变量 EAB_DB</span><span class="chip">防火墙</span></div></div>
@@ -14632,7 +14997,7 @@ async function loadSys() {
     view.querySelector('.section-panels')?.insertAdjacentHTML(
       'beforeend',
       `<section class="panel" data-section-panel="data">
-        <div class="panel-head"><div><h2>平台与运维</h2>${hintBadge('运维说明', '数据库备份；渠道绑定已统一到「连接与平台 → 渠道 → 企业一键绑定」。')}</div>
+        <div class="panel-head"><div class="panel-title-line"><h2>平台与运维</h2>${hintBadge('运维说明', '数据库备份；渠道绑定已统一到「连接与平台 → 渠道 → 企业一键绑定」。')}</div>
           <div class="panel-actions">
             <button class="btn sm ghost" type="button" id="backup-now">SQLite 快照</button>
             <button class="btn sm ghost" type="button" id="backup-runtime">运行数据备份</button>
@@ -14645,6 +15010,7 @@ async function loadSys() {
     for (const panel of view.querySelectorAll('[data-section-panel]')) {
       panel.hidden = panel.dataset.sectionPanel !== activeSystemSection
     }
+    view.querySelector('[data-state-action="sys-retry"]')?.addEventListener('click', () => loadSys())
     bindBootConfigPanel()
     const concurrencyRefresh = $('#concurrency-refresh')
     if (concurrencyRefresh) {
@@ -14658,6 +15024,11 @@ async function loadSys() {
     if (agentsRefresh) {
       agentsRefresh.addEventListener('click', () => PAGES.system.render())
     }
+    view.querySelectorAll('[data-agent-run-detail]').forEach((button) => {
+      button.addEventListener('click', () => {
+        void openAgentRunDetail(button.dataset.agentRunDetail ?? '')
+      })
+    })
     const jobsRefresh = $('#jobs-refresh')
     if (jobsRefresh) {
       jobsRefresh.addEventListener('click', () => PAGES.system.render())
@@ -15743,11 +16114,7 @@ async function loadSys() {
         error.hidden = !updateNow?.error
       }
       const notes = $('#update-notes-wrap')
-      if (notes) {
-        notes.innerHTML = updateNow?.notes
-          ? `<details class="update-notes" style="margin-top:10px"><summary>查看 v${esc(updateNow.latest ?? '')} 更新说明</summary><pre style="white-space:pre-wrap;margin:8px 0 0;max-height:240px;overflow:auto">${esc(updateNow.notes)}</pre></details>`
-          : ''
-      }
+      if (notes) notes.innerHTML = renderUpdateNotesHtml(updateNow?.notes, updateNow?.latest)
     }
     renderUpdateResult(updateNow?.lastResult)
     const updateCheck = $('#update-check')
@@ -15891,7 +16258,7 @@ async function loadSys() {
 
     refreshBackups()
   } catch (err) {
-    renderDenied(view, err)
+    renderConsoleError(view, err, () => loadSys())
   }
 }
 
@@ -16576,10 +16943,33 @@ async function loadTools() {
       if (access.mode === 'none') return '<span class="pill warn">默认未授权</span>'
       if (access.mode === 'all') return '<span class="pill ok">所有角色</span>'
       if ((access.roleCodes || []).length === 0) return '<span class="pill warn">未选择角色</span>'
-      return `<span class="tool-role-chips">${access.roleCodes
+      return `<span class="tool-role-chips">${(access.roleCodes || [])
         .map((code) => `<span class="chip">${esc(roleNames.get(code) || code)}</span>`)
         .join('')}</span>`
     }
+    const projectExec = data.projectExec || {}
+    const projectExecReady = projectExec.mode !== 'strict' || projectExec.strictReady
+    const projectExecTone = projectExec.mode === 'strict' ? (projectExecReady ? 'ok' : 'warn') : projectExec.mode === 'local' ? 'warn' : ''
+    const projectExecText = (() => {
+      if (!projectExec.mode) return '状态未知：工具目录没有返回项目命令执行状态。'
+      if (projectExec.mode === 'off') return '项目命令执行未启用：project.exec / project.job 不出现在工具目录，也不会执行命令。'
+      if (projectExec.mode === 'local') {
+        const allowlist = projectExec.allowlistError
+          ? `白名单正则非法：${esc(projectExec.allowlistError)}，所有命令都会被拒绝。`
+          : `白名单 ${projectExec.allowlistRules ?? 0} 条（可为空，空表示不做额外限制）。`
+        return `本地执行：只有路径锁和危险命令黑名单，没有 OS 隔离，网络不限制。${allowlist}`
+      }
+      if (!projectExec.backend) {
+        return `strict 已配置，但没有可用后端：直接拒绝执行，不会回落本地执行。${esc(projectExec.backendDetail || '')}`
+      }
+      if (projectExec.allowlistError) {
+        return `strict + ${esc(projectExec.backend)}，但白名单正则非法：${esc(projectExec.allowlistError)}。所有命令都会被拒绝。`
+      }
+      if (!projectExec.allowlistRules) {
+        return `strict + ${esc(projectExec.backend)}，但白名单为空：所有命令都会被拒绝。`
+      }
+      return `strict + ${esc(projectExec.backend)}：网络拒绝，白名单 ${projectExec.allowlistRules} 条；${esc(projectExec.backendDetail || '')}`
+    })()
     const mergedTools = [...data.tools]
     const rows = mergedTools
       .map((tool) => {
@@ -16608,7 +16998,7 @@ async function loadTools() {
     const pluginCount = mergedTools.length - builtinCount
     view.innerHTML = `
       <section class="panel">
-        <div class="panel-head"><div><h2>工具注册表</h2><span class="hint">${builtinCount} 个内置工具 + ${pluginCount} 个公司插件工具</span>${hintBadge('工具说明', '这里只展示内置工具与公司插件工具。个人插件工具不进入平台工具注册表，只留在安装人的个人工作台。公司插件工具默认所有角色可用，也可改成指定角色；个人插件工具的角色授权在「插件管理 > 个人插件详情」中单独配置。角色配置是工具原有 scope 校验之外的附加限制，不会跳过 scope。')}</div>
+        <div class="panel-head"><div class="panel-title-line"><h2>工具注册表</h2><span class="hint">${builtinCount} 个内置工具 + ${pluginCount} 个公司插件工具</span>${hintBadge('工具说明', '这里只展示内置工具与公司插件工具。个人插件工具不进入平台工具注册表，只留在安装人的个人工作台。公司插件工具默认所有角色可用，也可改成指定角色；个人插件工具的角色授权在「插件管理 > 个人插件详情」中单独配置。角色配置是工具原有 scope 校验之外的附加限制，不会跳过 scope。')}</div>
           <div class="tools-panel-tools">
             <label class="models-search"><span class="models-search-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="6.5"></circle><path d="m16 16 4 4"></path></svg></span><input id="tool-search" type="search" placeholder="搜索工具、说明或角色" aria-label="搜索工具" autocomplete="off" /></label>
             <span class="models-panel-note" id="tool-count"></span>
@@ -16625,6 +17015,7 @@ async function loadTools() {
       <section class="panel">
         <div class="panel-head"><h2>调用规则</h2></div>
         <div class="mini-list">
+          <div class="mini-row"><span>项目命令</span><div><span class="pill ${projectExecTone}">${projectExec.mode || 'unknown'}</span> ${projectExecText}</div></div>
           <div class="mini-row"><span>角色</span><div>内置工具和公司插件工具默认所有角色可用；改成指定角色后，只有拥有这些角色的成员能看到并调用。个人插件工具不进入这个注册表，只在安装人的个人工作台出现；管理员在「插件管理 > 个人插件详情」中给它配置可用角色，但不能代替安装人执行。</div></div>
           <div class="mini-row"><span>鉴权</span><div>每个工具仍声明所需 scope；没有 scope 直接 403，不进入执行。插件工具统一要求 agent:tool:invoke。角色白名单和 scope 同时满足才会放行。</div></div>
           <div class="mini-row"><span>插件</span><div>个人插件工具不进入平台通用工具目录，安装人只在个人工作台看到自己的工具；安装个人插件不会自动获得角色授权。公司/员工停用或卸载插件后，下一次对话立即看不到、也调不到。</div></div>
@@ -16697,24 +17088,24 @@ async function loadUsage(days = 30) {
         (item) => `<tr>
           <td class="mono">${esc(item.day)}</td>
           <td>${esc(item.userName)}<div class="desc mono">${esc(item.userId)}</div></td>
-          <td class="num">${item.requests}</td>
-          <td class="num">${item.promptTokens}</td>
-          <td class="num">${item.completionTokens}</td>
+          <td class="num">${fmtNum(item.requests)}</td>
+          <td class="num">${fmtNum(item.promptTokens)}</td>
+          <td class="num">${fmtNum(item.completionTokens)}</td>
         </tr>`,
       )
       .join('')
     view.innerHTML = `
       <section class="panel">
-        <div class="panel-head"><div><h2>最近 ${days} 天</h2>${hintBadge('统计口径', '按人和按天聚合；只统计当前管理范围内的对话请求。')}</div></div>
-        <div class="kv-grid">
-          <div><span>对话请求</span><strong>${data.totals.requests}</strong></div>
-          <div><span>Prompt tokens</span><strong>${data.totals.promptTokens}</strong></div>
-          <div><span>Completion tokens</span><strong>${data.totals.completionTokens}</strong></div>
-          <div><span>合计 tokens</span><strong>${data.totals.promptTokens + data.totals.completionTokens}</strong></div>
+        <div class="panel-head"><div class="panel-title-line"><h2>最近 ${days} 天</h2>${hintBadge('统计口径', '按人和按天聚合；只统计当前管理范围内的对话请求。')}</div></div>
+        <div class="kv-grid usage-kv-grid">
+          <div><span>对话请求</span><strong>${fmtNum(data.totals.requests)}</strong></div>
+          <div><span>Prompt tokens</span><strong>${fmtNum(data.totals.promptTokens)}</strong></div>
+          <div><span>Completion tokens</span><strong>${fmtNum(data.totals.completionTokens)}</strong></div>
+          <div><span>合计 tokens</span><strong>${fmtNum(data.totals.promptTokens + data.totals.completionTokens)}</strong></div>
         </div>
       </section>
       <section class="panel">
-        <div class="panel-head"><h2>明细</h2><span class="hint">${data.items.length} 条</span></div>
+        <div class="panel-head"><div class="panel-title-line"><h2>明细</h2><span class="hint">${data.items.length} 条</span></div></div>
         <table class="data">
           <thead><tr><th>日期</th><th>成员</th><th class="num">请求</th><th class="num">Prompt</th><th class="num">Completion</th></tr></thead>
           <tbody>${rows || '<tr><td colspan="5" class="empty">还没有对话用量。到 /chat 用员工账号发一条消息就会出现在这里。</td></tr>'}</tbody>
@@ -16980,10 +17371,14 @@ async function loadCompanyProfile() {
     view.innerHTML = `
       <section class="panel">
         <div class="panel-head">
-          <div><h2>${esc(company.name)}</h2><span class="hint mono">${esc(company.slug)} · ${esc(company.id)}</span>${hintBadge(
-            active ? '状态说明' : '停用说明',
-            active ? '成员可以正常登录对话；停用后成员登录会被拒绝，控制台仍可管理。' : '成员登录会被拒绝；重新启用后立即恢复。',
-          )}</div>
+          <div class="panel-title-line company-title-line">
+            <h2>${esc(company.name)}</h2>
+            <span class="hint mono">${esc(company.slug)} · ${esc(company.id)}</span>
+            ${hintBadge(
+              active ? '状态说明' : '停用说明',
+              active ? '成员可以正常登录对话；停用后成员登录会被拒绝，控制台仍可管理。' : '成员登录会被拒绝；重新启用后立即恢复。',
+            )}
+          </div>
           <div class="company-head-actions">
             <span class="pill ${active ? 'ok' : 'danger'}">${active ? '在营' : '已停用'}</span>
             <button class="btn sm primary" type="button" id="company-rename">重命名</button>
@@ -17000,7 +17395,7 @@ async function loadCompanyProfile() {
 
       <section class="panel">
         <div class="panel-head">
-          <div><h2>助手身份</h2>${hintBadge(
+          <div class="panel-title-line"><h2>助手身份</h2>${hintBadge(
             '展示位置',
             '显示在员工工作台 AI 消息左侧：头像在上，名字在下方。不配置时使用默认「AI」。',
           )}</div>
@@ -17030,7 +17425,7 @@ async function loadCompanyProfile() {
       </section>
 
       <section class="panel">
-        <div class="panel-head"><div><h2>规模</h2>${hintBadge('统计说明', '来自当前库，实时统计；成员包含在职与停用，部门包含根节点以下全部层级。')}</div></div>
+        <div class="panel-head"><div class="panel-title-line"><h2>规模</h2>${hintBadge('统计说明', '来自当前库，实时统计；成员包含在职与停用，部门包含根节点以下全部层级。')}</div></div>
         <div class="stats">
           <div class="stat"><div class="stat-label">成员</div><div class="stat-value">${fmtNum(counts.members)}<span class="stat-unit">在职 ${fmtNum(counts.activeMembers)}</span></div></div>
           <div class="stat"><div class="stat-label">部门</div><div class="stat-value">${fmtNum(counts.departments)}</div></div>
@@ -17040,7 +17435,7 @@ async function loadCompanyProfile() {
       </section>
 
       <section class="panel">
-        <div class="panel-head"><div><h2>渠道绑定</h2>${hintBadge('渠道说明', '一个渠道一行；绑定与解绑统一在「连接与平台 → 渠道 → 企业一键绑定」操作。')}</div>
+        <div class="panel-head"><div class="panel-title-line"><h2>渠道绑定</h2>${hintBadge('渠道说明', '一个渠道一行；绑定与解绑统一在「连接与平台 → 渠道 → 企业一键绑定」操作。')}</div>
           <button class="btn sm ghost" type="button" id="company-goto-channel">去渠道页</button></div>
         <table class="data">
           <thead><tr><th>渠道</th><th>状态</th><th>组织 / 租户</th><th>启用</th><th>最近同步</th></tr></thead>
@@ -17049,7 +17444,7 @@ async function loadCompanyProfile() {
       </section>
 
       <section class="panel">
-        <div class="panel-head"><div><h2>危险操作</h2><span class="hint">不可撤销，执行前请确认已导出需要保留的数据</span></div></div>
+        <div class="panel-head"><div class="panel-title-line"><h2>危险操作</h2><span class="hint">不可撤销，执行前请确认已导出需要保留的数据</span></div></div>
         <div class="setup-list">
           <div class="setup-row">
             <span class="setup-state ${active ? '' : 'done'}">${active ? '在营' : '已停用'}</span>
@@ -17226,7 +17621,11 @@ async function loadQuota(month = state.quotaMonth || '') {
     const header = `
       <section class="panel">
         <div class="panel-head">
-          <div><h2>${esc(data.month)} · 额度与用量</h2><span class="hint">${esc(data.company.name)}</span>${hintBadge('判定顺序', '额度按成员 → 部门 → 公司逐级判定；成员额度优先，部门额度覆盖整棵子树。')}</div>
+          <div class="panel-title-line">
+            <h2>${esc(data.month)} · 额度与用量</h2>
+            <span class="hint">${esc(data.company.name)}</span>
+            ${hintBadge('判定顺序', '额度按成员 → 部门 → 公司逐级判定；成员额度优先，部门额度覆盖整棵子树。')}
+          </div>
           <div class="panel-actions">
             <label class="field-inline"><span>月份</span><input type="month" id="quota-month" value="${esc(data.month)}" /></label>
           </div>
@@ -17247,7 +17646,7 @@ async function loadQuota(month = state.quotaMonth || '') {
       const cell = quotaUsageCell(usage, data.company.quota)
       table = `
         <section class="panel">
-          <div class="panel-head"><div><h2>公司月度额度</h2>${hintBadge('额度规则', '所有成员共享同一个上限；达到上限后本月新的对话请求会被拦截。')}</div>
+          <div class="panel-head"><div class="panel-title-line"><h2>公司月度额度</h2>${hintBadge('额度规则', '所有成员共享同一个上限；达到上限后本月新的对话请求会被拦截。')}</div>
             <button class="btn sm ghost" type="button" data-quota-edit="company" data-scope-id="${esc(data.company.id)}" data-scope-name="${esc(data.company.name)}">设置额度</button></div>
           <div class="table-wrap"><table class="data quota-table">
             <thead><tr><th>范围</th><th class="num">请求</th><th class="num">token</th><th>上限</th><th>使用率</th></tr></thead>
@@ -17280,7 +17679,7 @@ async function loadQuota(month = state.quotaMonth || '') {
         .join('')
       table = `
         <section class="panel">
-          <div class="panel-head"><div><h2>部门额度</h2>${hintBadge('额度规则', '部门额度覆盖整棵子树，下级的用量也算在这里。')}</div></div>
+          <div class="panel-head"><div class="panel-title-line"><h2>部门额度</h2>${hintBadge('额度规则', '部门额度覆盖整棵子树，下级的用量也算在这里。')}</div></div>
           <div class="table-wrap"><table class="data quota-table wide">
             <thead><tr><th>部门</th><th class="num">成员</th><th class="num">请求</th><th class="num">token</th><th>上限</th><th>使用率</th><th>操作</th></tr></thead>
             <tbody>${rows || '<tr><td colspan="7" class="empty">还没有部门</td></tr>'}</tbody>
@@ -17307,7 +17706,7 @@ async function loadQuota(month = state.quotaMonth || '') {
         .join('')
       table = `
         <section class="panel">
-          <div class="panel-head"><div><h2>成员额度</h2>${hintBadge('额度规则', '成员额度优先级最高：个人用完即拦，不影响同部门其他人。')}</div></div>
+          <div class="panel-head"><div class="panel-title-line"><h2>成员额度</h2>${hintBadge('额度规则', '成员额度优先级最高：个人用完即拦，不影响同部门其他人。')}</div></div>
           <div class="table-wrap"><table class="data quota-table wide">
             <thead><tr><th>成员</th><th>部门</th><th>状态</th><th class="num">请求</th><th class="num">token</th><th>上限</th><th>使用率</th><th>操作</th></tr></thead>
             <tbody>${rows || '<tr><td colspan="8" class="empty">还没有成员</td></tr>'}</tbody>
@@ -17417,7 +17816,7 @@ function openQuotaEdit(row) {
 
 async function loadAudit(action = '', page = 0) {
   const view = $('#view')
-  renderLoading(view)
+  renderLoading(view, '正在读取审计记录', { skeleton: true, rows: 6 })
   setSide(`
     <div class="side-head audit-side-head"><span class="side-title">审计</span>${hintBadge('审计说明', '审计表 append-only + 哈希链；列表/导出可配置读 PG 镜像，哈希链校验始终读 SQLite 权威链。')}</div>
     <div class="side-list">
@@ -17436,21 +17835,36 @@ async function loadAudit(action = '', page = 0) {
     const AUDIT_PAGE_SIZE = 30
     const data = await api(`/api/console/audit?limit=${AUDIT_PAGE_SIZE}&offset=${page * AUDIT_PAGE_SIZE}${action ? `&action=${encodeURIComponent(action)}` : ''}`)
     const rows = data.items
-      .map(
-        (item) => `<tr>
+      .map((item) => {
+        const [date, time] = fmtDateTime(item.createdAt).split(' ')
+        return `<tr>
           <td class="mono">#${item.seq}</td>
           <td><span class="chip">${esc(item.action)}</span><div class="desc">${esc(item.resourceType || '')} ${esc(item.resourceId || '')}</div></td>
           <td>${esc(item.actorUserId || '—')}</td>
           <td><span class="pill ${item.result === 'success' ? 'ok' : 'warn'}">${esc(item.result)}</span></td>
           <td class="mono">${esc(item.ip || '—')}</td>
-          <td class="mono desc">${esc(item.createdAt)}</td>
-        </tr>`,
-      )
+          <td class="mono" title="${esc(item.createdAt)}"><span>${esc(date || '—')}</span><div class="desc">${esc(time || '')}</div></td>
+        </tr>`
+      })
       .join('')
+    const emptyAuditState = stateBlockHtml({
+      compact: true,
+      title: action ? '当前筛选没有记录' : '还没有审计记录',
+      body: action
+        ? '换一个操作类型，或回到全部操作查看完整审计链。'
+        : '成员、部门、对话或登录操作产生后，会按顺序写入这里。',
+      actionLabel: action ? '查看全部操作' : '刷新',
+      action: action ? 'audit-all' : 'audit-reload',
+    })
     view.innerHTML = `
       <section class="panel">
         <div class="panel-head">
-          <div><h2>操作记录</h2><span class="hint">${data.total} 条${action ? ` · 过滤 ${esc(action)}` : ''} · 数据源 ${data.source === 'postgres' ? 'PostgreSQL' : 'SQLite'}${data.fallbackReason ? ` · ${esc(data.fallbackReason)}` : ''}</span></div>
+          <div class="panel-title-line">
+            <h2>操作记录</h2>
+            <span class="hint">${data.total} 条${action ? ` · 过滤 ${esc(action)}` : ''}</span>
+            <span class="hint">数据源 ${data.source === 'postgres' ? 'PostgreSQL' : 'SQLite'}${data.fallbackReason ? ` · ${esc(data.fallbackReason)}` : ''}</span>
+            ${hintBadge('导出说明', '导出包含最近 10 万条；更早的记录不会写入导出文件。')}
+          </div>
           <div class="panel-actions">
             <button class="btn sm ghost" type="button" id="audit-verify">校验哈希链</button>
             <button class="btn sm ghost" type="button" id="audit-csv">导出 CSV</button>
@@ -17461,13 +17875,17 @@ async function loadAudit(action = '', page = 0) {
         <div class="table-scroll">
           <table class="data">
             <thead><tr><th>序号</th><th>动作</th><th>操作者</th><th>结果</th><th>IP</th><th>时间</th></tr></thead>
-            <tbody>${rows || '<tr><td colspan="6" class="empty">没有记录</td></tr>'}</tbody>
+            <tbody>${rows || `<tr><td colspan="6">${emptyAuditState}</td></tr>`}</tbody>
           </table>
         </div>
         ${pagerHtml(data.total, page, AUDIT_PAGE_SIZE)}
-        <div class="hint" style="padding:12px 2px 0">共 ${data.total} 条，每页 ${AUDIT_PAGE_SIZE} 条 ${hintBadge('导出说明', '导出包含最近 10 万条；更早的记录不会写入导出文件。')}</div>
       </section>`
     bindPager(view, (next) => loadAudit(action, next))
+    view.querySelector('[data-state-action^="audit-"]')?.addEventListener('click', (event) => {
+      const value = event.currentTarget.dataset.stateAction
+      if (value === 'audit-all') loadAudit('', 0)
+      if (value === 'audit-reload') loadAudit(action, page)
+    })
     $('#audit-verify')?.addEventListener('click', async () => {
       const box = $('#audit-verify-result')
       try {
@@ -17480,7 +17898,7 @@ async function loadAudit(action = '', page = 0) {
     $('#audit-csv')?.addEventListener('click', () => downloadConsoleFile('/api/console/audit/export?format=csv', 'audit.csv').catch((err) => alert(err.message)))
     $('#audit-json')?.addEventListener('click', () => downloadConsoleFile('/api/console/audit/export?format=json', 'audit.json').catch((err) => alert(err.message)))
   } catch (err) {
-    renderDenied(view, err)
+    renderConsoleError(view, err, () => loadAudit(action, page))
   }
 }
 
@@ -17514,31 +17932,39 @@ function approvalActionHtml(item) {
 
 async function loadApprovals() {
   const view = $('#view')
-  renderLoading(view)
+  renderLoading(view, '正在读取审批记录', { skeleton: true, rows: 6 })
   setSide('', true)
   try {
     const data = await api('/api/console/approvals?status=all')
     const rows = data.items
-      .map(
-        (item) => `<tr>
+      .map((item) => {
+        const [date, time] = fmtDateTime(item.createdAt).split(' ')
+        return `<tr>
           <td>${esc(item.requesterName)}<div class="desc mono">${esc(item.requesterUserId)}</div></td>
           <td>${approvalActionHtml(item)}</td>
-          <td><span class="pill ${item.status === 'pending' ? 'warn' : item.status === 'approved' ? 'ok' : 'danger'}">${esc(APPROVAL_STATUS_LABEL[item.status] || item.status)}</span></td>
-          <td class="mono desc">${esc(item.createdAt)}</td>
+          <td><span class="pill ${item.status === 'pending' ? 'warn' : item.status === 'approved' ? 'ok' : 'danger'}">${esc(item.usedAt ? '已执行' : (APPROVAL_STATUS_LABEL[item.status] || item.status))}</span>${item.usedAt ? `<div class="desc mono" title="${esc(item.usedAt)}">${esc(fmtDateTime(item.usedAt))}</div>` : ''}</td>
+          <td class="mono" title="${esc(item.createdAt)}"><span>${esc(date || '—')}</span><div class="desc">${esc(time || '')}</div></td>
           <td>${
             item.status === 'pending'
               ? `<div class="row-actions"><button class="link-btn accent" type="button" data-approve="${esc(item.id)}">通过</button><button class="link-btn danger-link" type="button" data-reject="${esc(item.id)}">拒绝</button></div>`
               : `<span class="muted">${esc(item.decidedBy || '—')}</span>`
           }</td>
-        </tr>`,
-      )
+        </tr>`
+      })
       .join('')
+    const emptyState = stateBlockHtml({
+      compact: true,
+      title: '还没有审批记录',
+      body: '插件高危能力、技能高危工具、跨部门导出等动作会在这里生成待办；通过后只放行一次。',
+      actionLabel: '刷新',
+      action: 'approval-refresh',
+    })
     view.innerHTML = `
       <section class="panel">
-        <div class="panel-head"><div><h2>审批</h2>${hintBadge('审批说明', '高危动作需要先申请，再由控制台决定；技能高危工具会绑定技能、工具和同一组参数，审批通过后只放行一次。')}</div></div>
+        <div class="panel-head"><div class="panel-title-line"><h2>审批</h2><span class="hint">${data.items.length} 条</span>${hintBadge('审批说明', '高危动作需要先申请，再由控制台决定；审批与工具、参数哈希绑定，通过后只放行一次，状态会显示「已执行」。')}</div></div>
         <table class="data">
-          <thead><tr><th>申请人</th><th>动作</th><th>状态</th><th>提交时间</th><th>操作</th></tr></thead>
-          <tbody>${rows || '<tr><td colspan="5" class="empty">没有审批记录。插件高危能力、技能高危工具、跨部门导出等动作会在这里生成待办。</td></tr>'}</tbody>
+          <thead><tr><th>申请人</th><th>动作</th><th>状态</th><th>提交时间</th><th>处理人 / 操作</th></tr></thead>
+          <tbody>${rows || `<tr><td colspan="5">${emptyState}</td></tr>`}</tbody>
         </table>
       </section>`
     for (const button of view.querySelectorAll('[data-approve], [data-reject]')) {
@@ -17549,12 +17975,13 @@ async function loadApprovals() {
           await apiPost(`/api/console/approvals/${encodeURIComponent(id)}/decide`, { decision })
           loadApprovals()
         } catch (err) {
-          alert(err.message)
+          showTopToast(consoleErrorText(err), { tone: 'error' })
         }
       })
     }
+    view.querySelector('[data-state-action="approval-refresh"]')?.addEventListener('click', () => loadApprovals())
   } catch (err) {
-    renderDenied(view, err)
+    renderConsoleError(view, err, () => loadApprovals())
   }
 }
 
@@ -18519,9 +18946,16 @@ function onlyOfficeSourceText(source, fallback = '未配置') {
   return fallback
 }
 
+function onlyOfficeFailureText(value) {
+  const text = String(value || '')
+  return /fetch failed|failed to fetch|network request failed/i.test(text)
+    ? '无法连接文档服务，请检查地址和容器是否正在运行。'
+    : (text || '未知错误')
+}
+
 async function loadOnlyOffice() {
   const view = $('#view')
-  renderLoading(view)
+  renderLoading(view, '正在读取在线文档配置', { skeleton: true, rows: 3 })
   setSide('', true)
   setPageActions('')
   try {
@@ -18559,7 +18993,7 @@ async function loadOnlyOffice() {
     view.innerHTML = `
       <section class="panel oo-panel">
         <div class="panel-head">
-          <div>
+          <div class="panel-title-line">
             <h2>在线文档</h2>
             ${hintBadge('绑定说明', '这里绑定 OnlyOffice DocumentServer。文档服务地址供浏览器加载编辑器；内部回访地址供容器回调 EAB 读取原文件与保存结果。JWT 密钥只写入 secrets.json，页面不回显。')}
           </div>
@@ -18630,11 +19064,11 @@ async function loadOnlyOffice() {
         setState(
           result.ok
             ? `连接成功 · HTTP ${result.status ?? 200} · ${Number(result.latencyMs || 0)} ms · ${result.endpoint || ''}`
-            : `连接失败 · ${result.detail || result.error || '无法连接 DocumentServer'}`,
+            : `连接失败 · ${onlyOfficeFailureText(result.detail || result.error || '无法连接 DocumentServer')}`,
           result.ok ? 'is-ok' : 'is-bad',
         )
       } catch (err) {
-        setState(`测试失败 · ${err.message || '未知错误'}`, 'is-bad')
+        setState(`测试失败 · ${onlyOfficeFailureText(err.message)}`, 'is-bad')
       } finally {
         button.disabled = false
         button.textContent = '测试连接'
@@ -18658,20 +19092,20 @@ async function loadOnlyOffice() {
         showTopToast('OnlyOffice 绑定已保存，配置已立即生效。')
         await loadOnlyOffice()
       } catch (err) {
-        setState(`保存失败 · ${err.message || '未知错误'}`, 'is-bad')
+        setState(`保存失败 · ${onlyOfficeFailureText(err.message)}`, 'is-bad')
         button.disabled = false
         button.textContent = '保存并生效'
       }
     })
   } catch (err) {
-    renderDenied(view, err)
+    renderConsoleError(view, err, () => loadOnlyOffice())
   }
 }
 
 async function loadDatabases(status = state.databaseStatus || 'all') {
   state.databaseStatus = status
   const view = $('#view')
-  renderLoading(view)
+  renderLoading(view, '正在读取数据连接', { skeleton: true, rows: 5 })
   setSide('', true)
   setPageActions('')
   try {
@@ -18754,29 +19188,39 @@ async function loadDatabases(status = state.databaseStatus || 'all') {
       .join('')
     const serviceRows = visibleServices.map((entry) => entry.row).join('')
     const hasAnyRows = Boolean(items.length || visibleServices.length)
-    const emptyText =
-      state.databaseStatus === 'all'
-        ? '还没有数据库或缓存连接。点右上角“＋ 新增连接”接入 PostgreSQL、MySQL、SQLite、Redis，或配置下方的平台服务。'
-        : '没有符合当前筛选的连接。'
-    const databaseEmptyText =
-      state.databaseStatus === 'all'
-        ? '还没有数据库或缓存连接，可点右上角“＋ 新增连接”接入。'
-        : '没有符合当前筛选的数据库或缓存连接。'
+    const emptyDbState = stateBlockHtml({
+      compact: true,
+      title: state.databaseStatus === 'all' ? '还没有数据连接' : '当前筛选没有连接',
+      body: state.databaseStatus === 'all'
+        ? '接入 PostgreSQL、MySQL、SQLite 或 Redis，也可以配置联网搜索、浏览器和内网访问。'
+        : '换一个状态筛选，或回到全部连接继续管理。',
+      actionLabel: state.databaseStatus === 'all' ? '新增连接' : '查看全部连接',
+      action: state.databaseStatus === 'all' ? 'db-new' : 'db-all',
+    })
+    const databaseEmptyState = stateBlockHtml({
+      compact: true,
+      title: state.databaseStatus === 'all' ? '还没有数据库或缓存连接' : '当前筛选没有数据库或缓存连接',
+      body: state.databaseStatus === 'all'
+        ? '平台服务仍可在下方配置；数据源可点“新增连接”接入。'
+        : '换一个状态筛选，或回到全部连接继续管理。',
+      actionLabel: state.databaseStatus === 'all' ? '新增连接' : '查看全部连接',
+      action: state.databaseStatus === 'all' ? 'db-new' : 'db-all',
+    })
     const showDatabaseGroup = state.databaseStatus === 'all' || items.length > 0
     const databaseBlock = showDatabaseGroup
       ? `<tr class="db-group-row"><td colspan="6"><div class="db-group-title"><span class="db-group-label">数据源</span><span class="db-group-count">${items.length}</span></div></td></tr>${
-          items.length ? rows : `<tr class="db-group-empty"><td colspan="6">${esc(databaseEmptyText)}</td></tr>`
+          items.length ? rows : `<tr class="db-group-empty"><td colspan="6">${databaseEmptyState}</td></tr>`
         }`
       : ''
     const serviceBlock = visibleServices.length
       ? `<tr class="db-group-row"><td colspan="6"><div class="db-group-title"><span class="db-group-label">平台服务</span><span class="db-group-count">${visibleServices.length}</span></div></td></tr>${serviceRows}`
       : ''
-    const bodyRows = hasAnyRows ? `${databaseBlock}${serviceBlock}` : `<tr><td colspan="6" class="empty">${esc(emptyText)}</td></tr>`
+    const bodyRows = hasAnyRows ? `${databaseBlock}${serviceBlock}` : `<tr><td colspan="6">${emptyDbState}</td></tr>`
 
     view.innerHTML = `
       <section class="panel">
         <div class="panel-head">
-          <div>
+          <div class="panel-title-line">
             <h2>数据连接 <span class="muted">${shown}</span></h2>
             ${hintBadge('连接说明', '这里统一管理平台接入的外部资源连接：关系型数据库、文件数据库、键值缓存，以及联网搜索、内置浏览器和内网访问。数据库与缓存可按公司新增、编辑、测试、查询和停用/删除；平台服务是固定 3 项，通过“新增连接”选择类型后配置。密码只写入 secrets.json 或环境变量，页面不回显。PostgreSQL、MySQL / SQLite 支持只读查询，Redis 只做 PING 连通性测试。单公司部署下，已启用的 PostgreSQL / Redis 会自动接入平台后端（审计/会话镜像、缓存），环境变量优先。')}
           </div>
@@ -18805,6 +19249,8 @@ async function loadDatabases(status = state.databaseStatus || 'all') {
       button.addEventListener('click', () => loadDatabases(button.dataset.dbStatus || 'all'))
     }
     view.querySelector('#db-new')?.addEventListener('click', () => openConnectionWizard(settings))
+    view.querySelector('[data-state-action="db-new"]')?.addEventListener('click', () => openConnectionWizard(settings))
+    view.querySelector('[data-state-action="db-all"]')?.addEventListener('click', () => loadDatabases('all'))
     for (const button of view.querySelectorAll('[data-db-edit]')) {
       button.addEventListener('click', () => {
         const item = items.find((row) => row.id === button.dataset.dbEdit)
@@ -18870,7 +19316,7 @@ async function loadDatabases(status = state.databaseStatus || 'all') {
       })
     }
   } catch (err) {
-    renderDenied(view, err)
+    renderConsoleError(view, err, () => loadDatabases(status))
   }
 }
 
@@ -19274,10 +19720,52 @@ function taskRowActions(item) {
   return `<div class="row-actions">${pause}${resume}<button class="link-btn danger-link" type="button" data-task-act="cancel" data-task-id="${id}">取消</button></div>`
 }
 
-async function loadTasks(status = state.taskStatus || 'all') {
-  state.taskStatus = status
+function taskCenterTabsHtml(active) {
+  const tabs = [
+    ['schedules', '定时任务', '按时触发、提醒与推送'],
+    ['graphs', '任务图', '多步骤编排、审批与运行'],
+  ]
+  return `<div class="task-center-tabs">${tabs
+    .map(
+      ([key, label, desc]) =>
+        `<button class="${active === key ? 'active' : ''}" type="button" data-task-view="${key}"><strong>${esc(label)}</strong><span>${esc(desc)}</span></button>`,
+    )
+    .join('')}</div>`
+}
+
+function bindTaskCenterTabs(view) {
+  for (const button of view.querySelectorAll('[data-task-view]')) {
+    button.addEventListener('click', async () => {
+      const next = button.dataset.taskView
+      if (!next || next === state.taskView) return
+      if (state.taskView === 'graphs') {
+        const host = view.querySelector('#task-graph-panel')
+        if (host && !(await taskGraphCanLeave(host))) return
+      }
+      await loadTasks(state.taskStatus, next)
+    })
+  }
+}
+
+async function loadTaskGraphsView() {
+  state.taskView = 'graphs'
   const view = $('#view')
-  renderLoading(view)
+  setSide('', true)
+  setPageActions('')
+  view.innerHTML = `${taskCenterTabsHtml('graphs')}<div id="task-graph-panel"></div>`
+  bindTaskCenterTabs(view)
+  await loadTaskGraphPanel()
+}
+
+async function loadTasks(status = state.taskStatus || 'all', viewKey = state.taskView || 'schedules') {
+  if (viewKey === 'graphs') {
+    await loadTaskGraphsView()
+    return
+  }
+  state.taskStatus = status
+  state.taskView = 'schedules'
+  const view = $('#view')
+  renderLoading(view, '正在读取定时任务', { skeleton: true, rows: 6 })
   setSide('', true)
   setPageActions('')
   try {
@@ -19285,7 +19773,7 @@ async function loadTasks(status = state.taskStatus || 'all') {
     const counts = data.counts || {}
     const rows = (data.items || [])
       .map(
-        (item) => `<tr>
+        (item) => `<tr class="task-row${state.taskOpen === item.id ? ' is-open' : ''}" data-task-row="${esc(item.id)}">
           <td>
             <button class="link-btn task-title" type="button" data-task-open="${esc(item.id)}">${esc(item.title)}</button>
             <div class="desc">${esc(taskPromptBrief(item.prompt))}</div>
@@ -19317,26 +19805,44 @@ async function loadTasks(status = state.taskStatus || 'all') {
       )
       .join('')
     const shown = state.taskStatus === 'all' ? Number(data.total || 0) : (data.items || []).length
+    const emptyTaskState = stateBlockHtml({
+      compact: true,
+      title: state.taskStatus === 'all' ? '还没有定时任务' : '当前筛选没有任务',
+      body: state.taskStatus === 'all'
+        ? '员工在对话里让助手创建提醒或定时推送后，会出现在这里。'
+        : '换一个状态筛选，或回到全部任务查看完整列表。',
+      actionLabel: state.taskStatus === 'all' ? '刷新' : '查看全部任务',
+      action: state.taskStatus === 'all' ? 'task-reload' : 'task-all',
+    })
     view.innerHTML = `
+      ${taskCenterTabsHtml('schedules')}
       <section class="panel">
         <div class="panel-head">
-          <div>
-            <h2>任务中心 <span class="muted">${shown}</span></h2>
-            ${hintBadge('任务中心说明', '定时任务由员工在对话或 HTTP 创建；这里可以看到全公司的任务、最近一次执行和 append-only 事件时间线，暂停/恢复/取消会写审计。')}
+          <div class="panel-title-line">
+            <h2>定时任务 <span class="muted">${shown}</span></h2>
+            ${hintBadge('定时任务说明', '定时任务由员工在对话或 HTTP 创建；这里可以看到全公司的定时触发表、最近一次执行和 append-only 事件时间线，暂停/恢复/取消会写审计。多步骤流程请切到上方「任务图」。')}
           </div>
           <div class="panel-actions"><div class="segmented">${filters}</div></div>
         </div>
         <table class="data task-table">
           <thead><tr><th>任务</th><th>创建人</th><th>规则 / 下一次</th><th>状态</th><th>最近执行</th><th>操作</th></tr></thead>
-          <tbody>${rows || '<tr><td colspan="6" class="empty">还没有定时任务。员工在对话里让助手创建提醒后，会出现在这里。</td></tr>'}</tbody>
+          <tbody>${rows || `<tr><td colspan="6">${emptyTaskState}</td></tr>`}</tbody>
         </table>
       </section>`
 
+    bindTaskCenterTabs(view)
     for (const button of view.querySelectorAll('[data-task-status]')) {
-      button.addEventListener('click', () => loadTasks(button.dataset.taskStatus || 'all'))
+      button.addEventListener('click', () => loadTasks(button.dataset.taskStatus || 'all', 'schedules'))
     }
     for (const button of view.querySelectorAll('[data-task-open]')) {
       button.addEventListener('click', () => openTaskDetail(button.dataset.taskOpen))
+    }
+    // 整行可点：点标题/任意单元格都往右侧抽屉里拉详情，行内操作按钮仍然各自生效。
+    for (const rowEl of view.querySelectorAll('[data-task-row]')) {
+      rowEl.addEventListener('click', (event) => {
+        if (event.target.closest('button, a')) return
+        openTaskDetail(rowEl.dataset.taskRow)
+      })
     }
     for (const button of view.querySelectorAll('[data-task-act]')) {
       button.addEventListener('click', async () => {
@@ -19353,73 +19859,1742 @@ async function loadTasks(status = state.taskStatus || 'all') {
         }
         try {
           await apiPost(`/api/console/schedules/${encodeURIComponent(id)}/${action}`, {})
-          loadTasks(state.taskStatus)
+          loadTasks(state.taskStatus, 'schedules')
         } catch (err) {
           alert(err.message || '操作失败')
         }
       })
     }
+    view.querySelector('[data-state-action^="task-"]')?.addEventListener('click', (event) => {
+      const value = event.currentTarget.dataset.stateAction
+      if (value === 'task-all') loadTasks('all', 'schedules')
+      if (value === 'task-reload') loadTasks(state.taskStatus, 'schedules')
+    })
   } catch (err) {
-    renderDenied(view, err)
+    renderConsoleError(view, err, () => loadTasks(status, 'schedules'))
+  }
+}
+
+const TASK_GRAPH_STATUS_LABEL = {
+  draft: '草稿',
+  published: '已发布',
+  disabled: '已停用',
+  running: '执行中',
+  waiting_manual: '待人工',
+  waiting_wait: '等待中',
+  succeeded: '已完成',
+  failed: '失败',
+  rejected: '已拒绝',
+  cancelled: '已取消',
+}
+
+const TASK_GRAPH_NODE_KIND_LABEL = {
+  start: '开始',
+  tool: '工具',
+  agent: '子 Agent',
+  manual: '人工',
+  wait: '等待',
+  condition: '条件',
+  end: '结束',
+}
+
+function taskGraphTemplate() {
+  return {
+    entry: 'start',
+    nodes: [
+      { id: 'start', kind: 'start', title: '开始', nextIds: ['step1'] },
+      { id: 'step1', kind: 'tool', title: '检索资料', tool: 'kb.search', args: { query: '{{input.question}}' }, nextIds: ['end'] },
+      { id: 'end', kind: 'end', title: '结束' },
+    ],
+  }
+}
+
+function taskGraphPill(status) {
+  const tone = status === 'published' || status === 'succeeded' ? 'ok' : status === 'failed' || status === 'rejected' ? 'danger' : ''
+  return `<span class="pill ${tone}">${esc(TASK_GRAPH_STATUS_LABEL[status] || status)}</span>`
+}
+
+const TASK_GRAPH_ADDABLE_KINDS = [
+  ['tool', '工具'],
+  ['agent', '子 Agent'],
+  ['manual', '人工'],
+  ['wait', '等待'],
+  ['condition', '条件分支'],
+]
+
+const TASK_GRAPH_RULE_OPS = [
+  ['eq', '等于'],
+  ['neq', '不等于'],
+  ['contains', '包含'],
+  ['gt', '大于'],
+  ['gte', '大于等于'],
+  ['lt', '小于'],
+  ['lte', '小于等于'],
+  ['exists', '存在'],
+  ['empty', '为空'],
+  ['truthy', '为真'],
+]
+
+const TASK_GRAPH_WAIT_UNITS = [
+  ['60', '分钟'],
+  ['1', '秒'],
+  ['3600', '小时'],
+  ['86400', '天'],
+]
+
+const TASK_GRAPH_STARTERS = [
+  {
+    id: 'kb',
+    name: '知识库问答',
+    description: '检索知识库后直接结束，适合制度、政策、FAQ 查询。',
+    build: () => taskGraphTemplate(),
+  },
+  {
+    id: 'branch',
+    name: '条件分流',
+    description: '按输入内容走不同处理路径，最后汇总结束。',
+    build: () => ({
+      entry: 'start',
+      nodes: [
+        { id: 'start', kind: 'start', title: '开始', nextIds: ['branch'] },
+        {
+          id: 'branch',
+          kind: 'condition',
+          title: '判断问题类型',
+          nextIds: ['refund', 'other'],
+          edgeRules: {
+            refund: { field: 'input.question', op: 'contains', value: '退款' },
+            other: { else: true },
+          },
+        },
+        {
+          id: 'refund',
+          kind: 'tool',
+          title: '退款问题处理',
+          tool: 'kb.search',
+          args: { query: '{{input.question}}' },
+          nextIds: ['end'],
+        },
+        {
+          id: 'other',
+          kind: 'tool',
+          title: '通用问题处理',
+          tool: 'kb.search',
+          args: { query: '{{input.question}}' },
+          nextIds: ['end'],
+        },
+        { id: 'end', kind: 'end', title: '结束' },
+      ],
+    }),
+  },
+  {
+    id: 'approval',
+    name: '人工审批',
+    description: '模型或工具处理前先暂停，由指定角色通过或拒绝。',
+    build: () => ({
+      entry: 'start',
+      nodes: [
+        { id: 'start', kind: 'start', title: '开始', nextIds: ['approve'] },
+        {
+          id: 'approve',
+          kind: 'manual',
+          title: '人工确认',
+          nextIds: ['end'],
+          manual: {
+            instructions: '请核对申请内容后选择通过或拒绝。',
+            timeoutHours: 24,
+          },
+        },
+        { id: 'end', kind: 'end', title: '结束' },
+      ],
+    }),
+  },
+  {
+    id: 'wait',
+    name: '定时等待',
+    description: '先执行一步，等待指定时间后继续。',
+    build: () => ({
+      entry: 'start',
+      nodes: [
+        { id: 'start', kind: 'start', title: '开始', nextIds: ['wait'] },
+        { id: 'wait', kind: 'wait', title: '等待', nextIds: ['end'], wait: { durationSec: 60 } },
+        { id: 'end', kind: 'end', title: '结束' },
+      ],
+    }),
+  },
+]
+
+const TASK_GRAPH_CATALOG_TTL = 5 * 60 * 1000
+let taskGraphCatalogCache = null
+let taskGraphCatalogPromise = null
+
+function taskGraphCatalogDatalists(catalog) {
+  const option = (value, label) => `<option value="${esc(value)}">${esc(label || value)}</option>`
+  return `<datalist id="tg-tool-options">${(catalog.tools || [])
+    .map((tool) => option(tool.id, tool.source === 'plugin' ? `${tool.name}（插件）` : tool.name))
+    .join('')}</datalist>
+    <datalist id="tg-model-options">${(catalog.models || [])
+      .map((model) => option(model.id, `${model.name}${model.modelKey ? ` · ${model.modelKey}` : ''}`))
+      .join('')}</datalist>
+    <datalist id="tg-role-options">${(catalog.roles || [])
+      .map((role) => option(role.code, role.name || role.code))
+      .join('')}</datalist>`
+}
+
+function taskGraphCatalogStatus(catalog) {
+  if (!catalog || !catalog.at) return '候选 ID 加载中；也可以手动填写。'
+  if (!catalog.tools?.length && !catalog.models?.length && !catalog.roles?.length) {
+    return '暂无可用候选，可手动填写或检查控制台权限。'
+  }
+  return `候选：${catalog.tools?.length || 0} 个工具 · ${catalog.models?.length || 0} 个模型 · ${catalog.roles?.length || 0} 个角色`
+}
+
+async function loadTaskGraphCatalog(force = false) {
+  const now = Date.now()
+  if (!force && taskGraphCatalogCache && now - taskGraphCatalogCache.at < TASK_GRAPH_CATALOG_TTL) {
+    return taskGraphCatalogCache
+  }
+  if (taskGraphCatalogPromise) return taskGraphCatalogPromise
+  taskGraphCatalogPromise = Promise.all([
+    api('/api/console/tools/access').catch(() => null),
+    api('/api/console/models').catch(() => null),
+    api('/api/console/roles').catch(() => null),
+  ])
+    .then(([toolsData, modelsData, rolesData]) => {
+      const tools = (toolsData?.tools || [])
+        .filter((tool) => tool && tool.id && tool.available !== false)
+        .map((tool) => ({ id: tool.id, name: tool.name || tool.id, source: tool.source || 'builtin' }))
+      const models = (modelsData?.models || [])
+        .filter((model) => model && model.id && model.enabled && (model.endpointKind === 'chat' || model.endpointKind === 'systemone'))
+        .map((model) => ({ id: model.id, name: model.name || model.id, modelKey: model.modelKey || '' }))
+      const roles = (rolesData?.roles || [])
+        .filter((role) => role && role.code)
+        .map((role) => ({ code: role.code, name: role.name || role.code }))
+      taskGraphCatalogCache = { tools, models, roles, at: Date.now() }
+      return taskGraphCatalogCache
+    })
+    .catch(() => {
+      taskGraphCatalogCache = { tools: [], models: [], roles: [], at: Date.now() }
+      return taskGraphCatalogCache
+    })
+    .finally(() => {
+      taskGraphCatalogPromise = null
+    })
+  return taskGraphCatalogPromise
+}
+
+async function hydrateTaskGraphCatalog(host) {
+  if (!host) return
+  try {
+    const catalog = await loadTaskGraphCatalog()
+    if (!host.isConnected) return
+    const status = host.querySelector('#tg-catalog-status')
+    if (status) status.textContent = taskGraphCatalogStatus(catalog)
+    for (const [id, items] of [
+      ['tg-tool-options', catalog.tools],
+      ['tg-model-options', catalog.models],
+      ['tg-role-options', catalog.roles],
+    ]) {
+      const datalist = host.querySelector(`#${id}`)
+      if (!datalist) continue
+      datalist.innerHTML = (items || [])
+        .map((item) => {
+          const key = item.id || item.code
+          const label = item.name || key
+          return `<option value="${esc(key)}">${esc(id === 'tg-model-options' && item.modelKey ? `${label} · ${item.modelKey}` : label)}</option>`
+        })
+        .join('')
+    }
+  } catch {
+    /* 自动补全失败不阻断表单编辑 */
+  }
+}
+
+function taskGraphDefaultSelectedNode(definition) {
+  return (
+    definition?.nodes?.find((node) => node.id && node.kind !== 'start' && node.kind !== 'end')?.id ||
+    definition?.nodes?.[0]?.id ||
+    ''
+  )
+}
+
+function taskGraphFieldOptions(definition) {
+  const values = new Set([
+    ['input.question', '运行输入 · 问题'],
+    ['input.userId', '运行输入 · 用户 ID'],
+    ['input.date', '运行输入 · 日期'],
+  ])
+  for (const node of definition?.nodes || []) {
+    if (!node || !node.id) continue
+    values.add([`nodes.${node.id}`, `节点输出 · ${node.title || node.id}`])
+    if (node.kind === 'tool' || node.kind === 'agent') {
+      values.add([`nodes.${node.id}.text`, `文本输出 · ${node.title || node.id}`])
+      values.add([`nodes.${node.id}.count`, `计数输出 · ${node.title || node.id}`])
+      values.add([`nodes.${node.id}.result`, `结果输出 · ${node.title || node.id}`])
+    }
+    if (node.kind === 'tool') {
+      values.add([`nodes.${node.id}.hits.0.title`, `首条命中标题 · ${node.title || node.id}`])
+    }
+  }
+  return [...values]
+    .map(([value, label]) => `<option value="${esc(value)}">${esc(label)}</option>`)
+    .join('')
+}
+
+function taskGraphRuleLabel(rule) {
+  if (!rule || typeof rule !== 'object') return ''
+  if (rule.else) return '否则'
+  const opEntry = TASK_GRAPH_RULE_OPS.find(([id]) => id === (rule.op || 'truthy'))
+  const opLabel = opEntry ? opEntry[1] : rule.op || '满足'
+  const field = String(rule.field || '字段')
+  const value = rule.value === undefined || rule.value === null || rule.value === '' ? '' : String(rule.value)
+  const label = `${field} ${opLabel}${value ? ` ${value}` : ''}`
+  return label.length > 34 ? `${label.slice(0, 32)}…` : label
+}
+
+function taskGraphFlowEdgeList(definition) {
+  const byId = new Map((definition?.nodes || []).filter((node) => node?.id).map((node) => [node.id, node]))
+  const edges = []
+  for (const node of byId.values()) {
+    for (const target of node.nextIds || []) {
+      if (!byId.has(target) || target === node.id) continue
+      edges.push({
+        from: node.id,
+        to: target,
+        type: node.kind === 'condition' ? 'branch' : 'normal',
+        label: node.kind === 'condition' ? taskGraphRuleLabel(node.edgeRules?.[target]) : '',
+      })
+    }
+    if (node.kind === 'manual' && node.manual?.rejectNextId && byId.has(node.manual.rejectNextId)) {
+      edges.push({ from: node.id, to: node.manual.rejectNextId, type: 'reject', label: '拒绝' })
+    }
+  }
+  return edges
+}
+
+function taskGraphFlowLayout(definition) {
+  const nodes = (definition?.nodes || []).filter((node) => node && node.id && node.kind)
+  if (!nodes.length) return { nodes: [], edges: [], width: 0, height: 0 }
+  const byId = new Map(nodes.map((node) => [node.id, node]))
+  const edges = taskGraphFlowEdgeList(definition)
+  const entryId = byId.has(definition.entry) ? definition.entry : nodes[0].id
+  const depth = new Map([[entryId, 0]])
+
+  // 有环时也能停下来，最多按节点数传播
+  for (let pass = 0; pass < nodes.length; pass += 1) {
+    let changed = false
+    for (const edge of edges) {
+      if (!depth.has(edge.from) || !byId.has(edge.to)) continue
+      const next = depth.get(edge.from) + 1
+      if (!depth.has(edge.to) || next > depth.get(edge.to)) {
+        depth.set(edge.to, next)
+        changed = true
+      }
+    }
+    if (!changed) break
+  }
+
+  const order = new Map()
+  let sequence = 0
+  const visit = (id, stack) => {
+    if (!id || order.has(id) || stack.has(id)) return
+    order.set(id, sequence)
+    sequence += 1
+    stack.add(id)
+    for (const edge of edges.filter((item) => item.from === id)) visit(edge.to, stack)
+    stack.delete(id)
+  }
+  visit(entryId, new Set())
+  for (const node of nodes) {
+    if (!order.has(node.id)) {
+      order.set(node.id, sequence)
+      sequence += 1
+    }
+  }
+
+  const knownDepths = [...depth.values()]
+  const maxKnownDepth = knownDepths.length ? Math.max(...knownDepths) : 0
+  for (const node of nodes) {
+    if (!depth.has(node.id)) depth.set(node.id, maxKnownDepth + 1)
+  }
+  const maxDepth = Math.max(...nodes.map((node) => depth.get(node.id) || 0))
+
+  const sorted = [...nodes].sort((a, b) => {
+    const depthDiff = (depth.get(a.id) || 0) - (depth.get(b.id) || 0)
+    return depthDiff || (order.get(a.id) || 0) - (order.get(b.id) || 0)
+  })
+
+  const metrics = { nodeW: 176, nodeH: 78, gapX: 34, gapY: 62, pad: 24 }
+  const layers = []
+  for (const node of sorted) {
+    const d = depth.get(node.id) || 0
+    if (!layers[d]) layers[d] = []
+    layers[d].push(node)
+  }
+  let widest = 0
+  for (const layer of layers) {
+    if (!layer) continue
+    widest = Math.max(widest, layer.length)
+  }
+  const width = Math.max(520, metrics.pad * 2 + widest * metrics.nodeW + Math.max(0, widest - 1) * metrics.gapX)
+  const height = metrics.pad * 2 + (maxDepth + 1) * metrics.nodeH + maxDepth * metrics.gapY
+  const positions = new Map()
+  for (let d = 0; d <= maxDepth; d += 1) {
+    const layer = layers[d] || []
+    if (!layer.length) continue
+    const layerWidth = layer.length * metrics.nodeW + (layer.length - 1) * metrics.gapX
+    const startX = metrics.pad + Math.max(0, (width - metrics.pad * 2 - layerWidth) / 2)
+    layer.forEach((node, index) => {
+      positions.set(node.id, {
+        x: startX + index * (metrics.nodeW + metrics.gapX),
+        y: metrics.pad + d * (metrics.nodeH + metrics.gapY),
+      })
+    })
+  }
+
+  const edgeViews = edges
+    .filter((edge) => positions.has(edge.from) && positions.has(edge.to))
+    .map((edge, index) => {
+      const from = positions.get(edge.from)
+      const to = positions.get(edge.to)
+      const x1 = from.x + metrics.nodeW / 2
+      const y1 = from.y + metrics.nodeH
+      const x2 = to.x + metrics.nodeW / 2
+      const y2 = to.y
+      let path
+      if (y2 <= y1 + 2) {
+        const bulge = 52 + (index % 3) * 12
+        const direction = x2 >= x1 ? 1 : -1
+        path = `M ${x1} ${y1} C ${x1 + direction * bulge} ${y1 + 24}, ${x2 + direction * bulge} ${y2 - 24}, ${x2} ${y2}`
+      } else {
+        const bend = Math.max(20, (y2 - y1) * 0.35)
+        path = `M ${x1} ${y1} C ${x1} ${y1 + bend}, ${x2} ${y2 - bend}, ${x2} ${y2}`
+      }
+      return {
+        ...edge,
+        path,
+        labelX: (x1 + x2) / 2 + ((index % 3) - 1) * 12,
+        labelY: (y1 + y2) / 2,
+      }
+    })
+
+  return { nodes: sorted, positions, edges: edgeViews, width, height, metrics }
+}
+
+function taskGraphFlowNodeMeta(node) {
+  if (node.kind === 'tool') return node.tool || '未选择工具'
+  if (node.kind === 'agent') return node.agent?.modelId || '未选择模型'
+  if (node.kind === 'manual') return node.manual?.assigneeRole || '人工审批'
+  if (node.kind === 'wait') {
+    const parts = taskGraphWaitParts(node.wait?.durationSec ?? 60)
+    const unit = (TASK_GRAPH_WAIT_UNITS.find(([sec]) => sec === parts.unit) || ['60', '分钟'])[1]
+    return `等待 ${parts.value} ${unit}`
+  }
+  if (node.kind === 'condition') return `${node.nextIds?.length || 0} 条分支`
+  return node.kind === 'end' ? '流程结束' : '流程开始'
+}
+
+function taskGraphFlowHtml(definition, selectedNodeId) {
+  const layout = taskGraphFlowLayout(definition)
+  if (!layout.nodes.length) return '<div class="task-graph-flow-card"><div class="empty">还没有节点，先从模板开始或添加一个节点。</div></div>'
+  const { metrics } = layout
+  const flowNodes = layout.nodes
+    .map((node) => {
+      const point = layout.positions.get(node.id)
+      if (!point) return ''
+      return `<button class="tg-flow-node ${node.id === selectedNodeId ? 'selected' : ''}" type="button" data-tg-flow-node="${esc(node.id)}" style="left:${point.x}px;top:${point.y}px;width:${metrics.nodeW}px;height:${metrics.nodeH}px">
+        <span class="tg-flow-node-top"><span class="tg-flow-node-kind tg-flow-kind-${esc(node.kind)}">${esc(taskGraphKindLabel(node.kind))}</span><em>${esc(node.id)}</em></span>
+        <strong>${esc(node.title || node.id)}</strong>
+        <small>${esc(taskGraphFlowNodeMeta(node))}</small>
+      </button>`
+    })
+    .join('')
+  const paths = layout.edges
+    .map((edge) => `<path class="tg-flow-edge tg-flow-edge-${edge.type}" d="${edge.path}" marker-end="url(#tg-flow-arrow)"></path>`)
+    .join('')
+  const labels = layout.edges
+    .filter((edge) => edge.label)
+    .map(
+      (edge) =>
+        `<span class="tg-flow-edge-label ${edge.type === 'reject' ? 'reject' : ''}" style="left:${edge.labelX}px;top:${edge.labelY}px">${esc(edge.label)}</span>`,
+    )
+    .join('')
+
+  return `<div class="task-graph-flow-card">
+    <div class="task-graph-flow-head">
+      <div><strong>流程图预览</strong><span class="desc">点击节点可定位到下方表单；节点 ID 由系统生成。</span></div>
+      <span class="desc">${layout.nodes.length} 个节点 · ${layout.edges.length} 条流转</span>
+    </div>
+    <div class="task-graph-flow-scroll">
+      <div class="task-graph-flow-canvas" style="width:${layout.width}px;height:${layout.height}px">
+        <svg class="task-graph-flow-svg" width="${layout.width}" height="${layout.height}" viewBox="0 0 ${layout.width} ${layout.height}" aria-hidden="true">
+          <defs>
+            <marker id="tg-flow-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="rgba(127,127,127,0.8)"></path></marker>
+          </defs>
+          ${paths}
+        </svg>
+        ${flowNodes}
+        ${labels}
+      </div>
+    </div>
+    <div class="task-graph-flow-legend"><span><i class="tg-flow-dot"></i>正常流转</span><span><i class="tg-flow-dot branch"></i>条件分支</span><span><i class="tg-flow-dot reject"></i>拒绝后跳转</span></div>
+  </div>`
+}
+
+function taskGraphClone(value) {
+  return JSON.parse(JSON.stringify(value))
+}
+
+function taskGraphKindLabel(kind) {
+  return TASK_GRAPH_NODE_KIND_LABEL[kind] || kind || '节点'
+}
+
+function taskGraphEnsureDefinition(input) {
+  const definition = input && typeof input === 'object' ? taskGraphClone(input) : taskGraphTemplate()
+  if (!Array.isArray(definition.nodes)) definition.nodes = []
+  if (!definition.entry) definition.entry = definition.nodes.find((node) => node.kind === 'start')?.id || ''
+  for (const node of definition.nodes) {
+    if (!node || typeof node !== 'object') continue
+    if (!Array.isArray(node.nextIds)) node.nextIds = []
+    if (!node.edgeRules || typeof node.edgeRules !== 'object' || Array.isArray(node.edgeRules)) node.edgeRules = {}
+  }
+  return definition
+}
+
+function taskGraphTargetOptions(nodes, currentId, excludeId) {
+  return [
+    '<option value="">— 选择节点 —</option>',
+    ...nodes
+      .filter((node) => node.id !== excludeId)
+      .map(
+        (node) =>
+          `<option value="${esc(node.id)}" ${node.id === currentId ? 'selected' : ''}>${esc(node.title || node.id)}（${esc(node.id)}）</option>`,
+      ),
+  ].join('')
+}
+
+function taskGraphNextNodeId(kind, nodes) {
+  const prefix = kind === 'condition' ? 'branch' : kind === 'agent' ? 'agent' : kind
+  let index = 1
+  while (nodes.some((node) => node.id === `${prefix}${index}`)) index += 1
+  return `${prefix}${index}`
+}
+
+function taskGraphRuleDefault(hasElse) {
+  return hasElse ? { field: 'input.question', op: 'exists' } : { else: true }
+}
+
+function taskGraphNewNode(kind, nodes, nextId) {
+  const id = taskGraphNextNodeId(kind, nodes)
+  const nextIds = nextId ? [nextId] : []
+  if (kind === 'condition') {
+    return {
+      id,
+      kind,
+      title: '条件分支',
+      nextIds,
+      edgeRules: nextId ? { [nextId]: { field: 'input.question', op: 'exists' } } : {},
+    }
+  }
+  if (kind === 'agent') {
+    return {
+      id,
+      kind,
+      title: '子 Agent 处理',
+      nextIds,
+      agent: { modelId: '', prompt: '{{input.question}}', maxRounds: 4 },
+    }
+  }
+  if (kind === 'manual') {
+    return {
+      id,
+      kind,
+      title: '人工确认',
+      nextIds,
+      manual: { instructions: '请确认是否继续', assigneeRole: '' },
+    }
+  }
+  if (kind === 'wait') {
+    return { id, kind, title: '等待', nextIds, wait: { durationSec: 60 } }
+  }
+  if (kind === 'end') return { id, kind, title: '结束', nextIds: [] }
+  return {
+    id,
+    kind: 'tool',
+    title: '调用工具',
+    nextIds,
+    tool: 'kb.search',
+    args: { query: '{{input.question}}' },
+  }
+}
+
+function taskGraphReplaceEdge(node, fromId, toId) {
+  const index = node.nextIds.indexOf(fromId)
+  if (index >= 0) node.nextIds[index] = toId
+  if (node.edgeRules && node.edgeRules[fromId]) {
+    if (toId) node.edgeRules[toId] = node.edgeRules[fromId]
+    delete node.edgeRules[fromId]
+  }
+}
+
+function taskGraphInsertNode(definition, kind, afterId) {
+  const nodes = definition.nodes
+  const endNode = nodes.find((node) => node.kind === 'end')
+  const fallbackEnd = endNode?.id || ''
+  const source = nodes.find((node) => node.id === afterId) || null
+  const node = taskGraphNewNode(kind, nodes, fallbackEnd)
+
+  if (!source) {
+    const beforeEnd = endNode ? nodes.indexOf(endNode) : nodes.length
+    const predecessor = endNode ? nodes.find((item) => item !== endNode && item.nextIds.includes(endNode.id)) : null
+    nodes.splice(Math.max(0, beforeEnd), 0, node)
+    if (predecessor) taskGraphReplaceEdge(predecessor, endNode.id, node.id)
+    return node
+  }
+
+  if (source.kind === 'condition') {
+    const beforeEnd = endNode ? nodes.indexOf(endNode) : nodes.length
+    nodes.splice(Math.max(0, beforeEnd), 0, node)
+    source.nextIds.push(node.id)
+    const hasElse = Object.values(source.edgeRules || {}).some((rule) => rule?.else)
+    source.edgeRules[node.id] = taskGraphRuleDefault(hasElse)
+    return node
+  }
+
+  if (source.kind === 'end') {
+    const predecessor = nodes.find((item) => item !== source && item.nextIds.includes(source.id))
+    const beforeEnd = nodes.indexOf(source)
+    nodes.splice(beforeEnd, 0, node)
+    if (predecessor) taskGraphReplaceEdge(predecessor, source.id, node.id)
+    return node
+  }
+
+  const previousNext = source.nextIds[0] || fallbackEnd
+  node.nextIds = previousNext ? [previousNext] : []
+  source.nextIds = [node.id]
+  nodes.splice(nodes.indexOf(source) + 1, 0, node)
+  return node
+}
+
+function taskGraphRemoveNode(definition, nodeId) {
+  const nodes = definition.nodes
+  const node = nodes.find((item) => item.id === nodeId)
+  if (!node) return false
+  if (node.kind === 'start' || node.kind === 'end') return false
+  const fallback = node.nextIds.find((id) => id && id !== nodeId) || nodes.find((item) => item.kind === 'end')?.id || ''
+  for (const item of nodes) {
+    if (item === node) continue
+    const nextIds = []
+    for (const id of item.nextIds) {
+      if (id !== nodeId) nextIds.push(id)
+      else if (fallback && !nextIds.includes(fallback)) nextIds.push(fallback)
+    }
+    item.nextIds = nextIds
+    if (item.edgeRules?.[nodeId]) {
+      if (fallback && fallback !== nodeId && !item.edgeRules[fallback]) {
+        item.edgeRules[fallback] = item.edgeRules[nodeId]
+      }
+      delete item.edgeRules[nodeId]
+    }
+  }
+  nodes.splice(nodes.indexOf(node), 1)
+  return true
+}
+
+function taskGraphWaitParts(seconds) {
+  const value = Number(seconds) || 60
+  if (value % 86400 === 0) return { value: value / 86400, unit: '86400' }
+  if (value % 3600 === 0) return { value: value / 3600, unit: '3600' }
+  if (value % 60 === 0) return { value: value / 60, unit: '60' }
+  return { value, unit: '1' }
+}
+
+function taskGraphArgsText(node, argsTexts) {
+  if (argsTexts.has(node.id)) return argsTexts.get(node.id)
+  return node.args === undefined ? '{}' : JSON.stringify(node.args, null, 2)
+}
+
+function taskGraphDefinitionFromDraft(definition, argsTexts) {
+  const draft = taskGraphClone(definition)
+  for (const node of draft.nodes) {
+    if (node.kind !== 'tool') continue
+    if (!argsTexts.has(node.id)) continue
+    const text = String(argsTexts.get(node.id) || '').trim() || '{}'
+    try {
+      const args = JSON.parse(text)
+      if (!args || typeof args !== 'object' || Array.isArray(args)) {
+        throw new Error('参数必须是 JSON 对象')
+      }
+      node.args = args
+    } catch (err) {
+      throw new Error(`节点「${node.title || node.id}」参数 JSON 解析失败：${err.message}`)
+    }
+  }
+  return draft
+}
+
+function taskGraphNodeCardHtml(node, nodes, index, selectedNodeId, argsTexts) {
+  const selectable = node.id === selectedNodeId
+  const canDelete = node.kind !== 'start' && node.kind !== 'end'
+  const commonNext =
+    node.kind === 'condition' || node.kind === 'end'
+      ? ''
+      : `<label class="tg-field tg-field-inline"><span>下一步</span><select data-tg-next="${esc(node.id)}" data-node-id="${esc(node.id)}">${taskGraphTargetOptions(nodes, node.nextIds[0] || '', node.id)}</select></label>`
+  let body = ''
+
+  if (node.kind === 'tool') {
+    body = `
+      <div class="tg-field-grid">
+        <label class="tg-field"><span>工具 ID<span class="tg-field-hint">输入可搜索已有工具</span></span>
+          <input data-tg-field="tool" data-node-id="${esc(node.id)}" value="${esc(node.tool || '')}" placeholder="例如 kb.search" list="tg-tool-options" autocomplete="off" spellcheck="false">
+        </label>
+      </div>
+      <label class="tg-field"><span>参数 JSON<span class="tg-field-hint">字符串可用 {{input.question}} 引用运行输入</span></span>
+        <textarea class="tg-json-input" data-tg-json="args" data-node-id="${esc(node.id)}" spellcheck="false">${esc(taskGraphArgsText(node, argsTexts))}</textarea>
+      </label>`
+  } else if (node.kind === 'agent') {
+    body = `
+      <div class="tg-field-grid">
+        <label class="tg-field"><span>模型 ID<span class="tg-field-hint">输入可搜索已启用模型</span></span>
+          <input data-tg-field="agent.modelId" data-node-id="${esc(node.id)}" value="${esc(node.agent?.modelId || '')}" placeholder="填写已配置的模型 ID" list="tg-model-options" autocomplete="off" spellcheck="false">
+        </label>
+        <label class="tg-field"><span>最大轮次</span>
+          <input type="number" min="1" max="20" data-tg-number="agent.maxRounds" data-node-id="${esc(node.id)}" value="${esc(String(node.agent?.maxRounds ?? 4))}">
+        </label>
+      </div>
+      <label class="tg-field"><span>子 Agent 指令<span class="tg-field-hint">支持 {{input.question}} 模板</span></span>
+        <textarea data-tg-field="agent.prompt" data-node-id="${esc(node.id)}" spellcheck="false">${esc(node.agent?.prompt || '')}</textarea>
+      </label>`
+  } else if (node.kind === 'manual') {
+    body = `
+      <label class="tg-field"><span>处理说明</span>
+        <textarea data-tg-field="manual.instructions" data-node-id="${esc(node.id)}">${esc(node.manual?.instructions || '')}</textarea>
+      </label>
+      <div class="tg-field-grid tg-field-grid-3">
+        <label class="tg-field"><span>处理角色（可选）<span class="tg-field-hint">输入可搜索角色代码</span></span>
+          <input data-tg-field="manual.assigneeRole" data-node-id="${esc(node.id)}" value="${esc(node.manual?.assigneeRole || '')}" placeholder="例如 company_admin" list="tg-role-options" autocomplete="off">
+        </label>
+        <label class="tg-field"><span>超时小时（展示用）</span>
+          <input type="number" min="0" data-tg-number="manual.timeoutHours" data-node-id="${esc(node.id)}" value="${esc(String(node.manual?.timeoutHours ?? 0))}">
+        </label>
+        <label class="tg-field"><span>拒绝后转到</span>
+          <select data-tg-reject="${esc(node.id)}" data-node-id="${esc(node.id)}">${taskGraphTargetOptions(nodes, node.manual?.rejectNextId || '', node.id).replace('<option value="">— 选择节点 —</option>', '<option value="">— 直接结束 —</option>')}</select>
+        </label>
+      </div>`
+  } else if (node.kind === 'wait') {
+    const wait = taskGraphWaitParts(node.wait?.durationSec ?? 60)
+    body = `
+      <div class="tg-field-grid">
+        <label class="tg-field"><span>等待时长</span>
+          <input type="number" min="1" data-tg-wait-value="${esc(node.id)}" data-node-id="${esc(node.id)}" value="${esc(String(wait.value))}">
+        </label>
+        <label class="tg-field"><span>单位</span>
+          <select data-tg-wait-unit="${esc(node.id)}" data-node-id="${esc(node.id)}">${TASK_GRAPH_WAIT_UNITS.map(([sec, label]) => `<option value="${sec}" ${sec === wait.unit ? 'selected' : ''}>${label}</option>`).join('')}</select>
+        </label>
+      </div>`
+  } else if (node.kind === 'condition') {
+    const rows = node.nextIds.length
+      ? node.nextIds
+          .map((target, edgeIndex) => {
+            const rule = node.edgeRules?.[target] || {}
+            const isElse = Boolean(rule.else)
+            const needsValue = !isElse && !['exists', 'empty', 'truthy'].includes(rule.op || 'truthy')
+            return `<div class="tg-condition-row" data-tg-edge-row="${esc(node.id)}-${edgeIndex}">
+              <label class="tg-field"><span>走到</span>
+                <select data-tg-edge-target="${esc(node.id)}" data-edge-index="${edgeIndex}" data-old-target="${esc(target)}">${taskGraphTargetOptions(nodes, target, node.id)}</select>
+              </label>
+              <label class="tg-check"><input type="checkbox" data-tg-rule-else="${esc(node.id)}" data-edge-target="${esc(target)}" ${isElse ? 'checked' : ''}> 否则</label>
+              <label class="tg-field"><span>字段</span>
+                <input data-tg-rule-field="${esc(node.id)}" data-edge-target="${esc(target)}" value="${esc(rule.field || '')}" placeholder="input.question" list="tg-field-options" autocomplete="off" ${isElse ? 'disabled' : ''} spellcheck="false">
+              </label>
+              <label class="tg-field"><span>判断</span>
+                <select data-tg-rule-op="${esc(node.id)}" data-edge-target="${esc(target)}" ${isElse ? 'disabled' : ''}>${TASK_GRAPH_RULE_OPS.map(([op, label]) => `<option value="${op}" ${op === (rule.op || 'truthy') ? 'selected' : ''}>${label}</option>`).join('')}</select>
+              </label>
+              <label class="tg-field"><span>值</span>
+                <input data-tg-rule-value="${esc(node.id)}" data-edge-target="${esc(target)}" value="${esc(rule.value === undefined ? '' : String(rule.value))}" ${isElse || !needsValue ? 'disabled' : ''}>
+              </label>
+              <button class="link-btn danger-link" type="button" data-tg-edge-delete="${esc(node.id)}" data-edge-index="${edgeIndex}">删除出线</button>
+            </div>`
+          })
+          .join('')
+      : '<div class="empty">还没有出线，先在条件节点后添加一个节点。</div>'
+    body = `
+      <div class="tg-condition-head"><span class="desc">每条出线都要有规则，最多一个「否则」；执行时按顺序取第一个命中的非否则分支。</span>
+        <button class="btn ghost" type="button" data-tg-edge-add="${esc(node.id)}">添加出线</button>
+      </div>
+      <div class="tg-condition-list">${rows}</div>`
+  }
+
+  return `<section class="tg-node-card ${selectable ? 'selected' : ''}" data-tg-node-card="${esc(node.id)}">
+    <div class="tg-node-head">
+      <span class="tg-node-index">${index + 1}</span>
+      <span class="tg-kind tg-kind-${esc(node.kind)}">${esc(taskGraphKindLabel(node.kind))}</span>
+      <input class="tg-node-title" data-tg-field="title" data-node-id="${esc(node.id)}" value="${esc(node.title || '')}" placeholder="节点标题">
+      ${body || commonNext ? `<span class="tg-node-open">${selectable ? '编辑中' : '展开'}</span>` : ''}
+      <span class="tg-node-id mono">${esc(node.id)}</span>
+      ${canDelete ? `<button class="link-btn danger-link" type="button" data-tg-node-delete="${esc(node.id)}">删除</button>` : ''}
+    </div>
+    ${body ? `<div class="tg-node-body">${body}</div>` : ''}
+    ${commonNext ? `<div class="tg-node-foot">${commonNext}</div>` : ''}
+  </section>`
+}
+
+function taskGraphNodesHtml(definition, selectedNodeId, argsTexts) {
+  return definition.nodes
+    .map((node, index) => taskGraphNodeCardHtml(node, definition.nodes, index, selectedNodeId, argsTexts))
+    .join('')
+}
+
+function taskGraphEditorShell(selected, definition, runs, creating, runsError = null) {
+  const name = selected ? selected.name : '新任务图'
+  const description = selected ? selected.description || '' : ''
+  const initialNodeId = taskGraphDefaultSelectedNode(definition)
+  const catalog = taskGraphCatalogCache || { tools: [], models: [], roles: [] }
+  const status = selected
+    ? `状态 ${taskGraphPill(selected.status)} · 当前版本 v${Number(selected.version) || 0}${selected.publishedVersion ? ` · 已发布 v${selected.publishedVersion}` : ''}`
+    : '新建草稿：保存后生成第一个草稿版本。'
+  const validation = selected?.validation?.length
+    ? `<span class="danger-text">校验未通过：${esc(selected.validation.join('；'))}</span>`
+    : '<span class="desc">表单修改后可点「校验」检查结构。</span>'
+  const addChips = TASK_GRAPH_ADDABLE_KINDS.map(
+    ([kind, label]) => `<button class="tg-add-chip" type="button" data-tg-add-kind="${kind}">+ ${label}</button>`,
+  ).join('')
+  const starterHtml = creating
+    ? `<div class="task-graph-onboarding">
+        <span><b>1</b> 选模板或直接插入节点</span>
+        <span><b>2</b> 在节点卡片填工具 / 模型 / 规则</span>
+        <span><b>3</b> 校验通过后保存草稿</span>
+      </div>
+      <div class="task-graph-starters">
+        <div class="task-graph-starter-head"><strong>从模板开始</strong><span class="desc">套用模板会替换当前节点，名字和说明保留；之后仍可继续增删。</span></div>
+        <div class="task-graph-starter-grid">${TASK_GRAPH_STARTERS.map(
+          (template) => `<button class="tg-starter" type="button" data-tg-template="${esc(template.id)}">
+            <strong>${esc(template.name)}</strong>
+            <span>${esc(template.description)}</span>
+          </button>`,
+        ).join('')}</div>
+      </div>`
+    : ''
+  const runsHtml = selected
+    ? `<h3 class="task-graph-runs-title">运行记录 <span class="muted">${runs.length}</span></h3>${
+        runsError
+          ? stateBlockHtml({
+              compact: true,
+              tone: 'error',
+              title: '运行记录读取失败',
+              body: consoleErrorText(runsError),
+              actionLabel: '重试',
+              action: 'tg-runs-retry',
+            })
+          : taskGraphRunsTable(runs)
+      }`
+    : ''
+  const actions = selected
+    ? `<button class="btn ghost" type="button" id="tg-validate">校验</button>
+       <button class="btn" type="button" id="tg-save">保存草稿</button>
+       <button class="btn" type="button" id="tg-publish">发布</button>
+       <button class="btn danger" type="button" id="tg-delete">停用</button>`
+    : '<button class="btn ghost" type="button" id="tg-validate">校验</button><button class="btn" type="button" id="tg-save">保存草稿</button>'
+  const runBox = selected
+    ? `<div class="task-graph-run-box">
+        <div class="task-graph-json-head"><strong>运行输入 JSON</strong><span class="desc">模板里用 {{input.question}} 引用</span></div>
+        <textarea id="tg-run-input" spellcheck="false">${esc(JSON.stringify({ question: '测试任务图' }, null, 2))}</textarea>
+        <button class="btn accent" type="button" id="tg-run">运行已发布版本</button>
+      </div>`
+    : ''
+
+  return `<div class="task-graph-meta">
+      <label>名称<input id="tg-name" value="${esc(name)}"></label>
+      <label>说明<input id="tg-desc" value="${esc(description)}"></label>
+      <div class="desc tg-meta-status">${status}</div>
+    </div>
+    ${starterHtml}
+    <div id="tg-flow-preview">${taskGraphFlowHtml(definition, initialNodeId)}</div>
+    <div class="task-graph-orchestration-head">
+      <div><strong>节点编排</strong><span class="desc">点击流程图或节点卡片选中节点；只展开当前节点的表单，其余节点保持折叠。工具 ID、模型 ID、角色代码支持自动补全。</span></div>
+      <span class="desc" id="tg-add-hint"></span>
+    </div>
+    <div class="task-graph-addbar">
+      <div class="tg-add-kind-row"><span class="tg-add-label">插入节点</span>${addChips}</div>
+      <span class="desc">工具=调接口 · 子 Agent=让模型处理 · 人工=暂停审批 · 等待=延时 · 条件=按规则分流</span>
+      <span class="desc" id="tg-catalog-status">${esc(taskGraphCatalogStatus(catalog))}</span>
+    </div>
+    <div class="task-graph-node-editor is-single" id="tg-node-editor">${taskGraphNodesHtml(definition, initialNodeId, new Map())}</div>
+    ${taskGraphCatalogDatalists(catalog)}
+    <datalist id="tg-field-options">${taskGraphFieldOptions(definition)}</datalist>
+    <div class="task-graph-validation" id="tg-validation">${validation}</div>
+    <div class="row-actions task-graph-actions">${actions}</div>
+    <details class="task-graph-advanced">
+      <summary>高级 JSON（可修改后应用到表单）</summary>
+      <div class="task-graph-json-head"><strong>定义 JSON</strong><span class="desc">表单变更会同步到这里；直接修改后点「应用 JSON」覆盖表单。</span></div>
+      <textarea id="tg-definition" spellcheck="false">${esc(JSON.stringify(definition, null, 2))}</textarea>
+      <div class="row-actions task-graph-actions"><button class="btn ghost" type="button" id="tg-apply-json">应用 JSON 到表单</button></div>
+    </details>
+    ${runBox}
+    ${runsHtml}`
+}
+
+function taskGraphRunsTable(runs) {
+  if (!runs.length) {
+    return stateBlockHtml({
+      compact: true,
+      title: '还没有运行记录',
+      body: '发布并运行任务图后，这里会显示每次 Trace、状态和当前节点。',
+    })
+  }
+  return `<table class="data task-graph-runs">
+      <thead><tr><th>Trace</th><th>状态</th><th>开始</th><th>当前节点</th><th>操作</th></tr></thead>
+      <tbody>${runs
+        .map(
+          (run) => `<tr>
+            <td><button class="link-btn mono" type="button" data-tg-run="${esc(run.id)}">${esc(run.traceId)}</button></td>
+            <td>${taskGraphPill(run.status)}${run.error ? `<div class="desc danger-text">${esc(run.error)}</div>` : ''}</td>
+            <td class="desc">${esc(new Date(run.startedAt).toLocaleString('zh-CN'))}</td>
+            <td class="desc mono">${esc(run.currentNodeId || '—')}</td>
+            <td>${
+              run.status === 'waiting_manual'
+                ? `<div class="row-actions"><button class="link-btn accent" type="button" data-tg-approve="${esc(run.id)}" data-decision="approved">通过</button><button class="link-btn danger-link" type="button" data-tg-approve="${esc(run.id)}" data-decision="rejected">拒绝</button></div>`
+                : run.status === 'running' || run.status === 'waiting_wait'
+                  ? `<button class="link-btn danger-link" type="button" data-tg-cancel="${esc(run.id)}">取消</button>`
+                  : '—'
+            }</td>
+          </tr>`,
+        )
+        .join('')}</tbody>
+    </table>`
+}
+
+
+async function loadTaskGraphPanel(graphId) {
+  const host = document.getElementById('task-graph-panel')
+  if (!host) return
+  renderLoading(host, '正在读取任务图', { skeleton: true, rows: 5 })
+  let graphs = []
+  try {
+    const data = await api('/api/console/task-graphs')
+    graphs = data.graphs || []
+  } catch (err) {
+    renderConsoleError(host, err, () => loadTaskGraphPanel(graphId))
+    return
+  }
+  const selectedId = graphId || state.taskGraphSelected || (graphs[0] && graphs[0].id) || ''
+  const selected = graphs.find((item) => item.id === selectedId) || null
+  let runs = []
+  let runsError = null
+  if (selected) {
+    try {
+      const data = await api(`/api/console/task-graphs/${encodeURIComponent(selected.id)}/runs?limit=20`)
+      runs = data.runs || []
+    } catch (err) {
+      runs = []
+      runsError = err
+    }
+  }
+  state.taskGraphGraphs = graphs
+  state.taskGraphSelected = selected ? selected.id : ''
+  renderTaskGraphPanel(host, graphs, selected, runs, false, runsError)
+}
+
+function renderTaskGraphPanel(host, graphs, selected, runs, creating = false, runsError = null) {
+  const showGraphList = graphs.length > 1
+  const graphList = graphs.length
+    ? graphs
+        .map(
+          (graph) => `<button class="task-graph-item ${selected && selected.id === graph.id ? 'active' : ''}" type="button" data-tg-open="${esc(graph.id)}">
+            <strong>${esc(graph.name)}</strong>
+            <div class="desc">${esc(graph.description || '无描述')}</div>
+            <div class="desc">v${Number(graph.version) || 0} · ${taskGraphPill(graph.status)} ${graph.draftVersion ? `<span class="muted">草稿 v${graph.draftVersion}</span>` : ''}</div>
+          </button>`,
+        )
+        .join('')
+    : '<div class="empty">还没有任务图。</div>'
+
+  host.innerHTML = `
+    <section class="panel task-graph-panel">
+      <div class="panel-head">
+        <div>
+          <h2>任务图 <span class="muted">多步骤流程编排</span></h2>
+          <p class="desc task-graph-sub">把工具、模型、人工审批、等待和条件判断串成一条流程；发布后按版本运行，每一步都有记录。</p>
+        </div>
+        <div class="panel-actions"><button class="btn" type="button" id="task-graph-new">新建任务图</button></div>
+      </div>
+      <div class="task-graph-layout">
+        ${showGraphList ? `<aside class="task-graph-list">${graphList}</aside>` : ''}
+        <div class="task-graph-editor">${
+          selected || creating
+            ? taskGraphEditorShell(selected, selected ? selected.definition : taskGraphTemplate(), runs, creating, runsError)
+            : stateBlockHtml({
+                title: '还没有任务图',
+                body: '点右上角「新建任务图」，从模板开始，或从开始节点手工编排工具、子 Agent、人工审批和条件分支。',
+              })
+        }</div>
+      </div>
+    </section>`
+
+  for (const button of host.querySelectorAll('[data-tg-open]')) {
+    button.addEventListener('click', async () => {
+      if (!(await taskGraphCanLeave(host))) return
+      await loadTaskGraphPanel(button.dataset.tgOpen)
+    })
+  }
+  const newButton = host.querySelector('#task-graph-new')
+  if (newButton) {
+    newButton.addEventListener('click', async () => {
+      if (!(await taskGraphCanLeave(host))) return
+      state.taskGraphSelected = ''
+      renderTaskGraphPanel(host, graphs, null, [], true)
+    })
+  }
+  bindTaskGraphEditor(host, selected)
+  host.querySelector('[data-state-action="tg-runs-retry"]')?.addEventListener('click', () => {
+    loadTaskGraphPanel(selected ? selected.id : '')
+  })
+  void hydrateTaskGraphCatalog(host)
+}
+
+async function taskGraphCanLeave(host) {
+  if (host.dataset.tgDirty !== '1') return true
+  return confirmCard({
+    title: '放弃未保存的修改？',
+    message: '当前任务图有表单修改还没保存，切换后会丢失。',
+    confirmText: '放弃修改',
+  })
+}
+
+function bindTaskGraphEditor(host, selected) {
+  let draft = taskGraphEnsureDefinition(selected ? selected.definition : taskGraphTemplate())
+  let selectedNodeId = taskGraphDefaultSelectedNode(draft)
+  const argsTexts = new Map()
+  const nodeHost = host.querySelector('#tg-node-editor')
+  const jsonArea = host.querySelector('#tg-definition')
+  if (!nodeHost) return
+  host.dataset.tgDirty = '0'
+
+  const setPath = (target, path, value) => {
+    const parts = path.split('.')
+    let cursor = target
+    for (const part of parts.slice(0, -1)) {
+      if (!cursor[part] || typeof cursor[part] !== 'object') cursor[part] = {}
+      cursor = cursor[part]
+    }
+    cursor[parts[parts.length - 1]] = value
+  }
+
+  const syncJson = () => {
+    if (!jsonArea || document.activeElement === jsonArea) return
+    jsonArea.value = JSON.stringify(draft, null, 2)
+  }
+
+  const updateAddHint = () => {
+    const hint = host.querySelector('#tg-add-hint')
+    if (!hint) return
+    const node = draft.nodes.find((item) => item.id === selectedNodeId)
+    hint.textContent = node
+      ? node.kind === 'condition'
+        ? `选中「${node.title}」，添加节点会作为一条新分支接到它后面。`
+        : `选中「${node.title}」，添加节点会插在它后面。`
+      : '未选中节点，添加节点会插在结束节点之前。'
+  }
+
+  const refreshFlowPreview = () => {
+    const flowHost = host.querySelector('#tg-flow-preview')
+    if (flowHost) {
+      const scroller = flowHost.querySelector('.task-graph-flow-scroll')
+      const scrollLeft = scroller?.scrollLeft || 0
+      const scrollTop = scroller?.scrollTop || 0
+      flowHost.innerHTML = taskGraphFlowHtml(draft, selectedNodeId)
+      const nextScroller = flowHost.querySelector('.task-graph-flow-scroll')
+      if (nextScroller) {
+        nextScroller.scrollLeft = scrollLeft
+        nextScroller.scrollTop = scrollTop
+      }
+    }
+    const fieldOptions = host.querySelector('#tg-field-options')
+    if (fieldOptions) fieldOptions.innerHTML = taskGraphFieldOptions(draft)
+  }
+
+  const markDirty = () => {
+    host.dataset.tgDirty = '1'
+    syncJson()
+    refreshFlowPreview()
+    const box = host.querySelector('#tg-validation')
+    if (box) box.innerHTML = '<span class="desc">表单已修改，尚未校验。</span>'
+  }
+
+  const showEditorError = (message) => {
+    const box = host.querySelector('#tg-validation')
+    if (box) box.innerHTML = `<span class="err-text">${esc(message)}</span>`
+  }
+
+  const selectNode = (nodeId, scrollToForm = false) => {
+    if (!nodeId) return
+    selectedNodeId = nodeId
+    for (const card of nodeHost.querySelectorAll('[data-tg-node-card]')) {
+      const active = card.dataset.tgNodeCard === nodeId
+      card.classList.toggle('selected', active)
+      const open = card.querySelector('.tg-node-open')
+      if (open) open.textContent = active ? '编辑中' : '展开'
+    }
+    for (const node of host.querySelectorAll('[data-tg-flow-node]')) {
+      node.classList.toggle('selected', node.dataset.tgFlowNode === nodeId)
+    }
+    updateAddHint()
+    if (scrollToForm) {
+      const card = [...nodeHost.querySelectorAll('[data-tg-node-card]')].find((item) => item.dataset.tgNodeCard === nodeId)
+      card?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    }
+  }
+
+  const renderNodes = () => {
+    nodeHost.innerHTML = taskGraphNodesHtml(draft, selectedNodeId, argsTexts)
+    refreshFlowPreview()
+    updateAddHint()
+    syncJson()
+  }
+
+  const readDefinition = () => taskGraphDefinitionFromDraft(draft, argsTexts)
+
+  const payload = (definition) => ({
+    ...(selected ? { id: selected.id } : {}),
+    name: host.querySelector('#tg-name')?.value || '',
+    description: host.querySelector('#tg-desc')?.value || '',
+    definition,
+  })
+
+  const showValidation = (validation) => {
+    const box = host.querySelector('#tg-validation')
+    if (!box) return
+    box.innerHTML = validation.valid
+      ? '<span class="ok-text">校验通过，可以保存或发布。</span>'
+      : `<span class="danger-text">校验未通过：${esc((validation.errors || []).join('；'))}</span>`
+  }
+
+  const ensureJsonApplied = () => {
+    if (host.dataset.tgJsonDirty !== '1') return true
+    const box = host.querySelector('#tg-validation')
+    if (box) box.innerHTML = '<span class="err-text">高级 JSON 已修改但还没应用到表单，请先点「应用 JSON 到表单」。</span>'
+    return false
+  }
+
+  const save = async () => {
+    if (!ensureJsonApplied()) return
+    try {
+      const definition = readDefinition()
+      const data = await apiPost('/api/console/task-graphs', payload(definition))
+      host.dataset.tgDirty = '0'
+      await loadTaskGraphPanel(data.graph.id)
+    } catch (err) {
+      showEditorError(`保存失败：${err.message || '请求失败'}`)
+    }
+  }
+
+  const addNode = (kind = 'tool') => {
+    const node = taskGraphInsertNode(draft, kind, selectedNodeId)
+    selectedNodeId = node.id
+    host.dataset.tgDirty = '1'
+    renderNodes()
+    host.querySelector('#tg-validation').innerHTML = '<span class="desc">已添加节点，尚未校验。</span>'
+  }
+
+  for (const button of host.querySelectorAll('[data-tg-template]')) {
+    button.addEventListener('click', async () => {
+      const template = TASK_GRAPH_STARTERS.find((item) => item.id === button.dataset.tgTemplate)
+      if (!template) return
+      if (host.dataset.tgDirty === '1') {
+        const confirmed = await confirmCard({
+          title: `套用「${template.name}」模板？`,
+          message: '当前节点和表单修改会被替换，任务图名称和说明保留。',
+          confirmText: '套用模板',
+        })
+        if (!confirmed) return
+      }
+      draft = taskGraphEnsureDefinition(template.build(taskGraphCatalogCache))
+      argsTexts.clear()
+      selectedNodeId = taskGraphDefaultSelectedNode(draft)
+      const starterNames = TASK_GRAPH_STARTERS.map((item) => item.name)
+      const starterDescriptions = TASK_GRAPH_STARTERS.map((item) => item.description)
+      const nameInput = host.querySelector('#tg-name')
+      if (nameInput && (!nameInput.value.trim() || nameInput.value.trim() === '新任务图' || starterNames.includes(nameInput.value.trim()))) {
+        nameInput.value = template.name
+      }
+      const descInput = host.querySelector('#tg-desc')
+      if (descInput && (!descInput.value.trim() || starterDescriptions.includes(descInput.value.trim()))) descInput.value = template.description
+      host.dataset.tgJsonDirty = '0'
+      host.dataset.tgDirty = '1'
+      renderNodes()
+      host.querySelector('#tg-validation').innerHTML = `<span class="desc">已套用「${template.name}」模板，尚未校验。</span>`
+    })
+  }
+
+  nodeHost.addEventListener('click', async (event) => {
+    const target = event.target
+    if (!(target instanceof Element)) return
+    const addEdgeButton = target.closest('[data-tg-edge-add]')
+    if (addEdgeButton) {
+      const node = draft.nodes.find((item) => item.id === addEdgeButton.dataset.tgEdgeAdd)
+      if (!node) return
+      const used = new Set(node.nextIds)
+      const candidates = draft.nodes.filter((item) => item.id !== node.id && item.kind !== 'start' && !used.has(item.id))
+      if (!candidates.length) {
+        alert('没有可用的出线目标。请先选中条件节点并添加一个新节点，或在表单里调整已有节点。')
+        return
+      }
+      const targetNode = candidates.find((item) => item.kind === 'end') || candidates[0]
+      node.nextIds.push(targetNode.id)
+      const hasElse = Object.values(node.edgeRules || {}).some((rule) => rule?.else)
+      node.edgeRules[targetNode.id] = taskGraphRuleDefault(hasElse)
+      host.dataset.tgDirty = '1'
+      renderNodes()
+      host.querySelector('#tg-validation').innerHTML = '<span class="desc">已添加出线，尚未校验。</span>'
+      return
+    }
+
+    const deleteEdgeButton = target.closest('[data-tg-edge-delete]')
+    if (deleteEdgeButton) {
+      const node = draft.nodes.find((item) => item.id === deleteEdgeButton.dataset.tgEdgeDelete)
+      if (!node) return
+      const index = Number(deleteEdgeButton.dataset.edgeIndex)
+      const removed = node.nextIds[index]
+      node.nextIds.splice(index, 1)
+      if (removed && node.edgeRules) delete node.edgeRules[removed]
+      host.dataset.tgDirty = '1'
+      renderNodes()
+      host.querySelector('#tg-validation').innerHTML = '<span class="desc">已删除出线，尚未校验。</span>'
+      return
+    }
+
+    const deleteNodeButton = target.closest('[data-tg-node-delete]')
+    if (deleteNodeButton) {
+      const nodeId = deleteNodeButton.dataset.tgNodeDelete
+      const node = draft.nodes.find((item) => item.id === nodeId)
+      if (!node) return
+      const confirmed = await confirmCard({
+        title: `删除节点「${node.title || node.id}」？`,
+        message: '出线会尽量接到它的下一个节点；保存前都可以继续修改。',
+        confirmText: '删除节点',
+      })
+      if (!confirmed) return
+      if (!taskGraphRemoveNode(draft, nodeId)) {
+        alert('开始节点和结束节点不能删除。')
+        return
+      }
+      argsTexts.delete(nodeId)
+      if (selectedNodeId === nodeId) {
+        selectedNodeId = draft.nodes.find((item) => item.kind !== 'start' && item.kind !== 'end')?.id || ''
+      }
+      host.dataset.tgDirty = '1'
+      renderNodes()
+      host.querySelector('#tg-validation').innerHTML = '<span class="desc">已删除节点，尚未校验。</span>'
+      return
+    }
+
+    if (target.closest('input, select, textarea, button, label, a')) return
+    const card = target.closest('[data-tg-node-card]')
+    if (card) selectNode(card.dataset.tgNodeCard)
+  })
+
+  const handleFieldChange = (event) => {
+    const target = event.target
+    if (!(target instanceof HTMLElement)) return
+    const nodeId = target.dataset.nodeId
+    const node = nodeId ? draft.nodes.find((item) => item.id === nodeId) : null
+
+    if (node && target.dataset.tgField) {
+      setPath(node, target.dataset.tgField, target.value)
+      markDirty()
+      return
+    }
+    if (node && target.dataset.tgNumber) {
+      const value = target.value === '' ? undefined : Number(target.value)
+      setPath(node, target.dataset.tgNumber, value)
+      markDirty()
+      return
+    }
+    if (node && target.dataset.tgJson) {
+      argsTexts.set(node.id, target.value)
+      markDirty()
+      return
+    }
+    if (node && target.dataset.tgNext) {
+      node.nextIds = target.value ? [target.value] : []
+      markDirty()
+      return
+    }
+    if (node && target.dataset.tgReject) {
+      if (target.value) node.manual = { ...(node.manual || {}), rejectNextId: target.value }
+      else if (node.manual) delete node.manual.rejectNextId
+      markDirty()
+      return
+    }
+    if (node && target.dataset.tgWaitValue !== undefined) {
+      const unitSelect = [...nodeHost.querySelectorAll('[data-tg-wait-unit]')].find(
+        (item) => item.dataset.tgWaitUnit === node.id,
+      )
+      const unit = Number(unitSelect?.value) || 1
+      node.wait = { ...(node.wait || {}), durationSec: Math.max(1, Number(target.value) || 1) * unit }
+      markDirty()
+      return
+    }
+    if (node && target.dataset.tgWaitUnit !== undefined) {
+      const valueInput = [...nodeHost.querySelectorAll('[data-tg-wait-value]')].find(
+        (item) => item.dataset.tgWaitValue === node.id,
+      )
+      const value = Number(valueInput?.value) || 1
+      node.wait = { ...(node.wait || {}), durationSec: Math.max(1, value) * (Number(target.value) || 1) }
+      markDirty()
+      return
+    }
+
+    const ruleNode = target.dataset.tgRuleField || target.dataset.tgRuleOp || target.dataset.tgRuleValue || target.dataset.tgRuleElse
+      ? draft.nodes.find((item) => item.id === (target.dataset.tgRuleField || target.dataset.tgRuleOp || target.dataset.tgRuleValue || target.dataset.tgRuleElse))
+      : null
+    if (ruleNode) {
+      const edgeTarget = String(target.dataset.edgeTarget || '')
+      if (!edgeTarget) return
+      ruleNode.edgeRules = ruleNode.edgeRules || {}
+      const rule = ruleNode.edgeRules[edgeTarget] || {}
+      if (target.dataset.tgRuleElse !== undefined) {
+        if (target.checked) ruleNode.edgeRules[edgeTarget] = { else: true }
+        else ruleNode.edgeRules[edgeTarget] = { field: 'input.question', op: 'exists' }
+        markDirty()
+        renderNodes()
+        return
+      }
+      if (target.dataset.tgRuleField !== undefined) rule.field = target.value
+      if (target.dataset.tgRuleOp !== undefined) {
+        rule.op = target.value
+        if (!['eq', 'neq', 'contains', 'gt', 'gte', 'lt', 'lte'].includes(target.value)) delete rule.value
+      }
+      if (target.dataset.tgRuleValue !== undefined) rule.value = target.value
+      ruleNode.edgeRules[edgeTarget] = rule
+      markDirty()
+      if (target.dataset.tgRuleOp !== undefined) renderNodes()
+      return
+    }
+
+    const edgeSelect = target.closest('[data-tg-edge-target]')
+    if (edgeSelect) {
+      const node = draft.nodes.find((item) => item.id === edgeSelect.dataset.tgEdgeTarget)
+      if (!node) return
+      const index = Number(edgeSelect.dataset.edgeIndex)
+      const oldTarget = edgeSelect.dataset.oldTarget || ''
+      const newTarget = edgeSelect.value
+      if (!newTarget) {
+        edgeSelect.value = oldTarget
+        alert('请选择一个存在的目标节点。')
+        return
+      }
+      if (node.nextIds.some((id, itemIndex) => id === newTarget && itemIndex !== index)) {
+        edgeSelect.value = oldTarget
+        alert('同一个条件节点不能重复选择同一条出线。')
+        return
+      }
+      node.nextIds[index] = newTarget
+      if (oldTarget && node.edgeRules?.[oldTarget]) {
+        node.edgeRules[newTarget] = node.edgeRules[oldTarget]
+        delete node.edgeRules[oldTarget]
+      }
+      host.dataset.tgDirty = '1'
+      renderNodes()
+      host.querySelector('#tg-validation').innerHTML = '<span class="desc">出线已修改，尚未校验。</span>'
+    }
+  }
+
+  nodeHost.addEventListener('input', handleFieldChange)
+  nodeHost.addEventListener('change', handleFieldChange)
+  nodeHost.addEventListener('focusin', (event) => {
+    const target = event.target
+    if (!(target instanceof Element)) return
+    const card = target.closest('[data-tg-node-card]')
+    const nodeId = card?.dataset.tgNodeCard
+    if (nodeId && nodeId !== selectedNodeId) selectNode(nodeId)
+  })
+  host.querySelector('#tg-name')?.addEventListener('input', markDirty)
+  host.querySelector('#tg-desc')?.addEventListener('input', markDirty)
+  for (const button of host.querySelectorAll('[data-tg-add-kind]')) {
+    button.addEventListener('click', () => addNode(button.dataset.tgAddKind || 'tool'))
+  }
+  host.querySelector('#tg-flow-preview')?.addEventListener('click', (event) => {
+    const target = event.target
+    if (!(target instanceof Element)) return
+    const nodeButton = target.closest('[data-tg-flow-node]')
+    if (nodeButton) selectNode(nodeButton.dataset.tgFlowNode, true)
+  })
+
+  jsonArea?.addEventListener('input', () => {
+    host.dataset.tgDirty = '1'
+    host.dataset.tgJsonDirty = '1'
+    const box = host.querySelector('#tg-validation')
+    if (box) box.innerHTML = '<span class="desc">JSON 已修改，点「应用 JSON 到表单」后才会生效。</span>'
+  })
+  host.querySelector('#tg-apply-json')?.addEventListener('click', () => {
+    try {
+      const parsed = JSON.parse(jsonArea.value)
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('顶层必须是对象')
+      if (!Array.isArray(parsed.nodes)) throw new Error('nodes 必须是数组')
+      if (!parsed.nodes.length) throw new Error('nodes 不能为空')
+      parsed.nodes.forEach((node, index) => {
+        if (!node || typeof node !== 'object' || Array.isArray(node)) throw new Error(`第 ${index + 1} 个节点必须是对象`)
+        if (typeof node.id !== 'string' || !node.id.trim()) throw new Error(`第 ${index + 1} 个节点缺少 id`)
+        if (typeof node.kind !== 'string' || !node.kind.trim()) throw new Error(`节点「${node.id}」缺少 kind`)
+      })
+      draft = taskGraphEnsureDefinition(parsed)
+      argsTexts.clear()
+      selectedNodeId =
+        draft.nodes.find((node) => node.id === selectedNodeId)?.id ||
+        draft.nodes.find((node) => node.kind !== 'start' && node.kind !== 'end')?.id ||
+        draft.nodes[0]?.id ||
+        ''
+      host.dataset.tgDirty = '1'
+      host.dataset.tgJsonDirty = '0'
+      renderNodes()
+      host.querySelector('#tg-validation').innerHTML = '<span class="desc">JSON 已应用到表单，尚未校验。</span>'
+    } catch (err) {
+      showEditorError(`定义 JSON 应用失败：${err.message}`)
+    }
+  })
+
+  host.querySelector('#tg-validate')?.addEventListener('click', async () => {
+    if (!ensureJsonApplied()) return
+    try {
+      const data = await apiPost('/api/console/task-graphs/validate', { definition: readDefinition() })
+      showValidation(data.validation)
+    } catch (err) {
+      showEditorError(`校验失败：${err.message || '请求失败'}`)
+    }
+  })
+  host.querySelector('#tg-save')?.addEventListener('click', save)
+  host.querySelector('#tg-publish')?.addEventListener('click', async () => {
+    if (!selected) return
+    if (!ensureJsonApplied()) return
+    try {
+      const definition = readDefinition()
+      const data = await apiPost(`/api/console/task-graphs/${encodeURIComponent(selected.id)}/publish`, { definition })
+      host.dataset.tgDirty = '0'
+      await loadTaskGraphPanel(data.graph.id)
+    } catch (err) {
+      showEditorError(`发布失败：${err.message || '请求失败'}`)
+    }
+  })
+  host.querySelector('#tg-delete')?.addEventListener('click', async () => {
+    if (!selected) return
+    const okToDelete = await confirmCard({
+      title: '停用任务图？',
+      message: '停用后保留历史版本和运行记录，但不能再次运行。',
+      confirmText: '停用',
+    })
+    if (!okToDelete) return
+    try {
+      await api(`/api/console/task-graphs/${encodeURIComponent(selected.id)}`, { method: 'DELETE' })
+      host.dataset.tgDirty = '0'
+      await loadTaskGraphPanel()
+    } catch (err) {
+      alert(err.message || '停用失败')
+    }
+  })
+  host.querySelector('#tg-run')?.addEventListener('click', async () => {
+    if (!selected) return
+    if (host.dataset.tgDirty === '1') {
+      const okToRun = await confirmCard({
+        title: '运行已发布版本？',
+        message: '当前表单还有未保存的修改，本次运行不会使用这些修改。',
+        confirmText: '继续运行',
+      })
+      if (!okToRun) return
+    }
+    let input
+    try {
+      input = JSON.parse(host.querySelector('#tg-run-input')?.value || '{}')
+    } catch (err) {
+      alert(`运行输入 JSON 解析失败：${err.message}`)
+      return
+    }
+    try {
+      const data = await apiPost(`/api/console/task-graphs/${encodeURIComponent(selected.id)}/runs`, { input })
+      host.dataset.tgDirty = '0'
+      await loadTaskGraphPanel(selected.id)
+      await openTaskGraphRun(data.run.id)
+    } catch (err) {
+      alert(err.message || '运行失败')
+    }
+  })
+  for (const button of host.querySelectorAll('[data-tg-run]')) {
+    button.addEventListener('click', () => openTaskGraphRun(button.dataset.tgRun))
+  }
+  for (const button of host.querySelectorAll('[data-tg-approve]')) {
+    button.addEventListener('click', async () => {
+      const decision = button.dataset.decision === 'rejected' ? 'rejected' : 'approved'
+      let note = ''
+      if (decision === 'rejected') {
+        note = window.prompt('拒绝原因（可选）') || ''
+      }
+      try {
+        await apiPost(`/api/console/task-graph-runs/${encodeURIComponent(button.dataset.tgApprove)}/approve`, { decision, note })
+        await loadTaskGraphPanel(selected ? selected.id : '')
+      } catch (err) {
+        alert(err.message || '处理失败')
+      }
+    })
+  }
+  for (const button of host.querySelectorAll('[data-tg-cancel]')) {
+    button.addEventListener('click', async () => {
+      const okToCancel = await confirmCard({
+        title: '取消这次运行？',
+        message: '已完成的步骤会保留，运行状态变为已取消。',
+        confirmText: '取消运行',
+      })
+      if (!okToCancel) return
+      try {
+        await apiPost(`/api/console/task-graph-runs/${encodeURIComponent(button.dataset.tgCancel)}/cancel`, {})
+        await loadTaskGraphPanel(selected ? selected.id : '')
+      } catch (err) {
+        alert(err.message || '取消失败')
+      }
+    })
+  }
+
+  renderNodes()
+}
+
+async function openTaskGraphRun(runId) {
+  const overlay = modelModal(`
+    <div class="modal-head"><h3>任务图运行</h3><button class="modal-x" type="button">×</button></div>
+    <div class="task-graph-run-detail" id="task-graph-run-detail"><div class="empty">加载中…</div></div>
+    <div class="modal-actions"><button class="btn ghost" type="button" id="task-graph-run-close">关闭</button></div>`)
+  let timer = null
+  let closed = false
+  let terminal = false
+  const close = () => {
+    closed = true
+    if (timer) clearInterval(timer)
+    overlay.remove()
+  }
+  overlay.querySelector('.modal-x').addEventListener('click', close)
+  overlay.querySelector('#task-graph-run-close').addEventListener('click', close)
+  const render = async () => {
+    if (closed) return
+    try {
+      const data = await api(`/api/console/task-graph-runs/${encodeURIComponent(runId)}`)
+      if (closed) return
+      const run = data.run
+      const steps = (run.steps || [])
+        .map(
+          (step) => `<li>
+          <span class="task-event-dot"></span>
+          <div>
+            <strong>${esc(step.title)}</strong> ${taskGraphPill(step.status)}
+            <span class="desc">${esc(TASK_GRAPH_NODE_KIND_LABEL[step.nodeKind] || step.nodeKind)} · ${esc(step.nodeId)} · ${Number(step.durationMs) || 0}ms</span>
+            ${step.error ? `<div class="desc danger-text">${esc(step.error)}</div>` : ''}
+            <div class="desc mono task-event-payload">${esc(JSON.stringify({ input: step.input, output: step.output }, null, 2).slice(0, 800))}</div>
+          </div>
+        </li>`,
+        )
+        .join('')
+      overlay.querySelector('#task-graph-run-detail').innerHTML = `
+      <div class="task-detail-grid">
+        <div><span>任务图</span><strong>${esc(run.graphName)} · v${run.graphVersion}</strong></div>
+        <div><span>状态</span><strong>${taskGraphPill(run.status)}</strong></div>
+        <div><span>Trace</span><strong class="mono">${esc(run.traceId)}</strong></div>
+        <div><span>当前节点</span><strong class="mono">${esc(run.currentNodeId || '—')}</strong></div>
+        <div><span>开始</span><strong>${esc(new Date(run.startedAt).toLocaleString('zh-CN'))}</strong></div>
+        <div><span>结束</span><strong>${run.finishedAt ? esc(new Date(run.finishedAt).toLocaleString('zh-CN')) : '—'}</strong></div>
+      </div>
+      ${run.waiting ? `<div class="task-graph-waiting"><strong>当前等待</strong><pre>${esc(JSON.stringify(run.waiting, null, 2))}</pre></div>` : ''}
+      ${run.error ? `<div class="danger-text">${esc(run.error)}</div>` : ''}
+      <h3>步骤 <span class="muted">${(run.steps || []).length}</span></h3>
+      <ol class="task-timeline">${steps || '<li class="empty">还没有步骤。</li>'}</ol>`
+      terminal = !['running', 'waiting_manual', 'waiting_wait'].includes(run.status)
+      if (terminal && timer) {
+        clearInterval(timer)
+        timer = null
+      }
+    } catch (err) {
+      if (closed) return
+      const detail = overlay.querySelector('#task-graph-run-detail')
+      if (!detail) return
+      detail.innerHTML = stateBlockHtml({
+        tone: 'error',
+        title: '运行详情读取失败',
+        body: consoleErrorText(err),
+        actionLabel: '重试',
+        action: 'tg-run-retry',
+      })
+      detail.querySelector('[data-state-action="tg-run-retry"]')?.addEventListener('click', () => {
+        detail.innerHTML = '<div class="empty">正在重试…</div>'
+        void render()
+      })
+    }
+  }
+  await render()
+  if (!closed && !terminal && !timer) timer = setInterval(render, 2000)
+}
+
+/* 任务详情改成右侧抽屉：列表留在原位，抽屉里看概览、指令、执行记录和事件时间线，
+   暂停/恢复/取消直接在抽屉底部操作，关闭后列表状态已刷新。 */
+let taskDrawerOverlay = null
+let closeTaskDrawer = null
+
+function taskDrawerFacts(task) {
+  const facts = [
+    ['创建人', esc(task.userName || task.userId || '—')],
+    ['规则', esc(taskRuleText(task))],
+    ['下一次', esc(task.nextRunLocal || '—')],
+    ['最近执行', esc(task.lastRunLocal || '—')],
+    ['时区', esc(task.timezone || '—')],
+    ['渠道', esc(task.channel || '—')],
+  ]
+  return `<dl class="task-drawer-facts">${facts
+    .map(([label, value]) => `<div><dt>${label}</dt><dd>${value}</dd></div>`)
+    .join('')}<div class="is-wide"><dt>会话</dt><dd class="mono">${esc(task.sessionId || '—')}</dd></div></dl>`
+}
+
+function taskDrawerBody(task) {
+  const runs = (task.runs || [])
+    .map(
+      (run) => `<tr>
+        <td class="desc">${esc(new Date(run.startedAt).toLocaleString('zh-CN'))}</td>
+        <td>${taskRunPill(run.status)}</td>
+        <td class="desc">${esc(run.resultText ? taskPromptBrief(run.resultText) : run.error || '—')}</td>
+        <td class="desc">${esc(TASK_DELIVERY_LABEL[run.delivery] || run.delivery || '—')}${run.deliveryError ? `<div class="desc danger-text">${esc(run.deliveryError)}</div>` : ''}</td>
+      </tr>`,
+    )
+    .join('')
+  const events = (task.events || [])
+    .slice()
+    .reverse()
+    .map(
+      (event) => `<li>
+        <span class="task-event-dot"></span>
+        <div>
+          <strong>${esc(TASK_EVENT_LABEL[event.type] || event.type)}</strong>
+          <span class="desc">${esc(new Date(event.createdAt).toLocaleString('zh-CN'))}</span>
+          <div class="desc mono task-event-payload">${esc(taskPayloadText(event.payload))}</div>
+        </div>
+      </li>`,
+    )
+    .join('')
+  return `
+    <section class="task-drawer-section">
+      <h4>概览</h4>
+      ${taskDrawerFacts(task)}
+    </section>
+    <section class="task-drawer-section">
+      <h4>任务指令</h4>
+      <pre class="task-drawer-prompt">${esc(task.prompt)}</pre>
+    </section>
+    <section class="task-drawer-section">
+      <h4>最近执行 <span class="muted">${(task.runs || []).length}</span></h4>
+      <table class="data task-drawer-runs">
+        <thead><tr><th>开始时间</th><th>状态</th><th>结果 / 错误</th><th>投递</th></tr></thead>
+        <tbody>${runs || '<tr><td colspan="4" class="empty">还没有执行记录。</td></tr>'}</tbody>
+      </table>
+    </section>
+    <section class="task-drawer-section">
+      <h4>事件时间线 <span class="muted">${(task.events || []).length}</span></h4>
+      <ol class="task-timeline">${events || '<li class="empty">还没有事件。</li>'}</ol>
+    </section>`
+}
+
+function taskDrawerActions(task) {
+  const id = esc(task.id)
+  const close = `<button class="btn ghost" type="button" data-drawer-close>关闭</button>`
+  if (task.status === 'running' || task.status === 'done' || task.status === 'cancelled') return close
+  const pause = task.status === 'active' ? `<button class="btn ghost" type="button" data-drawer-act="pause" data-drawer-task="${id}">暂停</button>` : ''
+  const resume = task.status === 'paused' ? `<button class="btn primary" type="button" data-drawer-act="resume" data-drawer-task="${id}">恢复</button>` : ''
+  return `${pause}${resume}<button class="btn ghost danger-text" type="button" data-drawer-act="cancel" data-drawer-task="${id}">取消任务</button>${close}`
+}
+
+function markTaskRowOpen(id) {
+  for (const rowEl of document.querySelectorAll('#view [data-task-row]')) {
+    rowEl.classList.toggle('is-open', Boolean(id) && rowEl.dataset.taskRow === id)
   }
 }
 
 async function openTaskDetail(id) {
-  const overlay = modelModal(`
-    <div class="modal-head"><h3>任务详情</h3><button class="modal-x" type="button">×</button></div>
-    <div class="task-detail-body" id="task-detail-body"><div class="empty">加载中…</div></div>
-    <div class="modal-actions"><button class="btn ghost" type="button" id="task-detail-close">关闭</button></div>`)
-  const close = () => overlay.remove()
-  overlay.querySelector('.modal-x').addEventListener('click', close)
-  overlay.querySelector('#task-detail-close').addEventListener('click', close)
-  try {
-    const task = await api(`/api/console/schedules/${encodeURIComponent(id)}`)
-    const runs = (task.runs || [])
-      .map(
-        (run) => `<tr>
-          <td class="desc">${esc(new Date(run.startedAt).toLocaleString('zh-CN'))}</td>
-          <td>${taskRunPill(run.status)}</td>
-          <td class="desc">${esc(run.resultText ? taskPromptBrief(run.resultText) : run.error || '—')}</td>
-          <td class="desc">${esc(TASK_DELIVERY_LABEL[run.delivery] || run.delivery || '—')}${run.deliveryError ? `<div class="desc danger-text">${esc(run.deliveryError)}</div>` : ''}</td>
-        </tr>`,
-      )
-      .join('')
-    const events = (task.events || [])
-      .slice()
-      .reverse()
-      .map(
-        (event) => `<li>
-          <span class="task-event-dot"></span>
-          <div>
-            <strong>${esc(TASK_EVENT_LABEL[event.type] || event.type)}</strong>
-            <span class="desc">${esc(new Date(event.createdAt).toLocaleString('zh-CN'))}</span>
-            <div class="desc mono task-event-payload">${esc(taskPayloadText(event.payload))}</div>
-          </div>
-        </li>`,
-      )
-      .join('')
-    overlay.querySelector('#task-detail-body').innerHTML = `
-      <div class="task-detail-grid">
-        <div><span>创建人</span><strong>${esc(task.userName || task.userId || '—')}</strong></div>
-        <div><span>状态</span><strong>${taskStatusPill(task.status)}</strong></div>
-        <div><span>规则</span><strong>${esc(taskRuleText(task))}</strong></div>
-        <div><span>时区</span><strong>${esc(task.timezone)}</strong></div>
-        <div><span>下一次</span><strong>${esc(task.nextRunLocal)}</strong></div>
-        <div><span>最近执行</span><strong>${esc(task.lastRunLocal || '—')}</strong></div>
-        <div><span>渠道</span><strong>${esc(task.channel)}</strong></div>
-        <div><span>会话</span><strong class="mono">${esc(task.sessionId || '—')}</strong></div>
+  if (!id) return
+  if (closeTaskDrawer) closeTaskDrawer()
+  state.taskOpen = id
+  markTaskRowOpen(id)
+  const overlay = document.createElement('div')
+  overlay.className = 'drawer-overlay task-drawer-overlay'
+  overlay.innerHTML = `<aside class="drawer task-drawer" role="dialog" aria-modal="true" aria-label="任务详情">
+    <header class="task-drawer-head">
+      <div class="task-drawer-heading">
+        <span class="task-drawer-kicker">任务详情</span>
+        <h3 id="task-drawer-title">加载中…</h3>
+        <div class="task-drawer-sub" id="task-drawer-sub"></div>
       </div>
-      <div class="task-prompt"><span>任务指令</span><pre>${esc(task.prompt)}</pre></div>
-      <h3>最近执行 <span class="muted">${(task.runs || []).length}</span></h3>
-      <table class="data">
-        <thead><tr><th>开始时间</th><th>状态</th><th>结果 / 错误</th><th>投递</th></tr></thead>
-        <tbody>${runs || '<tr><td colspan="4" class="empty">还没有执行记录。</td></tr>'}</tbody>
-      </table>
-      <h3>事件时间线 <span class="muted">${(task.events || []).length}</span></h3>
-      <ol class="task-timeline">${events || '<li class="empty">还没有事件。</li>'}</ol>`
-  } catch (err) {
-    overlay.querySelector('#task-detail-body').innerHTML = `<div class="empty">${esc(err.message || '加载失败')}</div>`
+      <button class="drawer-x" type="button" aria-label="关闭">×</button>
+    </header>
+    <div class="task-drawer-body" id="task-drawer-body"><div class="empty">加载中…</div></div>
+    <footer class="task-drawer-foot" id="task-drawer-foot"></footer>
+  </aside>`
+  document.body.appendChild(overlay)
+  taskDrawerOverlay = overlay
+  const close = () => {
+    document.removeEventListener('keydown', onKey)
+    if (taskDrawerOverlay === overlay) taskDrawerOverlay = null
+    if (closeTaskDrawer === close) closeTaskDrawer = null
+    if (state.taskOpen === id) state.taskOpen = ''
+    markTaskRowOpen('')
+    overlay.remove()
   }
+  closeTaskDrawer = close
+  const onKey = (event) => {
+    if (event.key === 'Escape') {
+      event.stopPropagation()
+      close()
+    }
+  }
+  document.addEventListener('keydown', onKey)
+  overlay.addEventListener('click', (event) => {
+    if (event.target === overlay) close()
+  })
+  overlay.querySelector('.drawer-x').addEventListener('click', close)
+
+  const load = async () => {
+    try {
+      const task = await api(`/api/console/schedules/${encodeURIComponent(id)}`)
+      const title = overlay.querySelector('#task-drawer-title')
+      const sub = overlay.querySelector('#task-drawer-sub')
+      const body = overlay.querySelector('#task-drawer-body')
+      const foot = overlay.querySelector('#task-drawer-foot')
+      if (!overlay.isConnected) return
+      title.textContent = task.title || '任务详情'
+      sub.innerHTML = `${taskStatusPill(task.status)}<span class="muted">${esc(taskRuleText(task))}</span>`
+      body.innerHTML = taskDrawerBody(task)
+      foot.innerHTML = taskDrawerActions(task)
+      for (const button of foot.querySelectorAll('[data-drawer-close]')) button.addEventListener('click', close)
+      for (const button of foot.querySelectorAll('[data-drawer-act]')) {
+        button.addEventListener('click', async () => {
+          const action = button.dataset.drawerAct
+          const taskId = button.dataset.drawerTask
+          if (!action || !taskId) return
+          if (action === 'cancel') {
+            const okToCancel = await confirmCard({
+              title: '取消定时任务？',
+              message: '取消后不会再触发；历史执行记录和事件时间线会保留。',
+              confirmText: '取消任务',
+            })
+            if (!okToCancel) return
+          }
+          button.disabled = true
+          try {
+            await apiPost(`/api/console/schedules/${encodeURIComponent(taskId)}/${action}`, {})
+            await load()
+            await loadTasks(state.taskStatus, 'schedules')
+            markTaskRowOpen(state.taskOpen)
+          } catch (err) {
+            alert(err.message || '操作失败')
+            button.disabled = false
+          }
+        })
+      }
+    } catch (err) {
+      if (overlay.isConnected) overlay.querySelector('#task-drawer-body').innerHTML = `<div class="empty">${esc(err.message || '加载失败')}</div>`
+    }
+  }
+  await load()
 }
 
 /* ---------------- 组织同步 ---------------- */
@@ -19707,7 +21882,7 @@ function renderSync(channels, data, bindings) {
   const paneBinding = `
     <section class="panel channel-pane" id="ch-binding" data-pane="binding">
       <div class="panel-head">
-        <div><h2>企业一键绑定</h2>${hintBadge('绑定说明', '钉钉、飞书、企业微信都支持扫码或手工绑定；飞书、企业微信不装 dsh-im 也能用，装了插件时机器人由插件接管。飞书通讯录复用应用凭据，企业微信通讯录另需 CorpId + CorpSecret。')}</div>
+        <div class="panel-title-line"><h2>企业一键绑定</h2>${hintBadge('绑定说明', '钉钉、飞书、企业微信都支持扫码或手工绑定；飞书、企业微信不装 dsh-im 也能用，装了插件时机器人由插件接管。飞书通讯录复用应用凭据，企业微信通讯录另需 CorpId + CorpSecret。')}</div>
         ${hintBadge('租户规则', '一个租户只归一家公司；绑定关系与同步结果都会写审计。')}
       </div>
       ${
@@ -19723,7 +21898,7 @@ function renderSync(channels, data, bindings) {
   const paneConfig = `
     <section class="panel channel-pane" id="ch-config" data-pane="config" hidden>
       <div class="panel-head">
-        <div><h2>渠道接入</h2>${hintBadge('展示说明', '已绑定的企业优先显示；未绑定渠道收在下方，避免抢占视线。')}</div>
+        <div class="panel-title-line"><h2>渠道接入</h2>${hintBadge('展示说明', '已绑定的企业优先显示；未绑定渠道收在下方，避免抢占视线。')}</div>
       </div>
       <div class="channel-tier-head">
         <div>
@@ -19745,7 +21920,7 @@ function renderSync(channels, data, bindings) {
         secondaryChannels.length
           ? `<details class="channel-secondary">
               <summary>
-                <div><strong>其他渠道</strong>${hintBadge('收纳说明', '未绑定渠道收在下方；配置凭证后可接入，不占用主视线。')}</div>
+                <div class="panel-title-line"><strong>其他渠道</strong>${hintBadge('收纳说明', '未绑定渠道收在下方；配置凭证后可接入，不占用主视线。')}</div>
                 <span class="channel-more-count">${secondaryChannels.length} 个待接入 <span class="channel-more-chevron" aria-hidden="true">⌄</span></span>
               </summary>
               <div class="channel-config-grid channel-config-grid-secondary">${secondaryChannels
@@ -23088,6 +25263,15 @@ function applyAccessToTopNav() {
     if (!domain) continue
     button.hidden = visiblePagesOfDomain(domain).length === 0
   }
+  if (navSubbarPinnedDomain) {
+    const pinnedButton = navPrimaryButton(navSubbarPinnedDomain)
+    // 权限变化可能把当前固定的业务域整个藏起来；这种情况下 pin 也要清掉，
+    // 否则页内选择器会被一个已经不存在的 44px 二级行向下顶。
+    if (!pinnedButton || pinnedButton.hidden) {
+      navSubbarPinnedDomain = null
+      syncNavPinState()
+    }
+  }
   hideNavSubbar()
 }
 
@@ -23106,6 +25290,8 @@ function syncNavPinState() {
     button.classList.toggle('is-pinned', pinned)
     button.setAttribute('aria-pressed', pinned ? 'true' : 'false')
   }
+  // 固定二级导航会让导航区高度增加 44px；页内选择器需要同步下移，避免被压住。
+  document.body.classList.toggle('has-nav-pin', Boolean(navSubbarPinnedDomain))
 }
 
 function restorePinnedNavSubbar() {
@@ -23252,10 +25438,14 @@ function setupNavSubbar() {
   for (const button of document.querySelectorAll('.nav-primary[data-domain]')) {
     const domain = DOMAINS.find((item) => item.id === button.dataset.domain)
     if (!domain) continue
-    if (navSubbarItems(domain).length < 2) continue
+    const hasSubbar = navSubbarItems(domain).length >= 2
+    button.classList.toggle('has-subnav', hasSubbar)
+    if (!hasSubbar) continue
     if (button.dataset.navSubbarBound === '1') continue
     button.dataset.navSubbarBound = '1'
     // 多页面业务域：悬停临时展开，点击固定；再次点击同一项取消固定
+    button.setAttribute('aria-haspopup', 'true')
+    button.setAttribute('aria-controls', 'nav-subbar')
     button.setAttribute('aria-expanded', 'false')
     button.setAttribute('aria-pressed', 'false')
     button.addEventListener('pointerenter', () => openNavSubbar(button))
@@ -23478,6 +25668,39 @@ function renderNoAccess() {
   </div></section>`
 }
 
+/**
+ * 页面到达反馈：只表达“已经换到另一页”，160ms，移动 6px。
+ * 不隐藏首屏、不阻塞点击；减少动态效果时由 ui-motion.css 关闭。
+ */
+function playPageEnter(view = $('#view')) {
+  if (!view) return
+  if (!view.dataset.pageEnterBound) {
+    view.dataset.pageEnterBound = '1'
+    view.addEventListener('animationend', (event) => {
+      if (event.animationName === 'eab-page-enter') view.classList.remove('is-page-enter')
+    })
+  }
+  view.classList.remove('is-page-enter')
+  // 强制重排一次，让同一页面连续切换时动画也能重新开始。
+  void view.offsetWidth
+  view.classList.add('is-page-enter')
+}
+
+/**
+ * 长页结构层统一接入 reveal：只标记页面区块，不改表格行、表单和正文。
+ * 首屏元素由 ui-motion.js 自动跳过；滚动进入的面板才播放。
+ */
+function decorateAdminPageMotion(view = $('#view')) {
+  if (!view || !window.EABMotion) return
+  for (const el of view.querySelectorAll('.panel, .kb-flow-step, .dept-detail-stats, .kb-test-card')) {
+    // 隐藏的页内分页面板不挂 reveal：首次切换出来时没有进入观察者，
+    // 否则会一直停在 opacity:0，表现为“切到用途路由后整块空白”。
+    if (el.closest('[hidden]')) continue
+    if (!el.dataset.motion) el.dataset.motion = 'reveal'
+  }
+  window.EABMotion.init(view)
+}
+
 function navigate(page) {
   if (!state.companies.length) {
     renderFirstCompany()
@@ -23498,6 +25721,12 @@ function navigate(page) {
   }
   state.page = page
   state.domain = PAGE_DOMAIN[page] ?? 'overview'
+  // 固定的是某个业务域的二级行；切到概览等单页域时必须清掉，
+  // 否则 navigate 末尾会恢复上一个域的二级导航，出现“概览页下挂着组织子页”。
+  if (navSubbarPinnedDomain && navSubbarPinnedDomain !== state.domain) {
+    navSubbarPinnedDomain = null
+    syncNavPinState()
+  }
   lastPageByDomain.set(state.domain, page)
   const meta = PAGES[page]
   const domain = domainOf(page)
@@ -23522,10 +25751,14 @@ function navigate(page) {
   renderNavRail()
   applyPagePermissionMode(page)
   state.deptFilter = null
+  const view = $('#view')
   const rendered = meta.render()
   Promise.resolve(rendered)
     .then(() => {
-      if (state.page === page) applyPagePermissionMode(page)
+      if (state.page !== page) return
+      applyPagePermissionMode(page)
+      playPageEnter(view)
+      decorateAdminPageMotion(view)
     })
     .catch(() => {})
   // 点击一级导航会先走页面跳转；固定状态在跳转后恢复，避免被 hideNavSubbar 清掉

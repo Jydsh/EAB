@@ -131,4 +131,68 @@ describe('钉钉模型意图自动出引导卡', () => {
       .get('c1', 'u1') as { model_id: string | null } | undefined
     expect(session?.model_id ?? null).toBeNull()
   })
+
+  it('普通对话结束后写入钉钉渠道的自动记忆记录', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'eab-dingtalk-memory-'))
+    dirs.push(dir)
+    const dbPath = join(dir, 'eab.db')
+    const db = openDatabase({ path: dbPath })
+    handles.push(db)
+    migrate(db)
+    seed(db, dbPath)
+
+    vi.stubGlobal('fetch', async (url: string) => {
+      if (url.includes('/oauth2/accessToken')) {
+        return jsonResponse({ accessToken: 'token_test', expireIn: 7200 })
+      }
+      if (url.includes('/chat/completions')) {
+        return jsonResponse({
+          choices: [{ message: { role: 'assistant', content: '好的，我记住了。' } }],
+          usage: { prompt_tokens: 10, completion_tokens: 5 },
+        })
+      }
+      return jsonResponse({ success: true, result: { deliverResults: [{ success: true }] } })
+    })
+
+    const config = { dbPath, dataDir: dir, companyId: 'c1', devAuth: false } as ServerConfig
+    const deps = { db, config, companyId: 'c1', migrations: [], consoleToken: '' } as ServerDeps
+    const result = await handleDingTalkMessage(
+      deps,
+      {
+        senderStaffId: 'dt_u1',
+        msgtype: 'text',
+        text: { content: '我叫钉钉小张，以后都用一行表格回复。' },
+        msgId: 'msg-memory-1',
+      },
+      { dedupe: false },
+    )
+    expect(result.handled).toBe(true)
+    const run = db
+      .prepare(
+        `SELECT channel, mode, auto_confirm, extracted, inserted, activated
+           FROM memory_extraction_runs
+          WHERE company_id = 'c1' AND user_id = 'u1' AND channel = 'dingtalk'
+          ORDER BY created_at DESC LIMIT 1`,
+      )
+      .get() as {
+      channel: string
+      mode: string
+      auto_confirm: number
+      extracted: number
+      inserted: number
+      activated: number
+    } | undefined
+    expect(run).toMatchObject({
+      channel: 'dingtalk',
+      mode: 'rules',
+      auto_confirm: 1,
+      extracted: 2,
+      inserted: 2,
+      activated: 2,
+    })
+    const stored = db
+      .prepare(`SELECT COUNT(*) AS count FROM memories WHERE extraction_source = 'auto' AND source_message_id IS NOT NULL`)
+      .get() as { count: number }
+    expect(stored.count).toBe(2)
+  })
 })

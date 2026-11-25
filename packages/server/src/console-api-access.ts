@@ -228,6 +228,9 @@ export function consoleApiRuleFor(method: string, path: string): ConsoleApiRule 
   if (/^\/api\/console\/audit(?:\/|$)/.test(path)) return { pages: P('audit'), actions }
 
   if (/^\/api\/console\/schedules(?:\/|$)/.test(path)) return { pages: P('tasks'), actions }
+  if (/^\/api\/console\/(?:task-graphs|task-graph-runs)(?:\/|$)/.test(path)) {
+    return { pages: P('tasks'), actions }
+  }
   if (/^\/api\/console\/approval-workflows(?:\/|$)/.test(path)) return { pages: P('approvalPolicies'), actions }
   if (/^\/api\/console\/approvals(?:\/|$)/.test(path)) return { pages: P('approvals'), actions }
 

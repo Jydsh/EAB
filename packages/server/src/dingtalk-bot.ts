@@ -16,6 +16,11 @@ import { appendAudit, type Db } from '@eab/storage'
 import { consumeRobotUserFileSend } from './dingtalk-file-echo.js'
 import { clearDingTalkClarifySync, registerDingTalkClarifySync } from './dingtalk-clarify-sync.js'
 import { handlePermissionApprovalCardCallback } from './permission-approval-dingtalk.js'
+import {
+  handleToolApprovalCardCallback,
+  isToolApprovalCardSession,
+  notifyToolApprovalPending,
+} from './tool-approval-dingtalk.js'
 import { sendDingTalkVoiceReply } from './dingtalk-voice.js'
 import {
   adoptLegacyInterruptedTurns,
@@ -31,6 +36,7 @@ import {
 import { acquireLeaderHold, claimOnce, hitRate, readLeaderOwner, type LeaderHold, type LeaderOwner } from './backends/coordination.js'
 import { memoryQueryForTurn, recentMessageIds, searchChatMemory, shouldRecallPastConversations } from './chat-memory.js'
 import { refreshSessionSummary, sessionSummaryForPrompt } from './chat-summary.js'
+import { extractMemoryShadow } from './memory-extractor.js'
 import { publishChatEvent, type ChatLiveToolEventPayload } from './chat-events.js'
 import { findActivePerson, findPerson, actorFor, type RequestActor } from './session.js'
 import type { ServerDeps } from './deps.js'
@@ -1229,14 +1235,20 @@ export async function handleDingTalkMessage(
     const speedStats = readModelSpeedStats(deps.db, actor.subject.companyId)
     const hasMeasuredSpeed = availableChatModels.some((item) => speedStats.has(item.id))
     const visionModels = availableChatModels.filter((item) => modelSupportsVision(item.tags, item.capabilities))
-    const autoModel = imageUrls.length > 0
-      ? visionRouted ??
-        (hasMeasuredSpeed ? chooseAutoChatModel(visionModels, speedStats) : visionModels[0]) ??
-        availableChatModels[0]
-      : hasMeasuredSpeed
-        ? chooseAutoChatModel(availableChatModels, speedStats)
-        : availableChatModels[0]
-    const model = preferredModel ?? autoModel
+    const dataModels = imageUrls.length > 0 ? visionModels : availableChatModels
+    // 会话里显式选过 /model 时优先用它；否则按视觉路由与实测速度自动选，没有实测速度就取第一个可用。
+    const preferredAvailable = preferredModel && dataModels.some((item) => item.id === preferredModel.id)
+      ? preferredModel
+      : undefined
+    const model =
+      preferredAvailable ??
+      (imageUrls.length > 0
+        ? visionRouted ??
+          (hasMeasuredSpeed ? chooseAutoChatModel(visionModels, speedStats) : visionModels[0]) ??
+          availableChatModels[0]
+        : hasMeasuredSpeed
+          ? chooseAutoChatModel(availableChatModels, speedStats)
+          : availableChatModels[0])
     if (!model) {
       return {
         handled: false,
@@ -1467,6 +1479,7 @@ export async function handleDingTalkMessage(
       skillPrompts,
       availableModels: availableChatModels.map((item) => ({ id: item.id, name: item.name })),
       currentModelId: model.id,
+      channel: 'dingtalk',
     })
     const imageSystemNote =
       imageUrls.length > 0
@@ -1676,6 +1689,12 @@ export async function handleDingTalkMessage(
         sessionId,
         modelSwitch: modelSwitchContext,
         space: toolSpace,
+        // 钉钉没有网页审批气泡：高危工具在渠道里等 A2UI 审批卡回调，
+        // 通过后同一轮继续执行；没有可送达审批人时由回调返回 false 立即失败。
+        approvalMode: 'wait',
+        messageId: assistantMessageId,
+        onToolApprovalPending: (request) =>
+          notifyToolApprovalPending(deps, actor, request),
         emit: (event) => {
           if (event.type === 'reasoning') {
             turnTiming.token()
@@ -1990,6 +2009,19 @@ export async function handleDingTalkMessage(
       modelId: effectiveModel.id,
     }).catch((error) => {
       console.warn('[eab] 钉钉会话摘要更新失败：', (error as Error).message)
+    })
+    void extractMemoryShadow({
+      db: deps.db,
+      dbPath: deps.config.dbPath,
+      companyId: actor.subject.companyId,
+      userId: actor.person.id,
+      sessionId,
+      sourceMessageId: userMessageId,
+      userText: rawText,
+      modelId: effectiveModel.id,
+      channel: 'dingtalk',
+    }).catch((error) => {
+      console.warn('[eab] 钉钉自动记忆抽取失败：', (error as Error).message)
     })
 
     deps.db
@@ -2617,6 +2649,18 @@ export async function handleDingTalkCardCallback(
         console.warn('[eab] 钉钉面板切换：更新原卡异常', error)
       })
     return
+  }
+
+  // 工具执行审批卡：sessionId 是 toolapproval:<approvalId>；必须在题组/模型分支前拦截。
+  if (isToolApprovalCardSession(sessionId)) {
+    const consumed = await handleToolApprovalCardCallback(deps, {
+      outTrackId,
+      externalUserId: externalId,
+      sessionId,
+      optionId,
+      actionIds,
+    })
+    if (consumed) return
   }
 
   // 权限审批卡复用 clarify 的选项组件，但 sessionId 是 approval:<requestId>:<stepNo>；

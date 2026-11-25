@@ -43,3 +43,60 @@ describe('长期记忆的相关性过滤', () => {
     expect(selectRelevantLongTermMemories(memories, '方案 文档 周报 考试 出题', 1)).toHaveLength(1)
   })
 })
+
+describe('长期记忆的向量召回与情景衰减', () => {
+  it('词面不重合但向量足够接近时也能召回', () => {
+    const vectorMemories = [
+      { content: 'Q3 营收目标口径按确认收入计算', embedding: [0.92, 0.08, 0] },
+      { content: '办公室绿植每周三浇水', embedding: [0, 1, 0] },
+    ]
+    const picked = selectRelevantLongTermMemories(vectorMemories, '收入指标怎么算', {
+      queryVector: [1, 0, 0],
+      limit: 3,
+    })
+    expect(picked.map((item) => item.content)).toEqual([
+      expect.stringContaining('Q3 营收目标口径'),
+    ])
+  })
+
+  it('向量分低于门槛且词面不命中时不召回', () => {
+    const vectorMemories = [{ content: '办公室绿植每周三浇水', embedding: [0.2, 0.98, 0] }]
+    const picked = selectRelevantLongTermMemories(vectorMemories, '收入指标怎么算', {
+      queryVector: [1, 0, 0],
+    })
+    expect(picked).toEqual([])
+  })
+
+  it('同领域但只有 0.66 相似且词面不命中时不召回，避免无关记忆占上下文', () => {
+    const vectorMemories = [{ content: '出题/测试/考试场景一次只出一题', embedding: [0.66, 0.75, 0] }]
+    const picked = selectRelevantLongTermMemories(vectorMemories, '修改方案文档时要注意什么', {
+      queryVector: [1, 0, 0],
+    })
+    expect(picked).toEqual([])
+  })
+
+  it('情景记忆按 45 天半衰期降权，偏好与决策不衰减', () => {
+    const now = Date.UTC(2026, 10, 24)
+    const oldEpisode = {
+      content: '项目复盘时先对齐目标再列问题',
+      memoryType: 'episode',
+      createdAt: now - 45 * 24 * 60 * 60 * 1000,
+    }
+    const freshEpisode = {
+      content: '项目复盘时先对齐目标再列问题',
+      memoryType: 'episode',
+      createdAt: now,
+    }
+    expect(
+      selectRelevantLongTermMemories([oldEpisode, freshEpisode], '项目复盘怎么做', { now })
+        .map((item) => item.createdAt),
+    ).toEqual([now, oldEpisode.createdAt])
+
+    const oldDecision = { ...oldEpisode, memoryType: 'decision' }
+    const freshDecision = { ...freshEpisode, memoryType: 'decision' }
+    expect(
+      selectRelevantLongTermMemories([oldDecision, freshDecision], '项目复盘怎么做', { now })
+        .map((item) => item.createdAt),
+    ).toEqual([oldDecision.createdAt, now])
+  })
+})

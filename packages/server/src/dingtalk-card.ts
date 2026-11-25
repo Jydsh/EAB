@@ -11,9 +11,12 @@
  * 任何一步失败都只返回 false，由调用方回退到普通文字消息或 A2UI 卡，保证机器人仍可用。
  */
 import { randomUUID } from 'node:crypto'
+import { chartCatalogForChannel } from '@eab/domain'
 import { getBackendRuntime } from './backends/runtime.js'
+import { parseDingTalkChartPartials, parseDingTalkChartRenders, type DingTalkA2UIChart } from './dingtalk-chart.js'
 
 const DINGTALK_API = 'https://api.dingtalk.com'
+const DINGTALK_CHART_HINT = chartCatalogForChannel('dingtalk').map((item) => item.name).join('、')
 const AI_CARD_TEMPLATE_ID = '02fcf2f4-5e02-4a85-b672-46d1f715543e.schema'
 /**
  * 流式刷新策略：
@@ -864,11 +867,24 @@ const A2UI_PERMISSION_COOLDOWN_MS = 5 * 60_000
 let a2uiDisabledUntil = 0
 
 const A2UI_STATUS = {
+  // PROCESSING 只用于创建首帧；卡片已经存在后继续推内容必须切到 INPUTTING。
+  // 官方“机器人更新卡片”文档：PROCESSING=处理中（创建时用），INPUTTING=输入中（流式内容产出）。
   processing: 'PROCESSING',
+  inputting: 'INPUTTING',
+  confirming: 'CONFIRMING',
   // 官方 JSON 卡文档的终态枚举名是 FINISH（不是 FINISHED）。
   finished: 'FINISH',
   failed: 'FAILED',
 } as const
+
+/** 活跃帧的 flowStatus：都已存在卡片，不能再退回创建态的 PROCESSING。 */
+function isActiveFlowStatus(status: string): boolean {
+  return (
+    status === A2UI_STATUS.processing ||
+    status === A2UI_STATUS.inputting ||
+    status === A2UI_STATUS.confirming
+  )
+}
 
 // 钉钉一次 A2UI update 最多接受 100 条 a2uiMessages，超出统一报 param.invalid。
 const A2UI_MAX_MESSAGES = 95
@@ -1209,6 +1225,7 @@ interface DingTalkRichCardData {
         meta: Array<{ colKey: string; colName: string; type: 'text' }>
         data: Array<Record<string, string>>
       }
+      chart: DingTalkA2UIChart | null
     }>
   }
   thinking: { text: string; preview: string; header: string }
@@ -1284,6 +1301,7 @@ interface DingTalkRichCardData {
     [key: `showAnswerUnit${number}`]: boolean
     [key: `showAnswerText${number}`]: boolean
     [key: `showAnswerTable${number}`]: boolean
+    [key: `showAnswerChart${number}`]: boolean
   }
 }
 
@@ -1295,6 +1313,7 @@ interface DingTalkAnswerTable {
 interface DingTalkAnswerBlock {
   text: string
   table: DingTalkAnswerTable
+  chart: DingTalkA2UIChart | null
 }
 
 /**
@@ -1316,7 +1335,11 @@ function emptyAnswerTable(): DingTalkAnswerTable {
 }
 
 function emptyAnswerBlocks(): DingTalkAnswerBlock[] {
-  return Array.from({ length: MAX_ANSWER_BLOCKS }, () => ({ text: '', table: emptyAnswerTable() }))
+  return Array.from({ length: MAX_ANSWER_BLOCKS }, () => ({
+    text: '',
+    table: emptyAnswerTable(),
+    chart: null,
+  }))
 }
 
 /**
@@ -1377,15 +1400,19 @@ function compactAnswerTable(table: DingTalkAnswerTable): DingTalkAnswerTable {
 }
 
 /**
- * 把回答拆成“普通 Markdown 段 + 原生 A2UI Table 段”。
+ * 把回答拆成“普通 Markdown 段 + 原生 A2UI Table 段 + 原生 Chart 段”。
  * 钉钉 A2UI 的 Markdown 组件没有横向滚动，宽表格会被裁；原生 Table 才有 scrollAreaWidth，
  * 所以这里保留真表格，交给 Table 组件内部横滚，而不是把表格改写成竖排列表。
+ * chart 代码块如果继续留在 Markdown 里，钉钉客户端会直接显示 JSON；
+ * 这里在围栏闭合后解析成 Chart 数据，流式未闭合时先不显示，避免露半截 JSON。
  */
 function parseAnswerBlocks(value: string): DingTalkAnswerBlock[] {
   const lines = String(value ?? '').replace(/\r\n?/g, '\n').split('\n')
-  const blocks: Array<{ kind: 'text' | 'table'; text: string; table: DingTalkAnswerTable }> = []
+  const blocks: Array<DingTalkAnswerBlock & { kind: 'text' | 'table' | 'chart' }> = []
   let textLines: string[] = []
   let inFence = false
+  let inChartFence = false
+  let chartLines: string[] = []
   let index = 0
 
   const cellsOf = (line: string): string[] =>
@@ -1397,14 +1424,83 @@ function parseAnswerBlocks(value: string): DingTalkAnswerBlock[] {
   const flushText = (): void => {
     const text = textLines.join('\n').replace(/\n{3,}/g, '\n\n').trim()
     textLines = []
-    if (text) blocks.push({ kind: 'text', text, table: emptyAnswerTable() })
+    if (text) {
+      blocks.push({ kind: 'text', text, table: emptyAnswerTable(), chart: null })
+    }
+  }
+
+  const flushChart = (partial = false): void => {
+    const raw = chartLines.join('\n').trim()
+    chartLines = []
+    if (!raw) return
+    flushText()
+    const renders = partial
+      ? parseDingTalkChartPartials(raw, { nativeOnly: true })
+      : parseDingTalkChartRenders(raw, { nativeOnly: true })
+    if (renders.length === 0) {
+      if (partial) {
+        // JSON 还没长出可渲染的数据点：先给一段占位骨架，下一帧再换成真图表。
+        blocks.push({
+          kind: 'text',
+          text: '图表生成中…',
+          table: emptyAnswerTable(),
+          chart: null,
+        })
+        return
+      }
+      blocks.push({
+        kind: 'text',
+        text: `这个图表类型在钉钉消息里无法保持原图，已不画近似图；请到网页端查看。钉钉可直接画：${DINGTALK_CHART_HINT}。`,
+        table: emptyAnswerTable(),
+        chart: null,
+      })
+      return
+    }
+    const previousText = [...blocks].reverse().find((block) => block.kind === 'text')?.text ?? ''
+    const previousLines = previousText
+      .split('\n')
+      .map((line) => compactCardText(line))
+      .filter(Boolean)
+    renders.forEach((render) => {
+      const title = render.title.trim()
+      // JSON 里的标题通常和正文小标题重复；同一行已经写过就不再单独加一行。
+      const titleAlreadyShown = Boolean(title) && previousLines.includes(compactCardText(title))
+      blocks.push({
+        kind: 'chart',
+        text: title && !titleAlreadyShown ? `**${title}**` : '',
+        table: emptyAnswerTable(),
+        chart: render.chart,
+      })
+    })
   }
 
   while (index < lines.length) {
     const line = lines[index] ?? ''
     if (/^\s*```/.test(line)) {
-      inFence = !inFence
-      textLines.push(line)
+      if (inChartFence) {
+        inChartFence = false
+        flushChart()
+        index += 1
+        continue
+      }
+      if (!inFence) {
+        const language = line.trim().replace(/^```/, '').trim().toLowerCase()
+        if (/^chart(?:\s|$)/.test(language)) {
+          inChartFence = true
+          index += 1
+          continue
+        }
+        inFence = true
+        textLines.push(line)
+      } else {
+        inFence = false
+        textLines.push(line)
+      }
+      index += 1
+      continue
+    }
+    if (inChartFence) {
+      chartLines.push(line)
       index += 1
       continue
     }
@@ -1442,7 +1538,7 @@ function parseAnswerBlocks(value: string): DingTalkAnswerBlock[] {
         ),
       )
       const table = compactAnswerTable({ meta, data })
-      blocks.push({ kind: 'table', text: '', table })
+      blocks.push({ kind: 'table', text: '', table, chart: null })
       index = rowIndex
       continue
     }
@@ -1450,12 +1546,25 @@ function parseAnswerBlocks(value: string): DingTalkAnswerBlock[] {
     textLines.push(line)
     index += 1
   }
+  // 流式还没等到闭合围栏时不要把半截 JSON 当正文；用已经完整的数据点先长出一张草图。
+  if (inChartFence) {
+    inChartFence = false
+    flushChart(true)
+  }
   flushText()
 
-  // 超出预留块数的部分不能再丢：把后续表格/文字并回最后一块文本，至少保持可读。
+  // 超出预留块数时优先保住图表：图表一旦变成一行“已省略”就彻底没了，
+  // 而文字/表格可以合并压缩。先给每张图表留槽，再用剩余槽位放文字和表格。
   if (blocks.length > MAX_ANSWER_BLOCKS) {
-    const extra = blocks.slice(MAX_ANSWER_BLOCKS)
-    const tail = extra
+    const chartBlocks = blocks.filter((block) => block.kind === 'chart').slice(0, MAX_ANSWER_BLOCKS)
+    const otherBlocks = blocks.filter((block) => block.kind !== 'chart')
+    const roomForOther = Math.max(0, MAX_ANSWER_BLOCKS - chartBlocks.length - 1)
+    const keptOthers = otherBlocks.slice(0, roomForOther)
+    const droppedOthers = otherBlocks.slice(roomForOther)
+    const kept = blocks.filter(
+      (block) => chartBlocks.includes(block) || keptOthers.includes(block),
+    )
+    const tail = droppedOthers
       .map((block) => {
         if (block.kind === 'text') return block.text
         return block.table.data
@@ -1464,17 +1573,21 @@ function parseAnswerBlocks(value: string): DingTalkAnswerBlock[] {
       })
       .filter(Boolean)
       .join('\n\n')
-    const last = blocks[MAX_ANSWER_BLOCKS - 1]
-    if (last) {
-      last.text = [last.text, tail].filter(Boolean).join('\n\n')
-      last.table = emptyAnswerTable()
+    if (tail && kept.length < MAX_ANSWER_BLOCKS) {
+      kept.push({
+        kind: 'text',
+        text: tail,
+        table: emptyAnswerTable(),
+        chart: null,
+      })
     }
-    blocks.length = MAX_ANSWER_BLOCKS
+    blocks.length = 0
+    blocks.push(...kept.slice(0, MAX_ANSWER_BLOCKS))
   }
 
   const padded = emptyAnswerBlocks()
   blocks.forEach((block, blockIndex) => {
-    padded[blockIndex] = { text: block.text, table: block.table }
+    padded[blockIndex] = { text: block.text, table: block.table, chart: block.chart }
   })
   return padded
 }
@@ -1605,12 +1718,14 @@ function richCardData(
   visibleAnswerBlocks.forEach((block, blockIndex) => {
     const hasText = Boolean(block.text.trim())
     const hasTable = block.table.meta.length > 0
+    const hasChart = Boolean(block.chart)
     answerUi[`showAnswerText${blockIndex}`] = hasText
     answerUi[`showAnswerTable${blockIndex}`] = hasTable
-    answerUi[`showAnswerUnit${blockIndex}`] = hasText || hasTable
+    answerUi[`showAnswerChart${blockIndex}`] = hasChart
+    answerUi[`showAnswerUnit${blockIndex}`] = hasText || hasTable || hasChart
   })
   return {
-    // 正文拆成文本段和原生表格段；表格由 Table 组件自己横滚，不改成竖排列表。
+    // 正文拆成文本段、原生表格段和原生图表段；表格横滚，图表点击可看大图。
     answer: { blocks: visibleAnswerBlocks },
     thinking: {
       text: capCardText(flattenMarkdownTables(thinkingPreviewText)),
@@ -1915,7 +2030,7 @@ function richCardComponents(
         component: 'Column',
         gap: 6,
         visible: { path: `/ui/showAnswerUnit${index}` },
-        children: [`answerText${index}`, `answerTable${index}`],
+        children: [`answerText${index}`, `answerTable${index}`, `answerChart${index}`],
       },
       {
         id: `answerText${index}`,
@@ -1933,6 +2048,14 @@ function richCardComponents(
         maxLine: 3,
         zebra: true,
         visible: { path: `/ui/showAnswerTable${index}` },
+      },
+      {
+        // 钉钉 A2UI 公共 catalog 的原生图表；点击图表可查看大图。
+        id: `answerChart${index}`,
+        component: 'Chart',
+        data: { path: `/answer/blocks/${index}/chart` },
+        aspectRatio: '2:1',
+        visible: { path: `/ui/showAnswerChart${index}` },
       },
     ]).flat(),
     {
@@ -2444,7 +2567,7 @@ export class DingTalkAICardStream {
     active: boolean,
     previous?: DingTalkRichCardState | null,
   ): Promise<boolean> {
-    if (this.compactUpdates && flowStatus === A2UI_STATUS.processing) {
+    if (this.compactUpdates && isActiveFlowStatus(flowStatus)) {
       await this.putUpdateMessages(compactDataMessages(this.surfaceId, state, true), flowStatus)
       return true
     }
@@ -2457,13 +2580,18 @@ export class DingTalkAICardStream {
     if (this.skipComponentUpdates) {
       messages = messages.filter((message) => !message.includes('"updateComponents"'))
     }
+    // 活跃态一次只能发一条，消息数过多时要先压成整包数据（答案/思考/工具/UI/附件/澄清六类），
+    // 否则 100 条澄清字段会变成 100 次 update 请求，既慢又容易触发流控。
+    if (isActiveFlowStatus(flowStatus) && messages.length > 12) {
+      messages = compactDataMessages(this.surfaceId, state, true)
+    }
     if (messages.length === 0) return false
     try {
       await this.putUpdateMessages(messages, flowStatus)
       return true
     } catch (error) {
       if (
-        flowStatus !== A2UI_STATUS.processing ||
+        !isActiveFlowStatus(flowStatus) ||
         !(error instanceof DingTalkHttpError) ||
         error.status !== 400
       ) {
@@ -2505,14 +2633,15 @@ export class DingTalkAICardStream {
     if (messages.length === 0) return
     // 活跃帧可能因为 24 块正文 + 澄清题组超过 95 条；按条数与字节拆成多个
     // 连续 update。终态不拆，避免第一包就把卡片收口、后续包变成非法更新。
-    const allowChunks = options.allowChunks ?? flowStatus === A2UI_STATUS.processing
-    const chunks = allowChunks ? chunkA2uiMessages(messages) : [messages]
-    if (chunks.length > 1) {
-      console.info(
-        `[eab] 钉钉 A2UI 更新分批：${messages.length} 条 -> ${chunks.length} 批`,
-      )
-    }
+    const allowChunks = options.allowChunks ?? isActiveFlowStatus(flowStatus)
+    // 真机验证：INPUTTING/CONFIRMING 等活跃状态下，单次 update 只接受 1 条
+    // a2uiMessages；2 条起稳定返回 400 param.invalid（终态 FINISH 可多条）。
+    // 因此活跃帧必须逐条拆成独立请求，每条各带新的 outUpdateId。
+    const onePerRequest = isActiveFlowStatus(flowStatus)
+    const chunks = onePerRequest ? messages.map((message) => [message]) : allowChunks ? chunkA2uiMessages(messages) : [messages]
     const token = await this.token()
+    let sent = 0
+    let lastError: unknown = null
     for (const [index, chunk] of chunks.entries()) {
       try {
         await this.cardRequest('/v1.0/card/ai/instances/update', {
@@ -2525,6 +2654,7 @@ export class DingTalkAICardStream {
             a2uiMessages: chunk,
           },
         })
+        sent += 1
       } catch (error) {
         if (error instanceof DingTalkHttpError && error.status === 400) {
           const paths = chunk.slice(0, 6).map(a2uiMessagePath).join(',')
@@ -2532,9 +2662,16 @@ export class DingTalkAICardStream {
             `[eab] 钉钉 A2UI 更新被拒：outTrackId=${this.cardInstanceId} phase=${this.phase} flowStatus=${flowStatus} 批次=${index + 1}/${chunks.length} 消息数=${chunk.length} 字节=${a2uiMessagesBytes(chunk)} 含组件=${chunk.some((message) => message.includes('"updateComponents"'))} 路径=${paths} 错误=${(error as Error).message}`,
           )
         }
+        lastError = error
+        // 只有明确的 HTTP 400 才按“单条坏字段”跳过；网络错误/5xx 仍应让整帧失败，
+        // 由外层退避重试，避免把断网误判成内容非法。
+        if (onePerRequest && chunks.length > 1 && error instanceof DingTalkHttpError && error.status === 400) {
+          continue
+        }
         throw error
       }
     }
+    if (sent === 0 && lastError) throw lastError
   }
 
   /**
@@ -2784,8 +2921,8 @@ export class DingTalkAICardStream {
     this.lastSentChars = 0
     this.lastUpdateAt = 0
     try {
-      // 先回到处理中并清空上一轮的澄清数据，旧卡片按钮立即失效。
-      await this.putUpdate(state, A2UI_STATUS.processing, true, null)
+      // 续用旧卡继续产出：卡片已存在，状态用 INPUTTING，不能再退回创建态。
+      await this.putUpdate(state, A2UI_STATUS.inputting, true, null)
       this.lastSentState = state
       this.lastSentChars = richTextLength(state)
       this.lastUpdateAt = Date.now()
@@ -2836,7 +2973,8 @@ export class DingTalkAICardStream {
     try {
       this.compactUpdates = false
       this.skipComponentUpdates = false
-      await this.putUpdate(state, A2UI_STATUS.processing, true, null)
+      // 题组翻页是等待用户确认，不推进到终态，但也不能继续用创建态 PROCESSING。
+      await this.putUpdate(state, A2UI_STATUS.confirming, true, null)
       return true
     } catch (error) {
       this.logger.warn?.('[eab] 钉钉题组翻页更新失败：', (error as Error).message)
@@ -2910,7 +3048,7 @@ export class DingTalkAICardStream {
     const state = this.pendingState
     this.pendingState = null
     this.pendingSince = 0
-    this.worker = this.putUpdate(state, A2UI_STATUS.processing, true, this.lastSentState)
+    this.worker = this.putUpdate(state, A2UI_STATUS.inputting, true, this.lastSentState)
       .then((sent) => {
         if (!sent) return
         this.lastSentState = state
@@ -2984,7 +3122,7 @@ export class DingTalkAICardStream {
          * 下一轮回调直接对同一个 outTrackId 继续 update。
          */
         if (finalState.clarify) {
-          await this.putUpdate(cloneRichState(finalState), A2UI_STATUS.processing, false, null)
+          await this.putUpdate(cloneRichState(finalState), A2UI_STATUS.confirming, false, null)
           rememberClarifyCard(this.cardInstanceId, finalState.clarify)
           if (summary) {
             try {

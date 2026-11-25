@@ -54,7 +54,9 @@ describe('取数轮的系统提示降级（所有工具通用）', () => {
     }
     // 同一条要求在提示里只出现一次，模型才不会逐条复述
     expect(text.match(/人名按用户原话原样传/g)).toHaveLength(1)
-    expect(text.match(/rowStats/g)).toHaveLength(1)
+    // 同一条规则里允许分别引用 fields 和 groups，但整段规则只出现一次
+    expect(text.match(/rowStats/g)).toHaveLength(2)
+    expect(text.match(/【数据回合规则｜就这 6 条/g)).toHaveLength(1)
     expect(text.match(/禁止编造、补全/g)).toHaveLength(1)
   })
 
@@ -83,7 +85,7 @@ describe('取数轮的系统提示降级（所有工具通用）', () => {
         { type: 'function', function: { name: 'batch_read', description: '读批次', parameters: { type: 'object', properties: {}, required: [] } } },
       ] as unknown as ChatToolSpec[],
     })
-    expect(text).toContain('必须调 math_eval 把原值按顺序放进 values')
+    expect(text).toContain('也可把全量原值放进 math_eval.values 让它算')
     expect(text).toContain('先用 batch_read 读到行')
     expect(text).not.toContain('【数值计算硬规则')
   })
@@ -102,5 +104,17 @@ describe('取数轮的系统提示降级（所有工具通用）', () => {
   it('数据类问题：长期记忆只能理解意图，不能当本轮答案', () => {
     const text = prompt('李鹏本月加班合计多少', { memories: [{ content: '李鹏是重庆东环线组成员' } as never] })
     expect(text).toContain('本轮要的是实时数据')
+  })
+
+  it('钉钉渠道只给 7 种原生图表，网页渠道给 17 种', () => {
+    const dingtalk = prompt('邓骏的本月加班数据', { channel: 'dingtalk' })
+    expect(dingtalk).toContain('钉钉消息当前可用 7 种')
+    expect(dingtalk).not.toContain('- radar（')
+    expect(dingtalk).not.toContain('- doughnut（')
+    expect(dingtalk).toContain('清单外的类型')
+
+    const web = prompt('邓骏的本月加班数据', { channel: 'web' })
+    expect(web).toContain('网页对话当前可用 17 种')
+    expect(web).toContain('- radar（')
   })
 })

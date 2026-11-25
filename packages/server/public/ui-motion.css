@@ -1,0 +1,475 @@
+/* ==========================================================================
+   EAB Motion Layer
+   --------------------------------------------------------------------------
+   统一动效 token + 按名称选用（data-motion）的组件协议。
+   设计原则：动效只解释状态、层级和反馈，不做装饰性堆砌。
+   16 种效果：spotlight / reveal / beam / magnetic / story / tilt / scramble /
+   shimmer / parallax / count / lift / typewriter / stagger / marquee /
+   spring / ease
+   ========================================================================== */
+
+:root {
+  --eab-ease-linear: linear;
+  --eab-ease-out: cubic-bezier(.16, 1, .3, 1);
+  --eab-ease-in: cubic-bezier(.4, 0, 1, 1);
+  --eab-ease-in-out: cubic-bezier(.65, 0, .35, 1);
+  --eab-ease-spring: cubic-bezier(.34, 1.56, .64, 1);
+
+  /* 微交互 100–200ms；转场 200–300ms；只有叙事层允许更长 */
+  --eab-dur-1: 100ms;
+  --eab-dur-2: 160ms;
+  --eab-dur-3: 240ms;
+  --eab-dur-4: 360ms;
+  --eab-dur-5: 640ms;
+  --eab-dur-story: 900ms;
+
+  --eab-stagger-step: 55ms;
+  --eab-lift: -4px;
+  --eab-spot-color: rgba(15, 107, 92, .16);
+  --eab-spot-size: 220px;
+  --eab-beam-color: rgba(45, 212, 191, .75);
+  --eab-parallax-y: 0px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --eab-dur-1: 1ms;
+    --eab-dur-2: 1ms;
+    --eab-dur-3: 1ms;
+    --eab-dur-4: 1ms;
+    --eab-dur-5: 1ms;
+    --eab-dur-story: 1ms;
+    --eab-stagger-step: 0ms;
+    --eab-lift: 0px;
+  }
+}
+
+/* --------------------------------------------------------------------------
+   0. 基础：只在 JS 可用时进入动效模式，脚本失败时页面保持完全可见
+   -------------------------------------------------------------------------- */
+
+html.eab-motion-ready {
+  scroll-behavior: auto;
+}
+
+.eab-motion-card {
+  position: relative;
+}
+
+/* --------------------------------------------------------------------------
+   1. Spotlight 鼠标聚光灯
+   用途：产品卡、功能卡、登录卡、重点推荐位
+   -------------------------------------------------------------------------- */
+
+[data-motion~="spotlight"] {
+  position: relative;
+  isolation: isolate;
+}
+
+[data-motion~="spotlight"]::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  border-radius: inherit;
+  pointer-events: none;
+  opacity: 0;
+  background:
+    radial-gradient(
+      var(--eab-spot-size) circle at var(--eab-spot-x, 50%) var(--eab-spot-y, 50%),
+      var(--eab-spot-color),
+      transparent 68%
+    );
+  transition: opacity var(--eab-dur-3) var(--eab-ease-out);
+}
+
+[data-motion~="spotlight"].is-spotlight::before {
+  opacity: 1;
+}
+
+/* --------------------------------------------------------------------------
+   2. Scroll Reveal 滚动显现
+   用途：长页面的区块、列表、控制台卡片；首屏内容不隐藏
+   -------------------------------------------------------------------------- */
+
+html.eab-motion-ready [data-motion~="reveal"]:not(.is-motion-in):not(.is-motion-skip) {
+  opacity: 0;
+  transform: translate3d(0, 18px, 0);
+}
+
+[data-motion~="reveal"].is-motion-in {
+  animation: eab-reveal-in var(--eab-dur-5) var(--eab-ease-out) both;
+  animation-delay: var(--eab-delay, 0ms);
+}
+
+[data-motion~="reveal"].is-motion-skip {
+  opacity: 1;
+  transform: none;
+}
+
+@keyframes eab-reveal-in {
+  from { opacity: 0; transform: translate3d(0, 18px, 0); }
+  to   { opacity: 1; transform: translate3d(0, 0, 0); }
+}
+
+/* --------------------------------------------------------------------------
+   3. Border Beam 边缘流光
+   用途：仅用于“正在运行 / 推荐 / 重点”的容器，不用于静态内容
+   -------------------------------------------------------------------------- */
+
+[data-motion~="beam"] {
+  position: relative;
+}
+
+[data-motion~="beam"]::after,
+html.eab-motion-ready .agent-chat-panel.is-running::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  border-radius: inherit;
+  padding: 1px;
+  pointer-events: none;
+  background:
+    linear-gradient(
+      110deg,
+      transparent 20%,
+      var(--eab-beam-color) 45%,
+      rgba(255, 255, 255, .92) 50%,
+      var(--eab-beam-color) 55%,
+      transparent 80%
+    );
+  background-size: 240% 100%;
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  animation: eab-beam-slide 2.8s linear infinite;
+}
+
+html.eab-motion-ready .agent-chat-panel.is-running {
+  position: relative;
+}
+
+@keyframes eab-beam-slide {
+  from { background-position: 140% 0; }
+  to   { background-position: -140% 0; }
+}
+
+/* --------------------------------------------------------------------------
+   4. Magnetic Button 磁吸按钮
+   用途：页面唯一主 CTA；表单提交按钮不做磁吸，避免点不准
+   -------------------------------------------------------------------------- */
+
+[data-motion~="magnetic"] {
+  transform: translate3d(var(--eab-magnet-x, 0px), var(--eab-magnet-y, 0px), 0);
+  transition: transform var(--eab-dur-3) var(--eab-ease-spring);
+}
+
+[data-motion~="magnetic"].is-magnetized {
+  transition-duration: var(--eab-dur-1);
+  transition-timing-function: var(--eab-ease-out);
+}
+
+/* --------------------------------------------------------------------------
+   5. Scrolltelling 滚动叙事
+   用途：品牌页、产品故事、登录后的引导；应用工作台内部不使用整屏钉住
+   -------------------------------------------------------------------------- */
+
+.eab-story {
+  position: relative;
+}
+
+.eab-story-stage {
+  position: sticky;
+  top: var(--eab-story-top, 96px);
+}
+
+.eab-story-step {
+  opacity: .42;
+  transition: opacity var(--eab-dur-4) var(--eab-ease-out),
+              transform var(--eab-dur-4) var(--eab-ease-out);
+}
+
+.eab-story-step.is-active {
+  opacity: 1;
+  transform: translateX(0);
+}
+
+/* --------------------------------------------------------------------------
+   6. 3D Tilt 3D 倾斜
+   用途：产品卡、会员卡、作品集；表单、长文、表格禁止使用
+   -------------------------------------------------------------------------- */
+
+[data-motion~="tilt"] {
+  transform:
+    perspective(900px)
+    rotateX(var(--eab-tilt-x, 0deg))
+    rotateY(var(--eab-tilt-y, 0deg));
+  transform-style: preserve-3d;
+  transition: transform var(--eab-dur-3) var(--eab-ease-out);
+}
+
+[data-motion~="tilt"].is-tilting {
+  transition-duration: 80ms;
+  transition-timing-function: linear;
+}
+
+/* --------------------------------------------------------------------------
+   7. Text Scramble 文字解码
+   用途：科技感标题、状态切换；正文、表单标签、错误信息禁止使用
+   -------------------------------------------------------------------------- */
+
+[data-motion~="scramble"] {
+  font-variant-numeric: tabular-nums;
+  letter-spacing: .01em;
+}
+
+/* --------------------------------------------------------------------------
+   8. Shimmer 流光扫过
+   用途：骨架屏、加载中的按钮/卡片；不对已经稳定的内容反复扫光
+   -------------------------------------------------------------------------- */
+
+.eab-skeleton {
+  position: relative;
+  overflow: hidden;
+  border-radius: var(--r-md, 10px);
+  background: var(--surface-2, #f2f6f5);
+}
+
+.eab-skeleton::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(
+    100deg,
+    transparent 20%,
+    rgba(255, 255, 255, .68) 50%,
+    transparent 80%
+  );
+  animation: eab-shimmer 1.35s var(--eab-ease-in-out) infinite;
+}
+
+[data-motion~="shimmer"] {
+  position: relative;
+  overflow: hidden;
+}
+
+[data-motion~="shimmer"]::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(
+    100deg,
+    transparent 24%,
+    rgba(255, 255, 255, .5) 50%,
+    transparent 76%
+  );
+  animation: eab-shimmer 1.6s var(--eab-ease-in-out) infinite;
+  pointer-events: none;
+}
+
+@keyframes eab-shimmer {
+  to { transform: translateX(100%); }
+}
+
+/* --------------------------------------------------------------------------
+   9. Parallax Scrolling 视差滚动
+   用途：背景装饰、封面图、分层插画；正文和操作区禁止位移
+   -------------------------------------------------------------------------- */
+
+[data-motion~="parallax"] {
+  transform: translate3d(0, var(--eab-parallax-y), 0);
+  will-change: transform;
+}
+
+/* --------------------------------------------------------------------------
+   10. Count Up 数字递增
+   用途：真实指标、结果统计；金额、编号、时间禁止滚动变化
+   -------------------------------------------------------------------------- */
+
+[data-motion~="count"] {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+}
+
+/* --------------------------------------------------------------------------
+   11. Hover Lift 悬停上浮
+   用途：可点击卡片；静态信息卡不做，避免误导
+   -------------------------------------------------------------------------- */
+
+[data-motion~="lift"] {
+  transition:
+    transform var(--eab-dur-2) var(--eab-ease-out),
+    box-shadow var(--eab-dur-2) var(--eab-ease-out),
+    border-color var(--eab-dur-2) var(--eab-ease-out);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  [data-motion~="lift"]:hover {
+    transform: translate3d(0, var(--eab-lift), 0);
+    box-shadow: var(--shadow-md, 0 6px 20px rgba(17, 34, 30, .07));
+  }
+}
+
+/* --------------------------------------------------------------------------
+   12. Typewriter 打字机
+   用途：AI 首屏问候、空状态引导、短标题；长正文和表单值禁止使用
+   -------------------------------------------------------------------------- */
+
+[data-motion~="typewriter"].is-typing::after,
+.eab-type-caret::after {
+  content: "";
+  display: inline-block;
+  width: 1px;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: -.08em;
+  background: currentColor;
+  animation: eab-caret-blink 900ms steps(1, end) infinite;
+}
+
+@keyframes eab-caret-blink {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
+
+/* --------------------------------------------------------------------------
+   13. Stagger Animation 错峰动画
+   用途：卡片列表、筛选项、消息分组；同一屏最多 8 个，超过直接显示
+   -------------------------------------------------------------------------- */
+
+html.eab-motion-ready [data-motion~="stagger"]:not(.is-motion-in):not(.is-motion-skip) > * {
+  opacity: 0;
+  transform: translate3d(0, 12px, 0);
+}
+
+[data-motion~="stagger"].is-motion-in > * {
+  animation: eab-stagger-in var(--eab-dur-4) var(--eab-ease-out) both;
+  animation-delay: calc(var(--eab-i, 0) * var(--eab-stagger-step));
+}
+
+[data-motion~="stagger"].is-motion-skip > * {
+  opacity: 1;
+  transform: none;
+}
+
+@keyframes eab-stagger-in {
+  from { opacity: 0; transform: translate3d(0, 12px, 0); }
+  to   { opacity: 1; transform: translate3d(0, 0, 0); }
+}
+
+/* --------------------------------------------------------------------------
+   14. Marquee 跑马灯
+   用途：Logo 墙、评价、公告；必须悬停暂停，正文和关键操作禁止滚动
+   -------------------------------------------------------------------------- */
+
+[data-motion~="marquee"] {
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(90deg, transparent, #000 7%, #000 93%, transparent);
+  mask-image: linear-gradient(90deg, transparent, #000 7%, #000 93%, transparent);
+}
+
+.eab-marquee-track {
+  display: flex;
+  width: max-content;
+  align-items: center;
+  animation: eab-marquee var(--eab-marquee-duration, 26s) linear infinite;
+}
+
+[data-motion~="marquee"]:hover .eab-marquee-track,
+[data-motion~="marquee"]:focus-within .eab-marquee-track {
+  animation-play-state: paused;
+}
+
+@keyframes eab-marquee {
+  from { transform: translate3d(0, 0, 0); }
+  to   { transform: translate3d(-50%, 0, 0); }
+}
+
+/* --------------------------------------------------------------------------
+   15. Spring Animation 弹性动画
+   用途：点赞、成功确认、弹窗；只允许轻微过冲，不做夸张抖动
+   -------------------------------------------------------------------------- */
+
+[data-motion~="spring"].is-motion-in {
+  animation: eab-spring-in var(--eab-dur-4) var(--eab-ease-spring) both;
+}
+
+@keyframes eab-spring-in {
+  from { opacity: 0; transform: scale(.95); }
+  to   { opacity: 1; transform: scale(1); }
+}
+
+/* --------------------------------------------------------------------------
+   16. Easing 缓动
+   入场优先 ease-out：快速进入，自然减速；离场可更快
+   -------------------------------------------------------------------------- */
+
+.eab-ease-out    { transition-timing-function: var(--eab-ease-out); }
+.eab-ease-in-out { transition-timing-function: var(--eab-ease-in-out); }
+
+/* --------------------------------------------------------------------------
+   页面到达（结构层）
+   只表达“已经换到另一页”：160ms、6px，首屏仍然完整可见。
+   这不是 16 种效果之外的装饰，而是页面切换的 Easing。
+   -------------------------------------------------------------------------- */
+
+.view.is-page-enter {
+  animation: eab-page-enter var(--eab-dur-2) var(--eab-ease-out) both;
+}
+
+@keyframes eab-page-enter {
+  from { transform: translate3d(0, 6px, 0); }
+  to   { transform: translate3d(0, 0, 0); }
+}
+
+/* --------------------------------------------------------------------------
+   降级：系统开启“减少动态效果”时，所有非必要动效关闭
+   -------------------------------------------------------------------------- */
+
+@media (prefers-reduced-motion: reduce) {
+  html.eab-motion-ready {
+    scroll-behavior: auto;
+  }
+
+  .view.is-page-enter {
+    animation: none !important;
+  }
+
+  [data-motion~="reveal"],
+  [data-motion~="stagger"] > *,
+  [data-motion~="spring"],
+  [data-motion~="typewriter"],
+  [data-motion~="magnetic"],
+  [data-motion~="parallax"] {
+    animation: none !important;
+    transition: none !important;
+    opacity: 1 !important;
+    transform: none !important;
+  }
+
+  [data-motion~="beam"]::after,
+  html.eab-motion-ready .agent-chat-panel.is-running::after,
+  .eab-skeleton::after,
+  [data-motion~="shimmer"]::after,
+  .eab-marquee-track,
+  [data-motion~="typewriter"]::after {
+    animation: none !important;
+  }
+
+  [data-motion~="spotlight"]::before {
+    display: none;
+  }
+
+  [data-motion~="tilt"],
+  [data-motion~="lift"] {
+    transform: none !important;
+  }
+}

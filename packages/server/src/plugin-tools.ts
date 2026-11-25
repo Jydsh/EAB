@@ -441,7 +441,20 @@ export function resolvePluginToolForActor(
       return tool
     }
   }
-  return null
+  // 模型常把长工具名里的分隔符抄错（cy_api_..._8371-9d1f... 多一个连字符）。
+  // 这里只在忽略大小写和分隔符后仍然唯一时才兜底，避免撞到别的工具。
+  const normalize = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/g, '')
+  const wanted = normalize(functionName)
+  if (!wanted) return null
+  const matches: PluginToolRegistration[] = []
+  for (const instanceKey of actorInstanceKeys(db, actor, options.preferPersonal === true)) {
+    for (const tool of toolsByInstance.get(instanceKey)?.values() ?? []) {
+      if (normalize(tool.name) !== wanted) continue
+      if (!toolUsableForActor(db, tool, actor, roleAccess)) continue
+      if (!matches.some((item) => item.name === tool.name && item.pluginId === tool.pluginId)) matches.push(tool)
+    }
+  }
+  return matches.length === 1 ? matches[0]! : null
 }
 
 /**

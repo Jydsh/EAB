@@ -389,6 +389,121 @@ describe('钉钉 A2UI 卡片可见性与底色', () => {
     expect(tables.at(-1)?.table?.meta?.map((column: any) => column.colName)).toEqual(['检查人', '站名'])
   })
 
+  it('chart 围栏解析成原生 Chart 组件，不把 JSON 放进正文', () => {
+    const chart = {
+      type: 'bar',
+      title: '各站数据',
+      categories: ['A', 'B'],
+      series: [
+        { name: '时长', data: [3, 2] },
+        { name: '次数', data: [1, 4] },
+      ],
+    }
+    const answer = [
+      '各站数据如下：',
+      '',
+      '```chart',
+      JSON.stringify(chart),
+      '```',
+      '',
+      '明细见下：',
+    ].join('\n')
+    const messages = buildDingTalkA2UIUpdateMessages(
+      's',
+      { answer, reasoning: '', tools: [], thinkingDone: true },
+      false,
+    )
+    const blocks = (updateValues(messages)['/answer'] as { blocks: Array<Record<string, any>> }).blocks
+    expect(blocks[0]?.text).toBe('各站数据如下：')
+    expect(blocks[1]?.text).toBe('**各站数据**')
+    expect(blocks[1]?.chart).toMatchObject({
+      type: 'histogram',
+      data: [
+        { x: 'A', y: 3, type: '时长' },
+        { x: 'B', y: 2, type: '时长' },
+        { x: 'A', y: 1, type: '次数' },
+        { x: 'B', y: 4, type: '次数' },
+      ],
+    })
+    expect(blocks[2]?.text).toContain('明细见下')
+    expect(JSON.stringify(blocks)).not.toContain('"categories"')
+    expect(uiValues(messages)['/ui/showAnswerChart1']).toBe(true)
+    expect(uiValues(messages)['/ui/showAnswerUnit1']).toBe(true)
+
+    const components = componentsOf(buildDingTalkA2UICreateMessages('s', {
+      answer,
+      reasoning: '',
+      tools: [],
+      thinkingDone: true,
+    }))
+    expect(components.find((component) => component.id === 'answerChart1')).toMatchObject({
+      component: 'Chart',
+      data: { path: '/answer/blocks/1/chart' },
+      aspectRatio: '2:1',
+      visible: { path: '/ui/showAnswerChart1' },
+    })
+  })
+
+  it('钉钉实际卡片只保留原生同形图；环形、雷达改为明确提示，不画近似图', () => {
+    const charts = [
+      { type: 'doughnut', title: '占比', data: [['A', 3], ['B', 2]] },
+      { type: 'scatter', title: '散点', unit: '小时', series: [{ name: 'A', data: [1, 2, 3] }] },
+      {
+        type: 'radar',
+        title: '画像',
+        categories: ['合计', '平均', '天数'],
+        series: [{ name: 'A', data: [10, 5, 2] }],
+      },
+      { type: 'horizontalBar', title: '横向', data: [['A', 3], ['B', 2]] },
+    ]
+    const answer = charts
+      .map((chart, index) => `${index + 1}. ${chart.title}\n\n\`\`\`chart\n${JSON.stringify(chart)}\n\`\`\``)
+      .join('\n\n')
+    const messages = buildDingTalkA2UIUpdateMessages(
+      's',
+      { answer, reasoning: '', tools: [], thinkingDone: true },
+      false,
+    )
+    const blocks = (updateValues(messages)['/answer'] as { blocks: Array<Record<string, any>> }).blocks
+    const chartBlocks = blocks.filter((block) => block.chart)
+    expect(chartBlocks.map((block) => block.chart.type)).toEqual(['lineChart', 'histogram'])
+    expect(chartBlocks[1]?.chart.config).toMatchObject({ rotate: true })
+    expect(JSON.stringify(blocks)).toContain('这个图表类型在钉钉消息里无法保持原图')
+    expect(JSON.stringify(blocks)).not.toContain('按饼图展示')
+  })
+
+  it('流式未闭合的 chart 围栏不显示半截 JSON', () => {
+    const answer = '汇总如下：\n\n```chart\n{"type":"bar","title":"未完成"'
+    const messages = buildDingTalkA2UIUpdateMessages(
+      's',
+      { answer, reasoning: '', tools: [], thinkingDone: false },
+      true,
+    )
+    const blocks = (updateValues(messages)['/answer'] as { blocks: Array<Record<string, any>> }).blocks
+    expect(blocks[0]?.text).toBe('汇总如下：')
+    expect(blocks[1]?.text).toBe('图表生成中…')
+    expect(blocks.some((block) => block.chart)).toBe(false)
+    expect(JSON.stringify(blocks)).not.toContain('"type":"bar"')
+  })
+
+  it('流式 chart 已经有完整数据点时先画出草图，随后再补齐', () => {
+    const answer = '汇总如下：\n\n```chart\n{"type":"pie","title":"占比","data":[["A",3],["B",2'
+    const messages = buildDingTalkA2UIUpdateMessages(
+      's',
+      { answer, reasoning: '', tools: [], thinkingDone: false },
+      true,
+    )
+    const blocks = (updateValues(messages)['/answer'] as { blocks: Array<Record<string, any>> }).blocks
+    expect(blocks[0]?.text).toBe('汇总如下：')
+    expect(blocks[1]?.text).toBe('**占比**')
+    expect(blocks[1]?.chart).toMatchObject({
+      type: 'pieChart',
+      data: [{ x: 'A', y: 3 }],
+    })
+    expect(JSON.stringify(blocks)).not.toContain('"data":[["A",3]')
+    expect(uiValues(messages)['/ui/showAnswerChart1']).toBe(true)
+  })
+
   it('正文流式时不追加光标或 loading GIF 组件', () => {
     const streaming = buildDingTalkA2UIUpdateMessages(
       's',
@@ -840,7 +955,7 @@ describe('钉钉 A2UI 卡片可见性与底色', () => {
     })
   })
 
-  it('带澄清选项的卡片收口后仍保持 PROCESSING，下一次点击才能续用同一张卡', async () => {
+  it('带澄清选项的卡片收口后停在 CONFIRMING，下一次点击才能续用同一张卡', async () => {
     const requests: Array<{ url: string; body: Record<string, any> }> = []
     const realFetch = globalThis.fetch
     globalThis.fetch = (async (input: any, init?: RequestInit) => {
@@ -886,7 +1001,7 @@ describe('钉钉 A2UI 卡片可见性与底色', () => {
       )
       expect(ok).toBe(true)
       const update = requests.filter((request) => request.url.endsWith('/v1.0/card/ai/instances/update')).at(-1)
-      expect(update?.body.flowStatus).toBe('PROCESSING')
+      expect(update?.body.flowStatus).toBe('CONFIRMING')
       expect(update?.body.flowStatus).not.toBe('FINISH')
       expect(
         requests.some(
@@ -999,6 +1114,21 @@ describe('钉钉 A2UI 卡片可见性与底色', () => {
         .filter((request) => request.url.endsWith('/v1.0/card/ai/instances/update'))
         .flatMap((request) => request.body.a2uiMessages ?? [])
         .map((message: string) => JSON.parse(message) as Record<string, any>)
+      // 已存在卡片的活跃更新必须用 INPUTTING；PROCESSING 只属于创建首帧。
+      expect(
+        requests.some(
+          (request) =>
+            request.url.endsWith('/v1.0/card/ai/instances/update') &&
+            request.body.flowStatus === 'INPUTTING',
+        ),
+      ).toBe(true)
+      expect(
+        requests.every(
+          (request) =>
+            !request.url.endsWith('/v1.0/card/ai/instances/update') ||
+            request.body.flowStatus !== 'PROCESSING',
+        ),
+      ).toBe(true)
       const answer = updateBodies.find((message) => message.updateDataModel?.path === '/answer')?.updateDataModel
         ?.value as { blocks?: Array<Record<string, any>> } | undefined
       expect(answer?.blocks?.[0]?.text).toBe('答')
@@ -1073,11 +1203,15 @@ describe('钉钉 A2UI 卡片可见性与底色', () => {
       })
       expect(ok).toBe(true)
 
-      const update = requests.find((request) => request.url.endsWith('/v1.0/card/ai/instances/update'))
+      const updates = requests.filter((request) => request.url.endsWith('/v1.0/card/ai/instances/update'))
+      const update = updates[0]
       expect(update).toBeTruthy()
       expect(update?.body.outTrackId).toBe('eab_a2ui_existing')
-      expect(update?.body.flowStatus).toBe('PROCESSING')
-      const messages = parsed(update?.body.a2uiMessages ?? [])
+      expect(update?.body.flowStatus).toBe('INPUTTING')
+      // 活跃态一次只能带 1 条 A2UI 消息，续卡把 11 条字段拆成 11 次 update。
+      expect(updates.length).toBeGreaterThan(1)
+      expect(updates.every((request) => request.body.a2uiMessages?.length === 1)).toBe(true)
+      const messages = updates.flatMap((request) => parsed(request.body.a2uiMessages ?? []))
       expect(messages.some((message) => message.updateDataModel?.path === '/clarify')).toBe(true)
       expect(
         messages.find((message) => message.updateDataModel?.path === '/ui')
@@ -1625,7 +1759,7 @@ describe('钉钉 A2UI 多选与填空澄清', () => {
     }
   })
 
-  it('组件与纯数据都被拒时整包数据兜底，卡片不退出流式', async () => {
+  it('活跃态单条消息偶发被拒时跳过坏字段，其余字段继续刷新', async () => {
     const requests: Array<{ url: string; body: Record<string, any> }> = []
     let updateAttempts = 0
     const realFetch = globalThis.fetch
@@ -1661,11 +1795,14 @@ describe('钉钉 A2UI 多选与填空澄清', () => {
       await new Promise((resolve) => setTimeout(resolve, 400))
 
       const updates = requests.filter((request) => request.url.endsWith('/v1.0/card/ai/instances/update'))
-      expect(updateAttempts).toBe(3)
-      expect(updates[2]?.body.a2uiMessages?.some((message: string) => {
+      expect(updateAttempts).toBe(11)
+      expect(updates.every((request) => request.body.a2uiMessages?.length === 1)).toBe(true)
+      // 前两条被 400 拒绝的字段被跳过，后续 9 条仍应继续发出去。
+      expect(updates.slice(2).every((request) => request.body.a2uiMessages?.length === 1)).toBe(true)
+      expect(updates.some((request) => request.body.a2uiMessages?.some((message: string) => {
         const parsedMessage = JSON.parse(message) as Record<string, any>
-        return parsedMessage.updateDataModel?.path === '/ui'
-      })).toBe(true)
+        return parsedMessage.updateDataModel?.path === '/answer'
+      }))).toBe(true)
       expect(await card.finish({ answer: '答', reasoning: '先确认身份', tools: ['org.search'], thinkingDone: true }, '答')).toBe(true)
     } finally {
       globalThis.fetch = realFetch
@@ -1699,7 +1836,7 @@ describe('钉钉 A2UI 多选与填空澄清', () => {
     expect(JSON.stringify(created)).not.toMatch(/[\uD800-\uDFFF]/)
   })
 
-  it('更新消息超过 95 条时自动分批，不把整包打到钉钉', async () => {
+  it('终态更新最多 100 条消息，整包仍在钉钉限制内', async () => {
     const requests: Array<{ url: string; body: Record<string, any> }> = []
     const realFetch = globalThis.fetch
     globalThis.fetch = (async (input: any, init?: RequestInit) => {
@@ -1723,12 +1860,11 @@ describe('钉钉 A2UI 多选与填空澄清', () => {
       }))
       await (card as unknown as {
         putUpdateMessages: (messages: string[], flowStatus: string) => Promise<void>
-      }).putUpdateMessages(messages, 'PROCESSING')
+      }).putUpdateMessages(messages, 'FINISH')
 
       const updateCalls = requests.filter((request) => request.url.endsWith('/v1.0/card/ai/instances/update'))
-      expect(updateCalls).toHaveLength(2)
-      expect(updateCalls[0]?.body.a2uiMessages).toHaveLength(95)
-      expect(updateCalls[1]?.body.a2uiMessages).toHaveLength(5)
+      expect(updateCalls).toHaveLength(1)
+      expect(updateCalls[0]?.body.a2uiMessages).toHaveLength(100)
     } finally {
       globalThis.fetch = realFetch
     }

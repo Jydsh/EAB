@@ -97,6 +97,41 @@ function safeString(value: unknown, max = 500): string {
   return typeof value === 'string' ? value.trim().slice(0, max) : ''
 }
 
+function sizeLabel(size: number): string {
+  if (!Number.isFinite(size) || size <= 0) return '大小未知'
+  if (size < 1024) return `${size} B`
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`
+}
+
+function checksumLabel(checksum: string): string {
+  if (!checksum) return '无校验和'
+  const [algorithm, digest] = checksum.split(':')
+  if (digest) return `${algorithm}:${digest.slice(0, 16)}…`
+  return checksum.slice(0, 24)
+}
+
+/**
+ * 父 Agent 看到的单条产物摘要：名称、类型、大小、校验和、句柄和预览。
+ * 预览只放登记时的短摘要，不复制文件全文。
+ */
+export function artifactBrief(artifact: AgentArtifactRef): string {
+  const idPart = artifact.fileId
+    ? `，fileId:${artifact.fileId}`
+    : artifact.uri
+      ? `，uri:${artifact.uri.slice(0, 160)}`
+      : ''
+  const preview = artifact.preview ? `；预览：${artifact.preview}` : ''
+  return `${artifact.name}（${artifact.mimeType || '未知类型'}，${sizeLabel(artifact.size)}，${checksumLabel(artifact.checksum)}${artifact.source === 'a2a' ? '，A2A' : ''}${idPart}）${preview}`
+}
+
+export function artifactManifest(artifacts: readonly AgentArtifactRef[], limit = 6): string {
+  if (artifacts.length === 0) return ''
+  const shown = artifacts.slice(0, limit)
+  const more = artifacts.length > shown.length ? `；另有 ${artifacts.length - shown.length} 个产物未展开` : ''
+  return shown.map(artifactBrief).join('；') + more
+}
+
 /** 产物引用统一结构；缺 id/name/uri 的条目直接丢弃，避免空卡。 */
 export function parseAgentArtifacts(value: unknown): AgentArtifactRef[] {
   if (!Array.isArray(value)) return []
@@ -112,16 +147,18 @@ export function parseAgentArtifacts(value: unknown): AgentArtifactRef[] {
       ? raw.source as ArtifactSource
       : 'workspace'
     const size = Number(raw.size)
+    const mimeType = safeString(raw.mimeType, 128) || 'application/octet-stream'
+    const preview = safeString(raw.preview, 500) || `${name}（${mimeType}）`
     artifacts.push({
       id,
       name,
-      mimeType: safeString(raw.mimeType, 128),
+      mimeType,
       size: Number.isFinite(size) && size >= 0 ? Math.floor(size) : 0,
       checksum: safeString(raw.checksum, 128),
       source,
       uri,
       ...(safeString(raw.fileId, 128) ? { fileId: safeString(raw.fileId, 128) } : {}),
-      ...(safeString(raw.preview, 500) ? { preview: safeString(raw.preview, 500) } : {}),
+      preview,
     })
   }
   return artifacts

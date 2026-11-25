@@ -1,17 +1,15 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import { MemoryCache } from '../src/backends/cache.js'
 import { acquireLeaderHold, resetCoordinationForTest } from '../src/backends/coordination.js'
 import { setBackendRuntimeForTest } from '../src/backends/runtime.js'
+import { installSharedCache } from './helpers/shared-cache.js'
 
 afterEach(() => {
   setBackendRuntimeForTest(undefined)
   resetCoordinationForTest()
 })
 
-function sharedCache(): MemoryCache {
-  const cache = new MemoryCache(1_000)
-  setBackendRuntimeForTest({ cache } as never)
-  return cache
+function sharedCache() {
+  return installSharedCache(1_000)
 }
 
 describe('长期领导权（长连接托管）', () => {

@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
+  artifactBrief,
+  artifactManifest,
   parseAgentArtifacts,
   parseTaskBudget,
   protocolStatusOf,
@@ -61,5 +63,56 @@ describe('agent protocol core', () => {
       preview: '摘要',
     })
     expect(artifacts[1].source).toBe('workspace')
+    expect(artifacts[1].mimeType).toBe('application/octet-stream')
+    expect(artifacts[1].preview).toContain('坏来源')
+  })
+
+  it('父 Agent 产物清单带类型、大小、校验和、句柄和预览，且限制展开数量', () => {
+    const artifacts = parseAgentArtifacts([
+      {
+        id: 'art-1',
+        name: '巡检周报.md',
+        mimeType: 'text/markdown',
+        size: 2048,
+        checksum: `sha256:${'a'.repeat(64)}`,
+        source: 'cloud',
+        uri: 'eab://workspace/file/wf1',
+        fileId: 'wf1',
+        preview: '本周正常',
+      },
+      {
+        id: 'art-2',
+        name: '行程单.pdf',
+        mimeType: 'application/pdf',
+        size: 0,
+        checksum: `ref-sha256:${'b'.repeat(64)}`,
+        source: 'a2a',
+        uri: 'https://example.com/itinerary.pdf',
+        preview: 'A2A 文件：行程单.pdf',
+      },
+      {
+        id: 'art-3',
+        name: '第三份',
+        mimeType: 'text/plain',
+        size: 10,
+        checksum: '',
+        source: 'inline',
+        uri: 'mcp://third',
+      },
+    ])
+    const brief = artifactBrief(artifacts[0])
+    expect(brief).toContain('巡检周报.md')
+    expect(brief).toContain('text/markdown')
+    expect(brief).toContain('2.0 KB')
+    expect(brief).toContain('sha256:aaaaaaaaaaaaaaaa…')
+    expect(brief).toContain('fileId:wf1')
+    expect(brief).toContain('预览：本周正常')
+
+    const manifest = artifactManifest(artifacts, 2)
+    expect(manifest).toContain('巡检周报.md')
+    expect(manifest).toContain('A2A')
+    expect(manifest).toContain('ref-sha256:bbbbbbbbbbbbbbbb…')
+    expect(manifest).toContain('另有 1 个产物未展开')
+    expect(manifest).not.toContain('第三份')
   })
 })

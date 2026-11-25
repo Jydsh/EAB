@@ -7,6 +7,7 @@ import {
   getA2ATask,
   normalizeA2AEndpoint,
   sendA2AMessage,
+  summarizeA2ATask,
 } from '../src/a2a-client.js'
 
 const servers: Array<ReturnType<typeof createServer>> = []
@@ -209,5 +210,68 @@ describe('A2A JSON-RPC 客户端', () => {
     expect(result.kind).toBe('task')
     expect(result.task?.id).toBe('remote-task-sse')
     expect(result.task?.status.state).toBe('completed')
+  })
+
+  it('A2A 文件产物带 mime、大小、校验和、稳定 uri 和预览', () => {
+    const task = {
+      id: 'remote-task-preview',
+      contextId: 'ctx-preview',
+      status: { state: 'completed' as const },
+      history: [],
+      artifacts: [
+        {
+          artifactId: 'art-uri',
+          name: '行程单',
+          parts: [{
+            kind: 'file' as const,
+            file: { name: 'itinerary.pdf', mimeType: 'application/pdf', uri: 'https://example.com/itinerary.pdf' },
+          }],
+        },
+        {
+          artifactId: 'art-bytes',
+          name: '说明',
+          parts: [{
+            kind: 'file' as const,
+            file: {
+              name: 'notes.txt',
+              mimeType: 'text/plain',
+              bytes: Buffer.from('# 说明\n\n已订好酒店。').toString('base64'),
+            },
+          }],
+        },
+        {
+          artifactId: 'art-multi',
+          name: '多部分',
+          parts: [
+            { kind: 'file' as const, file: { name: 'a.txt', mimeType: 'text/plain', uri: 'https://example.com/a.txt' } },
+            { kind: 'file' as const, file: { name: 'b.txt', mimeType: 'text/plain', uri: 'https://example.com/b.txt' } },
+          ],
+        },
+      ],
+    }
+    const summary = summarizeA2ATask(task)
+    expect(summary.artifacts).toHaveLength(4)
+    expect(summary.artifacts[0]).toMatchObject({
+      id: 'art-uri',
+      name: '行程单',
+      mimeType: 'application/pdf',
+      size: 0,
+      source: 'a2a',
+      uri: 'https://example.com/itinerary.pdf',
+    })
+    expect(summary.artifacts[0].checksum).toMatch(/^ref-sha256:/)
+    expect(summary.artifacts[0].preview).toContain('application/pdf')
+    expect(summary.artifacts[0].preview).toContain('有下载地址')
+
+    expect(summary.artifacts[1]).toMatchObject({
+      name: '说明',
+      mimeType: 'text/plain',
+      size: Buffer.from('# 说明\n\n已订好酒店。').length,
+    })
+    expect(summary.artifacts[1].checksum).toMatch(/^sha256:/)
+    expect(summary.artifacts[1].uri).toMatch(/^a2a:artifact\//)
+    expect(summary.artifacts[1].preview).toContain('已订好酒店')
+
+    expect(summary.artifacts.slice(2).map((item) => item.id)).toEqual(['art-multi:0', 'art-multi:1'])
   })
 })

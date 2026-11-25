@@ -942,17 +942,57 @@ export interface RowStatsLabels {
   values: string[]
 }
 
+export interface RowStatsGroupField {
+  /** 该组内该数值字段的行数。 */
+  count: number
+  sum: number
+  avg: number
+  /** 该组合计占全部行该字段合计的百分比（保留两位）。 */
+  sharePct: number
+}
+
+export interface RowStatsGroupValue {
+  value: string
+  count: number
+  fields: Record<string, RowStatsGroupField>
+}
+
+export interface RowStatsGroup {
+  /** 分类字段名，例如“作业地”。 */
+  field: string
+  values: RowStatsGroupValue[]
+}
+
+export interface RowStatsSample {
+  /** 采样列名，按“时间 → 分类 → 数值 → 文本”的顺序排好。 */
+  columns: string[]
+  /** 已转成可读文本的少量原始行，用于服务端兜底时还原明细表。 */
+  rows: Array<Record<string, string>>
+}
+
 export interface RowStats {
   rows: number
   path: string
   fields: Record<string, RowStatsField>
   /** 姓名/员工/部门这类身份字段的取值分布；多人时提示筛选条件可能没生效。 */
   labels?: Record<string, RowStatsLabels>
+  /**
+   * 按分类字段（如作业地、部门）预先聚合的条数/合计/平均/占比。
+   * 模型要写“按地点分组”的数字时直接引用这里，不再自己把明细行分组求和。
+   */
+  groups?: RowStatsGroup[]
+  /** 少量原始行，模型失败时服务端兜底直接还原明细，不用再让模型编。 */
+  sample?: RowStatsSample
   note: string
 }
 
 const ROW_STATS_MAX_ROWS = 5_000
 const ROW_STATS_MAX_FIELDS = 12
+/** 分类字段的取值个数上限：超过这个数更像编号/时间戳，不适合分组。 */
+const ROW_STATS_MAX_GROUP_VALUES = 12
+const ROW_STATS_MAX_GROUP_FIELDS = 2
+/** 分类字段取值文本长度上限，避免把长描述或地址当分组。 */
+const ROW_STATS_MAX_GROUP_VALUE_CHARS = 24
 const ROW_STATS_MAX_DEPTH = 6
 
 function statNumber(raw: unknown): number | null {
@@ -1013,11 +1053,14 @@ function findRecordArray(payload: unknown): { rows: Array<Record<string, unknown
 /** 业务工具结果里的数据表统计；没有对象数组时返回 null。 */
 export function summarizeRowStats(payload: unknown): RowStats | null {
   let data = payload
-  if (typeof data === 'string' && data.trim().startsWith('{')) {
-    try {
-      data = JSON.parse(data)
-    } catch {
-      return null
+  if (typeof data === 'string') {
+    const text = data.trim()
+    if (text.startsWith('{') || text.startsWith('[')) {
+      try {
+        data = JSON.parse(text)
+      } catch {
+        return null
+      }
     }
   }
   const found = findRecordArray(data)
@@ -1068,11 +1111,260 @@ export function summarizeRowStats(payload: unknown): RowStats | null {
     }
     if (values.size >= 2) labels[key] = { count: values.size, values: [...values].slice(0, 12) }
   }
+  /**
+   * 按分类字段预聚合：模型要写“各站点/各部门”的条数与合计时直接引用，
+   * 不再把明细行搬进上下文自己分组求和（实测会漏行、串组、加错）。
+   */
+  const groupCandidates: Array<{ key: string; values: string[] }> = []
+  for (const key of keys) {
+    const values: string[] = []
+    const seenValues = new Set<string>()
+    let sane = true
+    for (const row of rows) {
+      const raw = row[key]
+      if (typeof raw !== 'string') { sane = false; break }
+      const text = raw.trim()
+      if (!text || text.length > ROW_STATS_MAX_GROUP_VALUE_CHARS) { sane = false; break }
+      if (!seenValues.has(text)) {
+        seenValues.add(text)
+        values.push(text)
+      }
+      if (seenValues.size > ROW_STATS_MAX_GROUP_VALUES) { sane = false; break }
+    }
+    // 只有一个取值（整批同部门/同一人）或取值太多（时间、编号）都不分组。
+    if (!sane || seenValues.size < 2) continue
+    // 每一行都是不同取值 → 大概率是时间戳/流水号，不是分类维度。
+    if (seenValues.size >= found.rows.length) continue
+    groupCandidates.push({ key, values })
+  }
+  const groups: RowStatsGroup[] = []
+  for (const candidate of groupCandidates.slice(0, ROW_STATS_MAX_GROUP_FIELDS)) {
+    const byValue = new Map<string, Array<Record<string, unknown>>>()
+    for (const row of rows) {
+      const text = String(row[candidate.key] ?? '').trim()
+      if (!text) continue
+      const bucket = byValue.get(text) ?? []
+      bucket.push(row)
+      byValue.set(text, bucket)
+    }
+    const entries: RowStatsGroupValue[] = []
+    for (const [value, groupRows] of byValue) {
+      const groupFields: Record<string, RowStatsGroupField> = {}
+      for (const [fieldName, stats] of Object.entries(statsFields)) {
+        let count = 0
+        let sum = 0
+        for (const row of groupRows) {
+          const parsed = statNumber(row[fieldName])
+          if (parsed === null) continue
+          count += 1
+          sum += parsed
+        }
+        if (count === 0) continue
+        groupFields[fieldName] = {
+          count,
+          sum: round2(sum),
+          avg: round2(sum / count),
+          sharePct: stats.sum === 0 ? 0 : round2((sum / stats.sum) * 100),
+        }
+      }
+      entries.push({ value, count: groupRows.length, fields: groupFields })
+    }
+    if (entries.some((entry) => Object.keys(entry.fields).length > 0)) {
+      groups.push({ field: candidate.key, values: entries })
+    }
+  }
+  const sample = buildRowSample(rows, statsFields, groups)
   return {
     rows: found.rows.length,
     path: found.path,
     fields: statsFields,
     ...(Object.keys(labels).length > 0 ? { labels } : {}),
-    note: `服务端对该批 ${found.rows.length} 条记录逐字段精确统计（最多取前 ${ROW_STATS_MAX_ROWS} 条）；合计、平均、条数、最大最小一律引用这里的值，不要再从明细重算。`,
+    ...(groups.length > 0 ? { groups } : {}),
+    ...(sample ? { sample } : {}),
+    note: `服务端对该批 ${found.rows.length} 条记录逐字段精确统计（最多取前 ${ROW_STATS_MAX_ROWS} 条）；合计、平均、条数、最大最小一律引用这里的值，不要再从明细重算；按分类字段分组的条数/合计/平均/占比见 groups；明细行见 sample。`,
   }
+}
+
+/** 从同一批行里挑出“时间、分类、数值、说明”四类列，保留少量原始行。 */
+function buildRowSample(
+  rows: Array<Record<string, unknown>>,
+  fields: Record<string, RowStatsField>,
+  groups: RowStatsGroup[],
+): RowStatsSample | undefined {
+  const allKeys = [...new Set(rows.flatMap((row) => Object.keys(row)))]
+  const numericNames = Object.keys(fields)
+  const datePattern = /日期|时间|date|time/i
+  const textPattern = /内容|场景|类型|状态|岗位|说明|备注|事由|工作/i
+  const groupField = groups[0]?.field
+  const scored: Array<{ key: string; score: number; order: number }> = []
+  allKeys.forEach((key, order) => {
+    if (datePattern.test(key)) scored.push({ key, score: 4, order })
+    else if (key === groupField) scored.push({ key, score: 3, order })
+    else if (numericNames.includes(key)) scored.push({ key, score: 2, order })
+    else if (textPattern.test(key)) scored.push({ key, score: 2, order })
+  })
+  // 单列（只有一个分类或一个数值）还原不出明细，至少要两列才值得展示。
+  const columns = scored
+    .sort((a, b) => b.score - a.score || a.order - b.order)
+    .slice(0, 6)
+    .map((item) => item.key)
+  if (columns.length < 2 || rows.length < 2) return undefined
+  const sampleRows: Array<Record<string, string>> = []
+  for (const row of rows.slice(0, 30)) {
+    const record: Record<string, string> = {}
+    for (const column of columns) {
+      const raw = row[column]
+      if (raw === null || raw === undefined) continue
+      record[column] = String(raw).replace(/\s+/g, ' ').trim().slice(0, 60)
+    }
+    if (Object.keys(record).length > 0) sampleRows.push(record)
+  }
+  return sampleRows.length > 0 ? { columns, rows: sampleRows } : undefined
+}
+
+/**
+ * 把 rowStats 写成模型可以直接抄的短句。
+ *
+ * 为什么不再只给 JSON：小模型对嵌套 JSON 的注意力很差，拿到 20 行明细后仍会自己
+ * 分组求和（实测写出 54.63、44.5 这类不存在的合计）。这里把整批和分组的
+ * 条数/合计/平均/占比摊平成固定句式，模型只需要照抄。
+ */
+/**
+ * 从预聚合分组里生成两条确定性结论，供模型失败时的服务端兜底直接使用。
+ *
+ * 模型算错分组时不能把错误数字发出去，但只回一串统计也不像“分析”。这里只做
+ * 排序、相减这类不会改变口径的运算，所有数字都仍来自 rowStats。
+ */
+export function formatRowStatsInsights(stats: RowStats): string {
+  const group = (stats.groups ?? []).find(
+    (item) => item.values.length >= 2 && Object.keys(item.values[0]?.fields ?? {}).length > 0,
+  )
+  if (!group) return ''
+  const metric = Object.keys(group.values[0].fields)[0]
+  if (!metric || !stats.fields[metric]) return ''
+  const entries = [...group.values].sort(
+    (a, b) => Number(b.fields[metric].sum) - Number(a.fields[metric].sum),
+  )
+  const top = entries[0]
+  const bottom = entries[entries.length - 1]
+  if (!top || !bottom || top.value === bottom.value) return ''
+  const total = stats.fields[metric]
+  const gap = (Number(top.fields[metric].sum) - Number(bottom.fields[metric].sum)).toFixed(2)
+  return [
+    `- ${group.field}里${metric}合计最高的是${top.value}：${top.fields[metric].sum}（${top.count} 条，占 ${top.fields[metric].sharePct}%）；`,
+    `  最低的是${bottom.value}：${bottom.fields[metric].sum}（${bottom.count} 条，占 ${bottom.fields[metric].sharePct}%）。`,
+    `- 两者相差 ${gap}；整批平均 ${total.avg}，单条区间 ${total.min}–${total.max}。`,
+  ].join('\n')
+}
+
+export function formatRowStatsBrief(stats: RowStats): string {  const lines: string[] = []
+  const totals = Object.entries(stats.fields).map(([name, field]) =>
+    `${name}：${field.count} 条有值，合计 ${field.sum}，平均 ${field.avg}，最小 ${field.min}，最大 ${field.max}`)
+  lines.push(`整批 ${stats.rows} 条。${totals.join('；')}`)
+  for (const group of stats.groups ?? []) {
+    lines.push(`按${group.field}分组：`)
+    for (const entry of group.values) {
+      const metrics = Object.entries(entry.fields).map(([name, field]) =>
+        `${name}合计 ${field.sum}（${field.count} 条，平均 ${field.avg}，占 ${field.sharePct}%）`)
+      lines.push(`- ${entry.value}：${entry.count} 条，${metrics.join('；')}`)
+    }
+  }
+  const labelEntries = Object.entries(stats.labels ?? {})
+  if (labelEntries.length > 0) {
+    lines.push(labelEntries.map(([name, label]) => `${name}有 ${label.count} 个取值：${label.values.join('、')}`).join('；'))
+  }
+  return lines.join('\n')
+}
+
+/**
+ * 用采样行还原一张明细表：模型没写出合格答案时，用户至少还能看到原始记录。
+ * 只展示模型本来就能看到的前 30 行，不是新生成的数据。
+ */
+export function formatRowStatsTable(stats: RowStats): string {
+  const sample = stats.sample
+  if (!sample || sample.columns.length === 0 || sample.rows.length === 0) return ''
+  const cell = (text: string | undefined): string => String(text ?? '').replace(/\|/g, '\\|').replace(/\n/g, ' ')
+  const header = `| ${sample.columns.map(cell).join(' | ')} |`
+  const divider = `| ${sample.columns.map(() => ':---').join(' | ')} |`
+  const body = sample.rows.map((row) => `| ${sample.columns.map((column) => cell(row[column])).join(' | ')} |`)
+  const more = stats.rows > sample.rows.length ? `\n（共 ${stats.rows} 条，这里先列前 ${sample.rows.length} 条）` : ''
+  return `明细列表：\n${[header, divider, ...body].join('\n')}${more}`
+}
+
+/** 把指标名里的单位拆出来，例如“加班时长（H）”→ 名称“加班时长”、单位“H”。 */
+function chartMetricName(metric: string): { name: string; unit: string } {
+  const match = /(?:（|\()([^）)]*)(?:）|\))/.exec(metric)
+  return {
+    name: metric.replace(/（[^）]*）|\([^)]*\)/g, '').trim() || metric,
+    unit: match?.[1]?.trim() ?? '',
+  }
+}
+
+/**
+ * 从分组统计生成一张可直接在消息气泡里渲染的图表配置。
+ *
+ * 只搬运 rowStats.groups 里已经算好的合计，不做任何新运算；分组少时用饼图看占比，
+ * 分组多时用横向柱状图看对比。模型自己画图时也使用同一套 ```chart 格式。
+ */
+export function formatRowStatsChart(stats: RowStats): string {
+  const group = (stats.groups ?? []).find((item) => item.values.length >= 2 && Object.keys(item.values[0]?.fields ?? {}).length > 0)
+  if (!group) return ''
+  const metric = Object.keys(group.values[0].fields)[0]
+  if (!metric) return ''
+  const points = group.values
+    .map((entry) => ({ label: entry.value, value: Number(entry.fields[metric].sum) }))
+    .filter((point) => Number.isFinite(point.value) && point.value >= 0)
+    .sort((a, b) => b.value - a.value)
+    .slice(0, 10)
+  if (points.length < 2) return ''
+  const { name, unit } = chartMetricName(metric)
+  const type = points.length <= 8 ? 'pie' : 'bar'
+  const spec = {
+    type,
+    title: type === 'pie' ? `按${group.field}的${name}占比` : `按${group.field}的${name}对比`,
+    ...(unit ? { unit } : {}),
+    data: points,
+  }
+  return '```chart\n' + JSON.stringify(spec) + '\n```'
+}
+
+/** 从采样行里挑“时间列 + 数值列”，生成一条可选的趋势折线；少于 5 个点不画。 */
+export function formatRowStatsTrendChart(stats: RowStats): string {
+  const sample = stats.sample
+  if (!sample || sample.rows.length < 5) return ''
+  const timeColumn = sample.columns.find((column) => /日期|时间|date|time/i.test(column))
+  if (!timeColumn) return ''
+  const valueColumns = sample.columns.filter((column) => stats.fields[column])
+  if (valueColumns.length === 0) return ''
+  const valueColumn = valueColumns[0]
+  if (!valueColumn) return ''
+  const points: Array<{ label: string; value: number; at: number | null }> = []
+  for (const row of sample.rows) {
+    const rawTime = String(row[timeColumn] ?? '').trim()
+    const rawValue = String(row[valueColumn] ?? '').replace(/,/g, '').trim()
+    const value = Number(rawValue)
+    if (!rawTime || !/^-?\d+(?:\.\d+)?$/.test(rawValue) || !Number.isFinite(value)) continue
+    const at = Date.parse(rawTime.replace(/年/g, '-').replace(/月/g, '-').replace(/日/g, ' '))
+    const date = Number.isFinite(at) ? new Date(at) : null
+    const label = date
+      ? `${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+      : rawTime.slice(0, 12)
+    points.push({ label, value, at: Number.isFinite(at) ? at : null })
+  }
+  if (points.length < 5) return ''
+  const dated = points.filter((point) => point.at !== null)
+  if (dated.length >= points.length * 0.8) points.sort((a, b) => (a.at ?? 0) - (b.at ?? 0))
+  const { name, unit } = chartMetricName(valueColumn)
+  const spec = {
+    type: 'line',
+    title: `${name}趋势（前 ${points.length} 条）`,
+    ...(unit ? { unit } : {}),
+    data: points.map(({ label, value }) => ({ label, value })),
+  }
+  return '```chart\n' + JSON.stringify(spec) + '\n```'
+}
+
+/** 兜底交付用的图表组合：分组占比/对比 + 单条趋势。 */
+export function formatRowStatsCharts(stats: RowStats): string {
+  return [formatRowStatsChart(stats), formatRowStatsTrendChart(stats)].filter(Boolean).join('\n\n')
 }

@@ -1,5 +1,6 @@
 import type { FastifyInstance } from 'fastify'
-import { EC, EabError, resolveVisibleCollections, SC, scopeAllows } from '@eab/domain'
+import { hostname } from 'node:os'
+import { EC, EabError, resolveVisibleCollections, SC, scopeAllows, chartCatalogForChannel, chartCountForChannel, type ChartChannel } from '@eab/domain'
 import { loadKbCollectionAcls, sqliteBusyStats } from '@eab/storage'
 import type { ServerDeps } from '../deps.js'
 import { coordinationBackendStatus } from '../backends/coordination.js'
@@ -12,7 +13,7 @@ import {
 import { isConsoleRequest, hasConsoleSession } from '../console-auth.js'
 import { pluginToolSemaphore, sharedPluginCapacityStats } from '../plugin-tools.js'
 import { sharedToolCapacityStats, toolConcurrencyStats } from './tools.js'
-import { activeAgentRunCount, cancelAgentRunTree, listAgentRuns } from '../agent-runtime.js'
+import { activeAgentRunCount, cancelAgentRunTree, getAgentRunDetail, listAgentRuns } from '../agent-runtime.js'
 import { toolDurationStats } from '../tool-metrics.js'
 import { toolInflightCount, toolInflightSnapshot } from '../tool-inflight.js'
 import { requestCancelAgentRun } from '../realtime-control.js'
@@ -63,6 +64,9 @@ export function registerSystemRoutes(app: FastifyInstance, deps: ServerDeps): vo
       // 更新器用 pid + uptime 确认健康响应来自新进程，而不是还在运行的旧进程。
       pid: process.pid,
       uptimeSec: Math.round(process.uptime()),
+      instanceId: (process.env.EAB_INSTANCE_ID ?? '').trim() || `${hostname()}:${process.pid}`,
+      role: deps.config.serverRole ?? 'all',
+      multiInstance: deps.config.multiInstance === true,
       devAuth: deps.config.devAuth,
       host: deps.config.host,
       chatPort: deps.config.port,
@@ -81,6 +85,36 @@ export function registerSystemRoutes(app: FastifyInstance, deps: ServerDeps): vo
       backends: deps.backends?.statuses().map((item) => ({ id: item.id, state: item.state })) ?? [],
     }),
   )
+
+  /**
+   * 公开图表能力清单：Agent、网页渲染器、钉钉映射都以这份目录为准。
+   * 只回类型定义，不回任何业务数据；以后新增图表只改 @eab/domain 的目录。
+   */
+  app.get('/api/charts/catalog', async (req) => {
+    const raw = (req.query as { channel?: string } | undefined)?.channel
+    const channel: ChartChannel = raw === 'dingtalk' ? 'dingtalk' : 'web'
+    const types = chartCatalogForChannel(channel)
+    return ok({
+      channel,
+      count: chartCountForChannel(channel),
+      total: chartCountForChannel('web'),
+      types: types.map((item) => ({
+        id: item.id,
+        aliases: item.aliases,
+        name: item.name,
+        purpose: item.purpose,
+        shape: item.shape,
+        limits: item.limits,
+        enabled: item.enabled,
+        web: true,
+        dingtalk: {
+          ...item.dingtalk,
+          supported: item.dingtalk.fidelity === 'native',
+        },
+        example: item.example,
+      })),
+    })
+  })
 
   /**
    * 控制台「系统 > 数据与运维」用：只回能力与健康状态，不回连接串/账号密码。
@@ -106,7 +140,12 @@ export function registerSystemRoutes(app: FastifyInstance, deps: ServerDeps): vo
 
   app.get('/readyz', async () => {
     deps.db.prepare('SELECT 1 AS ok').get()
-    return ok({ status: 'ready', version: readVersion() })
+    return ok({
+      status: 'ready',
+      version: readVersion(),
+      role: deps.config.serverRole ?? 'all',
+      instanceId: (process.env.EAB_INSTANCE_ID ?? '').trim() || `${hostname()}:${process.pid}`,
+    })
   })
 
   /** Prometheus 文本格式指标（OPS-08）：库内计数 + 进程内存/运行时长 */
@@ -285,6 +324,17 @@ export function registerSystemRoutes(app: FastifyInstance, deps: ServerDeps): vo
         sessionId: typeof query?.sessionId === 'string' && query.sessionId ? query.sessionId : undefined,
       }),
     })
+  })
+
+  app.get('/api/console/agent-runs/:id', async (req) => {
+    if (!isConsoleRequest(req, deps.config)) {
+      throw new EabError(EC.FORBIDDEN, '需要控制台登录后再查看任务详情')
+    }
+    const id = (req.params as { id?: string } | undefined)?.id ?? ''
+    if (!id) throw new EabError(EC.VALIDATION, '缺少运行 id')
+    const detail = getAgentRunDetail(deps.db, deps.companyId, id)
+    if (!detail) throw new EabError(EC.NOT_FOUND, '任务不存在或不属于当前公司')
+    return ok(detail)
   })
 
   app.post('/api/console/agent-runs/:id/cancel', async (req) => {

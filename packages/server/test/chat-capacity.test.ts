@@ -1,6 +1,6 @@
 import { describe, expect, it, afterEach } from 'vitest'
 import { createChatCapacity } from '../src/chat-capacity.js'
-import { MemoryCache } from '../src/backends/cache.js'
+import { installSharedCache } from './helpers/shared-cache.js'
 import { setBackendRuntimeForTest } from '../src/backends/runtime.js'
 
 describe('网页对话并发闸门', () => {
@@ -156,7 +156,7 @@ describe('接入共享缓存后的并发闸门', () => {
   }
 
   it('两个实例共享同一份全局名额：一边占满，另一边必须等', async () => {
-    setBackendRuntimeForTest({ cache: new MemoryCache(10_000) } as never)
+    installSharedCache(10_000)
     const a = createChatCapacity(sharedOptions())
     const b = createChatCapacity(sharedOptions())
 
@@ -179,7 +179,7 @@ describe('接入共享缓存后的并发闸门', () => {
   })
 
   it('同一模型的名额也跨实例共享', async () => {
-    setBackendRuntimeForTest({ cache: new MemoryCache(10_000) } as never)
+    installSharedCache(10_000)
     const options = { ...sharedOptions(), maxConcurrent: 5, modelMaxConcurrent: 1 }
     const a = createChatCapacity(options)
     const b = createChatCapacity(options)

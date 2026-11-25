@@ -1,0 +1,325 @@
+{
+  "version": "v0",
+  "name": "EAB 知识库质量基准（文本 / 表格 / 图片 / 新鲜度）",
+  "generatedAt": "2026-11-24",
+  "now": "2026-11-24T00:00:00+08:00",
+  "company": { "id": "c_kb_quality", "name": "知识库质量基准公司" },
+  "collection": { "id": "kb_quality_baseline", "name": "质量基准库" },
+  "documents": [
+    {
+      "id": "doc_travel",
+      "title": "2026年差旅报销标准",
+      "updatedDaysAgo": 14,
+      "chunks": [
+        {
+          "id": "chunk_travel_rule",
+          "text": "出差人员应在返回后 10 个工作日内提交报销申请，逾期需部门负责人说明。交通舱位标准：经理可乘经济舱，总监可乘公务舱。",
+          "meta": { "headingPath": ["差旅报销", "报销时限"], "blockType": "paragraph" }
+        },
+        {
+          "id": "chunk_travel_table",
+          "text": "职级 | 住宿上限(元/晚) | 餐补(元/天)\n经理 | 500 | 100\n主管 | 350 | 80",
+          "meta": {
+            "headingPath": ["差旅报销", "住宿与餐补标准"],
+            "blockType": "table",
+            "sheetName": "差旅标准",
+            "rowRange": [1, 3]
+          }
+        }
+      ]
+    },
+    {
+      "id": "doc_procurement",
+      "title": "采购审批权限表",
+      "updatedDaysAgo": 200,
+      "chunks": [
+        {
+          "id": "chunk_procurement_table",
+          "text": "金额区间 | 审批人 | 需附材料\n0-50万元 | 部门负责人 | 采购申请\n50-100万元 | 分管副总 | 比价记录\n100万元以上 | 总经理 | 招标结果",
+          "meta": {
+            "headingPath": ["采购管理", "审批权限"],
+            "blockType": "table",
+            "sheetName": "采购审批",
+            "rowRange": [1, 4]
+          }
+        },
+        {
+          "id": "chunk_procurement_rule",
+          "text": "所有采购必须先完成预算确认，再提交采购申请；不得先采购后补审批。",
+          "meta": { "headingPath": ["采购管理", "基本要求"], "blockType": "paragraph" }
+        }
+      ]
+    },
+    {
+      "id": "doc_safety_image",
+      "title": "变电站设备巡检图示",
+      "updatedDaysAgo": 30,
+      "chunks": [
+        {
+          "id": "chunk_safety_text",
+          "text": "巡检人员应按巡检路线逐项记录设备状态，发现异常立即上报值班长。",
+          "meta": { "headingPath": ["巡检要求"], "blockType": "paragraph" }
+        },
+        {
+          "id": "chunk_safety_image",
+          "text": "[图片] 变电站设备巡检图示\n主变油温表读数应在 60℃ 以下。\n开关柜运行指示灯为绿色。\n灭火器压力表指针应在绿色区域。\n安全帽颜色：运行人员红色，检修人员蓝色。",
+          "meta": {
+            "headingPath": ["巡检要求", "现场图示"],
+            "blockType": "image",
+            "imageAssetId": "img_safety_inspection",
+            "imageCaption": "变电站设备巡检图示，包含主变油温表、开关柜指示灯、灭火器和安全帽颜色。",
+            "pageNo": 2
+          }
+        }
+      ]
+    },
+    {
+      "id": "doc_leave_2024",
+      "title": "2024年休假管理制度",
+      "updatedDaysAgo": 400,
+      "chunks": [
+        {
+          "id": "chunk_leave_rule",
+          "text": "员工累计工作满1年不满10年的，年休假5天；满10年不满20年的，年休假10天；满20年的，年休假15天。",
+          "meta": { "headingPath": ["休假管理", "年休假"], "blockType": "paragraph" }
+        },
+        {
+          "id": "chunk_leave_process",
+          "text": "年休假需提前3个工作日在系统提交申请，由直属主管审批。",
+          "meta": { "headingPath": ["休假管理", "申请流程"], "blockType": "paragraph" }
+        }
+      ]
+    },
+    {
+      "id": "doc_project_2023",
+      "title": "2023年项目验收管理办法",
+      "updatedDaysAgo": 20,
+      "chunks": [
+        {
+          "id": "chunk_project_material",
+          "text": "项目验收需提交验收报告、测试记录和上线审批单。材料不齐的，验收流程退回补充。",
+          "meta": { "headingPath": ["项目验收", "提交材料"], "blockType": "paragraph" }
+        },
+        {
+          "id": "chunk_project_approval",
+          "text": "项目上线前必须取得上线审批单，并由项目负责人确认回滚方案。",
+          "meta": { "headingPath": ["项目上线", "审批"], "blockType": "paragraph" }
+        }
+      ]
+    },
+    {
+      "id": "doc_quality",
+      "title": "客户投诉处理规范",
+      "updatedDaysAgo": 90,
+      "chunks": [
+        {
+          "id": "chunk_quality_response",
+          "text": "客户投诉应在24小时内首次响应，并在3个工作日内给出处理方案。",
+          "meta": { "headingPath": ["投诉处理", "时限"], "blockType": "paragraph" }
+        },
+        {
+          "id": "chunk_quality_owner",
+          "text": "投诉由客户成功部统一受理，重大投诉需在1小时内升级至分管负责人。",
+          "meta": { "headingPath": ["投诉处理", "责任部门"], "blockType": "paragraph" }
+        }
+      ]
+    }
+  ],
+  "cases": [
+    {
+      "id": "table-travel-001",
+      "kind": "table",
+      "query": "经理出差住宿上限是多少",
+      "expectDocId": "doc_travel",
+      "expectDocTitle": "2026年差旅报销标准",
+      "expectSnippet": "经理 | 500",
+      "expectValue": "500",
+      "expectFreshness": "fresh"
+    },
+    {
+      "id": "table-travel-002",
+      "kind": "table",
+      "query": "主管出差餐补标准",
+      "expectDocId": "doc_travel",
+      "expectDocTitle": "2026年差旅报销标准",
+      "expectSnippet": "主管 | 350 | 80",
+      "expectValue": "80",
+      "expectFreshness": "fresh"
+    },
+    {
+      "id": "table-travel-003",
+      "kind": "table",
+      "query": "经理餐补每天多少钱",
+      "expectDocId": "doc_travel",
+      "expectDocTitle": "2026年差旅报销标准",
+      "expectSnippet": "经理 | 500 | 100",
+      "expectValue": "100",
+      "expectFreshness": "fresh"
+    },
+    {
+      "id": "table-procurement-001",
+      "kind": "table",
+      "query": "采购50万元审批人是谁",
+      "expectDocId": "doc_procurement",
+      "expectDocTitle": "采购审批权限表",
+      "expectSnippet": "50-100万元 | 分管副总",
+      "expectValue": "分管副总",
+      "expectFreshness": "aging"
+    },
+    {
+      "id": "table-procurement-002",
+      "kind": "table",
+      "query": "采购100万元以上审批人",
+      "expectDocId": "doc_procurement",
+      "expectDocTitle": "采购审批权限表",
+      "expectSnippet": "100万元以上 | 总经理",
+      "expectValue": "总经理",
+      "expectFreshness": "aging"
+    },
+    {
+      "id": "table-procurement-003",
+      "kind": "table",
+      "query": "50万元以下采购申请材料",
+      "expectDocId": "doc_procurement",
+      "expectDocTitle": "采购审批权限表",
+      "expectSnippet": "采购申请",
+      "expectValue": "采购申请",
+      "expectFreshness": "aging"
+    },
+    {
+      "id": "image-safety-001",
+      "kind": "image",
+      "query": "主变油温表读数上限",
+      "expectDocId": "doc_safety_image",
+      "expectDocTitle": "变电站设备巡检图示",
+      "expectSnippet": "主变油温表读数应在 60℃ 以下",
+      "expectImageAsset": "img_safety_inspection",
+      "expectFreshness": "fresh"
+    },
+    {
+      "id": "image-safety-002",
+      "kind": "image",
+      "query": "开关柜运行指示灯颜色",
+      "expectDocId": "doc_safety_image",
+      "expectDocTitle": "变电站设备巡检图示",
+      "expectSnippet": "开关柜运行指示灯为绿色",
+      "expectImageAsset": "img_safety_inspection",
+      "expectFreshness": "fresh"
+    },
+    {
+      "id": "image-safety-003",
+      "kind": "image",
+      "query": "灭火器压力表指针位置",
+      "expectDocId": "doc_safety_image",
+      "expectDocTitle": "变电站设备巡检图示",
+      "expectSnippet": "灭火器压力表指针应在绿色区域",
+      "expectImageAsset": "img_safety_inspection",
+      "expectFreshness": "fresh"
+    },
+    {
+      "id": "image-safety-004",
+      "kind": "image",
+      "query": "运行人员安全帽颜色",
+      "expectDocId": "doc_safety_image",
+      "expectDocTitle": "变电站设备巡检图示",
+      "expectSnippet": "运行人员红色",
+      "expectImageAsset": "img_safety_inspection",
+      "expectFreshness": "fresh"
+    },
+    {
+      "id": "image-safety-005",
+      "kind": "image",
+      "query": "检修人员安全帽颜色",
+      "expectDocId": "doc_safety_image",
+      "expectDocTitle": "变电站设备巡检图示",
+      "expectSnippet": "检修人员蓝色",
+      "expectImageAsset": "img_safety_inspection",
+      "expectFreshness": "fresh"
+    },
+    {
+      "id": "image-safety-006",
+      "kind": "image",
+      "query": "变电站设备巡检图示",
+      "expectDocId": "doc_safety_image",
+      "expectDocTitle": "变电站设备巡检图示",
+      "expectSnippet": "变电站设备巡检图示",
+      "expectImageAsset": "img_safety_inspection",
+      "expectFreshness": "fresh"
+    },
+    {
+      "id": "text-travel-001",
+      "kind": "text",
+      "query": "出差报销申请几个工作日提交",
+      "expectDocId": "doc_travel",
+      "expectDocTitle": "2026年差旅报销标准",
+      "expectSnippet": "10 个工作日内提交报销申请",
+      "expectFreshness": "fresh"
+    },
+    {
+      "id": "text-leave-001",
+      "kind": "text",
+      "query": "工作满1年不满10年年休假几天",
+      "expectDocId": "doc_leave_2024",
+      "expectDocTitle": "2024年休假管理制度",
+      "expectSnippet": "年休假5天",
+      "expectFreshness": "stale"
+    },
+    {
+      "id": "text-leave-002",
+      "kind": "text",
+      "query": "累计工作满20年年休假多少天",
+      "expectDocId": "doc_leave_2024",
+      "expectDocTitle": "2024年休假管理制度",
+      "expectSnippet": "年休假15天",
+      "expectFreshness": "stale"
+    },
+    {
+      "id": "text-project-001",
+      "kind": "text",
+      "query": "项目验收需要提交哪些材料",
+      "expectDocId": "doc_project_2023",
+      "expectDocTitle": "2023年项目验收管理办法",
+      "expectSnippet": "验收报告、测试记录和上线审批单",
+      "expectFreshness": "fresh",
+      "expectTitleYearWarning": true
+    },
+    {
+      "id": "text-project-002",
+      "kind": "text",
+      "query": "项目上线前需要什么审批单",
+      "expectDocId": "doc_project_2023",
+      "expectDocTitle": "2023年项目验收管理办法",
+      "expectSnippet": "上线审批单",
+      "expectFreshness": "fresh",
+      "expectTitleYearWarning": true
+    },
+    {
+      "id": "text-leave-003",
+      "kind": "text",
+      "query": "年休假制度",
+      "expectDocId": "doc_leave_2024",
+      "expectDocTitle": "2024年休假管理制度",
+      "expectSnippet": "年休假15天",
+      "expectFreshness": "stale",
+      "expectTitleYearWarning": true
+    },
+    {
+      "id": "text-quality-001",
+      "kind": "text",
+      "query": "客户投诉多久首次响应",
+      "expectDocId": "doc_quality",
+      "expectDocTitle": "客户投诉处理规范",
+      "expectSnippet": "24小时内首次响应",
+      "expectFreshness": "fresh"
+    },
+    {
+      "id": "text-quality-002",
+      "kind": "text",
+      "query": "客户投诉处理方案几个工作日给出",
+      "expectDocId": "doc_quality",
+      "expectDocTitle": "客户投诉处理规范",
+      "expectSnippet": "3个工作日内给出处理方案",
+      "expectFreshness": "fresh"
+    }
+  ]
+}

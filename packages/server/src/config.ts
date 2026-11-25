@@ -28,6 +28,9 @@ export interface ObjectStorageConfig {
   readonly required: boolean
 }
 
+/** AGT-17 多实例角色：all=单机全量，api=只接 HTTP，worker=只跑单例后台任务。 */
+export type ServerRole = 'all' | 'api' | 'worker'
+
 export interface ServerConfig {
   readonly host: string
   /** 员工对话端口（默认 8787） */
@@ -35,6 +38,17 @@ export interface ServerConfig {
   /** 管理控制台端口（默认 8788）；必须与员工端口不同 */
   readonly adminPort: number
   readonly dbPath: string
+  /**
+   * 进程角色（默认 all，保持旧部署行为）。
+   * - api：不跑调度、组织同步、渠道长连接、任务图等待恢复等单例后台循环；
+   * - worker：照常跑这些单例循环，但仍监听端口以便容器健康检查。
+   */
+  readonly serverRole?: ServerRole
+  /**
+   * 是否显式允许多个 EAB 进程共享同一数据目录（默认 false）。
+   * 开启后跳过单写进程锁，改用数据库租约协调单例任务；只应配合同一台主机/共享卷使用。
+   */
+  readonly multiInstance?: boolean
   /** 单公司模式：整个实例只服务这一家公司、一个组织架构（默认 c1） */
   readonly companyId: string
   /** 开发预览：允许用 ?as=<userId> 冒充身份。生产必须关。 */
@@ -94,6 +108,14 @@ export interface ServerConfig {
   readonly chatUserMaxInFlight?: number
   /** 同一个人每分钟最多发起几条消息 */
   readonly chatUserMessagesPerMinute?: number
+  /** 单轮普通问答的总墙钟预算；默认 180 秒 */
+  readonly chatTurnTimeoutMs?: number
+  /** 工程/项目意图的单轮总墙钟预算；默认 30 分钟 */
+  readonly chatProjectTurnTimeoutMs?: number
+  /** 单轮最多几次工具调用；默认 48 */
+  readonly chatTurnMaxToolCalls?: number
+  /** 单轮最多多少字思考；默认 4000（超出部分不再进入上下文和前端） */
+  readonly chatTurnMaxReasoningChars?: number
   /** 同一个模型同时生成上限；默认 4 */
   readonly chatModelMaxConcurrent?: number
   /** 同一个公司同时生成上限；默认等于全局上限 */
@@ -128,6 +150,10 @@ export interface ServerConfig {
   readonly agentWorkerRetentionMs?: number
   /** 子 Agent 单次任务最多几个模型→工具循环；默认 12（父 Agent 仍为 4） */
   readonly agentChildMaxRounds?: number
+  /** 独立验收员最多几个模型→工具循环；默认 10 */
+  readonly agentCriticMaxRounds?: number
+  /** 独立验收员整轮最长等待；默认 5 分钟，超时按验收失败处理 */
+  readonly agentCriticTimeoutMs?: number
   /** 父 Agent 等待子 Agent 事件的最长时间；默认 30 秒 */
   readonly agentWaitTimeoutMs?: number
   /**
@@ -142,6 +168,11 @@ export interface ServerConfig {
    */
   readonly agentWakeRetryLimit?: number
   readonly agentWakeRetryIntervalMs?: number
+  /**
+   * 子 Agent 启动后第一次安排父 Agent 唤醒的延迟；默认 400ms。
+   * 单测可调大，避免后台定时器在测试拆机后触发。
+   */
+  readonly agentWakeInitialDelayMs?: number
   /** 所有请求体同时在内存中的粗略预算（MB）；超过时新的大请求直接 429 */
   readonly maxInflightBodyMb?: number
   /** 缓存后端：auto（数据连接里有 Redis 才接入）、memory、redis、off（仍用内存，只是不尝试外部） */
@@ -297,11 +328,26 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     'EAB_ONLYOFFICE_INTERNAL_URL',
   )
 
+  const roleRaw = (env.EAB_SERVER_ROLE ?? 'all').trim().toLowerCase()
+  if (roleRaw !== 'all' && roleRaw !== 'api' && roleRaw !== 'worker') {
+    throw new EabError(EC.VALIDATION, `EAB_SERVER_ROLE 只能是 all、api 或 worker，当前是 ${roleRaw}`, {
+      hint: '单机保持 all；Compose 部署用 api 接流量、worker 跑后台单例任务',
+    })
+  }
+  const multiInstance = (env.EAB_MULTI_INSTANCE ?? '0') === '1'
+  if (multiInstance && roleRaw === 'all') {
+    throw new EabError(EC.VALIDATION, 'EAB_MULTI_INSTANCE=1 时必须显式指定 EAB_SERVER_ROLE=api 或 worker', {
+      hint: 'all 角色会同时跑 HTTP 与单例后台任务，多实例下容易重复执行',
+    })
+  }
+
   return {
     host,
     port,
     adminPort,
     dbPath: env.EAB_DB ?? DEFAULT_DB_PATH,
+    serverRole: roleRaw,
+    multiInstance,
     companyId: env.EAB_COMPANY_ID ?? 'c1',
     devAuth: (env.EAB_DEV_AUTH ?? '0') === '1',
     onlyOfficeUrl,
@@ -355,6 +401,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
       'EAB_AGENT_WORKER_RETENTION_MS',
     ),
     agentChildMaxRounds: readInt(env.EAB_AGENT_CHILD_MAX_ROUNDS, 64, 'EAB_AGENT_CHILD_MAX_ROUNDS'),
+    agentCriticMaxRounds: readInt(env.EAB_AGENT_CRITIC_MAX_ROUNDS, 10, 'EAB_AGENT_CRITIC_MAX_ROUNDS'),
+    agentCriticTimeoutMs: readInt(env.EAB_AGENT_CRITIC_TIMEOUT_MS, 300_000, 'EAB_AGENT_CRITIC_TIMEOUT_MS'),
     agentWaitTimeoutMs: readInt(env.EAB_AGENT_WAIT_TIMEOUT_MS, 30_000, 'EAB_AGENT_WAIT_TIMEOUT_MS'),
     // 本地大模型一轮长上下文推理可能超过 2 分钟；默认放宽到 5 分钟，避免把慢当故障转移。
     agentWakeTimeoutMs: readInt(env.EAB_AGENT_WAKE_TIMEOUT_MS, 300_000, 'EAB_AGENT_WAKE_TIMEOUT_MS'),
@@ -363,6 +411,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
       env.EAB_AGENT_WAKE_RETRY_INTERVAL_MS,
       5000,
       'EAB_AGENT_WAKE_RETRY_INTERVAL_MS',
+    ),
+    agentWakeInitialDelayMs: readInt(
+      env.EAB_AGENT_WAKE_INITIAL_DELAY_MS,
+      400,
+      'EAB_AGENT_WAKE_INITIAL_DELAY_MS',
     ),
     maxInflightBodyMb: readInt(env.EAB_MAX_INFLIGHT_BODY_MB, 256, 'EAB_MAX_INFLIGHT_BODY_MB'),
     cacheBackend: readEnum(env.EAB_CACHE, ['auto', 'memory', 'redis', 'off'] as const, 'auto', 'EAB_CACHE'),

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { capReasoningForStorage, hasMeaningfulArgs, tracesForStorage, type AgentToolTrace } from '../src/routes/chat.js'
+import { capReasoningForStorage, tracesForStorage, type AgentToolTrace } from '../src/routes/chat.js'
 
 function trace(over: Partial<AgentToolTrace> = {}): AgentToolTrace {
   return {
@@ -29,24 +29,9 @@ describe('capReasoningForStorage', () => {
 })
 
 describe('tracesForStorage', () => {
-  it('剥掉只给门禁用的 evidence，其它字段保持原样', () => {
-    const stored = tracesForStorage([trace({ evidence: { numbers: [1, 2, 3], sampleText: 'x'.repeat(10) } })])
-    expect(stored[0].evidence).toBeUndefined()
+  it('保留工具结果的关键字段，供历史消息回放', () => {
+    const stored = tracesForStorage([trace()])
     expect(stored[0].args).toEqual({ Username: '邓骏' })
     expect(stored[0].summary).toBe('{"rows":1}')
-  })
-})
-
-describe('hasMeaningfulArgs', () => {
-  it('零参数、空串、空对象都不算带了条件', () => {
-    expect(hasMeaningfulArgs({})).toBe(false)
-    expect(hasMeaningfulArgs(undefined)).toBe(false)
-    expect(hasMeaningfulArgs({ Username: '   ', startStr: '' })).toBe(false)
-    expect(hasMeaningfulArgs({ filter: {} })).toBe(false)
-  })
-  it('有任意非空值就算带了条件', () => {
-    expect(hasMeaningfulArgs({ Username: '邓骏' })).toBe(true)
-    expect(hasMeaningfulArgs({ pageNo: 1 })).toBe(true)
-    expect(hasMeaningfulArgs({ tags: ['加班'] })).toBe(true)
   })
 })

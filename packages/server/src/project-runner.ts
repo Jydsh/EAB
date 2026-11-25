@@ -12,17 +12,20 @@
  * - stdout/stderr 各保留 64 KB 尾部，完整输出交给批次层落盘；
  * - 支持后台任务，给 `npm install`、`dev server` 这类长命令用。
  *
- * 它不做文件隔离，enforcement 明确返回 `none`。共享部署要等后续接入
- * `workspace-write` 沙箱后端；不要把本地执行器当成安全边界。
+ * 默认 local 模式不做文件隔离，enforcement 明确返回 `none`，只适合可信开发机；
+ * strict 模式必须使用 Docker 或 bwrap，返回 `docker` / `bwrap` 与 `network: denied`，
+ * 没有可用后端直接拒绝执行，不降级。不要把 local 当成安全边界。
  */
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
-import { lstatSync, realpathSync, statSync } from 'node:fs'
-import { join } from 'node:path'
+import { existsSync, lstatSync, realpathSync, statSync } from 'node:fs'
+import { delimiter, join, relative } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { EC, EabError } from '@eab/domain'
 import { isWithinRoot, safeJoin } from '@eab/workspace'
 
-export type ProjectExecMode = 'off' | 'local'
+export type ProjectExecMode = 'off' | 'local' | 'strict'
+export type ProjectSandboxBackend = 'docker' | 'bwrap'
+export type ProjectNetworkPolicy = 'unrestricted' | 'denied'
 
 const DEFAULT_TIMEOUT_MS = 120_000
 const MAX_TIMEOUT_MS = 600_000
@@ -34,15 +37,29 @@ const MAX_JOBS_PER_USER = 8
 const JOB_TTL_MS = 30 * 60_000
 
 export function resolveProjectExecMode(env: NodeJS.ProcessEnv = process.env): ProjectExecMode {
-  const raw = (env.EAB_PROJECT_EXEC ?? '').trim().toLowerCase()
+  const raw = (env.EAB_PROJECT_EXEC ?? env.EAB_PROJECT_SANDBOX ?? '').trim().toLowerCase()
+  if (raw === 'strict' || raw === 'sandbox') return 'strict'
   return raw === '1' || raw === 'true' || raw === 'local' ? 'local' : 'off'
 }
 
 export function assertProjectExecEnabled(env: NodeJS.ProcessEnv = process.env): void {
-  if (resolveProjectExecMode(env) === 'local') return
+  const mode = resolveProjectExecMode(env)
+  if (mode === 'local') return
+  if (mode === 'strict') {
+    const capability = projectSandboxCapability(env)
+    if (capability.backend) return
+    throw new EabError(
+      EC.FORBIDDEN,
+      '项目命令 strict 模式没有可用的 OS 沙箱后端，已拒绝执行，不会降级为本地执行。',
+      {
+        details: { mode, backend: null, sandboxAvailable: false, reason: capability.detail },
+        hint: '安装 Docker 或 bubblewrap，或显式设置 EAB_PROJECT_SANDBOX_BACKEND=docker/bwrap；只在可信开发机使用 EAB_PROJECT_EXEC=local。',
+      },
+    )
+  }
   throw new EabError(
     EC.FORBIDDEN,
-    '项目命令执行未启用。请在服务进程设置 EAB_PROJECT_EXEC=1 后重启；当前为本地执行器，不做文件隔离，共享部署请等待沙箱后端接入。',
+    '项目命令执行未启用。请在服务进程设置 EAB_PROJECT_EXEC=1（本地）或 EAB_PROJECT_EXEC=strict（OS 沙箱）后重启。',
     { hint: 'EAB_PROJECT_EXEC=1 pnpm --filter @eab/server dev' },
   )
 }
@@ -73,7 +90,10 @@ export interface ProjectCommandResult {
   /** 完整输出，只给工具层落批次，不直接回给模型 */
   readonly fullOutput?: string
   readonly fullBytes?: number
-  readonly enforcement: 'none'
+  /** none=本地无隔离；docker/bwrap=OS 沙箱容器执行 */
+  readonly enforcement: 'none' | ProjectSandboxBackend
+  readonly sandboxMode: ProjectExecMode
+  readonly network: ProjectNetworkPolicy
 }
 
 export interface ProjectCommandHandle {
@@ -99,6 +119,9 @@ export interface ProjectCommandView {
   readonly stdout: string
   readonly stderr: string
   readonly truncated: boolean
+  readonly enforcement: 'none' | ProjectSandboxBackend
+  readonly sandboxMode: ProjectExecMode
+  readonly network: ProjectNetworkPolicy
 }
 
 interface ShellSpec {
@@ -170,6 +193,88 @@ function resolveShell(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): ShellS
   return { command: env.SHELL?.trim() || 'bash', args: ['-c'], windows: false }
 }
 
+export interface ProjectSandboxCapability {
+  readonly backend: ProjectSandboxBackend | null
+  readonly detail: string
+  readonly network: ProjectNetworkPolicy
+}
+
+function isCommandAvailable(name: string, env: NodeJS.ProcessEnv): boolean {
+  if (name.includes('/') || name.includes('\\')) return existsSync(name)
+  const path = env.PATH ?? env.Path ?? ''
+  const extensions =
+    process.platform === 'win32'
+      ? (env.PATHEXT ?? '.EXE;.CMD;.BAT;.COM').split(';').filter(Boolean)
+      : ['']
+  for (const entry of path.split(delimiter)) {
+    const dir = entry.trim().replace(/^"|"$/g, '')
+    if (!dir) continue
+    for (const extension of extensions) {
+      if (existsSync(join(dir, `${name}${extension}`))) return true
+    }
+  }
+  return false
+}
+
+/**
+ * OS 沙箱后端探测。
+ *
+ * 只探测“可执行文件是否存在”，Docker daemon 是否真在运行要到启动时才知道；
+ * strict 模式启动失败会直接报错，不会回落到本地执行。Windows 原生没有可用的
+ * 文件/网络隔离后端，默认只能是 local；Docker Desktop 装了以后才可用 docker。
+ */
+export function projectSandboxCapability(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): ProjectSandboxCapability {
+  const explicit = (env.EAB_PROJECT_SANDBOX_BACKEND ?? 'auto').trim().toLowerCase()
+  if (explicit === 'none') {
+    return {
+      backend: null,
+      detail: 'EAB_PROJECT_SANDBOX_BACKEND=none：管理员显式关闭了沙箱后端。',
+      network: 'unrestricted',
+    }
+  }
+  const order: ProjectSandboxBackend[] =
+    explicit === 'docker' || explicit === 'bwrap'
+      ? [explicit]
+      : platform === 'linux'
+        ? ['bwrap', 'docker']
+        : ['docker']
+  for (const backend of order) {
+    if (!isCommandAvailable(backend, env)) continue
+    return {
+      backend,
+      detail: `${backend} CLI 可用（只探测可执行文件，daemon / 命名空间是否真的可用要到启动时确认）；网络在沙箱内默认拒绝`,
+      network: 'denied',
+    }
+  }
+  return {
+    backend: null,
+    detail:
+      platform === 'win32'
+        ? 'Windows 原生没有可用的文件/网络隔离后端；可安装 Docker Desktop 后设置 EAB_PROJECT_SANDBOX_BACKEND=docker，或只在可信开发机使用 local。'
+        : '未找到 bwrap 或 docker CLI；strict 模式不会降级为本地执行。',
+    network: 'unrestricted',
+  }
+}
+
+/** 白名单按行分隔，每行一个正则；命令必须至少命中一条。 */
+export function parseProjectCommandAllowlist(raw: string | undefined): RegExp[] {
+  if (!raw) return []
+  const rules: RegExp[] = []
+  for (const line of raw.split(/\r?\n/)) {
+    const text = line.trim()
+    if (!text || text.startsWith('#')) continue
+    try {
+      rules.push(new RegExp(text, 'i'))
+    } catch {
+      throw new EabError(EC.VALIDATION, `EAB_PROJECT_COMMAND_ALLOWLIST 里的正则无效: ${text}`)
+    }
+  }
+  return rules
+}
+
 function sanitizeEnv(root: string, env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const clean: NodeJS.ProcessEnv = {}
   for (const [key, value] of Object.entries(env)) {
@@ -230,6 +335,220 @@ function normalizeCommand(command: string): string {
     throw new EabError(EC.VALIDATION, `command 太长，最多 ${MAX_COMMAND_CHARS} 字符`)
   }
   return text
+}
+
+export interface ProjectSandboxLaunch {
+  readonly shell: ShellSpec
+  readonly args: readonly string[]
+  readonly enforcement: 'none' | ProjectSandboxBackend
+  readonly network: ProjectNetworkPolicy
+  readonly mode: ProjectExecMode
+}
+
+const DEFAULT_DOCKER_IMAGE = 'node:22-bookworm-slim'
+const DEFAULT_SANDBOX_MEMORY = '2g'
+const DEFAULT_SANDBOX_CPUS = '2'
+const DEFAULT_SANDBOX_PIDS = '512'
+
+function safeDockerValue(name: string, value: string): string {
+  const text = value.trim()
+  if (!/^[a-zA-Z0-9._/:@+-]+$/.test(text) || text.startsWith('-')) {
+    throw new EabError(EC.VALIDATION, `${name} 含不允许的字符: ${value}`)
+  }
+  return text
+}
+
+function dockerLaunch(
+  root: string,
+  cwd: string,
+  command: string,
+  env: NodeJS.ProcessEnv,
+): ProjectSandboxLaunch {
+  const image = safeDockerValue('EAB_PROJECT_DOCKER_IMAGE', env.EAB_PROJECT_DOCKER_IMAGE || DEFAULT_DOCKER_IMAGE)
+  const memory = safeDockerValue('EAB_PROJECT_SANDBOX_MEMORY', env.EAB_PROJECT_SANDBOX_MEMORY || DEFAULT_SANDBOX_MEMORY)
+  const cpus = safeDockerValue('EAB_PROJECT_SANDBOX_CPUS', env.EAB_PROJECT_SANDBOX_CPUS || DEFAULT_SANDBOX_CPUS)
+  const pids = safeDockerValue('EAB_PROJECT_SANDBOX_PIDS', env.EAB_PROJECT_SANDBOX_PIDS || DEFAULT_SANDBOX_PIDS)
+  const relativeCwd = relative(root, cwd).replaceAll('\\', '/')
+  const containerCwd = relativeCwd ? `/workspace/${relativeCwd}` : '/workspace'
+  const args = [
+    'run',
+    '--rm',
+    '--init',
+    '--network',
+    'none',
+    '--cap-drop',
+    'ALL',
+    '--security-opt',
+    'no-new-privileges',
+    '--pids-limit',
+    pids,
+    '--memory',
+    memory,
+    '--cpus',
+    cpus,
+    '--read-only',
+    '--tmpfs',
+    '/tmp:rw,noexec,nosuid,size=256m',
+    '-e',
+    'HOME=/tmp',
+    '-e',
+    'XDG_CACHE_HOME=/tmp/.cache',
+    '-e',
+    'npm_config_cache=/tmp/.npm',
+    '-e',
+    'NO_COLOR=1',
+    '-v',
+    `${root}:/workspace:rw`,
+    '-w',
+    containerCwd,
+  ]
+  const user = (env.EAB_PROJECT_DOCKER_USER ?? '').trim()
+  if (user) args.push('--user', safeDockerValue('EAB_PROJECT_DOCKER_USER', user))
+  args.push(image, 'bash', '-lc', command)
+  return {
+    shell: { command: 'docker', args: [], windows: false },
+    args,
+    enforcement: 'docker',
+    network: 'denied',
+    mode: 'strict',
+  }
+}
+
+function bwrapLaunch(root: string, cwd: string, command: string): ProjectSandboxLaunch {
+  const binds = ['/usr', '/bin', '/lib', '/lib64', '/etc/ssl', '/etc/alternatives'].filter((path) =>
+    existsSync(path),
+  )
+  const args = [
+    '--die-with-parent',
+    '--new-session',
+    '--unshare-net',
+    '--unshare-pid',
+    '--unshare-ipc',
+    '--unshare-uts',
+  ]
+  for (const path of binds) args.push('--ro-bind', path, path)
+  args.push(
+    '--proc',
+    '/proc',
+    '--dev',
+    '/dev',
+    '--tmpfs',
+    '/tmp',
+    '--bind',
+    root,
+    root,
+    '--chdir',
+    cwd,
+    '--clearenv',
+    '--setenv',
+    'PATH',
+    '/usr/local/bin:/usr/bin:/bin',
+    '--setenv',
+    'HOME',
+    '/tmp',
+    '--setenv',
+    'NO_COLOR',
+    '1',
+    '--',
+    'bash',
+    '-lc',
+    command,
+  )
+  return {
+    shell: { command: 'bwrap', args: [], windows: false },
+    args,
+    enforcement: 'bwrap',
+    network: 'denied',
+    mode: 'strict',
+  }
+}
+
+export function projectSandboxLaunch(
+  root: string,
+  cwd: string,
+  command: string,
+  env: NodeJS.ProcessEnv = process.env,
+): ProjectSandboxLaunch {
+  const mode = resolveProjectExecMode(env)
+  const allowlist = parseProjectCommandAllowlist(env.EAB_PROJECT_COMMAND_ALLOWLIST)
+  assertProjectCommandAllowed(command, { mode, allowlist })
+  if (mode === 'strict') {
+    const capability = projectSandboxCapability(env)
+    if (!capability.backend) {
+      throw new EabError(EC.FORBIDDEN, `strict 模式没有可用 OS 沙箱后端：${capability.detail}`, {
+        details: { mode, guard: 'sandbox-required', backend: null },
+        hint: '设置 EAB_PROJECT_SANDBOX_BACKEND=docker 或 bwrap，并确认 CLI 可用；strict 不会回落本地执行。',
+      })
+    }
+    return capability.backend === 'docker'
+      ? dockerLaunch(root, cwd, command, env)
+      : bwrapLaunch(root, cwd, command)
+  }
+  const shell = resolveShell(env, process.platform)
+  const argvCommand = shell.windows ? winExitWrapper(command) : command
+  return {
+    shell,
+    args: [...shell.args, argvCommand],
+    enforcement: 'none',
+    network: 'unrestricted',
+    mode,
+  }
+}
+
+/**
+ * 命令级危险模式拦截（AGT-05）。
+ *
+ * 这是“防模型手滑”的黑名单，不是安全边界：它拦不住已获准命令里的任意脚本，
+ * 也拦不住绝对路径写入。真正的文件隔离、网络限制和权限降级留给 AGT-05b 的
+ * OS 沙箱后端；这里先把格式化磁盘、关机、批量删除系统目录、下载即执行这类
+ * 一眼致命的动作挡在启动之前。
+ */
+const DANGEROUS_COMMAND_PATTERNS: ReadonlyArray<{ readonly re: RegExp; readonly reason: string }> = [
+  { re: /\bformat(?:\.com)?\s+(?:[a-z]:|\/dev\/)/i, reason: '禁止格式化磁盘分区' },
+  { re: /\bdiskpart\b/i, reason: '禁止直接操作磁盘分区表' },
+  { re: /\bbcdedit\b/i, reason: '禁止修改启动配置' },
+  { re: /\b(?:clear|format|initialize|remove|set)-disk\b/i, reason: '禁止直接操作物理磁盘' },
+  { re: /\b(?:remove|clear)-partition\b/i, reason: '禁止删除分区' },
+  { re: /\b(?:shutdown|restart-computer|stop-computer)\b/i, reason: '禁止关机或重启主机' },
+  { re: /\b(?:vssadmin|wbadmin)\b.*\bdelete\b/i, reason: '禁止删除系统备份/卷影副本' },
+  { re: /\b(?:mkfs(?:\.\w+)?|dd\s+if=.*of=\/dev\/)/i, reason: '禁止向块设备写入数据' },
+  { re: /\brm\s+-(?:[a-z]*r[a-z]*f|[a-z]*f[a-z]*r)\s+(?:\/|~|\$HOME)(?:\s|$)/i, reason: '禁止递归删除根目录或家目录' },
+  { re: /\b(?:del|erase)\s+(?:\/f\s+)?(?:\/s\s+)?(?:[a-z]:\\|\/)(?:\s|$)/i, reason: '禁止批量删除盘根目录' },
+  { re: /\bremove-item\b.*(?:[a-z]:\\|[a-z]:\/|system32|\\windows)(?:\s|$)/i, reason: '禁止递归删除系统路径' },
+  { re: /\b(?:rd|rmdir)\s+\/s\s+\/q\s+(?:[a-z]:\\|\/)(?:\s|$)/i, reason: '禁止批量删除盘根目录' },
+  { re: /\breg\s+(?:add|delete)\s+(?:hklm|hkey_local_machine)/i, reason: '禁止修改 HKLM 注册表' },
+  { re: /\b(?:net\s+user|net\s+localgroup)\b.*(?:\/add|\/delete|\/domain)/i, reason: '禁止修改本机账户或管理员组' },
+  { re: /\b(?:runas|sudo)\b/i, reason: '禁止在项目命令里提权执行' },
+  { re: /\b(?:takeown|icacls)\b.*(?:[a-z]:\\|system32)/i, reason: '禁止修改系统目录所有权/ACL' },
+  { re: /\b(?:invoke-expression|iex)\b/i, reason: '禁止动态执行下载内容' },
+  { re: /\b(?:iwr|invoke-webrequest|curl|wget)\b.*\|\s*(?:iex|invoke-expression|bash|sh)\b/i, reason: '禁止下载后直接执行' },
+  { re: /:\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/, reason: '禁止 fork bomb' },
+]
+
+export function assertProjectCommandAllowed(
+  command: string,
+  options: { readonly mode?: ProjectExecMode; readonly allowlist?: readonly RegExp[] } = {},
+): void {
+  for (const pattern of DANGEROUS_COMMAND_PATTERNS) {
+    if (!pattern.re.test(command)) continue
+    throw new EabError(EC.FORBIDDEN, `项目命令被安全策略拦截：${pattern.reason}`, {
+      details: { reason: pattern.reason, guard: 'command-denylist-v1' },
+      hint: '确实需要这类操作时，请由管理员在受控终端执行，不要交给 Agent。',
+    })
+  }
+  const allowlist = options.allowlist ?? []
+  if (allowlist.length > 0 && !allowlist.some((rule) => rule.test(command))) {
+    throw new EabError(EC.FORBIDDEN, '项目命令不在管理员配置的白名单里，已拒绝执行。', {
+      details: { guard: 'command-allowlist-v1', allowlistRules: allowlist.length },
+      hint: '需要执行时，请管理员把匹配命令的正则追加到 EAB_PROJECT_COMMAND_ALLOWLIST（每行一条）。',
+    })
+  }
+  if (options.mode === 'strict' && allowlist.length === 0) {
+    throw new EabError(EC.FORBIDDEN, 'strict 模式必须先配置命令白名单，不能执行任意命令。', {
+      details: { guard: 'command-allowlist-required' },
+      hint: '设置 EAB_PROJECT_COMMAND_ALLOWLIST，每行一条正则，例如 ^pnpm\\s+(test|typecheck|build)$。',
+    })
+  }
 }
 
 class BoundedBuffer {
@@ -343,8 +662,7 @@ export function spawnProjectCommand(input: ProjectCommandInput, options: { backg
   const cwd = resolveCwd(root, input.cwd)
   const command = normalizeCommand(input.command)
   const timeoutMs = clampTimeout(input.timeoutMs)
-  const shell = resolveShell(process.env, process.platform)
-  const argvCommand = shell.windows ? winExitWrapper(command) : command
+  const launch = projectSandboxLaunch(root, cwd, command, process.env)
   const startedAt = Date.now()
 
   const stdout = new BoundedBuffer(MAX_OUTPUT_BYTES, true, MAX_SPILL_BYTES)
@@ -389,6 +707,9 @@ export function spawnProjectCommand(input: ProjectCommandInput, options: { backg
       stdout: stdout.text(),
       stderr: stderr.text(),
       truncated: stdout.truncated || stderr.truncated,
+      enforcement: launch.enforcement,
+      sandboxMode: launch.mode,
+      network: launch.network,
     }
   }
 
@@ -415,7 +736,7 @@ export function spawnProjectCommand(input: ProjectCommandInput, options: { backg
   }
 
   try {
-    child = spawn(shell.command, [...shell.args, argvCommand], {
+    child = spawn(launch.shell.command, launch.args, {
       cwd,
       env: sanitizeEnv(root, process.env),
       windowsHide: true,
@@ -435,7 +756,9 @@ export function spawnProjectCommand(input: ProjectCommandInput, options: { backg
       stdout: '',
       stderr: '',
       truncated: false,
-      enforcement: 'none',
+      enforcement: launch.enforcement,
+      sandboxMode: launch.mode,
+      network: launch.network,
     })
     throw new EabError(EC.INTERNAL, `启动命令失败: ${error instanceof Error ? error.message : String(error)}`)
   }
@@ -473,7 +796,9 @@ export function spawnProjectCommand(input: ProjectCommandInput, options: { backg
       truncated: stdout.truncated || stderr.truncated,
       fullOutput,
       fullBytes: stdout.total + stderr.total,
-      enforcement: 'none',
+      enforcement: launch.enforcement,
+      sandboxMode: launch.mode,
+      network: launch.network,
     })
   }
 

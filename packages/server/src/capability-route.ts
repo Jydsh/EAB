@@ -27,6 +27,8 @@ export interface CapabilityRoute {
   browser: boolean
   /** 形成可复用的团队规则 */
   memoryRule: boolean
+  /** 按文字生成图片（独立内容工具，不进入对话主链路） */
+  content: boolean
 }
 
 export interface CapabilityRouteOptions {
@@ -64,6 +66,8 @@ const BROWSER_TEXT =
   /(内置浏览器|浏览器|网页截图|页面截图|页面快照|网页快照|动态网页|需要渲染|渲染后|打开[^。；;]{0,6}(?:页面|网页|链接)|点击[^。；;]{0,6}(?:页面|网页|链接|按钮)|点开[^。；;]{0,6}(?:页面|网页|链接|按钮)|登录后(?:页面|网页)|browser|screenshot|snapshot)/i
 const MEMORY_RULE_TEXT =
   /(以后|今后|从今以后|统一|始终|一律|都按|记住|规则|标准|规范)|(?:不要|别再)[^。；;]{0,12}(?:再|以后|下次|每次|都|统一|一律)/i
+const CONTENT_TEXT =
+  /(画图|画一张|画个|画一幅|帮我画|生成图片|生成一张|生成一幅|配图|插画|插图|海报|封面图|头像|贴纸|文生图|image generation|generate image|draw (?:a|an|me)|illustration)/i
 const BUSINESS_TEXT =
   /(检查|整治|台账|记录|录入|统计|数量|几条|多少条|明细|报表|工单|数据|接口|汇总|填报)/i
 
@@ -190,6 +194,7 @@ export function routeCapabilities(
     web: WEB_TEXT.test(text),
     browser: BROWSER_TEXT.test(text),
     memoryRule: MEMORY_RULE_TEXT.test(text),
+    content: CONTENT_TEXT.test(text),
   }
 }
 
@@ -227,4 +232,5 @@ export const CAPABILITY_TOOL_GROUPS = {
   web: ['web.search', 'web.fetch'],
   browser: ['browser'],
   memoryRule: ['memory.propose'],
+  content: ['content.generate_image'],
 } as const

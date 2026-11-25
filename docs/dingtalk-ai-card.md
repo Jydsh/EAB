@@ -77,6 +77,59 @@ string，且收起时不渲染 children；把预览放在面板外又会变成�
 `thinkingHeader` / `toolHeader` 是唯一的收起态入口；`thinkingBody` / `toolBody`
 只有在对应的 `/ui/*Expanded` 为 true 时才渲染。
 
+## 图表映射与协议边界
+
+钉钉公开图表协议只有 `lineChart` / `histogram` / `pieChart` 三种，A2UI `Chart`
+组件消费的也是这同一套变量（官方协议见
+<https://open.dingtalk.com/document/development/chart-variable>）。EAB 的图表清单以
+`packages/domain/src/chart-catalog.ts` 为唯一数据源。**渠道能力分开计算，不能把
+“协议里有类型”当成“原图能正常显示”**：
+
+- **网页对话 17 种**：`pie`、`doughnut`、`bar`、`horizontalBar`、`line`、
+  `area`、`scatter`、`radar`、`polarArea`、`bubble`、`stackedBar`、
+  `groupedBar`、`rose`、`gauge`、`funnel`、`heatmap`、`waterfall`；
+  每种都有独立 SVG renderer。
+- **钉钉消息 7 种**：只保留 `dingtalk.fidelity=native` 且能保持原形的类型。
+  清单外的类型不再画近似图，卡片正文会提示“请到网页端查看”。
+
+| 钉钉可用图表 | 钉钉类型 | 映射方式 |
+|---|---|---|
+| `pie` | `pieChart` | 原生饼图，超过 6 项合并“其他” |
+| `bar` | `histogram` | 原生纵向柱 |
+| `horizontalBar` | `histogram` + `rotate:true` | 原生柱旋转成横向 |
+| `line` | `lineChart` | 原生折线；双轴拆成左/右两张 |
+| `scatter` | `lineChart` + `lineShape:'dot'` | 只画点不连线，和散点同形 |
+| `stackedBar` | `histogram` + `stack:true` | 原生堆叠柱 |
+| `groupedBar` | `histogram` | 多系列 `type` 原生分组 |
+
+以下 10 种只在网页端提供，不在钉钉端宣称可用：`doughnut`（无环形挖空）、
+`area`（无面积填充）、`radar`（无雷达几何）、`polarArea`、`bubble`（无气泡
+大小维度）、`rose`、`gauge`、`funnel`、`heatmap`、`waterfall`。此前把它们
+降级成饼图/柱图会在客户端变成“另一种图”，看起来像显示成功，实际是错误信息，
+因此按真实能力收紧。
+
+**块数预算也要优先保图表**：A2UI 正文只有 24 个块槽位。超预算时，文字和表格
+可以合并压缩，图表不能被压成“图表已省略”或清空 `chart` 引用；实现会先给每张
+图表留槽，再压缩其余正文。
+
+**2026-11-25 验收记录**：网页真实会话单轮输出 17 种图表，页面实际出现 17 个
+`.answer-chart`（每个都有 SVG，无“图表生成中”残留）；钉钉单聊发送“7 种原生
+图表自检卡”（`cardId=eab_a2ui_136dc5c277c14631aeb64c1f5dac76da`），卡片创建
+与收口成功，7 个图表块都在 24 块预算内。`GET /api/charts/catalog?channel=web`
+返回 17，`channel=dingtalk` 返回 7；全量 252 个测试文件 / 1570 个用例通过。
+
+### Agent 如何知道有哪些图表
+
+- `chartCatalogPrompt(channel)` 按渠道生成数据回合清单；`chartCatalogSummary(channel)`
+  给非数据回合一行摘要。网页 chat 传 `web`，钉钉 bot 传 `dingtalk`。
+- `GET /api/charts/catalog?channel=web|dingtalk` 返回对应渠道清单和 `total`；
+  不传 `channel` 默认网页全量。
+- 新增图表时：先在目录加一条 `enabled=true` 并设置真实 `dingtalk.fidelity`；
+  只有 `native` 才会进入钉钉清单。Agent 提示词、数量、API 会自动同步。
+- 测试 `packages/domain/test/chart-catalog.test.ts` 校验 17 种、7 种钉钉子集与
+  渠道提示词；`packages/server/test/chart-catalog.test.ts` 校验目录示例在网页
+  渲染结构、钉钉原生映射，以及降级类型在 `nativeOnly` 下被拒绝。
+
 ## 点击回调与展开态
 
 `Text.onLinkClick` 是基础协议里的 `Action`，钉钉当前实现为“点击 `Text` 节点任意
@@ -176,15 +229,35 @@ string，且收起时不渲染 children；把预览放在面板外又会变成�
 | 阶段 | 接口 | `flowStatus` | 动作 |
 |---|---|---|---|
 | 创建 | `POST /v1.0/card/ai/instances/createAndDeliver` | `PROCESSING` | 首帧即带单行头部与显隐正文 |
-| 流式刷新 | `PUT /v1.0/card/ai/instances/update` | `PROCESSING` | 更新正文/头部/工具链路数据 |
-| 思考结束 | `PUT /v1.0/card/ai/instances/update` | `PROCESSING` | 重发 `thinkingHeader`，切 `已思考 X.Xs` 并移除 shimmer |
-| 工具状态变化 | `PUT /v1.0/card/ai/instances/update` | `PROCESSING` | 重发 `toolHeader`，在 `工具调用中` / `工具` 间切换 |
+| 流式刷新 | `PUT /v1.0/card/ai/instances/update` | `INPUTTING` | 更新正文/头部/工具链路数据 |
+| 思考结束 | `PUT /v1.0/card/ai/instances/update` | `INPUTTING` | 重发 `thinkingHeader`，切 `已思考 X.Xs` 并移除 shimmer |
+| 工具状态变化 | `PUT /v1.0/card/ai/instances/update` | `INPUTTING` | 重发 `toolHeader`，在 `工具调用中` / `工具` 间切换 |
+| 澄清卡更新 / 收口 | `PUT /v1.0/card/ai/instances/update` | `CONFIRMING` | 写澄清题组并停住，等待用户点击同卡续用 |
 | 用户点开面板 | `PUT /v1.0/card/ai/instances/update` | `FINISH` | 只更新 `/ui/thinkingExpanded` 或 `/ui/toolsExpanded` |
 | 完成 | `PUT /v1.0/card/ai/instances/update` | `FINISH` | 更新正文 + 重发头部组件 |
 | 失败 | `PUT /v1.0/card/ai/instances/update` | `FAILED` / `ERROR`（代码按候选尝试） | 显示失败正文 |
 
 `flowStatus` 用枚举名，不要用旧模板卡的数字码（旧模板是 `2/3/5`）。
 官方 JSON 卡文档的完成枚举名是 `FINISH`，不是 `FINISHED`。
+
+**不要在活跃态一次发多条 `a2uiMessages`**。真机验证：卡片创建后用 `INPUTTING`
+或 `CONFIRMING` 更新时，`a2uiMessages` 只接受 **1 条**；同一次请求放 2 条（哪怕
+只有 2 个极短字符串）会稳定返回 `400 param.invalid`。终态 `FINISH` 不受这个限制，
+可以整包多条。
+
+因此 EAB 的活跃帧会把答案、思考、工具、UI 显隐等字段拆成多次 update，每次只带
+1 条消息、各自使用新的 `outUpdateId`。字段数超过 12 时先压成整包数据
+（答案/思考/工具/UI/附件/澄清六类），避免 100 条澄清字段变成 100 次请求。
+单条字段被 400 拒绝时只跳过该字段，其余字段继续刷新；网络错误或 5xx 仍按整帧
+失败退避重试。
+
+2026-11-24 真机验收：一条带柱状图、双轴柱状图的钉钉回合，同一张卡片的
+`/answer` 从 14 字逐帧增长到 940 字（20 次活跃刷新，每次 1 条消息），
+收口后正文 959 字并保留 2 个 `chart` 块，全部 update 返回 200。
+
+`flowStatus` 仍用枚举名，旧模板卡的数字码（`2/3/5`）不适用。完成态是 `FINISH`，
+不是 `FINISHED`。创建用 `PROCESSING`，内容产出用 `INPUTTING`；不要把已经完成的
+卡片再用 `INPUTTING` 拉回活跃态，真机会返回 `param.invalid`。
 
 流式刷新只在头部流光/澄清结构真的变化时重发对应组件；纯 token 更新只写数据路径，
 避免把正在播放的 shimmer 打断。UI 字段逐项更新，不整份下发 `/ui`，避免把用户

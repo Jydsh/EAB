@@ -234,8 +234,13 @@ describe('A2A 注册表与出站派遣', () => {
     expect(result.artifacts[0]).toMatchObject({
       source: 'a2a',
       name: '行程单',
+      mimeType: 'application/pdf',
+      size: 0,
       uri: 'https://example.com/itinerary.pdf',
     })
+    expect(result.artifacts[0].checksum).toMatch(/^ref-sha256:/)
+    expect(result.artifacts[0].preview).toContain('application/pdf')
+    expect(result.artifacts[0].preview).toContain('有下载地址')
     const task = listA2ATasks(fixture.db, 'c1')[0]
     expect(task).toMatchObject({ state: 'completed', traceId: 'trace-1', skillId: 'travel.plan' })
     const sent = fixture.received.find((item) => item.method === 'message/send')

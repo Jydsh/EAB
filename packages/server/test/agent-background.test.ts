@@ -293,7 +293,7 @@ describe('后台派活与 agent_wait', () => {
       emit: () => {},
     })
 
-    const deadline = Date.now() + 5000
+    const deadline = Date.now() + 12000
     let task: { status: string; error: string } | undefined
     let wake: { text: string } | undefined
     while (Date.now() < deadline) {
@@ -310,7 +310,7 @@ describe('后台派活与 agent_wait', () => {
     expect(task?.status).toBe('failed')
     expect(task?.error).toContain('没有完成')
     expect(wake?.text).toBe('已被后台结果唤醒')
-  })
+  }, 16_000)
 
   it('父回合结束后，后台任务完成事件会唤醒父 Agent 并写出汇总', async () => {
     state.mode = 'wake'

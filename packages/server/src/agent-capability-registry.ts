@@ -7,6 +7,7 @@
  * - 运行时子 Agent 的卡按岗位和团队现场生成，不落库。
  */
 import type { Db } from '@eab/storage'
+import type { TaskBudget } from './agent-protocol.js'
 
 export type AgentCardKind = 'builtin' | 'runtime' | 'a2a'
 export type AgentCardHealth = 'healthy' | 'degraded' | 'offline' | 'unknown'
@@ -60,6 +61,10 @@ const KINDS = new Set<AgentCardKind>(['builtin', 'runtime', 'a2a'])
 /** 岗位顺序也是无技能命中时的默认优先级：检索 → 实现 → 验收 → 内容 → 通用。 */
 export const AGENT_ROLE_PRIORITY: readonly string[] = ['researcher', 'builder', 'critic', 'producer', 'worker']
 
+/**
+ * 岗位卡的 tools 是运行时硬 allowlist，不再只是给模型看的摘要。
+ * 每个岗位都必须显式登记协作工具和验证工具，避免“卡外能力”被 tool_search 重新捞回来。
+ */
 const BUILTIN_CARDS: readonly AgentCard[] = [
   {
     id: 'builtin:researcher',
@@ -69,8 +74,8 @@ const BUILTIN_CARDS: readonly AgentCard[] = [
     version: '1',
     description: '负责资料检索、知识库核对、网页取证和竞品对比。',
     skills: ['资料检索', '知识库', '网页搜索', '竞品对比'],
-    tools: ['tool.search', 'kb.search', 'web.search', 'web.fetch', 'workspace.read'],
-    limits: { maxRounds: 12, timeoutMs: 180_000 },
+    tools: ['tool.search', 'kb.search', 'web.search', 'web.fetch', 'workspace.list', 'workspace.read', 'workspace.search', 'agent.ask_parent', 'agent.publish_artifact'],
+    limits: { maxRounds: 40, timeoutMs: 300_000, maxTokens: 120_000 },
     endpoint: { kind: 'internal' },
     health: 'healthy',
     enabled: true,
@@ -84,8 +89,11 @@ const BUILTIN_CARDS: readonly AgentCard[] = [
     version: '1',
     description: '负责代码实现、文件写入、工程构建和接口联调。',
     skills: ['代码实现', '文件写入', '工程构建', '接口联调'],
-    tools: ['workspace.read', 'workspace.write', 'workspace.edit', 'project.exec', 'project.job', 'office.read_outline'],
-    limits: { maxRounds: 24, timeoutMs: 600_000 },
+    tools: [
+      'workspace.list', 'workspace.read', 'workspace.search', 'workspace.write', 'workspace.edit', 'project.exec', 'project.job',
+      'office.read_outline', 'agent.ask_parent', 'agent.publish_artifact',
+    ],
+    limits: { maxRounds: 120, timeoutMs: 1_800_000, maxTokens: 400_000 },
     endpoint: { kind: 'internal' },
     health: 'healthy',
     enabled: true,
@@ -99,8 +107,8 @@ const BUILTIN_CARDS: readonly AgentCard[] = [
     version: '1',
     description: '负责测试、构建验证、代码审查和回归，不代替实现员写代码。',
     skills: ['测试', '构建验证', '代码审查', '回归'],
-    tools: ['workspace.read', 'project.exec', 'project.job', 'office.read_outline'],
-    limits: { maxRounds: 16, timeoutMs: 300_000 },
+    tools: ['workspace.list', 'workspace.read', 'workspace.search', 'project.exec', 'project.job', 'office.read_outline', 'review.verdict'],
+    limits: { maxRounds: 30, timeoutMs: 300_000, maxTokens: 150_000 },
     endpoint: { kind: 'internal' },
     health: 'healthy',
     enabled: true,
@@ -114,8 +122,11 @@ const BUILTIN_CARDS: readonly AgentCard[] = [
     version: '1',
     description: '负责文档、表格、PPT 和汇总类交付。',
     skills: ['文档', '表格', 'PPT', '汇总'],
-    tools: ['office.read_outline', 'office.find', 'office.replace', 'office.rewrite', 'workspace.read', 'workspace.write'],
-    limits: { maxRounds: 12, timeoutMs: 180_000 },
+    tools: [
+      'office.read_outline', 'office.find', 'office.replace', 'office.rewrite',
+      'workspace.list', 'workspace.read', 'workspace.search', 'workspace.write', 'agent.ask_parent', 'agent.publish_artifact',
+    ],
+    limits: { maxRounds: 60, timeoutMs: 1_200_000, maxTokens: 200_000 },
     endpoint: { kind: 'internal' },
     health: 'healthy',
     enabled: true,
@@ -127,10 +138,14 @@ const BUILTIN_CARDS: readonly AgentCard[] = [
     kind: 'builtin',
     name: '通用执行',
     version: '1',
-    description: '负责单点任务和补充材料，工具按任务动态下发。',
+    description: '负责单点任务和补充材料；需要写文件、跑命令时也走这条通用执行岗位。',
     skills: ['单点任务', '补充材料', '通用执行'],
-    tools: ['tool.search', 'workspace.read'],
-    limits: { maxRounds: 12, timeoutMs: 180_000 },
+    tools: [
+      'tool.search', 'workspace.list', 'workspace.read', 'workspace.search', 'workspace.write', 'workspace.edit',
+      'project.exec', 'project.job', 'office.read_outline', 'office.find', 'office.replace', 'office.rewrite',
+      'agent.ask_parent', 'agent.publish_artifact',
+    ],
+    limits: { maxRounds: 80, timeoutMs: 1_200_000, maxTokens: 200_000 },
     endpoint: { kind: 'internal' },
     health: 'healthy',
     enabled: true,
@@ -277,9 +292,9 @@ export function agentCardBrief(cards: AgentCard[] = builtinAgentCards()): string
     return `- ${card.agentKey}（${card.name}）：${card.skills.join('、')}｜工具 ${tools}${more}`
   })
   return [
-    '【可用岗位能力卡｜编队参考，不是完整工具清单】',
+    '【可用岗位能力卡｜工具为运行时硬白名单，这里只展示前 6 个】',
     ...lines,
-    '按技能匹配优先选岗；工具只作参考，实际执行仍按角色、空间和权限过滤。offline 或已停用的岗位不要派。',
+    '按技能匹配优先选岗；卡外工具不会下发给该岗位，也不能通过 tool_search 重新加载。offline 或已停用的岗位不要派。',
   ].join('\n')
 }
 
@@ -316,5 +331,59 @@ export function runtimeAgentCard(input: RuntimeAgentCardInput): AgentCard {
     health: status === 'retired' ? 'offline' : 'healthy',
     enabled: status !== 'retired',
     source: 'builtin',
+  }
+}
+
+export interface AgentTaskPolicy {
+  role: string
+  card: AgentCard
+  /** 运行时硬 allowlist：不在集合内的工具不会出现在模型工具表里，也不能被 tool_search 重新加载。 */
+  toolIds: string[]
+  /** 岗位默认预算与任务显式预算合并后的硬限制。 */
+  budget: TaskBudget
+  /** 有 maxDurationMs 时才给出绝对截止时间，便于任务行和子 Agent 超时共用同一时刻。 */
+  deadlineAt?: number
+}
+
+/**
+ * 把一个岗位解析成可执行策略。
+ *
+ * 岗位卡的工具清单是唯一来源：这里不做“协议工具偷偷放行”，
+ * 需要提问/登记产物的岗位必须自己在卡里登记 agent.ask_parent、agent.publish_artifact。
+ */
+export function resolveAgentTaskPolicy(
+  cards: AgentCard[],
+  role: string | undefined,
+  requestedBudget?: TaskBudget,
+  now: number = Date.now(),
+): AgentTaskPolicy {
+  const agentKey = String(role ?? '').trim() || 'worker'
+  const card = cards.find((item) => item.kind !== 'a2a' && item.agentKey === agentKey)
+  if (!card) throw new Error(`岗位 ${agentKey} 没有登记能力卡，不能派活`)
+  if (!card.enabled || card.health === 'offline') {
+    throw new Error(`岗位 ${agentKey}（${card.name}）当前不可用，不能派活`)
+  }
+  const toolIds = [...new Set(card.tools.map((id) => String(id ?? '').trim()).filter(Boolean))]
+  if (toolIds.length === 0) throw new Error(`岗位 ${agentKey}（${card.name}）没有登记任何工具，不能派活`)
+  // 任务显式预算只能收紧岗位卡，不能把上限调大；这是硬预算而不是建议值。
+  const tighter = (cardLimit?: number, requested?: number): number | undefined => {
+    if (cardLimit === undefined) return requested
+    if (requested === undefined) return cardLimit
+    return Math.min(cardLimit, requested)
+  }
+  const maxTokens = tighter(card.limits.maxTokens, requestedBudget?.maxTokens)
+  const maxDurationMs = tighter(card.limits.timeoutMs, requestedBudget?.maxDurationMs)
+  const maxRounds = tighter(card.limits.maxRounds, requestedBudget?.maxRounds)
+  const budget: TaskBudget = {}
+  if (maxTokens !== undefined) budget.maxTokens = maxTokens
+  if (maxDurationMs !== undefined) budget.maxDurationMs = maxDurationMs
+  if (maxRounds !== undefined) budget.maxRounds = maxRounds
+  if (requestedBudget?.maxCostMicros !== undefined) budget.maxCostMicros = requestedBudget.maxCostMicros
+  return {
+    role: agentKey,
+    card,
+    toolIds,
+    budget,
+    deadlineAt: maxDurationMs === undefined ? undefined : now + maxDurationMs,
   }
 }

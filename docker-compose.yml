@@ -1,0 +1,122 @@
+# AGT-17：一条命令起 EAB。
+#
+# 拓扑：
+#   nginx   ← 唯一对外入口（8787 员工 / 8788 控制台）
+#   api×N   ← 无状态 HTTP，可 `--scale api=N` 水平扩
+#   worker  ← 单例后台任务：队列消费、定时任务、组织同步、渠道长连接、任务图等待恢复
+#   redis   ← 跨实例唤醒 + 频控；Redis 不可用时自动降级为数据库租约
+#
+# 数据：SQLite 主库与云空间都落在 eab-data 卷；只支持同一台 Docker 主机上的多容器。
+# 跨主机水平扩必须先切 PostgreSQL 主存储，本版不承诺。
+
+services:
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes", "--save", ""]
+    restart: unless-stopped
+    volumes:
+      - eab-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  api:
+    image: eab:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      EAB_HOME: /data
+      EAB_HOST: 0.0.0.0
+      EAB_PORT: "8787"
+      EAB_ADMIN_PORT: "8788"
+      EAB_COMPANY_ID: ${EAB_COMPANY_ID:-c1}
+      EAB_MULTI_INSTANCE: "1"
+      EAB_SERVER_ROLE: api
+      EAB_CONSOLE_ALLOW_REMOTE: "1"
+      EAB_CONSOLE_TOKEN: ${EAB_CONSOLE_TOKEN:?请在 .env 配置 EAB_CONSOLE_TOKEN}
+      EAB_ADMIN_USER: ${EAB_ADMIN_USER:-admin}
+      EAB_ADMIN_PASSWORD: ${EAB_ADMIN_PASSWORD:-}
+      EAB_BACKENDS_FROM_ENV: "1"
+      EAB_CACHE: redis
+      EAB_REDIS_URL: redis://redis:6379
+      EAB_REDIS_PREFIX: "eab:"
+      EAB_LOG_LEVEL: ${EAB_LOG_LEVEL:-warn}
+    volumes:
+      - eab-data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    expose:
+      - "8787"
+      - "8788"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8787/readyz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+
+  worker:
+    image: eab:local
+    restart: unless-stopped
+    environment:
+      EAB_HOME: /data
+      EAB_HOST: 0.0.0.0
+      EAB_PORT: "8787"
+      EAB_ADMIN_PORT: "8788"
+      EAB_COMPANY_ID: ${EAB_COMPANY_ID:-c1}
+      EAB_MULTI_INSTANCE: "1"
+      EAB_SERVER_ROLE: worker
+      EAB_CONSOLE_ALLOW_REMOTE: "1"
+      EAB_CONSOLE_TOKEN: ${EAB_CONSOLE_TOKEN:?请在 .env 配置 EAB_CONSOLE_TOKEN}
+      EAB_ADMIN_USER: ${EAB_ADMIN_USER:-admin}
+      EAB_ADMIN_PASSWORD: ${EAB_ADMIN_PASSWORD:-}
+      EAB_BACKENDS_FROM_ENV: "1"
+      EAB_CACHE: redis
+      EAB_REDIS_URL: redis://redis:6379
+      EAB_REDIS_PREFIX: "eab:"
+      EAB_LOG_LEVEL: ${EAB_LOG_LEVEL:-warn}
+    volumes:
+      - eab-data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    expose:
+      - "8787"
+      - "8788"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8787/readyz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${EAB_PUBLIC_PORT:-8787}:80"
+      - "${EAB_PUBLIC_ADMIN_PORT:-8788}:81"
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/nginx.conf:ro
+
+volumes:
+  eab-data:
+  eab-redis:

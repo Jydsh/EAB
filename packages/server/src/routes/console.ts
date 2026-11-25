@@ -13,7 +13,7 @@ import { ALL_SCOPES, EC, EabError, SCOPE_REGISTRY, isKnownScope } from '@eab/dom
 import { appendAudit } from '@eab/storage'
 import type { ServerDeps } from '../deps.js'
 import { ok } from '../http.js'
-import { resolveActor, CONSOLE_OPERATOR_ID } from '../session.js'
+import { resolveActor, CONSOLE_OPERATOR_ID, consoleActor, findActivePerson, actorFor, type RequestActor } from '../session.js'
 import { getDocAsset, listDocAssetSummaries } from '../kb-assets.js'
 import { effectiveNetwork } from '../network-settings.js'
 import { resolveSecret, secretConfigured, storeSecret } from '../secrets.js'
@@ -25,7 +25,7 @@ import {
 import { applyOrgSync, fetchChannelOrg, fetchDingTalkTenant, mapRemoteOrg, pollFeishuScanNative, pollWecomScan, startFeishuScanNative, startWecomScan, verifyFeishuApp } from '@eab/channel'
 import { resolveOrgSyncIntervalMs, syncChannelOrg, type ChannelProvider } from '../org-sync-scheduler.js'
 import { dispatchPluginRpc } from '../plugin-host.js'
-import { hitRate } from '../backends/coordination.js'
+import { hitRate, runAsLeader } from '../backends/coordination.js'
 import { bumpHotVersion } from '../hot-cache.js'
 import {
   decidePermissionRequest,
@@ -45,6 +45,26 @@ import {
   saveApprovalWorkflow,
   validateWorkflowFlow,
 } from '../approval-workflows.js'
+import {
+  cancelTaskGraphRun,
+  createTaskGraphRun,
+  decideTaskGraphManual,
+  deleteTaskGraph,
+  getTaskGraph,
+  getTaskGraphRun,
+  getTaskGraphRunByTrace,
+  listTaskGraphRuns,
+  listTaskGraphs,
+  publishTaskGraph,
+  recoverStaleTaskGraphRuns,
+  resumeDueTaskGraphRuns,
+  runTaskGraphRun,
+  saveTaskGraph,
+  validateTaskGraph,
+  type TaskGraphExecutor,
+} from '../task-graph.js'
+import { executeTool } from './tools.js'
+import { runAgentTurn } from './chat.js'
 import { publishChatEvent } from '../chat-events.js'
 import { listPluginChannels, listAllPluginModels, listPluginModels } from '../plugin-models.js'
 import { invalidatePluginToolSpecsEverywhere, pluginToolCatalogFor } from '../plugin-tools.js'
@@ -295,6 +315,67 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
   startKbPipelineWorker(deps.db, { dbPath: deps.config.dbPath, dataDir: deps.config.dataDir })
   // 召回测试记录按过期时间清理，和入库 worker 一样与进程同生命周期。
   startKbTestRetentionWorker(deps.db)
+
+  const taskGraphActorForRun = (companyId: string, userId: string): RequestActor => {
+    if (userId === CONSOLE_OPERATOR_ID) return consoleActor(deps.db, companyId)
+    const person = findActivePerson(deps.db, userId)
+    if (!person) {
+      throw new EabError(EC.AUTH_REQUIRED, '任务图发起人已停用或不存在，自动恢复已停止')
+    }
+    return actorFor(deps.db, person)
+  }
+  const taskGraphExecutorFor = (companyId: string, actor = consoleActor(deps.db, companyId)): TaskGraphExecutor => {
+    return {
+      async runTool({ nodeId, tool, args, traceId, signal }) {
+        return executeTool(deps, actor, tool, args, { kind: 'cloud' }, {
+          traceId,
+          turnId: traceId,
+          idempotencyKey: `task-graph:${traceId}:${nodeId}`,
+          // 任务图由控制台管理员配置并发布，节点工具在发布时已经过一次人工确认；
+          // 运行时不再逐节点弹审批，否则自动流程会被卡死。
+          approval: 'bypass',
+          ...(signal ? { signal } : {}),
+        })
+      },
+      async runAgent({ nodeId, modelId, prompt, maxRounds, traceId, signal }) {
+        const result = await runAgentTurn({
+          deps,
+          actor,
+          modelId,
+          messages: [{ role: 'user', content: prompt }],
+          emit: () => {},
+          space: { kind: 'cloud' },
+          maxRounds,
+          turnId: traceId,
+          ...(signal ? { signal } : {}),
+        })
+        if (!result) throw new EabError(EC.INTERNAL, `子 Agent 节点 ${nodeId} 没有返回结果`)
+        return { text: result.text, runId: result.runId }
+      },
+    }
+  }
+
+  // 等待节点恢复 worker：与进程同生命周期，和 cron / 定时任务一致，不阻塞 HTTP 请求。
+  // api 角色不跑；多 worker 副本再用 leader 租约保证同一时刻只有一个扫描者。
+  const taskGraphTimer =
+    deps.config.serverRole === 'api'
+      ? null
+      : setInterval(() => {
+          void runAsLeader('task-graph-resume', 30_000, () => {
+            const recovered = recoverStaleTaskGraphRuns(deps.db, deps.companyId)
+            if (recovered > 0) {
+              app.log.warn({ recovered, companyId: deps.companyId }, 'stale task graph runs recovered')
+            }
+            return resumeDueTaskGraphRuns(
+              deps.db,
+              deps.companyId,
+              (run) => taskGraphExecutorFor(deps.companyId, taskGraphActorForRun(deps.companyId, run.userId)),
+            )
+          }).catch((error) => {
+            app.log.warn({ err: error }, 'task graph resume worker failed')
+          })
+        }, 5000)
+  taskGraphTimer?.unref?.()
 
   app.post<{ Body: { username?: string; password?: string; token?: string } }>(
     '/api/console/login',
@@ -978,6 +1059,221 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
     })
     return ok({ workflow })
   })
+
+  // ---------------------------------------------------------------- 任务图 v1（AGT-16）
+  app.get('/api/console/task-graphs', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    return ok({ graphs: listTaskGraphs(deps.db, companyId) })
+  })
+
+  app.post<{ Body: { definition?: unknown } }>(
+    '/api/console/task-graphs/validate',
+    async (req) => {
+      requireConsole(req, deps)
+      return ok({ validation: validateTaskGraph(req.body?.definition) })
+    },
+  )
+
+  app.get<{ Params: { id: string } }>('/api/console/task-graphs/:id', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    return ok({ graph: getTaskGraph(deps.db, companyId, req.params.id) })
+  })
+
+  app.post<{
+    Body: { id?: string; name?: string; description?: string; definition?: unknown }
+  }>('/api/console/task-graphs', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const graph = saveTaskGraph(deps.db, companyId, CONSOLE_OPERATOR_ID, req.body ?? {})
+    appendAudit(deps.db, {
+      companyId,
+      actorUserId: CONSOLE_OPERATOR_ID,
+      action: req.body?.id ? 'task_graph.save' : 'task_graph.create',
+      resourceType: 'task_graph',
+      resourceId: graph.id,
+      result: 'success',
+      detail: { name: graph.name, draftVersion: graph.draftVersion, errors: graph.validation },
+      ip: req.ip ?? null,
+      channel: 'console',
+    })
+    return ok({ graph })
+  })
+
+  app.post<{
+    Params: { id: string }
+    Body: { definition?: unknown }
+  }>('/api/console/task-graphs/:id/validate', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const graph = getTaskGraph(deps.db, companyId, req.params.id)
+    return ok({
+      validation: validateTaskGraph(req.body?.definition === undefined ? graph.definition : req.body.definition),
+    })
+  })
+
+  app.post<{
+    Params: { id: string }
+    Body: { definition?: unknown }
+  }>('/api/console/task-graphs/:id/publish', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const graph = publishTaskGraph(deps.db, companyId, CONSOLE_OPERATOR_ID, req.params.id, req.body?.definition)
+    appendAudit(deps.db, {
+      companyId,
+      actorUserId: CONSOLE_OPERATOR_ID,
+      action: 'task_graph.publish',
+      resourceType: 'task_graph',
+      resourceId: graph.id,
+      result: 'success',
+      detail: { name: graph.name, version: graph.version },
+      ip: req.ip ?? null,
+      channel: 'console',
+    })
+    return ok({ graph })
+  })
+
+  app.delete<{ Params: { id: string } }>('/api/console/task-graphs/:id', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const graph = deleteTaskGraph(deps.db, companyId, req.params.id)
+    appendAudit(deps.db, {
+      companyId,
+      actorUserId: CONSOLE_OPERATOR_ID,
+      action: 'task_graph.delete',
+      resourceType: 'task_graph',
+      resourceId: graph.id,
+      result: 'success',
+      detail: { name: graph.name },
+      ip: req.ip ?? null,
+      channel: 'console',
+    })
+    return ok({ deleted: true, id: graph.id })
+  })
+
+  app.get<{ Params: { id: string }; Querystring: { limit?: string } }>(
+    '/api/console/task-graphs/:id/runs',
+    async (req) => {
+      requireConsole(req, deps)
+      const companyId = companyOf(req, deps)
+      const graph = getTaskGraph(deps.db, companyId, req.params.id)
+      return ok({ runs: listTaskGraphRuns(deps.db, companyId, graph.id, Number(req.query.limit || 30)) })
+    },
+  )
+
+  app.post<{ Params: { id: string }; Body: { input?: unknown } }>(
+    '/api/console/task-graphs/:id/runs',
+    async (req) => {
+      requireConsole(req, deps)
+      const companyId = companyOf(req, deps)
+      const actor = resolveActor(deps.db, deps.config, req, deps.companyId)
+      const input =
+        req.body?.input && typeof req.body.input === 'object' && !Array.isArray(req.body.input)
+          ? (req.body.input as Record<string, unknown>)
+          : {}
+      const run = createTaskGraphRun(
+        deps.db,
+        companyId,
+        actor.subject.userId,
+        req.params.id,
+        input,
+      )
+      const executor = taskGraphExecutorFor(companyId, actor)
+      void runTaskGraphRun(deps.db, companyId, run.id, executor).catch((error) => {
+        app.log.warn({ err: error, runId: run.id }, 'task graph background run failed')
+      })
+      appendAudit(deps.db, {
+        companyId,
+        actorUserId: actor.subject.userId,
+        action: 'task_graph.run',
+        resourceType: 'task_graph_run',
+        resourceId: run.id,
+        result: 'success',
+        detail: { graphId: run.graphId, traceId: run.traceId, status: run.status },
+        ip: req.ip ?? null,
+        channel: 'console',
+      })
+      return ok({ run })
+    },
+  )
+
+  app.get<{ Params: { runId: string } }>(
+    '/api/console/task-graph-runs/:runId',
+    async (req) => {
+      requireConsole(req, deps)
+      const companyId = companyOf(req, deps)
+      return ok({ run: getTaskGraphRun(deps.db, companyId, req.params.runId) })
+    },
+  )
+
+  app.get<{ Params: { traceId: string } }>(
+    '/api/console/task-graph-runs/trace/:traceId',
+    async (req) => {
+      requireConsole(req, deps)
+      const companyId = companyOf(req, deps)
+      return ok({ run: getTaskGraphRunByTrace(deps.db, companyId, req.params.traceId) })
+    },
+  )
+
+  app.post<{
+    Params: { runId: string }
+    Body: { decision?: 'approved' | 'rejected'; note?: string }
+  }>('/api/console/task-graph-runs/:runId/approve', async (req) => {
+    requireConsole(req, deps)
+    const companyId = companyOf(req, deps)
+    const actor = resolveActor(deps.db, deps.config, req, deps.companyId)
+    const decision = req.body?.decision === 'rejected' ? 'rejected' : 'approved'
+    const run = await decideTaskGraphManual(
+      deps.db,
+      companyId,
+      req.params.runId,
+      decision,
+      String(req.body?.note ?? ''),
+      taskGraphExecutorFor(companyId, actor),
+      actor.subject.roles,
+      true,
+    )
+    if (run.status === 'running') {
+      const executor = taskGraphExecutorFor(companyId, actor)
+      void runTaskGraphRun(deps.db, companyId, run.id, executor).catch((error) => {
+        app.log.error({ err: error, runId: run.id }, 'task graph approve execution failed')
+      })
+    }
+    appendAudit(deps.db, {
+      companyId,
+      actorUserId: actor.subject.userId,
+      action: decision === 'approved' ? 'task_graph.approve' : 'task_graph.reject',
+      resourceType: 'task_graph_run',
+      resourceId: run.id,
+      result: 'success',
+      detail: { graphId: run.graphId, traceId: run.traceId, status: run.status, note: req.body?.note ?? '' },
+      ip: req.ip ?? null,
+      channel: 'console',
+    })
+    return ok({ run })
+  })
+
+  app.post<{ Params: { runId: string } }>(
+    '/api/console/task-graph-runs/:runId/cancel',
+    async (req) => {
+      requireConsole(req, deps)
+      const companyId = companyOf(req, deps)
+      const run = cancelTaskGraphRun(deps.db, companyId, req.params.runId)
+      appendAudit(deps.db, {
+        companyId,
+        actorUserId: CONSOLE_OPERATOR_ID,
+        action: 'task_graph.cancel',
+        resourceType: 'task_graph_run',
+        resourceId: run.id,
+        result: 'success',
+        detail: { graphId: run.graphId, traceId: run.traceId },
+        ip: req.ip ?? null,
+        channel: 'console',
+      })
+      return ok({ run })
+    },
+  )
 
   app.post<{
     Params: { code: string }
@@ -4110,40 +4406,42 @@ export function registerConsoleRoutes(app: FastifyInstance, deps: ServerDeps): v
         channelCount: pluginChannels.filter((channel) => channel.pluginId === plugin.id).length,
       }))
 
+    const models = [
+      ...rows.map((row) => ({
+        id: row.id,
+        providerId: row.provider_id,
+        providerKind: row.provider_kind,
+        providerName: row.provider_name,
+        providerStatus: row.provider_status,
+        name: row.name,
+        modelKey: row.model_key,
+        tags: parseList(row.tags),
+        capabilities: capabilitiesOf(row.capabilities ?? null, row.tags),
+        endpointKind: row.endpoint_kind ?? 'chat',
+        inputModalities: parseList(row.input_modalities ?? null),
+        outputModalities: parseList(row.output_modalities ?? null),
+        maxContext: row.max_context ?? null,
+        maxOutputTokens: row.max_output_tokens ?? null,
+        contextCompression: row.context_compression === null || row.context_compression === undefined
+          ? true
+          : Number(row.context_compression) !== 0,
+        embeddingDim: row.embedding_dim ?? null,
+        config: parseObject(row.config_json),
+        thinking: thinkingConfigOf(parseObject(row.config_json)),
+        roles: parseList(row.roles),
+        priority: Number(row.priority),
+        enabled: row.enabled === 1,
+        source: 'db' as const,
+        readonly: false,
+      })),
+      ...pluginModels,
+    ]
+
     return ok({
       companyId,
       roles,
       pluginStates,
-      models: [
-        ...rows.map((row) => ({
-          id: row.id,
-          providerId: row.provider_id,
-          providerKind: row.provider_kind,
-          providerName: row.provider_name,
-          providerStatus: row.provider_status,
-          name: row.name,
-          modelKey: row.model_key,
-          tags: parseList(row.tags),
-          capabilities: capabilitiesOf(row.capabilities ?? null, row.tags),
-          endpointKind: row.endpoint_kind ?? 'chat',
-          inputModalities: parseList(row.input_modalities ?? null),
-          outputModalities: parseList(row.output_modalities ?? null),
-          maxContext: row.max_context ?? null,
-          maxOutputTokens: row.max_output_tokens ?? null,
-          contextCompression: row.context_compression === null || row.context_compression === undefined
-            ? true
-            : Number(row.context_compression) !== 0,
-          embeddingDim: row.embedding_dim ?? null,
-          config: parseObject(row.config_json),
-          thinking: thinkingConfigOf(parseObject(row.config_json)),
-          roles: parseList(row.roles),
-          priority: Number(row.priority),
-          enabled: row.enabled === 1,
-          source: 'db' as const,
-          readonly: false,
-        })),
-        ...pluginModels,
-      ],
+      models,
     })
   })
 

@@ -16,6 +16,34 @@ import { chunkRetrievalText } from './kb-chunk-text.js'
 
 export type KbRetrievalMode = 'hybrid' | 'keyword' | 'vector'
 
+/** 知识库新鲜度：用于回答侧提示“这条资料是否可能过期”。 */
+export type KbFreshnessLevel = 'fresh' | 'aging' | 'stale' | 'unknown'
+
+export interface KbFreshness {
+  readonly level: KbFreshnessLevel
+  readonly label: string
+  /** 距离最后更新（或标题年份）的天数；无法判断时为 null。 */
+  readonly ageDays: number | null
+  /** 文档最后更新时间（毫秒时间戳）。 */
+  readonly updatedAt: number | null
+  /** 标题中标注的年份，如“2024年差旅制度”；没有则为 null。 */
+  readonly titleYear: number | null
+  readonly message: string
+  /** level 非 fresh，或标题年份明显早于当前年份时为 true。 */
+  readonly shouldWarn: boolean
+}
+
+/** 切片类型：正文、表格、图片或同一片里既有表格又有图片。 */
+export type KbHitKind = 'text' | 'table' | 'image' | 'mixed'
+
+export interface KbHitLayout {
+  readonly kind: KbHitKind
+  readonly blockType: string
+  readonly pageNo: number | null
+  readonly sheetName: string | null
+  readonly rowRange: readonly [number, number] | null
+}
+
 export interface KbRetrievalOptions {
   readonly mode?: KbRetrievalMode
   readonly topK?: number
@@ -51,6 +79,12 @@ export interface KbRetrievalHit {
   readonly classification: string
   readonly text: string
   readonly images: readonly KbRetrievalImage[]
+  /** 正文/表格/图片类型与页码、工作表、行号，供引用卡片和表格题评测使用。 */
+  readonly layout: KbHitLayout
+  /** 文档最后更新时间和新鲜度分级，供回答侧做“可能过期”提示。 */
+  readonly freshness: KbFreshness
+  readonly docUpdatedAt: number | null
+  readonly docVersion: number
   readonly keywordRank: number
   readonly vectorRank: number
   readonly keywordScore: number
@@ -73,6 +107,8 @@ export interface KbRetrievalDiagnostics {
   readonly embeddingModelIds: string[]
   readonly elapsedMs: number
   readonly warnings: string[]
+  /** 本轮命中按新鲜度分布；stale 命中会在回答上下文里加提示。 */
+  readonly freshness: Record<KbFreshnessLevel, number>
 }
 
 export interface KbRetrievalResult {
@@ -88,6 +124,9 @@ interface KbCandidateRow {
   classification: string
   collection_name: string
   doc_title: string
+  doc_updated_at: number | null
+  doc_created_at: number | null
+  doc_version: number | null
   meta_json: string | null
 }
 
@@ -173,6 +212,7 @@ export async function retrieveKbCore(
     embeddingModelIds: [] as string[],
     elapsedMs: 0,
     warnings,
+    freshness: { fresh: 0, aging: 0, stale: 0, unknown: 0 } as Record<KbFreshnessLevel, number>,
   }
 
   if (!q || ids.length === 0) {
@@ -186,12 +226,13 @@ export async function retrieveKbCore(
   let keywordRanked: RankedItem[] = []
   if (mode !== 'vector' && terms.length > 0) {
     // 标题路径存在 meta_json 中，正文不一定重复。只扫 text 会漏掉“三、申诉、执行与公示”
-    // 这类制度条框，因此关键词候选同时匹配正文和元数据里的 headingPath。
-    const likeClause = terms.map(() => '(c.text LIKE ? OR c.meta_json LIKE ?)').join(' OR ')
+    // 这类制度条框，因此关键词候选同时匹配正文、元数据标题路径和文档标题。
+    const likeClause = terms.map(() => '(c.text LIKE ? OR c.meta_json LIKE ? OR d.title LIKE ?)').join(' OR ')
     const rows = db
       .prepare(
         `SELECT c.id AS chunk_id, c.doc_id, c.collection_id, c.text, c.classification, c.meta_json,
-                k.name AS collection_name, d.title AS doc_title
+                k.name AS collection_name, d.title AS doc_title,
+                d.updated_at AS doc_updated_at, d.created_at AS doc_created_at, d.version AS doc_version
            FROM kb_chunks c
            JOIN kb_collections k ON k.id = c.collection_id
            JOIN kb_docs d ON d.id = c.doc_id
@@ -201,15 +242,17 @@ export async function retrieveKbCore(
             AND (${likeClause})
           LIMIT ${KEYWORD_CANDIDATE_LIMIT}`,
       )
-      .all(...ids, ...terms.flatMap((term) => [`%${term}%`, `%${term}%`])) as unknown as KbCandidateRow[]
+      .all(...ids, ...terms.flatMap((term) => [`%${term}%`, `%${term}%`, `%${term}%`])) as unknown as KbCandidateRow[]
 
     keywordRanked = rows
       .map((row) => {
-        const searchable = chunkRetrievalText(row.meta_json, row.text)
+        const searchable = `${row.doc_title}\n${chunkRetrievalText(row.meta_json, row.text)}`
         let score = 0
         for (const term of terms) {
           if (searchable.includes(term)) score += 1
         }
+        // 正文里完整出现文档标题的切片通常就是标题页/主图，标题同名查询时优先命中它。
+        if (row.text.includes(row.doc_title)) score += 1
         return {
           row,
           keywordRank: 0,
@@ -295,7 +338,8 @@ export async function retrieveKbCore(
       const hitRows = db
         .prepare(
           `SELECT c.id AS chunk_id, c.doc_id, c.collection_id, c.text, c.classification, c.meta_json,
-                  k.name AS collection_name, d.title AS doc_title
+                  k.name AS collection_name, d.title AS doc_title,
+                  d.updated_at AS doc_updated_at, d.created_at AS doc_created_at, d.version AS doc_version
              FROM kb_chunks c
              JOIN kb_collections k ON k.id = c.collection_id
              JOIN kb_docs d ON d.id = c.doc_id
@@ -388,7 +432,23 @@ export async function retrieveKbCore(
     }
   }
 
-  const hits: KbRetrievalHit[] = ranked.slice(0, topK).map((item, index) => ({
+  // 强关键词命中保护：同一文档常有许多切片同时进入向量候选，融合后会靠“双路加分”
+  // 把关键词排名第 1 的精确命中挤出 topK。这里只为首条高关键词分（>=2）命中保留席位，
+  // 避免“问年休假却只返回快奖制度”这类精度倒退。
+  const protectedIds = new Set(
+    keywordRanked
+      .filter((item) => item.keywordScore >= 2)
+      .slice(0, Math.min(1, topK))
+      .map((item) => item.row.chunk_id),
+  )
+  const ordered = [
+    ...keywordRanked
+      .filter((item) => protectedIds.has(item.row.chunk_id))
+      .map((item) => merged.get(item.row.chunk_id) ?? item),
+    ...ranked.filter((item) => !protectedIds.has(item.row.chunk_id)),
+  ]
+
+  const hits: KbRetrievalHit[] = ordered.slice(0, topK).map((item, index) => ({
     chunkId: item.row.chunk_id,
     docId: item.row.doc_id,
     collectionId: item.row.collection_id,
@@ -397,6 +457,13 @@ export async function retrieveKbCore(
     classification: item.row.classification,
     text: chunkRetrievalText(item.row.meta_json, item.row.text),
     images: imagesOf(item.row),
+    layout: layoutOf(item.row),
+    freshness: kbFreshnessOf({
+      title: item.row.doc_title,
+      updatedAt: Number(item.row.doc_updated_at ?? item.row.doc_created_at ?? 0) || null,
+    }),
+    docUpdatedAt: Number(item.row.doc_updated_at ?? item.row.doc_created_at ?? 0) || null,
+    docVersion: Math.max(1, Number(item.row.doc_version ?? 1) || 1),
     keywordRank: item.keywordRank,
     vectorRank: item.vectorRank,
     keywordScore: item.keywordScore,
@@ -407,28 +474,120 @@ export async function retrieveKbCore(
     source: item.keywordRank && item.vectorRank ? 'hybrid' : item.vectorRank ? 'vector' : 'keyword',
   }))
 
+  for (const hit of hits) baseDiagnostics.freshness[hit.freshness.level] += 1
+
   return {
     hits,
     diagnostics: { ...baseDiagnostics, elapsedMs: Date.now() - startedAt },
   }
 }
 
-function imagesOf(row: KbCandidateRow): KbRetrievalHit['images'] {
-  if (!row.meta_json) return []
+function metaOf(row: KbCandidateRow): Record<string, unknown> {
+  if (!row.meta_json) return {}
   try {
-    const meta = JSON.parse(row.meta_json) as Record<string, unknown>
-    const assetId = typeof meta.imageAssetId === 'string' ? meta.imageAssetId : ''
-    if (!assetId) return []
-    const pageNo = typeof meta.pageNo === 'number' ? meta.pageNo : Number.isFinite(Number(meta.pageNo)) ? Number(meta.pageNo) : null
-    return [{
-      assetId,
-      url: docAssetUrl(row.doc_id, assetId),
-      caption: typeof meta.imageCaption === 'string' ? meta.imageCaption : '',
-      pageNo,
-    }]
+    const value = JSON.parse(row.meta_json) as unknown
+    return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {}
   } catch {
-    return []
+    return {}
   }
+}
+
+function pageNoOf(value: unknown): number | null {
+  const number = Number(value)
+  return Number.isFinite(number) && number > 0 ? Math.floor(number) : null
+}
+
+function rowRangeOf(value: unknown): readonly [number, number] | null {
+  if (!Array.isArray(value) || value.length < 2) return null
+  const start = Number(value[0])
+  const end = Number(value[1])
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return null
+  return [Math.max(1, Math.floor(start)), Math.max(Math.floor(start), Math.floor(end))]
+}
+
+function layoutOf(row: KbCandidateRow): KbHitLayout {
+  const meta = metaOf(row)
+  const blockType = String(meta.blockType ?? '').trim()
+  const hasTable = blockType === 'table' || Boolean(meta.sheetName) || rowRangeOf(meta.rowRange) !== null
+  const hasImage = Boolean(meta.imageAssetId) || blockType === 'image'
+  return {
+    kind: hasTable && hasImage ? 'mixed' : hasImage ? 'image' : hasTable ? 'table' : 'text',
+    blockType: blockType || 'paragraph',
+    pageNo: pageNoOf(meta.pageNo),
+    sheetName: typeof meta.sheetName === 'string' && meta.sheetName.trim() ? meta.sheetName.trim() : null,
+    rowRange: rowRangeOf(meta.rowRange),
+  }
+}
+
+function titleYearOf(title: string): number | null {
+  const match = String(title || '').match(/(?:19|20)\d{2}/)
+  if (!match) return null
+  const year = Number(match[0])
+  return year >= 1900 && year <= 2100 ? year : null
+}
+
+/**
+ * 判断知识新鲜度。
+ *
+ * 目前 EAB 没有单独的“制度生效日期”字段，这里使用文档最后更新时间作为主依据；
+ * 标题里出现年份时额外做一次版本提示，防止旧制度刚上传就被当成新资料。
+ * 阈值：180 天内较新；181-365 天较旧；超过 365 天可能过期。
+ */
+export function kbFreshnessOf(input: {
+  title?: string | null
+  updatedAt?: number | null
+  now?: number
+}): KbFreshness {
+  const now = Number.isFinite(Number(input.now)) ? Number(input.now) : Date.now()
+  const updatedAtRaw = Number(input.updatedAt)
+  const updatedAt = Number.isFinite(updatedAtRaw) && updatedAtRaw > 0 ? updatedAtRaw : null
+  const titleYear = titleYearOf(String(input.title ?? ''))
+  const titleYearWarning = Boolean(titleYear && new Date(now).getFullYear() - titleYear >= 2)
+  const titleNote = titleYearWarning ? `；标题标注 ${titleYear} 年，早于当前版本，请核对` : ''
+  if (!updatedAt) {
+    return {
+      level: 'unknown',
+      label: '更新时间未知',
+      ageDays: null,
+      updatedAt: null,
+      titleYear,
+      message: `资料更新时间未知，引用前请核对最新版本${titleNote}`,
+      shouldWarn: true,
+    }
+  }
+  const ageDays = Math.max(0, Math.floor((now - updatedAt) / 86_400_000))
+  const level: KbFreshnessLevel = ageDays <= 180 ? 'fresh' : ageDays <= 365 ? 'aging' : 'stale'
+  const label = level === 'fresh' ? '较新' : level === 'aging' ? '较旧' : '可能过期'
+  const stamp = new Date(updatedAt)
+  const pad = (value: number) => String(value).padStart(2, '0')
+  const dateText = `${stamp.getFullYear()}-${pad(stamp.getMonth() + 1)}-${pad(stamp.getDate())}`
+  const ageText = ageDays < 1 ? '今天更新' : `约 ${ageDays} 天前`
+  const message = level === 'fresh'
+    ? `资料最后更新于 ${dateText}（${ageText}）${titleNote}`
+    : level === 'aging'
+      ? `资料最后更新于 ${dateText}（${ageText}），已超过半年未更新，建议核对最新版本${titleNote}`
+      : `资料最后更新于 ${dateText}（${ageText}），可能已过期，引用前请核对最新版本${titleNote}`
+  return {
+    level,
+    label,
+    ageDays,
+    updatedAt,
+    titleYear,
+    message,
+    shouldWarn: level !== 'fresh' || titleYearWarning,
+  }
+}
+
+function imagesOf(row: KbCandidateRow): KbRetrievalHit['images'] {
+  const meta = metaOf(row)
+  const assetId = typeof meta.imageAssetId === 'string' ? meta.imageAssetId : ''
+  if (!assetId) return []
+  return [{
+    assetId,
+    url: docAssetUrl(row.doc_id, assetId),
+    caption: typeof meta.imageCaption === 'string' ? meta.imageCaption : '',
+    pageNo: pageNoOf(meta.pageNo),
+  }]
 }
 
 function errorText(error: unknown): string {

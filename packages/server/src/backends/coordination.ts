@@ -12,6 +12,7 @@
  */
 import { randomUUID } from 'node:crypto'
 import { hostname } from 'node:os'
+import type { Db } from '@eab/storage'
 import { MemoryCache, type CacheBackend } from './cache.js'
 import { getBackendRuntime } from './runtime.js'
 import type { BackendStatus } from './types.js'
@@ -23,6 +24,21 @@ let fallbackCache: CacheBackend | undefined
 function localCache(): CacheBackend {
   fallbackCache ??= new MemoryCache(20_000)
   return fallbackCache
+}
+
+/**
+ * 多实例部署但没接 Redis 时，用同一份 SQLite 库做跨进程锁/计数。
+ * 只有 main.ts 显式调用 `useDatabaseCoordination` 后才启用，单实例行为完全不变。
+ */
+let databaseCache: SqliteCoordinationCache | undefined
+
+export function useDatabaseCoordination(db: Db): void {
+  databaseCache = new SqliteCoordinationCache(db)
+}
+
+/** 仅供测试：恢复默认内存协调层。 */
+export function resetDatabaseCoordination(): void {
+  databaseCache = undefined
 }
 
 interface ActiveCache {
@@ -39,13 +55,192 @@ function activeCache(): ActiveCache {
       // 降级时仍把请求交给它：HybridCache 内部会先试 Redis 再落内存，
       // 这样 Redis 恢复后下一次命令成功就能把状态翻回 ready；
       // 如果这里直接换成本地 Map，降级进程再也不会探测 Redis，永远恢复不了。
-      return { cache, shared: cache.status().state === 'ready' }
+      const ready = cache.status().state === 'ready' && cache.id !== 'memory'
+      if (ready) return { cache, shared: true }
+      if (databaseCache) return { cache: databaseCache, shared: true }
+      return { cache, shared: false }
     } catch {
       // 状态读取失败按未就绪处理
     }
   }
+  if (databaseCache) return { cache: databaseCache, shared: true }
   return { cache: localCache(), shared: false }
 }
+
+/**
+ * SQLite 协调缓存。
+ *
+ * 表 `runtime_coordination` 只存 TTL 键值；写入全部是单条 UPSERT/UPDATE，
+ * 依赖 SQLite 的写串行化保证「只有一个进程抢到锁」。
+ * 这不是高频缓存：只在显式多实例且没有 Redis 时承担 leader 租约与跨实例去重。
+ */
+export class SqliteCoordinationCache implements CacheBackend {
+  readonly id = 'sqlite-coordination'
+  private lastSweep = 0
+
+  constructor(private readonly db: Db) {}
+
+  private sweep(now = Date.now()): void {
+    if (now - this.lastSweep < 60_000) return
+    this.lastSweep = now
+    try {
+      this.db.prepare('DELETE FROM runtime_coordination WHERE expires_at <= ?').run(now)
+    } catch {
+      // 清理失败不影响业务，下次再试
+    }
+  }
+
+  async get<T>(key: string): Promise<T | null> {
+    const row = this.db
+      .prepare('SELECT value_json, expires_at FROM runtime_coordination WHERE key = ?')
+      .get(key) as { value_json?: string; expires_at?: number } | undefined
+    if (!row || Number(row.expires_at) <= Date.now()) {
+      if (row) {
+        try {
+          this.db.prepare('DELETE FROM runtime_coordination WHERE key = ? AND expires_at <= ?').run(key, Date.now())
+        } catch {
+          // ignore
+        }
+      }
+      return null
+    }
+    try {
+      return JSON.parse(String(row.value_json)) as T
+    } catch {
+      return null
+    }
+  }
+
+  async set(key: string, value: unknown, ttlSeconds: number): Promise<void> {
+    const now = Date.now()
+    const expiresAt = now + Math.max(1, ttlSeconds) * 1000
+    this.db
+      .prepare(
+        `INSERT INTO runtime_coordination(key, value_json, expires_at, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET
+           value_json = excluded.value_json,
+           expires_at = excluded.expires_at,
+           updated_at = excluded.updated_at`,
+      )
+      .run(key, JSON.stringify(value ?? null), expiresAt, now)
+    this.sweep(now)
+  }
+
+  async del(key: string): Promise<void> {
+    this.db.prepare('DELETE FROM runtime_coordination WHERE key = ?').run(key)
+  }
+
+  async incr(key: string, ttlSeconds: number): Promise<number> {
+    const now = Date.now()
+    const expiresAt = now + Math.max(1, ttlSeconds) * 1000
+    const row = this.db
+      .prepare(
+        `INSERT INTO runtime_coordination(key, value_json, expires_at, updated_at)
+         VALUES (?, '1', ?, ?)
+         ON CONFLICT(key) DO UPDATE SET
+           value_json = CASE
+             WHEN runtime_coordination.expires_at > ? THEN CAST(runtime_coordination.value_json AS INTEGER) + 1
+             ELSE 1
+           END,
+           expires_at = CASE
+             WHEN runtime_coordination.expires_at > ? THEN runtime_coordination.expires_at
+             ELSE excluded.expires_at
+           END,
+           updated_at = excluded.updated_at
+         RETURNING CAST(value_json AS INTEGER) AS n`,
+      )
+      .get(key, expiresAt, now, now, now) as { n?: number } | undefined
+    this.sweep(now)
+    return Number(row?.n ?? 1)
+  }
+
+  async adjust(key: string, delta: number, ttlSeconds: number): Promise<number> {
+    const now = Date.now()
+    const expiresAt = now + Math.max(1, ttlSeconds) * 1000
+    const row = this.db
+      .prepare(
+        `INSERT INTO runtime_coordination(key, value_json, expires_at, updated_at)
+         VALUES (?, CAST(? AS TEXT), ?, ?)
+         ON CONFLICT(key) DO UPDATE SET
+           value_json = CASE
+             WHEN runtime_coordination.expires_at > ? THEN CAST(runtime_coordination.value_json AS INTEGER) + ?
+             ELSE CAST(? AS INTEGER)
+           END,
+           expires_at = CASE
+             WHEN runtime_coordination.expires_at > ? THEN runtime_coordination.expires_at
+             ELSE excluded.expires_at
+           END,
+           updated_at = excluded.updated_at
+         RETURNING CAST(value_json AS INTEGER) AS n`,
+      )
+      .get(key, String(delta), expiresAt, now, now, delta, delta, now) as { n?: number } | undefined
+    const next = Number(row?.n ?? 0)
+    if (next <= 0) {
+      try {
+        this.db
+          .prepare(
+            'DELETE FROM runtime_coordination WHERE key = ? AND CAST(value_json AS INTEGER) <= 0',
+          )
+          .run(key)
+      } catch {
+        // ignore
+      }
+      this.sweep(now)
+      return 0
+    }
+    this.sweep(now)
+    return next
+  }
+
+  async setIfAbsent(key: string, value: unknown, ttlSeconds: number): Promise<boolean> {
+    const now = Date.now()
+    const expiresAt = now + Math.max(1, ttlSeconds) * 1000
+    const result = this.db
+      .prepare(
+        `INSERT INTO runtime_coordination(key, value_json, expires_at, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET
+           value_json = excluded.value_json,
+           expires_at = excluded.expires_at,
+           updated_at = excluded.updated_at
+         WHERE runtime_coordination.expires_at <= ?`,
+      )
+      .run(key, JSON.stringify(value ?? null), expiresAt, now, now)
+    this.sweep(now)
+    return Number(result.changes ?? 0) === 1
+  }
+
+  async compareAndTouch(key: string, value: unknown, ttlSeconds: number): Promise<boolean> {
+    const now = Date.now()
+    const expiresAt = ttlSeconds > 0 ? now + Math.max(1, ttlSeconds) * 1000 : now
+    const result = this.db
+      .prepare(
+        `UPDATE runtime_coordination
+            SET expires_at = ?, updated_at = ?
+          WHERE key = ? AND value_json = ? AND expires_at > ?`,
+      )
+      .run(expiresAt, now, key, JSON.stringify(value ?? null), now)
+    return Number(result.changes ?? 0) === 1
+  }
+
+  status(): BackendStatus {
+    return {
+      id: this.id,
+      kind: 'cache',
+      label: '数据库协调层（多实例）',
+      mode: 'builtin',
+      state: 'ready',
+      detail: '未接 Redis，用共享数据库的 TTL 租约协调 leader、频控与去重；只适合同机共享卷',
+      capabilities: ['kv', 'ttl', 'counter', 'shared'],
+    }
+  }
+
+  async close(): Promise<void> {
+    // 连接归 LiveDatabase 管理，这里不关闭
+  }
+}
+
 
 /** 控制台展示用：当前协作层到底跑在 Redis 还是内存。 */
 export function coordinationStatus(): { backend: string; shared: boolean; detail: string } {

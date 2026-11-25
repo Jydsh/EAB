@@ -1,6 +1,6 @@
 {
   "name": "eab",
-  "version": "2026.11.23.04",
+  "version": "2026.11.24",
   "private": true,
   "type": "module",
   "description": "EAB 企业智能体基座（Enterprise Agent Base）",
@@ -13,16 +13,22 @@
     "node": ">=22.13.0"
   },
   "scripts": {
-    "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run",
+    "typecheck": "node --max-old-space-size=4096 node_modules/typescript/bin/tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --minWorkers=1 --maxWorkers=1",
     "test:watch": "vitest",
-    "verify": "pnpm typecheck && pnpm test",
+    "eval:agent": "tsx scripts/eval-agent.ts",
+    "eval:kb": "tsx scripts/eval-kb.ts",
+    "verify": "pnpm typecheck && pnpm test && pnpm eval:agent && pnpm eval:kb",
+    "verify:release": "pnpm verify",
     "smoke": "node scripts/smoke-http.mjs && node scripts/smoke-platform.mjs",
     "test:auth-redirect": "node scripts/auth-redirect.e2e.mjs",
     "dev": "pnpm --filter @eab/server dev",
     "eab": "node scripts/eab.mjs",
     "server": "node scripts/eab.mjs server",
-    "demo:kb": "tsx demo/kb-visibility.ts"
+    "demo:kb": "tsx demo/kb-visibility.ts",
+    "docker:up": "docker compose up -d --build",
+    "docker:down": "docker compose down",
+    "docker:ps": "docker compose ps"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

@@ -42,6 +42,7 @@ export const MODEL_ENDPOINT_KINDS = [
   'rerank',
   'asr',
   'tts',
+  'image',
   'video',
 ] as const
 
@@ -59,6 +60,7 @@ export const MODEL_ROUTE_PURPOSES = [
   { purpose: 'kb.rerank', label: '检索重排', hint: '可选，提升混合检索准确率' },
   { purpose: 'asr.default', label: '语音转写', hint: '钉钉/企微语音消息转文本' },
   { purpose: 'tts.default', label: '语音合成', hint: '回答转语音条，可选' },
+  { purpose: 'image.default', label: '图片生成', hint: '按文字生成图片，独立内容工具，不进入对话主链路' },
   { purpose: 'video.analyze', label: '视频理解', hint: '异步抽帧、转写与画面描述' },
 ] as const
 
@@ -229,7 +231,7 @@ export function findModelById(db: Db, companyId: string, modelId: string): Model
 }
 
 export interface ModelProfileSuggestion {
-  readonly modelType: 'chat' | 'decision' | 'vision' | 'embedding' | 'rerank' | 'audio' | 'video'
+  readonly modelType: 'chat' | 'decision' | 'vision' | 'embedding' | 'rerank' | 'audio' | 'video' | 'image'
   readonly label: string
   readonly capabilities: readonly string[]
   readonly endpointKind: string
@@ -309,6 +311,22 @@ export function inferModelProfile(modelKey: string): ModelProfileSuggestion {
         path: '/audio/speech',
         request: '{ model, input, voice }',
         response: 'audio binary',
+      },
+    }
+  }
+  if (has(/gpt-image|dall-?e|flux|stable-diffusion|sdxl|sd-xl|imagen|text-to-image|seedream|kolors|image-gen/)) {
+    return {
+      modelType: 'image',
+      label: '图片生成',
+      capabilities: ['chat'],
+      endpointKind: 'image',
+      confidence: 'high',
+      basis: '模型名包含 dall-e / flux / stable-diffusion / image 等生成特征',
+      api: {
+        method: 'POST',
+        path: '/images/generations',
+        request: '{ model, prompt, size }',
+        response: 'data[{ b64_json | url }]',
       },
     }
   }
@@ -429,6 +447,8 @@ function purposeMatches(model: ModelCapabilityRecord, purpose: string): boolean 
       return model.endpointKind === 'asr'
     case 'tts.default':
       return model.endpointKind === 'tts'
+    case 'image.default':
+      return model.endpointKind === 'image'
     case 'video.analyze':
       return model.endpointKind === 'video' || capability.includes('video')
     default:

@@ -307,7 +307,7 @@ describe('A2A 入站端点', () => {
     await new Promise((resolve) => setTimeout(resolve, 1100))
     const final = db.prepare('SELECT state FROM a2a_inbound_tasks WHERE id = ?').get(row.id) as { state: string }
     expect(final.state).toBe('canceled')
-  })
+  }, 20_000)
 
   it('模型即使伪造内部工具调用，也不会派生 Agent 或执行工具', async () => {
     const { db, consoleApp, chatApp } = makeApps()

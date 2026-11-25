@@ -88,6 +88,35 @@ describe('project.exec 工具接入', () => {
     expect(specs.some((spec) => spec.function.name === 'project_job')).toBe(true)
   })
 
+  it('未审批的高危工具被门禁拦住，审批后只能执行一次', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'eab-project-tool-'))
+    dirs.push(dataDir)
+    const d = deps(dataDir)
+    d.db.exec('PRAGMA foreign_keys = OFF')
+    const me = actor([SC.AGENT_TOOL_INVOKE, SC.WORKSPACE_READ, SC.WORKSPACE_WRITE])
+    const args = { command: 'node -e "console.log(\'审批-ok\')"' }
+
+    const blocked = (await executeTool(d, me as any, 'project.exec', args, { kind: 'cloud' }, {
+      sessionId: 'chat_approval', channel: 'web', approval: 'defer', messageId: 'msg-approval',
+    }).catch((error) => error)) as any
+    expect(blocked.code).toBe('EAB_APPROVAL_REQUIRED')
+    const approvalId = blocked.details.approvalId as string
+    expect(approvalId).toBeTruthy()
+
+    d.db.prepare("UPDATE approvals SET status = 'approved', decided_by = 'admin', decided_at = ? WHERE id = ?")
+      .run(Date.now(), approvalId)
+    const allowed = (await executeTool(d, me as any, 'project.exec', args, { kind: 'cloud' }, {
+      sessionId: 'chat_approval', channel: 'web', approval: 'defer', approvalId,
+    })) as any
+    expect(allowed.status).toBe('completed')
+    expect(allowed.stdout).toContain('审批-ok')
+
+    const reused = (await executeTool(d, me as any, 'project.exec', args, { kind: 'cloud' }, {
+      sessionId: 'chat_approval', channel: 'web', approval: 'defer', approvalId,
+    }).catch((error) => error)) as any
+    expect(reused.code).toBe('EAB_CONFLICT')
+  }, 20_000)
+
   it('执行前台命令并返回退出码、stdout 和 stderr', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'eab-project-tool-'))
     dirs.push(dataDir)

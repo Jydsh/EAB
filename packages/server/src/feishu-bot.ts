@@ -37,6 +37,7 @@ import { assertChatQuota } from './quota.js'
 import { planChannelModelCommand } from './channel-model-command.js'
 import { memoryQueryForTurn, recentMessageIds, searchChatMemory, shouldRecallPastConversations } from './chat-memory.js'
 import { refreshSessionSummary, sessionSummaryForPrompt } from './chat-summary.js'
+import { extractMemoryShadow } from './memory-extractor.js'
 import { SWITCH_CHAT_MODEL_TOOL_SPEC, updateConversationModelPreference, type ModelSwitchContext } from './channel-model-switch.js'
 import { publishChatEvent } from './chat-events.js'
 import { acquireLeaderHold, claimOnce, readLeaderOwner, type LeaderHold, type LeaderOwner } from './backends/coordination.js'
@@ -658,7 +659,8 @@ export async function handleFeishuEvent(
         .run(Date.now(), sessionId)
       sessionModelId = null
     }
-    const model = preferredModel ?? available[0]
+    const preferredChatModel = preferredModel?.endpointKind === 'chat' ? preferredModel : undefined
+    const model = preferredChatModel ?? available[0]
     if (!model) {
       const text = 'EAB 当前还没有可用模型。请管理员到「模型接入」启用一个模型后再试。'
       await sendFeishuReply(deps, message, text)
@@ -769,7 +771,9 @@ export async function handleFeishuEvent(
         deps,
         actor,
         modelId: model.id,
-        fallbackModelIds: available.filter((item) => item.id !== model.id).map((item) => item.id),
+        fallbackModelIds: available
+          .filter((item) => item.id !== model.id)
+          .map((item) => item.id),
         bufferModelEvents: true,
         onModelFailover: (change) => {
           const next = available.find((item) => item.id === change.toModelId)
@@ -879,6 +883,19 @@ export async function handleFeishuEvent(
       modelId: effectiveModel.id,
     }).catch((error) => {
       console.warn('[eab] 飞书会话摘要更新失败：', (error as Error).message)
+    })
+    void extractMemoryShadow({
+      db: deps.db,
+      dbPath: deps.config.dbPath,
+      companyId: actor.subject.companyId,
+      userId: actor.person.id,
+      sessionId,
+      sourceMessageId: userMessageId,
+      userText: rawText,
+      modelId: effectiveModel.id,
+      channel: 'feishu',
+    }).catch((error) => {
+      console.warn('[eab] 飞书自动记忆抽取失败：', (error as Error).message)
     })
 
     await sendFeishuReply(deps, message, answerText)

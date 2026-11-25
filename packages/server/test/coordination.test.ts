@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 import { hostname } from 'node:os'
-import { MemoryCache } from '../src/backends/cache.js'
+import { createSharedCache } from './helpers/shared-cache.js'
 import {
   acquireCoordinationLock,
   acquireCoordinationSlot,
@@ -37,7 +37,7 @@ describe('协作层频控', () => {
   })
 
   it('接入外部缓存后计数共享，状态标记为共享', async () => {
-    const shared = new MemoryCache(10_000)
+    const shared = createSharedCache(10_000)
     setBackendRuntimeForTest({ cache: shared } as never)
     const key = `test:${Math.random()}`
     const verdict = await hitRate(key, 1, 60)
@@ -45,7 +45,7 @@ describe('协作层频控', () => {
     const next = await hitRate(key, 1, 60)
     expect(next.allowed).toBe(false)
     expect(coordinationStatus().shared).toBe(true)
-    expect(coordinationStatus().backend).toBe('memory')
+    expect(coordinationStatus().backend).toBe('redis')
   })
 
   it('Redis 读失败时退回进程内，不抛错', async () => {
@@ -99,7 +99,7 @@ describe('协作层事件去重', () => {
 
 describe('协作层互斥锁', () => {
   it('共享层在线时同一 key 只允许一个持有者，释放后交接', async () => {
-    setBackendRuntimeForTest({ cache: new MemoryCache(10_000) } as never)
+    setBackendRuntimeForTest({ cache: createSharedCache(10_000) } as never)
     const first = await acquireCoordinationLock('agent:session:s1', { ttlMs: 5_000, waitMs: 100 })
     let secondDone = false
     const pending = acquireCoordinationLock('agent:session:s1', { ttlMs: 5_000, waitMs: 800 }).then((lease) => {
@@ -116,7 +116,7 @@ describe('协作层互斥锁', () => {
   })
 
   it('等不到锁时抛 LOCK_TIMEOUT', async () => {
-    setBackendRuntimeForTest({ cache: new MemoryCache(10_000) } as never)
+    setBackendRuntimeForTest({ cache: createSharedCache(10_000) } as never)
     const held = await acquireCoordinationLock('agent:session:s2', { ttlMs: 5_000, waitMs: 100 })
     await expect(
       acquireCoordinationLock('agent:session:s2', { ttlMs: 5_000, waitMs: 200 }),
@@ -135,7 +135,7 @@ describe('协作层互斥锁', () => {
 
 describe('协作层并发名额（信号量）', () => {
   it('共享层在线时上限跨实例生效，释放后交接', async () => {
-    setBackendRuntimeForTest({ cache: new MemoryCache(10_000) } as never)
+    setBackendRuntimeForTest({ cache: createSharedCache(10_000) } as never)
     const first = await acquireCoordinationSlot('tool:demo', { limit: 1, ttlSec: 10, waitMs: 100 })
     let secondDone = false
     const pending = acquireCoordinationSlot('tool:demo', { limit: 1, ttlSec: 10, waitMs: 2_000 }).then((lease) => {
@@ -152,7 +152,7 @@ describe('协作层并发名额（信号量）', () => {
   })
 
   it('等不到名额时抛 SEMAPHORE_TIMEOUT', async () => {
-    setBackendRuntimeForTest({ cache: new MemoryCache(10_000) } as never)
+    setBackendRuntimeForTest({ cache: createSharedCache(10_000) } as never)
     const held = await acquireCoordinationSlot('tool:busy', { limit: 1, ttlSec: 10, waitMs: 100 })
     await expect(
       acquireCoordinationSlot('tool:busy', { limit: 1, ttlSec: 10, waitMs: 300 }),
@@ -170,7 +170,7 @@ describe('协作层并发名额（信号量）', () => {
 })
 
 describe('定时任务领导权', () => {  it('共享层在线时同一时刻只有一个实例执行任务', async () => {
-    setBackendRuntimeForTest({ cache: new MemoryCache(10_000) } as never)
+    setBackendRuntimeForTest({ cache: createSharedCache(10_000) } as never)
     let concurrent = 0
     let maxConcurrent = 0
     const task = async () => {
@@ -209,7 +209,7 @@ describe('协作层 run 心跳', () => {  it('写入后可见，清理后不可�
 
 describe('长连接领导权', () => {
   it('写入实例元数据，并可按 key 读回持有者', async () => {
-    setBackendRuntimeForTest({ cache: new MemoryCache(10_000) } as never)
+    setBackendRuntimeForTest({ cache: createSharedCache(10_000) } as never)
     const key = `stream-meta-${Math.random()}`
     const hold = await acquireLeaderHold(key, { ttlMs: 5_000 })
     expect(hold).not.toBeNull()
@@ -220,7 +220,7 @@ describe('长连接领导权', () => {
   })
 
   it('同机旧进程已退出时立即接管，不等 90 秒 TTL', async () => {
-    setBackendRuntimeForTest({ cache: new MemoryCache(10_000) } as never)
+    setBackendRuntimeForTest({ cache: createSharedCache(10_000) } as never)
     const key = `stream-dead-${Math.random()}`
     const stale = JSON.stringify({
       v: 1,
@@ -228,7 +228,7 @@ describe('长连接领导权', () => {
       owner: { instanceId: 'stale', host: hostname(), pid: 2_147_483_646, startedAt: 1 },
     })
     // 用同一个缓存实例，确保读到上面预置的 key。
-    const cache = new MemoryCache(10_000)
+    const cache = createSharedCache(10_000)
     setBackendRuntimeForTest({ cache } as never)
     await cache.setIfAbsent(`leader:${key}`, stale, 60)
     const hold = await acquireLeaderHold(key, { ttlMs: 5_000, waitMs: 0 })
@@ -239,8 +239,8 @@ describe('长连接领导权', () => {
   })
 
   it('同机进程仍存活或旧版本租约时不接管', async () => {
-    setBackendRuntimeForTest({ cache: new MemoryCache(10_000) } as never)
-    const cache = new MemoryCache(10_000)
+    setBackendRuntimeForTest({ cache: createSharedCache(10_000) } as never)
+    const cache = createSharedCache(10_000)
     setBackendRuntimeForTest({ cache } as never)
     const liveKey = `stream-live-${Math.random()}`
     const live = JSON.stringify({

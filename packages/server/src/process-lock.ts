@@ -56,10 +56,28 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
+export interface ProcessLockOptions {
+  /**
+   * 显式多实例部署时跳过独占锁。
+   *
+   * 仍然只允许同机共享同一 SQLite 文件；跨主机请先换 PostgreSQL 主存储。
+   * 跳过独占锁后，单例后台任务由 `backends/coordination` 的数据库租约选主。
+   */
+  readonly allowMultiple?: boolean
+}
+
 /** 尝试获取单写进程锁；已有活进程占用时抛 ProcessLockError。 */
-export function acquireProcessLock(dataDir: string, dbPath: string): ProcessLock {
+export function acquireProcessLock(
+  dataDir: string,
+  dbPath: string,
+  options: ProcessLockOptions = {},
+): ProcessLock {
   const path = join(dataDir, 'eab-server.lock')
   const info: ProcessLockInfo = { pid: process.pid, startedAt: Date.now(), dbPath }
+  if (options.allowMultiple) {
+    // 多实例模式不写独占锁；返回一个空释放器，调用方的退出清理保持同构。
+    return { path, info, release: () => {} }
+  }
 
   const tryCreate = (): number | null => {
     try {

@@ -63,6 +63,25 @@ export interface ChatLiveSubAgentEvent {
   data: unknown
 }
 
+/** 工具审批：网页聊天里直接弹「允许一次 / 拒绝」，不用切到控制台。 */
+export interface ChatLiveApprovalEvent {
+  type: 'approval'
+  companyId: string
+  userId: string
+  sessionId: string
+  messageId: string
+  approval: {
+    id: string
+    toolId: string
+    toolName: string
+    risk: 'read' | 'write' | 'exec' | 'irreversible'
+    argsSummary: string
+    expiresAt: number
+    status: 'pending' | 'approved' | 'rejected' | 'expired'
+    reason?: string | null
+  }
+}
+
 /** 管理后台修改助手身份：通知同一公司已打开的网页热更新名字、头像和语音唤醒词。 */
 export interface ChatAssistantChangedEvent {
   type: 'assistant'
@@ -89,6 +108,7 @@ export type ChatLiveEventPayload =
   | ChatLiveDeltaEvent
   | ChatLiveToolEvent
   | ChatLiveSubAgentEvent
+  | ChatLiveApprovalEvent
   | ChatModelsChangedEvent
   | ChatAssistantChangedEvent
   | ChatWorkspaceFilesEvent
@@ -168,6 +188,7 @@ export function initChatEventBridge(pubsub: PubSubBackend | null): void {
             event.type === 'delta' ||
             event.type === 'tool' ||
             event.type === 'subagent' ||
+            event.type === 'approval' ||
             event.type === 'models' ||
             event.type === 'assistant' ||
             event.type === 'workspace')

@@ -7,6 +7,7 @@
  */
 import { randomUUID } from 'node:crypto'
 import type { Db } from '@eab/storage'
+import type { TeamFormationDecision } from './agent-team-formation.js'
 import { toolSlowThresholdMs } from './tool-metrics.js'
 import { KeyedMutex } from './concurrency.js'
 import {
@@ -51,6 +52,17 @@ export interface AgentStepInput {
   readonly durationMs?: number
 }
 
+export interface AgentRunFormation extends TeamFormationDecision {
+  /** 文本判定为可编队后，是否真的被环境条件放行并强制了本轮第一次工具调用。 */
+  readonly applied: boolean
+  /** applied=false 时，是哪些运行时条件拦住了强制编队。 */
+  readonly blockedBy: readonly string[]
+  /** 判定写入时间。 */
+  readonly decidedAt: number
+  /** 实际成功建出的子任务数；模型没有调用 agent_spawn 时保持 undefined。 */
+  readonly spawnedAgents?: number
+}
+
 export interface AgentRunRecord {
   readonly id: string
   readonly parentRunId: string | null
@@ -62,6 +74,7 @@ export interface AgentRunRecord {
   readonly budget: number | null
   readonly spentTokens: number
   readonly error: string | null
+  readonly formation: AgentRunFormation | null
   readonly startedAt: number
   readonly endedAt: number | null
   readonly depth: number
@@ -481,6 +494,7 @@ interface RunRow {
   budget: number | null
   spent_tokens: number
   error: string | null
+  formation_json: string | null
   started_at: number
   ended_at: number | null
 }
@@ -495,6 +509,60 @@ interface StepRow {
   status: string
   result_summary: string | null
   duration_ms: number
+}
+
+function parseFormationJson(value: string | null): AgentRunFormation | null {
+  if (!value) return null
+  try {
+    const parsed = JSON.parse(value) as Partial<AgentRunFormation>
+    if (typeof parsed?.force !== 'boolean' || typeof parsed.reason !== 'string') return null
+    return {
+      force: parsed.force,
+      reason: parsed.reason as AgentRunFormation['reason'],
+      detail: typeof parsed.detail === 'string' ? parsed.detail : '',
+      signals: Array.isArray(parsed.signals) ? parsed.signals.map(String) : [],
+      minAgents: Number.isFinite(parsed.minAgents) ? Number(parsed.minAgents) : 2,
+      maxAgents: Number.isFinite(parsed.maxAgents) ? Number(parsed.maxAgents) : 4,
+      applied: parsed.applied === true,
+      blockedBy: Array.isArray(parsed.blockedBy) ? parsed.blockedBy.map(String) : [],
+      decidedAt: Number.isFinite(parsed.decidedAt) ? Number(parsed.decidedAt) : 0,
+      ...(Number.isFinite(parsed.spawnedAgents) ? { spawnedAgents: Number(parsed.spawnedAgents) } : {}),
+    }
+  } catch {
+    return null
+  }
+}
+
+/** 在模型第一次调用前写入编队判定，保证“为什么编队/为什么没编队”可回看。 */
+export function recordAgentRunFormation(
+  db: Db,
+  runId: string,
+  decision: TeamFormationDecision,
+  applied: boolean,
+  blockedBy: readonly string[] = [],
+): void {
+  const formation: AgentRunFormation = {
+    ...decision,
+    applied,
+    blockedBy,
+    decidedAt: Date.now(),
+  }
+  db.prepare('UPDATE agent_runs SET formation_json = ? WHERE id = ?')
+    .run(JSON.stringify(formation), runId)
+}
+
+/** 实际派发成功后补记人数；只改人员数字，不覆盖判定理由。 */
+export function recordAgentRunSpawnedAgents(db: Db, runId: string, count: number): void {
+  const row = db.prepare('SELECT formation_json FROM agent_runs WHERE id = ?')
+    .get(runId) as unknown as { formation_json: string | null } | undefined
+  const formation = parseFormationJson(row?.formation_json ?? null)
+  if (!formation) return
+  const next: AgentRunFormation = {
+    ...formation,
+    spawnedAgents: Math.max(0, Math.trunc(count)),
+  }
+  db.prepare('UPDATE agent_runs SET formation_json = ? WHERE id = ?')
+    .run(JSON.stringify(next), runId)
 }
 
 /** 控制台运行树：按 started_at 倒序取最近 runs，再补每一步工具轨迹。 */
@@ -568,6 +636,7 @@ export function listAgentRuns(
     budget: row.budget,
     spentTokens: row.spent_tokens,
     error: row.error,
+    formation: parseFormationJson(row.formation_json),
     startedAt: row.started_at,
     endedAt: row.ended_at,
     depth: depthOf(row),
@@ -582,6 +651,173 @@ export function listAgentRuns(
       durationMs: step.duration_ms,
     })),
   }))
+}
+
+export interface AgentRunDetailStep {
+  readonly id: string
+  readonly seq: number
+  readonly kind: string
+  readonly toolId: string | null
+  readonly name: string | null
+  readonly status: string
+  readonly args: unknown
+  readonly resultSummary: string | null
+  readonly durationMs: number
+  readonly at: number
+}
+
+export interface AgentRunDetailRecord extends Omit<AgentRunRecord, 'steps'> {
+  readonly selected: boolean
+  readonly steps: ReadonlyArray<AgentRunDetailStep>
+}
+
+export interface AgentRunDetail {
+  readonly selectedId: string
+  readonly rootId: string
+  readonly runs: ReadonlyArray<AgentRunDetailRecord>
+  readonly truncated: boolean
+  readonly stats: {
+    readonly totalRuns: number
+    readonly activeRuns: number
+    readonly failedRuns: number
+    readonly totalSteps: number
+    readonly totalTokens: number
+    readonly wallMs: number
+    readonly totalDurationMs: number
+  }
+}
+
+/** 控制台任务详情：以目标 run 所在树的根为起点，返回父子树、工具参数、结果摘要、耗时和 token。 */
+export function getAgentRunDetail(db: Db, companyId: string, runId: string): AgentRunDetail | null {
+  const runStatement = db.prepare('SELECT * FROM agent_runs WHERE company_id = ? AND id = ?')
+  const target = runStatement.get(companyId, runId) as unknown as RunRow | undefined
+  if (!target) return null
+
+  // 先找到这棵树真正的根；控制台从任意子 Agent 点进详情时也能看到完整父子树。
+  let root = target
+  const ancestors = new Set<string>([target.id])
+  for (let guard = 0; guard < 20 && root.parent_run_id; guard += 1) {
+    const parent = runStatement.get(companyId, root.parent_run_id) as unknown as RunRow | undefined
+    if (!parent || ancestors.has(parent.id)) break
+    ancestors.add(parent.id)
+    root = parent
+  }
+
+  // 递归 CTE 一次取回整棵树；depth 是相对根节点的层级，最多 20 层、200 条，避免异常数据把控制台拖死。
+  const treeRows = db.prepare(
+    `WITH RECURSIVE tree(
+       id, parent_run_id, agent_id, title, model_id, session_id, status, budget,
+       spent_tokens, error, formation_json, started_at, ended_at, depth
+     ) AS (
+       SELECT id, parent_run_id, agent_id, title, model_id, session_id, status, budget,
+              spent_tokens, error, formation_json, started_at, ended_at, 0
+         FROM agent_runs WHERE company_id = ? AND id = ?
+       UNION ALL
+       SELECT r.id, r.parent_run_id, r.agent_id, r.title, r.model_id, r.session_id, r.status,
+              r.budget, r.spent_tokens, r.error, r.formation_json, r.started_at, r.ended_at, t.depth + 1
+         FROM agent_runs r JOIN tree t ON r.parent_run_id = t.id
+        WHERE r.company_id = ? AND t.depth < 20
+     )
+     SELECT * FROM tree ORDER BY depth, started_at, id LIMIT 201`,
+  ).all(companyId, root.id, companyId) as unknown as Array<RunRow & { depth: number }>
+  const truncated = treeRows.length > 200
+  const rows = truncated ? treeRows.slice(0, 200) : treeRows
+  if (rows.length === 0) return null
+
+  const stepRows = db.prepare(
+    `SELECT * FROM agent_steps WHERE run_id IN (${rows.map(() => '?').join(',')}) ORDER BY run_id, seq`,
+  ).all(...rows.map((row) => row.id)) as unknown as Array<StepRow & {
+    args_json: string | null
+    created_at: number
+  }>
+  const stepsByRun = new Map<string, Array<StepRow & { args_json: string | null; created_at: number }>>()
+  for (const step of stepRows) {
+    const list = stepsByRun.get(step.run_id) ?? []
+    list.push(step)
+    stepsByRun.set(step.run_id, list)
+  }
+
+  // 重新按父子顺序展开，避免“按 depth 排序”把同一层的不同子树混在一起。
+  const byId = new Map(rows.map((row) => [row.id, row]))
+  const children = new Map<string, Array<RunRow & { depth: number }>>()
+  for (const row of rows) {
+    if (row.parent_run_id && byId.has(row.parent_run_id)) {
+      const list = children.get(row.parent_run_id) ?? []
+      list.push(row)
+      children.set(row.parent_run_id, list)
+    }
+  }
+  const ordered: Array<RunRow & { depth: number }> = []
+  const visited = new Set<string>()
+  const visit = (row: RunRow & { depth: number }, depth: number): void => {
+    if (visited.has(row.id)) return
+    visited.add(row.id)
+    ordered.push({ ...row, depth })
+    for (const child of children.get(row.id) ?? []) visit(child, depth + 1)
+  }
+  visit(rows[0]!, 0)
+
+  const now = Date.now()
+  const runs = ordered.map((row) => ({
+    id: row.id,
+    parentRunId: row.parent_run_id,
+    agentId: row.agent_id,
+    title: row.title,
+    modelId: row.model_id,
+    sessionId: row.session_id,
+    status: row.status,
+    budget: row.budget,
+    spentTokens: row.spent_tokens,
+    error: row.error,
+    formation: parseFormationJson(row.formation_json),
+    startedAt: row.started_at,
+    endedAt: row.ended_at,
+    depth: row.depth,
+    selected: row.id === runId,
+    steps: (stepsByRun.get(row.id) ?? []).map((step) => ({
+      id: step.id,
+      seq: step.seq,
+      kind: step.kind,
+      toolId: step.tool_id,
+      name: step.name,
+      status: step.status,
+      args: parseStepArgs(step.args_json),
+      resultSummary: step.result_summary,
+      durationMs: step.duration_ms,
+      at: step.created_at,
+    })),
+  }))
+  const totalSteps = runs.reduce((sum, run) => sum + run.steps.length, 0)
+  const totalTokens = runs.reduce((sum, run) => sum + run.spentTokens, 0)
+  const totalDurationMs = runs.reduce(
+    (sum, run) => sum + Math.max(0, (run.endedAt ?? now) - run.startedAt),
+    0,
+  )
+  const latestEnd = runs.reduce((latest, run) => Math.max(latest, run.endedAt ?? now), root.started_at)
+  return {
+    selectedId: runId,
+    rootId: root.id,
+    runs,
+    truncated,
+    stats: {
+      totalRuns: runs.length,
+      activeRuns: runs.filter((run) => run.status === 'running' || run.status === 'suspended').length,
+      failedRuns: runs.filter((run) => run.status === 'failed').length,
+      totalSteps,
+      totalTokens,
+      wallMs: Math.max(0, latestEnd - root.started_at),
+      totalDurationMs,
+    },
+  }
+}
+
+function parseStepArgs(raw: string | null): unknown {
+  if (!raw) return null
+  try {
+    return JSON.parse(raw)
+  } catch {
+    return raw
+  }
 }
 
 export function activeAgentRunCount(): number {

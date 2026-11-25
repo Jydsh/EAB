@@ -253,6 +253,146 @@ describe('跨成员团队学习候选', () => {
         kind: 'cloud',
       }).find((item) => item.function.name === 'memory_propose')
       expect(spec).toBeTruthy()
+      expect((spec?.function.parameters as any)?.properties?.memoryType?.enum).toEqual([
+        'preference',
+        'fact',
+        'decision',
+        'episode',
+      ])
+      expect((spec?.function.parameters as any)?.properties?.scopeType?.enum).toEqual([
+        'user',
+        'company',
+      ])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('memory.propose 可把个人偏好写成当前用户自动生效的记忆，不共享给团队', async () => {
+    const { dir, deps, actor } = testDeps()
+    try {
+      const learningActor = {
+        ...actor,
+        subject: {
+          ...actor.subject,
+          scopes: new Set([...actor.subject.scopes, SC.MEMORY_WRITE]),
+        },
+      }
+      const result = (await executeTool(
+        deps,
+        learningActor as unknown as Parameters<typeof executeTool>[1],
+        'memory.propose',
+        {
+          content: '回复时先给结论，再列细节，尽量控制在一屏内。',
+          scopeType: 'user',
+          memoryType: 'preference',
+        },
+      )) as Record<string, unknown>
+      expect(result).toMatchObject({
+        scopeType: 'user',
+        memoryType: 'preference',
+        confirmed: true,
+        status: 'active',
+      })
+      expect(String(result.note)).toContain('我的记忆')
+      expect(String(result.note)).toContain('自动生效')
+      const row = deps.db
+        .prepare('SELECT scope_type, scope_id, user_id, confirmed, memory_type, content FROM memories WHERE id = ?')
+        .get(String(result.id)) as {
+        scope_type: string
+        scope_id: string
+        user_id: string
+        confirmed: number
+        memory_type: string
+        content: string
+      }
+      expect(row).toMatchObject({
+        scope_type: 'user',
+        scope_id: 'u1',
+        user_id: 'u1',
+        confirmed: 1,
+        memory_type: 'preference',
+      })
+      expect(row.content).toContain('先给结论')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('个人偏好与已确认旧偏好相近时进入冲突待确认，不覆盖旧记忆', async () => {
+    const { dir, deps, actor } = testDeps()
+    try {
+      const learningActor = {
+        ...actor,
+        subject: {
+          ...actor.subject,
+          scopes: new Set([...actor.subject.scopes, SC.MEMORY_WRITE]),
+        },
+      }
+      const now = Date.now()
+      deps.db.prepare(
+        `INSERT INTO memories
+          (id, company_id, scope_type, scope_id, user_id, content, confirmed, created_at, memory_type)
+         VALUES (?, 'c1', 'user', 'u1', 'u1', ?, 1, ?, 'preference')`,
+      ).run('m_old_preference', '回复时先给结论，再列细节。', now)
+      const result = (await executeTool(
+        deps,
+        learningActor as unknown as Parameters<typeof executeTool>[1],
+        'memory.propose',
+        {
+          content: '回复时先给结论，再列细节，每条不超过两行。',
+          scopeType: 'user',
+          memoryType: 'preference',
+        },
+      )) as Record<string, unknown>
+      expect(result).toMatchObject({
+        scopeType: 'user',
+        status: 'conflict',
+        confirmed: false,
+        conflictWith: 'm_old_preference',
+      })
+      const oldRow = deps.db.prepare('SELECT confirmed, deleted_at FROM memories WHERE id = ?')
+        .get('m_old_preference') as { confirmed: number; deleted_at: number | null }
+      expect(oldRow).toMatchObject({ confirmed: 1, deleted_at: null })
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('memory.propose 遇到已确认的相近决策时进入冲突待确认，不覆盖旧记忆', async () => {
+    const { dir, deps, actor } = testDeps()
+    try {
+      const learningActor = {
+        ...actor,
+        subject: {
+          ...actor.subject,
+          scopes: new Set([...actor.subject.scopes, SC.MEMORY_WRITE]),
+        },
+      }
+      const now = Date.now()
+      deps.db.prepare(
+        `INSERT INTO memories
+          (id, company_id, scope_type, scope_id, user_id, content, confirmed, created_at, memory_type)
+         VALUES (?, 'c1', 'company', 'c1', 'u1', ?, 1, ?, 'decision')`,
+      ).run('m_old_decision', '周报统一在每周五 17:00 前提交', now)
+      const result = (await executeTool(
+        deps,
+        learningActor as unknown as Parameters<typeof executeTool>[1],
+        'memory.propose',
+        { content: '周报统一在每周五 18:00 前提交', memoryType: 'decision' },
+      )) as Record<string, unknown>
+      expect(result).toMatchObject({
+        status: 'conflict',
+        confirmed: false,
+        memoryType: 'decision',
+        conflictWith: 'm_old_decision',
+      })
+      const newRow = deps.db.prepare('SELECT conflict_with, confirmed FROM memories WHERE id = ?')
+        .get(String(result.id)) as { conflict_with: string | null; confirmed: number }
+      expect(newRow).toMatchObject({ conflict_with: 'm_old_decision', confirmed: 0 })
+      const oldRow = deps.db.prepare('SELECT confirmed, deleted_at FROM memories WHERE id = ?')
+        .get('m_old_decision') as { confirmed: number; deleted_at: number | null }
+      expect(oldRow).toMatchObject({ confirmed: 1, deleted_at: null })
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }

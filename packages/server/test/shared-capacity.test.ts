@@ -1,5 +1,4 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import { MemoryCache } from '../src/backends/cache.js'
 import {
   coordinationStatus,
   readCapacityCount,
@@ -8,6 +7,7 @@ import {
 } from '../src/backends/coordination.js'
 import { setBackendRuntimeForTest } from '../src/backends/runtime.js'
 import { sharedToolCapacityStats } from '../src/routes/tools.js'
+import { installSharedCache } from './helpers/shared-cache.js'
 
 afterEach(() => {
   setBackendRuntimeForTest(undefined)
@@ -22,7 +22,7 @@ describe('共享并发数回读', () => {
   })
 
   it('共享层在线时能读回全局占用数', async () => {
-    setBackendRuntimeForTest({ cache: new MemoryCache(1_000) } as never)
+    installSharedCache(1_000)
     const reservation = await reserveCapacity([{ key: 'tool:tool.search', limit: 4 }])
     expect(reservation.ok).toBe(true)
     if (reservation.ok) {
@@ -35,7 +35,7 @@ describe('共享并发数回读', () => {
   })
 
   it('名额释放后读数回到 0', async () => {
-    setBackendRuntimeForTest({ cache: new MemoryCache(1_000) } as never)
+    installSharedCache(1_000)
     const reservation = await reserveCapacity([{ key: 'tool:tool.search', limit: 4 }])
     if (reservation.ok) reservation.lease.release()
     // release 是异步发的，等一拍再读

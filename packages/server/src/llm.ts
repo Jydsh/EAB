@@ -1655,3 +1655,136 @@ export async function callSpeechStream(
     sampleRate: Number.isFinite(rawSampleRate) && rawSampleRate > 0 ? Math.round(rawSampleRate) : 24_000,
   }
 }
+
+export interface ImageGenerationResult {
+  readonly image: Buffer
+  readonly mime: string
+  readonly modelKey: string
+  /** 部分供应商会改写提示词，原样透传给前端便于核对。 */
+  readonly revisedPrompt?: string
+}
+
+const IMAGE_MAX_BYTES = 24 * 1024 * 1024
+
+/** 只认真实图片头，避免供应商把 HTML 错误页或 JSON 当图片返回。 */
+function imageMimeOf(buffer: Buffer): string | null {
+  if (buffer.length < 12) return null
+  if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47) return 'image/png'
+  if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return 'image/jpeg'
+  if (buffer.subarray(0, 4).toString('ascii') === 'RIFF' && buffer.subarray(8, 12).toString('ascii') === 'WEBP') {
+    return 'image/webp'
+  }
+  if (buffer.subarray(0, 3).toString('ascii') === 'GIF') return 'image/gif'
+  return null
+}
+
+function decodeImageData(raw: string): Buffer {
+  const value = raw.trim()
+  const dataUri = /^data:image\/[a-z0-9.+-]+;base64,(.*)$/i.exec(value)
+  const base64 = dataUri ? dataUri[1] : value
+  let buffer: Buffer
+  try {
+    buffer = Buffer.from(base64, 'base64')
+  } catch {
+    throw new EabError(EC.VALIDATION, '图片生成返回的 base64 无法解码')
+  }
+  return buffer
+}
+
+async function downloadGeneratedImage(url: string): Promise<Buffer> {
+  if (!/^https?:\/\//i.test(url)) {
+    throw new EabError(EC.VALIDATION, '图片生成返回的下载地址不是 http(s)')
+  }
+  const res = await fetch(url, { signal: AbortSignal.timeout(60_000) })
+  if (!res.ok) throw new EabError(EC.VALIDATION, `下载生成图片失败：HTTP ${res.status}`)
+  const declared = Number(res.headers.get('content-length') ?? 0)
+  if (declared > IMAGE_MAX_BYTES) {
+    throw new EabError(EC.VALIDATION, `生成图片超过 ${Math.round(IMAGE_MAX_BYTES / 1024 / 1024)}MB 上限`)
+  }
+  const buffer = Buffer.from(await res.arrayBuffer())
+  if (buffer.length > IMAGE_MAX_BYTES) {
+    throw new EabError(EC.VALIDATION, `生成图片超过 ${Math.round(IMAGE_MAX_BYTES / 1024 / 1024)}MB 上限`)
+  }
+  return buffer
+}
+
+/**
+ * 图片生成（用途路由 `image.default` 的运行时实现）。
+ *
+ * 只支持 OpenAI 兼容 `POST /images/generations`，返回 `data[0].b64_json` 或 `data[0].url`。
+ * 这是独立内容工具，不参与对话推理；调用方负责把结果落到个人云空间。
+ */
+export async function callImageGeneration(
+  db: Db,
+  dbPath: string,
+  companyId: string,
+  modelId: string,
+  prompt: string,
+  options: { size?: string } = {},
+): Promise<ImageGenerationResult> {
+  const input = prompt.trim()
+  if (!input) throw new EabError(EC.VALIDATION, '图片生成缺少提示词')
+  if (input.length > 2_000) throw new EabError(EC.VALIDATION, '图片提示词不能超过 2000 字')
+  const provider = providerOf(db, companyId, modelId)
+  if (provider.kind === 'demo') {
+    throw new EabError(EC.VALIDATION, '演示模型不提供图片生成能力', {
+      hint: '请接入任意 OpenAI 兼容的 /images/generations 端点，并在控制台把 image.default 绑定到它',
+    })
+  }
+  if (provider.kind === 'anthropic' || provider.kind === 'gemini') {
+    throw new EabError(EC.VALIDATION, `供应商「${provider.name}」没有标准的图片生成接口`, {
+      hint: '请选择 OpenAI 兼容的 /images/generations 端点',
+    })
+  }
+  const base = trimBase(provider.base_url || DEFAULT_BASE[provider.kind] || '')
+  if (!base) throw new EabError(EC.VALIDATION, `供应商「${provider.name}」还没有填写端点`)
+  const key = apiKeyOf(provider, dbPath)
+  const url = /\/images\/generations$/i.test(base) ? base : `${base}/images/generations`
+  const size = String(options.size ?? '').trim()
+  if (size && !/^\d{2,4}x\d{2,4}$/.test(size)) {
+    throw new EabError(EC.VALIDATION, '图片尺寸格式应为 宽x高，例如 1024x1024')
+  }
+  const headers: Record<string, string> = { 'content-type': 'application/json' }
+  if (key) headers.authorization = `Bearer ${key}`
+  const body: Record<string, unknown> = { model: provider.modelKey, prompt: input, n: 1 }
+  if (size) body.size = size
+  const res = await fetch(url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(180_000),
+  })
+  if (!res.ok) {
+    throw new EabError(EC.VALIDATION, `图片生成失败：HTTP ${res.status} ${await readError(res)}`.trim(), {
+      hint: '确认端点支持 OpenAI 兼容的 /images/generations，且模型名与供应商侧一致',
+    })
+  }
+  let payload: unknown = null
+  try {
+    payload = await res.json()
+  } catch {
+    payload = null
+  }
+  const data = payload && typeof payload === 'object'
+    ? (payload as { data?: unknown }).data
+    : null
+  const first = Array.isArray(data) && data[0] && typeof data[0] === 'object'
+    ? data[0] as { b64_json?: unknown; url?: unknown; revised_prompt?: unknown }
+    : null
+  if (!first) throw new EabError(EC.VALIDATION, '图片生成返回里没有 data[0]')
+  const b64 = typeof first.b64_json === 'string' ? first.b64_json.trim() : ''
+  const remoteUrl = typeof first.url === 'string' ? first.url.trim() : ''
+  const buffer = b64 ? decodeImageData(b64) : remoteUrl ? await downloadGeneratedImage(remoteUrl) : Buffer.alloc(0)
+  if (buffer.length === 0) throw new EabError(EC.VALIDATION, '图片生成返回空图片')
+  if (buffer.length > IMAGE_MAX_BYTES) {
+    throw new EabError(EC.VALIDATION, `生成图片超过 ${Math.round(IMAGE_MAX_BYTES / 1024 / 1024)}MB 上限`)
+  }
+  const mime = imageMimeOf(buffer)
+  if (!mime) throw new EabError(EC.VALIDATION, '图片生成返回的不是可识别的图片格式（支持 PNG/JPEG/WEBP/GIF）')
+  return {
+    image: buffer,
+    mime,
+    modelKey: provider.modelKey,
+    revisedPrompt: typeof first.revised_prompt === 'string' ? first.revised_prompt : undefined,
+  }
+}

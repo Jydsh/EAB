@@ -1,3 +1,4 @@
+export * from './chart-catalog.js'
 export * from './types.js'
 export * from './scopes.js'
 export * from './errors.js'

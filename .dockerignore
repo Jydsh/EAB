@@ -1,0 +1,15 @@
+.git
+.gitignore
+.env
+.eab-dev
+.sessions
+node_modules
+**/node_modules
+dist
+coverage
+*.log
+docs
+demo
+.idea
+.vscode
+.DS_Store

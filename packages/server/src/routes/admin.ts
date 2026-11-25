@@ -1950,7 +1950,7 @@ export function registerAdminRoutes(app: FastifyInstance, deps: ServerDeps): voi
     const rows = deps.db
       .prepare(
         `SELECT a.id, a.requester_user_id, u.name AS requester_name, a.action, a.resource_type, a.resource_id,
-                a.payload_json, a.status, a.reason, a.decided_by, a.decided_at, a.expires_at, a.created_at
+                a.payload_json, a.status, a.reason, a.decided_by, a.decided_at, a.used_at, a.expires_at, a.created_at
            FROM approvals a LEFT JOIN users u ON u.id = a.requester_user_id
           WHERE a.company_id = ? AND (? = 'all' OR a.status = ?)
           ORDER BY a.created_at DESC LIMIT 100`,
@@ -1968,6 +1968,7 @@ export function registerAdminRoutes(app: FastifyInstance, deps: ServerDeps): voi
         status: row.status,
         reason: row.reason,
         decidedBy: row.decided_by,
+        usedAt: row.used_at ? new Date(Number(row.used_at)).toISOString() : null,
         expiresAt: row.expires_at ? new Date(Number(row.expires_at)).toISOString() : null,
         createdAt: new Date(Number(row.created_at)).toISOString(),
       })),
@@ -1983,19 +1984,41 @@ export function registerAdminRoutes(app: FastifyInstance, deps: ServerDeps): voi
       if (!['approved', 'rejected'].includes(decisionRaw)) throw new EabError(EC.VALIDATION, 'decision 只能是 approved / rejected')
       const decision = decisionRaw as 'approved' | 'rejected'
       const row = deps.db
-        .prepare('SELECT id, status, action, requester_user_id, payload_json FROM approvals WHERE id = ? AND company_id = ?')
+        .prepare('SELECT id, status, action, requester_user_id, payload_json, expires_at FROM approvals WHERE id = ? AND company_id = ?')
         .get(req.params.id, companyId) as
-        | { id: string; status: string; action: string; requester_user_id: string; payload_json: string | null }
+        | { id: string; status: string; action: string; requester_user_id: string; payload_json: string | null; expires_at: number | null }
         | undefined
       if (!row) throw new EabError(EC.NOT_FOUND, '审批不存在')
       if (row.status !== 'pending') throw new EabError(EC.CONFLICT, `审批已是 ${row.status}`)
-      deps.db
-        .prepare('UPDATE approvals SET status = ?, decided_by = ?, decided_at = ?, reason = COALESCE(?, reason) WHERE id = ?')
-        .run(decision, 'console-operator', Date.now(), optionalText(req.body?.reason, 200), row.id)
+      const now = Date.now()
+      if (row.expires_at !== null && row.expires_at <= now) {
+        deps.db.prepare(
+          `UPDATE approvals SET status = 'expired', decided_by = 'system:expired', decided_at = ?
+            WHERE id = ? AND company_id = ? AND status = 'pending'`,
+        ).run(now, row.id, companyId)
+        throw new EabError(EC.CONFLICT, '审批已过期，请重新发起')
+      }
+      const updated = deps.db
+        .prepare(
+          `UPDATE approvals SET status = ?, decided_by = ?, decided_at = ?, reason = COALESCE(?, reason)
+            WHERE id = ? AND company_id = ? AND status = 'pending'`,
+        )
+        .run(decision, 'console-operator', now, optionalText(req.body?.reason, 200), row.id, companyId)
+      if (Number(updated.changes) !== 1) throw new EabError(EC.CONFLICT, '审批已被其他管理员处理')
       audit(deps, req, companyId, `approval.${decision}`, 'approval', row.id, { decision })
-      let payload: { toolId?: string; skillId?: string } | null = null
+      type ApprovalPayload = {
+        toolId?: string
+        toolName?: string
+        skillId?: string
+        risk?: string
+        argsSummary?: string
+        sessionId?: string
+        messageId?: string
+        expiresAt?: number
+      }
+      let payload: ApprovalPayload | null = null
       try {
-        payload = row.payload_json ? (JSON.parse(row.payload_json) as { toolId?: string; skillId?: string }) : null
+        payload = row.payload_json ? (JSON.parse(row.payload_json) as ApprovalPayload) : null
       } catch {
         payload = null
       }
@@ -2010,6 +2033,26 @@ export function registerAdminRoutes(app: FastifyInstance, deps: ServerDeps): voi
         skillId: payload?.skillId,
         reason: optionalText(req.body?.reason, 200),
       })
+      // 网页请求可能仍在轮询等待：把决定推回原气泡，避免审批卡一直停在「待处理」。
+      if (payload?.sessionId && payload?.messageId) {
+        publishChatEvent({
+          type: 'approval',
+          companyId,
+          userId: row.requester_user_id,
+          sessionId: payload.sessionId,
+          messageId: payload.messageId,
+          approval: {
+            id: row.id,
+            toolId: payload.toolId ?? '',
+            toolName: payload.toolName ?? '',
+            risk: payload.risk === 'exec' || payload.risk === 'irreversible' || payload.risk === 'write' ? payload.risk : 'write',
+            argsSummary: payload.argsSummary ?? '',
+            expiresAt: payload.expiresAt ?? Date.now(),
+            status: decision,
+            reason: optionalText(req.body?.reason, 200),
+          },
+        })
+      }
       return ok({ id: row.id, status: decision })
     },
   )

@@ -13,7 +13,7 @@
  */
 import type { Db } from '@eab/storage'
 import { createHash, randomUUID } from 'node:crypto'
-import { createReadStream, existsSync, realpathSync, statSync } from 'node:fs'
+import { closeSync, createReadStream, existsSync, openSync, readSync, realpathSync, statSync } from 'node:fs'
 import { basename, extname, isAbsolute, relative } from 'node:path'
 import { EC, EabError } from '@eab/domain'
 import { isWithinRoot, safeJoin } from '@eab/workspace'
@@ -51,6 +51,8 @@ export interface PublishAgentArtifactInput {
   fileId?: string
   uri?: string
   name?: string
+  /** 外部 URI 的媒体类型；不传时按扩展名推断，仍无法识别则用 text/uri-list */
+  mimeType?: string
   preview?: string
   now?: number
 }
@@ -80,7 +82,63 @@ function cleanText(value: unknown, max: number): string {
 }
 
 function mimeOf(name: string, fallback: string | null | undefined): string {
-  return cleanText(fallback, 128) || MIME_BY_EXT[extname(name).toLowerCase()] || 'application/octet-stream'
+  // 扩展名比 workspace_files 里可能过期的 mime 更可靠，先按扩展名推断。
+  return MIME_BY_EXT[extname(name).toLowerCase()] || cleanText(fallback, 128) || 'application/octet-stream'
+}
+
+/** 预览是一条单行摘要，避免换行把父 Agent 的产物清单撑成多行。 */
+function cleanPreview(value: unknown, max = 500): string {
+  return typeof value === 'string'
+    ? value.replace(/\s+/g, ' ').trim().slice(0, max)
+    : ''
+}
+
+function formatBytes(size: number): string {
+  if (!Number.isFinite(size) || size <= 0) return '大小未知'
+  if (size < 1024) return `${size} B`
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`
+}
+
+function isTextMime(mimeType: string): boolean {
+  return /^text\//i.test(mimeType) ||
+    /(?:json|xml|javascript|csv|markdown|yaml|sql|x-sh|x-python)/i.test(mimeType)
+}
+
+/**
+ * 只读文件开头一小段，生成可核对的文本预览；二进制文件退化为元数据摘要。
+ * 这里不能整文件读取，产物再大也只占固定内存。
+ */
+function readTextPreview(path: string, mimeType: string, size: number): string {
+  if (!isTextMime(mimeType) || size <= 0) return ''
+  let fd: number | undefined
+  try {
+    fd = openSync(path, 'r')
+    const buffer = Buffer.alloc(Math.min(1024, size))
+    const read = readSync(fd, buffer, 0, buffer.length, 0)
+    const text = buffer.subarray(0, read).toString('utf8')
+      .replace(/^\uFEFF/, '')
+      .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '')
+    return cleanPreview(text, 240)
+  } catch {
+    return ''
+  } finally {
+    if (fd !== undefined) closeSync(fd)
+  }
+}
+
+function metadataPreview(name: string, mimeType: string, size: number, external = false): string {
+  const kind = external ? '外部产物' : '文件'
+  const sizeText = size > 0 ? `，${formatBytes(size)}` : ''
+  return `${kind}：${name}（${mimeType}${sizeText}）`
+}
+
+/**
+ * 外部 URI 没有本地内容可算内容校验和，只能对“引用本身”做稳定指纹。
+ * 前缀 ref-sha256 明确表示这是引用指纹，不是文件内容 sha256。
+ */
+function digestReference(uri: string, name: string, mimeType: string): string {
+  return `ref-sha256:${createHash('sha256').update(`${uri}\n${name}\n${mimeType}`).digest('hex')}`
 }
 
 function sourceOfUri(uri: string): ArtifactSource {
@@ -228,10 +286,11 @@ export async function publishAgentArtifact(input: PublishAgentArtifactInput): Pr
 
   const now = input.now ?? Date.now()
   const name = cleanText(input.name, 256)
-  const preview = cleanText(input.preview, 500)
+  const preview = cleanPreview(input.preview, 500)
   const rawPath = cleanText(input.path, 1000)
   const fileId = cleanText(input.fileId, 128)
   const uriText = cleanText(input.uri, 2000)
+  const requestedMime = cleanText(input.mimeType, 128)
 
   const modes = [rawPath, fileId, uriText].filter(Boolean).length
   if (modes !== 1) {
@@ -242,17 +301,19 @@ export async function publishAgentArtifact(input: PublishAgentArtifactInput): Pr
     const resolved = resolveWorkspacePath(input.workspaceRoot, rawPath)
     const row = findFileByRelPath(input.db, input.companyId, input.userId, resolved.relPath)
     const stat = statSync(resolved.absolute)
+    const artifactName = name || row?.name || resolved.name
+    const mimeType = mimeOf(resolved.name, row?.mime)
     const artifactUri = row ? `eab://workspace/file/${row.id}` : `eab://workspace/path/${encodeURIComponent(resolved.relPath)}`
     return persistArtifact(input.db, input.team, input.taskId, {
       companyId: input.companyId,
       userId: input.userId,
-      name: name || row?.name || resolved.name,
-      mimeType: mimeOf(resolved.name, row?.mime),
+      name: artifactName,
+      mimeType,
       size: stat.size,
       checksum: await digestFile(resolved.absolute),
       source: 'workspace',
       uri: artifactUri,
-      preview,
+      preview: preview || readTextPreview(resolved.absolute, mimeType, stat.size) || metadataPreview(artifactName, mimeType, stat.size),
       ...(row ? { fileId: row.id } : {}),
     }, now)
   }
@@ -262,16 +323,18 @@ export async function publishAgentArtifact(input: PublishAgentArtifactInput): Pr
     if (!row) throw new EabError(EC.NOT_FOUND, `云空间里没有找到文件: ${fileId}`)
     const resolved = resolveWorkspacePath(input.workspaceRoot, row.rel_path)
     const stat = statSync(resolved.absolute)
+    const artifactName = name || row.name
+    const mimeType = mimeOf(row.name, row.mime)
     return persistArtifact(input.db, input.team, input.taskId, {
       companyId: input.companyId,
       userId: input.userId,
-      name: name || row.name,
-      mimeType: mimeOf(row.name, row.mime),
+      name: artifactName,
+      mimeType,
       size: stat.size,
       checksum: await digestFile(resolved.absolute),
       source: 'cloud',
       uri: `eab://workspace/file/${row.id}`,
-      preview,
+      preview: preview || readTextPreview(resolved.absolute, mimeType, stat.size) || metadataPreview(artifactName, mimeType, stat.size),
       fileId: row.id,
     }, now)
   }
@@ -280,15 +343,16 @@ export async function publishAgentArtifact(input: PublishAgentArtifactInput): Pr
     throw new EabError(EC.VALIDATION, 'uri 只支持 mcp: / a2a: / https: / http: / eab: 协议')
   }
   if (!name) throw new EabError(EC.VALIDATION, '登记外部 uri 产物时必须提供 name')
+  const mimeType = requestedMime || MIME_BY_EXT[extname(name).toLowerCase()] || 'text/uri-list'
   return persistArtifact(input.db, input.team, input.taskId, {
     companyId: input.companyId,
     userId: input.userId,
     name,
-    mimeType: 'text/uri-list',
+    mimeType,
     size: 0,
-    checksum: '',
+    checksum: digestReference(uriText, name, mimeType),
     source: sourceOfUri(uriText),
     uri: uriText,
-    preview,
+    preview: preview || metadataPreview(name, mimeType, 0, true),
   }, now)
 }

@@ -37,6 +37,7 @@ import { recoverInterruptedAgentTasks } from './agent-team.js'
 import { startRestartTaskWakeRecovery } from './routes/chat.js'
 import { startScheduleWorker } from './schedule.js'
 import { startOrgSyncScheduler } from './org-sync-scheduler.js'
+import { startMemoryMaintenance } from './memory-maintenance.js'
 import { startModelHealthMonitor, isModelHealthy, probeUnverifiedPluginModels, forgetModelHealth, probePluginChannelModels } from './model-health.js'
 import { JOB_KINDS, recoverStaleJobs, startJobWorker } from './job-queue.js'
 import { refreshPluginChannel } from './plugin-models.js'
@@ -48,6 +49,7 @@ import { checkForUpdate } from './update.js'
 import { acquireProcessLock, type ProcessLock } from './process-lock.js'
 import { applyNetworkToConfig, type NetworkTarget } from './network-settings.js'
 import { initBackends, closeBackends } from './backends/runtime.js'
+import { useDatabaseCoordination } from './backends/coordination.js'
 
 // 搬迁必须在开库之前完成：旧的库、云空间、插件目录先复制并校验，成功后才切换指针。
 try {
@@ -79,10 +81,15 @@ mkdirSync(dirname(config.dbPath), { recursive: true })
 const lockDir = config.dataDir ?? dirname(config.dbPath)
 let processLock: ProcessLock
 try {
-  processLock = acquireProcessLock(lockDir, config.dbPath)
+  processLock = acquireProcessLock(lockDir, config.dbPath, { allowMultiple: config.multiInstance })
 } catch (error) {
   console.error(`[eab] ${error instanceof Error ? error.message : String(error)}`)
   process.exit(1)
+}
+if (config.multiInstance) {
+  console.log(
+    `[eab] 多实例模式：role=${config.serverRole}，已跳过单写进程锁；单例后台任务改由数据库租约选主`,
+  )
 }
 // 正常退出、异常退出和 Ctrl+C 都要回收锁；release 自身是幂等的。
 process.on('exit', () => processLock.release())
@@ -99,6 +106,15 @@ const migration = migrate(db)
 if (migration.applied.length > 0) {
   console.log(`迁移已执行: ${migration.applied.join(', ')}`)
 }
+
+/**
+ * 多实例但没接 Redis 时，把协调层换成 SQLite TTL 租约。
+ * 必须在迁移之后调用，`runtime_coordination` 表才存在；单实例不启用，保持旧行为。
+ */
+if (config.multiInstance) {
+  useDatabaseCoordination(db)
+}
+const backgroundWorker = config.serverRole !== 'api'
 
 /**
  * 可选后端插件：不配 PostgreSQL/Redis 时这里只启用内存缓存；
@@ -123,46 +139,58 @@ try {
 
 /**
  * 僵尸 Agent 运行记录：
- * 进程锁保证同一数据目录只有一个实例，所以库里 running 但没有心跳的 run 只能是
- * 上次进程异常退出留下的，启动时统一收尾，避免控制台一直显示「运行中」。
+ * 单实例时，进程锁保证库里 running 但没有心跳的 run 只能来自上次异常退出；
+ * 多实例下不能做全局扫描——另一个实例的活跃 run 会被误判为僵尸。
  */
-try {
-  const sweptRuns = await sweepOrphanAgentRuns(db)
-  if (sweptRuns > 0) console.log(`[eab] 已回收 ${sweptRuns} 条僵尸 Agent 运行记录`)
-} catch (error) {
-  console.warn(`[eab] 僵尸 run 清理失败：${(error as Error).message}`)
+if (!config.multiInstance) {
+  try {
+    const sweptRuns = await sweepOrphanAgentRuns(db)
+    if (sweptRuns > 0) console.log(`[eab] 已回收 ${sweptRuns} 条僵尸 Agent 运行记录`)
+  } catch (error) {
+    console.warn(`[eab] 僵尸 run 清理失败：${(error as Error).message}`)
+  }
+
+  /**
+   * 上次进程崩溃时还挂在 running 的团队后台任务：单实例启动时统一收尾，唤醒父 Agent 继续。
+   * 多实例下跳过，避免把另一个实例正在跑的任务误判为中断。
+   */
+  try {
+    const recoveredTasks = recoverInterruptedAgentTasks(db)
+    if (recoveredTasks > 0) console.log(`[eab] 已收尾 ${recoveredTasks} 个中断的团队后台任务（检查点保留）`)
+  } catch (error) {
+    console.warn(`[eab] 团队后台任务收尾失败：${(error as Error).message}`)
+  }
+
+  /** 挂起等后台工具的 run：作业失败/丢失的判 failed，作业还在跑或已成功的留给恢复流程。 */
+  try {
+    const sweptSuspended = sweepSuspendedRuns(db)
+    if (sweptSuspended > 0) console.log(`[eab] 已收尾 ${sweptSuspended} 个挂起后无法恢复的 Agent 运行`)
+  } catch (error) {
+    console.warn(`[eab] 挂起 run 收尾失败：${(error as Error).message}`)
+  }
+} else {
+  console.log('[eab] 多实例模式：跳过启动期全局 Agent/团队任务清理，避免误伤其他实例的活跃运行')
 }
 
-/** 上次进程崩溃时还挂在 running 的异步作业：租约过期就放回队列，重启后自动接着跑。 */
-try {
-  const recoveredTasks = recoverInterruptedAgentTasks(db)
-  if (recoveredTasks > 0) console.log(`[eab] 已收尾 ${recoveredTasks} 个中断的团队后台任务（检查点保留）`)
-} catch (error) {
-  console.warn(`[eab] 团队后台任务收尾失败：${(error as Error).message}`)
-}
-
-/** 上次进程崩溃时还挂在 running 的异步作业：租约过期就放回队列，重启后自动接着跑。 */
-try {
-  const recoveredJobs = recoverStaleJobs(db)
-  if (recoveredJobs > 0) console.log(`[eab] 已回收 ${recoveredJobs} 个中断的异步作业`)
-} catch (error) {
-  console.warn(`[eab] 异步作业回收失败：${(error as Error).message}`)
-}
-
-/** 挂起等后台工具的 run：作业失败/丢失的判 failed，作业还在跑或已成功的留给恢复流程。 */
-try {
-  const sweptSuspended = sweepSuspendedRuns(db)
-  if (sweptSuspended > 0) console.log(`[eab] 已收尾 ${sweptSuspended} 个挂起后无法恢复的 Agent 运行`)
-} catch (error) {
-  console.warn(`[eab] 挂起 run 收尾失败：${(error as Error).message}`)
+/** 异步作业的租约过期回收是幂等的：每个实例启动都可以执行，只动租约确实过期的行。 */
+if (backgroundWorker) {
+  try {
+    const recoveredJobs = recoverStaleJobs(db)
+    if (recoveredJobs > 0) console.log(`[eab] 已回收 ${recoveredJobs} 个中断的异步作业`)
+  } catch (error) {
+    console.warn(`[eab] 异步作业回收失败：${(error as Error).message}`)
+  }
 }
 
 /**
  * 日志保留：同步记录 / 渠道事件 / 登录失败 / 插件事件按天清理；
  * 审计日志按独立保留天数只删最老的一段，并保留哈希链锚点。
  * 策略存在控制台设置文件里，改完立即生效，不用重启。
+ *
+ * 内部已经用 runAsLeader 选主；api 角色干脆不起定时器，减少多副本空转。
  */
-startRetention(
+const stopRetention = backgroundWorker
+  ? startRetention(
   db,
   () => readConsoleSettings().logRetentionDays,
   (result) => {
@@ -191,7 +219,8 @@ startRetention(
   () => readConsoleSettings().recordRetentionDays,
   workspaceRootFor(config.dbPath, config.workspacesDir),
 )
-console.log('[eab:boot] 保留清理已启动')
+  : () => {}
+if (backgroundWorker) console.log('[eab:boot] 保留清理已启动')
 
 /**
  * 单公司本地部署：整个实例只认一个公司 ID。
@@ -432,31 +461,39 @@ apps.console = buildApp(deps, 'console')
 console.log('[eab:boot] 应用已构建，启动后台工作器')
 
 /** 用户自建定时任务：到点执行并回推钉钉；停止函数在 shutdown 里调用 */
-const stopScheduleWorker = startScheduleWorker(deps)
+const stopScheduleWorker = backgroundWorker ? startScheduleWorker(deps) : () => {}
 
 /**
  * 异步作业队列（Phase 4）：控制台触发的慢操作（插件通道刷新、模型批量探测等）
  * 提交后立刻返回 jobId，由 worker 在后台跑完。没配 Redis 时 worker 按 pollMs 轮询，
  * 配了 Redis 则提交作业会通过 Pub/Sub 即时唤醒所有实例。
+ *
+ * api 角色不消费队列：HTTP 进程只负责请求与 SSE，慢作业统一交给 worker，
+ * 这样扩容 API 不会把同一批作业在每个副本上再抢一遍。
  */
-const stopJobWorker = startJobWorker({
-  db,
-  handlers: {
-    [JOB_KINDS.pluginChannelRefresh]: async (job) => {
-      const payload = (job.payload ?? {}) as { channelId?: unknown }
-      const channelId = String(payload.channelId ?? '')
-      if (!channelId) throw new Error('作业缺少 channelId')
-      await refreshPluginChannel(job.companyId, channelId)
-      const probe = await probePluginChannelModels(job.companyId, channelId)
-      return {
-        channelId,
-        checked: probe.checked,
-        models: probe.healthy,
-        failed: probe.failed.map((model) => model.name),
-      }
-    },
-  },
-})
+const stopJobWorker = backgroundWorker
+  ? startJobWorker({
+      db,
+      // 90 秒租约：容器被 kill 后最多 90 秒自动回到队列；正常长任务靠 30 秒心跳续租。
+      leaseMs: 90_000,
+      instanceId: `${config.serverRole}:${process.pid}`,
+      handlers: {
+        [JOB_KINDS.pluginChannelRefresh]: async (job) => {
+          const payload = (job.payload ?? {}) as { channelId?: unknown }
+          const channelId = String(payload.channelId ?? '')
+          if (!channelId) throw new Error('作业缺少 channelId')
+          await refreshPluginChannel(job.companyId, channelId)
+          const probe = await probePluginChannelModels(job.companyId, channelId)
+          return {
+            channelId,
+            checked: probe.checked,
+            models: probe.healthy,
+            failed: probe.failed.map((model) => model.name),
+          }
+        },
+      },
+    })
+  : () => {}
 
 console.log(`[eab:boot] 开始监听 chat=${config.port} console=${config.adminPort}`)
 await Promise.all([
@@ -471,16 +508,24 @@ console.log('[eab:boot] 监听完成')
  * 如果 Stream 排在其后，这段时间钉钉/飞书完全收不到消息，用户看到的就是“发消息没反应”。
  * 消息处理用到的插件工具可以随后由 plugin watcher 补上，断线巡检也会自动重建连接。
  */
-void refreshDingTalkStream(deps).catch((error) => {
-  console.warn('[eab] 钉钉 Stream 启动失败：', (error as Error).message)
-})
-const stopDingTalkStreamMonitor = startDingTalkStreamMonitor(deps, 10_000)
-void refreshFeishuStream(deps).catch((error) => {
-  console.warn('[eab] 飞书长连接启动失败：', (error as Error).message)
-})
-const stopFeishuStreamMonitor = startFeishuStreamMonitor(deps)
+/**
+ * 渠道长连接必须在插件宿主加载之前启动。
+ * 只有 worker/all 角色持有 Stream 长连接；api 角色不建连，避免多副本重复收同一条消息。
+ */
+if (backgroundWorker) {
+  void refreshDingTalkStream(deps).catch((error) => {
+    console.warn('[eab] 钉钉 Stream 启动失败：', (error as Error).message)
+  })
+}
+const stopDingTalkStreamMonitor = backgroundWorker ? startDingTalkStreamMonitor(deps, 10_000) : () => {}
+if (backgroundWorker) {
+  void refreshFeishuStream(deps).catch((error) => {
+    console.warn('[eab] 飞书长连接启动失败：', (error as Error).message)
+  })
+}
+const stopFeishuStreamMonitor = backgroundWorker ? startFeishuStreamMonitor(deps) : () => {}
 /** 本次重启打断的后台任务：等服务稳定后唤醒父 Agent，由它决定是否从检查点继续。 */
-const stopRestartWakeRecovery = startRestartTaskWakeRecovery(deps, 15_000)
+const stopRestartWakeRecovery = backgroundWorker ? startRestartTaskWakeRecovery(deps, 15_000) : () => {}
 
 /** 插件模型只有在真实回复探测通过后才进入模型目录。 */
 setPluginModelVisibilityResolver((companyId, modelId) => isModelHealthy(companyId, modelId))
@@ -516,13 +561,16 @@ await reloadPluginHosts(db, {
 const stopModelHealthMonitor = startModelHealthMonitor(config.companyId)
 
 /** 插件模型目录定时重读：插件把不再免费的模型摘掉后，EAB 目录跟随清理。 */
-const stopPluginModelCatalogSync = startPluginModelCatalogSync(config.companyId)
+const stopPluginModelCatalogSync = backgroundWorker ? startPluginModelCatalogSync(config.companyId) : () => {}
 
 /**
  * 已绑定渠道的通讯录定时同步：默认每 2 小时一次，启动后延迟 1 分钟首跑。
  * 成员被上游标记离职或连续两次缺失后会停用，员工会话随即失效。
  */
-const stopOrgSyncScheduler = startOrgSyncScheduler(db, config, config.companyId)
+const stopOrgSyncScheduler = backgroundWorker ? startOrgSyncScheduler(db, config, config.companyId) : () => {}
+
+/** 记忆维护：情景聚类 + 归档；worker 角色启动，20 小时内不重复跑。 */
+const stopMemoryMaintenance = backgroundWorker ? startMemoryMaintenance(db, config.companyId) : () => {}
 
 /** 0.0.0.0 时给运维一个可直接复制的局域网地址；只做展示，不参与监听。 */
 function localIpv4(): string | null {
@@ -585,7 +633,7 @@ console.log('')
 /**
  * 审批卡失败/半发送状态低频补偿；只补当前 active 步骤，不重复打扰已处理节点。
  */
-const stopPermissionApprovalCardRetry = startPermissionApprovalCardRetry(deps)
+const stopPermissionApprovalCardRetry = backgroundWorker ? startPermissionApprovalCardRetry(deps) : () => {}
 
 /**
  * 上次进程被重启/崩溃时没跑完的钉钉回合：Stream 重连不会替我们重推已 ACK 的消息，
@@ -593,19 +641,23 @@ const stopPermissionApprovalCardRetry = startPermissionApprovalCardRetry(deps)
  * 延迟 10 秒等插件模型和工具注册完成，避免恢复时模型目录还没就绪就直接判失败；
  * 异步执行，不阻塞健康检查；单个回合失败只收口，不影响其它回合。
  */
-const recoverTimer = setTimeout(() => {
-  void recoverInterruptedDingTalkTurns(deps).catch((error) => {
-    console.warn('[eab] 中断的钉钉回合恢复失败：', (error as Error).message)
-  })
-}, 10_000)
-recoverTimer.unref?.()
+const recoverTimer = backgroundWorker
+  ? setTimeout(() => {
+      void recoverInterruptedDingTalkTurns(deps).catch((error) => {
+        console.warn('[eab] 中断的钉钉回合恢复失败：', (error as Error).message)
+      })
+    }, 10_000)
+  : null
+recoverTimer?.unref?.()
 
 async function shutdown(): Promise<void> {
+  stopRetention()
   stopScheduleWorker()
   stopJobWorker()
   stopModelHealthMonitor()
   stopPluginModelCatalogSync()
   stopOrgSyncScheduler()
+  stopMemoryMaintenance()
   stopDingTalkStreamMonitor()
   stopPermissionApprovalCardRetry()
   stopDingTalkStream()

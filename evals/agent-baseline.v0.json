@@ -1,0 +1,340 @@
+{
+  "version": "v0",
+  "name": "EAB Agent 可信交付基准集",
+  "generatedAt": "2026-11-23",
+  "cases": [
+    {
+      "id": "cond-01-person-missing",
+      "kind": "condition",
+      "question": "邓骏本月加班数据分析一下",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "Username": {
+            "type": "string"
+          },
+          "startStr": {
+            "type": "string"
+          },
+          "endStr": {
+            "type": "string"
+          }
+        }
+      },
+      "args": {
+        "startStr": "2026-11-01",
+        "endStr": "2026-11-30"
+      },
+      "expected": {
+        "missing": [
+          {
+            "field": "Username",
+            "kind": "person",
+            "expected": "邓骏"
+          }
+        ]
+      },
+      "metrics": {
+        "toolRounds": 0,
+        "reasoningChars": 0
+      }
+    },
+    {
+      "id": "cond-02-person-provided",
+      "kind": "condition",
+      "question": "邓骏本月加班数据分析一下",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "Username": {
+            "type": "string"
+          }
+        }
+      },
+      "args": {
+        "Username": "邓骏"
+      },
+      "expected": {
+        "missing": []
+      },
+      "metrics": {
+        "toolRounds": 0,
+        "reasoningChars": 0
+      }
+    },
+    {
+      "id": "cond-03-no-person",
+      "kind": "condition",
+      "question": "本月加班数据分析一下",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "Username": {
+            "type": "string"
+          }
+        }
+      },
+      "args": {},
+      "expected": {
+        "missing": []
+      },
+      "metrics": {
+        "toolRounds": 0,
+        "reasoningChars": 0
+      }
+    },
+    {
+      "id": "cond-04-title-missing",
+      "kind": "condition",
+      "question": "查一下《员工考勤管理办法》里的加班规定",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string"
+          }
+        }
+      },
+      "args": {},
+      "expected": {
+        "missing": [
+          {
+            "field": "title",
+            "kind": "title",
+            "expected": "员工考勤管理办法"
+          }
+        ]
+      },
+      "metrics": {
+        "toolRounds": 0,
+        "reasoningChars": 0
+      }
+    },
+    {
+      "id": "cond-05-id-missing",
+      "kind": "condition",
+      "question": "查编号 Q-2026-001 的审批进度",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          }
+        }
+      },
+      "args": {},
+      "expected": {
+        "missing": [
+          {
+            "field": "code",
+            "kind": "id",
+            "expected": "Q-2026-001"
+          }
+        ]
+      },
+      "metrics": {
+        "toolRounds": 0,
+        "reasoningChars": 0
+      }
+    },
+    {
+      "id": "cond-06-department-not-person",
+      "kind": "condition",
+      "question": "客服部本月加班统计",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "Username": {
+            "type": "string"
+          }
+        }
+      },
+      "args": {},
+      "expected": {
+        "missing": []
+      },
+      "metrics": {
+        "toolRounds": 0,
+        "reasoningChars": 0
+      }
+    },
+    {
+      "id": "cond-07-time-word-not-person",
+      "kind": "condition",
+      "question": "本月加班统计",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "Username": {
+            "type": "string"
+          }
+        }
+      },
+      "args": {},
+      "expected": {
+        "missing": []
+      },
+      "metrics": {
+        "toolRounds": 0,
+        "reasoningChars": 0
+      }
+    },
+    {
+      "id": "cond-08-person-after-verb",
+      "kind": "condition",
+      "question": "查一下邓骏本月的加班记录",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "Username": {
+            "type": "string"
+          }
+        }
+      },
+      "args": {},
+      "expected": {
+        "missing": [
+          {
+            "field": "Username",
+            "kind": "person",
+            "expected": "邓骏"
+          }
+        ]
+      },
+      "metrics": {
+        "toolRounds": 0,
+        "reasoningChars": 0
+      }
+    },
+    {
+      "id": "budget-01-rounds",
+      "kind": "budget",
+      "action": "beginRound",
+      "round": 3,
+      "expected": {
+        "reason": "rounds"
+      },
+      "metrics": {
+        "toolRounds": 3,
+        "reasoningChars": 0
+      }
+    },
+    {
+      "id": "budget-02-duration",
+      "kind": "budget",
+      "action": "duration",
+      "elapsedMs": 1001,
+      "expected": {
+        "reason": "duration"
+      },
+      "metrics": {
+        "toolRounds": 1,
+        "reasoningChars": 0
+      }
+    },
+    {
+      "id": "budget-03-tool-calls",
+      "kind": "budget",
+      "action": "toolCalls",
+      "toolCalls": 2,
+      "expected": {
+        "reason": "tool_calls"
+      },
+      "metrics": {
+        "toolRounds": 1,
+        "reasoningChars": 0
+      }
+    },
+    {
+      "id": "budget-04-reasoning",
+      "kind": "budget",
+      "action": "reasoning",
+      "reasoningChars": 2001,
+      "expected": {
+        "reason": "reasoning"
+      },
+      "metrics": {
+        "toolRounds": 1,
+        "reasoningChars": 2000
+      }
+    },
+    {
+      "id": "budget-05-reasoning-truncated",
+      "kind": "budget",
+      "action": "truncate",
+      "reasoningChars": 2500,
+      "expected": {
+        "acceptedChars": 2000,
+        "overBudget": true
+      },
+      "metrics": {
+        "toolRounds": 0,
+        "reasoningChars": 2000
+      }
+    },
+    {
+      "id": "budget-06-round-reset",
+      "kind": "budget",
+      "action": "reset",
+      "expected": {
+        "acceptedChars": 10
+      },
+      "metrics": {
+        "toolRounds": 0,
+        "reasoningChars": 10
+      }
+    },
+    {
+      "id": "budget-07-notice-with-tools",
+      "kind": "budget",
+      "action": "notice",
+      "toolCalls": 3,
+      "expected": {
+        "noticeIncludes": "已查到部分结果"
+      },
+      "metrics": {
+        "toolRounds": 3,
+        "reasoningChars": 0
+      }
+    },
+    {
+      "id": "budget-08-notice-without-tools",
+      "kind": "budget",
+      "action": "notice",
+      "toolCalls": 0,
+      "expected": {
+        "noticeIncludes": "没有拿到可用的工具结果"
+      },
+      "metrics": {
+        "toolRounds": 0,
+        "reasoningChars": 0
+      }
+    },
+    {
+      "id": "budget-09-tool-p95",
+      "kind": "budget",
+      "action": "toolCalls",
+      "toolCalls": 2,
+      "expected": {
+        "reason": "tool_calls"
+      },
+      "metrics": {
+        "toolRounds": 2,
+        "reasoningChars": 0
+      }
+    },
+    {
+      "id": "budget-10-reasoning-p95",
+      "kind": "budget",
+      "action": "reasoning",
+      "reasoningChars": 2001,
+      "expected": {
+        "reason": "reasoning"
+      },
+      "metrics": {
+        "toolRounds": 1,
+        "reasoningChars": 2000
+      }
+    }
+  ]
+}

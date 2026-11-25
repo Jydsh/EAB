@@ -36,7 +36,7 @@ describe('Agent 能力卡注册表', () => {
     expect(cards.every((card) => card.kind === 'builtin' && card.enabled)).toBe(true)
     expect(cards[1]).toMatchObject({
       name: '实现员',
-      limits: { maxRounds: 24, timeoutMs: 600_000 },
+      limits: { maxRounds: 120, timeoutMs: 1_800_000 },
     })
     expect(cards[1].skills).toContain('代码实现')
     expect(cards[1].tools).toContain('project.exec')

@@ -24,8 +24,10 @@
     <script src="/theme.js?v=20261117a" data-surface="chat"></script>
     <script src="/brand.js?v=20261115c" defer></script>
     <link rel="stylesheet" href="/app.css?v=20261122c" />
-    <link rel="stylesheet" href="/chat.css?v=20261123wake" />
+    <link rel="stylesheet" href="/chat.css?v=20261125uiP13E" />
     <link rel="stylesheet" href="/theme.css?v=20261115b" />
+    <link rel="stylesheet" href="/ui-motion.css?v=20261124motionE" />
+    <link rel="stylesheet" href="/ui-overlay.css?v=20261124overlayB" />
     <link rel="stylesheet" href="/boot-splash.css?v=20261115i" />
   </head>
   <body class="chat-body">
@@ -234,6 +236,19 @@
 
           <div class="workbench-body" id="workbench-body">
             <section class="team-pane" id="team-pane" hidden aria-label="Agent 团队">
+              <div class="plan-board" id="plan-board" hidden aria-label="任务计划">
+                <div class="plan-board-head">
+                  <div>
+                    <span class="plan-board-kicker">TASK PLAN</span>
+                    <strong id="plan-board-title">任务计划</strong>
+                  </div>
+                  <div class="plan-board-side">
+                    <span class="plan-board-version" id="plan-board-version"></span>
+                    <span class="plan-board-status" id="plan-board-status"></span>
+                  </div>
+                </div>
+                <ol class="plan-board-steps" id="plan-board-steps"></ol>
+              </div>
               <div class="team-head">
                 <div class="team-head-main">
                   <span class="team-kicker">AGENT TEAM</span>
@@ -303,7 +318,7 @@
             <div class="perm-pane-head-main">
               <span class="perm-pane-kicker">PERMISSION APPROVAL</span>
               <h2>权限审批</h2>
-              <p class="perm-pane-sub">勾选当前身份缺少的权限点，多选合并成一张审批单；通过后只授予所选权限，不新增角色，到期自动失效。</p>
+              <p class="perm-pane-sub" id="perm-pane-sub">勾选当前身份缺少的权限点，多选合并成一张审批单；通过后只授予所选权限，不新增角色，到期自动失效。</p>
             </div>
           </div>
           <div class="perm-switch" id="perm-switch" role="tablist" aria-label="权限审批视图">
@@ -445,27 +460,22 @@
           <div class="settings-group">
             <div class="settings-group-title">个人设置</div>
             <button class="settings-row" id="settings-memories" type="button">
-              <span class="settings-row-icon">◎</span>
               <span class="settings-row-text">
                 <strong>我的记忆</strong>
                 <em>管理长期偏好与已确认的记忆</em>
               </span>
-              <span class="settings-row-arrow">›</span>
             </button>
             <button class="settings-row" id="settings-caps" type="button">
-              <span class="settings-row-icon">◇</span>
               <span class="settings-row-text">
                 <strong>我的权限</strong>
                 <em>查看角色与当前生效的权限点</em>
               </span>
-              <span class="settings-row-arrow">›</span>
             </button>
           </div>
 
           <div class="settings-group">
             <div class="settings-group-title">对话</div>
             <div class="settings-row is-static" id="settings-send-mode">
-              <span class="settings-row-icon">⇄</span>
               <span class="settings-row-text">
                 <strong>回复中再发消息</strong>
                 <em id="settings-send-mode-hint">排队：当前回复结束后，再按顺序发送</em>
@@ -480,7 +490,6 @@
           <div class="settings-group">
             <div class="settings-group-title">语音</div>
             <div class="settings-row is-static" id="settings-voice-enabled">
-              <span class="settings-row-icon">◉</span>
               <span class="settings-row-text">
                 <strong>语音回复</strong>
                 <em id="settings-voice-hint">用语音对话时，回答会自动转成语音</em>
@@ -491,7 +500,6 @@
               </div>
             </div>
             <div class="settings-row is-static" id="settings-voice-mode">
-              <span class="settings-row-icon">≣</span>
               <span class="settings-row-text">
                 <strong>播报时机</strong>
                 <em id="settings-voice-mode-hint">边生成边播：第一句说完就开口</em>
@@ -502,7 +510,6 @@
               </div>
             </div>
             <div class="settings-row is-static" id="settings-wake">
-              <span class="settings-row-icon">⌁</span>
               <span class="settings-row-text">
                 <strong>语音唤醒</strong>
                 <em id="settings-wake-hint">开启后说助手名字即可开始语音对话</em>
@@ -513,32 +520,30 @@
               </div>
             </div>
             <button class="settings-row" id="settings-voice" type="button">
-              <span class="settings-row-icon">♪</span>
               <span class="settings-row-text">
                 <strong>我的音色</strong>
                 <em id="settings-voice-label">系统默认</em>
               </span>
-              <span class="settings-row-arrow">›</span>
             </button>
           </div>
 
           <div class="settings-group">
-            <div class="settings-group-title">账号</div>
+            <div class="settings-group-title">账号安全</div>
             <button class="settings-row" id="settings-password" type="button">
-              <span class="settings-row-icon">✎</span>
               <span class="settings-row-text">
                 <strong>修改密码</strong>
                 <em>更新登录密码，其他设备会退出登录</em>
               </span>
-              <span class="settings-row-arrow">›</span>
             </button>
+          </div>
+
+          <div class="settings-group settings-group-danger">
+            <div class="settings-group-title">会话</div>
             <button class="settings-row danger" id="settings-logout" type="button">
-              <span class="settings-row-icon">↪</span>
               <span class="settings-row-text">
                 <strong>退出登录</strong>
                 <em>结束当前浏览器会话，回到登录页</em>
               </span>
-              <span class="settings-row-arrow">›</span>
             </button>
           </div>
 
@@ -555,7 +560,7 @@
 
     <!-- 未登录：只显示登录，不展示任何组织/成员信息 -->
     <div class="login-gate" id="login-gate" hidden>
-      <div class="login-card login-shell" id="login-card">
+      <div class="login-card login-shell" id="login-card" data-motion="spotlight">
         <div class="login-brand"><span class="logo" data-brand-logo>EAB</span><strong id="login-brand-name" data-brand-name>企业智能体基座</strong></div>
 
         <div class="login-mode-tabs" id="login-mode-tabs" hidden>
@@ -641,6 +646,16 @@
       }
     </script>
     <script src="/boot-splash.js?v=20261118d" data-surface="chat" defer></script>
-    <script src="/chat.js?v=20261123audio4" defer></script>
+    <script src="/ui-motion.js?v=20261124motionG" defer></script>
+    <script src="/ui-overlay.js?v=20261124overlayB" defer></script>
+    <script src="/chat.js?v=20261125uiP13E" defer></script>
   </body>
 </html>
+
+
+
+
+
+
+
+

@@ -4,8 +4,8 @@ EAB 是一套面向**单公司本地部署**的企业智能体基座：一个进
 
 - 员工入口：`http://127.0.0.1:8787/chat`
 - 管理控制台：`http://127.0.0.1:8788/admin`
-- 当前版本：`2026.11.23.04`
-- 本版发布说明：[`docs/releases/v2026.11.23.04.md`](docs/releases/v2026.11.23.04.md)
+- 当前版本：`2026.11.24`
+- 本版发布说明：[`docs/releases/v2026.11.24.md`](docs/releases/v2026.11.24.md)
 
 > 单公司边界：一个实例只服务一家公司。钉钉、飞书、企业微信、模型供应商、知识库、插件都在控制台里配置。
 
@@ -302,8 +302,8 @@ powershell -File .eab-dev\start-searxng.ps1
 
 EAB 的版本来自 GitHub Release：
 
-- Release tag：`v2026.11.23.04`
-- Release 资产：源码 zip（`EAB-2026.11.23.04.zip`）。桌面安装包、`latest.yml`、`.blockmap` 已停止发布。
+- Release tag：`v2026.11.24`
+- Release 资产：源码 zip（`EAB-2026.11.24.zip`）。桌面安装包、`latest.yml`、`.blockmap` 已停止发布。
 
 ### 两种更新方式
 

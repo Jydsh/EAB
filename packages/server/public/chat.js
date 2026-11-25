@@ -119,14 +119,1524 @@ function writtenFileContentBlocks(tools) {
   return blocks
 }
 
+/**
+ * 把 esc() 之后的代码块还原回原文，供 ```chart 里的 JSON 解析。
+ * 顺序必须先解 &amp; 再解其它，否则 &amp;quot; 会被拆坏。
+ */
+function decodeAnswerEntities(value) {
+  return String(value ?? '')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, '&')
+}
+
+const CHART_COLORS = ['#4e79e6', '#36b37e', '#f5a623', '#e05252', '#8e6bd8', '#2ab7ca', '#d97706', '#6b7280', '#0ea5e9', '#a3a329']
+
+/** 中文标签在 SVG 里不会自动换行，截断比溢出更安全；完整值放在 title 里。 */
+function chartShort(value, max = 12) {
+  const chars = Array.from(String(value ?? ''))
+  return chars.length > max ? `${chars.slice(0, max - 1).join('')}…` : chars.join('')
+}
+
+function chartNumberText(value) {
+  const number = Number(value)
+  if (!Number.isFinite(number)) return ''
+  if (Math.abs(number) >= 10_000) return `${Math.round(number / 10_000 * 100) / 100}万`
+  return String(Math.round(number * 100) / 100)
+}
+
+/**
+ * 图表类型唯一入口。这里的 id 必须与 @eab/domain 的 CHART_CATALOG 一一对应，
+ * 新增一种图表时先改目录，再在这里补别名和 renderer。
+ */
+const CHART_TYPE_ALIASES = {
+  pie: ['pie', '饼图', '占比图'],
+  doughnut: ['doughnut', 'donut', 'ring', '环形图', '甜甜圈图', '圆环图'],
+  bar: ['bar', 'column', 'verticalbar', '柱状图', '纵向柱状图', '柱形图'],
+  horizontalBar: ['horizontalbar', 'horizontal-bar', 'hbar', 'barh', '条形图', '横向柱状图', '横向条形图'],
+  line: ['line', 'trend', '折线图', '趋势图', '双轴折线图'],
+  area: ['area', '面积图', '面积折线图'],
+  scatter: ['scatter', 'point', '散点图', '点图'],
+  radar: ['radar', 'spider', '雷达图', '蜘蛛图'],
+  polarArea: ['polararea', 'polar-area', 'polar', '极坐标面积图', '极坐标图', '南丁格尔极区图'],
+  bubble: ['bubble', '气泡图', '气泡散点图'],
+  stackedBar: ['stackedbar', 'stacked-bar', 'stack', '堆叠柱状图', '堆叠柱'],
+  groupedBar: ['groupedbar', 'grouped-bar', 'grouped', '分组柱状图', '分组柱', '簇状柱状图'],
+  rose: ['rose', 'nightingale', '南丁格尔玫瑰图', '玫瑰图', '玫瑰'],
+  gauge: ['gauge', '仪表盘', '仪表图', '进度仪表'],
+  funnel: ['funnel', '漏斗图', '转化漏斗'],
+  heatmap: ['heatmap', 'heat-map', '热力图', '热图'],
+  waterfall: ['waterfall', '瀑布图', '瀑布'],
+}
+const CHART_TYPE_MAP = new Map(Object.entries(CHART_TYPE_ALIASES).flatMap(([type, aliases]) =>
+  aliases.map((alias) => [alias.toLowerCase(), type])))
+const CHART_TYPE_COUNT = Object.keys(CHART_TYPE_ALIASES).length
+
+function chartTypeOf(spec) {
+  const raw = String(spec?.type ?? '').trim().toLowerCase()
+  return CHART_TYPE_MAP.get(raw) || ''
+}
+
+/** 支持三种数据写法：数字、[标签, 数值]、{label, value}。 */
+function chartValueItem(item) {
+  if (typeof item === 'number' || typeof item === 'string') {
+    const value = Number(item)
+    return Number.isFinite(value) ? { label: null, value } : null
+  }
+  if (Array.isArray(item)) {
+    const value = Number(item[1])
+    return Number.isFinite(value) ? { label: String(item[0] ?? '').trim() || null, value } : null
+  }
+  if (item && typeof item === 'object') {
+    const value = Number(item.value ?? item.y)
+    return Number.isFinite(value) ? { label: String(item.label ?? item.name ?? item.x ?? '').trim() || null, value } : null
+  }
+  return null
+}
+
+/**
+ * 归一化图表配置：
+ * - 单系列：data = [3, 5] 或 [{label,value}]
+ * - 多系列：categories + series: [{name, data:[...], axis?}]
+ */
+function chartModelOf(spec, type) {
+  const categoriesRaw = Array.isArray(spec.categories) ? spec.categories : Array.isArray(spec.labels) ? spec.labels : []
+  const rawSeries = Array.isArray(spec.series) && spec.series.length > 0 ? spec.series : null
+  const series = []
+  const fallbackLabels = []
+  if (rawSeries) {
+    rawSeries.slice(0, 6).forEach((entry, index) => {
+      const raw = Array.isArray(entry?.data) ? entry.data : Array.isArray(entry?.values) ? entry.values : []
+      const parsed = raw.map(chartValueItem)
+      if (!fallbackLabels.length) {
+        parsed.forEach((item) => { if (item?.label) fallbackLabels.push(item.label) })
+      }
+      series.push({
+        name: String(entry?.name ?? entry?.label ?? `系列${index + 1}`).trim().slice(0, 24) || `系列${index + 1}`,
+        values: parsed.map((item) => item?.value ?? null),
+        axis: String(entry?.axis ?? '').toLowerCase() === 'right' ? 'right' : 'left',
+      })
+    })
+  } else {
+    const parsed = (Array.isArray(spec.data) ? spec.data : []).map(chartValueItem)
+    parsed.forEach((item) => { fallbackLabels.push(item?.label ?? '') })
+    series.push({ name: '数值', values: parsed.map((item) => item?.value ?? null), axis: 'left' })
+  }
+  const count = Math.max(categoriesRaw.length, ...series.map((item) => item.values.length), 0)
+  if (!count) return null
+  const categories = Array.from({ length: count }, (_, index) => {
+    const raw = categoriesRaw[index]
+    return String(raw ?? fallbackLabels[index] ?? `第 ${index + 1} 项`).trim() || `第 ${index + 1} 项`
+  })
+  for (const item of series) {
+    while (item.values.length < count) item.values.push(null)
+  }
+  if (!series.some((item) => item.values.some((value) => Number.isFinite(value)))) return null
+  return {
+    type,
+    categories,
+    series,
+    stacked: spec.stacked === true || spec.stacked === 'true' || spec.stacked === 'stacked' || /堆叠|stack/.test(String(spec.type ?? '').toLowerCase()),
+    unit: String(spec.unit ?? '').trim().slice(0, 10),
+    unitRight: String(spec.unitRight ?? '').trim().slice(0, 10),
+    title: String(spec.title ?? '数据分析').trim().slice(0, 60) || '数据分析',
+  }
+}
+
+function chartPointsOf(model) {
+  const series = model?.series?.[0]
+  if (!series) return []
+  return model.categories
+    .map((label, index) => ({ label, value: Number(series.values[index]) }))
+    .filter((point) => Number.isFinite(point.value))
+}
+
+function chartPieArc(cx, cy, radius, start, end) {
+  return [`M ${cx} ${cy}`, `L ${cx + radius * Math.cos(start)} ${cy + radius * Math.sin(start)}`,
+    `A ${radius} ${radius} 0 ${end - start > Math.PI ? 1 : 0} 1 ${cx + radius * Math.cos(end)} ${cy + radius * Math.sin(end)}`,
+    'Z'].join(' ')
+}
+
+function renderPieChart(points, unit) {
+  const positive = points.filter((point) => point.value > 0)
+  if (positive.length === 0) return ''
+  const total = positive.reduce((sum, point) => sum + point.value, 0)
+  if (!total) return ''
+  let angle = -Math.PI / 2
+  const slices = positive.map((point, index) => {
+    const share = point.value / total
+    const end = angle + share * Math.PI * 2
+    const path = share >= 0.999
+      ? ''
+      : `<path d="${chartPieArc(110, 110, 86, angle, end)}" fill="${CHART_COLORS[index % CHART_COLORS.length]}"><title>${esc(point.label)} ${chartNumberText(point.value)}${unit ? ` ${esc(unit)}` : ''}（${(share * 100).toFixed(1)}%）</title></path>`
+    angle = end
+    return path || `<circle cx="110" cy="110" r="86" fill="${CHART_COLORS[index % CHART_COLORS.length]}"><title>${esc(point.label)} 100%</title></circle>`
+  })
+  const legend = positive.map((point, index) => {
+    const pct = (point.value / total * 100).toFixed(1)
+    return `<li><span class="answer-chart-dot" style="background:${CHART_COLORS[index % CHART_COLORS.length]}"></span>` +
+      `<span class="answer-chart-label" title="${esc(point.label)}">${esc(chartShort(point.label, 14))}</span>` +
+      `<strong>${chartNumberText(point.value)}${unit ? ` ${esc(unit)}` : ''}</strong><em>${pct}%</em></li>`
+  }).join('')
+  return `<div class="answer-chart-pie"><svg viewBox="0 0 220 220" role="img" aria-label="饼图">${slices.join('')}</svg><ul class="answer-chart-legend">${legend}</ul></div>`
+}
+
+function chartDonutArcPath(cx, cy, inner, outer, start, end) {
+  return `M ${cx + outer * Math.cos(start)} ${cy + outer * Math.sin(start)} ` +
+    `A ${outer} ${outer} 0 ${end - start > Math.PI ? 1 : 0} 1 ${cx + outer * Math.cos(end)} ${cy + outer * Math.sin(end)} ` +
+    `L ${cx + inner * Math.cos(end)} ${cy + inner * Math.sin(end)} ` +
+    `A ${inner} ${inner} 0 ${end - start > Math.PI ? 1 : 0} 0 ${cx + inner * Math.cos(start)} ${cy + inner * Math.sin(start)} Z`
+}
+
+/** 环形图与饼图共用一份数据与图例，只是挖空圆心并显示合计。 */
+function renderDonutChart(points, unit) {
+  const positive = points.filter((point) => point.value > 0)
+  if (positive.length === 0) return ''
+  const total = positive.reduce((sum, point) => sum + point.value, 0)
+  if (!total) return ''
+  const cx = 110
+  const cy = 110
+  const inner = 50
+  const outer = 86
+  let angle = -Math.PI / 2
+  const slices = positive.map((point, index) => {
+    const share = point.value / total
+    const end = angle + share * Math.PI * 2
+    const color = CHART_COLORS[index % CHART_COLORS.length]
+    const title = `${esc(point.label)} ${chartNumberText(point.value)}${unit ? ` ${esc(unit)}` : ''}（${(share * 100).toFixed(1)}%）`
+    const path = share >= 0.999
+      ? `<circle cx="${cx}" cy="${cy}" r="${(inner + outer) / 2}" fill="none" stroke="${color}" stroke-width="${outer - inner}"><title>${title} 100%</title></circle>`
+      : `<path d="${chartDonutArcPath(cx, cy, inner, outer, angle, end)}" fill="${color}"><title>${title}</title></path>`
+    angle = end
+    return path
+  }).join('')
+  const legend = positive.map((point, index) => {
+    const pct = (point.value / total * 100).toFixed(1)
+    return `<li><span class="answer-chart-dot" style="background:${CHART_COLORS[index % CHART_COLORS.length]}"></span>` +
+      `<span class="answer-chart-label" title="${esc(point.label)}">${esc(chartShort(point.label, 14))}</span>` +
+      `<strong>${chartNumberText(point.value)}${unit ? ` ${esc(unit)}` : ''}</strong><em>${pct}%</em></li>`
+  }).join('')
+  return `<div class="answer-chart-pie"><svg viewBox="0 0 220 220" role="img" aria-label="环形图">${slices}` +
+    `<text class="answer-chart-donut-total" x="${cx}" y="${cy - 2}" text-anchor="middle">${chartNumberText(total)}${unit ? ` ${esc(unit)}` : ''}</text>` +
+    `<text class="answer-chart-donut-caption" x="${cx}" y="${cy + 15}" text-anchor="middle">合计</text></svg>` +
+    `<ul class="answer-chart-legend">${legend}</ul></div>`
+}
+
+function chartLegendHtml(model) {
+  if (model.series.length < 2) return ''
+  const mixedAxis = model.series.some((item) => item.axis === 'right')
+  const entries = model.series.map((item, index) => {
+    const right = item.axis === 'right'
+    return `<li><span class="answer-chart-dot" style="background:${CHART_COLORS[index % CHART_COLORS.length]}"></span>` +
+      `<span class="answer-chart-label">${esc(item.name)}</span>${mixedAxis ? `<em>${right ? '右轴' : '左轴'}</em>` : ''}</li>`
+  }).join('')
+  return `<ul class="answer-chart-series">${entries}</ul>`
+}
+
+function renderBarChart(model) {
+  const width = 640
+  const labelWidth = 116
+  const valueWidth = 84
+  const top = 10
+  const plotWidth = width - labelWidth - valueWidth - 20
+  const categoryCount = model.categories.length
+  const seriesCount = model.series.length
+  const stacked = model.stacked && seriesCount > 1 && model.series.every((item) => item.values.every((value) => value === null || value >= 0))
+  const rowHeight = stacked ? 36 : seriesCount === 1 ? 32 : 24 + seriesCount * 10
+  const height = top + categoryCount * rowHeight + 10
+  const totals = model.categories.map((_, index) =>
+    model.series.reduce((sum, item) => sum + (Number(item.values[index]) || 0), 0))
+  const max = Math.max(...(stacked ? totals : model.series.flatMap((item) => item.values.map((value) => value ?? 0))), 0)
+  const min = stacked ? 0 : Math.min(...model.series.flatMap((item) => item.values.map((value) => value ?? 0)), 0)
+  const span = max - min || 1
+  const zeroX = labelWidth + ((0 - min) / span) * plotWidth
+  const rows = model.categories.map((label, index) => {
+    const y = top + index * rowHeight
+    const axisLabel = `<text class="answer-chart-axis-label" x="8" y="${y + rowHeight / 2 + 4}">${esc(chartShort(label, 10))}</text>` +
+      `<rect x="${labelWidth}" y="${y + 5}" width="${plotWidth}" height="${rowHeight - 10}" rx="4" class="answer-chart-row"></rect>`
+    if (stacked) {
+      let cursorX = zeroX
+      const segments = model.series.map((item, seriesIndex) => {
+        const value = Number(item.values[index]) || 0
+        if (value <= 0) return ''
+        const segmentWidth = (value / span) * plotWidth
+        const x = cursorX
+        cursorX += segmentWidth
+        return `<rect x="${x}" y="${y + 9}" width="${Math.max(1, segmentWidth)}" height="${rowHeight - 18}" fill="${CHART_COLORS[seriesIndex % CHART_COLORS.length]}">` +
+          `<title>${esc(label)} · ${esc(item.name)} ${chartNumberText(value)}${model.unit ? ` ${esc(model.unit)}` : ''}</title></rect>`
+      }).join('')
+      const total = totals[index]
+      return `<g>${axisLabel}${segments}<text class="answer-chart-value" x="${zeroX + (total / span) * plotWidth + 6}" y="${y + 22}">${chartNumberText(total)}</text></g>`
+    }
+    if (seriesCount === 1) {
+      const value = Number(model.series[0].values[index]) || 0
+      const valueX = labelWidth + ((value - min) / span) * plotWidth
+      const x = Math.min(zeroX, valueX)
+      const barWidth = Math.max(1, Math.abs(valueX - zeroX))
+      const textX = value < 0 ? x - 6 : x + barWidth + 6
+      return `<g><title>${esc(label)} ${chartNumberText(value)}${model.unit ? ` ${esc(model.unit)}` : ''}</title>${axisLabel}` +
+        `<rect x="${x}" y="${y + 9}" width="${barWidth}" height="${rowHeight - 18}" rx="4" fill="${CHART_COLORS[index % CHART_COLORS.length]}"></rect>` +
+        `<text class="answer-chart-value" x="${textX}" y="${y + 22}" text-anchor="${value < 0 ? 'end' : 'start'}">${chartNumberText(value)}</text></g>`
+    }
+    const bandTop = y + 7
+    const bandHeight = rowHeight - 14
+    const gap = 4
+    const barHeight = Math.max(3, (bandHeight - gap * (seriesCount - 1)) / seriesCount)
+    const bars = model.series.map((item, seriesIndex) => {
+      const value = Number(item.values[index]) || 0
+      const valueX = labelWidth + ((value - min) / span) * plotWidth
+      const x = Math.min(zeroX, valueX)
+      const barWidth = Math.max(1, Math.abs(valueX - zeroX))
+      const barY = bandTop + seriesIndex * (barHeight + gap)
+      const valueLabel = seriesCount <= 2
+        ? `<text class="answer-chart-value" x="${value < 0 ? x - 5 : zeroX + barWidth + 5}" y="${barY + barHeight / 2 + 4}" text-anchor="${value < 0 ? 'end' : 'start'}">${chartNumberText(value)}</text>`
+        : ''
+      return `<rect x="${x}" y="${barY}" width="${barWidth}" height="${barHeight}" rx="3" fill="${CHART_COLORS[seriesIndex % CHART_COLORS.length]}">` +
+        `<title>${esc(label)} · ${esc(item.name)} ${chartNumberText(value)}${model.unit ? ` ${esc(model.unit)}` : ''}</title></rect>${valueLabel}`
+    }).join('')
+    return `<g>${axisLabel}${bars}</g>`
+  }).join('')
+  const kind = stacked ? '堆叠柱状图' : seriesCount > 1 ? '分组柱状图' : '柱状图'
+  return `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${kind}" preserveAspectRatio="xMinYMid meet">${rows}</svg>`
+}
+
+function chartDomain(seriesList) {
+  const values = seriesList.flatMap((item) => item.values.filter((value) => value !== null && Number.isFinite(value)))
+  if (values.length === 0) return null
+  let min = Math.min(...values)
+  let max = Math.max(...values)
+  if (min === max) {
+    min -= 1
+    max += 1
+  }
+  const pad = (max - min) * 0.12
+  return { min: min - pad, max: max + pad }
+}
+
+function renderLineChart(model, options = {}) {
+  const width = 640
+  const height = 244
+  const leftSeries = model.series.filter((item) => item.axis !== 'right')
+  const rightSeries = model.series.filter((item) => item.axis === 'right')
+  const hasRight = rightSeries.length > 0
+  const leftDomain = chartDomain(leftSeries.length ? leftSeries : rightSeries)
+  const rightDomain = hasRight ? chartDomain(rightSeries) : null
+  if (!leftDomain) return ''
+  const padding = { left: 54, right: hasRight ? 58 : 20, top: 16, bottom: 34 }
+  const plotWidth = width - padding.left - padding.right
+  const plotHeight = height - padding.top - padding.bottom
+  const xAt = (index) => padding.left + (model.categories.length <= 1 ? plotWidth / 2 : (index / (model.categories.length - 1)) * plotWidth)
+  const yAt = (value, axis) => {
+    const domain = axis === 'right' && rightDomain ? rightDomain : leftDomain
+    return padding.top + ((domain.max - value) / (domain.max - domain.min)) * plotHeight
+  }
+  const grid = [0, 1, 2, 3].map((tick) => {
+    const y = padding.top + (tick / 3) * plotHeight
+    const value = leftDomain.max - (tick / 3) * (leftDomain.max - leftDomain.min)
+    return `<line x1="${padding.left}" y1="${y}" x2="${width - padding.right}" y2="${y}" class="answer-chart-grid"></line>` +
+      `<text class="answer-chart-axis-value" x="${padding.left - 8}" y="${y + 4}" text-anchor="end">${chartNumberText(value)}</text>` +
+      (rightDomain
+        ? `<text class="answer-chart-axis-value" x="${width - padding.right + 8}" y="${y + 4}" text-anchor="start">${chartNumberText(rightDomain.max - (tick / 3) * (rightDomain.max - rightDomain.min))}</text>`
+        : '')
+  }).join('')
+  const xLabels = model.categories.map((label, index) => {
+    const step = Math.max(1, Math.ceil(model.categories.length / 7))
+    if (index % step !== 0 && index !== model.categories.length - 1) return ''
+    return `<text class="answer-chart-axis-label" x="${xAt(index)}" y="${height - 10}" text-anchor="middle">${esc(chartShort(label, 8))}</text>`
+  }).join('')
+  const areas = options.area ? model.series.map((item, seriesIndex) => {
+    const color = CHART_COLORS[seriesIndex % CHART_COLORS.length]
+    const domain = item.axis === 'right' && rightDomain ? rightDomain : leftDomain
+    const baseY = yAt(Math.max(domain.min, Math.min(domain.max, 0)), item.axis)
+    const shapes = []
+    let run = []
+    const flush = () => {
+      if (run.length > 1) {
+        shapes.push(`<path d="M ${run[0].split(',')[0]} ${baseY} L ${run.join(' L ')} L ${run[run.length - 1].split(',')[0]} ${baseY} Z" fill="${color}" fill-opacity="0.16"></path>`)
+      }
+      run = []
+    }
+    item.values.forEach((value, index) => {
+      if (value === null || !Number.isFinite(value)) {
+        flush()
+        return
+      }
+      run.push(`${xAt(index).toFixed(1)},${yAt(value, item.axis).toFixed(1)}`)
+    })
+    flush()
+    return shapes.join('')
+  }).join('') : ''
+  const lines = model.series.map((item, seriesIndex) => {
+    const color = CHART_COLORS[seriesIndex % CHART_COLORS.length]
+    const segments = []
+    let points = []
+    const flush = () => {
+      if (points.length > 1) segments.push(`<polyline points="${points.join(' ')}" fill="none" stroke="${color}" stroke-width="2.4" stroke-linejoin="round"></polyline>`)
+      points = []
+    }
+    item.values.forEach((value, index) => {
+      if (value === null || !Number.isFinite(value)) {
+        flush()
+        return
+      }
+      points.push(`${xAt(index)},${yAt(value, item.axis)}`)
+    })
+    flush()
+    const dots = item.values.map((value, index) => value === null || !Number.isFinite(value) ? '' :
+      `<circle cx="${xAt(index)}" cy="${yAt(value, item.axis)}" r="3.5" fill="${color}"><title>${esc(model.categories[index])} · ${esc(item.name)} ${chartNumberText(value)}${(item.axis === 'right' ? model.unitRight : model.unit) ? ` ${esc(item.axis === 'right' ? model.unitRight : model.unit)}` : ''}</title></circle>`).join('')
+    return segments.join('') + dots
+  }).join('')
+  return `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${options.area ? '面积图' : '折线图'}" preserveAspectRatio="xMinYMid meet">${grid}${areas}${lines}${xLabels}</svg>`
+}
+
+function chartNumericDomain(values, padRatio = 0.1) {
+  const numbers = values.filter((value) => Number.isFinite(value))
+  if (!numbers.length) return null
+  let min = Math.min(...numbers)
+  let max = Math.max(...numbers)
+  if (min === max) {
+    min -= 1
+    max += 1
+  }
+  const pad = (max - min) * padRatio
+  return { min: min >= 0 ? Math.max(0, min - pad) : min - pad, max: max + pad }
+}
+
+function chartScatterPoint(item, fallbackX) {
+  if (typeof item === 'number') {
+    return Number.isFinite(item) ? { x: fallbackX, y: item, label: '', indexed: true } : null
+  }
+  if (Array.isArray(item)) {
+    const x = Number(item[0])
+    const y = Number(item[1])
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null
+    return { x, y, label: String(item[2] ?? '').trim(), indexed: false }
+  }
+  if (item && typeof item === 'object') {
+    const x = Number(item.x ?? fallbackX)
+    const y = Number(item.y ?? item.value ?? item.v)
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null
+    return { x, y, label: String(item.label ?? item.name ?? '').trim(), indexed: item.x === undefined }
+  }
+  return null
+}
+
+function chartScatterModelOf(spec) {
+  const rawSeries = Array.isArray(spec.series) && spec.series.length
+    ? spec.series
+    : [{ name: '数据点', data: Array.isArray(spec.data) ? spec.data : Array.isArray(spec.values) ? spec.values : [] }]
+  const series = []
+  rawSeries.slice(0, 6).forEach((entry, seriesIndex) => {
+    const raw = Array.isArray(entry?.data) ? entry.data : Array.isArray(entry?.values) ? entry.values : []
+    const points = raw.map((item, index) => chartScatterPoint(item, index + 1)).filter(Boolean)
+    if (!points.length) return
+    series.push({
+      name: String(entry?.name ?? entry?.label ?? `系列${seriesIndex + 1}`).trim().slice(0, 24) || `系列${seriesIndex + 1}`,
+      points,
+    })
+  })
+  if (!series.length) return null
+  const indexed = series.some((item) => item.points.some((point) => point.indexed))
+  const unit = String(spec.unit ?? '').trim().slice(0, 10)
+  return {
+    type: 'scatter',
+    series,
+    indexed,
+    xLabel: String(spec.xLabel ?? spec.xAxis ?? (indexed ? '条序' : 'X')).trim().slice(0, 20) || 'X',
+    yLabel: String(spec.yLabel ?? spec.yAxis ?? (unit ? `数值（${unit}）` : 'Y')).trim().slice(0, 20) || 'Y',
+    title: String(spec.title ?? '数据分析').trim().slice(0, 60) || '数据分析',
+  }
+}
+
+function renderScatterChart(model) {
+  const width = 640
+  const height = 260
+  const padding = { left: 58, right: 26, top: 20, bottom: 44 }
+  const plotWidth = width - padding.left - padding.right
+  const plotHeight = height - padding.top - padding.bottom
+  const xDomain = chartNumericDomain(model.series.flatMap((item) => item.points.map((point) => point.x)), model.indexed ? 0 : 0.1)
+  const yDomain = chartNumericDomain(model.series.flatMap((item) => item.points.map((point) => point.y)))
+  if (!xDomain || !yDomain) return ''
+  const xAt = (value) => padding.left + ((value - xDomain.min) / (xDomain.max - xDomain.min)) * plotWidth
+  const yAt = (value) => padding.top + ((yDomain.max - value) / (yDomain.max - yDomain.min)) * plotHeight
+  const xTickText = (value) => model.indexed ? String(Math.round(value)) : chartNumberText(value)
+  const ticks = [0, 1, 2, 3, 4]
+  const grid = ticks.map((tick) => {
+    const x = padding.left + (tick / 4) * plotWidth
+    const y = padding.top + (tick / 4) * plotHeight
+    const xValue = xDomain.min + (tick / 4) * (xDomain.max - xDomain.min)
+    const yValue = yDomain.max - (tick / 4) * (yDomain.max - yDomain.min)
+    return `<line x1="${x}" y1="${padding.top}" x2="${x}" y2="${height - padding.bottom}" class="answer-chart-grid"></line>` +
+      `<text class="answer-chart-axis-value" x="${x}" y="${height - padding.bottom + 18}" text-anchor="middle">${xTickText(xValue)}</text>` +
+      `<line x1="${padding.left}" y1="${y}" x2="${width - padding.right}" y2="${y}" class="answer-chart-grid"></line>` +
+      `<text class="answer-chart-axis-value" x="${padding.left - 8}" y="${y + 4}" text-anchor="end">${chartNumberText(yValue)}</text>`
+  }).join('')
+  const dots = model.series.map((item, seriesIndex) => {
+    const color = CHART_COLORS[seriesIndex % CHART_COLORS.length]
+    return item.points.map((point) => {
+      const tip = [point.label, `${model.xLabel} ${chartNumberText(point.x)}`, `${model.yLabel} ${chartNumberText(point.y)}`]
+        .filter(Boolean).join(' · ')
+      return `<circle cx="${xAt(point.x)}" cy="${yAt(point.y)}" r="4.6" fill="${color}" fill-opacity="0.88" stroke="#ffffff" stroke-width="1.2"><title>${esc(tip)}</title></circle>`
+    }).join('')
+  }).join('')
+  const axisTitles =
+    `<text class="answer-chart-axis-label" x="${padding.left + plotWidth / 2}" y="${height - 8}" text-anchor="middle">${esc(chartShort(model.xLabel, 18))}</text>` +
+    `<text class="answer-chart-axis-label" x="14" y="${padding.top + plotHeight / 2}" text-anchor="middle" transform="rotate(-90 14 ${padding.top + plotHeight / 2})">${esc(chartShort(model.yLabel, 18))}</text>`
+  return `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="散点图" preserveAspectRatio="xMinYMid meet">${grid}${axisTitles}${dots}</svg>`
+}
+
+function chartRadarModelOf(spec) {
+  const indicators = Array.isArray(spec.indicators) ? spec.indicators : []
+  const categoriesRaw = Array.isArray(spec.categories) ? spec.categories : Array.isArray(spec.labels) ? spec.labels : []
+  const labels = indicators.length
+    ? indicators.map((item, index) => String(item?.name ?? item?.label ?? item ?? `指标${index + 1}`).trim() || `指标${index + 1}`)
+    : categoriesRaw.map((item, index) => String(item ?? `指标${index + 1}`).trim() || `指标${index + 1}`)
+  const rawSeries = Array.isArray(spec.series) && spec.series.length
+    ? spec.series
+    : [{ name: spec.name ?? '数值', data: Array.isArray(spec.data) ? spec.data : Array.isArray(spec.values) ? spec.values : [] }]
+  const series = []
+  rawSeries.slice(0, 6).forEach((entry, index) => {
+    const raw = Array.isArray(entry?.data) ? entry.data : Array.isArray(entry?.values) ? entry.values : []
+    const values = raw.map((value) => {
+      const number = Number(value && typeof value === 'object' ? value.value ?? value.y : value)
+      return Number.isFinite(number) ? number : null
+    })
+    if (!values.some((value) => value !== null)) return
+    series.push({
+      name: String(entry?.name ?? entry?.label ?? `系列${index + 1}`).trim().slice(0, 24) || `系列${index + 1}`,
+      values,
+    })
+  })
+  if (labels.length < 3 || !series.length) return null
+  const count = Math.min(labels.length, 10)
+  const axisMax = Array.from({ length: count }, (_, index) => {
+    const declared = Number(indicators[index]?.max ?? indicators[index]?.maxValue)
+    if (Number.isFinite(declared) && declared > 0) return declared
+    const observed = Math.max(0, ...series.map((item) => Number(item.values[index] ?? 0)))
+    return observed > 0 ? observed : 1
+  })
+  series.forEach((item) => {
+    item.values = Array.from({ length: count }, (_, index) =>
+      Math.max(0, Math.min(1, Number(item.values[index] ?? 0) / axisMax[index])))
+  })
+  return {
+    type: 'radar',
+    labels: labels.slice(0, count),
+    series,
+    unit: String(spec.unit ?? '').trim().slice(0, 10),
+    title: String(spec.title ?? '数据分析').trim().slice(0, 60) || '数据分析',
+  }
+}
+
+function renderRadarChart(model) {
+  const width = 640
+  const height = 300
+  const cx = 320
+  const cy = 146
+  const radius = 98
+  const count = model.labels.length
+  const pointAt = (fraction, index) => {
+    const angle = -Math.PI / 2 + (index / count) * Math.PI * 2
+    return [cx + Math.cos(angle) * radius * fraction, cy + Math.sin(angle) * radius * fraction]
+  }
+  const rings = [0.25, 0.5, 0.75, 1].map((fraction) => {
+    const points = Array.from({ length: count }, (_, index) => pointAt(fraction, index).map((value) => value.toFixed(1)).join(',')).join(' ')
+    return `<polygon points="${points}" fill="none" class="answer-chart-grid"></polygon>`
+  }).join('')
+  const axes = model.labels.map((label, index) => {
+    const [x, y] = pointAt(1, index)
+    const labelRadius = radius + 18
+    const angle = -Math.PI / 2 + (index / count) * Math.PI * 2
+    const labelX = cx + Math.cos(angle) * labelRadius
+    const labelY = cy + Math.sin(angle) * labelRadius
+    const anchor = Math.cos(angle) > 0.3 ? 'start' : Math.cos(angle) < -0.3 ? 'end' : 'middle'
+    return `<line x1="${cx}" y1="${cy}" x2="${x}" y2="${y}" class="answer-chart-grid"></line>` +
+      `<text class="answer-chart-axis-label" x="${labelX}" y="${labelY + 4}" text-anchor="${anchor}">${esc(chartShort(label, 10))}</text>`
+  }).join('')
+  const shapes = model.series.map((item, seriesIndex) => {
+    const color = CHART_COLORS[seriesIndex % CHART_COLORS.length]
+    const points = item.values.map((value, index) => pointAt(Math.max(0.04, value), index).map((point) => point.toFixed(1)).join(','))
+    return `<polygon points="${points.join(' ')}" fill="${color}" fill-opacity="0.1" stroke="${color}" stroke-width="2.2" stroke-linejoin="round"></polygon>` +
+      item.values.map((value, index) => {
+        const [x, y] = pointAt(Math.max(0.04, value), index)
+        return `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="3.2" fill="${color}"><title>${esc(model.labels[index])} · ${esc(item.name)} ${(value * 100).toFixed(0)}%</title></circle>`
+      }).join('')
+  }).join('')
+  return `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="雷达图" preserveAspectRatio="xMinYMid meet">${rings}${axes}${shapes}</svg>`
+}
+
+/** 纵向柱：单系列、分组、堆叠共用一个坐标系，保证 17 种里柱状家族不是同一张图换个名字。 */
+function chartColumnDomain(model) {
+  const values = model.stacked && model.series.length > 1
+    ? model.categories.map((_, index) => model.series.reduce((sum, item) => sum + Math.max(0, Number(item.values[index]) || 0), 0))
+    : model.series.flatMap((item) => item.values.map((value) => Number(value) || 0))
+  const max = Math.max(0, ...values)
+  const min = Math.min(0, ...values)
+  if (max === min) return { min: 0, max: 1 }
+  return { min, max }
+}
+
+function renderColumnChart(model, mode = 'grouped') {
+  const width = 640
+  const height = 288
+  const padding = { left: 50, right: 18, top: 18, bottom: 48 }
+  const plotWidth = width - padding.left - padding.right
+  const plotHeight = height - padding.top - padding.bottom
+  const stacked = mode === 'stacked' && model.series.length > 1 &&
+    model.series.every((item) => item.values.every((value) => value === null || Number(value) >= 0))
+  const domain = chartColumnDomain({ ...model, stacked })
+  const yAt = (value) => padding.top + ((domain.max - value) / (domain.max - domain.min)) * plotHeight
+  const ticks = [0, 1, 2, 3]
+  const grid = ticks.map((tick) => {
+    const y = padding.top + (tick / 3) * plotHeight
+    const value = domain.max - (tick / 3) * (domain.max - domain.min)
+    return `<line x1="${padding.left}" y1="${y}" x2="${width - padding.right}" y2="${y}" class="answer-chart-grid"></line>` +
+      `<text class="answer-chart-axis-value" x="${padding.left - 8}" y="${y + 4}" text-anchor="end">${chartNumberText(value)}</text>`
+  }).join('')
+  const count = model.categories.length
+  const band = plotWidth / Math.max(1, count)
+  const bandInner = band * 0.7
+  const seriesCount = model.series.length
+  const slot = bandInner / Math.max(1, seriesCount)
+  const barWidth = stacked ? band * 0.5 : Math.max(2, slot * 0.78)
+  const categories = model.categories.map((label, index) => {
+    const step = Math.max(1, Math.ceil(count / 8))
+    if (index % step !== 0 && index !== count - 1) return ''
+    return `<text class="answer-chart-axis-label" x="${padding.left + band * (index + 0.5)}" y="${height - 12}" text-anchor="middle">${esc(chartShort(label, 7))}</text>`
+  }).join('')
+  const bars = model.categories.map((label, index) => {
+    const center = padding.left + band * (index + 0.5)
+    const zeroY = yAt(Math.max(domain.min, Math.min(domain.max, 0)))
+    if (stacked) {
+      let cursor = 0
+      const segments = model.series.map((item, seriesIndex) => {
+        const value = Number(item.values[index]) || 0
+        if (value <= 0) return ''
+        const yTop = yAt(cursor + value)
+        const yBottom = yAt(cursor)
+        cursor += value
+        return `<rect x="${center - barWidth / 2}" y="${yTop}" width="${barWidth}" height="${Math.max(1, yBottom - yTop)}" fill="${CHART_COLORS[seriesIndex % CHART_COLORS.length]}">` +
+          `<title>${esc(label)} · ${esc(item.name)} ${chartNumberText(value)}${model.unit ? ` ${esc(model.unit)}` : ''}</title></rect>`
+      }).join('')
+      const total = Number(model.series.reduce((sum, item) => sum + (Number(item.values[index]) || 0), 0))
+      const valueText = count <= 8
+        ? `<text class="answer-chart-value" x="${center}" y="${yAt(total) - 6}" text-anchor="middle">${chartNumberText(total)}</text>`
+        : ''
+      return `<g>${segments}${valueText}</g>`
+    }
+    const groupWidth = seriesCount > 1 ? slot : barWidth
+    return model.series.map((item, seriesIndex) => {
+      const value = Number(item.values[index]) || 0
+      const x = seriesCount > 1
+        ? padding.left + band * index + (band - bandInner) / 2 + slot * seriesIndex + (slot - barWidth) / 2
+        : center - barWidth / 2
+      const y = Math.min(yAt(value), zeroY)
+      const heightValue = Math.max(1, Math.abs(yAt(value) - zeroY))
+      const valueText = seriesCount === 1 && count <= 8
+        ? `<text class="answer-chart-value" x="${x + barWidth / 2}" y="${value >= 0 ? y - 6 : y + heightValue + 14}" text-anchor="middle">${chartNumberText(value)}</text>`
+        : ''
+      return `<rect x="${x}" y="${y}" width="${barWidth}" height="${heightValue}" rx="4" fill="${CHART_COLORS[seriesIndex % CHART_COLORS.length]}">` +
+        `<title>${esc(label)} · ${esc(item.name)} ${chartNumberText(value)}${model.unit ? ` ${esc(model.unit)}` : ''}</title></rect>${valueText}`
+    }).join('')
+  }).join('')
+  return `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${stacked ? '堆叠柱状图' : seriesCount > 1 ? '分组柱状图' : '柱状图'}" preserveAspectRatio="xMinYMid meet">${grid}${bars}${categories}</svg>`
+}
+
+/** 极坐标面积图：等角度，半径按 sqrt(值) 开方，面积才与数值成正比。 */
+function renderPolarAreaChart(points, unit) {
+  const positive = points.filter((point) => point.value > 0)
+  if (!positive.length) return ''
+  const total = positive.reduce((sum, point) => sum + point.value, 0)
+  const max = Math.max(...positive.map((point) => point.value))
+  const cx = 130
+  const cy = 126
+  const outer = 92
+  const angle = (Math.PI * 2) / positive.length
+  const rings = [0.33, 0.66, 1].map((fraction) =>
+    `<circle cx="${cx}" cy="${cy}" r="${outer * fraction}" fill="none" class="answer-chart-grid"></circle>`).join('')
+  const sectors = positive.map((point, index) => {
+    const start = -Math.PI / 2 + index * angle
+    const end = start + angle - 0.02
+    const radius = outer * Math.sqrt(point.value / max)
+    const color = CHART_COLORS[index % CHART_COLORS.length]
+    return `<path d="${chartPieArc(cx, cy, radius, start, end)}" fill="${color}" fill-opacity="0.82">` +
+      `<title>${esc(point.label)} ${chartNumberText(point.value)}${unit ? ` ${esc(unit)}` : ''}（${(point.value / total * 100).toFixed(1)}%）</title></path>`
+  }).join('')
+  const legend = positive.map((point, index) =>
+    `<li><span class="answer-chart-dot" style="background:${CHART_COLORS[index % CHART_COLORS.length]}"></span>` +
+    `<span class="answer-chart-label">${esc(chartShort(point.label, 12))}</span><strong>${chartNumberText(point.value)}</strong></li>`).join('')
+  return `<div class="answer-chart-pie"><svg viewBox="0 0 260 252" role="img" aria-label="极坐标面积图">${rings}${sectors}</svg><ul class="answer-chart-legend">${legend}</ul></div>`
+}
+
+/** 玫瑰图：等角度，半径按数值线性放大；与极坐标面积图区分开。 */
+function renderRoseChart(points, unit) {
+  const positive = points.filter((point) => point.value > 0)
+  if (!positive.length) return ''
+  const total = positive.reduce((sum, point) => sum + point.value, 0)
+  const max = Math.max(...positive.map((point) => point.value))
+  const cx = 130
+  const cy = 126
+  const outer = 96
+  const angle = (Math.PI * 2) / positive.length
+  const rings = [0.33, 0.66, 1].map((fraction) =>
+    `<circle cx="${cx}" cy="${cy}" r="${outer * fraction}" fill="none" class="answer-chart-grid"></circle>`).join('')
+  const petals = positive.map((point, index) => {
+    const start = -Math.PI / 2 + index * angle
+    const end = start + angle - 0.08
+    const radius = Math.max(8, outer * point.value / max)
+    const color = CHART_COLORS[index % CHART_COLORS.length]
+    return `<path d="${chartPieArc(cx, cy, radius, start, end)}" fill="${color}" fill-opacity="0.8">` +
+      `<title>${esc(point.label)} ${chartNumberText(point.value)}${unit ? ` ${esc(unit)}` : ''}（${(point.value / total * 100).toFixed(1)}%）</title></path>`
+  }).join('')
+  const legend = positive.map((point, index) =>
+    `<li><span class="answer-chart-dot" style="background:${CHART_COLORS[index % CHART_COLORS.length]}"></span>` +
+    `<span class="answer-chart-label">${esc(chartShort(point.label, 12))}</span><strong>${chartNumberText(point.value)}</strong></li>`).join('')
+  return `<div class="answer-chart-pie"><svg viewBox="0 0 260 252" role="img" aria-label="玫瑰图">${rings}${petals}</svg><ul class="answer-chart-legend">${legend}</ul></div>`
+}
+
+function chartBubblePoint(item, fallbackX) {
+  let x = fallbackX
+  let y = null
+  let r = null
+  let label = ''
+  let indexed = true
+  if (typeof item === 'number') {
+    y = item
+  } else if (Array.isArray(item)) {
+    x = Number(item[0])
+    y = Number(item[1])
+    r = Number(item[2])
+    label = String(item[3] ?? '').trim()
+    indexed = false
+  } else if (item && typeof item === 'object') {
+    x = Number(item.x ?? fallbackX)
+    y = Number(item.y ?? item.value)
+    r = Number(item.r ?? item.size)
+    label = String(item.label ?? item.name ?? '').trim()
+    indexed = item.x === undefined
+  }
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null
+  return { x, y, r: Number.isFinite(r) && r > 0 ? r : null, label, indexed }
+}
+
+function chartBubbleModelOf(spec) {
+  const rawSeries = Array.isArray(spec.series) && spec.series.length
+    ? spec.series
+    : [{ name: '气泡', data: Array.isArray(spec.data) ? spec.data : [] }]
+  const series = []
+  rawSeries.slice(0, 4).forEach((entry, seriesIndex) => {
+    const raw = Array.isArray(entry?.data) ? entry.data : Array.isArray(entry?.values) ? entry.values : []
+    const points = raw.map((item, index) => chartBubblePoint(item, index + 1)).filter(Boolean)
+    if (!points.length) return
+    series.push({
+      name: String(entry?.name ?? entry?.label ?? `系列${seriesIndex + 1}`).trim().slice(0, 24) || `系列${seriesIndex + 1}`,
+      points,
+    })
+  })
+  if (!series.length) return null
+  const indexed = series.every((item) => item.points.every((point) => point.indexed))
+  const unit = String(spec.unit ?? '').trim().slice(0, 10)
+  return {
+    type: 'bubble',
+    series,
+    indexed,
+    xLabel: String(spec.xLabel ?? spec.xAxis ?? (indexed ? '条序' : 'X')).trim().slice(0, 20) || 'X',
+    yLabel: String(spec.yLabel ?? spec.yAxis ?? (unit ? `数值（${unit}）` : 'Y')).trim().slice(0, 20) || 'Y',
+    title: String(spec.title ?? '数据分析').trim().slice(0, 60) || '数据分析',
+  }
+}
+
+function renderBubbleChart(model) {
+  const width = 640
+  const height = 270
+  const padding = { left: 58, right: 26, top: 22, bottom: 44 }
+  const plotWidth = width - padding.left - padding.right
+  const plotHeight = height - padding.top - padding.bottom
+  const all = model.series.flatMap((item) => item.points)
+  const xDomain = chartNumericDomain(all.map((point) => point.x), model.indexed ? 0 : 0.1)
+  const yDomain = chartNumericDomain(all.map((point) => point.y))
+  if (!xDomain || !yDomain) return ''
+  const sizes = all.map((point) => point.r).filter((value) => value !== null)
+  const minSize = sizes.length ? Math.min(...sizes) : 0
+  const maxSize = sizes.length ? Math.max(...sizes) : 0
+  const xAt = (value) => padding.left + ((value - xDomain.min) / (xDomain.max - xDomain.min)) * plotWidth
+  const yAt = (value) => padding.top + ((yDomain.max - value) / (yDomain.max - yDomain.min)) * plotHeight
+  const radiusOf = (value) => {
+    if (value === null || maxSize === minSize) return 7
+    return 4 + Math.sqrt((value - minSize) / (maxSize - minSize)) * 10
+  }
+  const grid = [0, 1, 2, 3, 4].map((tick) => {
+    const x = padding.left + (tick / 4) * plotWidth
+    const y = padding.top + (tick / 4) * plotHeight
+    return `<line x1="${x}" y1="${padding.top}" x2="${x}" y2="${height - padding.bottom}" class="answer-chart-grid"></line>` +
+      `<text class="answer-chart-axis-value" x="${x}" y="${height - padding.bottom + 18}" text-anchor="middle">${chartNumberText(xDomain.min + (tick / 4) * (xDomain.max - xDomain.min))}</text>` +
+      `<line x1="${padding.left}" y1="${y}" x2="${width - padding.right}" y2="${y}" class="answer-chart-grid"></line>` +
+      `<text class="answer-chart-axis-value" x="${padding.left - 8}" y="${y + 4}" text-anchor="end">${chartNumberText(yDomain.max - (tick / 4) * (yDomain.max - yDomain.min))}</text>`
+  }).join('')
+  const bubbles = model.series.map((item, seriesIndex) => {
+    const color = CHART_COLORS[seriesIndex % CHART_COLORS.length]
+    return item.points.map((point) => {
+      const tip = [point.label, `${model.xLabel} ${chartNumberText(point.x)}`, `${model.yLabel} ${chartNumberText(point.y)}`]
+        .filter(Boolean).join(' · ')
+      return `<circle cx="${xAt(point.x)}" cy="${yAt(point.y)}" r="${radiusOf(point.r)}" fill="${color}" fill-opacity="0.3" stroke="${color}" stroke-width="1.8">` +
+        `<title>${esc(tip)}</title></circle>`
+    }).join('')
+  }).join('')
+  const axisTitles =
+    `<text class="answer-chart-axis-label" x="${padding.left + plotWidth / 2}" y="${height - 8}" text-anchor="middle">${esc(chartShort(model.xLabel, 18))}</text>` +
+    `<text class="answer-chart-axis-label" x="14" y="${padding.top + plotHeight / 2}" text-anchor="middle" transform="rotate(-90 14 ${padding.top + plotHeight / 2})">${esc(chartShort(model.yLabel, 18))}</text>`
+  return `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="气泡图" preserveAspectRatio="xMinYMid meet">${grid}${axisTitles}${bubbles}</svg>`
+}
+
+function chartGaugeModelOf(spec) {
+  const value = Number(spec.value)
+  if (!Number.isFinite(value)) return null
+  const min = Number.isFinite(Number(spec.min)) ? Number(spec.min) : 0
+  const max = Number.isFinite(Number(spec.max)) ? Number(spec.max) : Math.max(min + 1, value)
+  if (!(max > min)) return null
+  return {
+    type: 'gauge',
+    value: Math.max(min, Math.min(max, value)),
+    rawValue: value,
+    min,
+    max,
+    unit: String(spec.unit ?? '').trim().slice(0, 10),
+    title: String(spec.title ?? '数据分析').trim().slice(0, 60) || '数据分析',
+  }
+}
+
+function renderGaugeChart(model) {
+  const width = 640
+  const height = 300
+  const cx = 320
+  const cy = 190
+  const radius = 118
+  const start = Math.PI * 0.75
+  const totalAngle = Math.PI * 1.5
+  const end = start + totalAngle
+  const ratio = (model.value - model.min) / (model.max - model.min)
+  const point = (angle, r) => [cx + Math.cos(angle) * r, cy + Math.sin(angle) * r]
+  const arc = (from, to) => {
+    const [x1, y1] = point(from, radius)
+    const [x2, y2] = point(to, radius)
+    return `M ${x1} ${y1} A ${radius} ${radius} 0 ${to - from > Math.PI ? 1 : 0} 1 ${x2} ${y2}`
+  }
+  const progressEnd = start + totalAngle * ratio
+  const [nx, ny] = point(progressEnd, radius * 0.78)
+  const [mx, my] = point(start, radius + 28)
+  const [ex, ey] = point(end, radius + 28)
+  return `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="仪表盘" preserveAspectRatio="xMinYMid meet">` +
+    `<path d="${arc(start, end)}" fill="none" stroke="#dbe3f0" stroke-width="20" stroke-linecap="round"></path>` +
+    `<path d="${arc(start, progressEnd)}" fill="none" stroke="${CHART_COLORS[0]}" stroke-width="20" stroke-linecap="round"></path>` +
+    `<line x1="${cx}" y1="${cy}" x2="${nx}" y2="${ny}" stroke="#1f2937" stroke-width="3"></line>` +
+    `<circle cx="${cx}" cy="${cy}" r="7" fill="#1f2937"></circle>` +
+    `<text class="answer-chart-axis-value" x="${mx}" y="${my}" text-anchor="middle">${chartNumberText(model.min)}</text>` +
+    `<text class="answer-chart-axis-value" x="${ex}" y="${ey}" text-anchor="middle">${chartNumberText(model.max)}</text>` +
+    `<text class="answer-chart-donut-total" x="${cx}" y="${cy - 16}" text-anchor="middle">${chartNumberText(model.rawValue)}${model.unit ? ` ${esc(model.unit)}` : ''}</text>` +
+    `<text class="answer-chart-donut-caption" x="${cx}" y="${cy + 10}" text-anchor="middle">${(ratio * 100).toFixed(1)}%</text></svg>`
+}
+
+function renderFunnelChart(points, unit) {
+  const positive = points.filter((point) => Number.isFinite(point.value) && point.value >= 0).slice(0, 8)
+  if (!positive.length) return ''
+  const sorted = [...positive].sort((a, b) => b.value - a.value)
+  const max = Math.max(...sorted.map((point) => point.value), 1)
+  const width = 640
+  const topY = 12
+  const stageHeight = 40
+  const height = topY + sorted.length * stageHeight + 12
+  const maxWidth = 500
+  const minWidth = 150
+  const stages = sorted.map((point, index) => {
+    const y = topY + index * stageHeight
+    const topWidth = maxWidth - (maxWidth - minWidth) * (index / Math.max(1, sorted.length))
+    const bottomWidth = maxWidth - (maxWidth - minWidth) * ((index + 1) / Math.max(1, sorted.length))
+    const color = CHART_COLORS[index % CHART_COLORS.length]
+    return `<path d="M ${320 - topWidth / 2} ${y} L ${320 + topWidth / 2} ${y} L ${320 + bottomWidth / 2} ${y + stageHeight - 4} L ${320 - bottomWidth / 2} ${y + stageHeight - 4} Z" fill="${color}" fill-opacity="0.82">` +
+      `<title>${esc(point.label)} ${chartNumberText(point.value)}${unit ? ` ${esc(unit)}` : ''}（${(point.value / max * 100).toFixed(0)}%）</title></path>` +
+      `<text x="320" y="${y + stageHeight / 2 + 4}" text-anchor="middle" fill="#fff" font-size="12" font-weight="600">${esc(chartShort(point.label, 12))} · ${chartNumberText(point.value)}</text>`
+  }).join('')
+  return `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="漏斗图" preserveAspectRatio="xMinYMid meet">${stages}</svg>`
+}
+
+function chartHeatmapModelOf(spec) {
+  const xRaw = Array.isArray(spec.xAxis) ? spec.xAxis : Array.isArray(spec.categoriesX) ? spec.categoriesX : Array.isArray(spec.categories) ? spec.categories : []
+  const yRaw = Array.isArray(spec.yAxis) ? spec.yAxis : Array.isArray(spec.categoriesY) ? spec.categoriesY : []
+  const rows = Array.isArray(spec.data) ? spec.data : []
+  const cells = []
+  rows.forEach((row, rowIndex) => {
+    if (Array.isArray(row)) {
+      if (row.length >= 3 && Number.isFinite(Number(row[2]))) {
+        cells.push({ x: Number(row[0]), y: Number(row[1]), value: Number(row[2]) })
+      } else {
+        row.forEach((value, xIndex) => {
+          if (Number.isFinite(Number(value))) cells.push({ x: xIndex, y: rowIndex, value: Number(value) })
+        })
+      }
+    } else if (row && typeof row === 'object') {
+      const x = Number(row.x ?? row.xi ?? row.col)
+      const y = Number(row.y ?? row.yi ?? row.row)
+      const value = Number(row.value ?? row.v)
+      if (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(value)) cells.push({ x, y, value })
+    }
+  })
+  if (!cells.length) return null
+  const xCount = Math.max(xRaw.length, ...cells.map((cell) => cell.x + 1))
+  const yCount = Math.max(yRaw.length, ...cells.map((cell) => cell.y + 1))
+  const xLabels = Array.from({ length: Math.min(xCount, 8) }, (_, index) => String(xRaw[index] ?? `第 ${index + 1} 列`))
+  const yLabels = Array.from({ length: Math.min(yCount, 8) }, (_, index) => String(yRaw[index] ?? `第 ${index + 1} 行`))
+  const kept = cells.filter((cell) => cell.x < 8 && cell.y < 8)
+  const values = kept.map((cell) => cell.value)
+  return {
+    type: 'heatmap',
+    xLabels,
+    yLabels,
+    cells: kept,
+    min: Math.min(...values),
+    max: Math.max(...values),
+    unit: String(spec.unit ?? '').trim().slice(0, 10),
+    title: String(spec.title ?? '数据分析').trim().slice(0, 60) || '数据分析',
+  }
+}
+
+function renderHeatmapChart(model) {
+  const width = 640
+  const left = 104
+  const top = 44
+  const cellWidth = Math.min(64, (width - left - 34) / Math.max(1, model.xLabels.length))
+  const cellHeight = 42
+  const height = top + model.yLabels.length * cellHeight + 24
+  const span = model.max - model.min || 1
+  const colorAt = (value) => {
+    const ratio = (value - model.min) / span
+    return `hsl(224 70% ${93 - ratio * 58}%)`
+  }
+  const xLabels = model.xLabels.map((label, index) =>
+    `<text class="answer-chart-axis-label" x="${left + index * cellWidth + cellWidth / 2}" y="${top - 12}" text-anchor="middle">${esc(chartShort(label, 8))}</text>`).join('')
+  const yLabels = model.yLabels.map((label, index) =>
+    `<text class="answer-chart-axis-label" x="${left - 10}" y="${top + index * cellHeight + cellHeight / 2 + 4}" text-anchor="end">${esc(chartShort(label, 9))}</text>`).join('')
+  const cells = model.cells.map((cell) => {
+    const x = left + cell.x * cellWidth
+    const y = top + cell.y * cellHeight
+    const ratio = (cell.value - model.min) / span
+    return `<rect x="${x + 2}" y="${y + 2}" width="${cellWidth - 4}" height="${cellHeight - 4}" rx="4" fill="${colorAt(cell.value)}">` +
+      `<title>${esc(model.xLabels[cell.x])} · ${esc(model.yLabels[cell.y])} ${chartNumberText(cell.value)}${model.unit ? ` ${esc(model.unit)}` : ''}</title></rect>` +
+      (cellWidth >= 42 && cellHeight >= 24
+        ? `<text x="${x + cellWidth / 2}" y="${y + cellHeight / 2 + 4}" text-anchor="middle" font-size="11" fill="${ratio > 0.55 ? '#fff' : '#26334d'}">${chartNumberText(cell.value)}</text>`
+        : '')
+  }).join('')
+  const legendColors = [0, 0.25, 0.5, 0.75, 1].map((ratio) =>
+    `<rect x="${width - 154 + ratio * 40}" y="${height - 16}" width="24" height="8" fill="hsl(224 70% ${93 - ratio * 58}%)"></rect>`).join('')
+  return `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="热力图" preserveAspectRatio="xMinYMid meet">${xLabels}${yLabels}${cells}` +
+    `<text class="answer-chart-axis-value" x="${width - 166}" y="${height - 9}" text-anchor="end">低</text><text class="answer-chart-axis-value" x="${width - 46}" y="${height - 9}">高</text>${legendColors}</svg>`
+}
+
+function chartWaterfallModelOf(spec) {
+  const raw = Array.isArray(spec.data) ? spec.data : []
+  const items = []
+  let cursor = 0
+  for (const [index, entry] of raw.slice(0, 12).entries()) {
+    const record = entry && typeof entry === 'object' ? entry : {}
+    const value = Number(Array.isArray(entry) ? entry[1] : record.value ?? entry)
+    if (!Number.isFinite(value)) continue
+    const total = record.total === true || record.isTotal === true
+    const start = total ? 0 : cursor
+    const end = total ? value : cursor + value
+    items.push({
+      label: String(record.label ?? (Array.isArray(entry) ? entry[0] : '') ?? `第 ${index + 1} 项`).trim() || `第 ${index + 1} 项`,
+      value,
+      start,
+      end,
+      total,
+    })
+    cursor = end
+  }
+  if (!items.length) return null
+  const values = [0, ...items.flatMap((item) => [item.start, item.end])]
+  const max = Math.max(...values)
+  const min = Math.min(...values)
+  return {
+    type: 'waterfall',
+    items,
+    min,
+    max,
+    unit: String(spec.unit ?? '').trim().slice(0, 10),
+    title: String(spec.title ?? '数据分析').trim().slice(0, 60) || '数据分析',
+  }
+}
+
+function renderWaterfallChart(model) {
+  const width = 640
+  const height = 300
+  const padding = { left: 50, right: 18, top: 20, bottom: 48 }
+  const plotWidth = width - padding.left - padding.right
+  const plotHeight = height - padding.top - padding.bottom
+  const max = Math.max(0, model.max)
+  const min = Math.min(0, model.min)
+  const span = max - min || 1
+  const yAt = (value) => padding.top + ((max - value) / span) * plotHeight
+  const count = model.items.length
+  const band = plotWidth / Math.max(1, count)
+  const barWidth = band * 0.56
+  const zeroY = yAt(0)
+  const grid = [0, 1, 2, 3].map((tick) => {
+    const y = padding.top + (tick / 3) * plotHeight
+    return `<line x1="${padding.left}" y1="${y}" x2="${width - padding.right}" y2="${y}" class="answer-chart-grid"></line>` +
+      `<text class="answer-chart-axis-value" x="${padding.left - 8}" y="${y + 4}" text-anchor="end">${chartNumberText(max - (tick / 3) * span)}</text>`
+  }).join('')
+  const connectors = model.items.slice(1).map((item, index) => {
+    const prev = model.items[index]
+    const x1 = padding.left + band * (index + 0.5) + barWidth / 2
+    const x2 = padding.left + band * (index + 1.5) - barWidth / 2
+    return `<line x1="${x1}" y1="${yAt(prev.end)}" x2="${x2}" y2="${yAt(item.total ? 0 : item.start)}" stroke="#94a3b8" stroke-width="1.2" stroke-dasharray="4 3"></line>`
+  }).join('')
+  const bars = model.items.map((item, index) => {
+    const x = padding.left + band * (index + 0.5) - barWidth / 2
+    const y = Math.min(yAt(item.start), yAt(item.end))
+    const h = Math.max(1, Math.abs(yAt(item.end) - yAt(item.start)))
+    const color = item.total ? CHART_COLORS[0] : item.value >= 0 ? '#36b37e' : '#e05252'
+    return `<rect x="${x}" y="${y}" width="${barWidth}" height="${h}" rx="4" fill="${color}">` +
+      `<title>${esc(item.label)} ${chartNumberText(item.value)}${model.unit ? ` ${esc(model.unit)}` : ''}</title></rect>` +
+      `<text class="answer-chart-value" x="${x + barWidth / 2}" y="${Math.min(yAt(item.start), yAt(item.end)) - 5}" text-anchor="middle">${chartNumberText(item.value)}</text>` +
+      `<text class="answer-chart-axis-label" x="${x + barWidth / 2}" y="${height - 12}" text-anchor="middle">${esc(chartShort(item.label, 7))}</text>`
+  }).join('')
+  return `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="瀑布图" preserveAspectRatio="xMinYMid meet">${grid}${connectors}${bars}</svg>`
+}
+
+/** 把 SVG 的 CSS 计算样式写回元素属性，导出的 PNG 才能保留文字和网格颜色。 */
+function inlineChartSvgStyles(source, clone) {
+  const sourceNodes = [source, ...source.querySelectorAll('*')]
+  const cloneNodes = [clone, ...clone.querySelectorAll('*')]
+  sourceNodes.forEach((node, index) => {
+    const target = cloneNodes[index]
+    if (!target) return
+    const style = getComputedStyle(node)
+    for (const name of ['fill', 'stroke', 'stroke-width', 'stroke-dasharray', 'font-size', 'font-weight', 'font-family', 'opacity', 'fill-opacity', 'stroke-opacity']) {
+      const value = style.getPropertyValue(name)
+      if (value) target.setAttribute(name, value)
+    }
+  })
+}
+
+async function chartPngDataUrl(card) {
+  const svg = card?.querySelector('.answer-chart-body svg')
+  if (!svg) throw new Error('没有可导出的图表')
+  const viewBox = svg.viewBox?.baseVal
+  const chartWidth = Math.max(220, Math.round(viewBox?.width || svg.getBoundingClientRect().width || 640))
+  const chartHeight = Math.max(160, Math.round(viewBox?.height || svg.getBoundingClientRect().height || 240))
+  const clone = svg.cloneNode(true)
+  inlineChartSvgStyles(svg, clone)
+  clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+  clone.setAttribute('width', String(chartWidth))
+  clone.setAttribute('height', String(chartHeight))
+  const serialized = new XMLSerializer().serializeToString(clone)
+  const imageUrl = URL.createObjectURL(new Blob([serialized], { type: 'image/svg+xml;charset=utf-8' }))
+  try {
+    const image = new Image()
+    await new Promise((resolve, reject) => {
+      image.onload = resolve
+      image.onerror = () => reject(new Error('图表图片加载失败'))
+      image.src = imageUrl
+    })
+    const padding = 24
+    const header = 52
+    const fontFamily = '"PingFang SC", "Microsoft YaHei", sans-serif'
+    const pieLegend = [...card.querySelectorAll('.answer-chart-legend li')].map((item) => ({
+      label: item.querySelector('.answer-chart-label')?.textContent?.trim() || '',
+      value: item.querySelector('strong')?.textContent?.trim() || '',
+      pct: item.querySelector('em')?.textContent?.trim() || '',
+      color: getComputedStyle(item.querySelector('.answer-chart-dot')).backgroundColor,
+      labelColor: getComputedStyle(item).color,
+      valueColor: getComputedStyle(item.querySelector('strong')).color,
+    }))
+    const seriesLegend = [...card.querySelectorAll('.answer-chart-series li')].map((item) => ({
+      text: [item.querySelector('.answer-chart-label')?.textContent?.trim(), item.querySelector('em')?.textContent?.trim()]
+        .filter(Boolean).join(' · '),
+      color: getComputedStyle(item.querySelector('.answer-chart-dot')).backgroundColor,
+      labelColor: getComputedStyle(item).color,
+    }))
+    const isPie = pieLegend.length > 0
+    const contentWidth = isPie ? 640 : chartWidth + padding * 2
+    const measure = document.createElement('canvas').getContext('2d')
+    measure.font = `12px ${fontFamily}`
+    const legendRows = []
+    if (seriesLegend.length && !isPie) {
+      let row = []
+      let rowWidth = 0
+      for (const item of seriesLegend) {
+        const itemWidth = 20 + measure.measureText(item.text).width + 18
+        if (row.length && rowWidth + itemWidth > chartWidth) {
+          legendRows.push(row)
+          row = []
+          rowWidth = 0
+        }
+        row.push({ ...item, x: rowWidth })
+        rowWidth += itemWidth
+      }
+      if (row.length) legendRows.push(row)
+    }
+    const legendHeight = legendRows.length ? legendRows.length * 20 + 4 : 0
+    const pieRows = isPie ? pieLegend.length : 0
+    const bodyHeight = isPie ? Math.max(chartHeight, pieRows * 22 + 8) : chartHeight
+    const scale = Math.min(3, Math.max(2, 2400 / contentWidth))
+    const canvas = document.createElement('canvas')
+    canvas.width = Math.round(contentWidth * scale)
+    canvas.height = Math.round((header + legendHeight + bodyHeight + padding) * scale)
+    const context = canvas.getContext('2d')
+    if (!context) throw new Error('浏览器不支持导出')
+    context.scale(scale, scale)
+    const cardBackground = getComputedStyle(card).backgroundColor
+    context.fillStyle = !cardBackground || cardBackground === 'rgba(0, 0, 0, 0)' ? '#ffffff' : cardBackground
+    context.fillRect(0, 0, contentWidth, header + legendHeight + bodyHeight + padding)
+    const titleNode = card.querySelector('.answer-chart-title')
+    context.fillStyle = titleNode ? getComputedStyle(titleNode).color || '#111827' : '#111827'
+    context.font = `600 18px ${fontFamily}`
+    context.textBaseline = 'middle'
+    context.fillText(titleNode?.textContent?.trim() || '图表', padding, header / 2 - 2)
+    const bodyY = header + legendHeight
+    if (legendRows.length && !isPie) {
+      context.font = `12px ${fontFamily}`
+      legendRows.forEach((row, rowIndex) => {
+        const y = header + rowIndex * 20 + 8
+        for (const item of row) {
+          const x = padding + item.x
+          context.fillStyle = item.color
+          context.beginPath()
+          context.arc(x + 4, y, 4, 0, Math.PI * 2)
+          context.fill()
+          context.fillStyle = item.labelColor || '#6b7280'
+          context.fillText(item.text, x + 15, y)
+        }
+      })
+    }
+    if (isPie) {
+      context.drawImage(image, padding + 4, bodyY, chartWidth, chartHeight)
+      const legendX = padding + chartWidth + 42
+      pieLegend.forEach((item, index) => {
+        const y = bodyY + 14 + index * 22
+        context.fillStyle = item.color
+        context.beginPath()
+        context.arc(legendX + 4, y, 4, 0, Math.PI * 2)
+        context.fill()
+        context.font = `12px ${fontFamily}`
+        context.fillStyle = item.labelColor || '#6b7280'
+        context.fillText(chartShort(item.label, 14), legendX + 15, y)
+        context.font = `600 12px ${fontFamily}`
+        context.fillStyle = item.valueColor || '#111827'
+        context.textAlign = 'right'
+        context.fillText(item.value, contentWidth - padding - 54, y)
+        context.font = `11px ${fontFamily}`
+        context.fillStyle = item.labelColor || '#6b7280'
+        context.fillText(item.pct, contentWidth - padding, y)
+        context.textAlign = 'left'
+      })
+    } else {
+      context.drawImage(image, padding, bodyY, chartWidth, chartHeight)
+    }
+    return canvas.toDataURL('image/png')
+  } finally {
+    URL.revokeObjectURL(imageUrl)
+  }
+}
+
+async function exportChartPng(button) {
+  const card = button.closest('.answer-chart')
+  if (!card) return
+  const label = button.textContent
+  button.disabled = true
+  button.textContent = '导出中…'
+  try {
+    const url = await chartPngDataUrl(card)
+    const title = (card.querySelector('.answer-chart-title')?.textContent || '图表').replace(/[\\/:*?"<>|]+/g, '-').slice(0, 60)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `${title || '图表'}.png`
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+  } catch (error) {
+    button.textContent = '导出失败'
+    setTimeout(() => { button.textContent = label }, 1800)
+    return
+  } finally {
+    button.disabled = false
+    if (button.textContent === '导出中…') button.textContent = label
+  }
+}
+
+document.addEventListener('click', (event) => {
+  const button = event.target instanceof Element ? event.target.closest('[data-chart-export]') : null
+  if (!button) return
+  event.preventDefault()
+  void exportChartPng(button)
+})
+
+/** 从还没闭合的图表 JSON 里取“已经完整”的字段和数组项，供流式阶段先长图。 */
+function chartJsonValueStart(text, field) {
+  const match = new RegExp(`"${field}"\\s*:\\s*`).exec(String(text ?? ''))
+  return match ? match.index + match[0].length : -1
+}
+
+function chartJsonBalancedSlice(text, start) {
+  let depth = 0
+  let quote = false
+  let escape = false
+  for (let index = start; index < text.length; index += 1) {
+    const ch = text[index]
+    if (quote) {
+      if (escape) escape = false
+      else if (ch === '\\') escape = true
+      else if (ch === '"') quote = false
+      continue
+    }
+    if (ch === '"') {
+      quote = true
+      continue
+    }
+    if (ch === '[' || ch === '{') {
+      depth += 1
+      continue
+    }
+    if (ch === ']' || ch === '}') {
+      depth -= 1
+      if (depth === 0) return text.slice(start, index + 1)
+    }
+  }
+  return text.slice(start)
+}
+
+function chartJsonStringField(text, field) {
+  const start = chartJsonValueStart(text, field)
+  if (start < 0 || text[start] !== '"') return null
+  let escape = false
+  for (let index = start + 1; index < text.length; index += 1) {
+    const ch = text[index]
+    if (escape) {
+      escape = false
+      continue
+    }
+    if (ch === '\\') {
+      escape = true
+      continue
+    }
+    if (ch !== '"') continue
+    try {
+      return JSON.parse(text.slice(start, index + 1))
+    } catch {
+      return null
+    }
+  }
+  return null
+}
+
+function chartJsonNumberField(text, field) {
+  const start = chartJsonValueStart(text, field)
+  if (start < 0) return null
+  const match = /^-?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?/i.exec(text.slice(start))
+  return match ? Number(match[0]) : null
+}
+
+function chartJsonArrayBody(text, field) {
+  const start = chartJsonValueStart(text, field)
+  if (start < 0 || text[start] !== '[') return null
+  return chartJsonBalancedSlice(text, start)
+}
+
+function chartJsonStructureClosed(text) {
+  const value = String(text ?? '').trim()
+  let depth = 0
+  let quote = false
+  let escape = false
+  for (let index = 0; index < value.length; index += 1) {
+    const ch = value[index]
+    if (quote) {
+      if (escape) escape = false
+      else if (ch === '\\') escape = true
+      else if (ch === '"') quote = false
+      continue
+    }
+    if (ch === '"') {
+      quote = true
+      continue
+    }
+    if (ch === '[' || ch === '{') {
+      depth += 1
+      continue
+    }
+    if (ch === ']' || ch === '}') {
+      depth -= 1
+      if (depth === 0) return index === value.length - 1
+    }
+  }
+  return false
+}
+
+function chartSplitTopLevelItems(body) {
+  const value = String(body ?? '').trim()
+  if (!value.startsWith('[')) return []
+  let text = value.slice(1)
+  if (chartJsonStructureClosed(value)) text = text.replace(/\]\s*$/, '')
+  const parts = []
+  let depth = 0
+  let quote = false
+  let escape = false
+  let start = 0
+  for (let index = 0; index < text.length; index += 1) {
+    const ch = text[index]
+    if (quote) {
+      if (escape) escape = false
+      else if (ch === '\\') escape = true
+      else if (ch === '"') quote = false
+      continue
+    }
+    if (ch === '"') {
+      quote = true
+      continue
+    }
+    if (ch === '[' || ch === '{') {
+      depth += 1
+      continue
+    }
+    if (ch === ']' || ch === '}') {
+      depth = Math.max(0, depth - 1)
+      continue
+    }
+    if (ch !== ',' || depth !== 0) continue
+    parts.push(text.slice(start, index))
+    start = index + 1
+  }
+  parts.push(text.slice(start))
+  return parts.map((part) => part.trim()).filter(Boolean)
+}
+
+function chartCompleteArrayItems(body) {
+  if (!body) return []
+  const items = []
+  for (const part of chartSplitTopLevelItems(body)) {
+    try {
+      const item = JSON.parse(part)
+      if (item !== null) items.push(item)
+    } catch {
+      // 最后一项通常只写了一半，等下一次流式刷新再取。
+    }
+  }
+  return items
+}
+
+function chartTopLevelObjects(body) {
+  const value = String(body ?? '').trim()
+  if (!value.startsWith('[')) return []
+  let text = value.slice(1)
+  if (chartJsonStructureClosed(value)) text = text.replace(/\]\s*$/, '')
+  const objects = []
+  let index = 0
+  while (index < text.length) {
+    if (text[index] !== '{') {
+      index += 1
+      continue
+    }
+    const slice = chartJsonBalancedSlice(text, index)
+    objects.push(slice)
+    if (!slice.trim().endsWith('}')) break
+    index += slice.length
+  }
+  return objects
+}
+
+function chartPartialSeries(raw) {
+  const body = chartJsonArrayBody(raw, 'series')
+  if (!body) return null
+  const series = []
+  for (const objectText of chartTopLevelObjects(body)) {
+    let entry = null
+    try {
+      entry = JSON.parse(objectText)
+    } catch {
+      const dataBody = chartJsonArrayBody(objectText, 'data') ?? chartJsonArrayBody(objectText, 'values')
+      const data = chartCompleteArrayItems(dataBody)
+      if (!data.length) continue
+      const name = chartJsonStringField(objectText, 'name') ?? chartJsonStringField(objectText, 'label')
+      const axis = chartJsonStringField(objectText, 'axis')
+      entry = { data }
+      if (name) entry.name = name
+      if (axis) entry.axis = axis
+    }
+    if (!entry || typeof entry !== 'object') continue
+    const data = Array.isArray(entry.data) ? entry.data : Array.isArray(entry.values) ? entry.values : []
+    if (!data.length) continue
+    series.push({ ...entry, data })
+  }
+  return series.length ? series : null
+}
+
+function chartPartialSpec(raw) {
+  const typeRaw = chartJsonStringField(raw, 'type')
+  const type = chartTypeOf({ type: typeRaw })
+  if (!typeRaw || !type) return null
+  const spec = {
+    type: typeRaw,
+    title: chartJsonStringField(raw, 'title') ?? '图表生成中',
+  }
+  const unit = chartJsonStringField(raw, 'unit')
+  const unitRight = chartJsonStringField(raw, 'unitRight')
+  if (unit) spec.unit = unit
+  if (unitRight) spec.unitRight = unitRight
+  if (/"stacked"\s*:\s*(true|"true")/.test(raw)) spec.stacked = true
+  const categories = chartCompleteArrayItems(chartJsonArrayBody(raw, 'categories'))
+  if (categories.length) spec.categories = categories
+  const labels = chartCompleteArrayItems(chartJsonArrayBody(raw, 'labels'))
+  if (labels.length) spec.labels = labels
+  const indicators = chartCompleteArrayItems(chartJsonArrayBody(raw, 'indicators'))
+  if (indicators.length) spec.indicators = indicators
+  const xLabel = chartJsonStringField(raw, 'xLabel')
+  const yLabel = chartJsonStringField(raw, 'yLabel')
+  if (xLabel) spec.xLabel = xLabel
+  if (yLabel) spec.yLabel = yLabel
+  const xAxis = chartCompleteArrayItems(chartJsonArrayBody(raw, 'xAxis'))
+  const yAxis = chartCompleteArrayItems(chartJsonArrayBody(raw, 'yAxis'))
+  const categoriesX = chartCompleteArrayItems(chartJsonArrayBody(raw, 'categoriesX'))
+  const categoriesY = chartCompleteArrayItems(chartJsonArrayBody(raw, 'categoriesY'))
+  if (xAxis.length) spec.xAxis = xAxis
+  if (yAxis.length) spec.yAxis = yAxis
+  if (categoriesX.length) spec.categoriesX = categoriesX
+  if (categoriesY.length) spec.categoriesY = categoriesY
+  if (type === 'gauge') {
+    const value = chartJsonNumberField(raw, 'value')
+    if (value === null) return null
+    spec.value = value
+    const min = chartJsonNumberField(raw, 'min')
+    const max = chartJsonNumberField(raw, 'max')
+    if (min !== null) spec.min = min
+    if (max !== null) spec.max = max
+    return spec
+  }
+  const series = type === 'pie' ? null : chartPartialSeries(raw)
+  const data = chartCompleteArrayItems(chartJsonArrayBody(raw, 'data'))
+  if (series) spec.series = series
+  else if (data.length) spec.data = data
+  else return null
+  return spec
+}
+
+/** ```chart JSON → 气泡里的图表卡片；任何异常都降级成提示，不影响整条消息。 */
+function renderChartBlock(rawCode, options = {}) {
+  const partial = options.partial === true
+  const decoded = decodeAnswerEntities(rawCode)
+  let spec = null
+  try {
+    spec = JSON.parse(decoded)
+  } catch {
+    if (!partial) return '<div class="answer-chart is-error">图表配置解析失败，已跳过。</div>'
+    spec = chartPartialSpec(decoded)
+    if (!spec) return ''
+  }
+  if (!spec || typeof spec !== 'object') return partial ? '' : '<div class="answer-chart is-error">图表配置为空，已跳过。</div>'
+  const type = chartTypeOf(spec)
+  if (!type) return partial ? '' : `<div class="answer-chart is-error">不支持的图表类型：${esc(String(spec.type ?? ''))}</div>`
+  let model = null
+  if (type === 'scatter') model = chartScatterModelOf(spec)
+  else if (type === 'bubble') model = chartBubbleModelOf(spec)
+  else if (type === 'gauge') model = chartGaugeModelOf(spec)
+  else if (type === 'heatmap') model = chartHeatmapModelOf(spec)
+  else if (type === 'waterfall') model = chartWaterfallModelOf(spec)
+  else if (type === 'radar') model = chartRadarModelOf(spec)
+  else model = chartModelOf(spec, type)
+  if (!model) return partial ? '' : '<div class="answer-chart is-error">图表没有可用的数据点。</div>'
+  let body = ''
+  const kindLabel = {
+    pie: '占比', doughnut: '占比', polarArea: '极坐标分布', rose: '玫瑰占比',
+    bar: '纵向对比', horizontalBar: '横向对比', stackedBar: '堆叠对比', groupedBar: '分组对比',
+    line: '趋势', area: '面积趋势',
+    scatter: '相关分布', bubble: '气泡分布', radar: '多维对比',
+    gauge: '进度', funnel: '转化', heatmap: '热力分布', waterfall: '累加',
+  }[type]
+  if (type === 'pie' || type === 'doughnut' || type === 'polarArea' || type === 'rose') {
+    let points = chartPointsOf(model)
+    if (points.length === 0) return partial ? '' : '<div class="answer-chart is-error">图表没有可用的数据点。</div>'
+    const limit = type === 'polarArea' || type === 'rose' ? 8 : 10
+    if (points.length > limit) {
+      const rest = points.slice(limit - 1)
+      points = [...points.slice(0, limit - 1), { label: '其他', value: rest.reduce((sum, point) => sum + point.value, 0) }]
+    }
+    points.sort((a, b) => b.value - a.value)
+    if (type === 'pie') body = renderPieChart(points, model.unit)
+    else if (type === 'doughnut') body = renderDonutChart(points, model.unit)
+    else if (type === 'polarArea') body = renderPolarAreaChart(points, model.unit)
+    else body = renderRoseChart(points, model.unit)
+  } else if (type === 'bar' || type === 'horizontalBar' || type === 'stackedBar' || type === 'groupedBar') {
+    const limit = 12
+    if (model.categories.length > limit) {
+      model.categories = [...model.categories.slice(0, limit), '其他']
+      model.series.forEach((item) => {
+        const rest = item.values.slice(limit)
+        const sum = rest.reduce((total, value) => total + (Number(value) || 0), 0)
+        item.values = [...item.values.slice(0, limit), sum]
+      })
+    }
+    if (type === 'horizontalBar') body = renderBarChart(model)
+    else body = renderColumnChart(model, type === 'stackedBar' ? 'stacked' : 'grouped')
+  } else if (type === 'line' || type === 'area') {
+    body = renderLineChart(model, { area: type === 'area' })
+  } else if (type === 'scatter') {
+    body = renderScatterChart(model)
+  } else if (type === 'bubble') {
+    body = renderBubbleChart(model)
+  } else if (type === 'radar') {
+    body = renderRadarChart(model)
+  } else if (type === 'gauge') {
+    body = renderGaugeChart(model)
+  } else if (type === 'funnel') {
+    body = renderFunnelChart(chartPointsOf(model), model.unit)
+  } else if (type === 'heatmap') {
+    body = renderHeatmapChart(model)
+  } else if (type === 'waterfall') {
+    body = renderWaterfallChart(model)
+  }
+  if (!body) return partial ? '' : '<div class="answer-chart is-error">图表没有可展示的数值。</div>'
+  const unitText = type === 'scatter' || type === 'bubble'
+    ? `${model.xLabel} × ${model.yLabel}`
+    : type === 'radar'
+      ? '各维度归一化'
+      : type === 'gauge'
+        ? `${chartNumberText(model.min)}–${chartNumberText(model.max)}${model.unit ? ` ${model.unit}` : ''}`
+        : type === 'heatmap'
+          ? `${model.xLabels.length} × ${model.yLabels.length}${model.unit ? ` · ${model.unit}` : ''}`
+          : model.unitRight
+            ? [model.unit && `左轴 ${model.unit}`, `右轴 ${model.unitRight}`].filter(Boolean).join(' · ')
+            : model.unit
+  const hasSeriesLegend = !['pie', 'doughnut', 'polarArea', 'rose', 'gauge', 'funnel', 'heatmap', 'waterfall'].includes(type)
+  return `<div class="answer-chart"><div class="answer-chart-head"><span class="answer-chart-title">${esc(model.title)}</span>` +
+    `<span class="answer-chart-tools"><span class="answer-chart-kind">${kindLabel}${unitText ? ` · ${esc(unitText)}` : ''}</span>` +
+    `<button class="answer-chart-export" type="button" data-chart-export data-tip="把当前图表导出为 PNG 图片" aria-label="导出 PNG">导出 PNG</button></span></div>` +
+    `<div class="answer-chart-body">${hasSeriesLegend ? chartLegendHtml(model) : ''}${body}</div></div>`
+}
+
 /** Markdown：标题、列表、表格、引用、分隔线、代码块、行内代码、加粗、斜体、链接、图片。 */
 function renderAnswer(text, options = {}) {
-  const source = esc(String(text ?? '').replace(/\r\n?/g, '\n'))
+  let source = esc(String(text ?? '').replace(/\r\n?/g, '\n'))
+  let partialChartCode = ''
+  // 流式输出时图表 JSON 还没闭合：不再把半截代码整段丢掉，
+  // 先把已经完整的数据点画出来；一个点都没有时显示“图表生成中”。
+  const fenceCount = (source.match(/```/g) ?? []).length
+  if (fenceCount % 2 === 1) {
+    const lastFence = source.lastIndexOf('```')
+    const opening = source.slice(lastFence).split('\n')[0].trim().slice(3).trim().toLowerCase()
+    if (opening.startsWith('chart')) {
+      const openingEnd = source.indexOf('\n', lastFence)
+      partialChartCode = openingEnd >= 0 ? source.slice(openingEnd + 1) : ''
+      source = `${source.slice(0, lastFence)}\n\u0000CHARTLOADING\u0000`
+    }
+  }
   const omitCodeBlocks = options.omitCodeBlocks instanceof Set ? options.omitCodeBlocks : null
   const codeBlocks = []
-  const body = source.replace(/```[^\n]*\n?([\s\S]*?)```/g, (_, code) => {
+  const body = source.replace(/```([^\n`]*)\n?([\s\S]*?)```/g, (_, language, code) => {
     const index = codeBlocks.length
-    codeBlocks.push(code.replace(/\n$/, ''))
+    codeBlocks.push({
+      code: code.replace(/\n$/, ''),
+      language: String(language ?? '').trim().split(/\s+/)[0].toLowerCase(),
+    })
     return `\u0000CODE${index}\u0000`
   })
   const lines = body.split('\n')
@@ -139,9 +1649,22 @@ function renderAnswer(text, options = {}) {
       continue
     }
 
+    if (line.trim() === '\u0000CHARTLOADING\u0000') {
+      const partialChart = partialChartCode ? renderChartBlock(partialChartCode, { partial: true }) : ''
+      output.push(partialChart || '<div class="answer-chart is-loading">图表生成中…</div>')
+      index += 1
+      continue
+    }
+
     const codeMatch = /^\u0000CODE(\d+)\u0000$/.exec(line.trim())
     if (codeMatch) {
-      const code = codeBlocks[Number(codeMatch[1])] ?? ''
+      const block = codeBlocks[Number(codeMatch[1])] ?? { code: '', language: '' }
+      const code = block.code ?? ''
+      if (block.language === 'chart') {
+        output.push(renderChartBlock(code))
+        index += 1
+        continue
+      }
       if (omitCodeBlocks && omitCodeBlocks.has(normalizeAnswerCodeBlock(code, true))) {
         if (output.length) {
           const trimmed = trimFileContentCodeLeadIn(output[output.length - 1])
@@ -266,14 +1789,84 @@ function fmtQuota(bytes) {
   return `${value} B`
 }
 
+const CHAT_TOAST_MAX = 3
+const CHAT_TOAST_ICON = {
+  ok: '<path d="m5 12 4 4 10-10"/>',
+  warn: '<path d="M12 7v6"/><path d="M12 17h.01"/>',
+  bad: '<path d="M6 6l12 12"/><path d="m18 6-12 12"/>',
+}
+
+/**
+ * 对话页唯一的瞬时提示出口：固定顶部居中，和后台的顶部提示保持同一套视觉。
+ * 成功会自动消失；警告/错误保留更久并带关闭按钮，支持同时叠放最多 3 条。
+ */
 function banner(message, tone = 'ok') {
-  const old = document.querySelector('.chat-banner')
-  if (old) old.remove()
+  const text = String(message ?? '').trim()
+  if (!text) return
+  const kind = tone === 'bad' ? 'bad' : tone === 'warn' ? 'warn' : 'ok'
+  if (window.EABOverlay?.toast) {
+    return window.EABOverlay.toast(text, {
+      tone: kind === 'bad' ? 'error' : kind === 'warn' ? 'warn' : 'success',
+    })
+  }
+  let host = document.querySelector('.top-toast-host')
+  if (!host) {
+    host = document.createElement('div')
+    host.className = 'top-toast-host chat-toast-host'
+    document.body.appendChild(host)
+  }
+
+  // 同一条提示重复触发时只刷新位置，不把同样的文案堆满屏幕。
+  for (const item of host.querySelectorAll('.top-toast')) {
+    if (item.dataset.message === text) {
+      clearTimeout(item._chatToastTimer)
+      item.remove()
+    }
+  }
+  while (host.childElementCount >= CHAT_TOAST_MAX) {
+    const oldest = host.firstElementChild
+    if (!oldest) break
+    clearTimeout(oldest._chatToastTimer)
+    oldest.remove()
+  }
+
   const el = document.createElement('div')
-  el.className = `chat-banner ${tone === 'bad' ? 'is-bad' : tone === 'warn' ? 'is-warn' : 'is-ok'}`
-  el.textContent = message
-  document.body.appendChild(el)
-  window.setTimeout(() => el.remove(), 3200)
+  el.className = `top-toast chat-toast is-${kind}`
+  el.dataset.message = text
+  el.setAttribute('role', kind === 'bad' ? 'alert' : 'status')
+  el.setAttribute('aria-live', kind === 'bad' ? 'assertive' : 'polite')
+
+  const icon = document.createElement('span')
+  icon.className = 'top-toast-icon'
+  icon.setAttribute('aria-hidden', 'true')
+  icon.innerHTML = `<svg viewBox="0 0 24 24" focusable="false">${CHAT_TOAST_ICON[kind]}</svg>`
+
+  const copy = document.createElement('span')
+  copy.className = 'top-toast-copy'
+  copy.textContent = text
+
+  const close = document.createElement('button')
+  close.className = 'top-toast-close'
+  close.type = 'button'
+  close.setAttribute('aria-label', '关闭提示')
+  close.textContent = '×'
+
+  el.append(icon, copy, close)
+  host.appendChild(el)
+
+  const dismiss = () => {
+    if (!el.isConnected) return
+    clearTimeout(el._chatToastTimer)
+    el.classList.add('is-leaving')
+    window.setTimeout(() => {
+      el.remove()
+      if (!host.childElementCount) host.remove()
+    }, 180)
+  }
+  const duration = kind === 'bad' ? 6000 : kind === 'warn' ? 4800 : 3200
+  el._chatToastTimer = window.setTimeout(dismiss, duration)
+  close.addEventListener('click', dismiss)
+  return { dismiss }
 }
 
 let loginRedirectStarted = false
@@ -699,7 +2292,7 @@ async function refreshConsoleEntry() {
       } catch (err) {
         entry.disabled = false
         entry.textContent = label
-        alert(err?.message || '进入管理后台失败，请稍后重试')
+        banner(err?.message || '进入管理后台失败，请稍后重试', 'bad')
         if (err?.status === 403) refreshConsoleEntry()
       }
     }
@@ -760,6 +2353,9 @@ function resetThread() {
   clearFileActivity()
   state.parentTeamTurn = null
   state.pendingTeamProgress = null
+  // 空态没有“最新消息”可回；同时清掉上一会话遗留的“下方有新内容”状态。
+  threadScrollPinned = true
+  threadHasNewBelow = false
   const thread = $('#thread')
   for (const child of [...thread.children]) {
     if (child.id !== 'chat-empty') child.remove()
@@ -1205,9 +2801,10 @@ let remoteLivePaint = 0
 function updateRemoteLive(payload, snapshot) {
   if (!payload?.sessionId || payload.sessionId === state.sessionId) return
   const text = String(snapshot?.text || snapshot?.reasoning || '').replace(/\s+/g, ' ').trim()
+  const preview = remoteLivePreview(text, 80) || '正在生成…'
   state.remoteLive = {
     sessionId: payload.sessionId,
-    preview: text ? text.slice(-80) : '正在生成…',
+    preview,
   }
   if (remoteLivePaint) return
   remoteLivePaint = window.setTimeout(() => {
@@ -1481,8 +3078,12 @@ function markThreadNewContent() {
 function updateScrollBottomButton() {
   const button = $('#scroll-bottom')
   if (!button) return
-  // 贴底时内容增长可能让距离暂时变大，不能因此闪出按钮。
-  button.hidden = threadScrollPinned
+  const thread = $('#thread')
+  const empty = $('#chat-empty')
+  const hasMessages = Boolean(thread?.querySelector('.msg'))
+  const emptyVisible = Boolean(empty && !empty.hidden)
+  // 空态/新建会话没有“最新消息”可回；贴底时内容增长也可能让距离暂时变大，不能因此闪出按钮。
+  button.hidden = threadScrollPinned || emptyVisible || !hasMessages
   button.classList.toggle('has-new', threadHasNewBelow)
   const label = threadHasNewBelow ? '有新内容，回到最新消息' : '回到最新消息'
   button.title = label
@@ -1898,7 +3499,7 @@ async function openSession(sessionId) {
       banner('该对话已不存在，已从列表中移除', 'warn')
       return
     }
-    appendMessage('ai', `${err.message}${err.code ? `（${err.code}）` : ''}`)
+    appendMessage('ai', `${err.message}${err.code ? `（${err.code}）` : ''}`, undefined, undefined, undefined, { animate: true })
   }
 }
 
@@ -2151,12 +3752,14 @@ function openConfirmCard({ eyebrow = '危险操作', title, targetLabel = '目�
       </div>
     </div>`
     document.body.appendChild(overlay)
+    document.body.classList.add('eab-modal-open')
     let settled = false
     const finish = (value) => {
       if (settled) return
       settled = true
       document.removeEventListener('keydown', onKey)
       overlay.remove()
+      document.body.classList.remove('eab-modal-open')
       if (previousFocus instanceof HTMLElement && previousFocus.isConnected && !previousFocus.closest('[hidden]')) {
         previousFocus.focus({ preventScroll: true })
       } else {
@@ -2165,12 +3768,25 @@ function openConfirmCard({ eyebrow = '危险操作', title, targetLabel = '目�
       resolve(value)
     }
     const onKey = (event) => {
-      if (event.key === 'Escape') finish(false)
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        finish(false)
+        return
+      }
+      if (event.key !== 'Tab') return
+      const focusables = [...overlay.querySelectorAll('button:not([disabled]), input:not([disabled])')]
+      if (!focusables.length) return
+      const first = focusables[0]
+      const last = focusables[focusables.length - 1]
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault()
+        last.focus()
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault()
+        first.focus()
+      }
     }
     document.addEventListener('keydown', onKey)
-    overlay.addEventListener('click', (event) => {
-      if (event.target === overlay) finish(false)
-    })
     overlay.querySelector('.modal-x').addEventListener('click', () => finish(false))
     overlay.querySelector('[data-confirm-cancel]').addEventListener('click', () => finish(false))
     overlay.querySelector('[data-confirm-ok]').addEventListener('click', () => finish(true))
@@ -2192,7 +3808,7 @@ async function renameSession(sessionId, currentTitle) {
     if (state.sessionId === sessionId) $('#chat-title').textContent = next
     await loadSessions()
   } catch (err) {
-    alert(err.message)
+    banner(err.message || '会话重命名失败，请稍后重试', 'bad')
   }
 }
 
@@ -2220,7 +3836,7 @@ async function deleteSession(sessionId) {
     }
     await loadSessions()
   } catch (err) {
-    alert(err.message)
+    banner(err.message || '会话删除失败，请稍后重试', 'bad')
   }
 }
 
@@ -2721,7 +4337,7 @@ function renderWorkspaceFiles() {
   for (const button of box.querySelectorAll('[data-file-open]')) {
     button.addEventListener('click', (event) => {
       if (event.isTrusted) setWorkbenchCollapsed(false)
-      openWorkspaceFile(button.dataset.fileOpen)
+      openWorkspaceFile(button.dataset.fileOpen, { opener: button })
     })
   }
   for (const button of box.querySelectorAll('[data-file-more]')) {
@@ -3831,6 +5447,25 @@ function permApplyHtml() {
     state.permRoleCode = roles[0]?.code || ''
   }
   const currentChips = current.map((scope) => `<span class="perm-chip${scope.dangerous ? ' is-dangerous' : ''}">${esc(scope.label)}</span>`).join('')
+  if (!scopes.length) {
+    return `
+      <div class="perm-complete-state">
+        <span class="perm-complete-badge">权限已齐全</span>
+        <strong>当前身份已拥有全部可申请权限</strong>
+        <span>无需再发起新申请。如需调整角色或回收权限，请联系公司管理员在控制台处理。</span>
+        <div class="perm-complete-stats">
+          <div><strong>${current.length}</strong><span>已生效权限</span></div>
+          <div><strong>${scopes.length}</strong><span>可申请权限</span></div>
+          <div><strong>${roles.length}</strong><span>可切换角色</span></div>
+        </div>
+      </div>
+      <div class="perm-field perm-complete-current">
+        <details class="perm-current-details">
+          <summary><span class="perm-current-label">查看当前身份已有权限</span><span class="perm-selected-count">${current.length} 项</span></summary>
+          <div class="perm-current-scopes">${currentChips || '<span class="perm-field-hint">暂无可用权限</span>'}</div>
+        </details>
+      </div>`
+  }
   const selected = new Set(state.permScopeCodes || [])
   const emptyScopes = `<div class="perm-scope-empty">
     <strong>当前没有可申请的新权限</strong>
@@ -4195,6 +5830,14 @@ function renderPermissionPane() {
   const body = $('#perm-body')
   if (!body) return
   const counts = { mine: state.permRequests.mine.length, todo: state.permRequests.todo.length }
+  const sub = $('#perm-pane-sub')
+  if (sub && state.permConfig) {
+    const available = (state.permConfig.scopes || []).length
+    if (state.permView === 'mine') sub.textContent = '查看你已经发起过的权限申请，以及当前审批进度和处理结果。'
+    else if (state.permView === 'todo') sub.textContent = '查看当前轮到你的审批；处理后结果会同步给申请人。'
+    else if (available) sub.textContent = '勾选当前身份缺少的权限点，多选合并成一张审批单；通过后只授予所选权限，不新增角色，到期自动失效。'
+    else sub.textContent = '你已拥有全部可申请权限；这里可以查看当前权限，或联系公司管理员调整角色。'
+  }
   const todoCount = $('#perm-todo-count')
   if (todoCount) {
     todoCount.hidden = counts.todo === 0
@@ -5426,6 +7069,9 @@ let workspacePdfLoadSeq = 0
 let workspacePreviewWatchTimer = null
 let workspacePreviewWatchBusy = false
 let workspacePreviewWatchEpoch = 0
+/** 关闭右栏预览后，把键盘焦点还给打开它的附件卡/文件行；列表重绘后按文件 id 找回。 */
+let workspacePreviewReturnFocus = null
+let workspacePreviewReturnFileId = ''
 const WORKSPACE_PREVIEW_WATCH_MS = 30_000
 /** 模型正在生成的文件内容草稿；只在右侧预览层展示，不参与磁盘写入。 */
 let fileStreamDraft = null
@@ -6878,7 +8524,52 @@ async function openWorkspaceImagePreview(file) {
   }
 }
 
+/** 记住打开预览前的焦点，关闭后优先还给它；文件列表会在关闭时重绘，所以同时记住文件 id。 */
+function rememberWorkspacePreviewReturnFocus(opener) {
+  if (state.filePreview) return
+  const active = opener instanceof HTMLElement ? opener : document.activeElement
+  if (!(active instanceof HTMLElement) || active === document.body || active === document.documentElement) return
+  if (active.closest('#file-pane')) return
+  workspacePreviewReturnFocus = active
+  workspacePreviewReturnFileId = String(
+    active.dataset?.fileOpen || active.closest('[data-file-open]')?.dataset.fileOpen || '',
+  )
+}
+
+function restoreWorkspacePreviewReturnFocus() {
+  const opener = workspacePreviewReturnFocus
+  const fileId = workspacePreviewReturnFileId
+  workspacePreviewReturnFocus = null
+  workspacePreviewReturnFileId = ''
+  const usable = (element) =>
+    element instanceof HTMLElement &&
+    element.isConnected &&
+    element.getClientRects().length > 0 &&
+    !element.closest('#file-pane')
+  if (usable(opener)) {
+    opener.focus({ preventScroll: true })
+    return
+  }
+  if (fileId) {
+    const current = [...document.querySelectorAll('#ws-list [data-file-open]')].find(
+      (button) => button.dataset.fileOpen === fileId,
+    )
+    if (usable(current)) {
+      current.focus({ preventScroll: true })
+      return
+    }
+  }
+  if (state.mode === 'chat') {
+    const input = $('#input')
+    if (usable(input)) input.focus({ preventScroll: true })
+    return
+  }
+  const firstFile = document.querySelector('#ws-list [data-file-open]')
+  if (usable(firstFile)) firstFile.focus({ preventScroll: true })
+}
+
 async function openWorkspaceFile(id, options = {}) {
+  rememberWorkspacePreviewReturnFocus(options.opener)
   let file = state.files.find((item) => item.id === id)
   if (!file) {
     // 消息卡片可能在列表刷新前就被点击；按 ID 拉一次，不把“刚发完的附件”误判成不存在。
@@ -6936,6 +8627,7 @@ async function openWorkspaceFile(id, options = {}) {
   hidePreviewSelection()
   const pane = $('#file-pane')
   pane.hidden = false
+  playPaneEnter(pane)
   suppressFileDockForPreview()
   const chatMain = $('.chat-main')
   chatMain.classList.add('is-file-preview')
@@ -7097,6 +8789,7 @@ function closeWorkspaceFile() {
   destroyOnlyOfficeEditor()
   hideFilePaneSyncNotice()
   $('#file-pane').hidden = true
+  clearPaneEnter($('#file-pane'))
   $('#file-split-resizer').hidden = true
   $('.chat-main').classList.remove('is-file-preview')
   hidePreviewSelection()
@@ -7113,6 +8806,7 @@ function closeWorkspaceFile() {
   syncWorkbenchLayout()
   renderWorkspaceFiles()
   restoreFileDockAfterPreview()
+  restoreWorkspacePreviewReturnFocus()
 }
 
 function beginWorkspaceEdit() {
@@ -7771,7 +9465,7 @@ function bindWorkbenchTabs() {
     const button = event.target.closest('[data-agent-artifact-open]')
     if (!button) return
     event.preventDefault()
-    void openWorkspaceFile(String(button.getAttribute('data-agent-artifact-open') || ''))
+    void openWorkspaceFile(String(button.getAttribute('data-agent-artifact-open') || ''), { opener: button })
   })
   // 子 Agent 的思考/工具入口：和主对话一样单行折叠，点一下展开完整内容。
   $('#team-detail')?.addEventListener('click', (event) => {
@@ -9418,48 +11112,270 @@ async function showVoiceSettings() {
 async function showMemories() {
   const overlay = document.createElement('div')
   overlay.className = 'modal-overlay'
-  const render = (items) => {
-    const rows = items.length
-      ? items
-          .map(
-            (item) => `<div class="mini-row"><span>${esc(item.content)} <span class="desc">${
-              item.confirmed ? '已确认' : '待确认'
-            } · ${esc(item.scopeType)}</span></span><span>${
-              item.confirmed ? '' : `<button class="link-btn accent" type="button" data-mem-confirm="${esc(item.id)}">确认</button>`
-            }<button class="link-btn danger-link" type="button" data-mem-del="${esc(item.id)}">删除</button></span></div>`,
-          )
-          .join('')
-      : '<span class="hint">还没有记忆。把偏好或长期事项写下来，确认后下轮对话会自动带上。</span>'
-    overlay.innerHTML = `<div class="modal">
-      <div class="modal-head"><h3>我的记忆</h3><button class="modal-x" type="button">×</button></div>
-      <div class="hint">只有确认过的记忆会进入对话上下文；模型可提交团队学习候选，但需要管理员确认后才会全公司生效。</div>
-      <div class="modal-section-title">已有记忆 <span>${items.length} 条</span></div>
-      <div class="mini-list">${rows}</div>
-      <div class="field-stack" style="padding-top:12px">
-        <label class="field"><span>新增一条</span><input id="mem-input" placeholder="例如：汇报材料尽量用一页纸" maxlength="1000" /></label>
+  let activeFilter = 'active'
+  let searchText = ''
+  const filters = [
+    ['active', '生效中'],
+    ['pending', '待确认'],
+    ['conflict', '冲突'],
+    ['archived', '已归档'],
+    ['expired', '已失效'],
+    ['all', '全部'],
+  ]
+  const matchesFilter = (item) => {
+    if (activeFilter === 'all') return true
+    if (activeFilter === 'active') return item.status === 'active' && item.confirmed
+    if (activeFilter === 'pending') return item.status === 'pending'
+    if (activeFilter === 'conflict') return item.status === 'conflict'
+    if (activeFilter === 'archived') return item.status === 'archived'
+    if (activeFilter === 'expired') return item.status === 'expired'
+    return true
+  }
+  const countFor = (key, stats) => {
+    if (!stats?.counts) return 0
+    if (key === 'all') return stats.counts.total || 0
+    if (key === 'active') return stats.counts.active || 0
+    if (key === 'pending') return (stats.counts.pending || 0) + (stats.counts.conflict || 0)
+    if (key === 'conflict') return stats.counts.conflict || 0
+    if (key === 'archived') return stats.counts.archived || 0
+    if (key === 'expired') return stats.counts.expired || 0
+    return 0
+  }
+  const render = (items, stats, autoExtract) => {
+    const autoMode = autoExtract?.mode || 'rules'
+    const autoConfirm = autoExtract?.autoConfirm !== false
+    const autoLabel = autoMode === 'off'
+      ? '自动抽取已关闭'
+      : autoConfirm
+        ? `自动记忆已开启${autoMode === 'llm' ? '（规则 + 模型）' : ''}`
+        : '自动抽取为影子模式，需确认后生效'
+    const typeLabel = (type) => ({ preference: '偏好', fact: '事实', decision: '决策', episode: '情景' }[type] || '事实')
+    const scopeLabel = (scope) => ({ user: '个人', dept: '部门', company: '公司' }[scope] || scope)
+    const statusOf = (item) => {
+      if (item.status === 'archived') return { tone: 'pending', text: '已归档' }
+      if (item.status === 'expired') return { tone: 'pending', text: '已失效' }
+      if (item.status === 'conflict') return { tone: 'warn', text: '冲突待确认' }
+      if (item.confirmed) {
+        if (item.source === 'consolidated') return { tone: 'ok', text: '情景合集' }
+        return { tone: 'ok', text: item.source === 'auto' ? '自动记忆' : '已生效' }
+      }
+      if (item.source === 'auto') return { tone: 'pending', text: '自动待确认' }
+      return { tone: 'pending', text: '待确认' }
+    }
+    const sourceTag = (item) => {
+      if (item.source === 'auto') return item.confirmed ? '自动记忆' : '自动候选'
+      if (item.source === 'consolidated') return '夜间合并'
+      return ''
+    }
+    const visible = items
+      .filter(matchesFilter)
+      .filter((item) => {
+        if (!searchText) return true
+        return `${item.content} ${item.factKey || ''} ${item.object || ''}`.toLowerCase().includes(searchText)
+      })
+    const cards = visible
+      .map((item) => {
+        const status = statusOf(item)
+        const conflict = item.status === 'conflict' && item.conflictContent
+          ? `<p class="mem-conflict"><span>与旧记忆冲突</span>${esc(String(item.conflictContent).slice(0, 80))}</p>`
+          : ''
+        const action = !item.confirmed && item.status !== 'archived' && item.status !== 'expired'
+          ? `<button class="link-btn accent" type="button" data-mem-confirm="${esc(item.id)}">${
+            item.status === 'conflict' ? '确认替换' : '确认'
+          }</button>`
+          : ''
+        const merged = item.mergedFrom?.length
+          ? `<span class="mem-tag">合并 ${item.mergedFrom.length} 条</span>`
+          : ''
+        const recalled = item.recallCount > 0
+          ? `<span class="mem-tag">召回 ${item.recallCount} 次</span>`
+          : ''
+        return `<article class="mem-card is-${status.tone}">
+          <div class="mem-card-body">
+            <p class="mem-text">${esc(item.content)}</p>
+            <div class="mem-tags">
+              <span class="mem-badge is-${status.tone}">${status.text}</span>
+              <span class="mem-tag">${esc(typeLabel(item.memoryType))}</span>
+              <span class="mem-tag">${esc(scopeLabel(item.scopeType))}</span>
+              ${sourceTag(item) ? `<span class="mem-tag is-source">${esc(sourceTag(item))}</span>` : ''}
+              ${item.factKey ? `<span class="mem-tag">${esc(item.factKey)}</span>` : ''}
+              ${merged}${recalled}
+            </div>
+            ${conflict}
+          </div>
+          <div class="mem-card-actions">${action}<button class="link-btn danger-link" type="button" data-mem-del="${esc(item.id)}">删除</button></div>
+        </article>`
+      })
+      .join('')
+    const emptyText = activeFilter === 'archived'
+      ? '还没有归档记忆。长期没被召回的情景会在夜间整理时归档。'
+      : activeFilter === 'expired'
+        ? '没有失效记忆。结构化事实被新值替换后会保留在这里。'
+        : activeFilter === 'pending'
+          ? '没有待确认记忆。个人高置信事实和偏好会自动生效。'
+          : '还没有记忆。聊到稳定的偏好或事实时，会自动记住。'
+    const list = visible.length
+      ? `<div class="mem-list" data-motion="stagger">${cards}</div>`
+      : `<div class="mem-empty"><span class="mem-empty-icon">✦</span><p>${esc(emptyText)}</p></div>`
+    const tabs = filters.map(([key, label]) => {
+      const count = countFor(key, stats)
+      return `<button class="mem-filter${activeFilter === key ? ' is-active' : ''}" type="button" data-mem-filter="${key}">${label}<span>${count}</span></button>`
+    }).join('')
+    const statsLine = stats?.counts
+      ? `<div class="mem-stats">
+          <div class="mem-stat"><strong>${stats.counts.active}</strong><span>生效中</span></div>
+          <div class="mem-stat"><strong>${stats.counts.autoActive}</strong><span>自动记忆</span></div>
+          <div class="mem-stat"><strong>${(stats.counts.pending || 0) + (stats.counts.conflict || 0)}</strong><span>待确认</span></div>
+          <div class="mem-stat"><strong>${stats.counts.archived}</strong><span>已归档</span></div>
+          <div class="mem-stat"><strong>${stats.counts.recalls}</strong><span>累计召回</span></div>
+        </div>`
+      : ''
+    const maintenance = stats?.maintenance
+      ? `上次整理：${memoryStamp(stats.maintenance.finishedAt || stats.maintenance.startedAt) || '刚刚'}，合并 ${
+        Number(stats.maintenance.result?.consolidated || 0)
+      } 组、归档 ${Number(stats.maintenance.result?.archived || 0)} 条`
+      : '还没有运行过记忆整理'
+    const extraction = stats?.extraction
+    const channelLabels = { web: '网页', dingtalk: '钉钉', feishu: '飞书', schedule: '定时任务' }
+    const channelSummary = (extraction?.channels || [])
+      .filter((item) => item.runs > 0)
+      .map((item) => `${channelLabels[item.channel] || item.channel} ${item.runs} 轮`)
+      .join('、')
+    const extractionLine = extraction
+      ? extraction.runs > 0
+        ? `近 ${extraction.windowDays} 天自动记忆：${extraction.runs} 轮，生效 ${extraction.activated} 条（${extraction.activationRate}%），待确认 ${extraction.pending} 条，冲突 ${extraction.conflicts} 条，重复 ${extraction.duplicates} 条${channelSummary ? `；${channelSummary}` : ''}`
+        : `近 ${extraction.windowDays} 天还没有自动记忆抽取记录`
+      : ''
+    const benchmark = stats?.benchmark
+    const benchmarkDataset = benchmark?.dataset
+    const benchmarkLast = benchmark?.lastRun
+    const benchmarkLine = benchmarkDataset
+      ? benchmarkLast
+        ? `记忆评测：${benchmarkLast.total} 条基准用例，通过 ${benchmarkLast.passed} 条（${benchmarkLast.passRate}%）；漏写 ${benchmarkLast.missed} 条（${benchmarkLast.missRate}%），误写 ${benchmarkLast.unexpected} 条（${benchmarkLast.miswriteRate}%），敏感泄漏 ${benchmarkLast.sensitiveLeaks} 条；${benchmarkLast.retention.rounds} 轮针事实${
+          benchmarkLast.retention.recalled ? `第 ${benchmarkLast.retention.rank} 位命中` : '未命中'
+        }。上次 ${memoryStamp(benchmarkLast.createdAt) || '刚刚'}${benchmarkLast.stale ? '；基准已更新，建议重跑' : ''}`
+        : `记忆评测：${benchmarkDataset.total} 条基准用例 + ${benchmarkDataset.retentionRounds} 轮针事实召回，还没有运行过`
+      : ''
+    const canWrite = (state.me?.capabilities || []).some((cap) => cap.scope === 'memory:write' || cap.scope === 'memory:admin')
+    const canMaintain = (state.me?.capabilities || []).some((cap) => cap.scope === 'memory:admin')
+    overlay.innerHTML = `<div class="modal memory-modal">
+      <div class="modal-head mem-head">
+        <span class="mem-head-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7.5 3.75h9a2 2 0 0 1 2 2v14.5l-6.5-3.9-6.5 3.9V5.75a2 2 0 0 1 2-2z"/><path d="M9.5 8.75h5"/></svg>
+        </span>
+        <div class="mem-head-copy">
+          <h3>我的记忆</h3>
+          <p class="mem-head-note">${esc(autoLabel)}。${autoConfirm ? '不需要手动确认，随时可以删除。' : '自动候选必须确认后才生效。'}团队记忆仍需管理员确认。</p>
+        </div>
+        <button class="modal-x" type="button" aria-label="关闭">×</button>
       </div>
-      <div class="modal-state" id="mem-state"></div>
-      <div class="modal-actions"><button class="btn primary" type="button" id="mem-add">保存</button><button class="btn ghost" type="button" id="mem-close">关闭</button></div>
+      <div class="mem-body">
+        ${statsLine}
+        <div class="mem-toolbar">
+          <div class="mem-filters">${tabs}</div>
+          <input class="mem-search" id="mem-search" placeholder="搜索记忆内容或键" value="${esc(searchText)}" />
+        </div>
+        <div class="mem-section-head">
+          <span class="mem-section-title">${esc(filters.find(([key]) => key === activeFilter)?.[1] || '记忆')}</span>
+          <span class="mem-count">${visible.length} 条</span>
+        </div>
+        ${list}
+        ${extractionLine ? `<div class="mem-maintenance mem-quality"><span>${esc(extractionLine)}</span></div>` : ''}
+        ${benchmarkLine ? `<div class="mem-benchmark">
+          <div class="mem-benchmark-copy">
+            <span class="mem-benchmark-title">规则基线</span>
+            <span>${esc(benchmarkLine)}</span>
+          </div>
+          ${canWrite ? `<button class="link-btn" type="button" id="mem-benchmark-run">运行评测</button>` : ''}
+        </div>` : ''}
+        <div class="mem-maintenance">
+          <span>${esc(maintenance)}</span>
+          ${canMaintain ? '<button class="link-btn" type="button" id="mem-maintain">立即整理</button>' : ''}
+        </div>
+        <div class="mem-compose">
+          <div class="mem-compose-head">
+            <span class="mem-compose-title">新增一条</span>
+            <label class="mem-type-pick">
+              <span>类型</span>
+              <select id="mem-type"><option value="preference">偏好</option><option value="fact">事实</option><option value="decision">决策</option><option value="episode">情景</option></select>
+            </label>
+          </div>
+          <input id="mem-input" placeholder="例如：汇报材料尽量用一页纸" maxlength="1000" />
+          <div class="modal-state" id="mem-state"></div>
+          <div class="mem-compose-actions">
+            <button class="link-btn" type="button" id="mem-close">关闭</button>
+            <button class="btn primary" type="button" id="mem-add">保存</button>
+          </div>
+        </div>
+      </div>
     </div>`
     const close = () => overlay.remove()
     overlay.querySelector('.modal-x').addEventListener('click', close)
     overlay.querySelector('#mem-close').addEventListener('click', close)
+    for (const tab of overlay.querySelectorAll('[data-mem-filter]')) {
+      tab.addEventListener('click', () => {
+        activeFilter = tab.dataset.memFilter || 'active'
+        render(items, stats, autoExtract)
+      })
+    }
+    overlay.querySelector('#mem-search').addEventListener('input', (event) => {
+      searchText = String(event.target.value || '').trim().toLowerCase()
+      const caret = event.target.selectionStart
+      // 列表、空态和计数一起重绘，避免搜索“从 0 条变多条”时只更新了计数。
+      render(items, stats, autoExtract)
+      const nextInput = overlay.querySelector('#mem-search')
+      if (nextInput) {
+        nextInput.focus()
+        nextInput.setSelectionRange(caret, caret)
+      }
+    })
     overlay.querySelector('#mem-add').addEventListener('click', async () => {
       const stateEl = overlay.querySelector('#mem-state')
       const content = overlay.querySelector('#mem-input').value.trim()
+      const memoryType = overlay.querySelector('#mem-type').value
       if (!content) {
         stateEl.className = 'modal-state bad'
         stateEl.textContent = '先写点内容'
         return
       }
       try {
-        await api('/api/memories', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content, scopeType: 'user' }) })
+        await api('/api/memories', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content, scopeType: 'user', memoryType }) })
         await refresh()
       } catch (err) {
         stateEl.className = 'modal-state bad'
         stateEl.textContent = err.message || '保存失败'
       }
     })
+    const maintain = overlay.querySelector('#mem-maintain')
+    if (maintain) {
+      maintain.addEventListener('click', async () => {
+        maintain.disabled = true
+        try {
+          const result = await api('/api/memories/maintenance/run', { method: 'POST' })
+          banner(`记忆整理完成：合并 ${result.consolidated} 组，归档 ${result.archived} 条`, 'ok')
+        } catch (err) {
+          banner(err.message || '整理失败', 'bad')
+        }
+        await refresh()
+      })
+    }
+    const benchmarkRun = overlay.querySelector('#mem-benchmark-run')
+    if (benchmarkRun) {
+      benchmarkRun.addEventListener('click', async () => {
+        benchmarkRun.disabled = true
+        benchmarkRun.textContent = '评测中…'
+        try {
+          const result = await api('/api/memories/benchmark/run', { method: 'POST' })
+          const retention = result.retention?.recalled ? `，${result.retention.rounds} 轮召回第 ${result.retention.rank} 位` : ''
+          banner(`记忆评测完成：通过 ${result.passed}/${result.total}，漏写 ${result.missed} 条，误写 ${result.unexpected} 条${retention}`, 'ok')
+          await refresh()
+        } catch (err) {
+          banner(err.message || '评测失败', 'bad')
+          benchmarkRun.disabled = false
+          benchmarkRun.textContent = '运行评测'
+        }
+      })
+    }
     for (const button of overlay.querySelectorAll('[data-mem-confirm]')) {
       button.addEventListener('click', async () => {
         await api(`/api/memories/${encodeURIComponent(button.dataset.memConfirm)}/confirm`, { method: 'POST' }).catch(() => null)
@@ -9480,10 +11396,13 @@ async function showMemories() {
   }
   const refresh = async () => {
     try {
-      const data = await api('/api/memories')
-      render(data.memories || [])
+      const [data, stats] = await Promise.all([
+        api('/api/memories?status=all'),
+        api('/api/memories/stats').catch(() => null),
+      ])
+      render(data.memories || [], stats, data.autoExtract || { mode: 'rules', autoConfirm: true })
     } catch (err) {
-      render([])
+      render([], null, { mode: 'rules', autoConfirm: true })
       const stateEl = overlay.querySelector('#mem-state')
       if (stateEl) stateEl.textContent = err.message
     }
@@ -9628,6 +11547,33 @@ function syncChatTitle() {
   el.textContent = (current && current.title) || (state.sessionId ? '对话' : '新对话')
 }
 
+const paneEnterTimers = new WeakMap()
+
+function clearPaneEnter(pane) {
+  if (!pane) return
+  const timer = paneEnterTimers.get(pane)
+  if (timer) window.clearTimeout(timer)
+  paneEnterTimers.delete(pane)
+  pane.classList.remove('is-pane-enter')
+}
+
+/** 工作台整页 / 文件预览进入只做 6px 位移，不隐藏首屏；截图或 reduced-motion 下都不会挡住内容。 */
+function playPaneEnter(pane) {
+  if (!pane) return
+  clearPaneEnter(pane)
+  void pane.offsetWidth
+  pane.classList.add('is-pane-enter')
+  const timer = window.setTimeout(() => {
+    pane.classList.remove('is-pane-enter')
+    paneEnterTimers.delete(pane)
+  }, 220)
+  paneEnterTimers.set(pane, timer)
+}
+
+function playWorkspaceEnter() {
+  playPaneEnter($('#workspace-pane'))
+}
+
 function setChatMode(mode) {
   if (state.filePreview) closeWorkspaceFile()
   const next = mode === 'workspace' ? 'workspace' : 'chat'
@@ -9644,10 +11590,12 @@ function setChatMode(mode) {
     button.setAttribute('aria-selected', active ? 'true' : 'false')
   }
   if (next === 'workspace') {
+    playWorkspaceEnter()
     syncChatTitle()
     if (state.workspaceKind === 'skills') loadMySkills()
     else loadMyPlugins()
   } else {
+    clearPaneEnter($('#workspace-pane'))
     syncChatTitle()
     syncThreadScrollState()
   }
@@ -9810,7 +11758,7 @@ function myPluginRailItem(plugin) {
   const status = myPluginStatus(plugin)
   const active = plugin.id === state.pluginSelected
   const format = plugin.format === 'dsh' ? 'DSH' : 'EAB'
-  return `<button class="plugin-rail-item ${active ? 'is-active' : ''} ${plugin.enabled ? '' : 'is-muted'}" type="button" data-my-plugin-select="${esc(plugin.id)}">
+  return `<button class="plugin-rail-item ${active ? 'is-active' : ''} ${plugin.enabled ? '' : 'is-muted'}" type="button" data-motion="lift" data-my-plugin-select="${esc(plugin.id)}">
     <span class="plugin-rail-avatar ${plugin.enabled ? '' : 'ghost'}">${esc((plugin.name || plugin.id).slice(0, 1).toUpperCase())}</span>
     <span class="plugin-rail-text">
       <strong>${esc(plugin.name || plugin.id)}</strong>
@@ -10083,6 +12031,15 @@ function myPluginWelcomeHtml(data) {
   </div>`
 }
 
+function decorateWorkspaceMotion() {
+  const detail = $('#my-plugin-detail')
+  if (!detail) return
+  for (const block of detail.querySelectorAll('.plugin-block')) {
+    if (!block.hasAttribute('data-motion')) block.setAttribute('data-motion', 'reveal')
+  }
+  window.EABMotion?.init(detail)
+}
+
 function renderMyPluginWorkspace() {
   const rail = $('#my-plugin-rail')
   const detail = $('#my-plugin-detail')
@@ -10092,6 +12049,7 @@ function renderMyPluginWorkspace() {
   const plugin = (data.plugins || []).find((item) => item.id === state.pluginSelected)
   detail.innerHTML = plugin ? myPluginDetailHtml(data, plugin) : myPluginWelcomeHtml(data)
   bindMyPluginWorkspace()
+  decorateWorkspaceMotion()
 }
 
 function openMyPluginUninstall(plugin) {
@@ -10330,7 +12288,7 @@ function mySkillStatusPill(skill) {
 function mySkillRailItem(skill) {
   const status = mySkillStatus(skill)
   const active = skill.id === state.skillSelected
-  return `<button class="plugin-rail-item ${active ? 'is-active' : ''} ${skill.enabled && skill.valid ? '' : 'is-muted'}" type="button" data-my-skill-select="${esc(skill.id)}">
+  return `<button class="plugin-rail-item ${active ? 'is-active' : ''} ${skill.enabled && skill.valid ? '' : 'is-muted'}" type="button" data-motion="lift" data-my-skill-select="${esc(skill.id)}">
     <span class="plugin-rail-avatar ${skill.enabled && skill.valid ? '' : 'ghost'}">${esc((skill.name || skill.id).slice(0, 1).toUpperCase())}</span>
     <span class="plugin-rail-text">
       <strong>${esc(skill.name || skill.id)}</strong>
@@ -10495,6 +12453,7 @@ function renderMySkillWorkspace() {
   const skill = (data.skills || []).find((item) => item.id === state.skillSelected)
   detail.innerHTML = skill ? mySkillDetailHtml(data, skill) : mySkillWelcomeHtml(data)
   bindMySkillWorkspace()
+  decorateWorkspaceMotion()
 }
 
 function mySkillSignature(data) {
@@ -10925,6 +12884,23 @@ function ensureHintTip() {
   return tip
 }
 
+function showHintTip(tip, target, text) {
+  if (!text) return
+  tip.textContent = text
+  tip.style.left = '0px'
+  tip.style.top = '0px'
+  tip.classList.add('is-visible')
+  const rect = target.getBoundingClientRect()
+  const tipWidth = tip.offsetWidth
+  const tipHeight = tip.offsetHeight
+  let left = rect.left + rect.width / 2 - tipWidth / 2
+  left = Math.max(8, Math.min(left, window.innerWidth - tipWidth - 8))
+  let top = rect.bottom + 8
+  if (top + tipHeight > window.innerHeight - 8) top = rect.top - tipHeight - 8
+  tip.style.left = `${Math.round(left)}px`
+  tip.style.top = `${Math.max(8, Math.round(top))}px`
+}
+
 function bindHintTips(root) {
   const targets = Array.from(root.querySelectorAll('[data-tip]'))
   if (!targets.length) return () => {}
@@ -10941,19 +12917,7 @@ function bindHintTips(root) {
     if (current && current !== target) current.removeAttribute('aria-describedby')
     current = target
     target.setAttribute('aria-describedby', 'hint-tip')
-    tip.textContent = text
-    tip.style.left = '0px'
-    tip.style.top = '0px'
-    tip.classList.add('is-visible')
-    const rect = target.getBoundingClientRect()
-    const tipWidth = tip.offsetWidth
-    const tipHeight = tip.offsetHeight
-    let left = rect.left + rect.width / 2 - tipWidth / 2
-    left = Math.max(8, Math.min(left, window.innerWidth - tipWidth - 8))
-    let top = rect.bottom + 8
-    if (top + tipHeight > window.innerHeight - 8) top = rect.top - tipHeight - 8
-    tip.style.left = `${Math.round(left)}px`
-    tip.style.top = `${Math.max(8, Math.round(top))}px`
+    showHintTip(tip, target, text)
   }
   for (const target of targets) {
     target.addEventListener('pointerenter', () => show(target))
@@ -10964,6 +12928,119 @@ function bindHintTips(root) {
   return () => {
     hide()
   }
+}
+
+/**
+ * 消息流是动态增删的，不能每来一条消息就重新绑一遍 [data-tip]。
+ * 在 #thread 上做一次事件委托，气泡里的图标、思考/工具/记忆入口都能共用同一个提示层。
+ */
+function bindThreadHintTips() {
+  const thread = document.getElementById('thread')
+  if (!thread || thread.dataset.hintTipsBound === '1') return
+  thread.dataset.hintTipsBound = '1'
+  const tip = ensureHintTip()
+  let current = null
+  const hide = () => {
+    if (current) current.removeAttribute('aria-describedby')
+    current = null
+    tip.classList.remove('is-visible')
+  }
+  const show = (target) => {
+    const text = target?.dataset?.tip
+    if (!text) return
+    if (current && current !== target) current.removeAttribute('aria-describedby')
+    current = target
+    target.setAttribute('aria-describedby', 'hint-tip')
+    showHintTip(tip, target, text)
+  }
+  const targetOf = (node) => {
+    const element = node instanceof Element ? node : null
+    const target = element?.closest('[data-tip]')
+    return target && thread.contains(target) ? target : null
+  }
+  thread.addEventListener('pointermove', (event) => {
+    const target = targetOf(event.target)
+    if (target && target !== current) show(target)
+  })
+  thread.addEventListener('pointerover', (event) => {
+    const target = targetOf(event.target)
+    if (target && target !== current) show(target)
+  })
+  thread.addEventListener('pointerout', (event) => {
+    if (!current) return
+    if (event.relatedTarget instanceof Node && current.contains(event.relatedTarget)) return
+    const next = targetOf(event.relatedTarget)
+    if (next) {
+      show(next)
+      return
+    }
+    hide()
+  })
+  thread.addEventListener('focusin', (event) => {
+    const target = targetOf(event.target)
+    if (target) show(target)
+  })
+  thread.addEventListener('focusout', (event) => {
+    if (!current) return
+    if (event.relatedTarget instanceof Node && current.contains(event.relatedTarget)) return
+    const next = targetOf(event.relatedTarget)
+    if (next) show(next)
+    else hide()
+  })
+  const reposition = () => {
+    if (!current) return
+    const rect = current.getBoundingClientRect()
+    if (rect.bottom < 8 || rect.top > window.innerHeight - 8) {
+      hide()
+      return
+    }
+    showHintTip(tip, current, current.dataset.tip)
+  }
+  thread.addEventListener('scroll', reposition, { passive: true })
+  window.addEventListener('resize', reposition)
+  thread.addEventListener('pointerleave', hide)
+}
+
+/**
+ * 原生 title 的提示要停一秒才出现，和页面自己的即时提示体验不一致。
+ * 消息流里所有仍带 title 的节点（图表截断标签、工具明细、Artifact 等）统一提升成 data-tip，
+ * 由 #thread 的事件委托即时显示；title 本身移除，避免原生黑框延迟后重复出现。
+ */
+function promoteThreadTitles(root = document.getElementById('thread')) {
+  if (!root) return
+  for (const node of root.querySelectorAll('[title]')) {
+    const text = String(node.getAttribute('title') || '').trim()
+    node.removeAttribute('title')
+    if (!text || node.dataset.tip) continue
+    node.dataset.tip = text
+    if (!node.hasAttribute('aria-label') && node.matches('button, a, input, textarea, select, [role="button"]')) {
+      node.setAttribute('aria-label', text)
+    }
+  }
+  // 图表里的 <svg><title> 也会触发浏览器原生延迟提示；提升到父节点后删掉，
+  // 让柱形、折线点、饼图扇区都走同一套即时提示。
+  for (const titleNode of root.querySelectorAll('svg title')) {
+    const text = String(titleNode.textContent || '').trim()
+    const parent = titleNode.parentElement
+    if (parent && text) {
+      if (!parent.dataset.tip) parent.dataset.tip = text
+      if (!parent.hasAttribute('aria-label')) parent.setAttribute('aria-label', text)
+    }
+    titleNode.remove()
+  }
+}
+
+function watchThreadTitles() {
+  const thread = document.getElementById('thread')
+  if (!thread || thread.dataset.hintTitlesBound === '1') return
+  thread.dataset.hintTitlesBound = '1'
+  promoteThreadTitles(thread)
+  new MutationObserver(() => promoteThreadTitles(thread)).observe(thread, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ['title'],
+  })
 }
 
 function readFileAsDataUrl(file) {
@@ -12078,7 +14155,7 @@ function bindAttachmentCards(node) {
       openImageLightbox(imageSrc, String(button.dataset.attachmentName || '图片'))
       return
     }
-    void openWorkspaceFile(String(button.dataset.attachmentOpen || ''))
+    void openWorkspaceFile(String(button.dataset.attachmentOpen || ''), { opener: button })
   })
 }
 
@@ -12164,6 +14241,17 @@ function oneLinePreview(text, maxLength = 120) {
   const normalized = String(text || '').replace(/\s+/g, ' ').trim()
   if (!normalized) return ''
   return normalized.length > maxLength ? `…${normalized.slice(-maxLength)}` : normalized
+}
+
+/** 跨会话实时提示只展示可读正文，丢掉图表 JSON 和代码块，避免把原始协议当预览。 */
+function remoteLivePreview(text, maxLength = 80) {
+  const cleaned = String(text || '')
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/```[\s\S]*/g, ' ')
+    .replace(/\{[\s\S]*?\}/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  return cleaned ? oneLinePreview(cleaned, maxLength) : ''
 }
 
 /** CoT 单行摘要取思考内容的第一句，和 DSH 的 “Think · …” 预览一致。 */
@@ -13445,7 +15533,7 @@ function toolPanelHtml(tools, { active = false, expanded = false } = {}) {
   const hasError = visibleTools.some((tool) => tool.status === 'error')
   const title = active ? '工具调用中' : '工具'
   return `<div class="tool-panel${active ? ' is-active' : ''}${hasError ? ' is-error' : ''}${expanded ? '' : ' is-collapsed'}" data-tool-panel>
-    <button class="tool-head" type="button" aria-expanded="${expanded ? 'true' : 'false'}" aria-label="展开工具调用明细">
+    <button class="tool-head" type="button" data-tip="${expanded ? '收起这次工具调用的完整参数与结果' : '展开这次工具调用的完整参数与结果'}" aria-expanded="${expanded ? 'true' : 'false'}" aria-label="展开工具调用明细">
       <span class="tool-dot"></span>
       <span class="tool-title">${title}</span>
       <span class="tool-divider"${preview ? '' : ' hidden'}>·</span>
@@ -13460,7 +15548,7 @@ function toolPanelHtml(tools, { active = false, expanded = false } = {}) {
 function thinkPanelHtml(reasoning) {
   const preview = firstLinePreview(reasoning, 96)
   return `<div class="think-panel is-collapsed">
-    <button class="think-head" type="button" aria-expanded="false" aria-label="展开思考过程">
+    <button class="think-head" type="button" data-tip="展开这次回答的完整思考过程" aria-expanded="false" aria-label="展开思考过程">
       <span class="think-icon" aria-hidden="true">✦</span>
       <span class="think-title">思考</span>
       <span class="think-divider"${preview ? '' : ' hidden'}>·</span>
@@ -13472,7 +15560,7 @@ function thinkPanelHtml(reasoning) {
 }
 
 function channelTag(channel) {
-  if (channel === 'dingtalk') return '<span class="channel-tag">钉钉</span>'
+  if (channel === 'dingtalk') return '<span class="channel-tag" data-tip="来自钉钉渠道；这条对话和网页工作台共用同一份历史">钉钉</span>'
   return ''
 }
 
@@ -13500,11 +15588,17 @@ function historyAiBubble(text, meta, rich, options = {}) {
   const channel = channelTag(rich?.channel)
   const clarify = rich?.clarify && typeof rich.clarify === 'object' ? rich.clarify : null
   const metaText = historyMetaText(meta, text, rich)
+  const metaTip = [
+    rich?.channel === 'dingtalk' ? '来自钉钉渠道，和网页工作台共用同一份历史' : '',
+    metaText ? `这条回答使用的模型与生成速度：${metaText}` : '',
+  ]
+    .filter(Boolean)
+    .join('；')
   const progressValue = rich?.teamProgress && typeof rich.teamProgress === 'object'
     ? rich.teamProgress
     : (rich?.progress && typeof rich.progress === 'object' ? rich.progress : null)
   const progressCard = progressValue ? teamProgressCardHtml(progressValue, progressValue.note || '') : ''
-  const memoryCard = memorySourceHtml(rich?.memoryHits, rich?.memoryScope)
+  const memoryCard = `${longTermMemorySourceHtml(rich?.longTermMemoryRecall)}${memorySourceHtml(rich?.memoryHits, rich?.memoryScope)}`
   const answerBody = clarify && options.pendingClarify
     ? clarifyInlineNote()
     : `<div class="answer-text">${renderAnswer(text, { omitCodeBlocks: writtenFileContentBlocks(tools) })}</div>`
@@ -13517,7 +15611,7 @@ function historyAiBubble(text, meta, rich, options = {}) {
     ${tools.length > 0 ? toolPanelHtml(tools) : ''}
     ${memoryCard}
     ${body}
-    ${metaText || channel ? `<span class="meta">${channel}${metaText ? esc(metaText) : ''}</span>` : ''}`
+    ${metaText || channel ? `<span class="meta"${metaTip ? ` data-tip="${esc(metaTip)}"` : ''}>${channel}${metaText ? esc(metaText) : ''}</span>` : ''}`
 }
 
 function memoryStamp(value) {
@@ -13528,6 +15622,41 @@ function memoryStamp(value) {
 }
 
 /** 助手回复引用到的历史记忆来源；默认折叠，避免抢占正文阅读。 */
+const LONG_TERM_MEMORY_TYPE_LABEL = { preference: '偏好', fact: '事实', decision: '决策', episode: '情景' }
+const LONG_TERM_MEMORY_SCOPE_LABEL = { user: '个人', dept: '部门', company: '公司' }
+
+/** 长期记忆召回来源：显示命中了哪几条、综合分和命中原因，方便用户判断 AI 为什么记得。 */
+function longTermMemorySourceHtml(tracesInput) {
+  const traces = Array.isArray(tracesInput)
+    ? tracesInput.filter((trace) => trace && typeof trace === 'object' && String(trace.excerpt || '').trim()).slice(0, 4)
+    : []
+  if (traces.length === 0) return ''
+  const items = traces.map((trace) => {
+    const typeLabel = LONG_TERM_MEMORY_TYPE_LABEL[trace.memoryType] || '记忆'
+    const scopeLabel = LONG_TERM_MEMORY_SCOPE_LABEL[trace.scopeType] || trace.scopeType || '个人'
+    const reasons = Array.isArray(trace.reasons) ? trace.reasons.map((reason) => String(reason)).filter(Boolean).slice(0, 4) : []
+    const score = typeof trace.score === 'number' ? trace.score.toFixed(2) : ''
+    return `<div class="memory-item ltm-item">
+      <span class="memory-item-title">${esc(typeLabel)} · ${esc(scopeLabel)}${
+        trace.source === 'consolidated' ? ' · 情景合集' : ''
+      }</span>
+      ${score ? `<span class="memory-item-time">${esc(score)}</span>` : ''}
+      <span class="memory-item-excerpt">${esc(String(trace.excerpt).slice(0, 100))}</span>
+      ${reasons.length ? `<span class="ltm-reason">${esc(reasons.join(' · '))}</span>` : ''}
+    </div>`
+  }).join('')
+  return `<div class="memory-panel memory-panel-longterm is-collapsed">
+    <button class="memory-head" type="button" data-tip="展开长期记忆来源：看看这次回答记住了哪些偏好、事实或决策" aria-expanded="false" aria-label="展开长期记忆召回原因">
+      <span class="memory-icon" aria-hidden="true">◎</span>
+      <span class="memory-title">长期记忆</span>
+      <span class="memory-divider">·</span>
+      <span class="memory-summary">想起了 ${traces.length} 条</span>
+      <span class="memory-chevron" aria-hidden="true">⌄</span>
+    </button>
+    <div class="memory-body">${items}</div>
+  </div>`
+}
+
 function memorySourceHtml(hitsInput, scopeInput) {
   const hits = Array.isArray(hitsInput) ? hitsInput.filter((hit) => hit && typeof hit === 'object').slice(0, 5) : []
   if (hits.length === 0) return ''
@@ -13547,7 +15676,7 @@ function memorySourceHtml(hitsInput, scopeInput) {
     </div>`
   }).join('')
   return `<div class="memory-panel is-collapsed">
-    <button class="memory-head" type="button" aria-expanded="false" aria-label="展开历史记忆来源">
+    <button class="memory-head" type="button" data-tip="展开历史记忆来源：查看这次回答引用了哪些会话片段" aria-expanded="false" aria-label="展开历史记忆来源">
       <span class="memory-icon" aria-hidden="true">◈</span>
       <span class="memory-title">记忆</span>
       <span class="memory-divider">·</span>
@@ -14342,6 +16471,13 @@ function bindToolToggles(node) {
       button.setAttribute('aria-expanded', collapsed ? 'false' : 'true')
       if (panel.classList.contains('think-panel')) {
         panel.dataset.userToggled = collapsed ? '0' : '1'
+        button.dataset.tip = collapsed ? '展开这次回答的完整思考过程' : '收起思考过程，只看回答正文'
+      } else if (panel.classList.contains('memory-panel')) {
+        button.dataset.tip = collapsed ? '展开这次回答引用的记忆来源' : '收起记忆来源'
+      } else if (panel.classList.contains('tool-panel') || panel.classList.contains('tool-card')) {
+        button.dataset.tip = collapsed
+          ? '展开这次工具调用的完整参数与结果'
+          : '收起工具详情，只看调用摘要'
       }
     })
   }
@@ -14380,7 +16516,7 @@ function setMessageTime(node, value) {
   const stamp = formatMessageStamp(value)
   if (!time || !stamp) return
   time.dateTime = stamp.iso
-  time.title = stamp.full
+  time.dataset.tip = stamp.full
   time.textContent = stamp.short
 }
 
@@ -14395,16 +16531,16 @@ const MESSAGE_ACTION_ICONS = {
 function messageFooterMarkup(role) {
   const actions =
     role === 'me'
-      ? `<button type="button" class="msg-action" data-message-act="edit" title="编辑后重发" aria-label="编辑后重发">${MESSAGE_ACTION_ICONS.edit}</button>
-         <button type="button" class="msg-action" data-message-act="recall" title="撤回" aria-label="撤回">${MESSAGE_ACTION_ICONS.recall}</button>
-         <button type="button" class="msg-action is-danger" data-message-act="delete" title="删除" aria-label="删除">${MESSAGE_ACTION_ICONS.delete}</button>`
-      : `<button type="button" class="msg-action is-danger" data-message-act="delete" title="删除回答" aria-label="删除回答">${MESSAGE_ACTION_ICONS.delete}</button>`
+      ? `<button type="button" class="msg-action" data-message-act="edit" data-tip="编辑这条消息并重新发送" aria-label="编辑后重发">${MESSAGE_ACTION_ICONS.edit}</button>
+         <button type="button" class="msg-action" data-message-act="recall" data-tip="撤回这条消息" aria-label="撤回">${MESSAGE_ACTION_ICONS.recall}</button>
+         <button type="button" class="msg-action is-danger" data-message-act="delete" data-tip="删除这条消息" aria-label="删除">${MESSAGE_ACTION_ICONS.delete}</button>`
+      : `<button type="button" class="msg-action is-danger" data-message-act="delete" data-tip="删除这条回答" aria-label="删除回答">${MESSAGE_ACTION_ICONS.delete}</button>`
   const actionsBlock = `<div class="msg-actions" role="group" aria-label="消息操作" hidden>${actions}</div>`
   const speech =
     role === 'ai'
-      ? '<button class="msg-voice" type="button" title="播放语音" aria-label="播放语音" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 10v4h3l4 3V7l-4 3H5Z" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M15 9.5a3.5 3.5 0 0 1 0 5M17.5 7a7 7 0 0 1 0 10" fill="none" stroke="currentColor" stroke-width="1.5"/></svg><span>播放语音</span></button>'
+      ? '<button class="msg-voice" type="button" data-tip="播放这条回答的语音；播放中可再点一次停止" aria-label="播放语音" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 10v4h3l4 3V7l-4 3H5Z" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M15 9.5a3.5 3.5 0 0 1 0 5M17.5 7a7 7 0 0 1 0 10" fill="none" stroke="currentColor" stroke-width="1.5"/></svg><span>播放语音</span></button>'
       : ''
-  const time = '<time class="msg-time"></time>'
+  const time = '<time class="msg-time" aria-label="消息时间"></time>'
   const blocks =
     role === 'me'
       ? `${actionsBlock}${time}`
@@ -14446,6 +16582,16 @@ function bubbleVisibleAttachments(list) {
   return (Array.isArray(list) ? list : []).filter((file) => !file?.workspaceKind)
 }
 
+/**
+ * 只给这一轮新出现的消息加入场过渡。
+ * 历史记录首屏直接落在最终状态，避免页面重新打开时整段对话被动画起始帧的 opacity:0 挡住。
+ */
+function markMessageNew(node) {
+  if (!node) return
+  node.classList.add('is-new')
+  window.setTimeout(() => node.classList.remove('is-new'), 650)
+}
+
 function appendMessage(role, text, meta, attachments, rich, options = {}) {
   setEmptyVisible(false)
   const node = document.createElement('div')
@@ -14470,6 +16616,7 @@ function appendMessage(role, text, meta, attachments, rich, options = {}) {
         <div class="who-me"><span class="who-name">${esc(meName)}</span>${channel}${avatarMarkup(meName, meAvatarUrl(), 'who-badge me')}</div>`
       : `${aiWhoMarkup()}<div class="msg-body"><div class="bubble ai-turn">${historyAiBubble(text, meta, rich || {}, options)}</div>${footer}</div>`
   const thread = $('#thread')
+  if (options.animate) markMessageNew(node)
   if (options.prepend) {
     const firstMessage = thread.querySelector('.msg')
     thread.insertBefore(node, firstMessage || null)
@@ -14497,7 +16644,7 @@ function createAiTurn(options = {}) {
   node.className = 'msg ai'
   node.innerHTML = `${aiWhoMarkup()}<div class="msg-body"><div class="bubble ai-turn">
     <div class="think-panel is-collapsed" hidden>
-      <button class="think-head" type="button" aria-expanded="false" aria-label="展开思考过程">
+      <button class="think-head" type="button" data-tip="查看这次回答的思考过程；生成中也会实时更新" aria-expanded="false" aria-label="展开思考过程">
         <span class="think-icon" aria-hidden="true">✦</span><span class="think-title">思考中</span><span class="think-divider" hidden>·</span><span class="think-preview"></span><span class="think-chevron" aria-hidden="true">⌄</span>
       </button>
       <div class="think-body"></div>
@@ -14514,6 +16661,7 @@ function createAiTurn(options = {}) {
   setMessageTime(node, options.createdAt || Date.now())
   refreshMessageActions(node)
   if (append) {
+    markMessageNew(node)
     $('#thread').appendChild(node)
     bindToolToggles(node)
     scrollThreadToBottomInstant()
@@ -14537,6 +16685,10 @@ function createAiTurn(options = {}) {
   let reasoningStartedAt = 0
   let firstAnswerAt = 0
   let rawAnswer = ''
+  /** 已揭示到界面的字符数：与 rawAnswer 解耦，保证大段 delta 也不会一次性铺满。 */
+  let shownAnswerLength = 0
+  /** 整段正文一次性到达（例如只有 done.text）时，按更慢的逐字节奏揭示。 */
+  let batchReveal = false
   let answerRenderQueued = false
   let answerRenderTimer = 0
   let scrollQueued = false
@@ -14592,9 +16744,9 @@ function createAiTurn(options = {}) {
     if (card) applyTeamProgressCard(card, progress)
     teamProgress.hidden = false
   }
-  const setMemorySources = (hits, scope) => {
+  const setMemorySources = (hits, scope, longTermTraces) => {
     if (!memorySlot) return
-    const html = memorySourceHtml(hits, scope)
+    const html = `${longTermMemorySourceHtml(longTermTraces)}${memorySourceHtml(hits, scope)}`
     memorySlot.innerHTML = html
     memorySlot.hidden = !html
     if (html) bindToolToggles(node)
@@ -14685,18 +16837,37 @@ function createAiTurn(options = {}) {
   }
   // 流式阶段也按 Markdown 渲染；合并到 ~30fps，避免长回答逐 token 反复解析整段 Markdown。
   // 语音播报期间降到 ~20fps：音频已经由 AudioWorklet 独立播放，正文渲染不必和声卡抢主线程。
+  // 关键：界面只渲染“已揭示”的前缀，而不是 rawAnswer 全量。上游/门禁一次给来一大段
+  // （例如工具轮结束后的整段正文）时，也按固定节奏逐段揭开，不会整段突然出现。
   const renderStreamingAnswer = () => {
     if (answerRenderQueued) return
     answerRenderQueued = true
     const generation = renderGeneration
-    const interval = voiceSpeechStream?.active || state.voiceConversation.active ? 50 : 28
+    const interval = voiceSpeechStream?.active || state.voiceConversation.active ? 45 : 30
     answerRenderTimer = setTimeout(() => {
       answerRenderTimer = 0
       requestAnimationFrame(() => {
         answerRenderQueued = false
         if (generation !== renderGeneration) return
-        answer.innerHTML = renderAnswer(rawAnswer, { omitCodeBlocks: writtenFileContentBlocks(toolTraces) })
+        const chars = Array.from(rawAnswer)
+        const total = chars.length
+        if (shownAnswerLength > total) shownAnswerLength = total
+        const backlog = total - shownAnswerLength
+        if (backlog > 0) {
+          if (batchReveal) {
+            // 成批到达（含 finish-only）按接近逐字的速度揭示，约 130 字/秒；
+            // 正常 token 流不会走到这里，仍保持“有多少补多少”。
+            shownAnswerLength += Math.min(backlog, 4)
+          } else {
+            // 正常小增量（模型逐 token 下发）直接补齐；只有明显成批到达时才限速揭开。
+            shownAnswerLength += backlog <= 24 ? backlog : Math.min(60, Math.max(12, Math.ceil(backlog / 10)))
+          }
+          if (shownAnswerLength >= total) batchReveal = false
+        }
+        answer.innerHTML = renderAnswer(chars.slice(0, shownAnswerLength).join(''), { omitCodeBlocks: writtenFileContentBlocks(toolTraces) })
         scroll()
+        // 一次调度只推进一帧；还有积压就继续排下一帧，形成稳定的打字节奏。
+        if (shownAnswerLength < total) renderStreamingAnswer()
       })
     }, interval)
   }
@@ -14777,6 +16948,8 @@ function createAiTurn(options = {}) {
       reasoningStartedAt = 0
       firstAnswerAt = 0
       rawAnswer = ''
+      shownAnswerLength = 0
+      batchReveal = false
       answer.innerHTML = ''
       answer.hidden = true
       answer.classList.remove('is-clarify-note', 'is-error')
@@ -14807,6 +16980,7 @@ function createAiTurn(options = {}) {
     appendToThread() {
       if (node.isConnected) return
       setEmptyVisible(false)
+      markMessageNew(node)
       $('#thread').appendChild(node)
       bindToolToggles(node)
       scrollThreadToBottomInstant()
@@ -14864,6 +17038,9 @@ function createAiTurn(options = {}) {
       answer.hidden = false
       answer.classList.remove('is-clarify-note')
       rawAnswer += text
+      // 一次 delta 就送来越过 120 字的整段正文，说明上游没有逐 token 下发；
+      // 标记为成批揭示，避免这一大段在几帧内铺满。
+      if (Array.from(text).length > 120) batchReveal = true
       renderStreamingAnswer()
     },
     tool(event) {
@@ -14964,21 +17141,47 @@ function createAiTurn(options = {}) {
         showClarifyPrompt(data.clarify)
       } else {
         hideWaiting()
-        setMemorySources(data?.memoryHits || [], data?.memoryScope)
+        setMemorySources(data?.memoryHits || [], data?.memoryScope, data?.longTermMemoryRecall || [])
         clarifySlot.hidden = true
         clarifySlot.innerHTML = ''
         const finalText = String(data?.text || '').trim()
-        if (finalText) rawAnswer = finalText
+        if (finalText) {
+          // 收尾正文可能被门禁重写/服务端替换。如果和已经显示的前缀不是同一份内容，
+          // 清空重播，避免“前半段旧文 + 后半段突然换成终稿”或终稿整段瞬间铺满。
+          const revealed = Array.from(rawAnswer).slice(0, shownAnswerLength).join('')
+          if (finalText.trim() !== rawAnswer.trim() && finalText.trim() !== revealed.trim()) {
+            shownAnswerLength = 0
+            batchReveal = true
+            answer.innerHTML = ''
+          }
+          rawAnswer = finalText
+        }
         answer.hidden = false
         answer.classList.remove('is-clarify-note')
-        if (rawAnswer) answer.innerHTML = renderAnswer(rawAnswer, { omitCodeBlocks: writtenFileContentBlocks(toolTraces) })
-        else if (!answer.textContent) answer.textContent = '（没有返回内容）'
+        if (rawAnswer) {
+          // 如果正文是随 done 一次性回来的（没有任何 delta），这里也从 0 开始按节奏揭示，
+          // 而不是直接 innerHTML 全量铺开。已揭示到末尾时再补一次最终渲染，让图表完整收尾。
+          const finalLength = Array.from(rawAnswer).length
+          if (shownAnswerLength <= 0 || finalLength - shownAnswerLength > 120) batchReveal = true
+          if (shownAnswerLength < finalLength) renderStreamingAnswer()
+          else answer.innerHTML = renderAnswer(rawAnswer, { omitCodeBlocks: writtenFileContentBlocks(toolTraces) })
+        } else if (!answer.textContent) answer.textContent = '（没有返回内容）'
       }
       const citations = data.citations && data.citations.length ? ` · 引用 ${data.citations.length} 条` : ''
       const speed = tokenSpeedText(data.tokens, data.timing, `${data.reasoning || ''}${data.text || ''}`)
       const thinking = think.hidden ? '' : ` · 思考 ${formatElapsed((firstAnswerAt || Date.now()) - (reasoningStartedAt || startedAt))}`
       metaLine.hidden = false
       metaLine.innerHTML = `${channelTag(data.channel)}${esc(`${data.modelName || ''}${speed ? ` · ${speed}` : ''}${data.autoSelected ? ' · 自动选择' : ''}${thinking}${citations}`)}`
+      metaLine.dataset.tip = [
+        data.channel === 'dingtalk' ? '来自钉钉渠道，和网页工作台共用同一份历史' : '',
+        data.modelName ? `模型：${data.modelName}` : '',
+        speed ? `生成速度：${speed}（每秒生成的 token 数）` : '',
+        data.autoSelected ? '这个模型由系统自动选择' : '',
+        thinking ? `思考耗时：${thinking.replace(/^\s*·\s*/, '')}` : '',
+        citations ? `本次回答引用：${citations.replace(/^\s*·\s*/, '')}` : '',
+      ]
+        .filter(Boolean)
+        .join('；')
       // 固定模型的会话发生故障转移时，后端已写回接替模型；气泡同步为实际接替模型。
       if (!data.autoSelected && data.fallbackFromModelId && data.modelId) {
         setSelected(data.modelId, { persist: false })
@@ -15001,6 +17204,7 @@ function createAiTurn(options = {}) {
       if (meta) {
         metaLine.hidden = false
         metaLine.textContent = meta
+        metaLine.dataset.tip = `这次回答失败：${meta}`
       }
       if (node.isConnected) settleFileDock()
       scroll()
@@ -15016,6 +17220,7 @@ function createAiTurn(options = {}) {
       if (!rawAnswer) answer.textContent = '已停止生成'
       metaLine.hidden = false
       metaLine.textContent = '已停止生成'
+      metaLine.dataset.tip = '这次生成已手动停止；可以重新提问或继续追问'
       if (node.isConnected) settleFileDock()
       scroll()
     },
@@ -15344,7 +17549,8 @@ function renderAttachments() {
                   ? '图片可读'
                   : '当前模型不支持图片'
                 : '仅附件'
-      const kindText = isPersistentAttachment(file) ? `${kind} · 常驻` : kind
+      // 对话 chip 的副标题已经说明历史范围，徽标只保留「常驻引用」，避免「对话历史 + 对话引用」重复。
+      const kindText = isConversation ? '常驻引用' : isPersistentAttachment(file) ? `${kind} · 常驻` : kind
       const kindMuted = !isConversation && !isWorkspace && (file.readable === 'none' || (file.readable === 'image' && !visionReady))
       const sizeText = isConversation
         ? (Number(file.conversationMessageCount) > 0
@@ -15403,17 +17609,17 @@ async function addFiles(fileList) {
       }
     }
     if (file.size === 0 && (file.type || '').startsWith('image/')) {
-      alert('没读到剪贴板图片：请在浏览器弹窗里允许读取剪贴板，或直接点「上传图片」。')
+      banner('没读到剪贴板图片：请在浏览器弹窗里允许读取剪贴板，或直接点「上传图片」。', 'warn')
       continue
     }
     if (file.size > MAX_FILE_SIZE) {
-      alert(`「${safeFileName(file)}」超过 10MB，先不加入。`)
+      banner(`「${safeFileName(file)}」超过 10MB，先不加入。`, 'warn')
       continue
     }
     const name = safeFileName(file)
     const type = file.type || 'application/octet-stream'
     if (isTextLike(file) && file.size > MAX_TEXT_ATTACHMENT_BYTES) {
-      alert(`「${name}」超过单文件 4.8MB 的文本读取上限，无法保证完整读取；请拆分后再上传。`)
+      banner(`「${name}」超过单文件 4.8MB 的文本读取上限，无法保证完整读取；请拆分后再上传。`, 'warn')
       continue
     }
     const entry = {
@@ -15431,7 +17637,7 @@ async function addFiles(fileList) {
         entry.text = await readTextAttachment(file)
         entry.readable = entry.text ? 'text' : 'none'
       } catch {
-        alert(`「${name}」文本正文读取失败，请确认文件编码或拆分后重试。`)
+        banner(`「${name}」文本正文读取失败，请确认文件编码或拆分后重试。`, 'bad')
         continue
       }
     } else if (type.startsWith('image/')) {
@@ -16666,7 +18872,7 @@ async function send(options = {}) {
   runtime.queue.push(item)
   input.value = ''
   input.style.height = '44px'
-  item.node = appendMessage('me', text, undefined, attachmentMeta, undefined, { createdAt: item.createdAt })
+  item.node = appendMessage('me', text, undefined, attachmentMeta, undefined, { createdAt: item.createdAt, animate: true })
   scrollThreadToBottomInstant()
 
   state.attachments = pending.filter(isPersistentAttachment)
@@ -17005,6 +19211,7 @@ function showSettings() {
   $('.chat-head').hidden = true
   $('.chat-main').hidden = true
   stage.hidden = false
+  playPaneEnter(stage)
   $('#open-settings').classList.add('is-active')
   state.view = 'settings'
   persistChatLocation()
@@ -17018,6 +19225,7 @@ function hideSettings() {
   const stage = $('#settings-stage')
   if (!stage) return
   stage.hidden = true
+  clearPaneEnter(stage)
   $('.chat-head').hidden = false
   $('.chat-main').hidden = false
   $('#open-settings').classList.remove('is-active')
@@ -18520,5 +20728,7 @@ window.addEventListener('eab:branding', () => {
   try { paintLoginBrand() } catch { /* 登录页不在当前视图时忽略 */ }
 })
 bindHintTips($('#workspace-pane'))
+bindThreadHintTips()
+watchThreadTitles()
 bindWorkspaceKindSwitch()
 boot()

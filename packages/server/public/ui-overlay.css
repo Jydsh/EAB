@@ -1,0 +1,379 @@
+/* ==========================================================================
+   EAB Overlay Layer
+   --------------------------------------------------------------------------
+   共享浮层样式：顶部 Toast 的语气色、进度条、暂停态，以及锚定在触发按钮
+   旁边的 Popconfirm。Toast 复用现有 .top-toast 结构，避免出现第二套提示。
+   ========================================================================== */
+
+:root {
+  --eab-ov-z: 10040;
+  --eab-ov-surface: var(--surface, #ffffff);
+  --eab-ov-text: var(--text, #14201d);
+  --eab-ov-muted: var(--muted, #667085);
+  --eab-ov-line: var(--line, #d0d5dd);
+  --eab-ov-brand: var(--brand, #0f6b5c);
+  --eab-ov-success: #17795e;
+  --eab-ov-warning: #b54708;
+  --eab-ov-danger: #b42318;
+  --eab-ov-shadow: var(--shadow-md, 0 14px 36px rgba(16, 42, 40, 0.16));
+  --eab-ov-radius: 12px;
+}
+
+/* --------------------------------------------------------------------------
+   1. Toast：沿用 .top-toast 结构，补语气色、进度条和暂停态
+   -------------------------------------------------------------------------- */
+
+.top-toast-host {
+  z-index: var(--eab-ov-z);
+}
+
+.top-toast {
+  position: relative;
+  overflow: hidden;
+  background: var(--eab-ov-surface);
+  color: var(--eab-ov-text);
+  border-color: var(--eab-ov-line);
+  box-shadow: var(--eab-ov-shadow);
+  --eab-ov-progress: var(--eab-ov-success);
+}
+
+.top-toast::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  background: var(--eab-ov-progress);
+  opacity: 0.42;
+  transform-origin: left center;
+  animation: eab-toast-progress var(--eab-toast-duration, 4500ms) linear forwards;
+}
+
+.top-toast.is-paused::after {
+  animation-play-state: paused;
+}
+
+.top-toast.is-leaving::after {
+  animation: none;
+  opacity: 0;
+}
+
+.top-toast.is-persistent::after {
+  display: none;
+}
+
+.top-toast.is-success,
+.top-toast.is-ok {
+  border-color: #cfe6de;
+  --eab-ov-progress: var(--eab-ov-success);
+}
+
+.top-toast.is-success .top-toast-icon,
+.top-toast.is-ok .top-toast-icon {
+  background: #e7f5ef;
+  color: var(--eab-ov-success);
+}
+
+.top-toast.is-warn,
+.top-toast.is-warning {
+  border-color: #f1d3a1;
+  --eab-ov-progress: var(--eab-ov-warning);
+}
+
+.top-toast.is-warn .top-toast-icon,
+.top-toast.is-warning .top-toast-icon {
+  background: #fff4e5;
+  color: var(--eab-ov-warning);
+}
+
+.top-toast.is-bad,
+.top-toast.is-error {
+  border-color: #f3c6c1;
+  --eab-ov-progress: var(--eab-ov-danger);
+}
+
+.top-toast.is-bad .top-toast-icon,
+.top-toast.is-error .top-toast-icon {
+  background: #fef0ee;
+  color: var(--eab-ov-danger);
+}
+
+.top-toast.is-info {
+  border-color: #cfe6de;
+  --eab-ov-progress: var(--eab-ov-brand);
+}
+
+.top-toast.is-info .top-toast-icon {
+  background: #edf9f5;
+  color: var(--eab-ov-brand);
+}
+
+[data-theme='dark'] .top-toast {
+  background: var(--surface, #131b25);
+  color: var(--text, #e7eef7);
+  border-color: var(--line, #283444);
+  box-shadow: 0 18px 42px rgba(0, 0, 0, 0.46);
+}
+
+[data-theme='dark'] .top-toast.is-success,
+[data-theme='dark'] .top-toast.is-ok {
+  border-color: rgba(74, 222, 128, 0.34);
+}
+
+[data-theme='dark'] .top-toast.is-warn,
+[data-theme='dark'] .top-toast.is-warning {
+  border-color: rgba(251, 191, 36, 0.34);
+}
+
+[data-theme='dark'] .top-toast.is-bad,
+[data-theme='dark'] .top-toast.is-error {
+  border-color: rgba(248, 113, 113, 0.34);
+}
+
+[data-theme='dark'] .top-toast.is-info {
+  border-color: rgba(79, 217, 189, 0.3);
+}
+
+[data-theme='dark'] .top-toast-close:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text, #e7eef7);
+}
+
+@keyframes eab-toast-progress {
+  from { transform: scaleX(1); }
+  to { transform: scaleX(0); }
+}
+
+/* --------------------------------------------------------------------------
+   2. Popconfirm：透明遮罩 + 锚定卡片；点外部取消，Esc 取消，默认焦点在取消
+   -------------------------------------------------------------------------- */
+
+body.eab-popconfirm-open,
+body.eab-modal-open {
+  overflow: hidden;
+}
+
+.eab-popconfirm-layer {
+  position: fixed;
+  inset: 0;
+  z-index: var(--eab-ov-z);
+  background: transparent;
+}
+
+.eab-popconfirm {
+  position: fixed;
+  width: 288px;
+  max-width: calc(100vw - 24px);
+  padding: 12px;
+  border: 1px solid var(--eab-ov-line);
+  border-radius: var(--eab-ov-radius);
+  background: var(--eab-ov-surface);
+  box-shadow: var(--eab-ov-shadow);
+  color: var(--eab-ov-text);
+  animation: eab-popconfirm-in 160ms cubic-bezier(.16, 1, .3, 1);
+  transform-origin: var(--eab-pop-origin, 50% 100%);
+}
+
+.eab-popconfirm-arrow {
+  position: absolute;
+  z-index: 0;
+  width: 10px;
+  height: 10px;
+  background: var(--eab-ov-surface);
+  border: 1px solid var(--eab-ov-line);
+  transform: rotate(45deg);
+  pointer-events: none;
+}
+
+.eab-popconfirm[data-placement='bottom'] .eab-popconfirm-arrow {
+  top: -6px;
+  left: calc(var(--eab-pop-arrow-x, 50%) - 5px);
+  border-right: 0;
+  border-bottom: 0;
+}
+
+.eab-popconfirm[data-placement='top'] .eab-popconfirm-arrow {
+  bottom: -6px;
+  left: calc(var(--eab-pop-arrow-x, 50%) - 5px);
+  border-top: 0;
+  border-left: 0;
+}
+
+.eab-popconfirm-copy,
+.eab-popconfirm-actions,
+.eab-popconfirm-error {
+  position: relative;
+  z-index: 1;
+}
+
+.eab-popconfirm-title {
+  display: block;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.35;
+  letter-spacing: -0.01em;
+}
+
+.eab-popconfirm-message {
+  margin: 4px 0 0;
+  color: var(--eab-ov-muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.eab-popconfirm-detail {
+  margin: 7px 0 0;
+  padding: 7px 8px;
+  border-radius: 7px;
+  background: var(--surface-2, #f7f9f8);
+  color: var(--eab-ov-muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.eab-popconfirm-error {
+  display: block;
+  margin: 8px 0 0;
+  color: var(--eab-ov-danger);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.eab-popconfirm-error[hidden] {
+  display: none;
+}
+
+.eab-popconfirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 7px;
+  margin-top: 11px;
+}
+
+.eab-popconfirm-btn {
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--eab-ov-line);
+  border-radius: 7px;
+  background: var(--eab-ov-surface);
+  color: var(--eab-ov-text);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease, color 120ms ease;
+}
+
+.eab-popconfirm-btn:hover {
+  border-color: var(--eab-ov-brand);
+  color: var(--eab-ov-brand);
+}
+
+.eab-popconfirm-btn:focus-visible {
+  outline: 2px solid var(--eab-ov-brand);
+  outline-offset: 2px;
+}
+
+.eab-popconfirm-btn:disabled {
+  opacity: 0.56;
+  cursor: progress;
+}
+
+.eab-popconfirm-btn.is-primary {
+  border-color: var(--eab-ov-brand);
+  background: var(--eab-ov-brand);
+  color: #fff;
+}
+
+.eab-popconfirm-btn.is-primary:hover {
+  background: color-mix(in srgb, var(--eab-ov-brand) 86%, #000);
+  color: #fff;
+}
+
+.eab-popconfirm-btn.is-danger {
+  border-color: var(--eab-ov-danger);
+  background: var(--eab-ov-danger);
+  color: #fff;
+}
+
+.eab-popconfirm-btn.is-danger:hover {
+  background: #8f1c13;
+  color: #fff;
+}
+
+.eab-popconfirm-btn.is-warning {
+  border-color: var(--eab-ov-warning);
+  background: var(--eab-ov-warning);
+  color: #fff;
+}
+
+.eab-popconfirm-btn.is-warning:hover {
+  background: #8f3704;
+  color: #fff;
+}
+
+.eab-popconfirm.is-busy .eab-popconfirm-btn {
+  cursor: wait;
+}
+
+[data-theme='dark'] .eab-popconfirm {
+  border-color: var(--line, #283444);
+  background: var(--surface, #131b25);
+  box-shadow: 0 22px 54px rgba(0, 0, 0, 0.5);
+}
+
+[data-theme='dark'] .eab-popconfirm-arrow {
+  background: var(--surface, #131b25);
+  border-color: var(--line, #283444);
+}
+
+[data-theme='dark'] .eab-popconfirm-detail {
+  background: var(--surface-2, #18222e);
+}
+
+@keyframes eab-popconfirm-in {
+  from {
+    opacity: 0;
+    transform: scale(0.96) translateY(var(--eab-pop-shift, 4px));
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+/* --------------------------------------------------------------------------
+   3. 窄屏与减少动态效果
+   -------------------------------------------------------------------------- */
+
+@media (max-width: 560px) {
+  .top-toast-host {
+    top: max(12px, env(safe-area-inset-top));
+    width: calc(100vw - 24px);
+  }
+
+  .top-toast {
+    padding: 10px 10px 10px 12px;
+  }
+
+  .eab-popconfirm {
+    width: min(300px, calc(100vw - 24px));
+    padding: 11px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .top-toast::after {
+    display: none;
+  }
+
+  .eab-popconfirm {
+    animation: none;
+  }
+
+  .eab-popconfirm-btn {
+    transition: none;
+  }
+}

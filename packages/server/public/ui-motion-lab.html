@@ -1,0 +1,451 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>EAB Motion Lab · 16 种 UI 动效</title>
+  <meta name="description" content="EAB 企业智能体基座的动效语言验收页：16 种 UI 动效、三层使用边界与统一 token。" />
+  <link rel="stylesheet" href="/ui-motion.css?v=20261124motionB" />
+  <link rel="stylesheet" href="/ui-motion-lab.css?v=20261124motionE" />
+</head>
+<body>
+  <div class="lab-shell">
+    <header class="lab-topbar">
+      <a class="lab-brand" href="#top">
+        <span class="lab-brand-mark">EAB</span>
+        <span class="lab-brand-copy">
+          <strong>Motion Lab</strong>
+          <span>Enterprise interface motion</span>
+        </span>
+      </a>
+      <nav class="lab-topnav" aria-label="页面导航">
+        <a href="#patterns">16 种效果</a>
+        <a href="#story">滚动叙事</a>
+        <a href="#principles">使用边界</a>
+        <a class="lab-pill" href="/chat?company=c1">回到工作台</a>
+      </nav>
+    </header>
+
+    <main id="top">
+      <section class="lab-hero" aria-labelledby="hero-title">
+        <div>
+          <span class="lab-kicker">EAB Design Language · Motion 01</span>
+          <h1 id="hero-title">不是加动画，<br />是让界面<em>说清楚</em>。</h1>
+          <p class="lab-hero-sub">
+            把“高级动画”拆成 16 个可以命名的动作，让产品、设计、开发用同一套词沟通。
+            在企业工作台里，动效只回答三个问题：发生了什么、什么更重要、我下一步能做什么。
+          </p>
+          <div class="lab-hero-actions">
+            <a class="lab-btn lab-btn-primary" href="#patterns" data-motion="magnetic" data-magnet-strength="0.18">
+              查看 16 种动效
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 8h8M9 4l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </a>
+            <a class="lab-btn lab-btn-ghost" href="#principles">先看使用边界</a>
+          </div>
+          <div class="lab-stats" aria-label="动效体系概览">
+            <div class="lab-stat"><b data-motion="count" data-count-to="16" data-count-duration="1100">16</b><span>命名效果</span></div>
+            <div class="lab-stat"><b data-motion="count" data-count-to="3" data-count-duration="900">3</b><span>使用层级</span></div>
+            <div class="lab-stat"><b data-motion="count" data-count-to="0" data-count-suffix="ms">0</b><span>布局属性动画</span></div>
+          </div>
+        </div>
+
+        <div class="lab-stage" aria-label="运行中 Agent 的动效示意">
+          <div class="lab-orbit" aria-hidden="true"><i></i><i></i><i></i></div>
+          <article class="lab-run-card" data-motion="spotlight beam">
+            <div class="lab-run-head">
+              <div>
+                <span class="lab-run-eyebrow">AGENT RUNTIME / LIVE</span>
+                <h3>知识库检索任务</h3>
+              </div>
+              <span class="lab-live">RUNNING</span>
+            </div>
+            <div class="lab-run-grid">
+              <div class="lab-run-cell"><span>步骤</span><b>04 / 07</b></div>
+              <div class="lab-run-cell"><span>耗时</span><b>12.4s</b></div>
+              <div class="lab-run-cell"><span>引用</span><b>18</b></div>
+            </div>
+            <div class="lab-run-log">
+              <div class="lab-run-line"><i>01</i><span>拆解问题与检索范围</span><em>done</em></div>
+              <div class="lab-run-line"><i>02</i><span>召回制度、流程与历史工单</span><em>done</em></div>
+              <div class="lab-run-line"><i>03</i><span>核对权限与时效</span><em>running</em></div>
+            </div>
+            <div class="lab-run-progress" aria-hidden="true"></div>
+          </article>
+          <span class="lab-float-tag tag-a">Border Beam = 正在运行</span>
+          <span class="lab-float-tag tag-b">Spotlight = 当前焦点</span>
+        </div>
+      </section>
+
+      <section class="lab-section" id="patterns" aria-labelledby="patterns-title">
+        <div class="lab-section-head">
+          <div>
+            <span class="lab-kicker">Pattern Library</span>
+            <h2 id="patterns-title">16 个动效词，<br />一套判断标准。</h2>
+          </div>
+          <p>
+            每张卡只演示一种主效果。点击有下划线的文字可以重播，鼠标移入可以看到悬停状态。
+            这里的目标不是“都能用”，而是“知道什么时候该用、什么时候不该用”。
+          </p>
+        </div>
+
+        <div class="motion-grid" data-motion="stagger">
+          <article class="motion-card">
+            <div class="motion-card-top"><span class="motion-no">01</span><span class="motion-tag">Atmosphere</span></div>
+            <h3>鼠标聚光灯</h3>
+            <p class="en">Spotlight</p>
+            <div class="motion-demo">
+              <div class="spot-demo" data-motion="spotlight">
+                <strong>把注意力停在重点上</strong>
+                <span>光晕跟随指针，卡片不整体位移。</span>
+              </div>
+              <span class="motion-note">产品卡 / 功能卡 / 登录卡</span>
+            </div>
+          </article>
+
+          <article class="motion-card">
+            <div class="motion-card-top"><span class="motion-no">02</span><span class="motion-tag">Entry</span></div>
+            <h3>滚动显现</h3>
+            <p class="en">Scroll Reveal</p>
+            <div class="motion-demo">
+              <div class="reveal-demo" data-motion="reveal">
+                <div class="reveal-line"><span>第一段内容进入视口</span><b></b></div>
+                <div class="reveal-line"><span>第二段稍后出现</span><b></b></div>
+                <div class="reveal-line"><span>第三段收住页面</span><b></b></div>
+              </div>
+              <span class="motion-note">只让首屏以下内容参与</span>
+            </div>
+          </article>
+
+          <article class="motion-card">
+            <div class="motion-card-top"><span class="motion-no">03</span><span class="motion-tag">Status</span></div>
+            <h3>边缘流光</h3>
+            <p class="en">Border Beam</p>
+            <div class="motion-demo">
+              <div class="beam-demo" data-motion="beam" style="--eab-beam-color: rgba(15, 107, 92, .7)">
+                <small>推荐方案</small>
+                <strong>团队知识库</strong>
+                <span>正在为 128 人同步权限 →</span>
+              </div>
+              <span class="motion-note">只给运行中 / 推荐位</span>
+            </div>
+          </article>
+
+          <article class="motion-card">
+            <div class="motion-card-top"><span class="motion-no">04</span><span class="motion-tag">Action</span></div>
+            <h3>磁吸按钮</h3>
+            <p class="en">Magnetic Button</p>
+            <div class="motion-demo">
+              <button class="magnet-btn" type="button" data-motion="magnetic" data-magnet-strength="0.3">把鼠标靠近我</button>
+              <span class="motion-note">一个页面只留一个主 CTA</span>
+            </div>
+          </article>
+
+          <article class="motion-card">
+            <div class="motion-card-top"><span class="motion-no">05</span><span class="motion-tag">Narrative</span></div>
+            <h3>滚动叙事</h3>
+            <p class="en">Scrolltelling</p>
+            <div class="motion-demo">
+              <div class="story-mini">
+                <div class="story-mini-bar"></div>
+                <div class="story-mini-row"><span></span><span></span><span></span><span></span></div>
+                <p>钉住画面，让文字随滚动进度切换。</p>
+              </div>
+              <span class="motion-note">见下方完整段落</span>
+            </div>
+          </article>
+
+          <article class="motion-card">
+            <div class="motion-card-top"><span class="motion-no">06</span><span class="motion-tag">Depth</span></div>
+            <h3>3D 倾斜</h3>
+            <p class="en">3D Tilt</p>
+            <div class="motion-demo">
+              <div class="tilt-demo" data-motion="tilt" data-tilt-max="8">
+                <small>EAB / ENTERPRISE</small>
+                <strong>知识资产卡</strong>
+                <span>指针位置决定轻微旋转</span>
+              </div>
+              <span class="motion-note">表单和长文禁止使用</span>
+            </div>
+          </article>
+
+          <article class="motion-card">
+            <div class="motion-card-top"><span class="motion-no">07</span><span class="motion-tag">Text</span></div>
+            <h3>文字解码</h3>
+            <p class="en">Text Scramble</p>
+            <div class="motion-demo">
+              <div class="scramble-demo">
+                <span class="scramble-text" data-motion="scramble" data-scramble-text="EAB MOTION" title="点击重播">EAB MOTION</span>
+                <span>点击文字重播；只用于短标题</span>
+              </div>
+              <span class="motion-note">正文与错误提示禁止</span>
+            </div>
+          </article>
+
+          <article class="motion-card">
+            <div class="motion-card-top"><span class="motion-no">08</span><span class="motion-tag">Loading</span></div>
+            <h3>流光扫过</h3>
+            <p class="en">Shimmer</p>
+            <div class="motion-demo">
+              <div class="skeleton-demo" aria-label="骨架屏加载示意">
+                <div class="eab-skeleton skeleton-line w-70"></div>
+                <div class="eab-skeleton skeleton-line w-92"></div>
+                <div class="eab-skeleton skeleton-line w-54"></div>
+              </div>
+              <span class="motion-note">内容到位就停止，不反复扫</span>
+            </div>
+          </article>
+
+          <article class="motion-card">
+            <div class="motion-card-top"><span class="motion-no">09</span><span class="motion-tag">Depth</span></div>
+            <h3>视差滚动</h3>
+            <p class="en">Parallax Scrolling</p>
+            <div class="motion-demo">
+              <div class="parallax-stage">
+                <i data-motion="parallax" data-parallax-speed="0.05"></i>
+                <i data-motion="parallax" data-parallax-speed="0.15"></i>
+                <b>上下滚动，前后层速度不同</b>
+              </div>
+              <span class="motion-note">只用在背景与装饰层</span>
+            </div>
+          </article>
+
+          <article class="motion-card">
+            <div class="motion-card-top"><span class="motion-no">10</span><span class="motion-tag">Data</span></div>
+            <h3>数字递增</h3>
+            <p class="en">Count Up</p>
+            <div class="motion-demo">
+              <div class="count-demo">
+                <b data-motion="count" data-count-to="1280" data-count-duration="1500">1,280</b>
+                <span>PERFORMANCE BUDGET / MS</span>
+              </div>
+              <span class="motion-note">只滚真实指标，不滚编号</span>
+            </div>
+          </article>
+
+          <article class="motion-card">
+            <div class="motion-card-top"><span class="motion-no">11</span><span class="motion-tag">Affordance</span></div>
+            <h3>悬停上浮</h3>
+            <p class="en">Hover Lift</p>
+            <div class="motion-demo">
+              <div class="lift-demo" data-motion="lift" tabindex="0">
+                <strong>这是一张可点击的卡</strong>
+                <span>向上 4px + 阴影加深</span>
+              </div>
+              <span class="motion-note">静态信息卡不要上浮</span>
+            </div>
+          </article>
+
+          <article class="motion-card">
+            <div class="motion-card-top"><span class="motion-no">12</span><span class="motion-tag">Text</span></div>
+            <h3>打字机</h3>
+            <p class="en">Typewriter</p>
+            <div class="motion-demo">
+              <div class="type-demo" data-motion="typewriter" data-typewriter="把状态说清楚，再谈高级。">把状态说清楚，再谈高级。</div>
+              <span class="motion-note">AI 问候 / 空状态 / 短标题</span>
+            </div>
+          </article>
+
+          <article class="motion-card">
+            <div class="motion-card-top"><span class="motion-no">13</span><span class="motion-tag">Sequence</span></div>
+            <h3>错峰动画</h3>
+            <p class="en">Stagger Animation</p>
+            <div class="motion-demo">
+              <div class="stagger-demo" data-motion="stagger">
+                <span class="stagger-chip">拆解问题</span>
+                <span class="stagger-chip">检索资料</span>
+                <span class="stagger-chip">核对权限</span>
+                <span class="stagger-chip">生成结论</span>
+                <span class="stagger-chip">引用来源</span>
+              </div>
+              <span class="motion-note">一屏最多 8 个，间隔 55ms</span>
+            </div>
+          </article>
+
+          <article class="motion-card">
+            <div class="motion-card-top"><span class="motion-no">14</span><span class="motion-tag">Continuous</span></div>
+            <h3>跑马灯</h3>
+            <p class="en">Marquee</p>
+            <div class="motion-demo">
+              <div class="marquee-demo" data-motion="marquee">
+                <div class="eab-marquee-track">
+                  <span class="marquee-item">钉钉</span>
+                  <span class="marquee-item">飞书</span>
+                  <span class="marquee-item">知识库</span>
+                  <span class="marquee-item">审批</span>
+                  <span class="marquee-item">A2A</span>
+                  <span class="marquee-item">MCP</span>
+                </div>
+              </div>
+              <span class="motion-note">悬停暂停，正文禁止滚动</span>
+            </div>
+          </article>
+
+          <article class="motion-card">
+            <div class="motion-card-top"><span class="motion-no">15</span><span class="motion-tag">Feedback</span></div>
+            <h3>弹性动画</h3>
+            <p class="en">Spring Animation</p>
+            <div class="motion-demo">
+              <div class="spring-demo-wrap">
+                <div class="spring-demo" id="spring-demo" data-motion="spring">✓</div>
+                <button class="spring-replay" type="button" data-replay="spring-demo">重播一次</button>
+              </div>
+              <span class="motion-note">只轻微过冲，不夸张抖动</span>
+            </div>
+          </article>
+
+          <article class="motion-card">
+            <div class="motion-card-top"><span class="motion-no">16</span><span class="motion-tag">Rhythm</span></div>
+            <h3>缓动</h3>
+            <p class="en">Easing</p>
+            <div class="motion-demo">
+              <div class="ease-demo">
+                <div class="ease-row"><span>LINEAR</span><div class="ease-track"><div class="ease-bar is-linear"></div></div></div>
+                <div class="ease-row"><span>EASE OUT</span><div class="ease-track"><div class="ease-bar is-out"></div></div></div>
+                <button class="ease-replay" type="button" data-ease-replay>同时重播</button>
+              </div>
+              <span class="motion-note">入场快进慢停，离场更快</span>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section class="story-section" id="story" aria-labelledby="story-title">
+        <div class="lab-section-head">
+          <div>
+            <span class="lab-kicker">Scrolltelling / Full Pattern</span>
+            <h2 id="story-title">滚动不是特效，<br />是把论证顺序排好。</h2>
+          </div>
+          <p>
+            左侧三步随滚动点亮，右侧画面短暂钉住。它适合官网、产品故事和登录后的首次引导，
+            不适合工作台里的表格与表单——那里的滚动必须始终服从操作。
+          </p>
+        </div>
+
+        <div class="story-layout">
+          <div class="story-copy">
+            <article class="story-step is-active" data-story-step="1">
+              <small>01 / 问题</small>
+              <h3>先让人看见“为什么要变”</h3>
+              <p>企业里最贵的不是动画，是沟通成本。一个状态如果只能靠文字解释，就会在培训、交接和客服里反复消耗。</p>
+            </article>
+            <article class="story-step" data-story-step="2">
+              <small>02 / 证据</small>
+              <h3>再用层级说明“先看哪里”</h3>
+              <p>动效不负责制造注意力，它负责把已经存在的层级显影：谁在运行、哪里出错、哪一步需要确认。</p>
+            </article>
+            <article class="story-step" data-story-step="3">
+              <small>03 / 行动</small>
+              <h3>最后把下一步交回给人</h3>
+              <p>所有动效结束时，界面必须比开始时更清楚：能点的更明确，不能点的有原因，正在等的有进度。</p>
+            </article>
+          </div>
+
+          <aside class="story-pin" aria-label="滚动叙事画面">
+            <div class="story-pin-head"><span>EAB / STORY</span><b id="story-stage-label">01 — 问题</b></div>
+            <h2 id="story-stage-title">动效不是装饰，是界面的解释层。</h2>
+            <p id="story-stage-copy">当状态变化没有被看见，用户就会用刷新、重复点击和猜测来补足理解。</p>
+            <div class="story-pin-meter"><span id="story-meter"></span><b id="story-meter-text">12%</b></div>
+          </aside>
+        </div>
+      </section>
+
+      <section class="lab-principles" id="principles" aria-labelledby="principles-title">
+        <div class="lab-section-head">
+          <div>
+            <span class="lab-kicker">Guardrails</span>
+            <h2 id="principles-title">三条底线，<br />决定“高级”还是“花哨”。</h2>
+          </div>
+          <p>规范的价值不在于多，而在于每次评审都能用同一把尺子。下面三条是 EAB 的硬约束。</p>
+        </div>
+        <div class="principle-grid" data-motion="stagger">
+          <article class="principle-card">
+            <small>01 / TIME</small>
+            <h3>100–200ms 做反馈，200–300ms 做转场</h3>
+            <p>按钮、开关、悬停要快；面板、弹窗、抽屉可以稍慢。超过 300ms 的操作反馈会让人怀疑“是不是没点上”。</p>
+          </article>
+          <article class="principle-card">
+            <small>02 / PERFORMANCE</small>
+            <h3>只动 transform 和 opacity</h3>
+            <p>不改 width、height、top、left，不触发布局重排。大量列表、表格和长文默认不加动效，优先保证滚动与输入。</p>
+          </article>
+          <article class="principle-card">
+            <small>03 / ACCESS</small>
+            <h3>尊重“减少动态效果”</h3>
+            <p>系统开启后，关闭非必要动画；信息不能依赖动效才能读到。键盘焦点、触控目标和对比度始终优先于视觉效果。</p>
+          </article>
+        </div>
+
+        <div class="brief-card">
+          <span>MOTION BRIEF / 一句话描述</span>
+          <p>“给运行中的 Agent 卡片加 <b>Border Beam</b>，2.8 秒循环，只提示运行状态；同时用 <b>Ease Out</b> 让按钮按压在 120ms 内完成。不要改布局，开启减少动态效果时全部关闭。”</p>
+        </div>
+      </section>
+    </main>
+
+    <footer class="lab-footer">
+      <span><b>EAB Motion Lab</b> · v2026.11.24 · 16 patterns / 3 layers / 1 language</span>
+      <span>技能：`eab-ui-motion` · 运行时：`ui-motion.css` + `ui-motion.js`</span>
+    </footer>
+  </div>
+
+  <script src="/ui-motion.js?v=20261124motionG"></script>
+  <script>
+    // 仅示例页使用：重播弹性、缓动对比、滚动叙事进度。
+    (() => {
+      const spring = document.getElementById('spring-demo')
+      document.querySelectorAll('[data-replay]').forEach((button) => {
+        button.addEventListener('click', () => {
+          const target = document.getElementById(button.dataset.replay)
+          if (!target) return
+          target.classList.remove('is-motion-in')
+          void target.offsetWidth
+          target.classList.add('is-motion-in')
+        })
+      })
+
+      const easeBars = document.querySelectorAll('.ease-bar')
+      const replayEase = document.querySelector('[data-ease-replay]')
+      replayEase?.addEventListener('click', () => {
+        easeBars.forEach((bar) => bar.classList.remove('is-run'))
+        void easeBars[0]?.offsetWidth
+        requestAnimationFrame(() => easeBars.forEach((bar) => bar.classList.add('is-run')))
+      })
+
+      const steps = Array.from(document.querySelectorAll('[data-story-step]'))
+      const stageTitle = document.getElementById('story-stage-title')
+      const stageCopy = document.getElementById('story-stage-copy')
+      const stageLabel = document.getElementById('story-stage-label')
+      const meter = document.getElementById('story-meter')
+      const meterText = document.getElementById('story-meter-text')
+      const copy = {
+        1: ['动效不是装饰，是界面的解释层。', '当状态变化没有被看见，用户就会用刷新、重复点击和猜测来补足理解。', '01 — 问题'],
+        2: ['先显影层级，再谈美感。', '运行、等待、失败、推荐，各有各的动作；同一个词不能同时表示两种状态。', '02 — 证据'],
+        3: ['动效结束时，界面要更清楚。', '能点的更明确，不能点的有原因，正在等的有进度。否则这段动画就是噪音。', '03 — 行动']
+      }
+
+      const updateStory = () => {
+        let active = 0
+        steps.forEach((step, index) => {
+          const rect = step.getBoundingClientRect()
+          if (rect.top < window.innerHeight * 0.55) active = index
+        })
+        steps.forEach((step, index) => step.classList.toggle('is-active', index === active))
+        const key = active + 1
+        const entry = copy[key]
+        if (entry) {
+          stageTitle.textContent = entry[0]
+          stageCopy.textContent = entry[1]
+          stageLabel.textContent = entry[2]
+        }
+        const progress = Math.round((key / 3) * 100)
+        meter.style.setProperty('--story-scale', (key / 3).toFixed(3))
+        meterText.textContent = `${progress}%`
+      }
+
+      updateStory()
+      window.addEventListener('scroll', updateStory, { passive: true })
+      window.addEventListener('resize', updateStory)
+    })()
+  </script>
+</body>
+</html>
