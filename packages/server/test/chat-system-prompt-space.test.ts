@@ -31,6 +31,19 @@ const cloudTools = [
   },
 ] as unknown as ChatToolSpec[]
 
+const orgDirectoryTool = {
+  type: 'function',
+  function: {
+    name: 'org_directory',
+    description: '仅查组织关系',
+    parameters: {
+      type: 'object',
+      properties: { intent: { type: 'string' }, query: { type: 'string' } },
+      required: ['intent'],
+    },
+  },
+} as unknown as ChatToolSpec
+
 function prompt(spaceKind: 'cloud' | 'none', spaceLabel: string, chatTools = cloudTools, agentCapabilities = ''): string {
   return buildSystemPrompt({
     actor,
@@ -45,6 +58,42 @@ function prompt(spaceKind: 'cloud' | 'none', spaceLabel: string, chatTools = clo
 }
 
 describe('对话系统提示的文件空间边界', () => {
+  it('员工档案的手机号、身份证号按工具原值输出，不自行二次脱敏', () => {
+    const text = buildSystemPrompt({
+      actor,
+      chatTools: cloudTools,
+      memories: [],
+      hits: [],
+      hasAttachments: false,
+      spaceKind: 'cloud',
+      spaceLabel: '云空间',
+      pluginPrompts: ['【dsh-cy-api 氚云接口工具】人员档案接口可用'],
+    })
+    expect(text).toContain('【员工档案字段输出】')
+    expect(text).toContain('不是账号密码、接口密钥或登录凭据')
+    expect(text).toContain('必须按原值原样呈现')
+    expect(text).toContain('不得以“隐私保护”为由自行打码')
+    expect(text).toContain('只有工具结果本身已经是脱敏值时才保持原样')
+  })
+
+  it('插件加载后明确组织通讯录与人员档案的查询边界', () => {
+    const text = buildSystemPrompt({
+      actor,
+      chatTools: [...cloudTools, orgDirectoryTool],
+      memories: [],
+      hits: [],
+      hasAttachments: false,
+      spaceKind: 'cloud',
+      spaceLabel: '云空间',
+      pluginPrompts: ['【dsh-cy-api 氚云接口工具】人员档案接口可用'],
+    })
+    expect(text).toContain('人员查询先分清“组织关系”还是“人事档案”')
+    expect(text).toContain('部门、岗位、组长、谁在哪个组、成员名单用 org_directory')
+    expect(text).toContain('个人信息、个人档案、身份证号、手机号、入职/转正日期、司龄、学历、籍贯、身高体重用人员档案接口')
+    expect(text).toContain('用户只说“某人的个人信息/资料/档案”时，默认指人员档案，不是通讯录')
+    expect(text).toContain('不要用它回答手机号、身份证号、入职/转正日期、司龄、学历、籍贯、身高体重等人事档案字段')
+  })
+
   it('云空间是默认空间，本轮不暴露本地磁盘工具', () => {
     const text = prompt('cloud', '云空间')
     expect(text).toContain('云空间是默认空间，用户没有单独选择也可以使用')
@@ -336,6 +385,30 @@ describe('对话系统提示的自主团队编队', () => {
     expect(text).toContain('卡外工具不会下发给该岗位，也不能通过 tool_search 重新加载')
     expect(text).toContain('offline 或已停用的岗位不要派')
     expect(text).not.toContain('parameters')
+  })
+})
+
+describe('本地项目的工作任务提示', () => {
+  it('任务模式与普通对话在系统提示中有明确区分', () => {
+    const base = {
+      actor,
+      chatTools: cloudTools,
+      memories: [],
+      hits: [],
+      hasAttachments: false,
+      spaceKind: 'local' as const,
+      spaceLabel: 'EAB 项目演示',
+      projectInstructions: '所有回答使用简体中文。',
+      projectCloudRefs: ['docs/spec.md'],
+      projectDeviceLinked: true,
+    }
+    const task = buildSystemPrompt({ ...base, projectMode: 'task' })
+    const chat = buildSystemPrompt({ ...base, projectMode: 'chat' })
+    expect(task).toContain('当前是项目内的「工作任务」，不是普通问答')
+    expect(task).toContain('先把目标拆成可验收的步骤')
+    expect(task).toContain('所有回答使用简体中文。')
+    expect(task).toContain('docs/spec.md')
+    expect(chat).not.toContain('当前是项目内的「工作任务」')
   })
 })
 

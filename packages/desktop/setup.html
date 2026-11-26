@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>连接 EAB 服务</title>
+  <style>
+    :root {
+      --bg: #f4f7f5;
+      --card: #ffffff;
+      --ink: #182320;
+      --muted: #66756f;
+      --line: #dbe5e0;
+      --brand: #0f7a5a;
+      --brand-strong: #0a5f46;
+      --danger: #b23b3b;
+      --error: #fdf2f2;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      display: grid;
+      place-items: center;
+      background:
+        radial-gradient(1200px 600px at 15% -10%, rgba(15, 122, 90, .12), transparent 60%),
+        radial-gradient(900px 500px at 90% 110%, rgba(15, 122, 90, .08), transparent 55%),
+        var(--bg);
+      color: var(--ink);
+      font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    }
+    .wrap { width: min(560px, calc(100vw - 48px)); }
+    .brand { display: flex; align-items: center; gap: 12px; margin-bottom: 22px; }
+    .mark {
+      width: 42px; height: 42px; border-radius: 12px;
+      display: grid; place-items: center;
+      background: var(--brand); color: #fff;
+      font-weight: 800; letter-spacing: .5px;
+      box-shadow: 0 10px 24px rgba(15, 122, 90, .22);
+    }
+    .brand-text strong { display: block; font-size: 16px; letter-spacing: .2px; }
+    .brand-text em { display: block; margin-top: 3px; color: var(--muted); font-size: 12px; font-style: normal; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      padding: 30px;
+      box-shadow: 0 22px 60px rgba(23, 42, 34, .10), 0 2px 8px rgba(23, 42, 34, .04);
+    }
+    h1 { margin: 0; font-size: 25px; letter-spacing: -.4px; }
+    .sub { margin: 10px 0 24px; color: var(--muted); line-height: 1.7; font-size: 13.5px; }
+    label { display: block; margin-bottom: 8px; font-size: 13px; font-weight: 700; }
+    input {
+      width: 100%; height: 48px; padding: 0 14px;
+      border: 1px solid #cbd8d2; border-radius: 12px;
+      background: #fbfdfc; color: var(--ink);
+      font: inherit; font-size: 14px; outline: none;
+      transition: border-color .16s ease, background .16s ease;
+    }
+    input:focus { border-color: var(--brand); background: #fff; }
+    .hint { margin-top: 9px; color: var(--muted); font-size: 12px; line-height: 1.6; }
+    .error {
+      display: none; margin-top: 12px; padding: 10px 12px;
+      border-radius: 10px; background: var(--error); color: var(--danger);
+      font-size: 12.5px; line-height: 1.5;
+    }
+    .error.is-on { display: block; }
+    .actions { display: flex; align-items: center; gap: 12px; margin-top: 22px; }
+    button {
+      height: 46px; padding: 0 22px; border: 0; border-radius: 12px;
+      background: var(--brand); color: #fff; font: inherit; font-weight: 700;
+      cursor: pointer; box-shadow: 0 10px 22px rgba(15, 122, 90, .18);
+      transition: background .16s ease, transform .16s ease;
+    }
+    button:hover { background: var(--brand-strong); }
+    button:active { transform: translateY(1px); }
+    button:disabled { opacity: .6; cursor: default; }
+    .meta { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; line-height: 1.7; }
+    .meta code { padding: 1px 5px; border-radius: 5px; background: #f0f5f2; color: #41504a; }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <div class="brand">
+      <div class="mark">EAB</div>
+      <div class="brand-text">
+        <strong>EAB 企业智能体基座</strong>
+        <em>Windows 桌面版</em>
+      </div>
+    </div>
+
+    <section class="card">
+      <h1>连接你的 EAB 服务</h1>
+      <p class="sub">填写管理员提供的 EAB 地址。桌面版会直接在这台电脑上打开原生网页标签，不再依赖远程画面推流。</p>
+      <form id="server-form">
+        <label for="server-url">EAB 服务地址</label>
+        <input id="server-url" name="server-url" type="url" spellcheck="false" autocomplete="off"
+          placeholder="例如 http://192.168.1.13:8787/chat?company=c1" />
+        <div class="hint">支持公司内网地址；只允许 http/https。桌面版会把当前 EAB 地址设为可信来源，HTTP 内网也可以使用麦克风和语音对话。</div>
+        <div class="error" id="server-error" role="alert"></div>
+        <div class="actions">
+          <button id="server-submit" type="submit">连接并进入</button>
+        </div>
+      </form>
+      <div class="meta">
+        当前版本 <code id="app-version">-</code> · <span id="app-platform">Windows</span><br />
+        连接信息只保存在本机，不会上传。
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const form = document.getElementById('server-form')
+    const input = document.getElementById('server-url')
+    const errorNode = document.getElementById('server-error')
+    const submit = document.getElementById('server-submit')
+    const versionNode = document.getElementById('app-version')
+    const platformNode = document.getElementById('app-platform')
+
+    function showError(message) {
+      errorNode.textContent = message || ''
+      errorNode.classList.toggle('is-on', Boolean(message))
+    }
+
+    async function boot() {
+      try {
+        const info = await window.eabDesktop.getServerInfo()
+        versionNode.textContent = info?.version || '-'
+        platformNode.textContent = `${info?.platform || 'win32'} ${info?.arch || 'x64'}`
+        if (info?.serverUrl) input.value = info.serverUrl
+      } catch {
+        showError('桌面桥接未就绪，请重启应用。')
+      }
+      input.focus()
+    }
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault()
+      const value = input.value.trim()
+      if (!value) {
+        showError('请填写 EAB 服务地址')
+        input.focus()
+        return
+      }
+      submit.disabled = true
+      submit.textContent = '正在连接…'
+      showError('')
+      try {
+        await window.eabDesktop.saveServer(value)
+      } catch (err) {
+        showError(err?.message || '连接失败，请检查地址和网络')
+        submit.disabled = false
+        submit.textContent = '连接并进入'
+      }
+    })
+
+    boot()
+  </script>
+</body>
+</html>

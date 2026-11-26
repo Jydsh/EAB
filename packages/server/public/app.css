@@ -550,7 +550,6 @@ table.data td {
   outline: 0;
   border-color: var(--brand);
   background: #fff;
-  box-shadow: 0 0 0 3px rgba(14, 122, 100, 0.1);
 }
 .tool-run-schema { color: #98a2b3; font-size: 9.5px; line-height: 1.5; overflow-wrap: anywhere; }
 .tool-run-msg { padding: 7px 9px; border: 1px solid transparent; border-radius: 7px; font-size: 10.5px; line-height: 1.5; overflow-wrap: anywhere; }
@@ -2201,7 +2200,6 @@ table.data tr.clickable:hover td {
 .net-field:focus-within {
   border-color: rgba(15, 107, 92, .48);
   background: #fff;
-  box-shadow: 0 0 0 3px rgba(15, 107, 92, .08);
 }
 
 .net-field.is-locked {
@@ -2270,7 +2268,6 @@ table.data tr.clickable:hover td {
 .net-field input:focus {
   outline: none;
   border-color: var(--brand);
-  box-shadow: 0 0 0 3px rgba(15, 107, 92, .10);
 }
 
 .net-field input:disabled {
@@ -2732,7 +2729,7 @@ table.data tr.clickable:hover td {
   color: var(--text);
 }
 .install-field input:focus,
-.install-field select:focus { outline: none; border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15, 118, 110, 0.1); }
+.install-field select:focus { outline: none; border-color: #0f766e; }
 .install-existing {
   display: flex;
   align-items: center;
@@ -3666,7 +3663,6 @@ table.data tr.clickable { cursor: pointer; }
 .form-grid input:focus, .form-grid select:focus {
   outline: 0;
   border-color: var(--brand);
-  box-shadow: 0 0 0 3px rgba(14, 122, 100, 0.1);
 }
 .field input[aria-invalid="true"], .form-grid input[aria-invalid="true"] {
   border-color: #d92d20;
@@ -3674,7 +3670,6 @@ table.data tr.clickable { cursor: pointer; }
 }
 .field input[aria-invalid="true"]:focus, .form-grid input[aria-invalid="true"]:focus {
   border-color: #d92d20;
-  box-shadow: 0 0 0 3px rgba(217, 45, 32, 0.1);
 }
 .field textarea { resize: vertical; line-height: 1.6; }
 .field-note { margin: -2px 0 0; padding: 9px 11px; border-radius: 7px; background: #f8fafc; color: #667085; font-size: 11px; line-height: 1.55; }
@@ -3877,7 +3872,7 @@ table.data tr.clickable { cursor: pointer; }
   width: 100%; height: 36px; padding: 0 10px; border: 1px solid var(--line);
   border-radius: 8px; background: #fff; color: var(--ink); font: inherit; font-size: 12.5px;
 }
-.confirm-field input:focus { outline: none; border-color: #f04438; box-shadow: 0 0 0 3px rgba(240, 68, 56, 0.12); }
+.confirm-field input:focus { outline: none; border-color: #f04438; }
 .confirm-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 22px; }
 .confirm-actions .btn { min-width: 78px; }
 .btn.confirm-warning { border-color: #f79009; background: #b54708; color: #fff; }
@@ -4178,7 +4173,6 @@ table.data tr.clickable { cursor: pointer; }
 .model-import-search:focus {
   outline: none;
   border-color: #9ecdc4;
-  box-shadow: 0 0 0 3px rgba(15, 118, 110, .08);
 }
 
 .model-import-count {
@@ -5531,7 +5525,7 @@ body.has-nav-pin .page-rail {
   padding: 5px 8px; font: inherit; font-size: 11.5px; color: #173b36; background: #fbfdfc;
 }
 .plugin-rail-search input::placeholder { color: #a5b3b0; }
-.plugin-rail-search input:focus { outline: none; border-color: #9ecdc4; background: #fff; box-shadow: 0 0 0 3px rgba(15, 118, 110, .08); }
+.plugin-rail-search input:focus { outline: none; border-color: #9ecdc4; background: #fff; }
 .plugin-rail-list [data-plugin-item][hidden] { display: none; }
 .plugin-rail-item {
   display: flex; align-items: center; gap: 9px; width: 100%; text-align: left;
@@ -5881,12 +5875,12 @@ body.has-nav-pin .page-rail {
   height: 30px; min-width: 132px; max-width: 190px; padding: 0 26px 0 9px;
   border: 1px solid var(--line); border-radius: 8px; background: #fff; color: var(--text); font: inherit; font-size: 12px;
 }
-.inline-field select:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+.inline-field select:focus { border-color: var(--accent); }
 .inline-field input[type="search"] {
   height: 30px; width: 200px; padding: 0 10px;
   border: 1px solid var(--line); border-radius: 8px; background: #fff; color: var(--text); font: inherit; font-size: 12px;
 }
-.inline-field input[type="search"]:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+.inline-field input[type="search"]:focus { border-color: var(--accent); }
 .member-search-field input[type="search"]::placeholder { color: #98a2b3; }
 
 /* 部门管理：左树右详情 */
@@ -6020,7 +6014,7 @@ body.has-nav-pin .page-rail {
   display: flex; align-items: center; gap: 7px; margin: 0 12px 10px; padding: 0 9px;
   border: 1px solid var(--line); border-radius: 9px; background: #fbfdfc; color: #8b9693;
 }
-.role-rail-search:focus-within { border-color: #b9dcd3; background: #fff; box-shadow: 0 0 0 3px rgba(15, 118, 110, .06); }
+.role-rail-search:focus-within { border-color: #b9dcd3; background: #fff; }
 .role-rail-search-icon { display: inline-flex; flex: none; }
 .role-rail-search input {
   width: 100%; min-width: 0; padding: 7px 0; border: 0; background: transparent;
@@ -6267,7 +6261,7 @@ body.has-nav-pin .page-rail {
   display: flex; align-items: center; gap: 6px; min-width: 210px; padding: 0 9px;
   border: 1px solid var(--line); border-radius: 9px; background: #fff; color: #8b9693;
 }
-.role-matrix-search:focus-within { border-color: #b9dcd3; box-shadow: 0 0 0 3px rgba(15, 118, 110, .06); }
+.role-matrix-search:focus-within { border-color: #b9dcd3; }
 .role-matrix-search input {
   flex: 1; min-width: 0; padding: 7px 0; border: 0; background: transparent;
   color: var(--text); font: inherit; font-size: 12px; outline: 0;
@@ -6635,7 +6629,6 @@ table.role-matrix .role-matrix-cell:hover { outline: 1px solid #b9dcd3; outline-
 .role-tools-panel .models-search:hover { border-color: #cfe3de; }
 .role-tools-panel .models-search:focus-within {
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-soft);
 }
 .role-tools-panel .models-search input[type="search"] {
   flex: 1 1 auto;
@@ -6674,7 +6667,7 @@ table.data.role-tools-table td:first-child { text-align: center; }
   flex: 1 1 190px; min-width: 0; height: 32px; padding: 0 10px;
   border: 1px solid var(--line); border-radius: 8px; background: #fff; color: var(--text); font: inherit; font-size: 12px;
 }
-.role-member-toolbar input[type="search"]:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+.role-member-toolbar input[type="search"]:focus { border-color: var(--accent); }
 .role-member-count { color: var(--muted); font-size: 11.5px; white-space: nowrap; }
 .role-member-count strong { color: #0f766e; font-size: 13px; }
 .role-member-select-all {
@@ -6969,7 +6962,7 @@ table.data.role-tools-table td:first-child { text-align: center; }
   color: #253a37;
   font-size: 11.5px;
 }
-.models-route-row select:focus { border-color: #0f766e; outline: none; box-shadow: 0 0 0 3px #e6f4f2; }
+.models-route-row select:focus { border-color: #0f766e; outline: none; }
 .models-route-pick {
   display: flex;
   flex-direction: column;
@@ -7130,7 +7123,6 @@ table.data.role-tools-table td:first-child { text-align: center; }
 .models-search:hover { border-color: #bcdad2; }
 .models-search:focus-within {
   border-color: #7fc3b5;
-  box-shadow: 0 0 0 3px rgba(15, 118, 110, .1);
 }
 .models-search-icon {
   display: grid;
@@ -8553,7 +8545,7 @@ table.data.role-tools-table td:first-child { text-align: center; }
   font: inherit;
   font-size: 12px;
 }
-.storage-browser-bar input:focus { outline: 2px solid rgba(18, 111, 91, 0.18); border-color: var(--brand); }
+.storage-browser-bar input:focus { border-color: var(--brand); }
 .storage-browser-roots { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
 .storage-browser-root { min-width: 46px; }
 .storage-browser-list {
@@ -8669,6 +8661,7 @@ table.data.role-tools-table td:first-child { text-align: center; }
 
 .task-table .row-actions { display: inline-flex; gap: 8px; flex-wrap: nowrap; }
 .task-table .row-actions .link-btn { white-space: nowrap; }
+.task-table td:last-child .link-btn { white-space: nowrap; }
 
 /* 任务列表整行可点 + 选中态 */
 .task-table tbody tr.task-row { cursor: pointer; }
@@ -9937,7 +9930,7 @@ table.data.role-tools-table td:first-child { text-align: center; }
   line-height: 1.6;
   resize: vertical;
 }
-.db-query-input:focus { outline: 2px solid rgba(21, 112, 239, 0.18); border-color: var(--accent); background: #fff; }
+.db-query-input:focus { border-color: var(--accent); background: #fff; }
 .db-query-keyhint { margin: 6px 20px 0; color: #98a2b3; font-size: 11px; }
 .db-query-body > .modal-state { margin: 12px 20px 0; text-align: left; min-height: 16px; }
 .db-query-result { margin: 12px 20px 0; min-height: 42px; }
@@ -10896,7 +10889,7 @@ body.is-readonly-page .btn.primary,
   background: #fbfdfc; color: #223c39; font: inherit; font-size: 10.5px; outline: 0;
 }
 select.wf-input { padding-right: 3px; }
-.wf-input:focus { border-color: #a9d6c9; background: #fff; box-shadow: 0 0 0 3px rgba(15, 118, 110, .06); }
+.wf-input:focus { border-color: #a9d6c9; background: #fff; }
 .wf-textarea { height: 58px; padding: 7px 8px; resize: vertical; line-height: 1.5; }
 .wf-number-unit {
   display: flex; align-items: stretch; height: 30px; overflow: hidden;
@@ -10913,7 +10906,6 @@ select.wf-input { padding-right: 3px; }
 }
 .wf-number-unit:focus-within {
   border-color: #a9d6c9; background: #fff;
-  box-shadow: 0 0 0 3px rgba(15, 118, 110, .06);
 }
 .wf-unit {
   display: flex; align-items: center; flex: none; padding: 0 8px;
@@ -10929,7 +10921,7 @@ select.wf-input { padding-right: 3px; }
   flex: 1 1 auto; min-width: 0; height: 24px; padding: 0 4px; border: 1px solid #dce8e4; border-radius: 6px;
   background: #fff; color: #334b46; font: inherit; font-size: 9.5px;
 }
-.wf-preview-select:focus-visible { outline: none; border-color: #0f766e; box-shadow: 0 0 0 2px rgba(15, 118, 110, .14); }
+.wf-preview-select:focus-visible { outline: none; border-color: #0f766e; }
 .wf-preview-body { margin-top: 6px; }
 .wf-preview-chain { display: flex; flex-direction: column; gap: 3px; }
 .wf-preview-person { display: flex; align-items: center; gap: 6px; min-height: 22px; padding: 0 6px; border-radius: 5px; background: #f7faf9; }
@@ -11049,7 +11041,7 @@ select.wf-input { padding-right: 3px; }
 .ap-filter-row .ap-tab.is-active { background: #eff9f6; border-color: #cfe9e1; color: #0f766e; }
 .ap-filter-row .ap-tab span { background: #f2f4f3; color: #7c8884; }
 .ap-search { display: flex; align-items: center; gap: 5px; width: 220px; height: 28px; padding: 0 8px; border: 1px solid #dfeae6; border-radius: 7px; background: #fff; color: #9aa5a1; }
-.ap-search:focus-within { border-color: #a9d6c9; box-shadow: 0 0 0 3px rgba(15, 118, 110, .06); }
+.ap-search:focus-within { border-color: #a9d6c9; }
 .ap-search input { width: 100%; min-width: 0; border: 0; background: transparent; color: #223c39; font: inherit; font-size: 10.5px; outline: 0; }
 .ap-table-wrap { flex: 1 1 auto; min-height: 0; overflow: auto; overscroll-behavior: contain; }
 .ap-table { width: 100%; border-collapse: separate; border-spacing: 0; }
@@ -11468,4 +11460,329 @@ select.wf-input { padding-right: 3px; }
 }
 .update-notes .kb-flow-rich > :first-child {
   margin-top: 0;
+}
+
+/* ---------------- B22：表格工作流 --------------
+   三张长表共用「筛选摘要 + 分页 + 列优先级」：
+   1. 摘要条放在表头上方，随筛选实时更新，清空动作始终可见；
+   2. 分页统一由 pagerHtml 输出当前显示区间；
+   3. 窄屏先堆叠表头，再按优先级隐藏低频列，不让标题竖排、按钮出框。 */
+.table-summary {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 8px;
+  margin-top: 12px;
+  margin-bottom: 8px;
+  padding: 7px 10px;
+  border: 1px solid #edf1f4;
+  border-radius: 8px;
+  background: #fbfcfd;
+  color: var(--muted);
+  font-size: var(--type-xs);
+}
+.summary-label {
+  color: #98a2b3;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .04em;
+}
+.summary-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  max-width: 100%;
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid #e4e7ec;
+  border-radius: 999px;
+  background: #fff;
+  color: #667085;
+  line-height: 1;
+}
+.summary-chip > span { flex: none; }
+.summary-chip[hidden] { display: none; }
+.summary-chip > strong {
+  min-width: 0;
+  max-width: 280px;
+  overflow: hidden;
+  color: #344054;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.summary-empty { color: #98a2b3; }
+.summary-reset {
+  margin-left: auto;
+  padding: 0 2px;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  cursor: pointer;
+}
+.summary-reset:hover { text-decoration: underline; }
+.summary-reset:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
+.summary-reset[hidden] { display: none; }
+
+.member-action-group { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.member-table-scroll,
+.task-table-scroll { max-height: none; }
+.audit-table td { overflow-wrap: anywhere; }
+.audit-table th:first-child,
+.audit-table td:first-child {
+  width: 76px;
+  white-space: nowrap;
+}
+.audit-table th:nth-child(4),
+.audit-table td:nth-child(4) { width: 88px; }
+.audit-table th:nth-child(3),
+.audit-table td:nth-child(3) { width: 170px; }
+.audit-table .audit-actor {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.audit-table .col-audit-ip { width: 96px; white-space: nowrap; }
+.audit-table th:last-child,
+.audit-table td:last-child { width: 108px; }
+.audit-table td:last-child > span { white-space: nowrap; }
+
+/* 1024 以下：标题与操作分两行，操作区占满整行并可换行。 */
+@media (max-width: 1120px) {
+  .table-panel-head {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+  }
+  .table-panel-head > div:first-child { min-width: 0; }
+  .table-panel-head .panel-actions {
+    width: 100%;
+    flex-wrap: wrap;
+    justify-content: flex-start;
+  }
+  .table-panel-head .segmented {
+    max-width: 100%;
+    height: auto;
+    flex-wrap: wrap;
+    row-gap: 2px;
+  }
+  /* 成员部门路径先让位：部门名仍在，长路径只在宽屏展示。 */
+  .member-table .member-dept-path { display: none; }
+}
+
+/* 820 以下：成员工具条拆成两行，部门与搜索各占一列，按钮组独占一行。 */
+@media (max-width: 820px) {
+  .member-panel-actions {
+    display: grid;
+    grid-template-columns: minmax(160px, 240px) minmax(0, 1fr);
+    align-items: stretch;
+    row-gap: 8px;
+  }
+  .member-panel-actions .member-dept-field,
+  .member-panel-actions .member-search-field {
+    display: flex;
+    width: 100%;
+    min-width: 0;
+  }
+  .member-panel-actions .member-dept-field > span,
+  .member-panel-actions .member-search-field > span {
+    flex: none;
+    white-space: nowrap;
+  }
+  .member-panel-actions .member-dept-field select {
+    width: auto;
+    max-width: none;
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+  .member-panel-actions .member-search-field input[type="search"] {
+    width: auto;
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+  .member-panel-actions .member-action-group {
+    grid-column: 1 / -1;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+  /* 窄屏优先保留姓名、岗位、部门、角色和状态；第三方身份 ID 退到宽屏。 */
+  .member-table .member-identity-row { display: none; }
+}
+
+@media (max-width: 560px) {
+  .member-panel-actions { grid-template-columns: minmax(0, 1fr); }
+  .member-panel-actions .member-action-group { justify-content: flex-start; }
+}
+
+/* 审计窄屏：侧栏筛选从纵向列表变成顶部横向 chip，避免 6 行占掉半屏。 */
+@media (max-width: 900px) {
+  .audit-filter-list {
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .audit-filter-list .side-item {
+    width: auto;
+    padding: 6px 11px;
+    border: 1px solid #e4e7ec;
+    border-radius: 999px;
+    background: #fff;
+    font-size: 12px;
+    line-height: 1.2;
+  }
+  .audit-filter-list .side-item.is-active {
+    border-color: #cfe9e1;
+    background: var(--brand-soft);
+  }
+}
+
+/* 列优先级：审计先让出 IP，任务先让出创建人与最近执行；保留主键、规则、状态和操作。 */
+@media (max-width: 1080px) {
+  .audit-table .col-audit-ip { display: none; }
+}
+@media (max-width: 980px) {
+  .task-table .col-task-owner { display: none; }
+}
+@media (max-width: 720px) {
+  .task-table .col-task-last { display: none; }
+}
+
+/* B23 数据页：模型宽表列优先级。1024 保留完整六列，≤980 让出密钥列并在供应商名下补一行密钥状态。 */
+.models-key-brief { display: none; }
+@media (max-width: 980px) {
+  .models-provider-table { min-width: 660px; table-layout: fixed; }
+  .models-provider-table .col-provider-key { display: none; }
+  .models-provider-table .col-provider-name { width: 22%; }
+  .models-provider-table .col-provider-endpoint { width: 28%; }
+  .models-provider-table .col-provider-model { width: 8%; }
+  .models-provider-table .col-provider-status { width: 12%; }
+  .models-provider-table .col-provider-actions { width: 30%; }
+  .models-provider-table .models-key-brief {
+    display: block;
+    margin-top: 2px;
+    color: #667085;
+    font-size: 11px;
+    line-height: 1.35;
+  }
+}
+
+/* 模型目录：先让出可见角色，再让出上下文，600 档只保留模型、供应商、类型、状态和操作。 */
+@media (max-width: 980px) {
+  .models-table { min-width: 760px; }
+  .models-table .col-model-roles { display: none; }
+  .models-table .col-model-name { width: 18%; }
+  .models-table .col-model-provider { width: 13%; }
+  .models-table .col-model-type { width: 8%; }
+  .models-table .col-model-context { width: 11%; }
+  .models-table .col-model-capabilities { width: 27%; }
+  .models-table .col-model-status { width: 8%; }
+  .models-table .col-model-actions { width: 15%; }
+}
+@media (max-width: 780px) {
+  .models-table { min-width: 680px; }
+  .models-table .col-model-context { display: none; }
+  .models-table .col-model-name { width: 22%; }
+  .models-table .col-model-provider { width: 15%; }
+  .models-table .col-model-type { width: 9%; }
+  .models-table .col-model-capabilities { width: 26%; }
+  .models-table .col-model-status { width: 8%; }
+  .models-table .col-model-actions { width: 20%; }
+}
+@media (max-width: 640px) {
+  .models-table { min-width: 540px; }
+  .models-table .col-model-capabilities { display: none; }
+  .models-table .col-model-name { width: 30%; }
+  .models-table .col-model-provider { width: 22%; }
+  .models-table .col-model-type { width: 12%; }
+  .models-table .col-model-status { width: 12%; }
+  .models-table .col-model-actions { width: 24%; }
+}
+
+/* 知识库摘要头：窄屏先让标题占整行，再让操作按钮换行，避免标题被挤成竖排。 */
+@media (max-width: 760px) {
+  .kb-summary-head { align-items: flex-start; flex-wrap: wrap; gap: 10px; }
+  .kb-summary-copy { flex: 1 0 100%; min-width: 0; }
+  .kb-summary-head .kb-summary-actions { width: 100%; justify-content: flex-start; flex-wrap: wrap; }
+}
+
+/* 系统能力卡：先让出技能，再让出限制；宽度固定，避免岗位名被挤成单字一行。 */
+@media (max-width: 980px) {
+  .agent-cards-table { width: 100%; min-width: 0; table-layout: fixed; }
+  .agent-cards-table th:nth-child(3),
+  .agent-cards-table td:nth-child(3) { display: none; }
+  .agent-cards-table th:nth-child(1) { width: 20%; }
+  .agent-cards-table th:nth-child(2) { width: 11%; }
+  .agent-cards-table th:nth-child(4) { width: 35%; }
+  .agent-cards-table th:nth-child(5) { width: 18%; }
+  .agent-cards-table th:nth-child(6) { width: 10%; }
+}
+@media (max-width: 760px) {
+  .agent-cards-table th:nth-child(5),
+  .agent-cards-table td:nth-child(5) { display: none; }
+  .agent-cards-table th:nth-child(1) { width: 23%; }
+  .agent-cards-table th:nth-child(2) { width: 15%; }
+  .agent-cards-table th:nth-child(4) { width: 48%; }
+  .agent-cards-table th:nth-child(6) { width: 14%; }
+}
+
+/* 工具耗时：先让出“最长”，600 档再让出“超阈值”，保留工具、调用、p50、p95。 */
+@media (max-width: 760px) {
+  .sys-latency-table { width: 100%; min-width: 0; table-layout: fixed; }
+  .sys-latency-table th:nth-child(5),
+  .sys-latency-table td:nth-child(5) { display: none; }
+  .sys-latency-table th:nth-child(1) { width: 38%; }
+  .sys-latency-table th:nth-child(2) { width: 14%; }
+  .sys-latency-table th:nth-child(3) { width: 20%; }
+  .sys-latency-table th:nth-child(4) { width: 20%; }
+  .sys-latency-table th:nth-child(6) { width: 8%; }
+}
+@media (max-width: 640px) {
+  .sys-latency-table th:nth-child(6),
+  .sys-latency-table td:nth-child(6) { display: none; }
+  .sys-latency-table th:nth-child(1) { width: 38%; }
+  .sys-latency-table th:nth-child(2) { width: 14%; }
+  .sys-latency-table th:nth-child(3) { width: 24%; }
+  .sys-latency-table th:nth-child(4) { width: 24%; }
+}
+@media (max-width: 640px) {
+  .models-table { min-width: 520px; }
+  .models-filter-bar { flex-wrap: wrap; }
+  .models-filter { flex: 0 0 auto; white-space: nowrap; }
+}
+.sys-tools-table td:first-child,
+.sys-inflight-table td:first-child,
+.sys-latency-table td:first-child { overflow-wrap: anywhere; word-break: break-word; }
+@media (max-width: 980px) {
+  .col-model-provider .desc { display: none; }
+}
+@media (max-width: 980px) {
+  .models-model-cell { min-width: 0; }
+  .models-model-cell strong,
+  .models-model-key { overflow-wrap: anywhere; word-break: break-word; }
+}
+@media (max-width: 640px) {
+  .models-provider-table { min-width: 520px; }
+  .models-provider-table .col-provider-model { display: none; }
+  .models-provider-table .col-provider-name { width: 28%; }
+  .models-provider-table .col-provider-endpoint { width: 30%; }
+  .models-provider-table .col-provider-status { width: 12%; }
+  .models-provider-table .col-provider-actions { width: 30%; }
+  .models-provider-table .row-actions { gap: 4px; }
+}
+
+/* 输入焦点只用边框表达，不绘制任何浏览器默认外环；键盘可访问性由边框对比度保证。 */
+:where(
+  input:not([type="checkbox"]):not([type="radio"]):not([type="button"]):not([type="submit"]):not([type="reset"]):not([type="file"]):not([type="range"]):not([type="color"]),
+  textarea,
+  select
+):focus,
+:where(
+  input:not([type="checkbox"]):not([type="radio"]):not([type="button"]):not([type="submit"]):not([type="reset"]):not([type="file"]):not([type="range"]):not([type="color"]),
+  textarea,
+  select
+):focus-visible {
+  outline: none !important;
 }

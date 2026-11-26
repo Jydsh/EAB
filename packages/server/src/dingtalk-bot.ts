@@ -2762,8 +2762,8 @@ export async function handleDingTalkCardCallback(
     }
     if (!optionId) {
       // 兼容只回传选项卡片/文案组件 ID 的情况：clarifyOptionCard0 对应 option-1。
-      const option = actionIds.find((id) => /^clarifyOption(?:Card|Body|Label)?[0-3]$/.test(id))
-      const index = option ? Number(option.match(/[0-3]$/)?.[0] ?? -1) : -1
+      const option = actionIds.find((id) => /^clarifyOption(?:Card|Body|Label)?\d+$/.test(id))
+      const index = option ? Number(option.match(/(\d+)$/)?.[1] ?? -1) : -1
       if (index >= 0) optionId = `option-${index + 1}`
     }
     if (!optionId) {

@@ -72,6 +72,7 @@ import { searchWeb } from '../web-search.js'
 import { effectiveWebSearchEnv } from '../web-search-config.js'
 import { assertWebToolRateLimit, type WebToolId } from '../web-rate-limit.js'
 import { browserStatus, executeBrowserAction, type BrowserAction } from '../browser-session.js'
+import { assertPublicHttpUrl } from '../net-policy.js'
 import { browserNetworkSettingsView } from '../browser-network-config.js'
 import { publishAgentArtifact } from '../agent-artifacts.js'
 import {
@@ -129,6 +130,17 @@ import { generateImageToWorkspace } from './content.js'
 import { countTextLines, readTextFileRange, searchWorkspaceText, type TextRangeResult, type TextSearchResult } from '../workspace-text.js'
 import { saveTextBatch } from '../batch-results.js'
 import { analyzeWorkspaceFile } from '../workspace-analyze.js'
+import {
+  type LocalProject,
+} from '../local-project.js'
+import {
+  deleteProjectEntry,
+  editProjectText,
+  listProjectEntries,
+  readProjectText,
+  searchProjectText,
+  writeProjectText,
+} from '../project-files.js'
 import {
   assertProjectExecEnabled,
   killProjectJob,
@@ -224,6 +236,11 @@ export interface ToolExecutionContext {
    * 避免「明明开着文件还要反问是哪个文件」。
    */
   activeFile?: { id: string; relPath?: string }
+  /**
+   * 发起本轮对话的桌面客户端设备 id。
+   * 只有桌面页面会带 x-eab-desktop-device；浏览器工具据此把动作路由到右侧原生标签页。
+   */
+  desktopDeviceId?: string
   /** 当前子 Agent 的任务行；只有子 Agent 轮次才有，用于产物登记 */
   agentTaskId?: string
   /** 当前会话的团队存储；产物登记和 trace 归属都从这里取 */
@@ -611,7 +628,7 @@ export const TOOLS: readonly ToolDef[] = [
     id: 'browser',
     name: '内置浏览器',
     description:
-      '用服务端无头浏览器打开需要 JavaScript 渲染或要点击的网页。action=open 打开链接并返回标题、正文和可点击元素 ref；action=snapshot 重新读取当前页；action=click 按 ref 点链接/普通按钮；action=type 只在搜索框/文本框输入；action=screenshot 截图并保存到个人云空间；action=close 关闭页面。不能提交表单、登录、上传下载、支付或执行任意脚本。只看静态正文优先用 web.fetch，更省资源。',
+      '浏览器工具。桌面端会直接操作用户右侧已打开的浏览器标签页：action=list 先列出所有标签页及当前页；action=snapshot 不传 pageId 读取当前标签页标题、正文和可点击元素 ref；action=activate 切换标签页；action=open 在右侧新建标签并返回正文；action=click 按 ref 点链接/普通按钮；action=type 只在搜索框/文本框输入；action=scroll / back / forward / reload / navigate 操作当前页；action=screenshot 截图到个人云空间；action=close 关闭标签。用户说“这个网页/右侧页面/当前标签”时，先 list 或 snapshot，不要用 web.fetch 猜正文。不能提交表单、登录、上传下载、支付或执行任意脚本。网页端无桌面连接时回退服务端无头浏览器，除 open 外的动作要传 pageId；只看静态正文优先用 web.fetch。',
     scope: SC.AGENT_TOOL_INVOKE,
     dangerous: false,
     concurrency: 'write',
@@ -619,11 +636,11 @@ export const TOOLS: readonly ToolDef[] = [
     input: {
       action: {
         type: 'string',
-        description: 'open / snapshot / click / type / scroll / back / screenshot / close',
+        description: 'list / snapshot / activate / open / click / type / scroll / back / forward / reload / navigate / screenshot / close',
         required: true,
       },
-      url: { type: 'string', description: 'action=open 时要打开的完整 http/https 链接' },
-      pageId: { type: 'string', description: 'open 返回的页面 id；除 open 外都要传' },
+      url: { type: 'string', description: 'action=open / navigate 时要打开的完整 http/https 链接' },
+      pageId: { type: 'string', description: '目标标签页 id；桌面端省略时作用于当前标签页，网页端除 open 外必传' },
       ref: { type: 'string', description: 'snapshot 返回的元素引用，如 e1' },
       text: { type: 'string', description: 'action=type 时要输入的文字，最多 500 字' },
       direction: { type: 'string', description: 'action=scroll 方向：down（默认）/ up' },
@@ -983,14 +1000,15 @@ export const TOOLS: readonly ToolDef[] = [
   },
   {
     id: 'org.directory',
-    name: '组织通讯录（对话式）',
+    name: '组织通讯录（仅组织关系）',
     description:
-      '不要求用户先输入姓名。按对话意图查组织：intent=leader 查“我的组长/我的上级/我所在部门”；intent=me 查“我是谁/我在哪个部门”；intent=departments 查“公司有哪些部门/组织架构”；intent=members 查某个部门有谁（需要查看成员权限）；intent=search 按姓名/岗位关键字查人（需要查看成员权限）。返回部门、岗位、组长，不返回手机号。',
+      '仅查组织关系，不含手机号、身份证号、入职/转正日期、司龄、学历、籍贯、身高体重等人事档案字段。按对话意图查组织：intent=leader 查“我的组长/我的上级/我所在部门”；intent=me 查“我是谁/我在哪个部门”；intent=departments 查“公司有哪些部门/组织架构”；intent=members 查某个部门有谁（需要查看成员权限）；intent=search 按姓名/岗位关键字查人（需要查看成员权限）。返回部门、岗位、组长。用户问“某人的个人信息/个人档案/身份证/手机号/入职/学历/籍贯”时，不要用本工具回答，改用人员档案接口。',
     scope: SC.CHAT_USE,
     dangerous: false,
     input: {
       intent: {
         type: 'string',
+        enum: ['leader', 'me', 'departments', 'members', 'search'],
         description: 'leader | me | departments | members | search，按用户问题选择',
         required: true,
       },
@@ -999,8 +1017,8 @@ export const TOOLS: readonly ToolDef[] = [
   },
   {
     id: 'org.search',
-    name: '通讯录搜索',
-    description: '按姓名/工号/岗位搜索本公司在职成员，返回部门与岗位，不返回手机号',
+    name: '通讯录搜索（仅组织关系）',
+    description: '仅按姓名/工号/岗位搜索本公司在职成员，返回部门与岗位；不含手机号、身份证号、入职/转正、学历、籍贯等人事档案字段。查完整人事资料请用人员档案接口。',
     scope: SC.ORG_MEMBER_READ,
     dangerous: false,
     input: { query: { type: 'string', description: '姓名或工号关键字', required: true } },
@@ -1170,6 +1188,101 @@ export const TOOLS: readonly ToolDef[] = [
     input: {
       query: { type: 'string', description: '要搜索的文本或正则', required: true },
       path: { type: 'string', description: '可选：相对路径的文件或目录，默认整个工作区' },
+      maxResults: { type: 'number', description: '最多返回几条，默认 30，最大 100' },
+      regex: { type: 'boolean', description: '是否当正则，默认 false' },
+      caseSensitive: { type: 'boolean', description: '是否区分大小写，默认 false' },
+    },
+  },
+  {
+    id: 'project.list',
+    name: '浏览本地项目文件',
+    description:
+      '列出当前本地项目目录下的文件和文件夹。path 是相对项目根的目录（默认根目录），depth 默认 1、最大 3；自动跳过 .git、node_modules、dist 等大目录。返回 type、size、updatedAt 和相对 path，下一步再用 project.read 读内容。只能访问当前项目根目录，不能跳出。',
+    scope: SC.LOCAL_SPACE_READ,
+    dangerous: false,
+    input: {
+      path: { type: 'string', description: '可选：相对项目根的目录，默认根目录' },
+      depth: { type: 'number', description: '可选：递归层数，默认 1，最大 3' },
+      limit: { type: 'number', description: '可选：最多返回多少条，默认 300，最大 1000' },
+    },
+  },
+  {
+    id: 'project.read',
+    name: '读取本地项目文件',
+    description:
+      '按行读取当前本地项目里的文本文件，返回 path、size、text、startLine、endLine、totalLines 和 nextOffset；offset 是行号（从 1 开始），limit 默认 2000 行。代码、配置、Markdown 都可用；二进制文件请改用 project.exec 调用系统工具。',
+    scope: SC.LOCAL_SPACE_READ,
+    dangerous: false,
+    input: {
+      path: { type: 'string', description: '相对项目根的文本文件路径', required: true },
+      offset: { type: 'number', description: '可选：起始行号，从 1 开始' },
+      limit: { type: 'number', description: '可选：本次最多读多少行，默认 2000' },
+    },
+  },
+  {
+    id: 'project.write',
+    name: '写入本地项目文件',
+    description:
+      '在当前本地项目里创建或覆盖文本文件。path 相对项目根，父目录不存在会自动创建；返回 path、size、created。只接受文本内容，二进制 Office 文件请用对应工具或在项目里运行构建命令；单个文件最大 5 MB。敏感文件（.env、私钥、凭据）默认拒绝，需要用户在项目设置里显式开启。',
+    scope: SC.LOCAL_SPACE_WRITE,
+    dangerous: false,
+    input: {
+      path: { type: 'string', description: '相对项目根的文件路径，例如 src/index.ts', required: true },
+      text: { type: 'string', description: '完整文件内容', required: true },
+    },
+  },
+  {
+    id: 'project.edit',
+    name: '局部修改本地项目文件',
+    description:
+      '用精确 find/replace 局部修改当前本地项目里的文本文件，不重写整个文件。edits 是数组，每项包含 find、replace，可选 occurrence；所有 find 必须命中，任何一处失败整次修改不落盘。改完返回 changes、matchedEdits 和 diff。',
+    scope: SC.LOCAL_SPACE_WRITE,
+    dangerous: false,
+    input: {
+      path: { type: 'string', description: '相对项目根的文本文件路径', required: true },
+      edits: {
+        type: 'array',
+        description: '修改列表，每项 { find, replace, occurrence? }',
+        required: true,
+        minItems: 1,
+        maxItems: 50,
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            find: { type: 'string', description: '要替换的原文（区分大小写/空白）' },
+            replace: { type: 'string', description: '新内容；空字符串=删除' },
+            occurrence: {
+              type: 'integer',
+              description: '只替换第几个匹配（1 起）；不传=全部',
+            },
+          },
+          required: ['find', 'replace'],
+        },
+      },
+    },
+  },
+  {
+    id: 'project.delete',
+    name: '删除本地项目文件',
+    description:
+      '删除当前本地项目里的一个文件（不是目录）。path 相对项目根；只删文件，不会递归删除文件夹。这是不可逆操作，每次执行都需要用户审批；项目只读模式下拒绝。',
+    scope: SC.LOCAL_SPACE_WRITE,
+    dangerous: true,
+    input: {
+      path: { type: 'string', description: '相对项目根的文件路径', required: true },
+    },
+  },
+  {
+    id: 'project.search',
+    name: '搜索本地项目文本',
+    description:
+      '在当前本地项目里按关键词/正则搜索文本文件，返回 path、line、column、命中行和 total；query 也是文件名时返回 nameMatches。默认 30 条、最多 100，递归搜索但跳过 .git、node_modules、dist；先用它定位 path:line，再用 project.read 读上下文。',
+    scope: SC.LOCAL_SPACE_READ,
+    dangerous: false,
+    input: {
+      query: { type: 'string', description: '要搜索的文本或正则', required: true },
+      path: { type: 'string', description: '可选：相对项目根的目录或文件，默认整个项目' },
       maxResults: { type: 'number', description: '最多返回几条，默认 30，最大 100' },
       regex: { type: 'boolean', description: '是否当正则，默认 false' },
       caseSensitive: { type: 'boolean', description: '是否区分大小写，默认 false' },
@@ -2203,6 +2316,8 @@ export function toolSpecsForAgent(
   if (query.trim() === '' || route.workspace) routedIds.push(...CAPABILITY_TOOL_GROUPS.workspace)
   if (route.office) routedIds.push(...officeToolIdsForQuery(query))
   if (route.project) routedIds.push(...CAPABILITY_TOOL_GROUPS.project)
+  // 本地项目空间把文件工具常驻，不依赖关键词命中：用户可能只说“继续做”。
+  if (space.kind === 'local') routedIds.push(...CAPABILITY_TOOL_GROUPS.projectFiles)
   if (route.pluginDev) routedIds.push(...CAPABILITY_TOOL_GROUPS.pluginDev)
   if (route.skillDev) routedIds.push(...CAPABILITY_TOOL_GROUPS.skillDev)
   if (route.schedule) routedIds.push(...CAPABILITY_TOOL_GROUPS.schedule)
@@ -2277,8 +2392,46 @@ function toolAllowedInSpace(toolId: string, space: ActiveSpace): boolean {
   if (toolId === 'plugin.dev') return space.kind === 'cloud'
   if (toolId === 'skill.dev') return space.kind === 'cloud'
   if (toolId.startsWith('workspace.') || toolId.startsWith('office.')) return space.kind === 'cloud'
-  if (toolId.startsWith('project.') && resolveProjectExecMode() === 'off') return false
+  // 本地文件工具只在本地项目空间出现；云空间继续使用 workspace.*。
+  if (toolId.startsWith('project.') && !['project.exec', 'project.job'].includes(toolId)) {
+    return space.kind === 'local'
+  }
+  if (toolId === 'project.exec' || toolId === 'project.job') {
+    if (resolveProjectExecMode() === 'off') return false
+    // 云空间仍保留原有的项目命令能力；本地项目空间使用自己的根目录。
+    return space.kind === 'cloud' || space.kind === 'local'
+  }
   return true
+}
+
+/** 本地项目工具直接使用会话已校验的空间对象，不重新查库，避免子 Agent 跨员工拿项目。 */
+function localProjectForSpace(space: ActiveSpace): LocalProject {
+  if (space.kind !== 'local') {
+    throw new EabError(EC.FORBIDDEN, '当前不在本地项目空间，不能使用本地项目文件工具')
+  }
+  return {
+    id: space.id,
+    name: space.name,
+    rootPath: space.root,
+    rootRealPath: space.root,
+    mode: space.mode,
+    allowSensitive: space.allowSensitive,
+    deviceId: space.deviceId,
+    instructions: space.instructions,
+    cloudRefs: space.cloudRefs,
+    createdAt: 0,
+    updatedAt: 0,
+    lastUsedAt: null,
+  }
+}
+
+function projectRootForSpace(
+  deps: ServerDeps,
+  actor: RequestActor,
+  space: ActiveSpace,
+): string {
+  if (space.kind === 'local') return space.root
+  return userScopeDir(deps, actor.subject.companyId, actor.subject.userId)
 }
 
 /** 模型有时把 steps 作为 JSON 字符串传；两种都接住，非法输入在写库前就报清楚。 */
@@ -2827,6 +2980,103 @@ export async function executeTool(
         },
       }
       const browserPolicy = browserNetworkSettingsView()
+      const desktopDeviceId = deps.desktopBridge?.resolveOnlineDevice(
+        actor.subject.companyId,
+        actor.person.id,
+        context.desktopDeviceId,
+      )
+      const desktopAction = String(args.action ?? '').trim()
+      const desktopBrowserActions = new Set([
+        'open', 'snapshot', 'list', 'activate', 'click', 'type', 'scroll',
+        'back', 'forward', 'reload', 'navigate', 'screenshot', 'close',
+      ])
+      if (desktopDeviceId && desktopBrowserActions.has(desktopAction)) {
+        if (!['open', 'navigate'].includes(desktopAction) && args.url !== undefined && String(args.url).trim()) {
+          throw new EabError(EC.VALIDATION, `action=${desktopAction} 不需要 url`)
+        }
+        let targetUrl = args.url === undefined ? undefined : String(args.url)
+        if (desktopAction === 'open' || desktopAction === 'navigate') {
+          if (!targetUrl || !targetUrl.trim()) throw new EabError(EC.VALIDATION, `${desktopAction} 需要 url`)
+          targetUrl = (await assertPublicHttpUrl(targetUrl, {
+            allowPrivateNetwork: browserPolicy.enabled,
+            privateNetworkHosts: browserPolicy.enabled ? browserPolicy.allowedHosts : [],
+          })).href
+        }
+        const payload = await deps.desktopBridge!.browserCall<Record<string, unknown>>(
+          actor.subject.companyId,
+          actor.person.id,
+          desktopDeviceId,
+          {
+            action: desktopAction,
+            sessionId: context.sessionId ? String(context.sessionId) : undefined,
+            url: targetUrl,
+            pageId: args.pageId === undefined ? undefined : String(args.pageId),
+            ref: args.ref === undefined ? undefined : String(args.ref),
+            text: args.text === undefined ? undefined : String(args.text),
+            direction: args.direction === 'up' ? 'up' : 'down',
+          },
+          30_000,
+        )
+        let screenshot: { fileId: string; name: string; relPath: string; size: number; mime: string } | null = null
+        if (typeof payload.screenshotBase64 === 'string' && payload.screenshotBase64) {
+          const buffer = Buffer.from(payload.screenshotBase64, 'base64')
+          const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)
+          const saved = saveUserWorkspaceFile(deps, actor, {
+            relPath: `浏览器截图-${stamp}.png`,
+            buffer,
+            mime: 'image/png',
+            channel: context.channel,
+          })
+          screenshot = {
+            fileId: saved.id,
+            name: saved.name,
+            relPath: saved.relPath,
+            size: saved.size,
+            mime: saved.mime ?? 'image/png',
+          }
+        }
+        const browserFields = { ...payload }
+        delete browserFields.screenshotBase64
+        delete browserFields.screenshotMime
+        delete browserFields.screenshotWidth
+        delete browserFields.screenshotHeight
+        delete browserFields.tabs
+        delete browserFields.activePageId
+        delete browserFields.native
+        const nativeResult = {
+          action: desktopAction,
+          pageId: typeof browserFields.pageId === 'string' ? browserFields.pageId : null,
+          title: typeof browserFields.title === 'string' ? browserFields.title : null,
+          url: typeof browserFields.url === 'string' ? browserFields.url : null,
+          text: typeof browserFields.text === 'string' ? browserFields.text : null,
+          elements: Array.isArray(browserFields.elements) ? browserFields.elements : [],
+          screenshot,
+          truncated: Boolean(browserFields.truncated),
+          closed: Boolean(browserFields.closed),
+          hint: typeof browserFields.hint === 'string' ? browserFields.hint : null,
+          native: true,
+          tabs: Array.isArray(payload.tabs) ? payload.tabs : undefined,
+          activePageId: typeof payload.activePageId === 'string' ? payload.activePageId : undefined,
+        }
+        result = nativeResult
+        webAudit.detail = {
+          ...webAudit.detail,
+          surface: 'desktop',
+          deviceId: desktopDeviceId,
+          action: desktopAction,
+          url: nativeResult.url,
+          title: nativeResult.title,
+          elements: nativeResult.elements.length,
+          screenshotFileId: screenshot?.fileId ?? null,
+          closed: nativeResult.closed,
+        }
+        break
+      }
+      if (!desktopDeviceId && ['list', 'activate'].includes(desktopAction)) {
+        throw new EabError(EC.CONFLICT, `action=${desktopAction} 只支持桌面端右侧浏览器`, {
+          hint: '打开 EAB 桌面端并保持登录后重试；网页模式没有可列出的桌面标签页。',
+        })
+      }
       const browserResult = await executeBrowserAction(
         {
           action: String(args.action ?? '') as BrowserAction,
@@ -3131,9 +3381,190 @@ export async function executeTool(
       }
       break
     }
+    case 'project.list': {
+      const project = localProjectForSpace(space)
+      const listing = await listProjectEntries(
+        deps,
+        project,
+        actor.subject.companyId,
+        actor.subject.userId,
+        String(args.path ?? ''),
+        {
+          depth: args.depth === undefined ? 1 : Number(args.depth),
+          limit: args.limit === undefined ? undefined : Number(args.limit),
+        },
+      )
+      result = {
+        project: project.name,
+        path: listing.path,
+        entries: listing.entries,
+        total: listing.total,
+        truncated: listing.truncated,
+        note: 'path 都是相对项目根的路径；目录条目 type=dir，文件 type=file。需要读内容时用 project.read。',
+      }
+      break
+    }
+    case 'project.read': {
+      const project = localProjectForSpace(space)
+      const range = await readProjectText(
+        deps,
+        project,
+        actor.subject.companyId,
+        actor.subject.userId,
+        String(args.path ?? ''),
+        {
+          offset: args.offset === undefined ? undefined : Number(args.offset),
+          limit: args.limit === undefined ? undefined : Number(args.limit),
+        },
+      )
+      result = {
+        project: project.name,
+        path: range.path,
+        size: range.size,
+        text: range.text,
+        startLine: range.startLine,
+        endLine: range.endLine,
+        totalLines: range.totalLines,
+        truncated: range.truncated,
+        truncatedByBytes: range.truncatedByBytes,
+        longLines: range.longLines,
+        nextOffset: range.nextOffset,
+        mode: 'lines',
+      }
+      break
+    }
+    case 'project.search': {
+      const project = localProjectForSpace(space)
+      const search = await searchProjectText(
+        deps,
+        project,
+        actor.subject.companyId,
+        actor.subject.userId,
+        String(args.path ?? ''),
+        {
+          query: String(args.query ?? ''),
+          maxResults: args.maxResults === undefined ? undefined : Number(args.maxResults),
+          regex: Boolean(args.regex),
+          caseSensitive: Boolean(args.caseSensitive),
+        },
+      )
+      result = {
+        project: project.name,
+        query: String(args.query ?? ''),
+        path: String(args.path ?? ''),
+        regex: Boolean(args.regex),
+        caseSensitive: Boolean(args.caseSensitive),
+        count: search.matches.length,
+        total: search.total,
+        filesScanned: search.filesScanned,
+        truncated: search.truncated,
+        timeLimitHit: search.timeLimitHit,
+        matches: search.matches,
+        nameMatches: search.nameMatches,
+      }
+      break
+    }
+    case 'project.write': {
+      const project = localProjectForSpace(space)
+      if (project.mode === 'read_only') throw new EabError(EC.FORBIDDEN, '当前项目是只读模式')
+      const rawPath = String(args.path ?? '').trim()
+      const text = String(args.text ?? '')
+      const written = await writeProjectText(
+        deps,
+        project,
+        actor.subject.companyId,
+        actor.subject.userId,
+        rawPath,
+        text,
+      )
+      result = {
+        project: project.name,
+        path: written.path,
+        size: written.size,
+        created: written.created,
+        overwritten: written.overwritten,
+      }
+      break
+    }
+    case 'project.edit': {
+      const project = localProjectForSpace(space)
+      if (project.mode === 'read_only') throw new EabError(EC.FORBIDDEN, '当前项目是只读模式')
+      const rawPath = String(args.path ?? '').trim()
+      if (!isTextEditableFile(rawPath)) {
+        throw new EabError(EC.VALIDATION, '该文件类型暂不支持局部文本编辑')
+      }
+      let rawEdits: unknown = args.edits
+      if (typeof rawEdits === 'string') {
+        try {
+          rawEdits = JSON.parse(rawEdits)
+        } catch {
+          throw new EabError(EC.VALIDATION, 'edits 必须是 JSON 数组')
+        }
+      }
+      if (!Array.isArray(rawEdits) || rawEdits.length === 0) {
+        throw new EabError(EC.VALIDATION, 'edits 不能为空', { hint: '每项至少包含 find 和 replace' })
+      }
+      if (rawEdits.length > 50) throw new EabError(EC.VALIDATION, '一次最多修改 50 处')
+      const edits: WorkspaceTextEdit[] = rawEdits.map((item, index) => {
+        if (!item || typeof item !== 'object') {
+          throw new EabError(EC.VALIDATION, `第 ${index + 1} 项不是有效对象`)
+        }
+        const value = item as Record<string, unknown>
+        const find = String(value.find ?? '')
+        const replace = String(value.replace ?? '')
+        if (!find) throw new EabError(EC.VALIDATION, `第 ${index + 1} 项 find 不能为空`)
+        return {
+          find,
+          replace,
+          ...(value.occurrence === undefined ? {} : { occurrence: Number(value.occurrence) }),
+        }
+      })
+      const edited = await editProjectText(
+        deps,
+        project,
+        actor.subject.companyId,
+        actor.subject.userId,
+        rawPath,
+        edits,
+      )
+      result = {
+        project: project.name,
+        path: edited.path,
+        size: edited.size,
+        changes: edited.changes,
+        matchedEdits: edited.matchedEdits,
+        edited: true,
+        diff: edited.diff,
+      }
+      break
+    }
+    case 'project.delete': {
+      const project = localProjectForSpace(space)
+      const deleted = await deleteProjectEntry(
+        deps,
+        project,
+        actor.subject.companyId,
+        actor.subject.userId,
+        args.path,
+      )
+      result = {
+        project: project.name,
+        path: deleted.path,
+        deleted: true,
+        size: deleted.size,
+      }
+      break
+    }
     case 'project.exec': {
       assertProjectExecEnabled()
-      const root = userScopeDir(deps, actor.subject.companyId, actor.subject.userId)
+      if (space.kind === 'local' && localProjectForSpace(space).deviceId) {
+        throw new EabError(
+          EC.FORBIDDEN,
+          '当前项目目录在桌面端电脑上，服务端不能直接在远端执行命令',
+          { hint: '本轮桌面文件桥只开放文件读写；命令执行仍由桌面终端手动完成。' },
+        )
+      }
+      const root = projectRootForSpace(deps, actor, space)
       const command = String(args.command ?? '')
       const cwd = args.cwd === undefined || args.cwd === null ? undefined : String(args.cwd)
       const timeoutMs = args.timeoutMs === undefined || args.timeoutMs === null ? undefined : Number(args.timeoutMs)

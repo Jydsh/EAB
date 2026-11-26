@@ -842,7 +842,6 @@
 
 [data-theme='dark'] .composer-box:focus-within {
   border-color: var(--brand);
-  box-shadow: 0 0 0 3px rgba(94, 224, 198, 0.1), 0 2px 18px rgba(0, 0, 0, 0.32);
 }
 
 [data-theme='dark'] .chat-suggest button,

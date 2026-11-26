@@ -224,6 +224,15 @@ export const CAPABILITY_TOOL_GROUPS = {
     'office.gui',
   ],
   project: ['project.exec', 'project.job'],
+  /** 本地项目文件工具；只在 local 空间下发，云空间继续走 workspace.*。 */
+  projectFiles: [
+    'project.list',
+    'project.read',
+    'project.search',
+    'project.write',
+    'project.edit',
+    'project.delete',
+  ],
   pluginDev: ['plugin.dev'],
   skillDev: ['skill.dev'],
   schedule: ['schedule.create'],

@@ -48,6 +48,16 @@ describe('内置浏览器内网访问配置', () => {
     })
   })
 
+  it('星号代表放行全部企业局域网', () => {
+    useTempHome()
+    const saved = saveBrowserNetworkSettings({ allowPrivateNetwork: true, allowedHosts: '*' })
+    expect(saved).toMatchObject({
+      allowPrivateNetwork: true,
+      allowedHosts: ['*'],
+      enabled: true,
+    })
+  })
+
   it('开启开关但名单为空时拒绝保存', () => {
     useTempHome()
     expect(() =>

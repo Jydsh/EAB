@@ -3,6 +3,8 @@ dist/
 coverage/
 *.log
 .eab-dev/
+packages/desktop/release/
+packages/desktop/installer/generated/
 .EAB_HOME/
 workspaces/
 plugins/

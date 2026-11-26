@@ -34,6 +34,7 @@ describe('工具风险分级', () => {
     expect(toolRisk({ id: 'project.exec' })).toBe('exec')
     expect(toolRisk({ id: 'workspace.delete', concurrency: 'write' })).toBe('irreversible')
     expect(toolRisk({ id: 'admin.password.reset', dangerous: true })).toBe('irreversible')
+    expect(toolRisk({ id: 'project.delete', dangerous: true })).toBe('irreversible')
     expect(toolRisk({ id: 'office.rewrite', concurrency: 'write' })).toBe('write')
     expect(toolRisk({ id: 'workspace.write', concurrency: 'write' })).toBe('write')
     expect(toolRisk({ id: 'workspace.read', concurrency: 'read' })).toBe('read')
@@ -41,6 +42,7 @@ describe('工具风险分级', () => {
     expect(requiresToolApproval({ id: 'project.exec' })).toBe(true)
     expect(requiresToolApproval({ id: 'workspace.delete' })).toBe(true)
     expect(requiresToolApproval({ id: 'office.rewrite' })).toBe(true)
+    expect(requiresToolApproval({ id: 'project.delete', dangerous: true })).toBe(true)
     expect(requiresToolApproval({ id: 'workspace.write', concurrency: 'write' })).toBe(false)
     expect(toolApprovalPolicy({ id: 'workspace.read', concurrency: 'read' })).toBe('never')
 
@@ -50,6 +52,10 @@ describe('工具风险分级', () => {
     expect(requiresToolApprovalForArgs({ id: 'office.versions', risk: 'write' }, { action: 'restore' })).toBe(true)
     expect(requiresToolApprovalForArgs({ id: 'workspace.folder', approval: 'always' }, { action: 'create' })).toBe(false)
     expect(requiresToolApprovalForArgs({ id: 'workspace.folder', approval: 'always' }, { action: 'delete' })).toBe(true)
+    expect(requiresToolApprovalForArgs({ id: 'browser', risk: 'exec' }, { action: 'snapshot' })).toBe(false)
+    expect(requiresToolApprovalForArgs({ id: 'browser', risk: 'exec' }, { action: 'list' })).toBe(false)
+    expect(requiresToolApprovalForArgs({ id: 'browser', risk: 'exec' }, { action: 'click' })).toBe(true)
+    expect(requiresToolApprovalForArgs({ id: 'browser', risk: 'exec' }, { action: 'type' })).toBe(true)
   })
 })
 

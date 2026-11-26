@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { afterEach, describe, expect, it } from 'vitest'
 import { EC } from '@eab/domain'
-import { isPrivateAddress, fetchJson, proxyForUrl, safeGet } from '../src/net-policy.js'
+import { isInternalNetworkAddress, isPrivateAddress, fetchJson, proxyForUrl, safeGet } from '../src/net-policy.js'
 
 const servers: Server[] = []
 
@@ -73,6 +73,15 @@ describe('公网访问安全层', () => {
     expect(isPrivateAddress('::ffff:8.8.8.8')).toBe(false)
   })
 
+  it('区分企业局域网与环回、链路本地、云元数据', () => {
+    for (const address of ['10.1.2.3', '100.64.0.1', '172.16.0.1', '172.31.255.255', '192.168.1.13', 'fc00::1', 'fd12:3456::1']) {
+      expect(isInternalNetworkAddress(address), address).toBe(true)
+    }
+    for (const address of ['0.0.0.0', '127.0.0.1', '169.254.169.254', '192.0.0.1', '198.18.0.1', '224.0.0.1', '::', '::1', 'fe80::1']) {
+      expect(isInternalNetworkAddress(address), address).toBe(false)
+    }
+  })
+
   it('默认拒绝本机地址，并且拒绝发生在建立连接之前', async () => {
     const { port, calls } = await startServer((_req, res) => {
       res.writeHead(200, { 'content-type': 'text/plain' })
@@ -135,6 +144,27 @@ describe('公网访问安全层', () => {
         allowedPorts: [port],
       }),
     ).rejects.toMatchObject({ code: EC.VALIDATION })
+  })
+
+  it('星号放行企业局域网，但不放行环回和链路本地', async () => {
+    const { port } = await startServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/plain' })
+      res.end('wildcard')
+    })
+
+    for (const url of [
+      `http://127.0.0.1:${port}/`,
+      `http://0.0.0.0:${port}/`,
+      `http://169.254.169.254:${port}/`,
+    ]) {
+      await expect(
+        safeGet(url, {
+          allowPrivateNetwork: true,
+          privateNetworkHosts: ['*'],
+          allowedPorts: [port],
+        }),
+      ).rejects.toMatchObject({ code: EC.VALIDATION })
+    }
   })
 
   it('响应超过上限立即失败', async () => {

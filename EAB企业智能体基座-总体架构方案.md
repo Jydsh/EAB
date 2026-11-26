@@ -49,6 +49,7 @@
 - 20. 分期路线与任务分解
 - 21. 风险登记册
 - 22. 需要拍板的事项（附推荐）
+- 23. 内置浏览器工作台（2026-11-25 第一阶段）
 - 附录 A 术语表 / 附录 B 参考与对标
 
 ---
@@ -415,7 +416,7 @@ core-domain                         →  无依赖（领域模型、scope 常量
 | 自研 IM / 自研富文本编辑器 | 复用渠道与现成编辑器，别造第二套 |
 | 前端自研状态机做权限 | 见 ADR-13，能力清单下发 |
 | Dify/FastGPT 作为内核 | 见 ADR-02，只做外接 provider |
-| Electron 桌面端（本期） | 与"单机服务 + Web 端"重复；后续可作为"通道适配器"插件 |
+| Electron 桌面端（2026-11-26 第十轮后调整） | 作为**可选 Windows 客户端**正式推进，但不是默认入口：Web / Node 仍是零安装主形态，桌面客户端只访问已有 EAB 服务，不自带服务端。桌面端复用同一套业务 UI，增加原生 `WebContentsView` 网页标签、首次启动服务地址配置和 Windows 便携包分发；Android/iOS/浏览器继续使用 Web 右侧工作台 |
 
 ### 4.3 设计语言与动效层
 
@@ -504,6 +505,86 @@ core-domain                         →  无依赖（领域模型、scope 常量
 | `guest` / `self` | 仅被显式授予的功能页，不触达组织数据 | `user_id = :userId AND feature IN (:granted)` |
 
 > 关键：`dept` 用**物化路径前缀**（`dept_path` 形如 `/c1/d10/d23/`）做范围判断，移动部门时批量更新子树 path，避免递归查询。
+
+### 5.4 本地项目空间（桌面版工作区）
+
+本地项目是“绑定到某台桌面电脑上的真实文件夹”的项目工作区，产品形态对齐豆包工作的项目：项目把对话、工作任务和产物按项目分组，一个项目对应桌面电脑上的一个文件夹。**项目只能在安装 EAB 桌面端的电脑上创建**；服务端可以部署在远端，只保存设备标识、显示路径和真实路径快照，所有文件读写都通过桌面文件桥转发到那台电脑执行。
+
+| 维度 | 云空间（cloud） | 本地项目（local） | 纯对话（none） |
+|---|---|---|---|
+| 根目录 | `{EAB_HOME}/.../users/{userId}/workspace/` | 桌面电脑上用户选择的真实目录 `root_realpath` | 无 |
+| 创建入口 | 网页/桌面均可 | 仅桌面端：侧栏「新建项目」或输入区项目入口 | 无 |
+| 文件工具 | `workspace.*` / `office.*` | `project.list/read/search/write/edit/delete`，经桌面桥执行 | 无 |
+| 命令工具 | 无 | 不开放 `project.exec`；构建/测试由用户在桌面终端手动执行 | 无 |
+| 会话字段 | `chat_sessions.space_kind='cloud'` | `space_kind='local'` + `space_id=user_local_spaces.id`；`project_mode=chat/task` | `space_kind='none'` |
+
+**项目创建与字段**
+- 创建弹窗字段：项目名称、工作目录（桌面原生选择文件夹）、云端资源（可选）、项目指令（可选）。工作目录只显示桌面电脑上的本地路径，不允许网页手填。
+- 对话与工作任务：项目侧栏直接挂会话，任务用图标区分，不再显示「对话 / 工作任务」分组标签；项目行可折叠/展开，并复用普通会话的重命名、删除菜单。项目主页已不再是入口，保留隐藏代码待清理。工作任务使用独立的 `project_mode='task'`，系统提示会要求先拆步骤、再执行并给出产物与验收结果；普通对话保持问答式交互。
+- 云端资源本期只保存选择清单，并在系统提示里作为“项目资料清单”注入；**尚未真正读取云空间文件内容**，不能对用户宣称已经读过。
+
+**数据与归属**
+- 管理接口：`GET/POST/PATCH/DELETE /api/local-projects`；文件列表 `GET /api/local-projects/:id/files?path=&depth=&limit=`，`path` 为空表示项目根。
+- 创建 `POST /api/local-projects` 必须带桌面标记 `x-eab-desktop:1`、`x-eab-desktop-device` 和 `deviceId`；服务端先确认设备在线，再通过桥让桌面端校验目录，桌面端返回真实路径后才入库。服务端不直接 `stat` 本机路径。
+- 登记表 `user_local_spaces` 保存 `device_id / instructions / cloud_refs_json`；唯一键按 `(company_id, user_id, COALESCE(device_id,''), root_realpath)`，同一路径在不同电脑上可以是不同项目；每个员工最多 20 个。
+- 删除项目只解除项目绑定，**不删除磁盘文件**；项目内的对话和工作任务会一并逻辑删除，桌面端同步移除本地 `projectId -> root` 绑定。
+- 项目归属只按当前员工校验，子 Agent 使用父会话已校验的 `ActiveSpace`，不重新跨员工查库。
+
+**桌面文件桥**
+- Electron 主进程持久化 `desktopDeviceId`，通过 `register / jobs / result` 长轮询连接服务端；在线窗口 45 秒，单次长轮询最多 20 秒，任务默认 30 秒超时。
+- 服务端与桌面端按 `companyId + userId + deviceId` 三元组隔离；任务只携带相对路径和操作参数，桌面端用自己的 `projectId -> root` 绑定表解析根目录，避免服务端或网页诱导客户端读任意文件。
+- 创建流程：桌面原生选目录 → `getDesktopInfo()` 取 deviceId → POST 带设备标记与字段 → 服务端经桥 `describeRoot` 校验 → 入库 → 桌面 `bindProject(projectId, path)` → 展开左侧项目分组，等待用户点“新建对话”。
+- preload 暴露 `getDesktopInfo / bindProject / unbindProject / syncProjects`；Web 端没有这些桥能力，因此不显示创建入口。
+
+**路径与内容安全**
+- 桌面端只接受绝对路径且必须是已存在、可写文件夹；拒绝盘符根、`C:\Windows`、`Program Files`、`ProgramData`、`C:\Users` 本身等危险根。
+- 相对路径统一走 `safeJoin(root, rel)`；绝对路径必须 `isWithinRoot(root, value)`；存在的目标再做 `realpath` 校验，防止符号链接逃逸；新文件逐级检查已存在父目录的真实路径。
+- 默认拒绝 `.env`、`.npmrc`、`.pypirc`、`.netrc`、`.git-credentials`、`id_rsa` 等私钥、`credentials.json`、`service-account*.json`、`.pem/.key/.p12/.pfx/.jks/.keystore`，以及 `.ssh` / `.aws` 目录。`project.search` 同样跳过这些文件，避免从搜索侧绕过读取闸。
+- `project.write` 单文件上限 5 MB，`project.edit` 一次最多 50 处；`project.delete` 只删除文件、不递归删除目录，风险等级 `irreversible` 并逐次审批；`project.list` 跳过 `node_modules`、`.git` 等重目录的递归展开，只返回目录条目。
+
+**部署边界**
+服务端与桌面端可以不在同一台电脑：只要桌面端在线，文件操作就能转发过去。桌面端离线时项目列表仍可见，但文件读写会提示“保持安装 EAB 桌面端的电脑开机并打开应用”。服务端只保存设备与会话记录，不保存项目文件内容，也不把绝对根路径交给模型。
+
+**命令执行开关**
+桌面设备绑定的项目本期不开放命令执行（`project.exec` 返回 403）；需要装依赖、构建、测试或运行脚本时，由用户在桌面终端里手动执行。服务端本机的旧项目兼容路径仍受 `EAB_PROJECT_EXEC` 控制，默认 off。
+
+### 5.5 桌面右侧浏览器桥（Agent 原生操作）
+
+EAB 原有两条互不相通的浏览器路径：Web 形态是服务端 Playwright 打开页面、右侧投帧；桌面端右侧是 Electron `WebContentsView` 原生标签页，`pageId` 以 `dp_` 开头，有真实登录态、多标签和 `window.open` 新标签。Agent 的 `browser` 工具默认在服务端执行，因此看不到用户已经打开的桌面标签。
+
+2026-11-26 第十三轮把桌面文件桥扩成**通用桌面任务桥**：同一套 `register / jobs / result` 长轮询除了文件任务，还承载 `kind='browser'` 任务，由桌面主进程直接操作右侧原生 `WebContentsView`，再把结果回传服务端。服务端不另开无头页面，也不把桌面页面复制到云端；Agent 看到的标题、URL、正文和元素就是用户右侧正在显示的那一页。
+
+| 层 | 职责 |
+|---|---|
+| 服务端 | `desktop-bridge.ts` 保存标签清单、按 `companyId + userId + deviceId` 解析在线设备、下发 `browser` 任务；`routes/tools.ts` 的 `browser` 分支在命中桌面设备时改走 `browserCall`，30 秒超时；`routes/chat.ts` 把标签清单注入系统提示 |
+| 桌面主进程 | `main.mjs` 维护 `WebContentsView`、标签持久化/恢复、归属校验，执行 `list/open/activate/snapshot/click/type/scroll/navigate/back/forward/reload/screenshot/close` |
+| 桌面 preload | 暴露 `listTabs(userId)`、`activateTab(pageId)`、`onActivate(callback)`，不向第三方页面泄露桥能力 |
+| 前端 | `chat.js` 登录后恢复真实标签和本地草稿，切换工作台时激活对应标签；聊天请求带桌面设备头，Agent 切页时前端标签栏跟随 |
+
+**任务与设备路由**
+- 浏览器任务不带 `projectId`，只带 `kind:'browser'` 和动作参数；文件任务保持原结构。两者共用任务表和 20 秒长轮询，避免再起一套控制端口。
+- 服务端优先按请求头 `x-eab-desktop-device` 找设备，其次找最近在线设备。没有桌面设备时，`list` / `activate` 明确返回 409，提示该能力只支持桌面端右侧浏览器，不退化成服务端 Playwright。
+- `open` / `navigate` 的 URL 仍过 `assertPublicHttpUrl`：只允许 http/https，默认只读公网；内网白名单沿用浏览器工具既有策略。`snapshot` 读取的是用户自己已经打开的页面，目前不再对页面 URL 做一次公网校验。
+- `screenshot` 的 base64 由服务端落为个人云空间文件 `浏览器截图-<时间戳>.png`，不把大图塞进模型上下文。
+
+**标签持久化与恢复**
+- 主进程把标签元数据写入 `desktop-config.json` 的 `browserTabs`：`{ ownerUserId, activePageId, tabs:[{pageId,title,url,favicon}] }`，并在注册成功、标签变化、窗口关闭前上报 `POST /api/desktop/bridge/tabs`。
+- 主页面 `did-start-navigation` 只**隐藏**原生视图，不销毁。这是聊天页刷新后右侧标签仍存活的关键；刷新完成后前端重新拿到同一批 `dp_*` 标签。
+- 应用重启或首次 `listTabs` 时，主进程按持久化 URL 逐个恢复标签，恢复时 `broadcast:false, activate:false`，避免启动过程触发前端事件。
+- 前端另有 `localStorage` 快照 `eab.chat.browserTabs.v1:<person.id>`，保存标签、`pageId`、标题、URL、favicon、未提交草稿、活动标签和工作台布局。恢复顺序是：先取主进程仍存活的真实标签，再补回空白草稿标签，最后激活原活动标签。
+- 标签归属当前登录员工。换账号时 `resetBrowserTabsForOwner` 销毁旧视图并清空配置，避免上一账号的标签、登录态或页面正文泄露给下一个账号；换服务器也会清空旧标签配置。
+
+**原生页面操作口径**
+- `snapshot` 返回 `title`、`url`、`body.innerText`（最多 8000 字）和最多 80 个可见可交互元素，元素生成 `e1/e2...` ref，字段与服务端 `BrowserElement` 对齐。
+- `click` 只允许链接和普通按钮，明确禁止提交表单；`type` 只允许 `input` / `textarea`，`input` 仅 `search/text/url`，单次最多 500 字；`scroll` 每次 600px；`screenshot` 用 `webContents.capturePage()`。
+- 输入框缺 `type` 属性时按 `text` 处理，兼容百度等用无类型 `textarea` 做搜索框的站点；`type` 只写入值，不自动回车提交。
+- Agent `activate` 会通过 `eab:browser-activate` 通知前端切换标签栏；Agent `open` 创建的新标签通过 `eab:browser-tab-open` 加入前端标签栏。
+
+**审批与安全边界**
+- `list/snapshot/screenshot/scroll/activate` 是读或定位动作，不弹审批；`open/navigate/click/type/back/forward/reload/close` 仍逐次审批，审批动作记为 `tool:browser`。
+- 原生页仍只允许 http/https，拒绝 `file:` / `javascript:` / `data:` 和带账号密码 URL；`window.open` 不再一律拒绝，而是转为受控新标签，所有新页同样走 URL 校验。
+- 已登录页面、内网页面的正文读取是否要额外确认，目前未定；当前策略是“用户已经打开并显示在右侧的页面，Agent 可读”，行为类动作仍逐次审批。
+- 仍需补的边界：子 Agent 是否继承 `desktopDeviceId`、关闭 `EAB_BROWSER_ENABLED` 时桌面路径是否单独放行、失效 URL 恢复成空白标签后的清理策略。
 
 ---
 
@@ -3685,7 +3766,7 @@ eab/
 │       ├── src/routes/*.ts                            # 28 个路由模块
 │       └── public/{index.html,app.js,app.css,chat.html,chat.js,chat.css,...}
 ├── plugins/catalog.json + plugins/eab-plugin-oncall/  # 本地插件源与演示插件
-├── scripts/{smoke-http,smoke-platform,eab,eab-update,eval-agent,eval-kb,...}.mjs
+├── scripts/{smoke-http,smoke-platform,eab,eab-update,eval-agent,eval-kb,perf,...}.mjs
 ├── docs/                                              # 审计、交付、专项方案
 └── .eab-dev/                                          # 本地演示库、日志、管理员凭据（已 gitignore）
 ```
@@ -3702,6 +3783,7 @@ eab/
 | `pnpm dev` | 同时起员工 `8787/chat` 与管理 `8788/admin`；默认不造演示数据，`EAB_DEV_AUTH=1` 才生成甲科技 `c1` |
 | `node scripts/smoke-http.mjs` | 对已启动服务跑 HTTP 冒烟（含负向 401/403） |
 | `node scripts/smoke-platform.mjs` | 平台链路冒烟（导出、临时授权、记忆、SSE、绑定、去重、运维端点） |
+| `pnpm perf` / `pnpm perf:enforce` | AGT-21 压测：隔离库 + mock 上游，200 读请求 / 50 对话 / 50 工具；`perf:enforce` 不达 SLO 时非零退出 |
 | `node scripts/eab.mjs update` | 命令行一键更新；`eab update <版本>` 可指定升级或降级 |
 | `node scripts/eval-agent.ts` / `eval-kb.ts` | Agent 与知识库评测入口 |
 
@@ -3917,11 +3999,13 @@ web-*   ← shared-types（**禁止** import server/runtime/storage）
 12. **多公司口径（12.10）**：**公司从人身上取，不从进程配置取**——`deps.companyId` 只是单公司部署的默认公司，参与查询与鉴权的必须是 `subject.companyId`。`dataScope='global'` 只表示"本公司内不受部门限制"，不许退化成 `1 = 1`；跨公司读业务数据如果确实需要，做成控制台里按公司逐家看的独立只读出口，而不是放开超管谓词。渠道租户 `(provider, tenant_id)` 全局唯一，一个租户只能属于一家公司。
 13. **工作台版面口径（12.7.6 / 12.7.7）**：顶栏只放会话级信息，**任何"我是谁"都不出现在右上角**；账号、可用模型、退出登录在左侧栏（员工侧没有控制台入口）；模型选择在输入框里，且左侧列表与输入区胶囊共用同一份选中状态。未登录或登录态失效 → 登录卡，且**不请求 `/api/me`**，避免"默认塞给用户一个身份"。附件正文与图片视觉输入随消息进模型，但附件不落盘、历史不回放旧图；只有附件没有文字的消息允许发送，两者不能同时为空。
 
-### 20.2.2 当前状态（2026-11-24，替代 20.2.1 作为现状）
+### 20.2.2 当前状态（2026-11-24，2026-11-25 增补 AGT-21）
 
-版本仍为 `2026.11.23.04`。这一轮在 AGT-20 之后继续落地 AGT-05，不改版本号。
+当前工作区版本为 `2026.11.24`，本轮 AGT-21 不改版本号。
 
-**回归基线（2026-11-24）**：`pnpm typecheck` 通过；全量 `pnpm test`（串行）为 **252 个测试文件 / 1584 个用例全部通过**。并行 `vitest run` 下 A2A 用例偶发 5 秒超时，单跑通过，串行脚本作为权威口径。AGT-20 的文档漂移修正仍有效；AGT-05 相关新增/扩充覆盖审批门禁、钉钉卡片投递、命令沙箱与 `project.exec` 门禁，全量基线同时纳入已有的 `prompt-compiler` 13 个用例。
+**回归基线（2026-11-25）**：`pnpm typecheck` 通过；全量 `pnpm test`（串行）为 **252 个测试文件 / 1577 个用例全部通过**，耗时 401.3s。并行 `vitest run` 下 A2A 用例偶发 5 秒超时，单跑通过，串行脚本作为权威口径。AGT-20 的文档漂移修正仍有效；AGT-05 相关新增/扩充覆盖审批门禁、钉钉卡片投递、命令沙箱与 `project.exec` 门禁，全量基线同时纳入已有的 `prompt-compiler` 14 个用例。
+
+**压测基线（2026-11-25）**：新增 `scripts/perf.mjs`，用隔离种子库和本地 mock 模型上游，单实例完成 200 只读请求（20 并发）、50 并发对话、50 并发工具调用。读接口错误率 0%，P95 30.6ms；对话 50/50 成功，首字 P95 6.20s，整轮 P95 6.58s，队列峰值 46，SQLITE_BUSY 0；工具 50/50 成功，P95 284.7ms；RSS 峰值 160.0MB。`pnpm perf:enforce` 退出码 0。`/metrics` 的 `eab_tool_queued` 仍读旧 `toolSemaphore`，与实际工具执行路径不一致，本轮不用于 SLO。详见 `docs/EAB-AGT-21-压测与SLO基线-2026-11-25.md`。
 
 **审计项落地状态**
 
@@ -3947,7 +4031,7 @@ web-*   ← shared-types（**禁止** import server/runtime/storage）
 | AGT-18 模型任务白名单 | 已下线 | 2026-11-24 按产品决策移除；网页/钉钉/飞书不再按“数据类实测”限制选模，控制台接口与按钮同步删除；迁移 `0099_model_task_verifications.sql` 仅保留历史表 |
 | AGT-19 多模态内容工具 | 部分落地 | 图片生成 v1 已落地（`/api/content/images`、`content.generate_image`）；视频生成未做 |
 | AGT-20 文档漂移清理 | 本轮落地 | 本文件、审计表、整改清单同步校正 |
-| AGT-21 全量压测 + SLO | 未开始 | 当前只有功能回归，没有并发/延迟/失败率基线 |
+| AGT-21 全量压测 + SLO | 部分落地（基线 v1） | `scripts/perf.mjs`、`pnpm perf`、`pnpm perf:enforce`；隔离 `.eab-dev/perf`；覆盖读接口 / 知识库读 / 50 并发对话 / 50 并发工具；见 `EAB-AGT-21-压测与SLO基线-2026-11-25.md` |
 
 **仍未实现（不要按“已完成”对外说明）**
 
@@ -3956,7 +4040,7 @@ web-*   ← shared-types（**禁止** import server/runtime/storage）
 - 企微真实回调 AES 解密、真实厂商租户端到端。
 - AGT-05b：strict 沙箱代码与白名单已落地；剩余是在装有 Docker Desktop 或 bwrap 的机器上做真实容器执行、断网和越界写入验收。
 - AGT-04：提示编译器已落地，剩余“字符数下降 ≥20%”需对 `ask_user`、团队与计划长段做独立内容压缩，不在编译器里截断。
-- AGT-21 并发压测与 SLO 基线。
+- AGT-21 只完成基线 v1：真实厂商延迟、10 万 chunk 向量检索、子 Agent 并发、双实例与阶梯加压尚未覆盖。
 - 生产监控、灾难恢复演练、真实员工大样本验收。
 
 ### 20.3 M1 / M2 / V1 关键任务（粗粒度）
@@ -4047,7 +4131,7 @@ web-*   ← shared-types（**禁止** import server/runtime/storage）
 
 ### 22.4 版本号（已定）
 
-**已定：采用日期版本号**，当前为 **v2026.11.23.04**，与根 `package.json` 的 `version` 字段一致。AGT-20 文档清理不改版本号。
+**已定：采用日期版本号**，当前工作区为 **v2026.11.24**，与根 `package.json` 的 `version` 字段一致。AGT-20 文档清理与 AGT-21 压测基线均不改版本号。
 
 规则：
 
@@ -4075,6 +4159,579 @@ web-*   ← shared-types（**禁止** import server/runtime/storage）
 
 ---
 
+## 23. 内置浏览器工作台（2026-11-25 第一阶段已落地）
+
+### 23.1 目标与边界
+
+右侧“网页”页签用于预览和操作真实网站，Agent 的浏览器动作直接反映在同一页面上，不额外记录操作步骤。首个真实业务目标是标标达等招投标平台：打开登录页、人工接管输入手机号/验证码、登录后按企业需求检索项目并读取招标要求。
+
+不使用 iframe 直接嵌入目标站点：多数站点通过 `X-Frame-Options` / CSP 禁止被嵌入，且跨域后无法读取页面内容。默认形态为 Web 右侧工作台：服务端 Playwright 浏览器 + CDP screencast 实时 JPEG 帧（断流回退 HTTP 截图），标签条/工具栏/内容区全部在 8787 页面内完成，不依赖 Electron。`packages/desktop` 的 Electron `WebContentsView` 是可选 Windows 客户端，2026-11-26 起正式推进，但不替代 Web 默认入口；两条路径复用同一套 `pageId`、浏览器动作和安全策略。当前 Web 形态规则见 23.3.6，桌面分发见 23.3.7。
+
+### 23.2 会话与接口
+
+- 会话仍按 `${companyId}:${userId}` 隔离，每用户独立 `BrowserContext`，不同用户不共享 Cookie。
+- 页面以 `pageId` 标识；Agent 的 `browser` 工具与右侧工作台操作同一页面，工具结果里的 `pageId` 就是前端关联键。
+- 工作台接口：
+  - `POST /api/browser/workspace/open`：同步打开 http/https 页面，返回标题、URL、正文摘录和可操作元素；供 Agent/诊断链路使用。
+  - `POST /api/browser/workspace/open-fast`：工作台专用快速打开，先返回 `pageId` 和 URL，导航在后台继续，前端可在数百毫秒内开始接收加载画面。
+  - `POST /api/browser/workspace/warm`：只预热 Edge 进程和当前用户的 BrowserContext，不创建页面；新建网页标签时调用，降低首次打开的冷启动等待。
+  - `GET /api/browser/workspace/:pageId`：读取当前页状态与元素。
+  - `GET /api/browser/workspace/:pageId/stream`：`text/event-stream` 实时画面流，服务端用 CDP `Page.startScreencast` 在页面变化时推送 JPEG 帧；只在客户端断开后停止，切换标签自动重连。
+  - `GET /api/browser/workspace/:pageId/frame`：返回 `image/jpeg` 静态视口帧，带 `x-eab-tile-width/height` 和站点图标；作为实时流不可用时的兜底，不写个人云空间。
+  - `POST /api/browser/workspace/:pageId/input`：人工接管，支持坐标点击、向当前焦点输入文字、白名单按键和有限幅度滚轮。
+  - `POST /api/browser/workspace/:pageId/nav`：同步浏览器导航，`action` 为 `back` / `forward` / `reload` / `navigate`；`navigate` 额外带 `url`，复用与地址栏一致的安全校验和等待策略，超时或跳转失败返回 `EAB_UPSTREAM`。
+  - `POST /api/browser/workspace/:pageId/nav-fast`：工作台专用快速导航，先返回当前 `pageId` 和目标 URL，后退/前进/刷新/跳转在后台执行，加载过程由实时流上屏。
+  - `POST /api/browser/workspace/:pageId/close`：关闭页面。
+- 鉴权复用 `CHAT_USE`，操作写 `browser.workspace.*` 审计；输入内容不写审计，避免密码/验证码落库。
+
+### 23.3 前端行为
+
+- 右侧工作台是一个统一的标签页容器，不再是“团队 / 网页 / 文件 / 审批”四个固定按钮：Agent 团队、审批、文件预览和多个网页标签可以同时存在，按需切换。
+- 每个网页标签对应一个 `pageId`。实时画面、页面状态、坐标点击和接管输入都属于当前标签；切换标签只换画面，不关闭后端页面。
+- Agent 的 `browser` 工具结果到达时，前端按 `trace.view.pageId` 复用或新建网页标签，自动切到该标签并订阅实时流；不在页面里记录 Agent 或用户的动作步骤。
+- 点击画面按图片显示尺寸换算到浏览器视口坐标（当前视口 1280×800）；密码和验证码由用户在工作台输入，不进入模型上下文。
+- 画面可暂停，暂停只停止取帧，不关闭页面；页面关闭或超时后状态接口返回 404，前端移除对应标签，并把焦点交给相邻标签。
+- 网页标签拿到更宽的分栏（默认 44%，1440 宽下约 632px）；从网页切回团队或审批时回到团队栏宽度，避免审批表单被网页比例压窄。
+- 已打开网页的顶部不再是工作台标题，而是浏览器式工具栏：后退、前进、刷新、居中地址栏、连接状态和暂停按钮。地址栏收起时只显示域名（如 `cn.bing.com`），点击后展开完整 URL 并全选，回车跳转或搜索，失焦/`Esc` 恢复域名显示。标签标题、完整 URL 和连接状态各自独立，不再挤在一条地址行里。
+
+### 23.3.1 加号与标签页规则（2026-11-25 第二轮，部分已被 23.3.5 取代）
+
+> 注：加号浮动菜单已在第六轮移除；本节保留第二轮设计过程，当前规则以 23.3.5 为准。
+
+- 顶栏右侧只保留一个圆形 `+`（无文字标签），作为工作台统一入口；工作台未打开或已打开都能点它新建标签页。原“审批”按钮已移除，审批统一从加号菜单进入。工作台打开后，标签栏右侧也有一个 `+`，两者打开同一个“新建标签页”菜单。顶栏左侧的“对话 / 工作台”是个人插件工作区切换，和右侧标签工作台不是同一个东西。
+- 新建菜单提供三类入口：新建网页（先建空标签，输入网址或搜索词后打开）、Agent 团队（没有子 Agent 时也能先打开空团队视图）、审批（打开权限申请 / 我的申请 / 待我审批）。
+- 网页标签支持多开、切换和逐个关闭；每次点 `+` 都新建一个独立空白标签，不再复用已有草稿，和浏览器新标签页一致。同一个网址可以重复打开，每个页面有独立 `pageId`、实时帧和 Cookie 页面状态。空网页标签带一个圆点，关闭时直接移除，不请求后端。实际页面标签关闭时调用 `POST /close`，只关闭这一页。
+- Agent 团队标签在没有子 Agent 且由用户手动打开时显示空态，可关闭；有子 Agent 运行时不可关闭，避免把正在执行的工作过程藏掉。
+- 标签栏放不下时横向滚动，鼠标滚轮可横向滚标签；标签条按浏览器样式排布：激活标签为白底、上方两角圆角、左侧圆形图标 + 标题 + 右侧 `×`，未激活标签透明贴在条上；`+` 紧跟最后一个标签，不随标签滚动，“并排”靠最右。原“收起”按钮已移除，关闭最后一个可关闭标签后面板自动收起；有子 Agent 运行时团队标签仍不可关。
+- 新建的网页空标签页给出一组描边胶囊动作：第一项是真正的“搜索或输入网址”输入框（占位“搜索或输入网址，回车打开”），输入后按回车直接打开；其后是打开 Agent 团队、打开审批、打开云空间（在右侧工作台新增“云空间”标签，独立读取 `/api/workspace/files` 并列出全部云端文件和文件夹，可进入子目录、打开文件预览、刷新重读；不自动打开最近一个文件，也不受当前会话绑定本地项目影响）。输入内容按地址栏规则判断：`http://` / `https://`、域名、IPv4、IPv6、`localhost` 视为网址；带空格、中文或不像域名的裸词视为搜索词，交给必应搜索页（`https://www.bing.com/search?q=`，国内会落到 `cn.bing.com`）显示结果。顶部原来单独一行的地址栏表单已删除，工作台不再保留 `web-url-input` / `web-open`；每个空标签各自保留已输入但未提交的内容，切换到别的空标签再切回来不会丢。这一页只是入口，不拦截已打开网页的画面点击；页面打开后由顶部浏览器工具栏的地址栏接管导航。网页画面仍是服务端浏览器投屏，鼠标点击/滚轮/输入按 1280×800 归一化转发；Agent 动作直接反映在画面上，不生成操作步骤列表。
+- 标签顺序为：Agent 团队 → 审批 → 文件预览 → 网页标签（按打开顺序）。新网页标签追加在末尾，当前标签自动滚入可见区域。
+- 后端页面配额随多标签上调并支持环境变量：`EAB_BROWSER_MAX_PAGES` 默认 12（全局），`EAB_BROWSER_MAX_PAGES_PER_OWNER` 默认 8（单用户），超过时返回 429 并提示先关闭不用的页面。
+- 内置浏览器内网访问默认关闭；控制台「数据连接 → 内网访问」可显式开启。白名单每行一个域名或 IP，填 `*` 表示放行全部企业局域网（RFC1918、CGNAT、IPv6 ULA）；只开放 80 / 443 标准网页端口。`localhost`、环回、链路本地（含 `169.254.169.254` 云元数据）、组播和保留地址即使填 `*` 也继续拒绝；公共网站不受影响，`web.fetch` 不跟随这份浏览器白名单。
+
+### 23.3.2 浏览器式工具栏（2026-11-25 第三轮）
+
+- 网页打开后，标签条下方是约 42px 的浏览器工具栏：左侧后退 / 前进 / 刷新三枚线性图标，中间是居中的地址胶囊，右侧是连接状态和暂停按钮。工具栏只占一行，不再保留原来的 `WEB WORKSPACE` 标题头、页面标题行和底部地址行。
+- 地址栏默认只显示 `host`（例如 `cn.bing.com`），完整 URL 放在 `title` 属性里，避免长查询串撑破分栏；点击地址栏后展开完整 URL，延时 60ms 全选，方便直接覆盖输入。`Enter` 调用导航，`Esc` 或失焦恢复域名显示。
+- 地址栏同时是导航入口：输入网址按网址打开，输入裸词按搜索处理，复用新标签页的同一套地址判定规则；导航期间状态显示“正在跳转…”或“正在搜索…”，重复回车不会再发第二次请求。
+- 后退、前进、刷新由后端 `back` / `forward` / `reload` 执行，完成前按钮和画面互斥，完成后标签标题、地址栏、连接状态和实时帧一起刷新；不在前端记录操作步骤。
+- 暂停按钮是图标切换，暂停时显示播放图标、`aria-label` 改为“继续画面”，恢复后切回双竖线；暂停只停取帧，不关闭页面。空草稿标签和无页面标签隐藏整个工具栏，仍使用新标签页里的搜索胶囊。
+- 对应后端接口 `POST /api/browser/workspace/:pageId/nav`，审计事件为 `browser.workspace.<action>`；`navigate` 记录目标 URL，`back` / `forward` / `reload` 只记录动作。
+
+### 23.3.3 加载速度优化（2026-11-25 第四轮）
+
+- 导航不再等 `networkidle`。`open` / `reload` / `navigate` / 前进后退统一只等 `domcontentloaded`，再给正文最多 1 秒的短探测（首个 30 字出现即放行），避免广告和长轮询把页面卡在固定 5 秒等待上。
+- 新建网页标签时就调用 `POST /api/browser/workspace/warm`，提前启动 Edge 和当前用户的 BrowserContext；用户输入期间冷启动被后台吃掉，打开请求与预热共享同一个 Context Promise，不会重复启动浏览器。
+- 搜索入口在 2026-11-26 按用户要求从 `https://www.so.com/s` 改为豆包桌面版一致的必应 `https://www.bing.com/search`，国内实际落到 `cn.bing.com`。网址判定规则不变，`github`、`EAB 企业智能体基座` 这类裸词仍走搜索；真机实测搜索 `EAB 企业智能体基座` 后地址栏为 `https://cn.bing.com/search?q=EAB%20%E4%BC%81%E4%B8%9A%E6%99%BA%E8%83%BD%E4%BD%93%E5%9F%BA%E5%BA%A7`，标签标题为 `EAB 企业智能体基座 - 搜索`。
+- 原 360 搜索的加载速度记录保留在下面作为历史数据，不再代表当前默认入口。
+- 实时帧从 1 fps 提到 600ms 一帧，标签页可见时约 1.7 fps。取帧从“预加载 Image 再赋给页面 img”改为 `fetch → Blob → objectURL`，每帧只下载一次；切页时中止旧请求，避免上一页的慢帧覆盖新页。
+- 实测（本机 Edge、单用户）：标标达首页从 5.2 秒降到 1.4 秒；360 搜索从 3.7 秒降到约 1.7 秒（浏览器已预热），`reload` 约 0.6–1.1 秒，取帧 30–60ms。首次冷启动仍需约 0.7 秒预热加 2 秒左右首屏，后续搜索主要受目标站点网络影响。
+- 这条链路仍是“服务端浏览器 + JPEG 帧投屏”，不等于豆包桌面版的原生窗口渲染；能优化的是导航等待、冷启动和取帧频率，不能把第三方站点本身的重资源加载变成零成本。原生化方案见 23.3.4。
+
+### 23.3.4 豆包桌面版浏览器拆解与 EAB 原生化设计（2026-11-25 第五轮）
+
+#### 看到的事实
+
+- 本机豆包桌面版是 Electron / Chromium 147 多进程应用：主进程、renderer、GPU、network service、storage、audio、utility 分开运行；`Doubao.exe` 带 `--type=renderer`、`--type=gpu-process` 等标准 Chromium 参数。
+- `Application/app/local_webcontents/extensions/ai-views/manifest.json` 是一个 Manifest V3 浏览器扩展，权限包括 `tabs`、`cookies`、`webRequest`、`sidePanel`、`scripting`、`declarativeNetRequest`、`webNavigation`、`bookmarks`，content script 注入 `<all_urls>`。
+- 同一扩展下有 `side_panel.html` 和 `side_panel.js`，AI 对话界面运行在侧栏 WebContents 里；`route.json` 把 `/side_panel` 作为独立入口。
+- 应用目录里还有 `Doubao_browser_proxy.exe`、`agent_infra.dll`、`mcp_helper.dll`、`rpa-component-extension`，说明浏览器进程、Agent 基础设施和 RPA 控制是分开的，不靠截屏识别页面。
+- 豆包桌面版内置浏览器默认搜索引擎是必应（Bing），不是 360；EAB 的裸词搜索入口已按这个默认改成 `https://www.bing.com/search`。
+- 结论：豆包的网页是**原生 Chromium 标签页**，页面内容由 Chromium 合成器直接上屏；扩展负责 `tabs` / `navigation` / DOM 注入，侧栏负责 AI 界面。它没有“服务端浏览器截图 → 前端轮询 JPEG”这一层。
+
+#### EAB 现在慢在架构，不是慢在某个函数
+
+- 服务端 Playwright 打开并持有页面，前端每 600ms 取一张 JPEG；滚动、输入、切页都要走“前端 → HTTP → Playwright → 浏览器 → JPEG → 前端”的往返。
+- 站点加载仍在服务端浏览器进程里完成，第三方页面的 DNS、TLS、首屏资源一样要等；之前去掉 `networkidle`、预热 Context、提高取帧频率，只能把等待和投屏开销压低，不能变成原生渲染。
+- 原生标签页没有 JPEG 编解码、没有固定轮询、没有鼠标坐标换算，滚动和视频由 Chromium 自己合成，所以体感差距不是再调几个参数能抹平的。
+
+#### 目标架构：EAB Desktop Host + 原生网页标签
+
+```text
+┌──────────────────────── EAB Desktop Host（Electron） ───────────────────────┐
+│  EAB Web UI（现有 chat.html / chat.js，复用对话、标签、审批、文件）           │
+│    │ preload 白名单 IPC：open / nav / back / forward / reload / close / bounds │
+│    ▼                                                                        │
+│  Browser Tabs（每个网页标签一个 WebContentsView，独立 session partition）     │
+│    ├─ 标签 1：WebContentsView → Chromium 原生渲染，无截图                     │
+│    ├─ 标签 2：WebContentsView                                                │
+│    └─ 地址栏 / 标签条仍是 EAB UI，位置由 #web-frame-shell 的 CSS 像素决定      │
+│                                                                             │
+│  Agent Control Bridge（本地回环 + 一次性 token）                              │
+│    ▲                                                                        │
+└────┼────────────────────────────────────────────────────────────────────────┘
+     │ 同一套 BrowserAction：open / snapshot / click / type / scroll / nav
+┌────┴─────────────────────────┐        ┌────────────────────────────────────┐
+│ EAB Server                   │        │ Web-only 形态（保留）               │
+│ browser 工具 / pageId / 审计  │        │ 服务端 Playwright + JPEG 帧投屏     │
+└──────────────────────────────┘        └────────────────────────────────────┘
+```
+
+- 桌面宿主只做“壳 + 原生视口 + 控制桥”，不改业务 UI；EAB 仍是 Web 应用，服务端仍是唯一业务与权限入口。
+- 主窗口和每个网页标签共用同一个 `session.fromPartition('persist:eab-web-<owner>')` 持久会话。这样员工在 EAB 登录一次后，右侧原生网页标签也共享 EAB 的登录态；第三方站点仍受同源策略约束，只能带自己的 Cookie，读不到 EAB 的 `eab_session`。2026-11-26 真机验收发现“主窗口 defaultSession、原生页独立分区”会导致登录后标签仍显示登录页，已统一为同一分区。
+- 标签条、地址栏、连接状态继续由 `chat.js` 渲染；网页内容区域由原生 View 覆盖在 `#web-frame-shell` 的矩形上。切标签、收起工作台、拖动分栏、窗口缩放时，前端把新的 CSS 像素矩形经 IPC 传给主进程，主进程再夹取到窗口内容区。
+- 桌面模式下不再请求 `/api/browser/workspace/:pageId/frame`，也不启动 600ms 取帧定时器；`<img id="web-frame">` 只作为 Web 形态的占位，不再承担桌面渲染。
+- Agent 动作仍以 `pageId` 为关联键。桌面宿主在线时，服务端把 `BrowserAction` 转给本机控制桥；宿主不在线或用户使用局域网 Web 端时，回退到现有 Playwright 会话。两条路径返回同一份 `BrowserResult`，前端不需要区分。
+
+#### 接口契约
+
+- 渲染进程只暴露一个 `window.eabDesktop`：`open(url)`、`navigate(pageId, action, url?)`（action 为 `navigate` / `back` / `forward` / `reload`）、`setBounds(pageId, rect)`、`close(pageId)`、`show(pageId)`、`hideAll()`、`onState(cb)`、`onClosed(cb)`；事件为 `eab:browser-state`（`pageId`、`url`、`title`、`favicon`、`loading`、`canGoBack`、`canGoForward`、`error`）与 `eab:browser-closed`（`pageId`）。`diagnostics()` 只在开发态返回窗口内容区、每个原生页的 bounds/可见性/favicon，供自动化验收，打包版直接拒绝。
+- 原生页 `pageId` 使用 `dp_` 前缀；每个页一个 `WebContentsView`，Session 分区为 `persist:eab-web-<owner>`。`setBounds` 的输入是窗口内容区 CSS 像素，主进程按当前 `contentView` 尺寸夹取，宽度小于 24 时隐藏。
+- 主进程只接受 `http` / `https`（端口不限，便于企业内网），拒绝 `file:`、`javascript:`、`data:` 和内嵌账号密码 URL；`setWindowOpenHandler` 一律 `deny`，弹窗不进入 EAB 标签，和 Web 形态的“弹窗自动关闭”保持一致；页面内跳转也走同一套校验。
+- 控制桥只绑定 `127.0.0.1`，端口随机、启动时生成一次性 token；服务端注册后按 `ownerKey` 绑定，不能跨用户复用。控制桥只接受上面那组 `BrowserAction`，不提供任意命令执行、文件读写或 shell。
+- 桌面桥不可用时，`chat.js` 自动退回现有 Web 形态，不改变当前已经通过的 Playwright、JPEG、人工接管和凭据填充逻辑。
+
+#### 分阶段落地
+
+1. **D1：桌面壳与手动原生浏览（2026-11-25 已落地）**。新增 `packages/desktop`，Electron 主进程加载现有 EAB Chat，提供 `window.eabDesktop`；网页标签改为原生 `WebContentsView`；标签条、地址栏、前进后退刷新、关闭标签已跑通；桌面模式停止取帧。此阶段 Agent 仍走服务端浏览器，但桌面手动浏览已经不再投屏。
+2. **D2：Agent 原生控制（2026-11-26 第十三轮已落地）**。没有另起 localhost 控制桥，而是把桌面文件桥扩成通用任务桥：`kind='browser'` 任务经 `register / jobs / result` 下发到 Electron 主进程，对右侧 `WebContentsView` 执行 `list/open/activate/snapshot/click/type/scroll/navigate/back/forward/reload/screenshot/close`。服务端在 `browser` 工具里按桌面设备头路由；桌面离线或没有设备时，`list/activate` 返回 409，不偷偷回退到另一个页面。详见 §5.5 与 23.3.7.5。
+3. **D3：桌面交付（2026-11-26 第一版已落地）**。桌面壳不随包启动本地服务，首次启动填写已有 EAB 地址；Windows 便携包由 `pnpm desktop:build` 生成，服务端提供 `/download/desktop` 下载页；自动更新、代码签名、正式安装包和崩溃恢复待补。
+
+#### D1 实现与验收（2026-11-25）
+
+- 新增 `packages/desktop`：`main.mjs` 管窗口、`WebContentsView`、IPC、URL 校验和生命周期；`preload.cjs` 暴露 `window.eabDesktop`；`README.md` 记录启动方式和 D1 边界。根 `package.json` 增加 `desktop` 脚本；Electron 二进制由 `packages/desktop` 的 `postinstall` 调用官方安装脚本下载，不再依赖 workspace 构建白名单。
+- 安全与生命周期：只接受 http/https，拒绝 file/javascript/data 和内嵌账号密码 URL；页面内 `will-navigate` 与地址栏共用同一套校验；窗口关闭统一清理；bounds 夹取到内容区，小于 24 像素隐藏。D1 当时 `window.open` 一律拒绝、主页面 reload 时销毁全部原生页；这两条已在 2026-11-26 第十三轮调整：`window.open` 转为受控新标签，主页面 `did-start-navigation` 只隐藏原生页、不销毁，保证刷新聊天页后右侧标签仍存活。
+- 前端 `chat.js` 检测到 `window.eabDesktop.isDesktop` 后切原生分支：打开、地址栏导航、后退、前进、刷新、关闭全部走 IPC；原生页不再请求 `/api/browser/workspace/:pageId/frame`，也不启动 600ms 取帧定时器；前进/后退按钮按 `canGoBack` / `canGoForward` 禁用；主页面 reload 时标签栏从主进程 `listTabs` 与 `localStorage` 快照恢复，原生页本体不再随 reload 销毁。
+- 真机验收（本机 1920×1080、125% 缩放、Electron 45.4.1 / Chromium 156.0.8078.100）：两次实测，首次打开 360 搜索 1.5–2.4s 到标题并停止加载（含 UI 约 2.0–3.0s）；地址栏跳到 `example.com` 0.23–1.33s；后退 1.6s、前进 0.22–0.24s、刷新 0.65–1.49s。原生视口 bounds 为 `807,167,588,552`，与 `#web-frame-shell` 的 CSS 矩形逐像素一致；两个原生页切换时只有当前页 `visible=true`；切到 Agent 团队后全部隐藏；关闭标签收到 `eab:browser-closed` 且 View 从诊断列表移除；整轮验收 `/frame` 请求数为 0。
+- 验收产物：`.eab-dev/desktop-shell-native-page.png`（原生 `WebContentsView` 实际渲染的 `example.org` 页面）、`.eab-dev/desktop-shell-09-final.png`（EAB 外壳与标签状态）。
+- 未完成：D2 控制桥、桌面页与 Agent 页 `pageId` 统一、安装包/签名/自动更新；`EAB_DESKTOP_COOKIE` 仅开发态使用，正式登录流程待定。
+
+
+#### 验收口径
+
+- 桌面模式下打开网页，浏览器面板不再出现周期性 `/frame` 请求，滚动和视频由原生视口直接渲染；同一页面在桌面壳里的首屏时间应明显低于 Web 形态的“导航 + 首帧”时间。
+- 切标签、收起工作台、拖动分栏、窗口最大化后，原生视口与 `#web-frame-shell` 的矩形保持一致，不遮住标签条和地址栏。
+- 关闭标签后 `WebContentsView` 被销毁；关掉最后一个网页标签，工作台按现有规则收起。
+- 桌面桥断开时，前端退回 Web 形态并给出状态提示；Web 形态现有验收（工具栏、地址栏、搜索、前进后退刷新、人工接管）不能回归。
+- 安全验收：原生视口不能加载 `file:` / `javascript:` / `data:`；`window.open` 转为受控新标签且新页同样只允许 http/https；桌面桥必须带 `x-eab-desktop:1` 与设备 id，跨公司/跨员工/跨设备取标签清单返回空或不匹配；第三方页面读不到 `eab_session`，也读不到 `window.eabDesktop`。
+
+### 23.3.5 浏览器 UI 对齐豆包桌面版（2026-11-25 第六轮）
+
+- 加号规则：顶栏 `+`、标签条 `+` 都直接新建一个“新标签页”，立即出现在标签条并展开工作台；不再弹出“网页 / Agent 团队 / 审批”的浮动选择卡。Agent 团队、审批、云空间文件改从新标签页的胶囊入口进入，和豆包“加号只开新标签”的心智一致。
+- 标签条：高 50px，页签高 42px；激活页签白底、顶部 12px 圆角、细边框，未激活透明；页签内容为站点 favicon（取不到时回退灰色通用图标）+ 标题 + 关闭 `×`，`×` 默认透明，激活或悬停才显示；`+` 为 36px 圆形按钮，紧跟最后一个页签。
+- 工具栏：白底 44px；左侧后退 / 前进 / 刷新为 30px 圆形悬停按钮，中间地址栏默认无边框、文字居中，聚焦才显示浅边框；右侧保留站点登录钥匙、键盘输入、暂停；原“已连接”胶囊默认隐藏，只有错误时显示红色状态。
+- 网页内容区：去掉外框、圆角、阴影和 8px 边距，`#web-frame-shell` 从工具栏下缘直接铺满右侧面板；原生 `WebContentsView` bounds 随 shell 逐像素同步。
+- 动作时间线已于 2026-11-26 第八轮移除，不再记录 Agent 或用户的操作步骤；工具栏不再有时钟按钮，底部只保留本站登录信息和键盘输入。
+- 新标签页：最大宽度 520px、单项高 50px、纵向间距 10px，白底细边框胶囊；首项是搜索/网址输入框，其后是 Agent 团队、审批、云空间文件。
+- 站点图标：桌面主进程监听 `page-favicon-updated`，只接受 http/https 或 `data:image/`，随 `eab:browser-state` 下发；导航到新页面先清空旧 favicon，避免串站。
+- 边界：Web 形态是默认形态，仍使用服务端浏览器投帧，但没有常驻“人工接管”条；键盘输入只在右侧工具栏键盘按钮打开时出现。桌面原生形态没有“已连接”胶囊，也不记录操作步骤，交互以原生网页为主。Agent 团队 / 审批 / 文件仍是 EAB 特有入口，收在新标签页胶囊，不与豆包完全等同。
+- 验收：原生壳点顶栏 `+` 直接得到“新标签页”，`#workbench-add-menu` 为 0；连续打开 360 搜索 / example.com 两个页面，标签条显示站点图标与标题；切到 example.com 后旧 favicon 清空并回退通用图标；Web 形态回归 `bridge=false`，加号直接新建、搜索页状态“已连接”、`pageerror` 为 0。原“动作时间线默认 hidden、点时钟后 shell 缩到 621”的验收项随 2026-11-26 功能移除作废。
+
+### 23.3.6 Web-only 右侧工作台收口（2026-11-25 第七轮，当前口径）
+
+- 方向演进：2026-11-25 第七轮曾按“在 8787 页面里做右侧工作台、不另做桌面程序”收口，Web 形态因此成为默认零安装入口并保留至今；2026-11-26 用户明确要求启动桌面版开发，桌面客户端重新转为正式交付，但仍只作为 Web 的可选超集访问端，不改 Web 默认路径、不做第二套业务 UI。`packages/desktop` 现在负责原生网页标签和 Windows 分发，Web 右侧 Playwright 投帧继续服务浏览器、移动端和无客户端岗位。
+- 页面内结构：右侧自上而下只有标签条（50px）、工具栏（44px）、网页内容区（无外框/圆角/阴影/边距）。标签条页签高 42px，激活白底、12px 顶部圆角、细边框；`+` 直接新建“新标签页”，不再弹“网页 / Agent 团队 / 审批”选择卡。
+- EAB 次级入口：Agent 团队、审批、云空间不删除，收进新标签页的三枚胶囊；主浏览器画面不再出现 `TASK PLAN`、`AGENT TEAM`、`并排` 等常驻结构。用户要进入这些入口时，仍然是从标签页内点胶囊，而不是挤在工具栏。
+- 底部收口：`#web-pane-foot` 默认整体隐藏。只有站点登录信息、键盘输入两者之一展开时才显示；`#web-takeover` 不再常驻，文案由“人工接管”改为“键盘输入”，由工具栏键盘按钮 `#web-control-toggle` 控制。键盘按钮只在 Web 分支出现，原生分支隐藏；无页面、草稿标签、原生页都收起键盘面板。
+- 交互：键盘按钮点击后展开键盘输入面板并聚焦输入框；再次点击收起；切换标签、新建草稿、关闭最后标签都会把 `browserControlOpen` 重置为 `false`，不会把上一个页面的键盘状态带到新页面。工具栏 `aria-expanded` 与激活态同步。
+- 不记录操作步骤：2026-11-26 按用户要求删除浏览器动作时间线。前端不再维护 `browserTimelines` / `browserTimelineOpen`，不渲染“动作时间线”抽屉和计数徽标，也不再调用 `pushBrowserAction`；`#web-timeline-toggle`、`#web-timeline`、`#web-timeline-count`、`#web-timeline-badge` 均从 DOM 移除，服务端没有新增持久化。Agent 和用户的操作只反映在实时画面上，不生成可回放的操作步骤。
+- Web 站点图标：`captureBrowserPageFrame()` 从页面 `link[rel~=icon]` / `apple-touch-icon` 读取绝对 `href`，只接受 `http:`、`https:` 或 `data:image/`；`GET /api/browser/workspace/:pageId/frame` 通过 `x-eab-favicon`（URL 编码）下发，`chat.js` 用 `safeTabFavicon()` 校验后写入标签；取不到时回退灰色通用地球图标，不把任意协议塞给 `<img>`。
+- 内容区自适应铺满：`chat.js` 取帧时把 `#web-frame-shell` 的 `clientWidth/clientHeight` 作为 `w/h` 查询参数；服务端按该宽高比重设 Playwright 视口（默认宽 1280、高不超过 2000，必要时等比缩宽），前端 `.web-frame` 改为 `width:100%; height:100%; object-fit:contain`。这样网页按面板比例重排后铺满内容区，不裁切、不拉伸；分屏或底部面板展开改变高度后，下一帧自动跟随。真机实测 shell `758×776`、帧 `1280×1310`、图片渲染 `758×776`，上下不再留白。
+- 鼠标交互：`#web-frame` 不再使用 `crosshair`（用户看到的是十字/加号），改为普通箭头；单击画面直接按坐标发送给 Playwright，不需要先点什么按钮进入“可点击”状态。点击入口由 `#web-frame` 的内联 `onclick` 调用 `window.eabFrameClick(event)`，避免标签切换/画面重渲染后 `addEventListener` 监听丢失。坐标换算按 `object-fit: contain` 的实际内容框计算，先扣掉上下/左右黑边再映射到浏览器视口，避免画面比例变化后点击偏移。
+- 实时画面从轮询改为 CDP screencast（2026-11-26 第九轮）：每个活动页面由服务端开一路 `Page.startScreencast`，只在画面变化时推 JPEG；`GET /api/browser/workspace/:pageId/stream` 用 SSE 把帧发给前端，`chat.js` 直接写 `data:image/jpeg;base64,...` 到 `<img>`，不再每帧创建/释放 blob。服务端按引用计数管理 CDP 会话，最后一个订阅者离开或页面关闭即 `stopScreencast` + `detach`。断流、非 Chromium 或 CDP 不可用时自动退回 `/frame` 200ms 轮询；暂停画面时停止订阅，继续时重连。
+- 工作台打开/导航改为“先返回、后加载”：`open-fast` 先返回 `pageId`，`nav-fast` 先返回目标 URL，`page.goto` / `goBack` / `goForward` / `reload` 在后台执行；完整快照仍由 Agent 的同步 `open` / `nav` 返回，不影响工具语义。
+- 实测（本机 758×776 面板、`example.com`）：暖态 `open-fast` 响应 253ms，从回车到首帧 116–415ms；服务刚重启、浏览器进程冷启动时首帧约 650ms。滚动时 CDP 帧间隔约 20–60ms，接近本地浏览器，而原 600ms 轮询在页面变化后最多要等 600ms 才更新。
+- 性能边界：Web 形态仍是服务端 Playwright + JPEG 帧轮询，帧率约 1–2fps，切换/导航等待高于原生 Chromium；这是 Web 默认零安装入口的代价。需要原生网页速度的 Windows 岗位改用桌面客户端（23.3.7），Web 路径继续保留，不把 Electron 设为默认入口。
+- 验收：in-app browser 中 8787 页面 `+` 直接新增第二个标签，DOM 中 `#workbench-add-menu` 为 0；网页标签存在时 `#web-pane-foot.hidden=true`、`#web-takeover.hidden=true`、键盘按钮 `hidden=false` 且 `title=键盘输入`；点击键盘按钮后 footer 展开、输入框获得焦点；新建标签页显示“打开 Agent 团队 / 打开审批 / 打开云空间”三枚胶囊；点击“打开云空间”后右侧出现独立云空间标签，列根目录全部文件并支持打开文件预览；打开带图标的站点（360 搜索结果页）后标签图标 class 为 `has-favicon`，`favicon` 为可访问的 http(s) 图标，说明服务端 `x-eab-favicon` 链路已生效。`pnpm typecheck`、`browser-session.test.ts` 13 条通过。
+
+### 23.3.7 Windows 桌面客户端分发（2026-11-26 第十轮）
+
+- 定位：桌面客户端是 Web 的可选超集，不是第二套产品。它加载同一个 `/chat` 工作台，复用服务端登录、权限、会话和 Agent；额外提供原生 Chromium 网页标签、独立窗口和首次启动服务地址配置。Web / Node 仍为零安装默认入口。
+- 首次启动：无配置时加载本地 `setup.html`；地址来源优先级 `EAB_DESKTOP_URL` > `%APPDATA%\EAB\desktop-config.json` > 安装目录 `resources\app\desktop-config.json`。Windows 安装包会把下载来源写入安装目录配置，首次启动直接绑定提供安装包的服务器；只有便携版、来源识别失败或用户主动改服务器时才需要手动填写。保存后写入用户配置并进入聊天页；配置损坏、协议非法或带账号密码时拒绝并留在配置页。
+- 会话：主窗口与所有原生标签统一使用 `persist:eab-web-<owner>` 分区，登录一次即可共享；第三方站点仍按同源策略隔离。`EAB_DESKTOP_COOKIE` 只在开发态注入，打包版忽略。
+- 设置页：Web 端「客户端」分组显示「下载桌面版」，桌面端显示「EAB 服务器」和「检查更新」，前者可重新打开配置页，后者可手动检查、下载或重启安装；对应 IPC 为 `eab:server-info`、`eab:save-server`、`eab:get-server`、`eab:open-server-settings`、`eab:update-check`、`eab:update-download`、`eab:update-apply`。
+- 构建：`pnpm desktop:installer` 先用 `build-win-portable.mjs` 复制 Electron 运行时、应用代码和 setup 页，生成便携目录与 zip；再写 `installer/generated/build.nsh`，调用 NSIS 3 编译 `EAB-Setup-<版本>-x64.exe`。安装器脚本为 `installer/eab-installer.nsi`，品牌资源在 `installer/assets`，不依赖 electron-builder。`.gitignore` 已排除 `packages/desktop/release/`。
+- 安装向导：欢迎 → 选择安装位置（默认 `C:\Program Files\EAB`，可点“浏览”改路径）→ 安装进度 → 完成并默认勾选“立即启动 EAB”。安装前 `taskkill /IM EAB.exe /F /T`，避免 Electron 文件被占用；写入开始菜单 `EAB` 程序组、公共桌面快捷方式、`HKLM\Software\EAB`（记住上次安装路径）和 `HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall\EAB` 卸载项。安装目录写 `.eab-install` 标记，卸载时据此确认目录归属，避免用户误选根目录后递归删除。
+- 卸载向导：欢迎 → 卸载选项（默认保留 `%APPDATA%\EAB`；勾选后删除登录状态和服务地址）→ 确认 → 进度 → 完成。卸载删除程序目录、开始菜单、桌面快捷方式和注册表项。
+- 分发：服务端 `GET /download/desktop` 提供说明页；`GET /download/desktop/windows` 优先返回最新 Setup EXE，安装包缺失时退回 zip；`GET /download/desktop/setup` 只返回 EXE；`GET /download/desktop/portable` 只返回便携 zip。路由在 `packages/server/src/routes/desktop-download.ts`，由 `app.ts` 注册。
+- 本机验收：默认 `C:\Program Files\EAB` 和自定义 `D:\...\install-test` 两条路径都安装成功；自定义路径安装后 `InstallLocation`、`UninstallString`、开始菜单和公共桌面快捷方式均指向自定义目录。卸载向导五页可走通，默认保留 `%APPDATA%\EAB\desktop-config.json`；程序目录、注册表卸载项、开始菜单和桌面快捷方式均被清理。安装器资源包含 `eab.ico`、`wizard.bmp`、`header.bmp`，窗口、快捷方式和卸载项共用该图标。
+- 图标资源：`installer/assets/eab.ico` 必须是 Windows 能解析的多尺寸 ICO，由同目录 `eab.png` 生成 16/24/32/48/64/128/256 七个尺寸；安装段创建 `$INSTDIR\assets` 并释放该文件，快捷方式与 `DisplayIcon` 才能稳定显示品牌图标。
+- 未完成：`dp_*` / `bp_*` pageId 统一、Web 到桌面的免登录握手、安装包代码签名、macOS/Linux 构建。安装包未签名，Windows 可能提示“未知发布者”；自动更新链路已落地，见下节。
+
+#### 23.3.7.1 原生标签页对齐豆包浏览器（2026-11-26 第十一轮）
+
+- 链接分流：`setWindowOpenHandler` 不再拒绝全部弹窗，`target=_blank`、`window.open`、Ctrl+点击、中键点击统一交给主进程 `openLinkInNewTab` / `openNativePage` 创建新的 `WebContentsView`；`background-tab` 在后台创建、不抢当前标签，其余前台激活。普通链接继续走 `will-navigate` 同页跳转，所有导航仍只允许 http/https、拒绝带账号密码 URL。
+- 标签同步：新页通过 `eab:browser-tab-open` 广播给工作台，`chat.js` 的 `handleDesktopTabOpen` 把它加入标签栏；`eab:browser-state` 继续同步标题、favicon、加载状态和 URL。
+- 原生右键菜单：链接菜单提供「在新标签页打开 / 在后台标签页打开 / 在系统浏览器打开 / 复制链接地址」；页面菜单提供后退、前进、刷新、复制页面地址、系统浏览器打开；输入框和选中文字额外提供编辑、复制。
+- 快捷键：原生页 `before-input-event` 处理 Ctrl+T 新建空标签、Ctrl+W 关闭当前标签、Ctrl+Tab / Shift+Ctrl+Tab 切换、Ctrl+L 聚焦地址栏、Alt+←/→、F5/Ctrl+R；主窗口也补了一套 `scope=shell` 的快捷键，地址栏和新标签输入框里同样可用。`Menu.setApplicationMenu(null)` 移除 Windows 默认 Ctrl+W 加速键，避免抢网页标签快捷键。
+- 焦点与布局：原生 `WebContentsView` 隐藏时会把系统键盘焦点留在隐藏页面，新增 `eab:focus-shell` / `eab:focus-page` 显式切换；新标签 IPC 到达时标签栏尚未布局，视图同步改为双 `requestAnimationFrame` + 180ms 兜底，避免偶发 0×0 空白。
+- 地址栏：失焦时只显示 `host:port`，Ctrl+L 或点击聚焦时切回完整 URL；`focusBrowserAddress` 先把焦点从原生页收回主窗口，再填完整 URL 并全选。
+- 验收：真实键盘和真实鼠标已验证普通链接同页跳转、`target=_blank` 新标签、`window.open` 新标签、Ctrl+点击后台标签、Ctrl+T/W/Tab/L、地址栏完整 URL、链接右键菜单；CDP 合成 Ctrl+点击不能触发 Chromium 的链接分流，不能作为失败依据。
+
+#### 23.3.7.2 下载即绑定服务器（2026-11-26 第十一轮）
+
+- 来源识别：安装器释放 `installer/scripts/detect-server-url.ps1`，读取安装包自身的 Windows `Zone.Identifier`（`HostUrl` / `ReferrerUrl`），只接受 http/https、拒绝带账号密码，输出 origin（例如 `http://127.0.0.1:8787`）。
+- 写入位置：识别结果写入 `$INSTDIR\resources\app\desktop-config.json`，字段 `serverUrl`、`source:"installer"`、`updatedAt`。打包后 `main.mjs` 的 `here` 是 `resources\app`，写到安装根目录客户端读不到，这是本轮修正的关键。
+- 兜底：构建时可用 `EAB_DESKTOP_SERVER_URL` / `EAB_DESKTOP_URL` 注入地址，`build-win-installer.mjs` 写入 `generated/build.nsh` 的 `SERVER_URL`；没有下载标记时仍可用构建地址或首次启动手动配置。
+- 验收：带人工 ADS 的安装包静默安装后，`resources\app\desktop-config.json` 内容为 `{"serverUrl":"http://127.0.0.1:8787","source":"installer","updatedAt":"2026.11.24"}`；临时移走 `%APPDATA%\EAB\desktop-config.json` 后首次启动直接进入已登录工作台，没有出现“连接 EAB 服务”设置页。
+- 边界：Chrome / Edge 下载是否保留 `HostUrl` 取决于浏览器和来源策略；安装器只信任安装包自身的下载标记，不读取任意本机文件。
+
+#### 23.3.7.3 服务器驱动自动更新（2026-11-26 第十一轮）
+
+- 服务端清单：`build-win-installer.mjs` 构建结束生成 `packages/desktop/release/desktop-release.json`，包含 `version`、`platform`、`arch`、`file`、`size`、`sha256`、`publishedAt`、`notes`。
+- 服务端接口：`GET /api/desktop/update?platform=win32&arch=x64&currentVersion=...` 返回 `version / hasUpdate / downloadUrl / fileName / size / sha256 / publishedAt / notes / channel / source`；`GET /api/desktop/version` 返回当前可用版本。`downloadUrl` 固定相对路径 `/download/desktop/setup`，只从当前 EAB 服务器下载；`/download/desktop/setup` 优先返回清单里的同一个安装包，保证 SHA256 与实际文件一致。
+- 客户端状态机：启动后 12 秒检查一次，之后每 4 小时检查；状态经 `eab:update-state` 广播为 `checking / current / available / downloading / ready / error`。发现新版本弹原生「下载并安装 / 稍后」，下载到 `%APPDATA%\EAB\updates`，边下边算 SHA256，校验 `size` 和 `sha256`，任务栏显示进度。
+- 安装：下载完成后弹「立即重启并安装 / 稍后」；确认后写 `updates/apply-update.ps1`，用 `Start-Process -Verb RunAs` 触发一次 UAC，静默执行安装器 `/S`，完成后从 `HKLM\Software\EAB\InstallDir` 启动新客户端；脚本把退出码或异常写 `updates/apply-update.log`。
+- 界面：发现更新时顶栏出现「发现 v<版本>」胶囊；下载中显示百分比；下载完成变实心「重启安装 v<版本>」；设置页「检查更新」显示当前版本、检查中、下载进度、已就绪或失败原因。点击胶囊或设置行分别执行检查 / 下载 / 安装，不新增常驻入口。
+- 验收：临时把清单版本改为 `2026.11.25` 后，桌面端启动自动弹「发现 EAB 桌面版 v2026.11.25」，顶栏出现胶囊；下载进度到 100%，SHA256/大小校验通过后弹「已下载完成」；恢复清单后接口 `hasUpdate:false`，正式版本仍是 `2026.11.24`。修复了下载流未 `end()` 导致 `finished()` 永久等待、进度停在 81% 的问题。
+- 未做：真正跨版本的“下载→静默安装→重启→版本变化”闭环需先确定下一版版本号并重新构建；安装阶段 UAC 仍需用户点一次“是”。
+
+#### 23.3.7.4 内网 HTTP 语音与品牌图标（2026-11-26 第十二轮）
+
+- HTTP 语音：Chromium 只在安全上下文暴露 `navigator.mediaDevices`。桌面端启动时读取当前配置，如果 EAB 服务是 `http://` 且不是回环地址，就在 `app ready` 前追加 `--unsafely-treat-insecure-origin-as-secure=<当前 EAB origin>`。这样 `http://192.168.x.x:8787` 下 `isSecureContext=true`、`mediaDevices` 可用，语音按钮和录音链路不再要求 HTTPS。
+- 变更服务器：在首次配置页或设置页保存一个此前未声明的 HTTP origin 时，先落盘配置并自动重启一次，让新的可信来源在 Chromium 启动阶段生效；HTTPS、localhost 和同 origin 修改不重启。
+- 作用范围：只信任当前 EAB 服务 origin，不把右侧用户自己打开的第三方 HTTP 站点一起提升为可信来源。生产环境仍建议 HTTPS；该开关是桌面客户端对内网 HTTP 部署的兼容措施。
+- 验收（局域网 `http://192.168.1.13:8787`）：`isSecureContext=true`、`navigator.mediaDevices.getUserMedia` 存在；使用 Chromium 虚拟麦克风实际拿到 1 条 audio track，`voiceSupported()` 为 true；把 `state.transcribeAvailable` 置真后语音按钮可见。
+- 品牌图标：`eab.ico` 重新生成为 16/24/32/48/64/128/256 多尺寸；构建便携版时用 `rcedit` 把 ICO、ProductName、FileDescription、FileVersion 写入 `EAB.exe`，安装器再释放一份到 `$INSTDIR\assets`。标题栏、任务栏、桌面快捷方式和资源管理器统一显示 EAB 图标，不再显示 Electron 原子图标或通用文件图标。
+
+#### 23.3.7.5 Agent 原生操作右侧标签与标签持久化（2026-11-26 第十三轮）
+
+**问题定位**
+- 桌面右侧标签是主进程里的 `WebContentsView`，`pageId` 为 `dp_*`；Agent `browser` 工具原来只走服务端 Playwright，拿不到这些页面。
+- 前端 `streamChat()` 没有走统一 `api()`，聊天请求缺少 `x-eab-desktop` / `x-eab-desktop-device`，服务端即使有桌面桥也无法把 browser 工具路由到桌面设备。这是首次实测 Agent 读不到右侧页面的直接原因。
+- 主页面 reload 时旧代码在 `did-start-navigation` 里销毁全部 `WebContentsView`，刷新聊天页必然丢标签。
+
+**实现**
+- 服务端：`desktop-bridge.ts` 新增 `kind`、`resolveOnlineDevice`、`updateBrowserTabs`、`browserTabsFor`、`browserCall`；新增 `POST /api/desktop/bridge/tabs` 接收桌面端上报的 `{activePageId,tabs}`；`routes/tools.ts` 的 `case 'browser'` 按设备头路由，30 秒超时；`routes/chat.ts` 的 `compileSystemPrompt` 新增桌面标签块，最多列 8 条并标出当前页，明确要求“当前页面/右侧标签/这个按钮”先用 `browser action=list/snapshot`，不要用 `web.fetch` 抓同一网址代替。
+- 桌面主进程：标签元数据写入 `desktop-config.json` 的 `browserTabs`，注册成功、标签变化和窗口关闭前上报；`browserTabsOwnerUserId` 做归属校验；`restoreBrowserTabsIfNeeded` 在启动或首次 `listTabs` 时恢复；`executeNativeBrowserJob` 执行 13 个动作；`NATIVE_SNAPSHOT_SCRIPT` 生成与 `BrowserElement` 对齐的 `e1/e2...`；`click` 禁提交表单，`type` 只写不提交。
+- preload / 前端：`listTabs(userId)`、`activateTab(pageId)`、`onActivate`；`currentUserId()` 从 `state.me.person.id` 取员工 id；`restoreBrowserTabs()` 先恢复主进程存活标签，再补 `localStorage` 草稿，最后激活原活动页；`localStorage` 键为 `eab.chat.browserTabs.v1:<person.id>`；`streamChat()` 补桌面设备头；`onActivate` 让 Agent 切页时前端标签栏跟随。
+- 审批：`requiresToolApprovalForArgs` 对 `browser` 分流，`list/snapshot/screenshot/scroll/activate` 免审批，`open/navigate/click/type/back/forward/reload/close` 逐次审批。
+
+**真实桌面验收（本机 Windows，Electron 45.4.1 / Chromium 156）**
+- 刷新聊天页：主进程保留 `dp_e252b9b29e4b`；前端 `listTabs` 后重新出现 `Example Domain`，右侧页面正常显示，`/frame` 请求为 0。
+- 重启桌面端：恢复 3 个标签（`Example Domains`、GNU 空白页、`百度一下，你就知道`），活动页恢复为 `dp_e252b9b29e4b`，标签栏 3 个均显示。
+- Agent `snapshot`（免审批）：返回标题 `Example Domain`、网址 `https://example.com/`、正文第一段，工具耗时 50ms；模型最终回复正确引用页面标题、网址和正文。
+- Agent `activate` + `snapshot` + `click ref=e1`：从 `Example Domain` 点 “Learn more”，同一标签跳到 `https://www.iana.org/help/example-domains`，标题变为 `Example Domains`。
+- Agent `activate` + `snapshot` + `type`：切到百度 `dp_ed2382267bba`，输入“EAB 企业智能体”，快照回读 `elements[].value` 为该文本，页面未提交。百度搜索框是无 `type` 的 `textarea`，本轮把类型判断改成 `node.type || getAttribute('type')`，缺省 input 按 `text` 处理。
+- Agent `open https://example.org/`：新标签 `dp_eb34be844f46` 创建并激活，前端标签栏同步出现 `Example Domain`，共 4 个标签；证明 `eab:browser-tab-open` 广播链路有效。
+- Agent `reload/back/forward`（审批）：在 `dp_e252b9b29e4b` 依次执行，`reload` 耗时 1.2 秒并重新读出 31 个元素；`back/forward` 调用成功（约 320ms），但该标签历史栈只有一个页面，URL 和标题未变化，不能证明多页历史位移。
+- Agent `screenshot`（免审批）：对当前 `dp_eb34be844f46` 截图，服务端在个人云空间根目录生成 `浏览器截图-20261126065448.png`（44,558 字节），`view.screenshot` 返回 `fileId`、`name`、`relPath`。
+- Agent `close`（审批）：关闭 `dp_eb34be844f46`，工具返回 `closed:true`；随后 `list` 返回剩余 3 个标签，活动页回到百度，前端标签栏同步减为 3 个。
+- 回归：`node --check` 对 `main.mjs`、`preload.cjs`、`chat.js` 通过；`npm run typecheck` 通过；项目/系统提示 26 个用例、审批 13 个用例通过。
+
+**尚未验收**
+- 真实长页 `scroll` 的实际滚动位移；多页历史下 `back/forward` 的跳转。
+- 失效 URL 恢复后可能变成空白标签（GNU 错误页已出现），前端还没有“已失效 URL 清理”。
+- 测试标签（IANA / GNU 空白 / 百度）与测试审批记录尚未清理。
+- 本轮安装包已重建，版本仍是 `2026.11.24`；新版 `EAB-Setup-2026.11.24-x64.exe` 为 `113,052,393` 字节，SHA256 `3a8b2bcd8896eaea899a8feda61de03a7a40d17b9f76440077fa8abac143290d`。同版本旧客户端不会收到自动更新提示，需要手动重新安装。
+
+**桌面本地项目读取修复（2026-11-26）**
+- 现象：桌面端新建项目弹窗工作目录一直显示“添加本地文件夹”，底部停在“正在读取桌面设备…”，创建按钮不可用。
+- 根因不是 Windows 文件权限，而是安装测试版用的是旧桌面包：`preload.cjs` 只有 `isDesktop`，没有 `getDesktopInfo / pickDirectory / bindProject`；`main.mjs` 也没有 `local-files` 模块。前端 `ensureDesktopInfo()` 因接口不存在直接返回空，设备标签永远不会变成已识别状态。
+- 构建缺陷：`scripts/build-win-portable.mjs` 原来只复制 `main.mjs / preload.cjs / setup.html`，漏了 `main.mjs` 启动即 import 的 `local-files.mjs`，即使重新打包也会因缺模块启动失败。已把复制列表改为 `main.mjs / preload.cjs / local-files.mjs / setup.html`。
+- 修复后真机验收：安装版 `getDesktopInfo()` 返回 `dev_8a74b97ce0e94d8dbda90d74e0a57e78 / DESKTOP-LK59VNR / win32 / x64`，弹窗底部显示 `DESKTOP-LK59VNR · 项目目录保存在这台电脑上`；点击“添加本地文件夹”能打开 Windows 原生目录对话框；`bindProject('lp_probe123','D:\\AI kaifa\\EAB')` 与 `unbindProject` 均成功。
+- 打包验收：新建的 `release/EAB-Desktop-Windows-x64/resources/app` 含 `local-files.mjs`（21,223 字节），`preload.cjs` 含项目接口，`main.mjs` 含 `import './local-files.mjs'`；启动便携包后 `getDesktopInfo / pickDirectory / bindProject` 均为 `function`，设备信息正常返回。
+
+#### 23.3.7.6 项目侧栏纯文件夹化与文件删除（2026-11-26）
+
+**交互调整**
+- 本地项目从“项目主页 + 文件树 + 分组标签”收口为可折叠的本地文件夹：项目行只保留文件夹图标、项目名和更多菜单，不显示展开/收起箭头；去掉“桌面端在线/离线”副标题，项目下不再显示「对话 / 工作任务」标签，任务用紫色图标区分。
+- 项目行点击仍切换折叠/展开，折叠状态写 `localStorage` 键 `eab.chat.collapsedProjects.v1:<userId>`；新建项目或新建项目会话时强制展开。项目下只挂会话行，不再渲染“＋ 新建对话”虚线按钮，也不再显示项目文件列表；新对话从项目“⋯”菜单进入。
+- 项目内会话复用普通会话菜单：悬浮“⋯”和右键都打开 `#session-menu`，支持重命名、删除；删除仍走会话软删除确认卡。项目操作菜单改为新建对话、新建工作任务、打开文件夹、重命名、移除项目，不再有“项目主页”。
+- 项目主页 `#project-pane` 和 `openProjectHome/renderProjectHome` 暂保留但无入口，页面保持隐藏；`renderLocalProjectSide()` 不再显示 `#side-local-files`，`applySessionSpace()` 不再启动 5 秒项目文件轮询。`chat.html` 已移除 `#side-local-files / #local-file-list` DOM。
+- 项目文件不再占左侧栏，但 Agent 仍可通过 `project.list/read/search/write/edit` 在项目目录内创建、读取、修改文件；新建目录由 `project.write` 自动创建父目录实现。
+
+**输入区项目选择器与会话归属**
+- 桌面端点击输入区「云空间」chip 打开豆包式项目选择器：列出本机项目（文件夹图标 + 名称），当前项目行显示根路径和勾选；底部提供「创建新项目」和「不使用项目」。Web 端仍保留云空间 / 不使用文件空间的简洁菜单。
+- 选择项目时直接调用 `PATCH /api/chat/sessions/:id/space` 把当前已有会话归入该项目；未落库的新对话只更新前端待发送状态，下一条消息随 `spaceKind/spaceId` 持久化。选择「不使用项目」退回云空间。
+- 归属接口只改 `chat_sessions.space_kind/space_id`，不动消息、标题和 `updated_at`；本地项目校验归属员工与 `local-space:read` 权限，项目不存在返回 404。切换后头部仍显示原会话标题，不把项目名写成对话名。
+- 从选择器进入「创建新项目」时，创建成功后把当前对话直接归入新项目；从侧栏「新建项目」进入时只创建项目，不抢占当前对话。
+- 未落库新对话归入项目后，切换项目不会创建空会话；已有会话的重命名、删除、任务徽标仍按原会话链路处理。
+
+**文件删除**
+- `project.delete` 新增到工具目录和能力清单，只允许删除**文件**，路径相对项目根；目录必须拒绝，避免一次误删整棵树。项目 `mode='read_only'` 时拒绝。
+- 桌面桥 `DesktopFileOp` 增加 `delete`，`local-files.mjs` 增加 `deleteText()`；校验根边界、敏感文件和 realpath 后再 `unlinkSync`。服务端本机兼容路径在 `project-files.ts` 增加同语义 `deleteProjectEntry()`。
+- 风险等级 `irreversible`，每次执行都走工具审批；不会把磁盘绝对路径交给模型。
+
+**真实桌面验收**
+- 项目侧栏 DOM：`projectCount=1`，`hasLocalFiles=false`，`projectPaneHidden=true`，`projectRowText=dsh-ding-card`（无“桌面端在线”），`hasStatus=false`，`hasKidsLabel=false`，`hasCaret=false`，`hasQuickStart=false`。
+- 折叠/展开：点击项目行后 `aria-expanded=false`、`.project-children.hidden=true`；`localStorage` 写入折叠项目 id；再点恢复展开。
+- 项目选择器：初始 `spaceKind=cloud` 时菜单为「dsh-ding-card / 创建新项目 / 不使用项目 ✓」；选中项目后 chip 变为项目名，项目内会话子项从 0 变 1；再次打开菜单显示项目根路径与勾选。点「不使用项目」后 `spaceKind=cloud`，项目子项回到 0。
+- 刷新恢复：对已有会话执行归属后重新打开，返回 `spaceKind=local`、正确 `spaceId` 和 `project`，chip 与项目分组同步恢复。
+- 会话菜单：项目内会话“⋯”打开 `#session-menu`，显示“重命名 / 删除”；删除确认卡目标为「侧栏交互验收」，确认后项目子项从 1 变 0。
+- 项目菜单：显示“新建对话 / 新建工作任务 / 打开文件夹 / 重命名 / 移除项目”，无“项目主页”。
+- 后端：`project.delete` 删除文件成功且大小正确，目录删除返回“只能删除文件”，越界路径返回 forbidden；`PATCH /api/chat/sessions/:id/space` 本地项目/云空间往返通过，缺失项目与会话返回 404；桌面 `deleteText` 同样通过缺失文件、目录和 `../` 越界测试。
+- 回归：`node --check chat.js`、`node --check local-files.mjs`、`npm run typecheck` 通过；`local-project.test.ts` 5 个、`tool-approval.test.ts` 7 个、`chat-session-space-route.test.ts` 2 个用例通过。
+
+#### 23.3.7.7 豆包式桌面侧栏第一轮（2026-11-26）
+
+**布局与固定导航**
+- 左侧栏改成“顶部固定导航 → 中部滚动项目/最近 → 底部紧凑账号与设置”三段式，不再把用户大卡片、项目区、最近区、云空间文件列表和分隔条依次堆叠。
+- 顶部固定导航为：`新工作任务`、`新对话`、`工作台`、`定时任务`、`插件·技能·伙伴`、`云空间`、`更多`。图标统一为 18px 线性 SVG（方框笔、聊天气泡、四宫格、时钟、叠层方块、文件夹、四格更多），和豆包桌面版保持同一类线性语言。
+- `云空间`放在固定导航的“资料库”位置，点击打开右侧云空间面板；侧栏底部原来的 `#side-files` 文件列表、`#side-split-resizer` 上下拖拽条和配额角标已从 DOM 移除。输入区 chip 仍负责把当前会话归属到项目/云空间，二者职责分开。
+- 中部滚动区不再显示“项目 / 新建项目”标题和按钮，直接显示项目行；项目行使用浅灰底 20px 线性文件夹图标、项目名和悬浮“⋯”，不显示箭头、不显示绿色虚线“新建对话”。项目列表之后显示“最近”，独立会话行左侧统一加淡蓝圆底聊天气泡图标；工作任务行使用方框笔图标和淡紫圆底。
+- 底部用户信息收成紧凑两行：28px 头像、姓名、职位；公司/部门/角色明细只在设置页完整展示。下面固定“设置”入口。
+- `更多`是右侧浮出菜单，当前承载四个真实入口：新建项目（仅桌面端）、打开云空间、管理后台（按 `#console-entry` 可见性同步）、设置；四项图标统一为线性 SVG。点击外部或按 Esc 收起。
+
+**导航动作**
+- `新工作任务`：项目内调用 `createProjectSession(project,'task')`；云空间创建 `projectMode='task'` 的独立任务，头部显示任务徽标，最近列表用任务图标。
+- `新对话`：复用 `newSession()`；项目内创建项目对话，云空间回到空白新对话。
+- `工作台`：`setChatMode('workspace')`，保留上次工作台子页。
+- `插件·技能·伙伴`：进入工作台并切到插件子页（`setWorkspaceKind('plugins')`）。
+- `云空间`：`openCloudSpacePane()`，右侧全宽文件浏览，不占用左侧项目/对话滚动区。
+
+**定时任务浮层**
+- 新增 `#schedule-modal`，从员工端 `GET /api/schedules` 读取任务，展示标题、状态、下次执行/上次执行、执行模式（对话/工作任务/单次）、渠道（网页/钉钉）。
+- 状态映射：`active→运行中`、`paused→已暂停`、`running→执行中`、`done→已完成`、`error→失败`、`cancelled→已取消`；已完成/失败/取消不再把旧的 `nextRunAt`伪装成“下次执行”。
+- `active` 可暂停、`paused` 可恢复，分别调用 `POST /api/schedules/:id/pause|resume`；支持刷新；空态提示在对话里描述周期任务，由 Agent 创建。
+- `新建`不单独做表单，先开一个新对话并预填“帮我创建一个定时任务：”，让 Agent 继续走现有 `schedule` 工具审批链。
+
+**兼容与清理**
+- `#new-session`、`#new-project` 旧按钮从 `chat.html` 移除；`bindSideNav()` 接管顶部动作，旧的 `#new-project` 绑定保留 `?.` 兜底。
+- 底部云空间文件区移除后，`#ws-new-folder`、`#ws-upload`、`#ws-input`、`#ws-upload-status` 的绑定全部改为可选链；`#ws-list/#ws-path` 渲染函数保持空值保护，不再影响启动。
+- 项目行保留 `data-project-toggle` 折叠能力；`renderLocalProjects()` 只渲染项目与会话，不渲染项目主页。当前项目为空时提示“点上方「更多」→ 新建项目”。
+
+**真实桌面验收**
+- 固定导航 7 项全部存在，旧节点 `#new-project/#new-session/#side-files/#side-split-resizer` 查询均为 false；侧栏宽度 264px，中部滚动区 `scrollHeight=clientHeight=462`（当前数据量下不溢出）。
+- 最近会话图标：普通会话 `.side-session-icon`、任务会话 `.side-session-icon.is-task` 均渲染；钉钉来源徽标仍保留。
+- 顶部新工作任务：创建 `spaceKind=cloud`、`projectMode=task`、标题“新工作任务”的会话，头部任务徽标显示，最近行出现任务图标；测试后已删除临时会话。
+- 项目内任务：`createProjectSession(project,'task')` 返回 `spaceKind=local`，项目子会话从 0 变 1，子行图标为 `.project-child-icon.is-task`，最近列表不重复出现该会话；测试后已删除临时会话。
+- 定时任务浮层：打开后读取 3 条历史任务，卡片 540×329.5，已完成任务显示“上次 2026/11/24 14:00”，不再显示“下次”；关闭按钮、刷新、空态、Esc 路径可用。
+- `更多`菜单：浮层 186×148.6，包含“新建项目 / 打开云空间 / 管理后台 / 设置”，`aria-expanded=true`，点击外部收起。
+- 工作台 / 插件 / 云空间 / 新对话动作均返回预期状态：`mode=workspace`、`workspaceKind=plugins`、`tab=cloud`、`mode=chat`；从云空间切回新对话时会关闭右侧云空间面板。
+- 回归：`node --check chat.js` 通过；后端本次未改，沿用 7 个会话归属/项目测试结果；普通启动（不带 9334 调试参数）后主窗口正常显示新侧栏。
+
+**仍未做**
+- 本轮只完成桌面侧栏第一轮视觉与导航收口；启动耗时、首屏渲染、长列表滚动、侧栏虚拟化等性能基线尚未测量。
+- 定时任务“新建”仍依赖对话创建，未做完整创建表单；运行中任务的实时进度也未单独展示。
+- 云空间从侧栏文件列表改为右侧面板后，窄屏下右侧面板与对话的切换仍需继续优化。
+
+#### 23.3.7.8 桌面体验对齐豆包的阶段目标（2026-11-26 规划）
+
+本轮完成的是侧栏结构与视觉语言的第一轮收口，以下为后续逐步改造的方向，尚未实施：
+
+1. **交互与视觉一致性**：深色主题真实验收、窄屏布局、会话搜索、项目内显式新建入口、右键/更多菜单统一；动效只使用 `transform/opacity`，控制在 100–200ms，并保留 `prefers-reduced-motion` 降级。
+2. **性能基线**：先测冷启动到可交互、首屏渲染、会话列表首帧、长列表滚动帧率和常驻内存；再做列表虚拟化/分批渲染、会话缓存、按需加载工作台与云空间、减少启动时重复请求。侧栏在 200 条会话下应保持首帧可读且滚动不卡顿。
+3. **桌面壳能力**：快捷键（新对话/新工作任务/搜索/设置）、启动恢复上次会话、托盘与更新提示、异常退出恢复；先保证稳定和可测，再追求与豆包桌面版同级的响应速度。
+
+#### 23.3.7.9 桌面与网页五项体验修正（2026-11-26 第二轮）
+
+**需求与结论**
+
+1. **新工作任务 / 新对话要立即区分并立即入列**：两者不再只重置本地空白状态，而是分别创建 `projectMode='task'` 和 `projectMode='chat'` 的会话；会话一创建就刷新“最近”并打开，不再等首条消息。当前已是同类型空白会话时只回到输入框，避免连点产生多条空记录。
+2. **个人信息卡回到顶部**：`#side-user` 从 `.side-bottom` 移到品牌区下方、固定导航上方，显示头像、姓名、职位、公司/部门一行和在线点；底部只保留“设置”。
+3. **工作台与插件入口都在工作台内部**：`工作台` 调用 `setChatMode('workspace')` 并保留上次子页；`插件·技能·伙伴` 进入同一工作台并切到插件子页；两者都是右侧工作台内页，不跳外部页面，侧栏对应入口有选中态。
+4. **没有项目时不占位**：项目数为 0 时整块 `#side-projects` 收起，不再渲染虚线加号、“还没有项目”和“点上方「更多」→ 新建项目”空态。
+5. **网页端可看到并继续桌面项目会话**：网页端“最近”混排当前账号的本地项目会话，行内显示项目徽标和“桌面在线/离线”；打开后恢复项目、项目指令和 `spaceId`，输入区项目选择器可切换归属；文件工具按 `deviceId` 经桌面桥转发。不同电脑登录同一账号，只要项目所属电脑在线，另一台电脑即可继续该项目对话并读写该项目文件。
+
+**实现位置**
+
+- `chat.js`：`openNewSession(mode)` 统一两个新会话入口；`newSession({create:false})` 只留给启动引导和定时任务草稿；`openSession()` 头部标题改为 `session.title`，项目名进 `#chat-project-badge`，任务徽标只由 `projectMode='task'` 控制；首条消息在标题仍为“新对话/新工作任务”时用首条文字更新本地标题。
+- `chat.js`：`renderSessions()` 网页端包含 `spaceKind='local'` 会话，桌面端仍把项目会话挂在项目树；`renderSpaceMenu()` 两端共用项目列表，网页端行内显示设备在线状态且不显示“创建新项目”；`assignConversationSpace()` 允许网页端把已有会话归入远程项目。
+- `chat.html` / `chat.css`：顶部 `side-profile-card`、项目徽标、设备徽标；项目选择器名称优先、路径让位截断。
+- `packages/server/src/routes/chat.ts`：`GET /api/chat/sessions` 返回 `projectDeviceOnline`；历史与 `PATCH /api/chat/sessions/:id/space` 返回 `project.deviceOnline`；`ensureSession()` 对标题仍为默认名且已有首条文本的会话自动命名，用户手改过的标题不覆盖。
+
+**网页端实测（2026-11-26）**
+
+- 侧栏顶部个人信息卡显示“李鹏 / 技术员 / 重庆居易智能科技有限公司 / 重庆东环线组”，在线点正常；项目数为 0 时 `#side-projects.hidden === true`，没有空项目块。
+- 临时远程项目会话实测：网页“最近”从 2 条增到 3 条，项目行显示 `远程项目验收` + `桌面在线`；打开后头部为“远程项目验收 / 远程项目任务 / 工作任务 / 桌面在线”，输入区 chip 为“远程项目验收”。在该会话发送“只回复 OK，不要调用任何工具”后返回 `OK`（Kilo Auto Free，70.1 tok/s），远程项目对话闭环成立；验证后临时项目、会话、消息和目录均已清理。
+- 依次点击“新工作任务”“新对话”：会话数从 3 → 4 → 5，列表立即出现“新工作任务”和“新对话”，任务行有任务图标；前者头部显示工作任务徽标，后者不显示，标题不再被项目名覆盖。
+- 工作台和插件入口均进入右侧工作台内页，侧栏高亮分别落在“工作台”和“插件·技能·伙伴”。
+- 清理临时项目/会话后，“最近”回到 2 条，项目区保持隐藏；`node --check chat.js`、`npm run typecheck` 通过；`chat-session-space-route.test.ts` 2 条与 `local-project.test.ts` 5 条通过。
+
+**边界与未完成**
+
+- 跨设备当前开放的是“项目对话 + 项目文件读写”，**没有开放远程 shell/`project.exec`**；构建、测试、启动服务仍需在项目所属电脑本地执行。
+- 远程文件链路要求项目在桌面端正常绑定。验收中通过 REST 直接创建的临时项目没有进入桌面桥 `bindings`，文件列表返回 `EAB_CONFLICT`；正常从桌面端“新建项目”创建会同时绑定，此路径已在前序真机验收通过。
+- 安装包仍是 `2026.11.24`，未按本轮源码重建；桌面端旧安装包需重装或更新后才能看到新侧栏。
+- 网页端“最近”采用“项目会话混入最近 + 项目徽标”的扁平形态，没有保留桌面端项目分组；自动命名也尚无专门单测。
+
+#### 23.3.7.10 项目入口与右侧标签页会话隔离（2026-11-26 第三轮）
+
+**需求与结论**
+
+1. **云空间不再作为可选入口**：云空间是平台自带能力，对话选不选都可用，因此输入区不再显示绿色“云空间”胶囊，也没有必要让用户主动选择空间。
+2. **改成豆包式“项目”入口**：输入区显示中性灰胶囊，内容为线性文件夹图标 + “项目” + 右箭头；未归属项目时固定显示“项目”，归属后显示项目名。菜单仍包含当前账号项目、创建新项目和“不使用项目”，但“不使用项目”只表示不把对话挂到项目，不代表失去云空间。
+3. **右侧网页标签跟对话绑定**：每个对话各自维护一份标签栏和当前活动标签。切到没开过标签的对话时右侧网页栏整块隐藏；切回开过标签的对话时恢复该对话的标签、活动标签和工作台展开状态。网页端与桌面端同一规则。
+
+**实现位置**
+
+- `chat.html` / `chat.css`：`#space-chip` 改为文件夹 SVG + “项目” + 右箭头；中性灰底 `#f3f4f5`、透明边框、深灰文字，hover `#ebedef`，不再有绿点和绿色描边；`.caret` 在展开时旋转 90°。
+- `chat.js`：`renderSpaceChip()` 未归项目固定显示“项目”，归项目显示项目名；`renderSpaceMenu()` 保留项目列表、创建新项目和“不使用项目”；`assignConversationSpace()` 退出项目时提示改为“已取消当前对话的项目归属”，云空间后端默认 `spaceKind='cloud'` 和文件工具不变。
+- `chat.js`：标签快照存储改为 `eab.chat.browserTabs.v2:<userId>:session:<sessionId>`，无会话时用 `:draft`；`switchBrowserTabScope()` 切会话前先保存旧会话、再清空并通知桌面主进程切换；`restoreBrowserTabsForSession()` 只恢复当前会话的标签；`ensureBrowserTab()`、`newBrowserDraftTab()`、`handleDesktopTabOpen()` 都带 `sessionId` 归属和守卫。
+- `chat.js`：`browserTabsLoadedScope` 用 `null` 表示“尚未恢复完成”，`persistBrowserTabsNow()` 在恢复完成前拒绝落盘，避免切换会话时把清空后的标签栏覆盖成空数组；这是“切回会话标签不恢复”的根因修复。
+- `packages/desktop/main.mjs` / `preload.cjs`：主进程新增 `activeChatSessionId`、按会话的 `browserTabsPayload()`、`setActiveChatSession()`、v2 配置结构 `{version:2, ownerUserId, activeSessionId, sessions:{sessionId:{activePageId,tabs}}}`、按会话恢复、`entry.sessionId`、`browserTargetEntry()` 会话校验；IPC 新增 `eab:set-browser-session`，`eab:browser-tabs` 改为 `(userId, sessionId)`，激活、显示、bounds、关闭都只操作当前会话的页面。
+- `packages/server/src/desktop-bridge.ts` / `routes/desktop-bridge.ts`：设备状态里的标签快照改为 `browserTabsBySession: Map<string, snapshot>`，每个对话一份，设备最多保留最近 40 个对话；`browserTabsFor(company,user,device,sessionId?)` 按会话返回。系统提示和桌面 `browserCall` 都带 `sessionId`。
+
+**验收**
+
+- 网页端：输入区显示中性“项目 >”胶囊，无绿点和“云空间”字样；项目菜单可打开。
+- 网页端会话 A 打开“新标签页”后右侧展开；切到没开过标签的“钉钉·对话”后 `#workbench-rail.hidden === true`、标签栏为空；切回 A 后标签栏恢复为“新标签页”，刷新页面后仍能恢复。
+- 桌面端用源码 `electron .` 实测：空会话开草稿标签能展开；切到另一个没标签的会话整块隐藏；切回后草稿标签恢复。把草稿升级为真实 `https://example.com` 原生标签后，`listTabs` 返回 `sessionId` 为该会话、`pageId` 独立；切走再切回，原生标签恢复；重启桌面进程后仍按会话恢复。
+- `node --check chat.js / main.mjs / preload.cjs`、`npm run typecheck` 通过；新增 `desktop-bridge-tabs.test.ts` 2 条，连同会话项目归属 2 条、本地项目 5 条共 9 条通过。
+
+**边界与未完成**
+
+- 云空间仍是所有对话的默认文件空间，后端 `spaceKind='cloud'`、上传、文件工具和配额都没有改；本轮只是不再把它做成输入区的可选项。
+- 桌面原生 `WebContentsView` 采用“非当前会话隐藏保活”，没有销毁重建；长期多对话会累计页面对象，后续需要按 LRU 或标签上限回收。
+- 旧版全局标签只作为“无会话草稿”兜底读取一次，不迁移到具体会话；已删除会话遗留的 v2 localStorage 快照不会被自动清理。
+- 本轮桌面端是源码启动验收，安装包仍是 `2026.11.24`，未重建；打包版要看到同样效果需重新构建并安装。
+- 已验收“网页标签只在前端隔离”；网页端没有原生 `WebContentsView`，其网页标签由服务端 Playwright 承载，不走桌面主进程的按会话视图。
+
+#### 23.3.7.11 云空间文件管理：新建、右键与拖拽上传（2026-11-26 第四轮）
+
+**需求与结论**
+
+1. **补全头部入口**：右侧云空间面板顶部在“刷新”旁增加“新建文件夹”“上传”，都作用于当前面包屑目录，不再只做只读浏览。
+2. **文件/文件夹右键**：文件和文件夹行都支持右键浮出操作菜单，文件为打开、下载、重命名、编辑、发送到钉钉、删除；文件夹为打开、新建子文件夹、新建文件、重命名、删除。文件夹含他人共享文件时，整体重命名/删除沿用原有限制。
+3. **空白区右键**：云空间列表空白处或空目录里的右键菜单为“新建文件夹 / 新建文件 / 上传文件”，和 Windows 文件系统的当前目录操作一致。
+4. **拖拽上传**：从桌面或浏览器拖入文件到云空间面板，直接上传到当前目录；拖入期间显示“松开即可上传 + 目标目录”虚线高亮，上传后保留当前目录并显示进度。
+5. **两端一致**：按钮、右键菜单、拖拽上传全部实现在共享的 `chat.html / chat.css / chat.js` 渲染层。网页端和桌面端使用同一套 UI 与同一后端接口；桌面端只是多一个 `window.eabDesktop` 原生网页桥，不另做一套文件面板。
+
+**实现位置**
+
+- `packages/server/public/chat.html`：`.cloud-pane-actions` 增加 `#cloud-pane-new-folder`、`#cloud-pane-upload`、`#cloud-pane-refresh`；新增隐藏的 `#cloud-upload-input`、`#cloud-upload-status` 和 `#cloud-drop-hint`。
+- `packages/server/public/chat.css`：新增 `.cloud-pane-actions`、`.cloud-action`、`.cloud-icon-btn`、`.cloud-drop-hint`、`.cloud-pane.is-drop-target`；拖拽提示使用虚线边框和半透明遮罩，不改变正文布局。
+- `packages/server/public/chat.js`：`bindCloudSpaceActions()` 绑定头部按钮、文件选择、空白右键和 `dragenter/dragover/dragleave/drop`；`renderCloudSpacePane()` 为文件夹/文件行绑定 `contextmenu`，并区分 `scope='cloud'`。
+- `packages/server/public/chat.js`：复用现有 `createWorkspaceFolder()`、`renameWorkspaceFolder()`、`deleteWorkspaceFolder()`、`renameWorkspaceFile()`、`deleteWorkspaceFile()`、`openWorkspaceFile()`、`downloadWorkspaceFile()`、`editWorkspaceFile()`、`sendWorkspaceFileToDingTalk()`；没有另造一套文件 API。
+- `packages/server/public/chat.js`：新增 `createWorkspaceFile()` 与 `workspaceFileNameError()`，创建空文本文件前检查同名文件和文件夹，避免静默覆盖；`uploadWorkspaceFileWithProgress()`、`uploadWorkspaceFiles()` 增加 `parentPath` 参数，云空间上传写入当前目录，而不是侧栏工作区目录。
+- `packages/server/public/chat.js`：`showFileMenu()` / `showFolderMenu()` 增加 `scope` 参数和 `dataset.scope`，文件夹“打开”在云空间面板调用 `setCloudSpacePath()`，侧栏调用 `setWorkspacePath()`；`showCloudBlankMenu()` 负责空白区菜单。文件夹重命名/删除同时校正 `state.cloudSpacePath`。
+- 后端沿用 `POST/PATCH/DELETE /api/workspace/folders`、`POST/PATCH/DELETE /api/workspace/files`、`GET /api/workspace/files/:id/download`，本轮未新增后端接口。
+
+**验收**
+
+- 网页端：头部显示“新建文件夹”“上传”和刷新按钮；右键 `README.md` 出现“打开 / 下载 / 重命名 / 编辑 / 发送到钉钉 / 删除”；右键空白区出现“新建文件夹 / 新建文件 / 上传文件”。
+- 网页端实测通过右键新建文件夹“右键验收”、进入空目录后右键新建文件“验收文件.txt”、通过文件选择上传 `eab-cloud-upload-test.txt`、模拟拖拽上传“拖拽验收.txt”，并在右键菜单中完成文件重命名和删除；最后删除“右键验收”文件夹，`README.md` 与 `AGT-08_测试用例摘要.md` 恢复为根目录仅有两项。
+- 桌面端源码 `electron . --remote-debugging-port=9222` 实测：云空间头部按钮与网页一致；`README.md` 右键菜单一致；空白区菜单一致；通过 `DataTransfer` 拖拽上传“桌面拖拽验收.txt”，上传进度与目标目录提示正常，随后删除该验收文件并关闭调试端口，恢复普通桌面启动。
+- 拖拽高亮截图：`C:\Users\shq\AppData\Local\Temp\eab-cloud-drop-hint-final.png`；桌面云空间截图：`C:\Users\shq\AppData\Local\Temp\eab-desktop-cloud-pane.png`。
+- `node --check chat.js`、`node --check main.mjs`、`npm run typecheck` 通过；`desktop-bridge-tabs.test.ts` 2 条、`chat-session-space-route.test.ts` 2 条、`local-project.test.ts` 5 条、`workspace-folders.test.ts` 6 条，共 15 条通过。
+
+**边界与未完成**
+
+- 拖拽只处理 `DataTransfer.files` 中的文件，不递归上传整个文件夹；拖入纯文件夹时提示“暂不支持直接拖入文件夹”。
+- 单个文件沿用云空间上传上限 50 MB（面板侧）；后端 `POST /api/workspace/files` 的 `bodyLimit` 为 80 MB，大文件分片/对象存储直传仍未做。
+- “新建文件”创建空文本文件，不内置内容编辑器；创建后通过右键“打开/编辑”进入现有预览与编辑器。
+- 安装包仍是 `2026.11.24`，本轮只更新源码；打包版需重新构建并安装后才能看到同样界面。
+
+#### 23.3.7.12 会话与右侧多标签收口：空草稿不登记、标签按会话常驻（2026-11-26 第五轮）
+
+**需求与结论**
+
+1. **右侧标签跟随对话**：打开几个标签就挂几个标签；切换对话、切走页面、刷新页面都不自动关闭，只有用户手动点 × 才消失。
+2. **标签不跨对话串**：A 对话的网页、云空间、文件预览、Agent 团队、审批、工作台激活页只在 A 显示；切到 B 时 B 只恢复自己开过的标签，不继承 A 的。
+3. **空对话不进左侧列表**：用户没有发出第一条消息前，不生成列表条目、不生成标题。点“新对话 / 新工作任务”只在右侧开临时空白态。
+4. **空对话切走即丢弃**：首条消息前关闭标签、切到别的对话或切到工作台，临时草稿直接丢弃，不在 localStorage 留快照，也不在数据库留空会话。
+5. **首条消息才登记**：发出第一条用户消息后，后端 `ensureSession()` 创建会话并落首条消息，前端用第一句话（前 24 字）作为标题，同时把草稿里已打开的右侧标签整体改归这个正式会话。
+6. 本节覆盖此前 §0.2/23.3.7.9 中“新会话立即 POST 落库并 `loadSessions()`”的做法：即时创建改为首条消息后创建。
+
+**实现位置**
+
+- `packages/server/src/routes/chat.ts`：`GET /api/chat/sessions` 拿到读源行后，按 `chat_messages` 中是否存在 `role='user'` 批量过滤。一次 `SELECT DISTINCT session_id ... WHERE session_id IN (...)` 覆盖 SQLite / PostgreSQL 两种读源，不做逐行 N+1；预创建空会话、历史无消息会话都不返回。
+- `packages/server/public/chat.js`：`enterBlankDraft()` 维持纯前端草稿（`state.sessionId=null`、`state.draftSession` 记录 mode/space），`openNewSession()` 同类型草稿只回输入框，换类型时先 `discardDraftSession()`。
+- `packages/server/public/chat.js`：新增 `discardDraftSession()`、`discardDraftBrowserTabs()`、`removeDraftBrowserTabsStorage()`。空白草稿的 `persistBrowserTabsNow()` 直接返回并删除 `:draft` 快照；`restoreBrowserTabsForSession('')` 清空标签、不读旧 draft 快照，刷新后是全新空白态。
+- `packages/server/public/chat.js`：新增 `currentWorkbenchShell()` / `applyWorkbenchShell()` / `clearWorkbenchShell()`。v2 快照新增 `shell` 字段，保存 `cloudSpaceOpen`、`cloudSpacePath`、`teamTabOpen`、`permOpen`、`filePreviewId`、`filePreviewSplit`、`workbenchTab`、`workbenchCollapsed`、`workbenchSplit`；兼容旧快照只有 `workbenchTab/collapsed/split` 的形态。
+- `packages/server/public/chat.js`：`switchBrowserTabScope()` 切走前保存正式会话的网页标签与工作台外壳；旧 scope 是空白草稿时改为丢弃并关闭真实页面。切到新 scope 后由 `restoreBrowserTabsForSession()` 恢复自己的云空间、文件、团队、审批与网页标签；文件按保存的 id 异步重开，云空间按保存的路径刷新，审批重新加载。
+- `packages/server/public/chat.js`：新增 `adoptBrowserTabsForSession(sessionId)`。首条消息 `meta` 返回新 `sessionId` 且仍停在草稿时，把 `browserTabsScopeSessionId` 从 `''` 改成正式会话、更新每个 tab 的 `sessionId`、删 draft key、按正式会话持久化。
+- `packages/desktop/main.mjs` + `preload.cjs`：新增 `eab:adopt-browser-session` IPC。主进程只收养明确列出的、当前 `sessionId=''` 的原生 `WebContentsView`，把其 `sessionId` 改为正式会话并切换 `activeChatSessionId`；非法 sessionId 或非草稿标签不收养。
+- `packages/server/public/chat.js`：`setChatMode()` 移除无条件的 `closeWorkspaceFile()`，切对话/切模式不再自动关文件标签；由会话切换逻辑负责保存/恢复。`closeWorkbenchKind('cloud')` 等手动 × 仍按用户动作关闭。
+
+**验收**
+
+- 网页真实服务：`POST /api/chat/sessions` 新建空会话后 `GET /api/chat/sessions` 的 `visible=false`；删除探针后列表只剩有用户消息的「钉钉 · 对话」「测试一下图表渲染」，原空「新工作任务」也被隐藏。
+- 网页草稿：点「新对话」后左侧列表条数不变；在草稿开网页标签或云空间后 `localStorage` 的 `:draft` 仍为 `null`；切到已有对话后网页标签为 0、云空间自动关闭；再开新对话仍为 0 标签、0 云空间。
+- 会话隔离：A 开云空间切 B，B 无云空间标签；切回 A 云空间恢复。A 开 `README.md` 切 B，B 无文件标签；切回 A 文件恢复为 `README.md`。A 开 `https://example.com` 切 B，B 0 标签；切回 A 恢复同一 `bp_...` 页面，手动 × 后标签归 0。
+- 首条消息：草稿开一个空白网页标签，发送“只回复OK”后新会话进入左侧列表、标题为「只回复OK」，`state.sessionId === browserTabsScopeSessionId`、标签 `sessionId` 全部改为新会话、draft key 为空；验收后删除该会话。
+- 刷新恢复：A 的云空间标签在刷新后自动恢复；标签只随用户手动关闭消失。
+- 桌面源码 CDP：`eabDesktop.adoptBrowserSession('chat_desktop_probe',[pageId])` 返回 `adoptedCount=1`；收养后 `listTabs(...,'chat_desktop_probe')` 为 1、空白 scope 为 0；非法 sessionId 返回 `ok=false`；关闭页面后该会话标签为 0。桌面源码实例因独立 profile 未登录，只验收主进程 IPC，未重复整套聊天 UI。
+- `node --check chat.js / main.mjs / preload.cjs`、`npm run typecheck` 通过；`desktop-bridge-tabs 2` + `local-project 5` + `workspace-folders 6` + `chat-session-space-route 3`，共 16 条通过。
+
+**边界与未完成**
+
+- 空会话只在 `GET /api/chat/sessions` 隐藏，不自动物理/软删除；旧数据库里预创建的空行仍保留，后续可加一次性清理。
+- 空白草稿标签只在内存与当前页面存在；刷新即丢弃。正式会话的网页标签、云空间、文件、团队、审批、工作台激活页按会话快照持久化。
+- 桌面原生标签仍然是隐藏保活，不是销毁重建；长期多对话会累计页面对象，后续需要 LRU 或标签上限。
+- 草稿首条消息与用户立即切走存在竞态：当前只收养“发送后仍停在草稿直到 `meta` 返回”的主路径；后台自动收养未做。
+- 桌面安装包仍为 `2026.11.24`，本轮桌面只改源码并通过源码 CDP 验收；打包版需重新构建安装后才能获得 `eab:adopt-browser-session` 与新的前端逻辑。
+- 桌面安装包版本与网页同源：`build-win-portable.mjs` / `build-win-installer.mjs` 都读取项目根 `package.json` 的 `version`，和 `/api/health` 显示值一致，不再单独使用 `packages/desktop/package.json` 的版本。发版时只改根版本，桌面 Setup、`desktop-release.json`、网页健康接口和下载页会保持一致。
+
+#### 23.3.7.13 v2026.11.26 桌面发布与服务器下载（2026-11-27）
+
+**目标**
+
+1. 根包、桌面包、`/api/health`、安装包和 `desktop-release.json` 统一为 `2026.11.26`；Git 标签和 Release 使用 `v2026.11.26`。
+2. 桌面安装包和便携包上传 GitHub Release，仓库可直接下载。
+3. 服务器升级后仍具备桌面下载能力：安装包不能只放在 `packages/desktop/release`，否则 `eab update` 整包替换 `packages` 时会丢失。
+4. 对话页增加显眼的「下载桌面端」入口，不再只藏在设置里。
+
+**实现**
+
+- `packages/desktop/scripts/build-win-installer.mjs`：构建后把 Setup、便携 zip、`desktop-release.json` 同步到数据目录；优先级为 `EAB_DESKTOP_RELEASE_DIR` > `EAB_HOME/desktop-release` > 仓库 `.eab-dev/desktop-release`。
+- `packages/server/src/routes/desktop-download.ts`：发布目录新增数据目录优先；本地无包时从 `EAB_DESKTOP_RELEASE_URL`（默认 `https://github.com/Jydsh/EAB/releases/latest/download`）读取 `desktop-release.json`，首次下载把 EXE 拉回数据目录并校验 SHA256，后续直接读本地。
+- `packages/server/public/chat.html` + `chat.js`：网页端顶栏新增 `#open-desktop-download`「下载桌面端」，桌面宿主隐藏；设置里的入口保留。
+- `.gitignore`：桌面 `release`、`installer/generated`、日志和 `node_modules` 不进 Git；桌面源码、安装器脚本和品牌资源进 Git。
+
+**服务器下载能力结论**
+
+- 本机源码服务：构建后数据目录和 `packages/desktop/release` 都有产物，`/download/desktop`、`/download/desktop/windows`、`/api/desktop/update` 直接可用。
+- `eab update` 升级：数据目录不参与 `packages` 替换，安装包保留；若新服务器首次没有本地包，则从 GitHub Release 回源一次并缓存。
+- Docker：必须把数据目录挂到 `/data/desktop-release`，并设置 `EAB_DESKTOP_RELEASE_DIR=/data/desktop-release`；镜像本身不塞 113MB 安装包。
+- 其他用户访问对话页后可从顶栏或设置进入 `/download/desktop`，下载的是服务器当前版本；桌面端自动更新仍走 `/api/desktop/update`，不会直接跳第三方地址。
+
+**验收**
+
+- `/api/health`、根 `package.json`、`packages/desktop/package.json`、安装包文件名和 `desktop-release.json` 的版本一致。
+- `/download/desktop` 显示 `v2026.11.26`，Setup 和便携包大小正确；`/api/desktop/update?currentVersion=2026.11.24` 返回 `hasUpdate=true`。
+- 重启服务、模拟 `eab update` 删除 `packages` 后，数据目录中的安装包仍可下载。
+- 清空数据目录后首次请求会回源 GitHub 并缓存，第二次请求直接走本地。
+
+### 23.4 当前安全边界
+
+- 仍然只允许 http/https；默认只读公网。内网地址必须由控制台显式开启，可配置精确主机白名单或 `*` 放行全部企业局域网，本机、链路本地和云元数据地址始终拒绝。
+- 自动登录、验证码/短信/2FA 自动处理尚未实现；当前登录流程由用户在右侧接管完成，扫码页只做识别提示，不解码二维码。
+- 站点账号密码已进入服务端加密凭据库；登录态复用已支持用户手动保存 Cookie/localStorage，但自动保存、站点适配器和招标分析流水线尚未落地。
+- 不自动破解图形验证码、不绕过平台付费墙或会员权限；批量数据优先使用平台官方搜索、订阅、导出能力。
+- 标标达站点适配器、招标项目数据模型和需求抽取流水线尚未落地，当前只能完成通用浏览器打开、人工登录和页面读取。
+
+### 23.5 下一阶段（B1）
+
+1. 服务端加密凭据库：账号密码只在浏览器进程注入，模型上下文不接触明文。
+2. 二维码优先：识别登录二维码并提示用户扫码；图形验证码/短信/2FA 转人工接管。
+3. 登录成功后的持久会话与站点适配器：标标达登录态复用、项目搜索/筛选/详情读取。
+4. 招标分析流水线：需求抽取、资格门槛、评分办法、企业匹配度和风险清单。
+
+#### 23.5.1 B1-1 已落地（2026-11-25）
+
+- 服务端加密凭据库：`browser-credentials.ts` 按 `companyId:userId + origin` 隔离，密码用 AES-256-GCM 加密，AAD 绑定 owner 与 origin；密钥单独存 `browser-credentials.key`（32 字节、`0600`），密文存 `browser-credentials.json`，未写数据库。
+- 工作台入口：浏览器工具栏新增钥匙按钮与“本站登录信息”面板，可保存、删除、回填；账号可回显，密码不在任何公开接口或审计中返回。
+- 填充边界：服务端只在页面上下文写入账号和最近的前置文本输入框，把焦点移到密码框；不自动点击登录、不提交表单、不绕过验证码或扫码。页面没有可见密码框时直接失败。
+- 已知限制：密钥与密文同目录，当前是应用层加密 + 文件权限，尚未接 Windows DPAPI / 凭据管理器；B1-2 已对凭据/登录态保存加 HTTPS 守卫，但控制台其他接口仍依赖部署层 TLS。
+- 未做：二维码优先识别、登录态持久化/标标达站点适配、招标分析流水线；自动填入当前仍由用户点击“填入当前页”触发。
+
+#### 23.5.2 B1-2 登录边界落地（2026-11-25）
+
+- 远程凭据传输（D5）：保存站点账号或登录态时，本机回环直连允许 HTTP；远程请求必须直连 TLS，或由同机反代声明 `x-forwarded-proto: https`，跨机反代还需把代理 IP 写入 `EAB_CREDENTIAL_PROXY_HOSTS`。否则返回 `FORBIDDEN`，不把密码放进远程明文。
+- 扫码识别：填充时若没有可见密码框，会检查页面是否存在语义为二维码/扫码的可见元素（class、id、aria-label、title、alt）。识别到就返回“当前页面是扫码登录，请用手机扫码完成”，不做二维码解码、不绕过登录。
+- 登录态持久化：`browser-session-store.ts` 按用户隔离、按站点合并保存 Cookie 与 localStorage，AES-256-GCM 加密，AAD 绑定 ownerKey；密钥 `browser-sessions.key` 32 字节、`0600`，密文 `browser-sessions.json`。新建 BrowserContext 时自动恢复，服务重启后仍可复用。
+- 工作台入口：登录面板新增“保存登录态 / 清除登录态”，显示已保存 Cookie 与本地存储数量；清除只删除持久化副本，当前页面仍保持登录，刷新或重开后才失效。
+- UI 修复：`renderWebPane()` 在普通网页存在时显式恢复 `#web-browser-bar`，修复工具栏被 `hidden` 卡住、钥匙按钮不可见的问题。
+- 仍未做：Windows DPAPI / 凭据管理器接入、登录成功自动保存、二维码自动优先打开、标标达站点适配器与招标分析流水线。
+
+### 23.6 验收记录
+
+> 说明：浏览器动作时间线已于 2026-11-26 第八轮按用户要求移除；本节下方早期验收中涉及“时间线/时钟按钮”的步骤仅作历史记录，不再作为当前验收标准。
+>
+> 移除验收（2026-11-26）：刷新 8787 后 `#web-timeline-toggle`、`#web-timeline`、`#web-timeline-count`、`#web-timeline-badge` 查询结果均为 0；工具栏只剩后退/前进/刷新/登录钥匙/键盘输入/暂停六个按钮；打开 `example.com` 后 `#web-pane-foot` 默认 `hidden=true`，画面仍铺满 `758×776`；点键盘按钮后 footer 展开、`#web-takeover` 出现且输入框获得焦点，再点一次收起；`pnpm typecheck` 通过。截图：`.eab-dev/timeline-removed-20261126.png`。
+
+- `packages/server/test/browser-session.test.ts`：13 条通过，覆盖实时帧、坐标点击、焦点输入、按键、滚动、跨用户拒绝、登录凭据填入、无密码框拒绝、扫码登录识别、登录态恢复，以及前进 / 后退 / 刷新 / 地址栏跳转。
+- `packages/server/test/browser-credentials.test.ts`：5 条通过，覆盖按用户和 origin 隔离、密码不落明文、重存覆盖、删除清空、origin 规范化与拒绝内嵌账号密码、密文篡改拒绝解密。
+- `packages/server/test/browser-session-store.test.ts`：8 条通过，覆盖按 origin 过滤、用户隔离、多站点合并、空状态拒绝、非 http/https 拒绝、密文篡改、Cookie 域名匹配与错误码。
+- `packages/server/test/browser-credential-transport.test.ts`：6 条通过，覆盖本机 HTTP、远程 HTTP 拒绝、直连 TLS、同机反代 HTTPS、跨机白名单和代理环境变量解析。
+- B1-1 真机验收：在 `saucedemo` 登录页保存测试账号后，面板显示 `https://www.saucedemo.com` 与账号、密码输入清空；点“填入当前页”后页面用户名框出现 `eab-test-user`、密码框显示掩码，提示“请确认后手动点击登录”且未自动提交；删除后状态回到未保存，`browser-credentials.json` 变为 `{}`。验收截图：`.eab-dev/b1-credentials-fill-20261125.png`。
+- 工作台内容区铺满真机验收（2026-11-25）：右侧打开 `https://example.com` 后，`#web-frame-shell` 为 `758×776`，帧自然尺寸 `1280×1310`，`#web-frame` 渲染为 `758×776` 且相对 shell 顶部偏移 `0`，`object-fit=contain`，上下留白消失；截图 `.eab-dev/web-browser-fill-final-20261125.png`。
+- B1-2 真机验收：在右侧网页打开 `https://httpbin.org/cookies/set?eab_session=ok`，登录面板显示 `https://httpbin.org`；点“保存登录态”后提示“登录态已加密保存”，状态为“已保存本站登录态（1 个 Cookie）”，`browser-sessions.json` 中不出现 `eab_session` 或明文值，密钥 32 字节；点“清除登录态”后状态回到未保存，文件变为 `{}`，当前页面仍保持登录。验收截图：`.eab-dev/b1-session-20261125.png`。
+- 多标签 UI 验收（第二轮记录；加号菜单已在第六轮移除）：顶栏只剩圆形加号与主题切换，审批与收起按钮均不再出现；加号菜单向下展开，可新建网页/Agent 团队/审批；连续点加号三次得到三个独立 `新标签页`，三个空标签的第一个胶囊都是可聚焦的网址输入框，顶部独立地址栏表单和“打开”按钮均不存在；在三个标签分别输入同一个 `https://example.com/` 后按回车，三个标签均显示 `Example Domain`、`已连接` 和各自实时帧，切换任意标签后画面跟随该页，关闭第二个标签后其余标签不受影响。空标签之间切换时各自已输入未提交的网址保持不变。在实时帧上点击一次，动作时间线从 1 条增到 2 条且无 `pageerror`。同时打开 `example.com` 与 `bbda.com` 两个网页标签，切换回第一个标签后标题恢复 `Example Domain`，关闭最后一个标签后面板收起、顶栏加号仍常驻。
+- 内网访问验收：控制台开启白名单 `*` 后，内置浏览器打开局域网页面 `http://192.168.1.13/` 成功显示“EAB 内网验收页”、状态“已连接”并出现实时帧；同一策略下打开 `http://127.0.0.1/` 仍被拒绝，提示“内网访问仅放行企业局域网，本机、链路本地和保留地址仍被拒绝”，页面无 `pageerror`。`packages/server/test/net-policy.test.ts` 与 `browser-network-config.test.ts` 共 21 条通过；`pnpm typecheck` 通过。
+- 新标签页搜索验收：输入框占位为“搜索或输入网址，回车打开”。输入不含网址的 `EAB 企业智能体基座` 后按回车，标签标题变为 `EAB 企业智能体基座_360搜索`，状态“已连接”，地址栏为 `https://www.so.com/s?q=...`，实时帧显示搜索结果页，动作时间线为“你 搜索‘EAB 企业智能体基座’”；同一输入框再输入 `example.com` 仍按网址打开 `Example Domain`，页面无 `pageerror`。搜索走公网 360 搜索页，不经过本机 SearXNG；SearXNG 仍在 `127.0.0.1:8080`，内置浏览器因本机地址硬拦截不能直接打开。
+- 浏览器工具栏验收：空草稿标签隐藏工具栏；打开搜索结果后工具栏显示，地址栏收起值为 `www.so.com`，`title` 为完整搜索 URL，状态“已连接”。点击地址栏后完整 URL 出现，`selectionStart=0`、`selectionEnd=92` 为全选；在地址栏输入 `github` 回车，标签变为 `github_360搜索`，地址栏回到 `www.so.com`。后退回到 `EAB 企业智能体基座_360搜索`，前进回到 `github_360搜索`，刷新后状态重新变为“已连接”，时间线新增一条标题类动作。暂停后按钮 class 为 `is-paused`、`aria-label` 为“继续画面”。暗色主题下工具栏、地址栏和状态胶囊对比正常，无 `pageerror`。
+- 真实接口：`https://example.com` 打开并取帧成功（JPEG 约 52KB，1280×800）；`https://bbda.com/` 返回标题“标标达_精准锁定全网招标采购商机_投标中标AI情报专家”，正文 4318 字、30 个可操作元素；`https://bidradar.com.cn/login.html` 返回手机号/验证码输入框和登录页帧。
+- D1 桌面原生浏览验收：Electron 45.4.1 主进程加载 `chat?company=c1`，`window.eabDesktop` 方法齐全；360 搜索原生页打开后 CDP 出现独立 `EAB_360搜索` page target，JS 页面内截图正常。桌面态全轮 `/frame` 请求为 0；视口 bounds 与 `#web-frame-shell` 完全一致；标签切换、Agent 团队隐藏、原生页关闭、主页面 reload 清理均通过。非法 URL（`file:`、`javascript:`、`data:`、带账号密码 URL）全部拒绝，`window.open` 返回 null 且不新增 target；在原生页执行 `location.href='file:///...'` 被阻止，页面留在原 URL，改成 `https` 跳转正常。
+- 第十一轮桌面验收：本地 `index.html` 上普通链接点击后 URL 变 `/same.html` 且标签数不变；`target=_blank`、`window.open` 各新增一个前台标签并立即有 `676×688` 视口；Ctrl+点击链接新增后台标签、当前标签保持原页；Ctrl+T 新建空标签、Ctrl+W 关闭草稿/原生标签、Ctrl+Tab 切换、Ctrl+L 聚焦地址栏并显示完整 URL；链接右键菜单出现「在新标签页打开 / 在后台标签页打开 / 在系统浏览器打开 / 复制链接地址」。安装包人工 ADS 绑定和服务端清单更新均通过；临时清单 `2026.11.25` 触发顶栏胶囊、原生弹窗、下载 100% 与 SHA256 校验，恢复清单后 `hasUpdate:false`。最终安装包 `EAB-Setup-2026.11.24-x64.exe` 为 `112,978,208` 字节，SHA256 `1a64803da675d12229be80ccbe4072b37766bbdbda4d38cd026f20a1d90809f0`。
+- 桌面图标修复：原 `eab.ico` 是损坏的多尺寸 ICO（Windows 无法加载），且安装器只引用 `$INSTDIR\assets\eab.ico` 却没有释放该目录；快捷方式和“应用和功能”因此回退到通用文件图标。已用 Pillow 从 `eab.png` 重新生成 16/24/32/48/64/128/256 多尺寸 ICO，安装段显式创建 `$INSTDIR\assets` 并释放图标；原安装目录补入有效 ICO 并刷新外壳缓存后，公共桌面快捷方式显示 EAB 品牌图标。新安装包图标资源也已验证。
+- 桌面 HTTP 语音验收：`http://192.168.1.13:8787` 下 `isSecureContext=true`、`navigator.mediaDevices` 可用、`voiceSupported()=true`；使用 Chromium 虚拟麦克风时 `getUserMedia` 返回 1 条音轨，证明无 HTTPS 的局域网部署也能进入录音链路。保存新的 HTTP 服务地址会先落盘配置再自动重启，让可信来源开关在新进程启动阶段生效。
+- Web 形态回归：同一 `chat?company=c1` 在 Edge/Chromium 中运行，`window.eabDesktop` 不存在，自动走原 JPEG 分支；360 搜索打开后状态“已连接”，`#web-frame` 为 1280×800，`pageerror` 为 0。
+- 浏览器 UI 对齐验收（第六轮）：原生壳顶栏和标签条 `+` 均直接新建“新标签页”，`#workbench-add-menu` 不存在；标签条激活页签高 42、白底圆角、带站点 favicon，工具栏高 44、地址居中、无“已连接”胶囊；`#web-frame-shell` bounds 与原生 View 完全一致；动作时间线默认隐藏，点时钟后 shell `688→621`、原生 bounds 同步 `610×621`；从 360 搜索跳到 `example.com` 后旧 favicon 清空；暗色主题下标签条 / 工具栏 / 地址栏无 `pageerror`。
+- Web-only 右侧工作台验收（第七轮）：8787 页面 `+` 直接新增“新标签页”，`#workbench-add-menu` 为 0；网页标签激活时 `#web-pane-foot.hidden=true`、`#web-takeover.hidden=true`，工具栏键盘按钮可见且 `aria-expanded=false`；点击键盘按钮后 footer 展开、`#web-input-text` 获得焦点，再次点击收起；新建标签页展示 Agent 团队、审批、云空间三枚胶囊；`example.com` 页面通过服务端帧显示，`x-eab-favicon` 响应头存在；打开带图标站点后标签 class 含 `has-favicon` 且图标 URL 为 http(s) 地址；无 `pageerror`。
+- 类型检查通过：`pnpm typecheck`。
+
 ## 附录 A：术语与 DSH 能力对照
 
 | DSH 概念 | EAB 对应 | 迁移注意 |
@@ -4097,6 +4754,9 @@ web-*   ← shared-types（**禁止** import server/runtime/storage）
 | 10 知识库 | `packages/server/src/kb-*.ts`、`packages/storage/migrations/*kb*.sql` |
 | 11 运行时 | `packages/server/src/agent-runtime.ts`、`agent-team.ts`、`llm.ts`、`model-registry.ts`、`routes/tools.ts`、`routes/chat.ts` |
 | 15 数据字典 | `packages/storage/migrations/*.sql` |
+| 23.3.4 桌面宿主与原生浏览器 | `packages/desktop`（D1 起）、`packages/server/public/chat.js` 的 `window.eabDesktop` 分支、`packages/server/src/browser-session.ts` 的桌面控制驱动 |
+| 23.3.5 浏览器 UI 对齐 | `packages/server/public/chat.html` 的 `#workbench-tabs` / `#web-browser-bar`、`chat.js` 的 `renderWorkbenchTabs` / `applyDesktopBrowserState`、`chat.css` 末尾“浏览器工作台：对齐豆包桌面版”整段 |
+| 23.3.7 桌面分发 / 更新 | `packages/desktop/main.mjs`、`preload.cjs`、`installer/eab-installer.nsi`、`installer/scripts/detect-server-url.ps1`、`scripts/build-win-installer.mjs`、`packages/server/src/routes/desktop-download.ts`、`chat.js` 的 `bindDesktopUpdates` / `renderDesktopUpdate`、`chat.html` 的 `#desktop-update-chip` / `#settings-update` |
 | 16 接口契约 | `packages/server/src/routes/*.ts`（实况）；没有独立的 shared-types 包 |
 | 18 工程结构 | `packages/*`、`scripts/smoke-http.mjs` |
 | 20 进度 | 本文件 20.2.2、`docs/EAB-P*-2026-11-24.md`、`docs/EAB-Agent框架对照审计与能力建设需求-2026-11-23.md` |
@@ -4186,7 +4846,7 @@ web-*   ← shared-types（**禁止** import server/runtime/storage）
 1. `video.analyze` 运行时调用：只有端点类型、用途位与设计管线。
 2. AGT-05b `project.exec` strict 沙箱的**真实隔离验收**：Docker/bwrap 执行、断网和越界写入尚未在具备后端的机器上验证。
 3. 移动端、访客门户、企微真实回调。
-4. AGT-21 全量压测 + SLO 基线；目前只有功能回归，没有并发/延迟/失败率基线。
+4. AGT-21 剩余项：真实厂商延迟、10 万 chunk 检索、子 Agent 并发、双实例与阶梯加压；v1 基线已落地，不能当成生产容量上限。
 5. 生产监控、灾难恢复演练、真实员工大样本验收。
 
 使用方式见同目录 `EAB使用说明.md`。

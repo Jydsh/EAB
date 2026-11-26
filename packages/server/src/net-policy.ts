@@ -35,7 +35,7 @@ export interface SafeFetchOptions {
   readonly signal?: AbortSignal
   /** 仅测试或管理员显式放行内网时使用；默认 false。 */
   readonly allowPrivateNetwork?: boolean
-  /** 与 allowPrivateNetwork 搭配：只放行这些域名/IP；为空表示不限制（仅测试使用）。 */
+  /** 与 allowPrivateNetwork 搭配：只放行这些域名/IP；`*` 表示放行全部企业局域网。 */
   readonly privateNetworkHosts?: readonly string[]
   /** 仅测试或可信 provider 使用，允许非 80/443 端口。 */
   readonly allowedPorts?: readonly number[]
@@ -88,6 +88,23 @@ function isPrivateIPv4(address: string): boolean {
   if (a === 192 && b === 0 && parts[2] === 0) return true
   if (a === 198 && (b === 18 || b === 19)) return true
   if (a >= 224) return true
+  return false
+}
+
+/**
+ * 是否属于企业局域网可以访问的地址。
+ *
+ * 只包含 RFC1918、CGNAT 和 IPv6 ULA；环回、链路本地、未指定和组播不算内网，
+ * 即使管理员打开“全部内网”也继续拒绝，避免浏览器打到 EAB 自己或云元数据。
+ */
+function isInternalIPv4(address: string): boolean {
+  const parts = ipv4Parts(address)
+  if (!parts) return false
+  const [a, b] = parts
+  if (a === 10) return true
+  if (a === 100 && b >= 64 && b <= 127) return true
+  if (a === 172 && b >= 16 && b <= 31) return true
+  if (a === 192 && b === 168) return true
   return false
 }
 
@@ -167,6 +184,25 @@ export function isPrivateAddress(address: string): boolean {
   return groups ? isPrivateIPv6Shape(groups) : false
 }
 
+/** 判断一个 IP 字面量是否属于可放行的企业局域网地址。 */
+export function isInternalNetworkAddress(address: string): boolean {
+  const clean = address.trim().replace(/^\[|\]$/g, '')
+  if (ipv4Parts(clean)) return isInternalIPv4(clean)
+  const groups = expandIPv6(clean)
+  if (!groups) return false
+  if ((groups[0] & 0xfe00) === 0xfc00) return true
+  const embedded = `${Math.floor(groups[6] / 256)}.${groups[6] % 256}.${Math.floor(groups[7] / 256)}.${groups[7] % 256}`
+  const mapped =
+    groups[0] === 0 &&
+    groups[1] === 0 &&
+    groups[2] === 0 &&
+    groups[3] === 0 &&
+    groups[4] === 0 &&
+    groups[5] === 0xffff
+  const nat64 = groups[0] === 0x0064 && groups[1] === 0xff9b && groups[2] === 0 && groups[3] === 0 && groups[4] === 0 && groups[5] === 0
+  return (mapped || nat64) && isInternalIPv4(embedded)
+}
+
 function domainList(env: NodeJS.ProcessEnv, key: string): string[] {
   return String(env[key] ?? '')
     .split(',')
@@ -190,6 +226,7 @@ function allowsPrivateHost(hostname: string, options: SafeFetchOptions): boolean
   if (!options.allowPrivateNetwork) return false
   const allowlist = options.privateNetworkHosts
   if (!allowlist || allowlist.length === 0) return true
+  if (allowlist.includes('*')) return true
   return allowlist.some((domain) => matchesDomain(hostname, domain))
 }
 
@@ -322,25 +359,40 @@ async function resolveTarget(url: URL, options: SafeFetchOptions, env: NodeJS.Pr
   const hostname = url.hostname.replace(/^\[|\]$/g, '')
   if (!hostname) throw new EabError(EC.VALIDATION, '链接缺少域名')
   const allowPrivate = allowsPrivateHost(hostname, options)
+  const wildcardPrivate = options.allowPrivateNetwork === true && options.privateNetworkHosts?.includes('*') === true
   // localhost 永远拒绝，包括管理员名单：EAB 自己的控制台和接口不能被模型访问。
   if (hostname === 'localhost' || hostname.endsWith('.localhost')) {
     throw new EabError(EC.VALIDATION, '不允许访问本机或局域网地址', { hint: '换成公网域名或公网 IP' })
   }
   if (hostname.endsWith('.local') && !allowPrivate) {
     throw new EabError(EC.VALIDATION, '不允许访问本机或局域网地址', {
-      hint: '让管理员把该域名加入内置浏览器内网白名单',
+      hint: '让管理员把该域名加入内置浏览器内网白名单，或填 * 放行全部局域网目标',
     })
   }
 
   let address = hostname
   let family: 4 | 6 = 4
   if (ipv4Parts(hostname)) {
-    if (isPrivateAddress(hostname) && !allowPrivate) {
-      throw new EabError(EC.VALIDATION, '不允许访问内网、本机或保留地址', { hint: '提供公网可访问的链接' })
+    if (isPrivateAddress(hostname)) {
+      if (!allowPrivate) {
+        throw new EabError(EC.VALIDATION, '不允许访问内网、本机或保留地址', { hint: '提供公网可访问的链接' })
+      }
+      if (wildcardPrivate && !isInternalNetworkAddress(hostname)) {
+        throw new EabError(EC.VALIDATION, '内网访问仅放行企业局域网，本机、链路本地和保留地址仍被拒绝', {
+          hint: '使用 RFC1918 / CGNAT / IPv6 ULA 内的地址',
+        })
+      }
     }
   } else if (expandIPv6(hostname)) {
-    if (isPrivateAddress(hostname) && !allowPrivate) {
-      throw new EabError(EC.VALIDATION, '不允许访问内网、本机或保留地址', { hint: '提供公网可访问的链接' })
+    if (isPrivateAddress(hostname)) {
+      if (!allowPrivate) {
+        throw new EabError(EC.VALIDATION, '不允许访问内网、本机或保留地址', { hint: '提供公网可访问的链接' })
+      }
+      if (wildcardPrivate && !isInternalNetworkAddress(hostname)) {
+        throw new EabError(EC.VALIDATION, '内网访问仅放行企业局域网，本机、链路本地和保留地址仍被拒绝', {
+          hint: '使用 RFC1918 / CGNAT / IPv6 ULA 内的地址',
+        })
+      }
     }
     family = 6
   } else {
@@ -359,9 +411,15 @@ async function resolveTarget(url: URL, options: SafeFetchOptions, env: NodeJS.Pr
     if (usable.length === 0) {
       throw new EabError(EC.UPSTREAM, `域名没有可用地址：${hostname}`)
     }
-    if (!allowPrivate && usable.some((record) => isPrivateAddress(record.address))) {
+    const privateRecords = usable.filter((record) => isPrivateAddress(record.address))
+    if (!allowPrivate && privateRecords.length > 0) {
       throw new EabError(EC.VALIDATION, '域名解析到了内网或保留地址，已拒绝访问', {
-        hint: '提供公网域名；如果确实是内网站点，让管理员把域名加入内置浏览器内网白名单',
+        hint: '提供公网域名；如果确实是内网站点，让管理员把域名加入内置浏览器内网白名单，或填 * 放行全部局域网目标',
+      })
+    }
+    if (wildcardPrivate && privateRecords.some((record) => !isInternalNetworkAddress(record.address))) {
+      throw new EabError(EC.VALIDATION, '域名解析到了本机、链路本地或保留地址，已拒绝访问', {
+        hint: '内网访问只放行 RFC1918 / CGNAT / IPv6 ULA 地址',
       })
     }
     address = usable[0].address

@@ -139,6 +139,12 @@ export function requiresToolApprovalForArgs(tool: ToolRiskInput, args: Record<st
   if (tool.id === 'workspace.folder') {
     return String(args.action ?? '').trim().toLowerCase() === 'delete'
   }
+  if (tool.id === 'browser' || tool.id === 'browser.use') {
+    // 读取当前页、列标签、截屏和滚动不产生外部副作用，不需要每次弹审批；
+    // 点按、输入、打开网址、前进后退、刷新和关闭标签仍然逐次审批。
+    const action = String(args.action ?? 'snapshot').trim().toLowerCase()
+    return !['list', 'snapshot', 'screenshot', 'scroll', 'activate'].includes(action)
+  }
   return true
 }
 

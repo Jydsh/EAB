@@ -1,0 +1,19 @@
+{
+  "name": "@eab/desktop",
+  "version": "2026.11.26",
+  "private": true,
+  "type": "module",
+  "description": "EAB 桌面宿主：原生 Chromium 网页标签，不再使用 JPEG 投屏",
+  "main": "main.mjs",
+  "scripts": {
+    "postinstall": "node node_modules/electron/install.js",
+    "start": "electron .",
+    "start:probe": "electron . --probe",
+    "build:win": "node scripts/build-win-portable.mjs",
+    "build:installer": "node scripts/build-win-installer.mjs"
+  },
+  "devDependencies": {
+    "electron": "45.4.1",
+    "rcedit": "^5.0.2"
+  }
+}

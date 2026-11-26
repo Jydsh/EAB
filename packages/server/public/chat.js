@@ -19,6 +19,8 @@ const qsAppend = (url) => {
   return `${url}${url.includes('?') ? '&' : '?'}${text.slice(1)}`
 }
 const currentAs = () => new URLSearchParams(location.search).get('as')
+/** 桌面宿主注入的原生浏览器桥；Web 形态下为 null，所有分支必须能回退到服务端投屏。 */
+const desktopBrowserHost = window.eabDesktop?.isDesktop ? window.eabDesktop : null
 
 const ROLE_LABEL = {
   super_admin: '平台超管',
@@ -1916,7 +1918,13 @@ function withTimeout(promise, ms, message) {
 }
 
 async function api(path, options) {
-  const response = await fetch(path, options)
+  const headers = new Headers(options?.headers || {})
+  // 桌面页面把设备标识一并带给服务端，Agent 的 browser 工具才能定位到右侧原生标签页。
+  if (desktopBrowserHost && state.desktopInfo?.deviceId) {
+    headers.set('x-eab-desktop', '1')
+    headers.set('x-eab-desktop-device', state.desktopInfo.deviceId)
+  }
+  const response = await fetch(path, { ...(options || {}), headers })
   const payload = await response.json().catch(() => null)
   if (!response.ok || !payload || payload.ok === false) {
     const err = new Error((payload && (payload.error?.message || payload.message)) || `HTTP ${response.status}`)
@@ -1968,6 +1976,14 @@ const state = {
     voices: [],
     speechAvailable: false,
   },
+  /** 桌面端版本：只从当前 EAB 服务器检查，状态由主进程 eab:update-state 推送。 */
+  desktopUpdate: {
+    status: 'idle',
+    current: '',
+    latest: '',
+    progress: 0,
+    error: '',
+  },
   /** 当前正在播放的语音，避免连续回答叠加播放。 */
   activeVoiceAudio: null,
   /** 停止播放时要触发的收尾回调（用于语音对话在播报结束后续听）。 */
@@ -2007,6 +2023,12 @@ const state = {
   personas: [],
   sessionId: null,
   sessions: [],
+  /**
+   * 未落库的草稿会话：点「新对话 / 新工作任务」后先只在前端开空白态，
+   * 不进左侧列表；首条消息发出时才由后端落库。切走 / 关闭即丢弃，不留痕迹。
+   * 结构：{ mode: 'chat' | 'task', spaceKind, spaceId, localProject }
+   */
+  draftSession: null,
   historyBefore: null,
   historyHasMore: false,
   historyLoading: false,
@@ -2040,6 +2062,31 @@ const state = {
   wsUploadHideTimer: 0,
   spaceKind: 'cloud',
   spaceLabel: '云空间',
+  /** 当前绑定的本地项目 id；空表示云空间或纯对话 */
+  spaceId: null,
+  localProjects: [],
+  localProject: null,
+  localFilePath: '',
+  localFileEntries: [],
+  localFilesLoading: false,
+  localProjectsLoaded: false,
+  /** 项目文件夹折叠状态；按用户持久化，默认展开 */
+  projectCollapsed: {},
+  projectCollapsedOwner: '',
+  projectCollapsedLoaded: false,
+  /** 桌面宿主信息：deviceId / deviceName 等；Web 形态为 null */
+  desktopInfo: null,
+  /** 新建项目草稿：名称、工作目录、云端资源、指令 */
+  projectDraft: { name: '', path: '', rootRealPath: '', cloudRefs: [], instructions: '' },
+  projectDraftBusy: false,
+  /** 从输入区项目选择器进入新建项目时，创建成功后直接把当前对话归入该项目。 */
+  projectDraftAssignOnCreate: false,
+  /** 项目主页状态；与当前对话的文件空间解耦 */
+  projectHomeOpen: false,
+  projectHomeProject: null,
+  projectHomeTab: 'chat',
+  cloudPickSelected: [],
+  cloudPickTarget: null,
   plugins: [],
   pluginData: null,
   pluginSelected: null,
@@ -2053,6 +2100,11 @@ const state = {
   /** 当前实际停留的界面：chat / workspace / settings，刷新后恢复 */
   view: 'chat',
   filePreview: null,
+  /** 右侧「云空间」浏览面板；独立于当前会话的文件空间，只读浏览全部云端文件 */
+  cloudSpaceOpen: false,
+  cloudSpacePath: '',
+  cloudSpaceLoading: false,
+  cloudSpaceError: '',
   /** 当前对话回合的子 Agent 团队；key 为 childId，同一子 Agent 复用同一窗口 */
   agentRuns: new Map(),
   /** 父 Agent 名称，用于团队标题 */
@@ -2073,8 +2125,34 @@ const state = {
   agentPanelOpen: new Map(),
   /** 每个子 Agent 窗口的滚动位置；和主对话一样：贴底时跟随新内容，上滑后停在历史 */
   agentScroll: new Map(),
-  /** 右侧工作台当前面板：team / file */
+  /** 右侧工作台当前面板：team / web / file / perm */
   workbenchTab: 'team',
+  /** 工作台当前网页；pageId 与 Agent browser 工具复用同一 Playwright 页面 */
+  browserPage: null,
+  /** 右侧网页标签页；每个条目是一个独立 pageId，切换时只换画面不关页面 */
+  browserTabs: [],
+  browserTabSeq: 0,
+  /** 用户主动打开过 Agent 团队预览后，即使还没有子 Agent 也保留这个标签页 */
+  teamTabOpen: false,
+  /** Web 形态的键盘接管面板默认收起，点工具栏键盘图标才展开 */
+  browserControlOpen: false,
+  /** 实时帧轮询：暂停只停画面，不关页面 */
+  browserFrameTimer: 0,
+  browserFrameBusy: false,
+  browserFrameAbort: null,
+  browserFrameObjectUrl: '',
+  browserStream: null,
+  browserStreamPageId: '',
+  browserStreamWatchdog: 0,
+  browserStreamLastFrameAt: 0,
+  browserStateTick: 0,
+  browserPaused: false,
+  browserOpening: false,
+  browserNavigating: false,
+  browserWarmStarted: false,
+  browserNotice: '',
+  browserNoticeBad: false,
+  browserFrameError: '',
   /** 团队与文件是否并排显示 */
   workbenchSplit: false,
   /** 右侧工作台是否折叠为窄条；只收起外观，不丢 tab / 并排状态 */
@@ -2108,6 +2186,7 @@ const SIDEBAR_COLLAPSED_KEY = 'eab.chat.sidebarCollapsed'
 const FILE_SPLIT_RATIO_KEY = 'eab.chat.fileSplitRatio'
 /** 右栏（Agent 团队 / 文件）与对话之间的宽度比例，独立于文件预览记住 */
 const TEAM_SPLIT_RATIO_KEY = 'eab.chat.teamSplitRatio'
+const WEB_SPLIT_RATIO_KEY = 'eab.chat.webSplitRatio'
 const WORKBENCH_COLLAPSED_KEY = 'eab.chat.workbenchCollapsed'
 const TEAM_LIST_WIDTH_KEY = 'eab.chat.teamListWidth'
 const SIDE_SECTION_RATIO_KEY = 'eab.chat.sideSectionRatio'
@@ -2263,14 +2342,20 @@ function endBoot(text) {
 
 async function refreshConsoleEntry() {
   const entry = $('#console-entry')
-  if (!entry) return
+  const moreEntry = $('#side-more-console')
+  if (!entry) {
+    if (moreEntry) moreEntry.hidden = true
+    return
+  }
   try {
     const data = await api('/api/me/console-entry')
     if (!data?.visible) {
       entry.hidden = true
+      if (moreEntry) moreEntry.hidden = true
       return
     }
     entry.hidden = false
+    if (moreEntry) moreEntry.hidden = false
     const company = new URLSearchParams(location.search).get('company')
     const targetOf = (href) => {
       const target = new URL(href || '/admin', location.href)
@@ -2298,6 +2383,7 @@ async function refreshConsoleEntry() {
     }
   } catch {
     entry.hidden = true
+    if (moreEntry) moreEntry.hidden = true
   }
 }
 
@@ -2396,9 +2482,51 @@ function sessionIsRunning(sessionId) {
   return false
 }
 
+function sideSessionGlyph(task = false) {
+  return task
+    ? '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2.8" y="2.8" width="10.4" height="10.4" rx="2" fill="none" stroke="currentColor" stroke-width="1.25"/><path d="m5.8 10.6.4-2 4.7-4.7a1 1 0 0 1 1.4 0l.5.5a1 1 0 0 1 0 1.4L8 10.2l-2.2.4Z" fill="none" stroke="currentColor" stroke-width="1.15" stroke-linejoin="round"/></svg>'
+    : '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 4.4A1.7 1.7 0 0 1 4.7 2.7h6.6A1.7 1.7 0 0 1 13 4.4v5a1.7 1.7 0 0 1-1.7 1.7H7l-2.8 2.1v-2.1H4.7A1.7 1.7 0 0 1 3 9.4V4.4Z" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round"/></svg>'
+}
+
+function chatProjectGlyph() {
+  return '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.2 5h4l1.2 1.5h5.9a1.2 1.2 0 0 1 1.2 1.2v5.1a1.2 1.2 0 0 1-1.2 1.2H3.4a1.2 1.2 0 0 1-1.2-1.2V5Z" fill="none" stroke="currentColor" stroke-width="1.15" stroke-linejoin="round"/><path d="M2.2 5V4.3a1 1 0 0 1 1-1h2.4l1.1 1.1h3.6a1 1 0 0 1 1 1v.8" fill="none" stroke="currentColor" stroke-width="1.15" stroke-linejoin="round"/></svg>'
+}
+
+/** 顶部上下文：项目名 → 会话标题 → 工作任务 → 桌面在线状态。 */
+function renderChatContextBadges(project = null, task = false, online = null) {
+  const projectBadge = $('#chat-project-badge')
+  if (projectBadge) {
+    projectBadge.hidden = !project
+    projectBadge.innerHTML = project ? `${chatProjectGlyph()}<span>${esc(project.name || '项目')}</span>` : ''
+    if (project) projectBadge.title = project.rootPath || project.name || ''
+  }
+  const taskBadge = $('#chat-task-badge')
+  if (taskBadge) taskBadge.hidden = !task
+  const deviceBadge = $('#chat-device-badge')
+  if (deviceBadge) {
+    const showDevice = Boolean(!desktopBrowserHost && project && online !== null)
+    deviceBadge.hidden = !showDevice
+    deviceBadge.classList.toggle('is-offline', showDevice && online === false)
+    deviceBadge.textContent = showDevice ? (online ? '桌面在线' : '桌面离线') : ''
+    deviceBadge.title = showDevice
+      ? (online ? '项目所在电脑已连接，可以读写项目文件' : '项目所在电脑未连接；历史可看，文件操作需要电脑在线')
+      : ''
+  }
+}
+
+function projectOnlineState(project) {
+  if (!project) return null
+  if (project.deviceOnline !== undefined) return project.deviceOnline !== false
+  const known = (state.localProjects || []).find((item) => item.id === project.id)
+  return known ? known.deviceOnline !== false : null
+}
+
 function renderSessions() {
   const box = $('#session-list')
-  const sessions = sortSessionsByRecent(state.sessions)
+  // 桌面端把项目会话挂在项目树里；网页端没有项目树，最近列表直接展示远端项目会话。
+  const sessions = sortSessionsByRecent(state.sessions).filter(
+    (session) => !desktopBrowserHost || session.spaceKind !== 'local',
+  )
   $('#side-sessions').hidden = sessions.length === 0 && !state.me
   if (sessions.length === 0) {
     box.innerHTML = '<div class="side-session-empty">还没有对话</div>'
@@ -2411,16 +2539,25 @@ function renderSessions() {
       const displayTitle =
         session.source === 'dingtalk' ? String(session.title || '').replace(/^钉钉\s*·\s*/, '') : session.title
       const running = sessionIsRunning(session.id)
+      const task = session.projectMode === 'task'
+      // 项目名本身就是新会话标题时，不再重复挂一次项目徽标。
+      const projectName = session.spaceKind === 'local' ? String(session.projectName || '本地项目') : ''
+      const showProjectBadge = Boolean(projectName) && displayTitle !== projectName
       return `<div class="side-session ${session.id === state.sessionId ? 'active' : ''}" data-session="${esc(session.id)}" draggable="true">
-        <button class="side-session-main" type="button" data-open="${esc(session.id)}" title="${esc(session.title)}">${
+        <button class="side-session-main" type="button" data-open="${esc(session.id)}" title="${esc(session.title)}">
+          <span class="side-session-icon ${task ? 'is-task' : ''}" aria-hidden="true">${sideSessionGlyph(task)}</span>${
           running
             ? '<span class="side-session-running" role="status" aria-label="正在回复" title="正在回复"></span>'
             : session.unread && session.id !== state.sessionId
               ? '<span class="side-session-unread" aria-label="有新的回复" title="有新的回复"></span>'
               : ''
         }${
+          showProjectBadge
+            ? `<span class="side-session-project">${esc(projectName)}</span>`
+            : ''
+        }${
           session.source === 'dingtalk' ? '<span class="side-session-source">钉钉</span>' : ''
-        }${esc(displayTitle)}</button>
+        }<span class="side-session-title">${esc(displayTitle)}</span></button>
         <button class="side-session-more" type="button" data-more="${esc(session.id)}" title="会话操作" aria-label="会话操作">⋯</button>
       </div>`
     })
@@ -2467,6 +2604,7 @@ async function loadSessions() {
     state.sessions = []
   }
   renderSessions()
+  renderLocalProjects()
 }
 
 /** 同一 messageId 的后续结果：更新原气泡，而不是再追加一条。 */
@@ -3414,12 +3552,17 @@ async function openSession(sessionId) {
   clearRemoteLive()
   hideSettings()
   setChatMode('chat')
+  closeProjectHome({ silent: true })
   resetAgentRuns()
+  // 切到已有正式会话：之前未发送任何消息的草稿直接丢弃，不留记录。
+  state.draftSession = null
   if (state.messageEdit) cancelMessageEdit({ clearInput: true, silent: true })
   const seq = ++state.openSeq
   try {
     const data = await api(historyMessagesUrl(sessionId))
     if (seq !== state.openSeq) return
+    // 标签页跟着对话走：切走前先保存旧会话的标签，切回时再按该会话自己的快照恢复。
+    switchBrowserTabScope(data.session.id)
     state.sessionId = data.session.id
     state.view = 'chat'
     persistChatLocation()
@@ -3440,7 +3583,14 @@ async function openSession(sessionId) {
     state.historyMessageIds.clear()
     markSessionReadLocally(data.session.id)
     renderSessions()
-    $('#chat-title').textContent = data.session.title
+    renderLocalProjects()
+    $('#chat-title').textContent = data.session.title || (state.spaceKind === 'local' && state.localProject ? '新对话' : '会话')
+    renderChatContextBadges(
+      state.spaceKind === 'local' ? state.localProject : null,
+      data.session.projectMode === 'task',
+      state.spaceKind === 'local' ? projectOnlineState(state.localProject) : null,
+    )
+    void restoreBrowserTabsForSession(data.session.id)
     resetThread()
     const thread = $('#thread')
     const pendingClarify = trailingPendingClarify(data.messages)
@@ -3503,25 +3653,397 @@ async function openSession(sessionId) {
   }
 }
 
-function newSession() {
+function genericSessionTitle(mode) {
+  return mode === 'task' ? '新工作任务' : '新对话'
+}
+
+/**
+ * 丢弃未发送首条消息的空白草稿：状态、右侧标签、文件预览一起清掉。
+ * 已发送消息的正式会话不走这里。
+ */
+function discardDraftSession() {
+  const hadDraft = Boolean(state.draftSession)
+  const draftScope = browserTabsScopeSessionId === ''
+  if (!hadDraft && !draftScope) return false
+  state.draftSession = null
+  if (state.filePreview) closeWorkspaceFile()
+  if (draftScope) {
+    discardDraftBrowserTabs()
+    clearBrowserTabState()
+    clearWorkbenchShell()
+    syncWorkbenchLayout(true)
+  }
+  return true
+}
+
+/**
+ * 纯前端空白草稿：不落库、不进左侧列表。首条消息发出后才由后端创建会话；
+ * 在此之前切走 / 关闭标签，草稿直接丢弃，不留任何记录。
+ */
+function enterBlankDraft({ mode = 'chat', spaceKind = 'cloud', spaceId = null, localProject = null } = {}) {
+  const task = mode === 'task'
   hideSettings()
-  // 新建对话等于换上下文：连续语音不能沿用旧会话的收听状态与播报归属。
   if (state.voiceConversation.active) exitVoiceConversation({ silent: true })
   setChatMode('chat')
+  if (state.cloudSpaceOpen) {
+    state.cloudSpaceOpen = false
+    syncWorkbenchLayout(true)
+  }
   if (state.messageEdit) cancelMessageEdit({ clearInput: true, silent: true })
   state.openSeq += 1
+  switchBrowserTabScope('')
   state.sessionId = null
+  state.draftSession = { mode: task ? 'task' : 'chat', spaceKind, spaceId: localProject ? localProject.id : spaceId, localProject }
+  state.spaceKind = spaceKind
+  state.spaceId = localProject ? localProject.id : spaceId
+  state.localProject = localProject
+  state.localFilePath = ''
+  state.localFileEntries = []
+  stopLocalFilesWatcher()
   clearComposerAttachments()
   setSelected('', { persist: false })
   resetAgentRuns()
   resetHistoryState()
-  $('#chat-title').textContent = '新对话'
+  $('#chat-title').textContent = genericSessionTitle(mode)
+  renderChatContextBadges(localProject, task, localProject ? projectOnlineState(localProject) : null)
   resetThread()
   renderSessions()
   renderQueueState()
+  renderSpaceChip()
+  renderLocalProjectSide()
+  if (state.me && spaceKind !== 'local') void loadWorkspaceFiles(true)
   persistChatLocation()
   $('#input').focus()
 }
+
+/**
+ * 新工作任务 / 新对话先只在前端开空白草稿，不立即落库、不进列表；
+ * 等首条消息发出后再由后端创建会话并以第一句话命名。
+ * 当前已是同类型空白草稿时，只回到输入框，避免重复开空白态。
+ */
+async function openNewSession(mode = 'chat') {
+  const task = mode === 'task'
+  const draft = state.draftSession
+  if (
+    draft &&
+    draft.mode === mode &&
+    state.historyMessageIds.size === 0 &&
+    !sessionReplyBusy()
+  ) {
+    $('#input')?.focus()
+    return
+  }
+  hideSettings()
+  if (state.voiceConversation.active) exitVoiceConversation({ silent: true })
+  if (state.messageEdit) cancelMessageEdit({ clearInput: true, silent: true })
+  // 已有一个未发消息的空白草稿时，再点另一种新会话等于离开旧草稿：
+  // 旧草稿和它自己的右侧标签直接丢弃，再开新的空白态。
+  if (state.draftSession && state.historyMessageIds.size === 0) discardDraftSession()
+  setChatMode('chat')
+  if (state.cloudSpaceOpen) {
+    state.cloudSpaceOpen = false
+    syncWorkbenchLayout(true)
+  }
+  clearComposerAttachments()
+  const project = state.spaceKind === 'local' ? state.localProject : null
+  if (project) {
+    enterBlankDraft({ mode, spaceKind: 'local', spaceId: project.id, localProject: project })
+    return
+  }
+  enterBlankDraft({ mode, spaceKind: state.spaceKind === 'none' ? 'none' : 'cloud', spaceId: null, localProject: null })
+}
+
+async function newSession(options = {}) {
+  if (options.create !== false) {
+    await openNewSession('chat')
+    return
+  }
+  // 在本地项目里点“新建”= 在同一个项目下开一个新对话，而不是回到云空间。
+  if (state.spaceKind === 'local' && state.localProject) {
+    try {
+      await createProjectSession(state.localProject, 'chat')
+    } catch (err) {
+      banner(err.message || '新建项目对话失败', 'bad')
+    }
+    return
+  }
+  // 纯前端空白草稿：不落库、不进列表；首条消息发出后才创建会话。
+  enterBlankDraft({ mode: 'chat', spaceKind: 'cloud', spaceId: null, localProject: null })
+}
+
+async function startNewWorkTask() {
+  // 顶部“新工作任务”：先开前端空白草稿，首条消息落库后保留 task 类型与任务徽标。
+  await openNewSession('task')
+}
+
+function openPluginsWorkspace() {
+  // 切到工作台属于离开对话：未发送消息的草稿连同右侧标签直接丢弃。
+  discardDraftSession()
+  setChatMode('workspace')
+  if (state.workspaceKind !== 'plugins') setWorkspaceKind('plugins')
+}
+
+/* ---------------- 定时任务浮层 ---------------- */
+
+let scheduleLoading = false
+let scheduleTrigger = null
+
+const SCHEDULE_STATUS = {
+  active: { label: '运行中', className: 'is-active' },
+  paused: { label: '已暂停', className: 'is-paused' },
+  running: { label: '执行中', className: 'is-running' },
+  done: { label: '已完成', className: '' },
+  error: { label: '失败', className: 'is-error' },
+  cancelled: { label: '已取消', className: '' },
+}
+
+function scheduleStatusMeta(status) {
+  return SCHEDULE_STATUS[String(status || '')] || { label: status || '未知', className: '' }
+}
+
+function scheduleModeLabel(mode) {
+  return {
+    chat: '对话',
+    task: '工作任务',
+    agent: 'Agent',
+    once: '单次',
+  }[String(mode || '')] || String(mode || '任务')
+}
+
+function scheduleChannelLabel(channel) {
+  return channel === 'dingtalk' ? '钉钉' : '网页'
+}
+
+function formatScheduleDate(value) {
+  if (!value) return ''
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return ''
+  return date.toLocaleString('zh-CN', { hour12: false, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+}
+
+function scheduleTimeLabel(item) {
+  const status = String(item.status || '')
+  if (status === 'active' || status === 'running' || status === 'paused') {
+    const next = item.nextRunLocal || formatScheduleDate(item.nextRunAt)
+    return next ? `下次 ${next}` : '暂无下次执行'
+  }
+  const last = formatScheduleDate(item.lastRunAt)
+  if (last) return `上次 ${last}`
+  if (status === 'cancelled') return '已取消'
+  if (status === 'error' && item.lastError) return `最近失败：${item.lastError}`
+  return '已结束'
+}
+
+function renderScheduleList(items) {
+  const list = $('#schedule-list')
+  if (!list) return
+  if (!Array.isArray(items) || items.length === 0) {
+    list.innerHTML = `<div class="schedule-list-empty">
+      <strong>还没有定时任务</strong>
+      <span>在对话里描述“每天/每周要做什么”，Agent 会帮你创建。</span>
+    </div>`
+    return
+  }
+  list.innerHTML = items
+    .map((item) => {
+      const status = scheduleStatusMeta(item.status)
+      const when = scheduleTimeLabel(item)
+      const canToggle = item.status === 'active' || item.status === 'paused'
+      return `<div class="schedule-item" data-schedule-id="${esc(item.id)}">
+        <div class="schedule-item-main">
+          <div class="schedule-item-title">
+            <strong title="${esc(item.title || item.prompt || '定时任务')}">${esc(item.title || item.prompt || '定时任务')}</strong>
+            <span class="schedule-status ${status.className}">${esc(status.label)}</span>
+          </div>
+          <div class="schedule-item-meta">
+            <span class="is-next" title="${esc(when)}">${esc(when)}</span>
+            <span>${esc(scheduleModeLabel(item.mode))}</span>
+            <span>${esc(scheduleChannelLabel(item.channel))}</span>
+          </div>
+        </div>
+        ${
+          canToggle
+            ? `<button class="schedule-toggle" type="button" data-schedule-toggle="${esc(item.id)}" data-action="${item.status === 'active' ? 'pause' : 'resume'}">${item.status === 'active' ? '暂停' : '恢复'}</button>`
+            : ''
+        }
+      </div>`
+    })
+    .join('')
+}
+
+async function loadSchedules() {
+  const list = $('#schedule-list')
+  const refresh = $('#schedule-refresh')
+  if (!list || scheduleLoading) return
+  scheduleLoading = true
+  if (refresh) refresh.disabled = true
+  list.innerHTML = `<div class="schedule-list-empty"><span>正在读取定时任务…</span></div>`
+  try {
+    const data = await api('/api/schedules')
+    renderScheduleList(data?.schedules || [])
+  } catch (err) {
+    const hint = err?.status === 403 ? '当前账号没有查看定时任务的权限。' : err?.message || '读取定时任务失败'
+    list.innerHTML = `<div class="schedule-list-empty"><strong>暂时读不到定时任务</strong><span>${esc(hint)}</span></div>`
+  } finally {
+    scheduleLoading = false
+    if (refresh) refresh.disabled = false
+  }
+}
+
+function openScheduleModal(trigger) {
+  const modal = $('#schedule-modal')
+  if (!modal) return
+  scheduleTrigger = trigger || null
+  hideSideMoreMenu()
+  modal.hidden = false
+  void loadSchedules()
+  $('.schedule-card')?.focus()
+}
+
+function closeScheduleModal() {
+  const modal = $('#schedule-modal')
+  if (!modal) return
+  modal.hidden = true
+  if (scheduleTrigger && typeof scheduleTrigger.focus === 'function') scheduleTrigger.focus()
+  scheduleTrigger = null
+}
+
+async function startScheduleDraft() {
+  closeScheduleModal()
+  await newSession({ create: false })
+  const input = $('#input')
+  if (!input) return
+  input.value = '帮我创建一个定时任务：'
+  input.dispatchEvent(new Event('input', { bubbles: true }))
+  input.focus()
+  const end = input.value.length
+  if (typeof input.setSelectionRange === 'function') input.setSelectionRange(end, end)
+}
+
+async function toggleSchedule(button) {
+  const id = String(button?.dataset?.scheduleToggle || '')
+  const action = String(button?.dataset?.action || '')
+  if (!id || !action) return
+  button.disabled = true
+  try {
+    await api(`/api/schedules/${encodeURIComponent(id)}/${action}`, { method: 'POST' })
+    await loadSchedules()
+  } catch (err) {
+    banner(err?.message || (action === 'pause' ? '暂停定时任务失败' : '恢复定时任务失败'), 'bad')
+    button.disabled = false
+  }
+}
+
+/* ---------------- “更多”浮层 ---------------- */
+
+function hideSideMoreMenu(options = {}) {
+  const menu = $('#side-more-menu')
+  const button = $('#side-more')
+  if (!menu || menu.hidden) return
+  menu.hidden = true
+  if (button) {
+    button.setAttribute('aria-expanded', 'false')
+    if (options.focusButton) button.focus()
+  }
+}
+
+function showSideMoreMenu(trigger) {
+  const menu = $('#side-more-menu')
+  const button = $('#side-more')
+  if (!menu || !button) return
+  menu.hidden = false
+  button.setAttribute('aria-expanded', 'true')
+  const anchor = (trigger || button).getBoundingClientRect()
+  const box = menu.getBoundingClientRect()
+  const gap = 8
+  let left = anchor.right + gap
+  if (left + box.width > window.innerWidth - 8) left = Math.max(8, anchor.left - box.width - gap)
+  const top = Math.min(Math.max(8, anchor.top - 4), window.innerHeight - box.height - 8)
+  menu.style.left = `${left}px`
+  menu.style.top = `${top}px`
+}
+
+/* ---------------- 顶部导航绑定 ---------------- */
+
+function bindSideNav() {
+  const side = $('#chat-side')
+  if (!side || side.dataset.navBound === '1') return
+  side.dataset.navBound = '1'
+
+  side.querySelectorAll('[data-side-action]').forEach((button) => {
+    button.addEventListener('click', (event) => {
+      const action = button.dataset.sideAction
+      if (action === 'more') {
+        event.preventDefault()
+        const menu = $('#side-more-menu')
+        if (menu && !menu.hidden) hideSideMoreMenu({ focusButton: true })
+        else showSideMoreMenu(button)
+        return
+      }
+      hideSideMoreMenu()
+      if (action === 'new-task') void startNewWorkTask()
+      else if (action === 'new-chat') void newSession()
+      else if (action === 'workspace') setChatMode('workspace')
+      else if (action === 'plugins') openPluginsWorkspace()
+      else if (action === 'schedules') openScheduleModal(button)
+      else if (action === 'cloud') openCloudSpacePane()
+    })
+  })
+
+  $('#side-more-new-project')?.addEventListener('click', () => {
+    hideSideMoreMenu()
+    void beginNewLocalProject()
+  })
+  $('#side-more-cloud')?.addEventListener('click', () => {
+    hideSideMoreMenu()
+    openCloudSpacePane()
+  })
+  $('#side-more-console')?.addEventListener('click', () => {
+    hideSideMoreMenu()
+    $('#console-entry')?.click()
+  })
+  $('#side-more-settings')?.addEventListener('click', () => {
+    hideSideMoreMenu()
+    showSettings()
+  })
+
+  const moreProject = $('#side-more-new-project')
+  if (moreProject) moreProject.hidden = !desktopBrowserHost
+
+  $('#schedule-close')?.addEventListener('click', closeScheduleModal)
+  $('#schedule-refresh')?.addEventListener('click', () => void loadSchedules())
+  $('#schedule-new')?.addEventListener('click', () => void startScheduleDraft())
+  $('#schedule-modal')?.addEventListener('click', (event) => {
+    if (event.target === event.currentTarget) closeScheduleModal()
+  })
+  $('#schedule-list')?.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-schedule-toggle]')
+    if (button) void toggleSchedule(button)
+  })
+
+  document.addEventListener('click', (event) => {
+    const menu = $('#side-more-menu')
+    if (!menu || menu.hidden) return
+    if (menu.contains(event.target) || $('#side-more')?.contains(event.target)) return
+    hideSideMoreMenu()
+  })
+
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return
+    const menu = $('#side-more-menu')
+    if (menu && !menu.hidden) {
+      event.preventDefault()
+      hideSideMoreMenu({ focusButton: true })
+      return
+    }
+    const modal = $('#schedule-modal')
+    if (modal && !modal.hidden) {
+      event.preventDefault()
+      closeScheduleModal()
+    }
+  })
+}
+
 
 function sessionById(sessionId) {
   return state.sessions.find((session) => session.id === sessionId)
@@ -3538,6 +4060,7 @@ function showSessionMenu(sessionId, anchor) {
   const menu = $('#session-menu')
   const session = sessionById(sessionId)
   if (!menu || !session) return
+  hideProjectMenu()
   hideFileMenu()
   menu.innerHTML = `<div class="session-menu-title">${esc(session.title)}</div>
     <button type="button" data-act="rename">重命名</button>
@@ -3733,7 +4256,7 @@ function openConfirmCard({ eyebrow = '危险操作', title, targetLabel = '目�
     const previousFocus = document.activeElement
     const overlay = document.createElement('div')
     overlay.className = 'modal-overlay confirm-overlay'
-    overlay.innerHTML = `<div class="modal confirm-card" role="dialog" aria-modal="true" aria-labelledby="confirm-card-title" aria-describedby="confirm-card-message">
+    overlay.innerHTML = `<div class="modal confirm-card" data-eab-focus-owned="1" role="dialog" aria-modal="true" aria-labelledby="confirm-card-title" aria-describedby="confirm-card-message">
       <div class="confirm-card-head">
         <span class="confirm-card-icon" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 2.6 14.2 13.4H1.8L8 2.6Z" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round"/><path d="M8 6.2v3.5" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/><circle cx="8" cy="11.4" r=".65" fill="currentColor"/></svg></span>
         <div class="confirm-card-titles">
@@ -3828,6 +4351,12 @@ async function deleteSession(sessionId) {
     await api(`/api/chat/sessions/${encodeURIComponent(sessionId)}${qs()}`, { method: 'DELETE' })
     banner('会话已删除', 'ok')
     if (state.sessionId === sessionId) {
+      if (desktopBrowserHost && typeof desktopBrowserHost.close === 'function') {
+        for (const tab of state.browserTabs) {
+          if (tab.pageId && tab.native) desktopBrowserHost.close(tab.pageId)
+        }
+      }
+      switchBrowserTabScope('')
       state.sessionId = null
       $('#chat-title').textContent = '新对话'
       resetHistoryState()
@@ -3862,8 +4391,13 @@ async function loadWorkspaceFiles(options = {}) {
       ])
       state.files = data.items || []
       if (!workspacePathExists(state.files, state.workspacePath)) state.workspacePath = ''
-      if (state.me) $('#side-files').hidden = false
+      if (state.cloudSpacePath && !workspacePathExists(state.files, state.cloudSpacePath)) {
+        state.cloudSpacePath = ''
+      }
+      const cloudSection = $('#side-files')
+      if (cloudSection) cloudSection.hidden = false
       renderWorkspaceFiles()
+      if (state.cloudSpaceOpen) renderCloudSpacePane()
       if (silent && list) list.scrollTop = scrollTop
       if (quota) {
         renderWorkspaceQuota(quota)
@@ -3913,6 +4447,7 @@ function handleWorkspaceFilesEvent(payload) {
     const deleted = new Set(fileIds)
     state.files = state.files.filter((file) => !deleted.has(String(file.id)))
     renderWorkspaceFiles()
+    if (state.cloudSpaceOpen) renderCloudSpacePane()
     if (state.filePreview && deleted.has(String(state.filePreview.id))) {
       stopWorkspacePreviewWatch()
       closeWorkspaceFile()
@@ -3998,6 +4533,7 @@ function maybeWarnWorkspaceQuota(quota) {
 }
 
 function spaceLabelFor(kind) {
+  if (kind === 'local') return state.localProject?.name || '本地项目'
   return kind === 'none' ? '不使用文件' : '云空间'
 }
 
@@ -4005,27 +4541,65 @@ function renderSpaceChip() {
   const label = $('#space-chip-label')
   const chip = $('#space-chip')
   if (!label || !chip) return
-  const kind = state.spaceKind === 'none' ? 'none' : 'cloud'
+  const kind =
+    state.spaceKind === 'none' ? 'none' : state.spaceKind === 'local' && state.localProject ? 'local' : 'cloud'
   state.spaceKind = kind
   state.spaceLabel = spaceLabelFor(kind)
-  label.textContent = state.spaceLabel
+  // 云空间是平台自带能力，不再作为需要用户选择的空间项展示。
+  // 输入区只显示“项目”入口：未归属项目时保持中性文案，归入项目后显示项目名。
+  label.textContent = kind === 'local' ? state.localProject?.name || '项目' : '项目'
   chip.classList.toggle('is-none', kind === 'none')
-  chip.title = kind === 'none'
-    ? '本轮不读写文件；点击可切换到云空间'
-    : '云空间默认可用；点击可切换为不使用文件空间'
-  chip.setAttribute('aria-label', `文件空间：${state.spaceLabel}`)
+  chip.classList.toggle('is-local', kind === 'local')
+  chip.title =
+    kind === 'local'
+      ? `当前对话属于「${state.spaceLabel}」；点击可切换项目`
+      : '选择当前对话归属的项目'
+  chip.setAttribute('aria-label', kind === 'local' ? `项目：${state.spaceLabel}` : '项目')
 }
 
-/** 文件空间固定为云空间：输入区不再提供切换入口，历史会话也统一回到默认。 */
-function applySessionSpace(_session) {
-  state.spaceKind = 'cloud'
+/** 会话恢复：云空间 / 无文件 / 本地项目三态；本地项目只展开左侧项目分组。 */
+function applySessionSpace(session) {
+  const kind = session?.spaceKind === 'local' && session?.project
+    ? 'local'
+    : session?.spaceKind === 'none'
+      ? 'none'
+      : 'cloud'
+  state.spaceKind = kind
+  if (kind === 'local') {
+    state.localProject = session.project
+    state.spaceId = session.project.id
+    state.localFilePath = ''
+    state.localFileEntries = []
+    setProjectCollapsed(session.project.id, false)
+    stopLocalFilesWatcher()
+  } else {
+    state.localProject = null
+    state.spaceId = null
+    state.localFilePath = ''
+    state.localFileEntries = []
+    stopLocalFilesWatcher()
+  }
   renderSpaceChip()
+  renderLocalProjectSide()
 }
 
 function setSpace(kind, _spaceId, options = {}) {
+  // 本地项目只能通过「新建项目 / 项目列表」进入，空间菜单只负责引导。
+  if (kind === 'local') {
+    hideSpaceMenu()
+    void beginNewLocalProject({ assign: true })
+    return
+  }
+  state.localProject = null
+  state.spaceId = null
+  state.localFilePath = ''
+  state.localFileEntries = []
+  stopLocalFilesWatcher()
   state.spaceKind = kind === 'none' ? 'none' : 'cloud'
   renderSpaceChip()
+  renderLocalProjectSide()
   hideSpaceMenu()
+  if (!options.silent && state.spaceKind === 'cloud') void loadWorkspaceFiles(true)
   if (!options.silent) {
     closeWorkspaceFile()
     banner(`文件空间已切换为「${spaceLabelFor(state.spaceKind)}」；发送新消息后生效。`, 'ok')
@@ -4055,25 +4629,998 @@ function bindSpacePicker() {
   })
 }
 
+function spaceMenuFolderIcon() {
+  return '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.4 5.2h4l1.2 1.4h5.9v5.6a1.4 1.4 0 0 1-1.4 1.4H3.8a1.4 1.4 0 0 1-1.4-1.4V5.2Z" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round"/><path d="M2.4 5.2V4.4A1.2 1.2 0 0 1 3.6 3.2h2.8l1.2 1.2h3.6A1.2 1.2 0 0 1 12.4 5.6v.8" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round"/></svg>'
+}
+
+function spaceMenuPlusIcon() {
+  return '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3.2v9.6M3.2 8h9.6" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>'
+}
+
+function spaceMenuNoProjectIcon() {
+  return '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.4 5.2h4l1.2 1.4h5.9v5.6a1.4 1.4 0 0 1-1.4 1.4H3.8a1.4 1.4 0 0 1-1.4-1.4V5.2Z" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round"/><path d="m3.6 12.4 8.8-8.8" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>'
+}
+
+/** 输入区「项目」入口：桌面端列出本机项目，网页端列出同账号的在线/离线桌面项目。云空间能力始终存在，不在这里选择。 */
 function renderSpaceMenu() {
   const menu = $('#space-menu')
   if (!menu) return
-  const options = [
-    { kind: 'cloud', label: '云空间', desc: '默认可用，文件保存在云端' },
-    { kind: 'none', label: '不使用文件空间', desc: '本轮只聊天，不读写任何文件' },
-  ]
-  menu.innerHTML = options
-    .map(
-      (option) => `<button class="space-menu-item${state.spaceKind === option.kind ? ' is-active' : ''}" type="button" data-space-kind="${option.kind}">
-        <span class="space-menu-name">${option.label}</span>
-        <span class="space-menu-desc">${option.desc}</span>
-      </button>`,
+  const projects = state.localProjects || []
+  const activeProjectId = state.spaceKind === 'local' ? state.localProject?.id || '' : ''
+  const cloudActive = state.spaceKind === 'cloud'
+  const projectRows = projects.length
+    ? projects
+        .map((project) => {
+          const active = project.id === activeProjectId
+          const online = project.deviceOnline !== false
+          const path = active && project.rootPath
+            ? `<span class="space-menu-project-path" title="${esc(project.rootPath)}">${esc(project.rootPath)}</span>`
+            : ''
+          const device = desktopBrowserHost
+            ? ''
+            : `<span class="space-menu-device${online ? '' : ' is-offline'}">${online ? '桌面在线' : '桌面离线'}</span>`
+          return `<button class="space-menu-project${active ? ' is-active' : ''}" type="button" data-space-project="${esc(project.id)}" title="${esc(project.name)}">
+            <span class="space-menu-project-icon">${spaceMenuFolderIcon()}</span>
+            <span class="space-menu-project-name">${esc(project.name)}</span>
+            ${device}
+            ${path}
+            ${active ? '<span class="space-menu-check" aria-hidden="true">✓</span>' : ''}
+          </button>`
+        })
+        .join('')
+    : `<div class="space-menu-empty">${desktopBrowserHost ? '还没有项目' : '同账号还没有桌面项目'}</div>`
+
+  menu.innerHTML = `
+    <div class="space-menu-projects">${projectRows}</div>
+    <div class="space-menu-actions">
+      ${desktopBrowserHost ? `<button class="space-menu-action" type="button" data-space-action="new-project">
+        <span class="space-menu-action-icon">${spaceMenuPlusIcon()}</span>
+        <span>创建新项目</span>
+      </button>` : ''}
+      <button class="space-menu-action${cloudActive ? ' is-active' : ''}" type="button" data-space-action="no-project">
+        <span class="space-menu-action-icon is-muted">${spaceMenuNoProjectIcon()}</span>
+        <span>不使用项目</span>
+        ${cloudActive ? '<span class="space-menu-check" aria-hidden="true">✓</span>' : ''}
+      </button>
+    </div>`
+
+  for (const button of menu.querySelectorAll('[data-space-project]')) {
+    button.addEventListener('click', () => {
+      const project = projects.find((item) => item.id === button.dataset.spaceProject)
+      if (project) void assignConversationToProject(project)
+    })
+  }
+  menu.querySelector('[data-space-action="new-project"]')?.addEventListener('click', () => {
+    hideSpaceMenu()
+    void beginNewLocalProject({ assign: true })
+  })
+  menu.querySelector('[data-space-action="no-project"]')?.addEventListener('click', () => {
+    void assignConversationSpace('cloud', null)
+  })
+}
+
+/** 当前对话直接归入某个本地项目，或退回云空间；已有会话同步回写服务端。 */
+async function assignConversationSpace(kind, project, options = {}) {
+  hideSpaceMenu()
+  const sameProject = kind === 'local' && state.spaceKind === 'local' && state.localProject?.id === project?.id
+  if (sameProject || (kind === 'cloud' && state.spaceKind === 'cloud')) {
+    if (project) {
+      setProjectCollapsed(project.id, false)
+      renderLocalProjects()
+    }
+    return
+  }
+  const sessionId = state.sessionId
+  if (sessionId) {
+    try {
+      const result = await api(`/api/chat/sessions/${encodeURIComponent(sessionId)}/space`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ spaceKind: kind, spaceId: kind === 'local' ? project?.id : null }),
+      })
+      if (kind === 'local' && result?.session?.project) project = result.session.project
+    } catch (err) {
+      banner(err.message || '切换项目失败', 'bad')
+      return
+    }
+  }
+  state.spaceKind = kind
+  state.spaceId = kind === 'local' ? project?.id || null : null
+  state.localProject = kind === 'local' ? project : null
+  state.localFilePath = ''
+  state.localFileEntries = []
+  stopLocalFilesWatcher()
+  if (kind === 'local' && project) setProjectCollapsed(project.id, false)
+  renderSpaceChip()
+  renderLocalProjectSide()
+  renderLocalProjects()
+  if (kind === 'cloud') {
+    closeWorkspaceFile()
+    void loadWorkspaceFiles(true)
+  } else {
+    closeWorkspaceFile()
+  }
+  if (sessionId) {
+    await loadSessions()
+    renderSessions()
+    renderLocalProjects()
+    const title = $('#chat-title')
+    const session = (state.sessions || []).find((item) => item.id === sessionId)
+    if (title && session?.title) title.textContent = session.title
+    renderChatContextBadges(
+      kind === 'local' ? state.localProject : null,
+      session?.projectMode === 'task',
+      kind === 'local' ? projectOnlineState(state.localProject) : null,
     )
-    .join('')
-  for (const button of menu.querySelectorAll('[data-space-kind]')) {
-    button.addEventListener('click', () => setSpace(button.dataset.spaceKind))
+  } else {
+    renderChatContextBadges(
+      kind === 'local' ? state.localProject : null,
+      false,
+      kind === 'local' ? projectOnlineState(state.localProject) : null,
+    )
+  }
+  if (!options.silent) {
+    banner(
+      options.message ||
+        (kind === 'local' && project
+          ? `已将当前对话归入「${project.name}」`
+          : '已取消当前对话的项目归属'),
+      'ok',
+    )
   }
 }
+
+async function assignConversationToProject(project, options = {}) {
+  if (!project) return
+  await assignConversationSpace('local', project, options)
+}
+/* ---------------- 本地项目 ---------------- */
+
+function localBaseName(value) {
+  return String(value || '').split(/[\\/]/).filter(Boolean).pop() || '本地项目'
+}
+
+function localJoinPath(root, relPath) {
+  const rootText = String(root || '').replace(/[\\/]+$/, '')
+  const rel = String(relPath || '').replace(/^[\\/]+/, '').replace(/\//g, '\\')
+  return rel ? `${rootText}\\${rel}` : rootText
+}
+
+function localApiUrl(path, params = {}) {
+  const query = new URLSearchParams()
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null && String(value) !== '') query.set(key, String(value))
+  }
+  const suffix = qs()
+  if (suffix) {
+    const extra = new URLSearchParams(suffix.replace(/^\?/, ''))
+    for (const [key, value] of extra.entries()) query.set(key, value)
+  }
+  const text = query.toString()
+  return `${path}${text ? `?${text}` : ''}`
+}
+
+async function loadLocalProjects() {
+  try {
+    const data = await api(localApiUrl('/api/local-projects'))
+    state.localProjects = data.projects || []
+  } catch {
+    state.localProjects = []
+  }
+  state.localProjectsLoaded = true
+  renderLocalProjects()
+  renderLocalProjectSide()
+}
+
+function upsertLocalProject(project) {
+  if (!project?.id) return
+  const others = state.localProjects.filter((item) => item.id !== project.id)
+  state.localProjects = [project, ...others]
+  if (state.localProject?.id === project.id) {
+    state.localProject = project
+    renderSpaceChip()
+  }
+  renderLocalProjects()
+}
+
+const PROJECT_COLLAPSED_STORAGE_PREFIX = 'eab.chat.collapsedProjects.v1:'
+
+function ensureProjectCollapsedLoaded() {
+  const owner = currentUserId() || 'anonymous'
+  if (state.projectCollapsedLoaded && state.projectCollapsedOwner === owner) return
+  state.projectCollapsedLoaded = true
+  state.projectCollapsedOwner = owner
+  state.projectCollapsed = {}
+  try {
+    const parsed = JSON.parse(localStorage.getItem(`${PROJECT_COLLAPSED_STORAGE_PREFIX}${owner}`) || '[]')
+    if (Array.isArray(parsed)) {
+      for (const id of parsed) {
+        if (typeof id === 'string' && id) state.projectCollapsed[id] = true
+      }
+    }
+  } catch {
+    /* 本地存储不可用时只在本次会话内记忆折叠状态 */
+  }
+}
+
+function projectIsCollapsed(projectId) {
+  ensureProjectCollapsedLoaded()
+  return state.projectCollapsed[projectId] === true
+}
+
+function setProjectCollapsed(projectId, collapsed) {
+  if (!projectId) return
+  ensureProjectCollapsedLoaded()
+  if (collapsed) state.projectCollapsed[projectId] = true
+  else delete state.projectCollapsed[projectId]
+  try {
+    const ids = Object.keys(state.projectCollapsed).filter((id) => state.projectCollapsed[id])
+    localStorage.setItem(`${PROJECT_COLLAPSED_STORAGE_PREFIX}${state.projectCollapsedOwner}`, JSON.stringify(ids))
+  } catch {
+    /* 本地存储不可用不影响折叠交互 */
+  }
+}
+
+function projectSessionsFor(projectId) {
+  return sortSessionsByRecent(
+    (state.sessions || []).filter(
+      (session) => session.spaceKind === 'local' && session.spaceId === projectId,
+    ),
+  )
+}
+
+function projectSessionRow(session, options = {}) {
+  const task = session.projectMode === 'task'
+  const running = sessionIsRunning(session.id)
+  const title = session.source === 'dingtalk'
+    ? String(session.title || '').replace(/^钉钉\s*·\s*/, '')
+    : session.title
+  return `<div class="project-child-row ${session.id === state.sessionId ? 'is-active' : ''}" data-project-session-row="${esc(session.id)}">
+    <button class="project-child ${session.id === state.sessionId ? 'is-active' : ''} ${task ? 'is-task' : ''}" type="button" data-project-session="${esc(session.id)}" title="${esc(session.title)}">
+      <span class="project-child-icon ${task ? 'is-task' : ''}" aria-hidden="true">${sideSessionGlyph(task)}</span>
+      <span class="project-child-name">${esc(title)}</span>
+      ${running ? '<span class="project-child-running" role="status" aria-label="正在执行"></span>' : session.unread && session.id !== state.sessionId ? '<span class="side-session-unread" aria-label="有新回复"></span>' : ''}
+    </button>
+    <button class="project-child-more" type="button" data-project-session-more="${esc(session.id)}" title="会话操作" aria-label="会话操作">⋯</button>
+  </div>`
+}
+
+function renderLocalProjects() {
+  const section = $('#side-projects')
+  const box = $('#project-list')
+  if (!section || !box) return
+  ensureProjectCollapsedLoaded()
+  const projects = state.localProjects || []
+  // 网页端不再重复渲染项目树：远端项目会话直接进最近列表，通过输入区项目选择器继续。
+  // 没有项目时整块收起，不用“还没有项目”的空状态占侧栏位置。
+  section.hidden = !state.me || !desktopBrowserHost || projects.length === 0
+  if (!state.me || !desktopBrowserHost || projects.length === 0) return
+  box.innerHTML = projects
+    .map((project) => {
+      const sessions = projectSessionsFor(project.id)
+      const active = state.projectHomeProject?.id === project.id || state.localProject?.id === project.id
+      const collapsed = projectIsCollapsed(project.id)
+      return `<div class="project-group ${active ? 'is-active' : ''}" data-project-group="${esc(project.id)}">
+        <div class="project-row">
+          <button class="project-row-main" type="button" data-project-toggle="${esc(project.id)}" title="${esc(project.rootPath || project.name)}" aria-expanded="${collapsed ? 'false' : 'true'}">
+            <span class="project-avatar" aria-hidden="true"><svg viewBox="0 0 16 16"><path d="M2.4 5.2h4l1.2 1.4h5.9v5.6a1.4 1.4 0 0 1-1.4 1.4H3.8a1.4 1.4 0 0 1-1.4-1.4V5.2Z" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round"/><path d="M2.4 5.2V4.4A1.2 1.2 0 0 1 3.6 3.2h2.8l1.2 1.2h3.6A1.2 1.2 0 0 1 12.4 5.6v.8" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round"/></svg></span>
+            <span class="project-row-copy">
+              <strong>${esc(project.name)}</strong>
+            </span>
+          </button>
+          <button class="project-more" type="button" data-project-more="${esc(project.id)}" aria-label="项目操作" title="项目操作">⋯</button>
+        </div>
+        <div class="project-children" ${collapsed ? 'hidden' : ''}>
+          ${sessions.map((session) => projectSessionRow(session)).join('')}
+        </div>
+      </div>`
+    })
+    .join('')
+  for (const button of box.querySelectorAll('[data-project-toggle]')) {
+    button.addEventListener('click', () => {
+      const id = button.dataset.projectToggle
+      setProjectCollapsed(id, !projectIsCollapsed(id))
+      renderLocalProjects()
+    })
+  }
+  for (const button of box.querySelectorAll('[data-project-session]')) {
+    button.addEventListener('click', () => openSession(button.dataset.projectSession))
+  }
+  for (const button of box.querySelectorAll('[data-project-session-more]')) {
+    button.addEventListener('click', (event) => {
+      event.stopPropagation()
+      showSessionMenu(button.dataset.projectSessionMore, button.getBoundingClientRect())
+    })
+  }
+  for (const row of box.querySelectorAll('[data-project-session-row]')) {
+    row.addEventListener('contextmenu', (event) => {
+      event.preventDefault()
+      showSessionMenu(row.dataset.projectSessionRow, row.getBoundingClientRect())
+    })
+  }
+  for (const button of box.querySelectorAll('[data-project-more]')) {
+    button.addEventListener('click', (event) => {
+      event.stopPropagation()
+      showProjectMenu(button.dataset.projectMore, button.getBoundingClientRect())
+    })
+  }
+}
+
+function renderLocalProjectSide() {
+  const desktop = Boolean(desktopBrowserHost)
+  const active = desktop && state.spaceKind === 'local' && Boolean(state.localProject)
+  const localSection = $('#side-local-files')
+  const cloudSection = $('#side-files')
+  // 项目文件不再占用左侧栏；项目本身只是一个可折叠的对话分组。
+  if (localSection) localSection.hidden = true
+  if (cloudSection) cloudSection.hidden = !state.me || active
+  renderLocalProjects()
+}
+
+async function ensureDesktopInfo(options = {}) {
+  if (state.desktopInfo && !options.force) return state.desktopInfo
+  if (!desktopBrowserHost || typeof desktopBrowserHost.getDesktopInfo !== 'function') return null
+  try {
+    state.desktopInfo = await desktopBrowserHost.getDesktopInfo()
+  } catch {
+    state.desktopInfo = null
+  }
+  return state.desktopInfo
+}
+
+/** 页面刷新后把本机项目目录重新交给桌面主进程，文件桥才能按 projectId 找到根目录。 */
+async function syncDesktopProjectBindings() {
+  if (!desktopBrowserHost?.bindProject || !state.desktopInfo?.deviceId) return
+  const own = (state.localProjects || []).filter(
+    (project) => project.deviceId && project.deviceId === state.desktopInfo.deviceId && project.rootPath,
+  )
+  for (const project of own) {
+    try {
+      await desktopBrowserHost.bindProject(project.id, project.rootPath)
+    } catch {
+      // 单个项目绑定失败不影响其他项目，真正读写时还会给出明确错误。
+    }
+  }
+}
+
+function projectDeviceLabel() {
+  if (!desktopBrowserHost) return '网页端不能访问本机文件夹，请在 EAB 桌面端创建项目'
+  if (!state.desktopInfo) return '正在读取桌面设备…'
+  return `${state.desktopInfo.deviceName || '本机'} · 项目目录保存在这台电脑上`
+}
+
+function syncProjectDraftUI() {
+  const draft = state.projectDraft
+  const name = $('#project-name')
+  if (name && name.value !== draft.name) name.value = draft.name
+  const instructions = $('#project-instructions')
+  if (instructions && instructions.value !== draft.instructions) instructions.value = draft.instructions
+  const label = $('#project-folder-label')
+  if (label) label.textContent = draft.path ? localBaseName(draft.path) : '添加本地文件夹'
+  const path = $('#project-folder-path')
+  if (path) {
+    path.hidden = !draft.path
+    path.textContent = draft.path || ''
+  }
+  const count = $('#project-cloud-count')
+  if (count) count.textContent = draft.cloudRefs.length > 0 ? `已选 ${draft.cloudRefs.length} 项` : '未选择'
+  const chips = $('#project-cloud-chips')
+  if (chips) {
+    chips.innerHTML = draft.cloudRefs
+      .map((ref) => `<span class="project-cloud-chip">${esc(String(ref).split('/').pop() || ref)}<button type="button" data-remove-cloud="${esc(ref)}" aria-label="移除">×</button></span>`)
+      .join('')
+    for (const button of chips.querySelectorAll('[data-remove-cloud]')) {
+      button.addEventListener('click', () => {
+        state.projectDraft.cloudRefs = state.projectDraft.cloudRefs.filter((item) => item !== button.dataset.removeCloud)
+        syncProjectDraftUI()
+      })
+    }
+  }
+  const deviceLabel = $('#project-device-label')
+  if (deviceLabel) deviceLabel.textContent = projectDeviceLabel()
+  const dot = $('#project-device-dot')
+  if (dot) dutchDot(dot, Boolean(desktopBrowserHost && state.desktopInfo))
+  const create = $('#project-modal-create')
+  if (create) create.disabled = state.projectDraftBusy || !draft.path
+}
+
+function dutchDot(dot, online) {
+  dot.classList.toggle('is-online', online)
+  dot.classList.toggle('is-offline', !online)
+}
+
+function openProjectModal(options = {}) {
+  if (!desktopBrowserHost) {
+    banner('本地项目只能在 EAB 桌面端创建。请打开桌面客户端，在安装它的电脑上选择文件夹。', 'warn')
+    return
+  }
+  const modal = $('#project-modal')
+  if (!modal) return
+  state.projectDraft = { name: '', path: '', rootRealPath: '', cloudRefs: [], instructions: '' }
+  state.projectDraftBusy = false
+  state.projectDraftAssignOnCreate = Boolean(options.assign)
+  syncProjectDraftUI()
+  modal.hidden = false
+  void ensureDesktopInfo({ force: true }).then(() => syncProjectDraftUI())
+  window.setTimeout(() => $('#project-name')?.focus(), 60)
+}
+
+function closeProjectModal() {
+  const modal = $('#project-modal')
+  if (modal) modal.hidden = true
+  closeCloudPicker()
+}
+
+async function pickLocalProjectFolder() {
+  if (typeof desktopBrowserHost?.pickDirectory !== 'function') return null
+  const picked = await desktopBrowserHost.pickDirectory({ title: '选择项目工作目录' })
+  if (picked?.canceled || !picked?.path) return null
+  return { path: picked.path, name: picked.name || localBaseName(picked.path), rootRealPath: picked.rootRealPath || '' }
+}
+
+async function beginNewLocalProject(options = {}) {
+  openProjectModal(options)
+}
+
+async function submitNewLocalProject() {
+  if (state.projectDraftBusy) return
+  const draft = state.projectDraft
+  const assignOnCreate = state.projectDraftAssignOnCreate
+  if (!draft.path) {
+    banner('请先选择项目工作目录', 'warn')
+    return
+  }
+  const button = $('#project-modal-create')
+  state.projectDraftBusy = true
+  if (button) {
+    button.disabled = true
+    button.textContent = '创建中…'
+  }
+  try {
+    const info = await ensureDesktopInfo()
+    if (!info?.deviceId) throw new Error('桌面端还没有准备好，请稍后重试')
+    const data = await api(localApiUrl('/api/local-projects'), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-eab-desktop': '1' },
+      body: JSON.stringify({
+        path: draft.path,
+        name: draft.name.trim() || undefined,
+        deviceId: info.deviceId,
+        instructions: draft.instructions.trim(),
+        cloudRefs: draft.cloudRefs,
+      }),
+    })
+    upsertLocalProject({ ...data.project, deviceOnline: true })
+    if (typeof desktopBrowserHost?.bindProject === 'function') {
+      try {
+        await desktopBrowserHost.bindProject(data.project.id, draft.path)
+      } catch (err) {
+        banner(`项目已创建，但本机目录绑定失败：${err.message || err}`, 'warn')
+      }
+    }
+    closeProjectModal()
+    state.projectDraftAssignOnCreate = false
+    const project = state.localProjects.find((item) => item.id === data.project.id) || data.project
+    setProjectCollapsed(project.id, false)
+    renderLocalProjects()
+    if (assignOnCreate) {
+      await assignConversationToProject(project, {
+        message: data.created
+          ? `已创建项目「${project.name}」，当前对话已归入该项目`
+          : `当前对话已归入「${project.name}」`,
+      })
+    } else {
+      banner(
+        data.created
+          ? `已创建项目「${project.name}」；可在项目右侧「⋯」中新建对话。`
+          : `已打开已有项目「${project.name}」。`,
+        'ok',
+      )
+    }
+  } catch (err) {
+    banner(err.message || '创建项目失败', 'bad')
+    if (err.hint) banner(err.hint, 'warn')
+  } finally {
+    state.projectDraftBusy = false
+    if (button) {
+      button.disabled = false
+      button.textContent = '创建'
+    }
+  }
+}
+
+async function createProjectSession(project, mode = 'chat') {
+  // 本地项目里的新对话 / 任务同样先开前端空白草稿，不落库、不进列表；
+  // 首条消息发出后才创建会话并归属到该项目。
+  setProjectCollapsed(project.id, false)
+  renderLocalProjects()
+  enterBlankDraft({ mode, spaceKind: 'local', spaceId: project.id, localProject: project })
+}
+
+async function openProjectConversation(project) {
+  const recent = (state.sessions || []).find(
+    (session) => session.spaceKind === 'local' && session.spaceId === project.id,
+  )
+  if (recent) {
+    await openSession(recent.id)
+    return
+  }
+  try {
+    await createProjectSession(project, 'chat')
+  } catch (err) {
+    banner(err.message || '打开项目失败', 'bad')
+  }
+}
+
+function hideProjectMenu() {
+  const menu = $('#project-menu')
+  if (menu) menu.hidden = true
+}
+
+function showProjectMenu(projectId, anchor) {
+  const menu = $('#project-menu')
+  const project = state.localProjects.find((item) => item.id === projectId)
+  if (!menu || !project) return
+  hideSessionMenu()
+  menu.innerHTML = `<div class="session-menu-title">${esc(project.name)}</div>
+    <button type="button" data-project-act="new-chat">新建对话</button>
+    <button type="button" data-project-act="new-task">新建工作任务</button>
+    <button type="button" data-project-act="open-folder">打开文件夹</button>
+    <button type="button" data-project-act="rename">重命名</button>
+    <button type="button" data-project-act="delete" class="is-danger">移除项目</button>`
+  menu.dataset.project = projectId
+  menu.hidden = false
+  const box = menu.getBoundingClientRect()
+  const left = Math.min(Math.max(8, anchor.right - box.width), window.innerWidth - box.width - 8)
+  const below = anchor.bottom + 4
+  const top = below + box.height + 8 > window.innerHeight ? Math.max(8, anchor.top - box.height - 4) : below
+  menu.style.left = `${left}px`
+  menu.style.top = `${top}px`
+}
+
+async function handleProjectMenuAction(action) {
+  const menu = $('#project-menu')
+  const project = state.localProjects.find((item) => item.id === menu?.dataset.project)
+  hideProjectMenu()
+  if (!project || !action) return
+  if (action === 'new-chat' || action === 'new-task') {
+    await createProjectSession(project, action === 'new-task' ? 'task' : 'chat')
+    return
+  }
+  if (action === 'open-folder') {
+    if (typeof desktopBrowserHost?.openPath === 'function') {
+      void desktopBrowserHost.openPath(project.rootPath)
+    } else {
+      banner(`项目目录：${project.rootPath}`, 'info')
+    }
+    return
+  }
+  if (action === 'rename') {
+    const name = window.prompt('项目名称', project.name)
+    if (name === null) return
+    const clean = String(name).trim()
+    if (!clean) return
+    try {
+      const data = await api(localApiUrl(`/api/local-projects/${encodeURIComponent(project.id)}`), {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: clean }),
+      })
+      upsertLocalProject(data.project)
+    } catch (err) {
+      banner(err.message || '重命名失败', 'bad')
+    }
+    return
+  }
+  if (action === 'delete') {
+    if (!window.confirm(`移除项目「${project.name}」？项目内的对话会一并删除，本机文件夹不会被删除。`)) return
+    try {
+      await api(localApiUrl(`/api/local-projects/${encodeURIComponent(project.id)}`), { method: 'DELETE' })
+      if (typeof desktopBrowserHost?.unbindProject === 'function') {
+        void desktopBrowserHost.unbindProject(project.id).catch(() => {})
+      }
+      state.localProjects = state.localProjects.filter((item) => item.id !== project.id)
+      delete state.projectCollapsed[project.id]
+      if (state.localProject?.id === project.id) setSpace('cloud', null, { silent: true })
+      if (state.projectHomeProject?.id === project.id) closeProjectHome({ silent: true })
+      await loadSessions()
+      renderLocalProjects()
+      banner(`已移除项目「${project.name}」；本机文件夹保持不变。`, 'ok')
+    } catch (err) {
+      banner(err.message || '移除项目失败', 'bad')
+    }
+  }
+}
+
+function closeProjectHome(options = {}) {
+  const pane = $('#project-pane')
+  if (pane) pane.hidden = true
+  state.projectHomeOpen = false
+  state.projectHomeProject = null
+  const thread = $('#thread')
+  if (thread) thread.hidden = false
+  const composer = document.querySelector('.composer')
+  if (composer) composer.hidden = false
+  document.body.classList.remove('project-home-open')
+  if (!options.silent) renderLocalProjects()
+}
+
+function openProjectHome(project) {
+  if (!project) return
+  setChatMode('chat')
+  const switchedProject = state.projectHomeProject?.id !== project.id
+  state.projectHomeOpen = true
+  state.projectHomeProject = project
+  if (switchedProject || !['chat', 'tasks', 'config'].includes(state.projectHomeTab)) state.projectHomeTab = 'chat'
+  const badge = $('#chat-task-badge')
+  if (badge) badge.hidden = true
+  const pane = $('#project-pane')
+  const thread = $('#thread')
+  const composer = document.querySelector('.composer')
+  if (pane) pane.hidden = false
+  if (thread) thread.hidden = true
+  if (composer) composer.hidden = true
+  document.body.classList.add('project-home-open')
+  const title = $('#chat-title')
+  if (title) title.textContent = project.name
+  renderProjectHome()
+  renderLocalProjects()
+}
+
+function renderProjectHome() {
+  const inner = $('#project-pane-inner')
+  const project = state.projectHomeProject
+  if (!inner || !project) return
+  const sessions = projectSessionsFor(project.id)
+  const chats = sessions.filter((session) => session.projectMode !== 'task')
+  const tasks = sessions.filter((session) => session.projectMode === 'task')
+  const tab = state.projectHomeTab
+  const initial = String(project.name || 'P').trim().slice(0, 1).toUpperCase()
+  const online = project.deviceOnline !== false
+  const content = tab === 'config'
+    ? `<form class="project-config" id="project-config-form">
+        <label class="project-config-field">
+          <span>项目名称</span>
+          <input name="name" value="${esc(project.name)}" maxlength="60" />
+        </label>
+        <div class="project-config-field">
+          <span>工作目录</span>
+          <div class="project-config-path">${esc(project.rootPath || '—')}<button type="button" id="project-config-open-folder">打开文件夹</button></div>
+          <em>目录在安装 EAB 桌面端的电脑上；服务端只保存设备和路径记录。</em>
+        </div>
+        <div class="project-config-field">
+          <span>云端资源</span>
+          <div class="project-config-cloud">
+            ${(project.cloudRefs || []).length > 0
+              ? project.cloudRefs.map((ref) => `<span class="project-config-chip">${esc(String(ref).split('/').pop() || ref)}</span>`).join('')
+              : '<em>还没有关联云端资源。</em>'}
+            <button type="button" id="project-config-cloud">选择云端资源</button>
+          </div>
+        </div>
+        <label class="project-config-field">
+          <span>项目指令</span>
+          <textarea name="instructions" rows="7" maxlength="8000" placeholder="项目内所有对话与工作任务共享的长期规则">${esc(project.instructions || '')}</textarea>
+          <em>这些规则会随项目内每轮对话注入 Agent；不要放一次性任务说明。</em>
+        </label>
+        <div class="project-config-actions">
+          <span class="project-config-status" id="project-config-status" role="status" aria-live="polite"></span>
+          <button class="btn primary" type="submit">保存修改</button>
+        </div>
+      </form>`
+    : tab === 'tasks'
+      ? `<div class="project-home-hero">
+          <div class="project-home-hero-copy">
+            <span class="project-home-kicker">WORK TASKS</span>
+            <h3>把复杂事情交给工作任务</h3>
+            <p>工作任务适合多步骤执行：先规划，再调用工具、读写项目文件，最后汇总产物。它和普通对话分开记录。</p>
+          </div>
+          <button class="btn primary" type="button" data-project-new-task>新建工作任务</button>
+        </div>
+        ${renderProjectHomeList(tasks, 'task')}`
+      : `<div class="project-home-hero">
+          <div class="project-home-hero-copy">
+            <span class="project-home-kicker">CONVERSATIONS</span>
+            <h3>在「${esc(project.name)}」里继续</h3>
+            <p>项目内对话共享项目指令、工作目录与云端资源，历史和产物都归在这个项目下。</p>
+          </div>
+          <button class="btn primary" type="button" data-project-new-chat>新建对话</button>
+        </div>
+        ${renderProjectHomeList(chats, 'chat')}`
+  inner.innerHTML = `
+    <div class="project-home-head">
+      <div class="project-home-identity">
+        <span class="project-home-avatar" aria-hidden="true">${esc(initial)}</span>
+        <div class="project-home-title">
+          <span class="project-home-kicker">PROJECT</span>
+          <h2>${esc(project.name)}</h2>
+          <div class="project-home-meta">
+            <span class="project-home-device ${online ? 'is-online' : 'is-offline'}"><i></i>${online ? '桌面端在线' : '桌面端离线'}</span>
+            <span class="project-home-path" title="${esc(project.rootPath || '')}">${esc(project.rootPath || '—')}</span>
+          </div>
+        </div>
+      </div>
+      <div class="project-home-actions">
+        <button class="btn ghost sm" type="button" data-project-open-folder>打开文件夹</button>
+        <button class="btn ghost sm" type="button" data-project-home-settings>项目配置</button>
+      </div>
+    </div>
+    <div class="project-home-tabs" role="tablist" aria-label="项目主页">
+      <button type="button" role="tab" data-project-tab="chat" aria-selected="${tab === 'chat'}" class="${tab === 'chat' ? 'is-active' : ''}">对话<span>${chats.length}</span></button>
+      <button type="button" role="tab" data-project-tab="tasks" aria-selected="${tab === 'tasks'}" class="${tab === 'tasks' ? 'is-active' : ''}">工作任务<span>${tasks.length}</span></button>
+      <button type="button" role="tab" data-project-tab="config" aria-selected="${tab === 'config'}" class="${tab === 'config' ? 'is-active' : ''}">项目配置</button>
+    </div>
+    <div class="project-home-body">${content}</div>`
+  for (const button of inner.querySelectorAll('[data-project-tab]')) {
+    button.addEventListener('click', () => {
+      state.projectHomeTab = button.dataset.projectTab
+      renderProjectHome()
+    })
+  }
+  inner.querySelector('[data-project-new-chat]')?.addEventListener('click', () => void createProjectSession(project, 'chat'))
+  inner.querySelector('[data-project-new-task]')?.addEventListener('click', () => void createProjectSession(project, 'task'))
+  inner.querySelectorAll('[data-project-session]').forEach((button) => {
+    button.addEventListener('click', () => openSession(button.dataset.projectSession))
+  })
+  inner.querySelectorAll('[data-project-open-folder], #project-config-open-folder').forEach((button) => {
+    button.addEventListener('click', () => openLocalProjectFolderFor(project))
+  })
+  inner.querySelector('[data-project-home-settings]')?.addEventListener('click', () => {
+    state.projectHomeTab = 'config'
+    renderProjectHome()
+  })
+  inner.querySelector('#project-config-cloud')?.addEventListener('click', () => openCloudPicker({ target: 'project', project }))
+  inner.querySelector('#project-config-form')?.addEventListener('submit', (event) => {
+    event.preventDefault()
+    void saveProjectConfig(project, event.currentTarget)
+  })
+}
+
+function renderProjectHomeList(sessions, mode) {
+  if (sessions.length === 0) {
+    return `<div class="project-home-empty">
+      <span class="project-home-empty-icon" aria-hidden="true">${mode === 'task' ? '◇' : '◌'}</span>
+      <strong>${mode === 'task' ? '还没有工作任务' : '还没有对话'}</strong>
+      <p>${mode === 'task' ? '把需要多步执行的事情放到工作任务里。' : '从右下角新建一个对话，项目规则会自动继承。'}</p>
+    </div>`
+  }
+  return `<div class="project-home-list">
+    ${sessions.map((session) => `<button class="project-home-row" type="button" data-project-session="${esc(session.id)}">
+      <span class="project-home-row-icon ${session.projectMode === 'task' ? 'is-task' : ''}" aria-hidden="true">${session.projectMode === 'task' ? '◇' : '◌'}</span>
+      <span class="project-home-row-main">
+        <strong>${esc(session.title)}</strong>
+        <em>${session.projectMode === 'task' ? '工作任务' : '对话'} · ${fmtSessionTime(session.updatedAt)}</em>
+      </span>
+      <span class="project-home-row-arrow" aria-hidden="true">›</span>
+    </button>`).join('')}
+  </div>`
+}
+
+function fmtSessionTime(value) {
+  const time = new Date(value || '').getTime()
+  if (!Number.isFinite(time)) return ''
+  const now = Date.now()
+  const diff = now - time
+  if (diff < 60_000) return '刚刚'
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} 小时前`
+  return new Date(time).toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' })
+}
+
+function openLocalProjectFolderFor(project) {
+  if (!project || typeof desktopBrowserHost?.openPath !== 'function') {
+    banner(`项目目录：${project?.rootPath || '—'}`, 'info')
+    return
+  }
+  void desktopBrowserHost.openPath(project.rootPath)
+}
+
+async function saveProjectConfig(project, form) {
+  const status = form.querySelector('#project-config-status')
+  const name = String(form.elements.name?.value || '').trim()
+  const instructions = String(form.elements.instructions?.value || '')
+  if (!name) {
+    if (status) status.textContent = '项目名称不能为空'
+    return
+  }
+  if (status) status.textContent = '正在保存…'
+  try {
+    const data = await api(localApiUrl(`/api/local-projects/${encodeURIComponent(project.id)}`), {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name, instructions }),
+    })
+    upsertLocalProject(data.project)
+    state.projectHomeProject = data.project
+    renderProjectHome()
+    banner('项目配置已保存', 'ok')
+  } catch (err) {
+    if (status) status.textContent = err.message || '保存失败'
+    banner(err.message || '保存项目配置失败', 'bad')
+  }
+}
+
+function openCloudPicker(options = {}) {
+  const modal = $('#cloud-pick-modal')
+  const list = $('#cloud-pick-list')
+  if (!modal || !list) return
+  state.cloudPickTarget = options
+  state.cloudPickSelected = options.target === 'project'
+    ? [...(options.project?.cloudRefs || [])]
+    : [...state.projectDraft.cloudRefs]
+  modal.hidden = false
+  renderCloudPickList()
+  void loadWorkspaceFiles({ silent: true }).then(() => renderCloudPickList())
+}
+
+function closeCloudPicker() {
+  const modal = $('#cloud-pick-modal')
+  if (modal) modal.hidden = true
+}
+
+function renderCloudPickList() {
+  const list = $('#cloud-pick-list')
+  const summary = $('#cloud-pick-summary')
+  if (!list) return
+  const files = (state.files || []).filter((file) => !file?.workspaceKind || file.workspaceKind === 'file')
+  if (files.length === 0) {
+    list.innerHTML = '<div class="cloud-pick-empty">云空间里还没有文件。可以先去「云空间」上传，或直接创建项目。</div>'
+  } else {
+    list.innerHTML = files.slice(0, 300).map((file) => {
+      const path = workspaceFilePath(file)
+      const checked = state.cloudPickSelected.includes(path)
+      const name = String(file.name || path.split('/').pop() || path)
+      return `<label class="cloud-pick-row ${checked ? 'is-selected' : ''}">
+        <input type="checkbox" data-cloud-ref="${esc(path)}" ${checked ? 'checked' : ''} />
+        <span class="cloud-pick-icon" aria-hidden="true">▤</span>
+        <span class="cloud-pick-copy"><strong>${esc(name)}</strong><em>${esc(path)}</em></span>
+      </label>`
+    }).join('')
+  }
+  list.querySelectorAll('[data-cloud-ref]').forEach((checkbox) => {
+    checkbox.addEventListener('change', () => {
+      const path = checkbox.dataset.cloudRef
+      state.cloudPickSelected = checkbox.checked
+        ? [...new Set([...state.cloudPickSelected, path])]
+        : state.cloudPickSelected.filter((item) => item !== path)
+      renderCloudPickList()
+    })
+  })
+  if (summary) summary.textContent = `已选 ${state.cloudPickSelected.length} 项`
+}
+
+function applyCloudPick() {
+  const selected = state.cloudPickSelected.slice(0, 100)
+  if (state.cloudPickTarget?.target === 'project' && state.cloudPickTarget.project) {
+    const project = state.cloudPickTarget.project
+    api(localApiUrl(`/api/local-projects/${encodeURIComponent(project.id)}`), {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ cloudRefs: selected }),
+    }).then((data) => {
+      upsertLocalProject(data.project)
+      state.projectHomeProject = data.project
+      renderProjectHome()
+      banner('云端资源已更新', 'ok')
+    }).catch((err) => banner(err.message || '更新云端资源失败', 'bad'))
+  } else {
+    state.projectDraft.cloudRefs = selected
+    syncProjectDraftUI()
+  }
+  closeCloudPicker()
+}
+
+
+function localFileSizeLabel(size) {
+  const value = Number(size) || 0
+  if (value >= 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`
+  if (value >= 1024) return `${Math.round(value / 1024)} KB`
+  return value > 0 ? `${value} B` : ''
+}
+
+function renderLocalFiles() {
+  const box = $('#local-file-list')
+  if (!box) return
+  if (!state.localProject) {
+    box.innerHTML = '<div class="side-session-empty">还没有选择项目</div>'
+    return
+  }
+  if (state.localFilesLoading && state.localFileEntries.length === 0) {
+    box.innerHTML = '<div class="side-session-empty">正在读取项目…</div>'
+    return
+  }
+  const path = state.localFilePath
+  const parent = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : ''
+  const rows = []
+  if (path) {
+    rows.push(`<button class="local-file-row local-file-up" type="button" data-local-dir="${esc(parent)}">
+      <span class="local-file-icon" aria-hidden="true">↑</span><span class="local-file-name">返回上级</span>
+    </button>`)
+  }
+  for (const entry of state.localFileEntries) {
+    const isDir = entry.type === 'dir'
+    rows.push(`<button class="local-file-row" type="button" data-local-${isDir ? 'dir' : 'file'}="${esc(entry.path)}" title="${esc(entry.path)}">
+      <span class="local-file-icon ${isDir ? 'is-dir' : 'is-file'}" aria-hidden="true">${isDir ? '▸' : '·'}</span>
+      <span class="local-file-name">${esc(entry.name || localBaseName(entry.path))}</span>
+      ${isDir ? '' : `<span class="local-file-size">${localFileSizeLabel(entry.size)}</span>`}
+    </button>`)
+  }
+  box.innerHTML = rows.length ? rows.join('') : '<div class="side-session-empty">项目目录是空的</div>'
+  for (const button of box.querySelectorAll('[data-local-dir]')) {
+    button.addEventListener('click', () => void loadLocalFiles(button.dataset.localDir))
+  }
+  for (const button of box.querySelectorAll('[data-local-file]')) {
+    button.addEventListener('click', () => openLocalProjectFile(button.dataset.localFile))
+  }
+}
+
+async function loadLocalFiles(path, options = {}) {
+  const project = state.localProject
+  if (!project) return
+  const targetPath = path === undefined ? state.localFilePath : String(path || '')
+  const box = $('#local-file-list')
+  const scrollTop = options.silent && box ? box.scrollTop : 0
+  state.localFilesLoading = true
+  if (!options.silent) {
+    state.localFilePath = targetPath
+    state.localFileEntries = []
+    renderLocalProjectSide()
+    renderLocalFiles()
+  }
+  try {
+    const data = await api(
+      localApiUrl(`/api/local-projects/${encodeURIComponent(project.id)}/files`, {
+        path: targetPath,
+        depth: 1,
+        limit: 200,
+      }),
+    )
+    if (state.localProject?.id !== project.id) return
+    state.localFilePath = data.path || targetPath
+    state.localFileEntries = data.entries || []
+    state.localFilesLoading = false
+    renderLocalProjectSide()
+    renderLocalFiles()
+    if (options.silent && box) box.scrollTop = scrollTop
+  } catch (err) {
+    state.localFilesLoading = false
+    renderLocalFiles()
+    if (!options.silent) banner(err.message || '读取项目文件失败', 'bad')
+  }
+}
+
+function openLocalProjectFile(relPath) {
+  if (!state.localProject) return
+  const absPath = localJoinPath(state.localProject.rootPath, relPath)
+  if (typeof desktopBrowserHost?.revealPath === 'function') {
+    void desktopBrowserHost.revealPath(absPath)
+    return
+  }
+  banner(`文件路径：${absPath}`, 'info')
+}
+
+function openLocalProjectFolder() {
+  if (!state.localProject) return
+  if (typeof desktopBrowserHost?.openPath === 'function') {
+    void desktopBrowserHost.openPath(state.localProject.rootPath)
+    return
+  }
+  banner(`项目目录：${state.localProject.rootPath}`, 'info')
+}
+
+let localFilesTimer = 0
+function startLocalFilesWatcher() {
+  if (localFilesTimer) return
+  localFilesTimer = window.setInterval(() => {
+    if (document.hidden || state.spaceKind !== 'local' || !state.localProject) return
+    void loadLocalFiles(state.localFilePath, { silent: true })
+  }, 5000)
+}
+
+function stopLocalFilesWatcher() {
+  if (localFilesTimer) window.clearInterval(localFilesTimer)
+  localFilesTimer = 0
+}
+
 /* ---------------- 云空间虚拟目录 ---------------- */
 
 /** 云空间路径统一成无首尾斜杠的 `/` 分隔形式。 */
@@ -4411,6 +5958,8 @@ function hideFileMenu() {
   menu.hidden = true
   menu.dataset.file = ''
   menu.dataset.folder = ''
+  menu.dataset.scope = ''
+  menu.dataset.cloudBlank = ''
 }
 
 function placeFileMenu(menu, anchor, atPoint = false) {
@@ -4427,29 +5976,32 @@ function placeFileMenu(menu, anchor, atPoint = false) {
   menu.style.top = `${Math.max(8, top)}px`
 }
 
-function showFileMenu(fileId, anchor, atPoint = false) {
+function showFileMenu(fileId, anchor, atPoint = false, scope = 'workspace') {
   const menu = $('#file-menu')
   const file = fileById(fileId)
   if (!menu || !file) return
   hideSessionMenu()
   const owner = file.ownerUserId === state.me?.person?.id
   menu.innerHTML = `<div class="session-menu-title">${esc(file.name)}</div>
+    <button type="button" data-file-act="open">打开</button>
+    <button type="button" data-file-act="download">下载</button>
     ${
       owner
-        ? `<button type="button" data-file-act="send-dingtalk">发送到钉钉</button>
-           <button type="button" data-file-act="rename">重命名</button>
+        ? `<button type="button" data-file-act="rename">重命名</button>
            <button type="button" data-file-act="edit">编辑</button>
+           <button type="button" data-file-act="send-dingtalk">发送到钉钉</button>
            <button type="button" data-file-act="delete" class="is-danger">删除</button>`
-        : `<button type="button" data-file-act="download">下载</button>
-           <button type="button" data-file-act="send-dingtalk">发送到钉钉</button>`
+        : `<button type="button" data-file-act="send-dingtalk">发送到钉钉</button>`
     }`
   menu.dataset.file = fileId
   menu.dataset.folder = ''
+  menu.dataset.scope = scope
+  menu.dataset.cloudBlank = ''
   menu.hidden = false
   placeFileMenu(menu, anchor, atPoint)
 }
 
-function showFolderMenu(folderPath, anchor, atPoint = false) {
+function showFolderMenu(folderPath, anchor, atPoint = false, scope = 'workspace') {
   const menu = $('#file-menu')
   const folder = workspaceFolderMeta(folderPath)
   if (!menu || !folder.path) return
@@ -4461,14 +6013,36 @@ function showFolderMenu(folderPath, anchor, atPoint = false) {
   menu.innerHTML = `<div class="session-menu-title">${esc(folder.name)}</div>
     <button type="button" data-folder-act="open">打开</button>
     <button type="button" data-folder-act="new">新建子文件夹</button>
+    <button type="button" data-folder-act="new-file">新建文件</button>
     <button type="button" data-folder-act="rename"${locked ? ' disabled title="文件夹含他人共享文件"' : ''}>重命名</button>
     <button type="button" data-folder-act="delete" class="is-danger"${locked ? ' disabled title="文件夹含他人共享文件"' : ''}>删除</button>
     ${lockedHint}`
   menu.dataset.folder = folder.path
   menu.dataset.file = ''
+  menu.dataset.scope = scope
+  menu.dataset.cloudBlank = ''
   menu.hidden = false
   placeFileMenu(menu, anchor, atPoint)
 }
+
+/** 云空间空白区域右键菜单：和本地文件系统的“新建/上传”入口保持一致。 */
+function showCloudBlankMenu(anchor, atPoint = true) {
+  const menu = $('#file-menu')
+  if (!menu) return
+  hideSessionMenu()
+  const location = workspaceFolderLocationLabel(state.cloudSpacePath)
+  menu.innerHTML = `<div class="session-menu-title">${esc(location)}</div>
+    <button type="button" data-cloud-act="new-folder">新建文件夹</button>
+    <button type="button" data-cloud-act="new-file">新建文件</button>
+    <button type="button" data-cloud-act="upload">上传文件</button>`
+  menu.dataset.file = ''
+  menu.dataset.folder = ''
+  menu.dataset.scope = 'cloud'
+  menu.dataset.cloudBlank = '1'
+  menu.hidden = false
+  placeFileMenu(menu, anchor, atPoint)
+}
+
 
 function workspaceFolderLocationLabel(path) {
   const normalized = workspaceNormalizePath(path)
@@ -4555,6 +6129,102 @@ function createWorkspaceFolder(parentPath = state.workspacePath) {
   })
 }
 
+/** 新建文件的名称校验；比文件夹多允许点开头的文件名。 */
+function workspaceFileNameError(value) {
+  const name = String(value || '').trim()
+  if (!name) return '文件名不能为空'
+  if (name.includes('/') || name.includes('\\')) return '文件名不能包含斜杠'
+  if (name === '.' || name === '..') return '请输入具体的文件名'
+  if (name === '.gitkeep') return '这个文件名由系统保留'
+  if (/[\u0000-\u001f\u007f<>:"|?*]/.test(name)) return '文件名包含不允许的字符'
+  if (name.endsWith('.') || name.endsWith(' ')) return '文件名不能以点或空格结尾'
+  if (name.length > 200) return '文件名过长，最多 200 个字符'
+  const base = name.split('.')[0].toLowerCase()
+  if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/.test(base)) return '文件名不能使用 Windows 保留名'
+  return ''
+}
+
+/** 当前目录下是否已经有同名文件或文件夹；创建前先提示，避免静默覆盖。 */
+function workspaceEntryExists(parentPath, name) {
+  const parent = workspaceNormalizePath(parentPath)
+  const relPath = workspaceFolderPathJoin(parent, name)
+  if ((state.files || []).some((file) => workspaceFilePath(file) === relPath)) return true
+  const view = workspaceDirView(state.files, parent)
+  return view.folders.some((folder) => folder.path === relPath)
+}
+
+/** 新建空文件；文件命名完成后可以直接在预览/编辑器里打开继续编辑。 */
+function createWorkspaceFile(parentPath = state.workspacePath) {
+  const parent = workspaceNormalizePath(parentPath)
+  const overlay = document.createElement('div')
+  overlay.className = 'modal-overlay'
+  overlay.innerHTML = `<div class="modal">
+    <div class="modal-head"><h3>新建文件</h3><button class="modal-x" type="button">×</button></div>
+    <p class="hint">创建在「${esc(workspaceFolderLocationLabel(parent))}」。输入文件名时请带上扩展名，例如“说明.md”。</p>
+    <div class="form-grid"><label><span>文件名</span><input id="ws-new-file-input" placeholder="未命名.txt" /></label></div>
+    <div class="modal-state" id="ws-new-file-state"></div>
+    <div class="modal-actions"><button class="btn ghost" type="button" id="ws-new-file-cancel">取消</button><button class="btn primary" type="button" id="ws-new-file-save">创建</button></div>
+  </div>`
+  document.body.appendChild(overlay)
+  const close = () => overlay.remove()
+  const input = overlay.querySelector('#ws-new-file-input')
+  const stateEl = overlay.querySelector('#ws-new-file-state')
+  const saveButton = overlay.querySelector('#ws-new-file-save')
+  const cancelButton = overlay.querySelector('#ws-new-file-cancel')
+  const closeButton = overlay.querySelector('.modal-x')
+  let saving = false
+  const setBusy = (busy) => {
+    saving = busy
+    saveButton.disabled = busy
+    cancelButton.disabled = busy
+    closeButton.disabled = busy
+    input.disabled = busy
+  }
+  closeButton.addEventListener('click', close)
+  cancelButton.addEventListener('click', close)
+  input.focus()
+  input.select()
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') saveButton.click()
+  })
+  saveButton.addEventListener('click', async () => {
+    if (saving) return
+    const name = String(input.value || '').trim()
+    const error = workspaceFileNameError(name)
+    if (error) {
+      stateEl.className = 'modal-state bad'
+      stateEl.textContent = error
+      input.focus()
+      return
+    }
+    if (workspaceEntryExists(parent, name)) {
+      stateEl.className = 'modal-state bad'
+      stateEl.textContent = '同名文件或文件夹已存在，请换一个名称'
+      input.focus()
+      return
+    }
+    setBusy(true)
+    stateEl.className = 'modal-state muted'
+    stateEl.textContent = '正在创建…'
+    try {
+      const relPath = workspaceFolderPathJoin(parent, name)
+      await api(`/api/workspace/files${qs()}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ path: relPath, text: '' }),
+      })
+      await loadWorkspaceFiles()
+      banner(`文件「${name}」已创建`, 'ok')
+      close()
+    } catch (err) {
+      setBusy(false)
+      stateEl.className = 'modal-state bad'
+      stateEl.textContent = err.message || '创建文件失败'
+    }
+  })
+}
+
+
 function syncWorkspacePreviewAfterFolderRename(oldPath, nextPath) {
   const preview = state.filePreview
   if (!preview) return
@@ -4599,6 +6269,10 @@ function renameWorkspaceFolder(folderPath) {
       const currentPath = state.workspacePath
       if (currentPath === folder.path || currentPath.startsWith(`${folder.path}/`)) {
         state.workspacePath = `${nextPath}${currentPath.slice(folder.path.length)}`
+      }
+      const currentCloudPath = state.cloudSpacePath
+      if (currentCloudPath === folder.path || currentCloudPath.startsWith(`${folder.path}/`)) {
+        state.cloudSpacePath = `${nextPath}${currentCloudPath.slice(folder.path.length)}`
       }
       await loadWorkspaceFiles()
       syncWorkspacePreviewAfterFolderRename(folder.path, nextPath)
@@ -4690,9 +6364,17 @@ function deleteWorkspaceFolder(folderPath) {
       })
       const deletedCount = Math.max(0, Number(result?.fileCount ?? count) || 0)
       finishProgress('已移入回收区')
+      const parentPath = folder.path.includes('/')
+        ? folder.path.slice(0, folder.path.lastIndexOf('/'))
+        : ''
       if (state.workspacePath === folder.path || state.workspacePath.startsWith(`${folder.path}/`)) {
-        const slash = folder.path.lastIndexOf('/')
-        state.workspacePath = slash < 0 ? '' : folder.path.slice(0, slash)
+        state.workspacePath = parentPath
+      }
+      if (
+        state.cloudSpacePath === folder.path ||
+        state.cloudSpacePath.startsWith(`${folder.path}/`)
+      ) {
+        state.cloudSpacePath = parentPath
       }
       close()
       if (
@@ -5196,12 +6878,321 @@ const AGENT_USER_SELECTION_HOLD_MS = 5000
 
 let workbenchLayoutSignature = ''
 
+/** 新建一个空网页标签；输入网址并成功打开后才真正分配 pageId。 */
+function newBrowserTabId() {
+  state.browserTabSeq += 1
+  return `browser_tab_${state.browserTabSeq}`
+}
+
+function browserTabTitle(tab) {
+  const title = String(tab?.title || '').trim()
+  if (title) return title
+  if (tab?.url) return shortBrowserUrl(tab.url)
+  return tab?.draft ? '新网页' : '网页'
+}
+
+function safeTabFavicon(raw) {
+  const value = String(raw || '').trim()
+  if (!value) return ''
+  if (/^data:image\//i.test(value)) return value
+  try {
+    const parsed = new URL(value)
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? parsed.href : ''
+  } catch {
+    return ''
+  }
+}
+
+function browserTabIdForPage(pageId) {
+  const id = String(pageId || '')
+  if (!id) return ''
+  return state.browserTabs.find((tab) => tab.pageId === id)?.tabId || ''
+}
+
+function currentBrowserTab() {
+  const page = state.browserPage
+  if (!page) return null
+  return state.browserTabs.find((tab) => tab.tabId === page.tabId) || page
+}
+
+function ensureBrowserTab(page, options = {}) {
+  const pageId = String(page?.pageId || '')
+  if (!pageId) return null
+  let tab = options.reuse?.draft ? options.reuse : state.browserTabs.find((item) => item.pageId === pageId)
+  if (!tab) {
+    tab = {
+      tabId: newBrowserTabId(),
+      pageId,
+      title: '',
+      url: '',
+      favicon: '',
+      width: 1280,
+      height: 800,
+      draft: false,
+      createdAt: Date.now(),
+    }
+    state.browserTabs.push(tab)
+  }
+  tab.draft = false
+  tab.pageId = pageId
+  tab.sessionId = browserTabsScopeSessionId
+  tab.native = Boolean(page.native)
+  tab.title = String(page.title || tab.title || '').trim()
+  tab.url = String(page.url || tab.url || '').trim()
+  if (page.favicon) tab.favicon = safeTabFavicon(page.favicon)
+  tab.width = Number(page.width) || tab.width || 1280
+  tab.height = Number(page.height) || tab.height || 800
+  if ('canGoBack' in page) tab.canGoBack = Boolean(page.canGoBack)
+  if ('canGoForward' in page) tab.canGoForward = Boolean(page.canGoForward)
+  tab.updatedAt = Date.now()
+  if (options.activate !== false) {
+    state.browserPage = tab
+    state.workbenchTab = 'web'
+    state.workbenchCollapsed = false
+    state.workbenchSplit = false
+  }
+  return tab
+}
+
+function newBrowserDraftTab() {
+  // 和浏览器的新标签页一致：每次点加号都新建一个空白标签，不抢回旧草稿。
+  const tab = {
+    tabId: newBrowserTabId(),
+    pageId: '',
+    sessionId: browserTabsScopeSessionId,
+    title: '新标签页',
+    url: '',
+    draftInput: '',
+    width: 1280,
+    height: 800,
+    draft: true,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  }
+  state.browserTabs.push(tab)
+  state.browserPage = tab
+  state.workbenchTab = 'web'
+  state.workbenchCollapsed = false
+  state.workbenchSplit = false
+  state.browserPaused = false
+  state.browserNotice = ''
+  state.browserNoticeBad = false
+  state.browserControlOpen = false
+  stopBrowserFramePolling()
+  syncWorkbenchLayout()
+  renderWebPane()
+  warmBrowserRuntime()
+  // 原生页切回空白标签时，隐藏的 WebContentsView 仍可能持有系统键盘焦点，
+  // 必须把焦点交还 EAB 主窗口，否则接下来的 Ctrl+W / Ctrl+Tab 会“消失”。
+  desktopBrowserHost?.focusShell?.()
+  $('#web-newtab-input')?.focus()
+  return tab
+}
+
+function activateBrowserTab(tabId) {
+  const tab = state.browserTabs.find((item) => item.tabId === tabId)
+  if (!tab) return
+  state.browserPage = tab
+  state.workbenchTab = 'web'
+  state.workbenchCollapsed = false
+  state.workbenchSplit = false
+  state.browserPaused = false
+  state.browserNotice = ''
+  state.browserNoticeBad = false
+  state.browserControlOpen = false
+  syncWorkbenchLayout()
+  renderWebPane()
+  if (usesNativeBrowser(tab)) {
+    stopBrowserFramePolling()
+    scheduleDesktopBrowserViewSync()
+    window.setTimeout(() => {
+      if (state.browserPage?.tabId === tab.tabId) desktopBrowserHost?.focusPage?.(tab.pageId)
+    }, 100)
+    return
+  }
+  if (tab.pageId) {
+    startBrowserFramePolling()
+    loadBrowserFrame(true)
+    void refreshBrowserState()
+  } else {
+    stopBrowserFramePolling()
+    desktopBrowserHost?.focusShell?.()
+    $('#web-newtab-input')?.focus()
+  }
+}
+
+/** 移除标签；如果当前页被移走，优先切到相邻标签，没有就收起网页栏。 */
+function removeBrowserTab(tabId) {
+  const index = state.browserTabs.findIndex((tab) => tab.tabId === tabId)
+  if (index < 0) return
+  const removed = state.browserTabs[index]
+  const wasActive = state.browserPage?.tabId === tabId
+  state.browserTabs.splice(index, 1)
+  if (!wasActive) {
+    syncWorkbenchLayout()
+    return
+  }
+  const next = state.browserTabs[Math.min(index, state.browserTabs.length - 1)]
+  if (next) {
+    activateBrowserTab(next.tabId)
+    return
+  }
+  state.browserPage = null
+  state.browserPaused = false
+  state.browserNotice = ''
+  state.browserNoticeBad = false
+  state.browserControlOpen = false
+  stopBrowserFramePolling()
+  state.workbenchTab = state.agentRuns.size > 0 ? 'team' : state.filePreview ? 'file' : state.permOpen ? 'perm' : 'web'
+  renderWebPane()
+  syncWorkbenchLayout()
+}
+
+function workbenchTabIcon(kind) {
+  if (kind === 'team') {
+    return '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="3.8" r="1.7" fill="none" stroke="currentColor" stroke-width="1.3"/><circle cx="3.9" cy="11.4" r="1.6" fill="none" stroke="currentColor" stroke-width="1.3"/><circle cx="12.1" cy="11.4" r="1.6" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M7.2 5.4 4.7 9.9M8.8 5.4l2.5 4.5M5.5 11.4h5" fill="none" stroke="currentColor" stroke-width="1.1"/></svg>'
+  }
+  if (kind === 'perm') {
+    return '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.2 12.8 4v3.4c0 3-2 5.4-4.8 6.4-2.8-1-4.8-3.4-4.8-6.4V4L8 2.2Z" fill="none" stroke="currentColor" stroke-width="1.25"/><path d="m6 8 1.4 1.4 2.6-2.6" fill="none" stroke="currentColor" stroke-width="1.15" stroke-linecap="round"/></svg>'
+  }
+  if (kind === 'cloud') {
+    return '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.6 5.2h4.2l1.3 1.7h6.3v6.3a1.3 1.3 0 0 1-1.3 1.3H2.6A1.3 1.3 0 0 1 1.3 13.2V5.2Z" fill="none" stroke="currentColor" stroke-width="1.2"/><path d="M2.6 5.2V4.2A1.1 1.1 0 0 1 3.7 3.1h2.8l1.2 1.6h4.2A1.1 1.1 0 0 1 13 5.8v1" fill="none" stroke="currentColor" stroke-width="1.05"/></svg>'
+  }
+  if (kind === 'file') {
+    return '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.4h5l3 3v8.2H4z" fill="none" stroke="currentColor" stroke-width="1.25"/><path d="M9 2.4v3h3M6 8h4M6 10.2h3" fill="none" stroke="currentColor" stroke-width="1.1"/></svg>'
+  }
+  return '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="5.3" fill="none" stroke="currentColor" stroke-width="1.25"/><path d="M3 8h10M8 2.8c1.6 1.5 2.3 3.2 2.3 5.2S9.6 12.5 8 13.2C6.4 12.5 5.7 10 5.7 8s.7-3.7 2.3-5.2Z" fill="none" stroke="currentColor" stroke-width="1.05"/></svg>'
+}
+
+function renderWorkbenchTabs({ hasTeam, hasFile, hasPerm, hasWeb, hasCloud }) {
+  const list = $('#workbench-tab-list')
+  if (!list) return
+  const tabs = []
+  if (hasTeam) {
+    tabs.push({
+      key: 'team',
+      kind: 'team',
+      title: 'Agent 团队',
+      count: state.agentRuns.size,
+      close: state.agentRuns.size === 0 ? 'team' : '',
+    })
+  }
+  if (hasPerm) {
+    tabs.push({
+      key: 'perm',
+      kind: 'perm',
+      title: '审批',
+      count: state.permRequests.todo.length,
+      close: 'perm',
+    })
+  }
+  if (hasCloud) {
+    tabs.push({
+      key: 'cloud',
+      kind: 'cloud',
+      title: '云空间',
+      count: 0,
+      close: 'cloud',
+    })
+  }
+  if (hasFile) {
+    tabs.push({
+      key: 'file',
+      kind: 'file',
+      title: '文件预览',
+      count: 0,
+      close: 'file',
+    })
+  }
+  if (hasWeb) {
+    for (const tab of state.browserTabs) {
+      tabs.push({
+        key: tab.tabId,
+        kind: 'web',
+        title: browserTabTitle(tab),
+        count: 0,
+        close: 'web',
+        tabId: tab.tabId,
+        draft: Boolean(tab.draft),
+        favicon: tab.favicon || '',
+      })
+    }
+  }
+  list.innerHTML = ''
+  for (const tab of tabs) {
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.className = 'workbench-tab'
+    button.dataset.workbenchKind = tab.kind
+    button.dataset.workbenchKey = tab.key
+    if (tab.tabId) button.dataset.browserTab = tab.tabId
+    button.setAttribute('role', 'tab')
+    const active = state.workbenchSplit
+      ? tab.kind === 'team' || tab.kind === 'file'
+      : state.workbenchTab === tab.kind && (tab.kind !== 'web' || state.browserPage?.tabId === tab.tabId)
+    button.classList.toggle('is-active', active)
+    button.classList.toggle('is-draft', Boolean(tab.draft))
+    button.setAttribute('aria-selected', active ? 'true' : 'false')
+    button.title = tab.title
+    const icon = document.createElement('span')
+    icon.className = `workbench-tab-icon is-${tab.kind}`
+    if (tab.favicon) {
+      icon.classList.add('has-favicon')
+      const image = document.createElement('img')
+      image.className = 'workbench-tab-favicon'
+      image.src = tab.favicon
+      image.alt = ''
+      image.referrerPolicy = 'no-referrer'
+      image.addEventListener('error', () => {
+        image.remove()
+        icon.classList.remove('has-favicon')
+        icon.innerHTML = workbenchTabIcon(tab.kind)
+      })
+      icon.append(image)
+    } else {
+      icon.innerHTML = workbenchTabIcon(tab.kind)
+    }
+    const label = document.createElement('span')
+    label.className = 'workbench-tab-label'
+    label.textContent = tab.title
+    button.append(icon, label)
+    if (tab.count > 0) {
+      const count = document.createElement('span')
+      count.className = 'workbench-tab-count'
+      count.textContent = String(tab.count)
+      button.append(count)
+    }
+    if (tab.close) {
+      const close = document.createElement('span')
+      close.className = 'workbench-tab-close'
+      close.dataset.workbenchClose = tab.close
+      if (tab.tabId) close.dataset.browserTab = tab.tabId
+      close.setAttribute('role', 'button')
+      close.setAttribute('aria-label', `关闭 ${tab.title}`)
+      close.textContent = '×'
+      button.append(close)
+    }
+    list.append(button)
+  }
+  const active = list.querySelector('.workbench-tab.is-active')
+  active?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' })
+}
+
 function workbenchLayoutStateSignature() {
   return [
     state.mode,
     state.agentRuns.size,
+    state.teamTabOpen ? '1' : '0',
     Boolean(state.filePreview),
+    state.cloudSpaceOpen ? '1' : '0',
+    state.cloudSpacePath,
+    state.cloudSpaceLoading ? '1' : '0',
+    state.cloudSpaceError,
     Boolean(state.permOpen),
+    state.browserTabs.map((tab) => `${tab.tabId}:${tab.pageId}:${tab.title}:${tab.favicon || ''}`).join(','),
+    state.browserPage?.tabId || '',
+    state.browserPage?.pageId || '',
+    state.browserPaused ? '1' : '0',
     state.workbenchCollapsed ? '1' : '0',
     state.workbenchSplit ? '1' : '0',
     state.workbenchTab,
@@ -5209,94 +7200,486 @@ function workbenchLayoutStateSignature() {
   ].join('|')
 }
 
-function syncWorkbenchLayout() {
+const BROWSER_TABS_STORAGE_PREFIX = 'eab.chat.browserTabs.v2:'
+const LEGACY_BROWSER_TABS_STORAGE_PREFIX = 'eab.chat.browserTabs.v1:'
+let browserTabsRestoreStarted = false
+let browserTabsPersistTimer = 0
+let browserTabsScopeSessionId = ''
+let browserTabsLoadedScope = null
+const browserTabsLoadingScopes = new Set()
+
+function currentUserId() {
+  return state.me?.person?.id || state.me?.id || ''
+}
+
+/** 标签页按会话隔离：同一个员工的不同对话各存一份，不再共用一个全局标签栏。 */
+function browserTabsStorageKey(sessionId = browserTabsScopeSessionId) {
+  const userId = currentUserId()
+  if (!userId) return ''
+  const scope = String(sessionId || '') ? `session:${encodeURIComponent(String(sessionId))}` : 'draft'
+  return `${BROWSER_TABS_STORAGE_PREFIX}${userId}:${scope}`
+}
+
+function readStoredBrowserTabs(sessionId = browserTabsScopeSessionId) {
+  try {
+    const key = browserTabsStorageKey(sessionId)
+    if (!key) return null
+    const raw = localStorage.getItem(key)
+    if (!raw) return null
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === 'object' ? parsed : null
+  } catch {
+    return null
+  }
+}
+
+/** 升级前只有“按员工”一份全局标签：仅在没有会话归属的空草稿里兜底恢复一次。 */
+function readLegacyStoredBrowserTabs() {
+  try {
+    const userId = currentUserId()
+    if (!userId) return null
+    const raw = localStorage.getItem(`${LEGACY_BROWSER_TABS_STORAGE_PREFIX}${userId}`)
+    if (!raw) return null
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === 'object' ? parsed : null
+  } catch {
+    return null
+  }
+}
+
+function clearBrowserTabState() {
+  state.browserTabs = []
+  state.browserPage = null
+  state.browserPaused = false
+  state.browserNotice = ''
+  state.browserNoticeBad = false
+  state.browserControlOpen = false
+  stopBrowserFramePolling()
+}
+
+/** 空白草稿的右侧标签只活在当前页面，刷新、切走、关闭都直接丢弃。 */
+function removeDraftBrowserTabsStorage() {
+  try {
+    const key = browserTabsStorageKey('')
+    if (key) localStorage.removeItem(key)
+  } catch {
+    /* 本地存储不可用时草稿本身也不持久化 */
+  }
+}
+
+function currentWorkbenchShell() {
+  return {
+    cloudSpaceOpen: Boolean(state.cloudSpaceOpen),
+    cloudSpacePath: String(state.cloudSpacePath || ''),
+    teamTabOpen: Boolean(state.teamTabOpen),
+    permOpen: Boolean(state.permOpen),
+    filePreviewId: String(state.filePreview?.id || ''),
+    filePreviewSplit: Boolean(state.filePreview) && state.mode === 'chat',
+    workbenchTab: String(state.workbenchTab || 'web'),
+    workbenchCollapsed: Boolean(state.workbenchCollapsed),
+    workbenchSplit: Boolean(state.workbenchSplit),
+  }
+}
+
+function emptyWorkbenchShell() {
+  return {
+    cloudSpaceOpen: false,
+    cloudSpacePath: '',
+    teamTabOpen: false,
+    permOpen: false,
+    filePreviewId: '',
+    filePreviewSplit: true,
+    workbenchTab: 'web',
+    workbenchCollapsed: false,
+    workbenchSplit: false,
+  }
+}
+
+function readSavedWorkbenchShell(saved) {
+  if (saved?.shell && typeof saved.shell === 'object') return { ...emptyWorkbenchShell(), ...saved.shell }
+  // 兼容第三轮的旧快照：当时只存了网页标签和激活标签类型。
+  return {
+    ...emptyWorkbenchShell(),
+    workbenchTab: String(saved?.workbenchTab || 'web'),
+    workbenchCollapsed: Boolean(saved?.workbenchCollapsed),
+    workbenchSplit: Boolean(saved?.workbenchSplit),
+  }
+}
+
+function applyWorkbenchShell(shell) {
+  const next = { ...emptyWorkbenchShell(), ...(shell || {}) }
+  state.cloudSpaceOpen = Boolean(next.cloudSpaceOpen)
+  state.cloudSpacePath = String(next.cloudSpacePath || '')
+  state.cloudSpaceLoading = false
+  state.cloudSpaceError = ''
+  state.teamTabOpen = Boolean(next.teamTabOpen)
+  state.permOpen = Boolean(next.permOpen)
+  state.workbenchCollapsed = Boolean(next.workbenchCollapsed)
+  state.workbenchSplit = Boolean(next.workbenchSplit)
+  state.workbenchTab = ['team', 'web', 'file', 'perm', 'cloud'].includes(next.workbenchTab)
+    ? next.workbenchTab
+    : 'web'
+}
+
+/** 清空右侧工作台外壳；文件预览由调用方先关闭或保存，网页标签由 clearBrowserTabState 处理。 */
+function clearWorkbenchShell() {
+  state.cloudSpaceOpen = false
+  state.cloudSpacePath = ''
+  state.cloudSpaceLoading = false
+  state.cloudSpaceError = ''
+  state.teamTabOpen = false
+  state.permOpen = false
+  state.workbenchCollapsed = false
+  state.workbenchSplit = false
+  state.workbenchTab = 'web'
+}
+
+/** 丢弃空白草稿的右侧标签：关闭真实页面并清掉草稿快照，不留下任何标签。 */
+function discardDraftBrowserTabs() {
+  for (const tab of state.browserTabs) {
+    if (!tab.pageId) continue
+    if (tab.native && typeof desktopBrowserHost?.close === 'function') {
+      void Promise.resolve(desktopBrowserHost.close(tab.pageId)).catch(() => undefined)
+    } else if (!tab.native) {
+      void api(`/api/browser/workspace/${encodeURIComponent(tab.pageId)}/close`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: '{}',
+      }).catch(() => undefined)
+    }
+  }
+  removeDraftBrowserTabsStorage()
+}
+
+/**
+ * 草稿首条消息落库后，把当前草稿里的右侧标签整体转给正式会话。
+ * 网页端改本地快照键；桌面端同时把原生 View 的 sessionId 改到正式会话。
+ */
+function adoptBrowserTabsForSession(sessionId) {
+  const target = String(sessionId || '')
+  if (!target || browserTabsScopeSessionId) return false
+  const pageIds = []
+  for (const tab of state.browserTabs) {
+    tab.sessionId = target
+    if (tab.pageId && tab.native) pageIds.push(tab.pageId)
+  }
+  if (typeof desktopBrowserHost?.adoptBrowserSession === 'function') {
+    void Promise.resolve(desktopBrowserHost.adoptBrowserSession(target, pageIds)).catch(() => undefined)
+  } else if (typeof desktopBrowserHost?.setBrowserSession === 'function') {
+    void Promise.resolve(desktopBrowserHost.setBrowserSession(target)).catch(() => undefined)
+  }
+  browserTabsScopeSessionId = target
+  browserTabsLoadedScope = target
+  removeDraftBrowserTabsStorage()
+  scheduleBrowserTabsPersist()
+  return true
+}
+
+/**
+ * 切换右侧标签归属的会话。旧会话的网页标签、云空间、文件、团队、审批标签先落盘；
+ * 新会话恢复自己的那一套，没开过的标签保持关闭。只有空白草稿被切走时才会真正丢弃。
+ */
+function switchBrowserTabScope(nextSessionId) {
+  const next = String(nextSessionId || '')
+  if (browserTabsScopeSessionId === next) return false
+  const previous = browserTabsScopeSessionId
+  if (previous) persistBrowserTabsNow()
+  else discardDraftBrowserTabs()
+  if (state.filePreview) closeWorkspaceFile()
+  clearWorkbenchShell()
+  browserTabsScopeSessionId = next
+  browserTabsLoadedScope = null
+  clearBrowserTabState()
+  if (typeof desktopBrowserHost?.setBrowserSession === 'function') {
+    void desktopBrowserHost.setBrowserSession(next)
+  } else if (typeof desktopBrowserHost?.hideAll === 'function') {
+    desktopBrowserHost.hideAll()
+  }
+  syncWorkbenchLayout(true)
+  return true
+}
+
+function persistBrowserTabsNow() {
+  // 空白草稿不落快照：切走或刷新直接丢弃，不能污染下一次「新对话」。
+  if (!browserTabsScopeSessionId) {
+    removeDraftBrowserTabsStorage()
+    return
+  }
+  if (!browserTabsRestoreStarted || !currentUserId()) return
+  // 恢复完成前不要写入：切换会话时先清空标签栏，若此时落盘会把旧会话的标签覆盖成空。
+  if (browserTabsLoadedScope !== browserTabsScopeSessionId) return
+  try {
+    const tabs = state.browserTabs.map((tab) => ({
+      tabId: tab.tabId,
+      pageId: tab.pageId || '',
+      native: Boolean(tab.native),
+      draft: Boolean(tab.draft),
+      title: tab.title || '',
+      url: tab.url || '',
+      favicon: tab.favicon || '',
+      draftInput: tab.draftInput || '',
+      width: Number(tab.width) || 1280,
+      height: Number(tab.height) || 800,
+    }))
+    localStorage.setItem(browserTabsStorageKey(), JSON.stringify({
+      tabs,
+      activeTabId: state.browserPage?.tabId || '',
+      activePageId: state.browserPage?.pageId || '',
+      workbenchTab: state.workbenchTab || 'web',
+      workbenchCollapsed: Boolean(state.workbenchCollapsed),
+      workbenchSplit: Boolean(state.workbenchSplit),
+      shell: currentWorkbenchShell(),
+      savedAt: Date.now(),
+    }))
+  } catch {
+    // 隐私模式或存储满时忽略，标签页仍由桌面主进程持久化。
+  }
+}
+
+function scheduleBrowserTabsPersist() {
+  if (!browserTabsRestoreStarted || !currentUserId()) return
+  if (browserTabsPersistTimer) window.clearTimeout(browserTabsPersistTimer)
+  browserTabsPersistTimer = window.setTimeout(() => {
+    browserTabsPersistTimer = 0
+    persistBrowserTabsNow()
+  }, 250)
+}
+
+async function restoreBrowserTabsForSession(sessionId) {
+  const target = String(sessionId || '')
+  if (browserTabsScopeSessionId !== target) return
+  browserTabsRestoreStarted = true
+  if (browserTabsLoadedScope === target || browserTabsLoadingScopes.has(target)) return
+  if (!target) {
+    // 空白草稿不恢复任何右侧标签：刷新后是全新空白对话。
+    removeDraftBrowserTabsStorage()
+    clearBrowserTabState()
+    applyWorkbenchShell(emptyWorkbenchShell())
+    browserTabsLoadedScope = target
+    browserTabsLoadingScopes.delete(target)
+    syncWorkbenchLayout(true)
+    return
+  }
+  browserTabsLoadingScopes.add(target)
+  const saved = readStoredBrowserTabs(target)
+  const savedTabs = Array.isArray(saved?.tabs) ? saved.tabs : []
+  const savedShell = readSavedWorkbenchShell(saved)
+  let restored = false
+  if (desktopBrowserHost && typeof desktopBrowserHost.listTabs === 'function') {
+    try {
+      const payload = await desktopBrowserHost.listTabs(currentUserId(), target)
+      if (browserTabsScopeSessionId !== target) {
+        browserTabsLoadingScopes.delete(target)
+        return
+      }
+      const tabs = Array.isArray(payload?.tabs) ? payload.tabs : []
+      for (const tab of tabs) {
+        if (!tab?.pageId) continue
+        if (tab.sessionId && String(tab.sessionId) !== target) continue
+        const entry = ensureBrowserTab({
+          pageId: String(tab.pageId),
+          title: String(tab.title || ''),
+          url: String(tab.url || ''),
+          favicon: String(tab.favicon || ''),
+          native: true,
+        }, { activate: false })
+        if (entry) entry.sessionId = target
+        restored = true
+      }
+    } catch {
+      // 桌面主进程尚未恢复标签时退回本地草稿，不阻塞聊天。
+    }
+  }
+  if (browserTabsScopeSessionId !== target) {
+    browserTabsLoadingScopes.delete(target)
+    return
+  }
+  for (const tab of savedTabs) {
+    if (!tab?.tabId) continue
+    if (tab.draft) {
+      // 正式会话里保留用户手动开的空白标签页；刷新后按本地快照补回。
+      if (state.browserTabs.some((item) => item.tabId === tab.tabId)) continue
+      state.browserTabs.push({
+        tabId: String(tab.tabId),
+        pageId: '',
+        sessionId: target,
+        native: false,
+        draft: true,
+        title: String(tab.title || '新标签页'),
+        url: '',
+        favicon: '',
+        draftInput: String(tab.draftInput || ''),
+        width: Number(tab.width) || 1280,
+        height: Number(tab.height) || 800,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      })
+      restored = true
+      continue
+    }
+    // 网页端的标签页由服务端 Playwright 页面承载；桌面端以主进程 listTabs 为准。
+    if (desktopBrowserHost || !tab.pageId) continue
+    if (state.browserTabs.some((item) => item.tabId === tab.tabId)) continue
+    const entry = ensureBrowserTab({
+      pageId: String(tab.pageId),
+      title: String(tab.title || ''),
+      url: String(tab.url || ''),
+      favicon: String(tab.favicon || ''),
+      native: false,
+    }, { activate: false })
+    if (entry) entry.sessionId = target
+    restored = true
+  }
+  applyWorkbenchShell(savedShell)
+  browserTabsLoadedScope = target
+  browserTabsLoadingScopes.delete(target)
+  const restoreFileId = String(savedShell.filePreviewId || '')
+  const restoreFileSplit = savedShell.filePreviewSplit !== false
+  if (state.cloudSpaceOpen) void refreshCloudSpace()
+  if (state.permOpen) {
+    renderPermissionPane()
+    void loadPermissionData()
+  }
+  if (restoreFileId) {
+    void openWorkspaceFile(restoreFileId, { split: restoreFileSplit })
+      .then(() => {
+        if (browserTabsScopeSessionId !== target) return
+        if (String(state.filePreview?.id || '') !== restoreFileId) return
+        state.workbenchTab = 'file'
+        state.workbenchSplit = false
+        syncWorkbenchLayout(true)
+      })
+      .catch(() => undefined)
+  }
+  const activeTab = state.browserTabs.find((tab) => tab.tabId === saved?.activeTabId)
+    || state.browserTabs.find((tab) => tab.pageId && tab.pageId === saved?.activePageId)
+    || state.browserTabs[state.browserTabs.length - 1]
+  if (activeTab) {
+    state.browserPage = activeTab
+    if (savedShell.workbenchTab === 'web') {
+      activateBrowserTab(activeTab.tabId)
+      state.workbenchCollapsed = Boolean(savedShell.workbenchCollapsed)
+    }
+  }
+  syncWorkbenchLayout(true)
+  if (!restored && !state.cloudSpaceOpen && !state.permOpen && !state.teamTabOpen && !restoreFileId) {
+    // 只有网页标签时才需要额外落一次快照；空会话保持右侧工作台关闭。
+    clearWorkbenchShell()
+  }
+  scheduleBrowserTabsPersist()
+}
+
+async function restoreBrowserTabs() {
+  await restoreBrowserTabsForSession(browserTabsScopeSessionId || state.sessionId || '')
+}
+
+function syncWorkbenchLayout(force = false) {
   const rail = $('#workbench-rail')
   const teamPane = $('#team-pane')
+  const webPane = $('#web-pane')
   const filePane = $('#file-pane')
   const permPane = $('#perm-pane')
+  const cloudPane = $('#cloud-pane')
   const main = $('.chat-main')
-  if (!rail || !teamPane || !filePane || !permPane || !main) return
+  if (!rail || !teamPane || !webPane || !filePane || !permPane || !cloudPane || !main) return
   const signature = workbenchLayoutStateSignature()
-  if (signature === workbenchLayoutSignature) return
+  if (!force && signature === workbenchLayoutSignature) return
   workbenchLayoutSignature = signature
 
   const inChat = state.mode === 'chat'
-  const hasTeam = inChat && state.agentRuns.size > 0
+  const hasTeam = inChat && (state.agentRuns.size > 0 || state.teamTabOpen)
   // 工作台整页预览也复用同一个文件栏；只看对话模式会把它藏掉，导致 PDF/Office 预览只剩 DOM。
   const hasFile = Boolean(state.filePreview)
   const hasPerm = inChat && state.permOpen
-  const hasWorkbench = hasTeam || hasFile || hasPerm
+  const hasCloud = inChat && state.cloudSpaceOpen
+  const hasWeb = inChat && state.browserTabs.length > 0
+
+  // 页面对象与标签条目保持同一份引用；刷新后若只有 pageId 没有标签，补一个。
+  if (inChat && state.browserPage?.pageId && !browserTabIdForPage(state.browserPage.pageId)) {
+    ensureBrowserTab(state.browserPage, { activate: false })
+  }
+  if (hasWeb) {
+    const activeTab = state.browserPage?.tabId
+      ? state.browserTabs.find((tab) => tab.tabId === state.browserPage.tabId)
+      : null
+    if (activeTab) state.browserPage = activeTab
+    else {
+      state.browserPage = state.browserTabs[state.browserTabs.length - 1]
+      renderWebPane()
+    }
+  }
+  if (!hasWeb && state.browserPage) {
+    state.browserPage = null
+    stopBrowserFramePolling()
+  }
+  const hasWorkbench = hasTeam || hasFile || hasPerm || hasWeb || hasCloud
   rail.hidden = !hasWorkbench
   const collapsed = hasWorkbench && state.workbenchCollapsed
   rail.classList.toggle('is-collapsed', collapsed)
 
   // 当前面板没有内容时自动切到另一个，避免打开一个空白面板。
-  const tabAvailable = (name) => (name === 'team' ? hasTeam : name === 'file' ? hasFile : hasPerm)
+  const tabAvailable = (name) =>
+    name === 'team' ? hasTeam : name === 'web' ? hasWeb : name === 'file' ? hasFile : name === 'cloud' ? hasCloud : hasPerm
   if (state.workbenchSplit && !(hasTeam && hasFile)) state.workbenchSplit = false
   if (!tabAvailable(state.workbenchTab)) {
-    state.workbenchTab = hasTeam ? 'team' : hasFile ? 'file' : hasPerm ? 'perm' : state.workbenchTab
+    state.workbenchTab = hasTeam ? 'team' : hasCloud ? 'cloud' : hasWeb ? 'web' : hasFile ? 'file' : hasPerm ? 'perm' : state.workbenchTab
   }
 
   const showTeam = hasTeam && (state.workbenchSplit || state.workbenchTab === 'team')
+  const showWeb = hasWeb && !state.workbenchSplit && state.workbenchTab === 'web'
   const showFile = hasFile && (state.workbenchSplit || state.workbenchTab === 'file')
   const showPerm = hasPerm && !state.workbenchSplit && state.workbenchTab === 'perm'
+  const showCloud = hasCloud && !state.workbenchSplit && state.workbenchTab === 'cloud'
   teamPane.hidden = !showTeam
+  webPane.hidden = !showWeb
   filePane.hidden = !showFile
   permPane.hidden = !showPerm
+  cloudPane.hidden = !showCloud
   $('#workbench-body')?.classList.toggle('is-split', state.workbenchSplit && showTeam && showFile)
 
-  const tabs = $('#workbench-tabs')
-  if (tabs) {
-    tabs.hidden = !hasWorkbench
-    tabs.querySelectorAll('[data-workbench-tab]').forEach((tab) => {
-      const name = tab.getAttribute('data-workbench-tab')
-      const available = tabAvailable(name)
-      tab.hidden = !available
-      const selected = state.workbenchSplit || state.workbenchTab === name
-      tab.classList.toggle('is-active', selected)
-      tab.setAttribute('aria-selected', selected ? 'true' : 'false')
-    })
-    const count = $('#workbench-team-count')
-    if (count) {
-      const total = state.agentRuns.size
-      count.hidden = total === 0
-      count.textContent = String(total)
-    }
-    const permCount = $('#workbench-perm-count')
-    if (permCount) {
-      const total = state.permRequests.todo.length
-      permCount.hidden = total === 0
-      permCount.textContent = String(total)
-    }
-    const split = $('#workbench-split')
-    if (split) {
-      split.hidden = !(hasTeam && hasFile)
-      split.classList.toggle('is-active', state.workbenchSplit)
-      split.setAttribute('aria-pressed', state.workbenchSplit ? 'true' : 'false')
-    }
-    const collapse = $('#workbench-collapse')
-    if (collapse) {
-      collapse.hidden = !hasWorkbench
-      collapse.setAttribute('aria-expanded', collapsed ? 'false' : 'true')
-      collapse.title = collapsed ? '展开右侧工作台' : '收起右侧工作台'
-      collapse.setAttribute('aria-label', collapse.title)
-    }
-    const close = $('#workbench-close')
-    if (close) close.hidden = !showPerm
+  renderWorkbenchTabs({ hasTeam, hasFile, hasPerm, hasWeb, hasCloud })
+  const split = $('#workbench-split')
+  if (split) {
+    split.hidden = !(hasTeam && hasFile)
+    split.classList.toggle('is-active', state.workbenchSplit)
+    split.setAttribute('aria-pressed', state.workbenchSplit ? 'true' : 'false')
   }
-
   const restore = $('#workbench-restore')
   if (restore) {
     restore.hidden = !collapsed
     restore.setAttribute('aria-expanded', collapsed ? 'false' : 'true')
     const restoreLabel = $('#workbench-restore-label')
-    if (restoreLabel) restoreLabel.textContent = hasTeam ? '团队' : hasFile ? '文件' : '权限'
+    if (restoreLabel) {
+      restoreLabel.textContent =
+        state.workbenchTab === 'web' && hasWeb
+          ? '网页'
+          : state.workbenchTab === 'cloud' && hasCloud
+            ? '云空间'
+            : state.workbenchTab === 'perm' && hasPerm
+              ? '审批'
+              : state.workbenchTab === 'file' && hasFile
+                ? '文件'
+                : '团队'
+    }
     const restoreCount = $('#workbench-restore-count')
     if (restoreCount) {
-      const total = hasTeam ? state.agentRuns.size : hasPerm ? state.permRequests.todo.length : 0
+      const total =
+        state.workbenchTab === 'web' && hasWeb
+          ? state.browserTabs.length
+          : state.workbenchTab === 'cloud' && hasCloud
+            ? state.files.length
+            : state.workbenchTab === 'perm' && hasPerm
+              ? state.permRequests.todo.length
+              : state.agentRuns.size
       restoreCount.hidden = total === 0
       restoreCount.textContent = String(total)
     }
+  }
+
+  const dock = $('#workbench-dock')
+  if (dock) {
+    // 顶栏加号常驻在审批旁：工作台开或关都能新建网页标签；只有不在对话模式时隐藏。
+    dock.hidden = !inChat
   }
 
   if (inChat) main.classList.toggle('is-split-preview', !rail.hidden)
@@ -5307,6 +7690,8 @@ function syncWorkbenchLayout() {
   main.classList.toggle('is-team-only', !rail.hidden && hasTeam && !hasFile)
   main.classList.toggle('is-team-file', !rail.hidden && hasTeam && hasFile)
   main.classList.toggle('is-perm-only', !rail.hidden && hasPerm && !hasTeam && !hasFile)
+  main.classList.toggle('is-web-only', !rail.hidden && hasWeb && !hasTeam && !hasFile && !hasPerm)
+  main.classList.toggle('is-web-active', !rail.hidden && !collapsed && showWeb)
   const resizer = $('#file-split-resizer')
   if (resizer) resizer.hidden = !(inChat && !rail.hidden && !collapsed)
   // 从文件 / 权限页切回团队，或展开右栏后，容器尺寸才真正可用；
@@ -5316,6 +7701,9 @@ function syncWorkbenchLayout() {
       if (state.agentSelectedId) restoreAgentThreadScroll(state.agentSelectedId)
     })
   }
+  // 原生网页 View 覆盖在 Web 页面之上，必须在布局真正落位后再同步矩形。
+  scheduleDesktopBrowserViewSync()
+  scheduleBrowserTabsPersist()
 }
 
 function setWorkbenchCollapsed(collapsed, options = {}) {
@@ -5843,11 +8231,6 @@ function renderPermissionPane() {
     todoCount.hidden = counts.todo === 0
     todoCount.textContent = String(counts.todo)
   }
-  const entryCount = $('#perm-entry-count')
-  if (entryCount) {
-    entryCount.hidden = counts.todo === 0
-    entryCount.textContent = String(counts.todo)
-  }
   document.querySelectorAll('[data-perm-view]').forEach((button) => {
     const view = button.getAttribute('data-perm-view')
     const active = view === state.permView
@@ -5921,6 +8304,7 @@ async function refreshPermissionBadge() {
 function openPermissionPane() {
   state.permOpen = true
   state.workbenchTab = 'perm'
+  state.workbenchSplit = false
   state.permSuccess = ''
   setWorkbenchCollapsed(false)
   syncWorkbenchLayout()
@@ -6044,13 +8428,6 @@ async function urgePermissionFromWeb(requestId) {
 }
 
 function bindPermissionPane() {
-  $('#perm-entry')?.addEventListener('click', () => {
-    if (state.permOpen && state.workbenchTab === 'perm' && !state.workbenchCollapsed) {
-      closePermissionPane()
-      return
-    }
-    openPermissionPane()
-  })
   $('#perm-switch')?.addEventListener('click', (event) => {
     const button = event.target.closest('[data-perm-view]')
     if (!button) return
@@ -7130,7 +9507,15 @@ async function openWorkspaceOffice(file, mode) {
     )
     if (token !== workspacePreviewToken || state.filePreview?.id !== file.id) return
     if (!result?.configured) {
-      filePaneMessage(result?.reason || 'OnlyOffice 文档服务未配置')
+      filePaneState({
+        kicker: '文档服务',
+        title: '文档服务暂不可用',
+        message: result?.reason || 'OnlyOffice 文档服务未配置，当前只能下载后查看。',
+        actions: [
+          { label: '下载文件', primary: true, onClick: downloadWorkspacePreview },
+          { label: '重试加载', onClick: () => void openWorkspaceOffice(file, mode) },
+        ],
+      })
       return
     }
     const holder = document.createElement('div')
@@ -7146,10 +9531,20 @@ async function openWorkspaceOffice(file, mode) {
       edit.hidden = !owner
       edit.textContent = onlyOfficeMode === 'edit' ? '预览' : '编辑'
       edit.title = onlyOfficeMode === 'edit' ? '切换为只读预览' : '在线编辑并保存回云空间'
+      syncFilePanePrimary()
     }
   } catch (err) {
     if (token !== workspacePreviewToken) return
-    filePaneMessage(`文档服务加载失败：${err.message}`, 'bad')
+    filePaneState({
+      kicker: '文档服务',
+      title: '文档服务加载失败',
+      message: uiFailureMessage(err),
+      tone: 'bad',
+      actions: [
+        { label: '重试加载', primary: true, onClick: () => void openWorkspaceOffice(file, mode) },
+        { label: '下载文件', onClick: downloadWorkspacePreview },
+      ],
+    })
   }
 }
 
@@ -7177,6 +9572,62 @@ function filePaneMessage(message, tone = 'muted') {
   const text = document.createElement('p')
   text.textContent = message
   holder.appendChild(text)
+  setFilePaneBody(holder)
+  hidePreviewSelection()
+}
+
+function previewFileExtension(file) {
+  const name = String(file?.name || '')
+  const index = name.lastIndexOf('.')
+  return index > 0 ? name.slice(index + 1).toUpperCase() : ''
+}
+
+function uiFailureMessage(err) {
+  return err instanceof TypeError ? '网络连接中断或请求被阻止' : err?.message || '未知错误'
+}
+
+/** 文件正文的可行动状态：说明发生了什么、为什么，以及下载 / 重试入口。 */
+function filePaneState({ kicker = '文件预览', title, message = '', tone = 'muted', actions = [] }) {
+  const holder = document.createElement('div')
+  holder.className = `file-pane-empty file-pane-state ${tone === 'bad' ? 'is-bad' : ''}`
+  holder.setAttribute('role', tone === 'bad' ? 'alert' : 'status')
+  const card = document.createElement('div')
+  card.className = 'file-pane-state-card'
+  const mark = document.createElement('span')
+  mark.className = 'file-pane-state-mark'
+  mark.textContent = tone === 'bad' ? '!' : 'i'
+  mark.setAttribute('aria-hidden', 'true')
+  card.appendChild(mark)
+  if (kicker) {
+    const eyebrow = document.createElement('span')
+    eyebrow.className = 'file-pane-state-kicker'
+    eyebrow.textContent = kicker
+    card.appendChild(eyebrow)
+  }
+  const heading = document.createElement('h3')
+  heading.className = 'file-pane-state-title'
+  heading.textContent = title
+  card.appendChild(heading)
+  if (message) {
+    const text = document.createElement('p')
+    text.className = 'file-pane-state-text'
+    text.textContent = message
+    card.appendChild(text)
+  }
+  if (actions.length) {
+    const row = document.createElement('div')
+    row.className = 'file-pane-state-actions'
+    for (const action of actions) {
+      const button = document.createElement('button')
+      button.type = 'button'
+      button.className = `btn sm ${action.primary ? 'primary' : 'ghost'}`
+      button.textContent = action.label
+      button.addEventListener('click', action.onClick)
+      row.appendChild(button)
+    }
+    card.appendChild(row)
+  }
+  holder.appendChild(card)
   setFilePaneBody(holder)
   hidePreviewSelection()
 }
@@ -8598,19 +11049,11 @@ async function openWorkspaceFile(id, options = {}) {
     return
   }
   const requestSeq = ++workspacePreviewToken
-  // 打开另一个文件时先冻结旧预览的巡检；若新文件不可预览，旧预览仍在，稍后恢复巡检。
-  const previousFile = state.filePreview
-  const replacing = Boolean(previousFile && previousFile.id !== file.id)
-  if (replacing) stopWorkspacePreviewWatch()
   const capability = await fetchPreviewCapability(file)
   if (requestSeq !== workspacePreviewToken) return
   const kind = capability?.kind || previewKindForFile(file)
-  if (kind === 'none') {
-    // 没有可用预览能力时不创建面板，也不让右栏出现空白占位。
-    if (replacing && state.filePreview?.id === previousFile.id) startWorkspacePreviewWatch(previousFile)
-    banner(capability?.reason || `《${file.name}》暂不支持在线预览，请下载后查看。`, 'warn')
-    return
-  }
+  const unsupported = kind === 'none'
+  // 不支持的格式不再只弹一条会消失的横幅：仍打开右侧面板，用可行动状态说明原因并给出下载入口。
   // 新文件即将替换旧预览，先让上一份文件的巡检失效，避免旧请求关掉新面板。
   stopWorkspacePreviewWatch()
   if (fileStreamDraft && fileStreamDraft.fileId !== file.id) finishStreamingFilePreview()
@@ -8632,6 +11075,8 @@ async function openWorkspaceFile(id, options = {}) {
   const chatMain = $('.chat-main')
   chatMain.classList.add('is-file-preview')
   chatMain.classList.toggle('is-split-preview', split)
+  // 用户可能在上一次会话里收起过右栏；打开文件预览时必须重新展开，否则窄屏只剩标签条。
+  if (split && state.workbenchCollapsed) setWorkbenchCollapsed(false, { persist: false })
   if (split) restoreFileSplitRatio()
   syncWorkbenchLayout()
   // 对话内预览保留左栏对话和输入区，只把右侧让给文件；工作台/窄屏仍走整页预览。
@@ -8654,6 +11099,8 @@ async function openWorkspaceFile(id, options = {}) {
   const owner = file.ownerUserId === state.me?.person?.id
   $('#file-pane-rename').hidden = true
   $('#file-pane-edit').hidden = true
+  setFilePaneEditing(false)
+  syncFilePanePrimary()
   $('#file-pane-edit').textContent = '编辑'
   $('#file-pane-edit').title = '编辑文件内容'
   $('#file-pane-delete').hidden = !owner
@@ -8663,6 +11110,16 @@ async function openWorkspaceFile(id, options = {}) {
   $('#file-pane-download').hidden = false
   $('#file-pane-send-dingtalk').hidden = false
   renderWorkspaceFiles()
+  if (unsupported) {
+    const extension = previewFileExtension(file)
+    filePaneState({
+      kicker: extension ? `${extension} 文件` : '文件类型',
+      title: '暂不支持在线预览',
+      message: `${capability?.reason || '该类型文件不能直接在右侧打开'}；下载后可用本地应用查看，也可继续发送钉钉。`,
+      actions: [{ label: '下载文件', primary: true, onClick: downloadWorkspacePreview }],
+    })
+    return
+  }
   startWorkspacePreviewWatch(file)
   if (isOfficeLike(file)) {
     await openWorkspaceOffice(file, options.mode === 'edit' ? 'edit' : 'view')
@@ -8680,8 +11137,14 @@ async function openWorkspaceFile(id, options = {}) {
     if (token !== workspacePreviewToken || state.filePreview?.id !== file.id) return
     if (isTextLike(file)) {
       if (file.size > 5 * 1024 * 1024) {
-        filePaneMessage('这个文本文件超过 5 MB，先在右侧下载后查看。')
+        filePaneState({
+          kicker: '文本预览',
+          title: '文件过大，暂不在线展开',
+          message: '这个文本文件超过 5 MB，为避免卡顿没有继续读取。下载后可本地查看或编辑。',
+          actions: [{ label: '下载文件', primary: true, onClick: downloadWorkspacePreview }],
+        })
         $('#file-pane-edit').hidden = true
+        syncFilePanePrimary()
         return
       }
       const text = await blob.text()
@@ -8702,6 +11165,7 @@ async function openWorkspaceFile(id, options = {}) {
         setFilePaneBody(pre)
       }
       $('#file-pane-edit').hidden = !owner
+      syncFilePanePrimary()
       return
     }
     if (isPdfLike(file)) {
@@ -8721,10 +11185,26 @@ async function openWorkspaceFile(id, options = {}) {
       }
       return
     }
-    filePaneMessage('这个文件类型不能直接预览，点右上角「下载」查看内容。')
+    const extension = previewFileExtension(file)
+    filePaneState({
+      kicker: extension ? `${extension} 文件` : '文件类型',
+      title: '暂不支持在线预览',
+      message: `${extension ? `${extension} 格式` : '该类型'}不能直接在右侧打开，下载后可用本地应用查看；共享与发送钉钉仍可继续。`,
+      actions: [{ label: '下载文件', primary: true, onClick: downloadWorkspacePreview }],
+    })
   } catch (err) {
     if (token !== workspacePreviewToken) return
-    filePaneMessage(`读取失败：${err.message}`, 'bad')
+    const failure = uiFailureMessage(err)
+    filePaneState({
+      kicker: '读取失败',
+      title: '文件没有加载成功',
+      message: `${failure}。可以重试读取，或先下载到本地。`,
+      tone: 'bad',
+      actions: [
+        { label: '重试读取', primary: true, onClick: () => void openWorkspaceFile(file.id) },
+        { label: '下载文件', onClick: downloadWorkspacePreview },
+      ],
+    })
   }
 }
 
@@ -8809,9 +11289,42 @@ function closeWorkspaceFile() {
   restoreWorkspacePreviewReturnFocus()
 }
 
+function syncFilePanePrimary() {
+  const editButton = $('#file-pane-edit')
+  const downloadButton = $('#file-pane-download')
+  if (!editButton || !downloadButton) return
+  const canEdit = !editButton.hidden
+  editButton.classList.toggle('primary', canEdit)
+  editButton.classList.toggle('ghost', !canEdit)
+  downloadButton.classList.toggle('primary', !canEdit)
+  downloadButton.classList.toggle('ghost', canEdit)
+}
+
+function setFilePaneEditing(editing) {
+  const editButton = $('#file-pane-edit')
+  if (editButton) {
+    editButton.disabled = editing
+    editButton.textContent = editing ? '编辑中' : '编辑'
+    editButton.title = editing ? '正在编辑，保存或取消后可继续其他操作' : '编辑文件内容'
+  }
+  for (const id of [
+    '#file-pane-versions',
+    '#file-pane-export',
+    '#file-pane-gui',
+    '#file-pane-download',
+    '#file-pane-send-dingtalk',
+    '#file-pane-rename',
+    '#file-pane-delete',
+  ]) {
+    const button = $(id)
+    if (button) button.disabled = editing
+  }
+}
+
 function beginWorkspaceEdit() {
   const file = state.filePreview
   if (!file || !workspacePreviewTextLoaded) return
+  setFilePaneEditing(true)
   $('#file-pane-body').hidden = true
   $('#file-pane-editor').hidden = false
   workspaceDiffVisible = false
@@ -8826,7 +11339,9 @@ function beginWorkspaceEdit() {
   toggle.disabled = false
   toggle.textContent = '查看差异'
   toggle.setAttribute('aria-pressed', 'false')
-  $('#file-pane-editor-hint').textContent = '保存后会覆盖原文件内容；空内容也可以保存。'
+  const hint = $('#file-pane-editor-hint')
+  hint.classList.remove('is-bad')
+  hint.textContent = '保存后会覆盖原文件内容；空内容也可以保存。'
   textarea.focus()
 }
 
@@ -8838,6 +11353,7 @@ function cancelWorkspaceEdit() {
   $('#file-pane-text').hidden = false
   $('#file-pane-diff-toggle').hidden = true
   $('#file-pane-body').hidden = false
+  setFilePaneEditing(false)
   const editButton = $('#file-pane-edit')
   if (editButton && !editButton.hidden) editButton.focus()
 }
@@ -8859,7 +11375,10 @@ async function saveWorkspaceEdit() {
     if (state.files.some((item) => item.id === file.id)) await openWorkspaceFile(file.id)
     else closeWorkspaceFile()
   } catch (err) {
-    $('#file-pane-editor-hint').textContent = `保存失败：${err.message}`
+    const hint = $('#file-pane-editor-hint')
+    const failure = uiFailureMessage(err)
+    hint.classList.add('is-bad')
+    hint.textContent = `保存失败：${failure}。内容仍在编辑器，可重试保存。`
   } finally {
     workspacePreviewSaving = false
     $('#file-pane-save').disabled = false
@@ -8986,7 +11505,7 @@ async function openWorkspaceVersionHistory(file) {
     }
     list.innerHTML = items.map((item) => {
       const current = Number(item.version) === Number(file.updatedAt)
-      const versionName = `v${item.version}`
+      const versionName = formatVersionTime(item.createdAt)
       return `<div class="version-row${current ? ' is-current' : ''}">
         <div class="version-row-main">
           <div class="version-row-title">
@@ -8994,7 +11513,7 @@ async function openWorkspaceVersionHistory(file) {
             ${current ? '<span class="version-current-badge">当前</span>' : ''}
             <span class="version-row-size">${esc(fmtSize(item.size))}</span>
           </div>
-          <div class="version-row-meta">${esc(versionSourceLabel(item.source))} · ${esc(formatVersionTime(item.createdAt))}</div>
+          <div class="version-row-meta">${esc(versionSourceLabel(item.source))}</div>
           ${item.summary ? `<div class="version-row-summary">${esc(item.summary)}</div>` : ''}
         </div>
         <div class="version-row-actions">
@@ -9007,7 +11526,7 @@ async function openWorkspaceVersionHistory(file) {
     if (previous) {
       quickRestore.disabled = false
       quickRestore.dataset.versionId = previous.id
-      quickRestore.dataset.versionLabel = `v${previous.version}`
+      quickRestore.dataset.versionLabel = formatVersionTime(previous.createdAt)
     }
   }
 
@@ -9018,7 +11537,11 @@ async function openWorkspaceVersionHistory(file) {
       showStatus('')
     } catch (err) {
       count.textContent = '读取失败'
-      list.innerHTML = `<div class="version-card-empty is-error">读取版本历史失败：${esc(err.message)}</div>`
+      const failure = uiFailureMessage(err)
+      list.innerHTML = `<div class="version-card-empty is-error">
+        <div>读取版本历史失败：${esc(failure)}</div>
+        <button class="btn ghost sm" type="button" data-version-retry>重试</button>
+      </div>`
     }
   }
 
@@ -9073,6 +11596,14 @@ async function openWorkspaceVersionHistory(file) {
   }
 
   list.addEventListener('click', async (event) => {
+    const retry = event.target.closest('[data-version-retry]')
+    if (retry) {
+      retry.disabled = true
+      retry.textContent = '读取中…'
+      count.textContent = '正在读取…'
+      await load()
+      return
+    }
     const button = event.target.closest('[data-version-restore]')
     if (!button || button.disabled) return
     const versionId = button.getAttribute('data-version-restore') || ''
@@ -9407,8 +11938,1776 @@ async function exportWorkspacePreviewPdf(file) {
   }
 }
 
-/** 右侧工作台：团队 / 文件 / 并排。两个面板同级，团队不在文件预览里面。 */
+/* ---------------- 右侧工作台：网页 ---------------- */
+
+function shortBrowserUrl(url) {
+  const value = String(url || '').trim()
+  if (value.length <= 44) return value
+  return `${value.slice(0, 40)}…`
+}
+
+/** 浏览器底部只保留真正需要展示的内容：键盘接管和本站登录信息按需展开。 */
+function syncWebPaneFoot() {
+  const foot = $('#web-pane-foot')
+  if (!foot) return
+  const cred = $('#web-cred-panel')
+  const takeover = $('#web-takeover')
+  const credOpen = Boolean(cred && !cred.hidden)
+  const controlOpen = Boolean(state.browserControlOpen && state.browserPage?.pageId && !usesNativeBrowser())
+  if (takeover) takeover.hidden = !controlOpen
+  foot.hidden = !(credOpen || controlOpen)
+  const controlToggle = $('#web-control-toggle')
+  if (controlToggle) {
+    controlToggle.setAttribute('aria-expanded', controlOpen ? 'true' : 'false')
+    controlToggle.classList.toggle('is-active', controlOpen)
+    controlToggle.title = controlOpen ? '收起键盘输入' : '键盘输入'
+    controlToggle.setAttribute('aria-label', controlToggle.title)
+  }
+}
+
+function setBrowserStatus(text, bad = false) {
+  state.browserNotice = String(text || '')
+  state.browserNoticeBad = Boolean(bad)
+  const status = $('#web-pane-status')
+  if (!status) return
+  status.textContent = state.browserNotice || '就绪'
+  status.classList.toggle('is-bad', state.browserNoticeBad)
+}
+
+function setWebEmpty(title, body) {
+  const empty = $('#web-empty')
+  if (!empty) return
+  const titleNode = empty.querySelector('.web-empty-title')
+  const bodyNode = empty.querySelector('p')
+  if (titleNode) titleNode.textContent = title
+  if (bodyNode) {
+    bodyNode.textContent = body
+    bodyNode.hidden = !body
+  }
+}
+
+/** 地址栏收起时只显示域名，聚焦后再展开完整 URL；长路径不进常驻视图。 */
+function browserAddressHost(url) {
+  const value = String(url || '').trim()
+  if (!value) return ''
+  try {
+    const parsed = new URL(value)
+    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') return parsed.host || value
+  } catch {
+    // 非法 URL 仍原样显示，避免地址栏变成空白。
+  }
+  return value
+}
+
+function updateBrowserAddress(url, force = false) {
+  const input = $('#web-address-input')
+  if (!input) return
+  const fullUrl = String(url || '')
+  const host = browserAddressHost(fullUrl) || 'about:blank'
+  input.dataset.fullUrl = fullUrl
+  input.dataset.host = host
+  input.title = fullUrl
+  if (!force && input.dataset.editing === '1') return
+  if (input.value !== host) input.value = host
+}
+
+function usesNativeBrowser(page = state.browserPage) {
+  return Boolean(desktopBrowserHost && page?.native && page.pageId)
+}
+
+/** 把原生 WebContentsView 的矩形对齐到 #web-frame-shell；非原生页一律隐藏。 */
+let desktopBrowserViewSyncTimer = 0
+/**
+ * WebContentsView 的矩形依赖工作台 DOM 完成布局。
+ * 新标签由主进程在页面自身 window.open 时创建，IPC 到达时标签栏可能还没完成一帧布局；
+ * 只跑一次 requestAnimationFrame 会偶发拿到 0×0，页面就会一直空白。
+ * 这里用两帧 + 一个延时兜底，确保新标签、切换标签都能立刻显示。
+ */
+function scheduleDesktopBrowserViewSync() {
+  requestAnimationFrame(() => {
+    syncDesktopBrowserView()
+    requestAnimationFrame(syncDesktopBrowserView)
+  })
+  if (desktopBrowserViewSyncTimer) clearTimeout(desktopBrowserViewSyncTimer)
+  desktopBrowserViewSyncTimer = window.setTimeout(() => {
+    desktopBrowserViewSyncTimer = 0
+    syncDesktopBrowserView()
+  }, 180)
+}
+
+function syncDesktopBrowserView() {
+  if (!desktopBrowserHost) return
+  const page = state.browserPage
+  const shell = $('#web-frame-shell')
+  const pane = $('#web-pane')
+  if (
+    !usesNativeBrowser(page) ||
+    state.mode !== 'chat' ||
+    state.workbenchCollapsed ||
+    state.workbenchTab !== 'web' ||
+    !shell ||
+    !pane ||
+    pane.hidden ||
+    !shell.offsetParent
+  ) {
+    desktopBrowserHost.hideAll()
+    // 当前没有可显示的原生页（空白标签 / 切到团队面板）时，焦点回到主窗口。
+    if (!state.browserPage?.pageId) desktopBrowserHost.focusShell?.()
+    return
+  }
+  const rect = shell.getBoundingClientRect()
+  if (rect.width < 24 || rect.height < 24) {
+    desktopBrowserHost.hideAll()
+    return
+  }
+  desktopBrowserHost.setBounds(page.pageId, {
+    x: rect.left,
+    y: rect.top,
+    width: rect.width,
+    height: rect.height,
+  })
+  desktopBrowserHost.show(page.pageId)
+}
+
+/** 原生页只同步标题、URL、加载态，不启动 JPEG 轮询。 */
+function applyDesktopBrowserState(view) {
+  const pageId = String(view?.pageId || '')
+  if (!pageId) return
+  const tab = state.browserTabs.find((item) => item.pageId === pageId)
+  if (!tab) return
+  const nextTitle = String(view.title || '').trim()
+  const nextUrl = String(view.url || '').trim()
+  const nextFavicon = safeTabFavicon(view.favicon)
+  const urlChanged = Boolean(nextUrl && nextUrl !== tab.url)
+  const changed = (nextTitle && nextTitle !== tab.title) || urlChanged || (nextFavicon && nextFavicon !== tab.favicon)
+  if (nextTitle) tab.title = nextTitle
+  if (nextUrl) tab.url = nextUrl
+  if (urlChanged) tab.favicon = nextFavicon
+  else if (nextFavicon) tab.favicon = nextFavicon
+  if (state.browserPage?.pageId !== pageId) {
+    if (changed) syncWorkbenchLayout(true)
+    return
+  }
+  if (nextUrl) state.browserPage.url = nextUrl
+  if (nextTitle) state.browserPage.title = nextTitle
+  if (nextFavicon) state.browserPage.favicon = nextFavicon
+  else if (urlChanged) state.browserPage.favicon = ''
+  state.browserPage.canGoBack = Boolean(view.canGoBack)
+  state.browserPage.canGoForward = Boolean(view.canGoForward)
+  if (nextUrl) updateBrowserAddress(nextUrl)
+  if (view.error) setBrowserStatus(String(view.error), true)
+  else if (view.loading) setBrowserStatus('正在加载…')
+  else setBrowserStatus('已连接')
+  if (changed) {
+    renderWebPane()
+    syncWorkbenchLayout(true)
+  } else {
+    requestAnimationFrame(syncDesktopBrowserView)
+  }
+}
+
+function handleDesktopTabOpen(view) {
+  const pageId = String(view?.pageId || '')
+  if (!pageId) return
+  // 原生页可能由别的对话的后台流程打开；只接收当前对话的标签。
+  if (view.sessionId && String(view.sessionId) !== browserTabsScopeSessionId) return
+  const tab = ensureBrowserTab(view, { activate: view.activate !== false })
+  if (!tab) return
+  if (view.activate === false) {
+    // Ctrl+点击 / 中键点击按后台标签打开，不打断当前页面。
+    syncWorkbenchLayout(true)
+    return
+  }
+  activateBrowserTab(tab.tabId)
+}
+
+function handleDesktopBrowserCommand(payload) {
+  const command = String(payload?.command || '')
+  if (!command) return
+  // 主窗口自身的快捷键只在网页工作台前台生效，避免用户在聊天输入框按 Ctrl+W 误关标签。
+  if (payload?.scope === 'shell' && (state.mode !== 'chat' || state.workbenchTab !== 'web' || state.workbenchCollapsed)) return
+  if (command === 'new-tab') {
+    newBrowserDraftTab()
+    return
+  }
+  if (command === 'close-tab') {
+    closeActiveBrowserTab()
+    return
+  }
+  if (command === 'next-tab' || command === 'previous-tab') {
+    cycleBrowserTab(command === 'next-tab' ? 1 : -1)
+    return
+  }
+  if (command === 'focus-address') {
+    focusBrowserAddress()
+    return
+  }
+  if (command === 'back' || command === 'forward' || command === 'reload') {
+    void navigateBrowserPage(command)
+  }
+}
+
+function closeActiveBrowserTab() {
+  const page = state.browserPage
+  if (!page) return
+  if (page.draft || !page.pageId) {
+    removeBrowserTab(page.tabId)
+    return
+  }
+  void closeBrowserPage(page.pageId)
+}
+
+function cycleBrowserTab(step) {
+  if (!state.browserTabs.length) return
+  const current = state.browserPage?.tabId || ''
+  const index = Math.max(0, state.browserTabs.findIndex((tab) => tab.tabId === current))
+  const next = state.browserTabs[(index + step + state.browserTabs.length) % state.browserTabs.length]
+  if (next) activateBrowserTab(next.tabId)
+}
+
+function focusBrowserAddress() {
+  // 地址栏在 EAB 渲染进程里，先把系统焦点从原生 WebContentsView 收回主窗口，
+  // 否则 focus 事件不触发，地址栏只会显示 host、不会展开完整 URL。
+  const input = state.browserPage?.draft ? $('#web-newtab-input') : $('#web-address-input')
+  if (!input) return
+  const focusInput = () => {
+    if (!input.isConnected) return
+    // 不依赖 focus 事件也把完整 URL 填进去，避免主窗口尚未拿回系统焦点时仍显示 host。
+    if (input.id === 'web-address-input' && input.dataset.fullUrl) {
+      input.dataset.editing = '1'
+      input.value = input.dataset.fullUrl
+    }
+    input.focus()
+    input.select()
+  }
+  if (desktopBrowserHost) {
+    desktopBrowserHost.focusShell?.()
+    window.setTimeout(focusInput, 40)
+  } else {
+    focusInput()
+  }
+}
+
+/**
+ * 网页标签获得焦点时，主进程的 before-input-event 会接管快捷键；
+ * 但地址栏 / 新标签输入框在 EAB 渲染进程里，必须由前端再补一套，
+ * 否则 Ctrl+W、Ctrl+Tab 等快捷键在输入框内会失效。
+ */
+function bindBrowserPaneShortcuts() {
+  document.addEventListener('keydown', (event) => {
+    if (!desktopBrowserHost || event.defaultPrevented || event.isComposing) return
+    if (state.mode !== 'chat' || state.workbenchTab !== 'web' || state.workbenchCollapsed) return
+    const pane = $('#web-pane')
+    if (!pane || pane.hidden) return
+    const target = event.target instanceof Node ? event.target : null
+    if (!target || !pane.contains(target)) return
+    const key = String(event.key || '')
+    const lower = key.toLowerCase()
+    const ctrl = Boolean(event.ctrlKey || event.metaKey)
+    const alt = Boolean(event.altKey)
+    if (ctrl && lower === 't') {
+      event.preventDefault()
+      newBrowserDraftTab()
+      return
+    }
+    if (ctrl && lower === 'w') {
+      event.preventDefault()
+      closeActiveBrowserTab()
+      return
+    }
+    if (ctrl && key === 'Tab') {
+      event.preventDefault()
+      cycleBrowserTab(event.shiftKey ? -1 : 1)
+      return
+    }
+    if (ctrl && lower === 'l') {
+      event.preventDefault()
+      focusBrowserAddress()
+      return
+    }
+    if (ctrl && lower === 'r') {
+      event.preventDefault()
+      if (state.browserPage?.pageId) void navigateBrowserPage('reload')
+      return
+    }
+    if (lower === 'f5') {
+      event.preventDefault()
+      if (state.browserPage?.pageId) void navigateBrowserPage('reload')
+      return
+    }
+    if (alt && key === 'ArrowLeft') {
+      event.preventDefault()
+      if (state.browserPage?.pageId) void navigateBrowserPage('back')
+      return
+    }
+    if (alt && key === 'ArrowRight') {
+      event.preventDefault()
+      if (state.browserPage?.pageId) void navigateBrowserPage('forward')
+    }
+  })
+}
+
+/** 桌面版更新：界面只展示状态，检查/下载/安装都由主进程执行并弹原生确认框。 */
+function renderDesktopUpdate() {
+  const chip = $('#desktop-update-chip')
+  const chipLabel = $('#desktop-update-chip-label')
+  const row = $('#settings-update')
+  const hint = $('#settings-update-hint')
+  if (!desktopBrowserHost) {
+    if (chip) chip.hidden = true
+    if (row) row.hidden = true
+    return
+  }
+  const update = state.desktopUpdate || {}
+  const current = update.current || ''
+  const latest = update.latest || ''
+  const percent = Math.round((Number(update.progress) || 0) * 100)
+  if (row) row.hidden = false
+  if (hint) {
+    if (update.status === 'checking') hint.textContent = '正在从当前 EAB 服务器检查更新…'
+    else if (update.status === 'current') hint.textContent = `已是最新版本${current ? ` v${current}` : ''}`
+    else if (update.status === 'available') hint.textContent = `发现新版本 v${latest}，点击下载并安装`
+    else if (update.status === 'downloading') hint.textContent = `正在下载 v${latest} · ${percent}%`
+    else if (update.status === 'ready') hint.textContent = `v${latest} 已下载完成，点击重启并安装`
+    else if (update.status === 'error') hint.textContent = `检查失败：${update.error || '请稍后重试'}（点击重试）`
+    else if (update.status === 'unconfigured') hint.textContent = '尚未连接 EAB 服务器'
+    else hint.textContent = current ? `当前版本 v${current}，点击检查更新` : '从当前 EAB 服务器检查桌面版更新'
+  }
+  if (!chip) return
+  const visible = ['available', 'downloading', 'ready'].includes(update.status)
+  chip.hidden = !visible
+  chip.classList.toggle('is-ready', update.status === 'ready')
+  chip.classList.toggle('is-progress', update.status === 'downloading')
+  if (!visible || !chipLabel) return
+  if (update.status === 'available') chipLabel.textContent = `发现 v${latest}`
+  else if (update.status === 'downloading') chipLabel.textContent = `更新 ${percent}%`
+  else chipLabel.textContent = `重启安装 v${latest}`
+}
+
+async function triggerDesktopUpdate() {
+  if (!desktopBrowserHost) return
+  const status = state.desktopUpdate?.status || 'idle'
+  if (status === 'checking' || status === 'downloading') return
+  try {
+    if (status === 'ready') await desktopBrowserHost.applyUpdate?.()
+    else if (status === 'available') await desktopBrowserHost.downloadUpdate?.()
+    else await desktopBrowserHost.checkUpdates?.()
+  } catch (err) {
+    banner(err.message || '更新操作失败', 'bad')
+    renderDesktopUpdate()
+  }
+}
+
+function bindDesktopUpdates() {
+  if (!desktopBrowserHost) return
+  const row = $('#settings-update')
+  const chip = $('#desktop-update-chip')
+  row?.addEventListener('click', () => void triggerDesktopUpdate())
+  chip?.addEventListener('click', () => void triggerDesktopUpdate())
+  desktopBrowserHost.onUpdate?.((next) => {
+    state.desktopUpdate = {
+      ...state.desktopUpdate,
+      ...(next && typeof next === 'object' ? next : {}),
+    }
+    renderDesktopUpdate()
+  })
+  desktopBrowserHost
+    .getServerInfo?.()
+    .then((info) => {
+      state.desktopUpdate.current = String(info?.version || '')
+      renderDesktopUpdate()
+    })
+    .catch(() => renderDesktopUpdate())
+  renderDesktopUpdate()
+}
+
+function bindDesktopBrowser() {
+  if (!desktopBrowserHost) return
+  desktopBrowserHost.onState((view) => applyDesktopBrowserState(view))
+  desktopBrowserHost.onClosed((payload) => {
+    const pageId = String(payload?.pageId || '')
+    const tab = state.browserTabs.find((item) => item.pageId === pageId)
+    if (tab) removeBrowserTab(tab.tabId)
+  })
+  if (typeof desktopBrowserHost.onTabOpen === 'function') {
+    desktopBrowserHost.onTabOpen((view) => handleDesktopTabOpen(view))
+  }
+  if (typeof desktopBrowserHost.onActivate === 'function') {
+    desktopBrowserHost.onActivate((payload) => {
+      const pageId = String(payload?.pageId || '')
+      const tab = state.browserTabs.find((item) => item.pageId === pageId)
+      if (tab) activateBrowserTab(tab.tabId)
+    })
+  }
+  if (typeof desktopBrowserHost.onCommand === 'function') {
+    desktopBrowserHost.onCommand((payload) => handleDesktopBrowserCommand(payload))
+  }
+  const shell = $('#web-frame-shell')
+  if (shell && typeof ResizeObserver === 'function') {
+    const observer = new ResizeObserver(() => syncDesktopBrowserView())
+    observer.observe(shell)
+  }
+  window.addEventListener('resize', syncDesktopBrowserView)
+}
+
+function renderWebPane() {
+  renderWebPaneContent()
+  syncWebPaneFoot()
+}
+
+function renderWebPaneContent() {
+  const page = state.browserPage
+  const img = $('#web-frame')
+  const empty = $('#web-empty')
+  const bar = $('#web-browser-bar')
+  const addressInput = $('#web-address-input')
+  const draftInput = $('#web-newtab-input')
+  const takeover = $('#web-takeover')
+  const pause = $('#web-pane-pause')
+  const control = $('#web-control-toggle')
+  const status = $('#web-pane-status')
+
+  if (!page) {
+    if (bar) bar.hidden = true
+    if (addressInput) {
+      addressInput.value = ''
+      addressInput.dataset.fullUrl = ''
+      addressInput.dataset.host = ''
+      addressInput.title = ''
+      addressInput.dataset.editing = '0'
+    }
+    if (status) {
+      status.textContent = state.browserNotice || '就绪'
+      status.classList.toggle('is-bad', Boolean(state.browserNoticeBad))
+    }
+    if (takeover) takeover.hidden = true
+    if (control) {
+      control.hidden = true
+      control.setAttribute('aria-expanded', 'false')
+      control.classList.remove('is-active')
+    }
+    const credPanel = $('#web-cred-panel')
+    if (credPanel) credPanel.hidden = true
+    $('#web-cred-open')?.setAttribute('aria-expanded', 'false')
+    if (pause) {
+      pause.classList.remove('is-paused')
+      pause.setAttribute('aria-pressed', 'false')
+      pause.setAttribute('aria-label', '暂停画面')
+      pause.title = '暂停画面'
+    }
+    if (img) {
+      img.hidden = true
+      img.removeAttribute('src')
+    }
+    if (empty) empty.hidden = false
+    setWebEmpty('在右侧打开一个网页', 'Agent 打开网页后会自动出现在这里；你也可以输入网址或搜索。画面是服务端浏览器投屏，点击画面即可操作。')
+    if (draftInput && draftInput.value) draftInput.value = ''
+    if (draftInput) delete draftInput.dataset.tabId
+    requestAnimationFrame(syncDesktopBrowserView)
+    return
+  }
+
+  if (page.draft) {
+    if (bar) bar.hidden = true
+    if (addressInput) {
+      addressInput.value = ''
+      addressInput.dataset.fullUrl = ''
+      addressInput.dataset.host = ''
+      addressInput.title = ''
+      addressInput.dataset.editing = '0'
+    }
+    if (status) {
+      status.textContent = state.browserNotice || '输入网址后打开'
+      status.classList.toggle('is-bad', Boolean(state.browserNoticeBad))
+    }
+    if (takeover) takeover.hidden = true
+    if (control) {
+      control.hidden = true
+      control.setAttribute('aria-expanded', 'false')
+      control.classList.remove('is-active')
+    }
+    const credPanel = $('#web-cred-panel')
+    if (credPanel) credPanel.hidden = true
+    $('#web-cred-open')?.setAttribute('aria-expanded', 'false')
+    if (pause) {
+      pause.hidden = true
+      pause.classList.remove('is-paused')
+      pause.setAttribute('aria-pressed', 'false')
+      pause.setAttribute('aria-label', '暂停画面')
+      pause.title = '暂停画面'
+    }
+    if (img) {
+      img.hidden = true
+      img.removeAttribute('src')
+    }
+    if (empty) empty.hidden = false
+    setWebEmpty('在这里打开一个网页', '粘贴网址或输入关键词后回车；也可以从 Agent 团队、审批、文件之间切换标签。')
+    if (draftInput) {
+      const value = String(page.draftInput || '')
+      if (draftInput.dataset.tabId !== String(page.tabId || '')) {
+        draftInput.value = value
+        draftInput.dataset.tabId = String(page.tabId || '')
+      } else if (document.activeElement !== draftInput && draftInput.value !== value) {
+        draftInput.value = value
+      }
+    }
+    requestAnimationFrame(syncDesktopBrowserView)
+    return
+  }
+
+  if (usesNativeBrowser(page)) {
+    if (bar) bar.hidden = false
+    if (addressInput) updateBrowserAddress(page.url || '')
+    if (status) {
+      const text = state.browserNotice || (page.title ? '已连接' : '正在打开…')
+      status.textContent = text
+      status.classList.toggle('is-bad', Boolean(state.browserNoticeBad))
+    }
+    if (takeover) takeover.hidden = true
+    if (control) {
+      control.hidden = true
+      control.setAttribute('aria-expanded', 'false')
+      control.classList.remove('is-active')
+    }
+    if (pause) pause.hidden = true
+    if (img) {
+      img.hidden = true
+      img.removeAttribute('src')
+    }
+    if (empty) empty.hidden = true
+    const credPanel = $('#web-cred-panel')
+    if (credPanel) credPanel.hidden = true
+    const credOpen = $('#web-cred-open')
+    if (credOpen) {
+      credOpen.hidden = true
+      credOpen.setAttribute('aria-expanded', 'false')
+    }
+    if (bar) bar.dataset.native = '1'
+    const backBtn = $('#web-back')
+    const forwardBtn = $('#web-forward')
+    if (backBtn) backBtn.disabled = page.canGoBack === false
+    if (forwardBtn) forwardBtn.disabled = page.canGoForward === false
+    requestAnimationFrame(syncDesktopBrowserView)
+    return
+  }
+  if (bar) {
+    bar.hidden = false
+    delete bar.dataset.native
+    const backBtn = $('#web-back')
+    const forwardBtn = $('#web-forward')
+    if (backBtn) backBtn.disabled = false
+    if (forwardBtn) forwardBtn.disabled = false
+  }
+  const webCredOpen = $('#web-cred-open')
+  if (webCredOpen) webCredOpen.hidden = false
+  if (addressInput) updateBrowserAddress(page.url || '')
+  if (status) {
+    const text = state.browserNotice || (state.browserPaused ? '画面已暂停' : '已连接')
+    status.textContent = text
+    status.classList.toggle('is-bad', Boolean(state.browserNoticeBad))
+  }
+  if (control) {
+    control.hidden = false
+    control.setAttribute('aria-expanded', state.browserControlOpen ? 'true' : 'false')
+    control.classList.toggle('is-active', state.browserControlOpen)
+    control.title = state.browserControlOpen ? '收起键盘输入' : '键盘输入'
+    control.setAttribute('aria-label', control.title)
+  }
+  if (takeover) takeover.hidden = !state.browserControlOpen
+  if (pause) {
+    pause.hidden = false
+    pause.classList.toggle('is-paused', state.browserPaused)
+    pause.setAttribute('aria-pressed', state.browserPaused ? 'true' : 'false')
+    pause.setAttribute('aria-label', state.browserPaused ? '继续画面' : '暂停画面')
+    pause.title = state.browserPaused ? '继续画面' : '暂停画面'
+  }
+  const hasFrame = Boolean(img?.getAttribute('src'))
+  if (img) img.hidden = !hasFrame
+  if (empty) empty.hidden = hasFrame
+  if (!hasFrame) {
+    setWebEmpty('正在打开页面…', '正在连接浏览器实时画面。')
+  }
+}
+
+function stopBrowserFrameStream() {
+  if (state.browserStreamWatchdog) {
+    window.clearTimeout(state.browserStreamWatchdog)
+    state.browserStreamWatchdog = 0
+  }
+  if (state.browserStream) {
+    try {
+      state.browserStream.close()
+    } catch {
+      // 已断开
+    }
+    state.browserStream = null
+  }
+  state.browserStreamPageId = ''
+  state.browserStreamLastFrameAt = 0
+}
+
+function stopBrowserFramePolling() {
+  if (state.browserFrameTimer) {
+    window.clearInterval(state.browserFrameTimer)
+    state.browserFrameTimer = 0
+  }
+  stopBrowserFrameStream()
+  state.browserFrameAbort?.abort()
+  state.browserFrameAbort = null
+  state.browserFrameBusy = false
+}
+
+/** CDP screencast 帧直接以 data URL 上屏；不再每帧创建 blob，减少解码和内存抖动。 */
+function applyBrowserStreamFrame(jpegBase64) {
+  const page = state.browserPage
+  const img = $('#web-frame')
+  if (!page?.pageId || !img || state.browserPaused) return
+  if (String(jpegBase64 || '').length < 64) return
+  const pageId = page.pageId
+  state.browserStreamLastFrameAt = Date.now()
+  // 流帧比正在进行的 HTTP 取帧更新，取消旧请求，避免旧画面覆盖新画面。
+  state.browserFrameAbort?.abort()
+  state.browserFrameAbort = null
+  state.browserFrameBusy = false
+  if (state.browserFrameObjectUrl) {
+    URL.revokeObjectURL(state.browserFrameObjectUrl)
+    state.browserFrameObjectUrl = ''
+  }
+  img.onload = () => {
+    if (!state.browserPage || state.browserPage.pageId !== pageId) return
+    if (!img.naturalWidth || !img.naturalHeight) return
+    state.browserPage.width = img.naturalWidth
+    state.browserPage.height = img.naturalHeight
+  }
+  img.src = `data:image/jpeg;base64,${jpegBase64}`
+  img.hidden = false
+  const empty = $('#web-empty')
+  if (empty) empty.hidden = true
+  const status = $('#web-pane-status')
+  if (status && status.textContent !== '已连接') {
+    status.textContent = '已连接'
+    status.classList.remove('is-bad')
+    state.browserNotice = ''
+    state.browserNoticeBad = false
+  }
+}
+
+async function loadBrowserFrame(force = false) {
+  const page = state.browserPage
+  const img = $('#web-frame')
+  if (usesNativeBrowser(page)) return
+  if (!page?.pageId || !img) return
+  if (state.browserFrameBusy) return
+  if (state.browserPaused && !force) return
+  state.browserFrameBusy = true
+  const pageId = page.pageId
+  const controller = new AbortController()
+  state.browserFrameAbort?.abort()
+  state.browserFrameAbort = controller
+  const shell = $('#web-frame-shell')
+  const paneWidth = Math.round(shell?.clientWidth || 0)
+  const paneHeight = Math.round(shell?.clientHeight || 0)
+  const sizeQuery = paneWidth > 0 && paneHeight > 0 ? `&w=${paneWidth}&h=${paneHeight}` : ''
+  const frameUrl = `/api/browser/workspace/${encodeURIComponent(pageId)}/frame?t=${Date.now()}${sizeQuery}`
+  try {
+    const response = await fetch(frameUrl, {
+      cache: 'no-store',
+      credentials: 'same-origin',
+      signal: controller.signal,
+    })
+    if (!response.ok) throw new Error(`frame ${response.status}`)
+    let frameFavicon = ''
+    const faviconHeader = response.headers.get('x-eab-favicon') || ''
+    if (faviconHeader) {
+      try {
+        frameFavicon = safeTabFavicon(decodeURIComponent(faviconHeader))
+      } catch {
+        frameFavicon = ''
+      }
+    }
+    const tab = state.browserTabs.find((item) => item.pageId === pageId)
+    if (tab && tab.favicon !== frameFavicon) {
+      tab.favicon = frameFavicon
+      syncWorkbenchLayout(true)
+    }
+    const blob = await response.blob()
+    if (!state.browserPage || state.browserPage.pageId !== pageId) return
+    const objectUrl = URL.createObjectURL(blob)
+    const previousUrl = state.browserFrameObjectUrl
+    state.browserFrameObjectUrl = objectUrl
+    const decoded = new Promise((resolve) => {
+      img.addEventListener('load', () => resolve(img.naturalWidth), { once: true })
+      img.addEventListener('error', () => resolve(0), { once: true })
+    })
+    img.src = objectUrl
+    img.hidden = false
+    const naturalWidth = await decoded
+    if (state.browserPage && naturalWidth && img.naturalHeight) {
+      state.browserPage.width = naturalWidth
+      state.browserPage.height = img.naturalHeight
+    }
+    if (previousUrl) URL.revokeObjectURL(previousUrl)
+    const empty = $('#web-empty')
+    if (empty) empty.hidden = true
+    if (state.browserNotice && state.browserNoticeBad) {
+      state.browserNotice = ''
+      state.browserNoticeBad = false
+      const status = $('#web-pane-status')
+      if (status) {
+        status.textContent = state.browserPaused ? '画面已暂停' : '已连接'
+        status.classList.remove('is-bad')
+      }
+    }
+  } catch (err) {
+    if (controller.signal.aborted) return
+    if (!state.browserPage || state.browserPage.pageId !== pageId) return
+    setBrowserStatus('画面读取失败，页面可能已关闭', true)
+  } finally {
+    if (state.browserFrameAbort === controller) state.browserFrameAbort = null
+    state.browserFrameBusy = false
+  }
+}
+
+async function refreshBrowserState() {
+  const page = state.browserPage
+  if (!page) return
+  if (usesNativeBrowser(page)) return
+  try {
+    const result = await api(`/api/browser/workspace/${encodeURIComponent(page.pageId)}`)
+    if (!state.browserPage || state.browserPage.pageId !== page.pageId || !result?.pageId) return
+    if (result.title) state.browserPage.title = result.title
+    if (result.url) state.browserPage.url = result.url
+    const tab = state.browserTabs.find((item) => item.tabId === state.browserPage.tabId)
+    if (tab) {
+      if (result.title) tab.title = result.title
+      if (result.url) tab.url = result.url
+    }
+    syncWorkbenchLayout()
+    renderWebPane()
+  } catch (err) {
+    if (err.status === 404 && state.browserPage?.pageId === page.pageId) {
+      const tab = state.browserTabs.find((item) => item.pageId === page.pageId)
+      if (tab) removeBrowserTab(tab.tabId)
+      else {
+        state.browserPage = null
+        stopBrowserFramePolling()
+        renderWebPane()
+        syncWorkbenchLayout()
+      }
+      setBrowserStatus('页面已关闭或超时', true)
+    }
+  }
+}
+
+function browserFrameTick() {
+  if (!state.browserPage || state.browserPaused) return
+  if (usesNativeBrowser()) return
+  if (state.mode !== 'chat' || state.workbenchCollapsed || state.workbenchTab !== 'web') return
+  const pane = $('#web-pane')
+  if (!pane || pane.hidden) return
+  state.browserStateTick += 1
+  // 流正常时不再截图，只在后台低频校准标题/地址；断流后这里自动退回轮询。
+  if (state.browserStream && state.browserStreamPageId === state.browserPage.pageId) {
+    if (state.browserStreamLastFrameAt === 0 && state.browserStateTick % 2 === 0) loadBrowserFrame()
+  } else {
+    loadBrowserFrame()
+  }
+  if (state.browserStateTick % 12 === 0) void refreshBrowserState()
+}
+
+function startBrowserFramePolling() {
+  const page = state.browserPage
+  if (!page?.pageId) return
+  if (usesNativeBrowser(page)) return
+  const pageId = page.pageId
+  if (state.browserStream && state.browserStreamPageId !== pageId) stopBrowserFrameStream()
+  if (!state.browserStream) {
+    const shell = $('#web-frame-shell')
+    const width = Math.round(shell?.clientWidth || 0)
+    const height = Math.round(shell?.clientHeight || 0)
+    const params = new URLSearchParams({ t: String(Date.now()) })
+    if (width > 0 && height > 0) {
+      params.set('w', String(width))
+      params.set('h', String(height))
+    }
+    try {
+      const stream = new EventSource(
+        `/api/browser/workspace/${encodeURIComponent(pageId)}/stream?${params.toString()}`,
+      )
+      state.browserStream = stream
+      state.browserStreamPageId = pageId
+      state.browserStreamLastFrameAt = 0
+      stream.addEventListener('frame', (event) => {
+        if (!state.browserStream || state.browserStreamPageId !== pageId) return
+        applyBrowserStreamFrame(event.data)
+      })
+      stream.addEventListener('ready', () => {
+        if (state.browserStreamPageId === pageId && state.browserStreamLastFrameAt) setBrowserStatus('已连接')
+      })
+      stream.addEventListener('error', () => {
+        if (!state.browserStream || state.browserStreamPageId !== pageId) return
+        stopBrowserFrameStream()
+        // 流断开后立即用 HTTP 帧兜底，不让画面卡在旧帧。
+        if (state.browserPage?.pageId === pageId) loadBrowserFrame()
+      })
+      // 首帧迟迟不到（例如新 CDP 会话建得慢）时补一张静态帧。
+      state.browserStreamWatchdog = window.setTimeout(() => {
+        state.browserStreamWatchdog = 0
+        if (!state.browserStreamLastFrameAt && state.browserPage?.pageId === pageId) loadBrowserFrame()
+      }, 1_200)
+    } catch {
+      state.browserStream = null
+      state.browserStreamPageId = ''
+    }
+  }
+  if (!state.browserFrameTimer) state.browserFrameTimer = window.setInterval(browserFrameTick, 200)
+}
+
+function applyBrowserPageResult(result, options = {}) {
+  if (!result || !result.pageId) return
+  const pageId = String(result.pageId)
+  const previousPageId = state.browserPage?.pageId || ''
+  const existing = state.browserTabs.find((tab) => tab.pageId === pageId) || null
+  const reusable = options.reuseTab?.draft && state.browserTabs.includes(options.reuseTab) ? options.reuseTab : null
+  const draft = reusable || (!existing && state.browserPage?.draft ? state.browserPage : null)
+  const tab = ensureBrowserTab(result, { activate: true, reuse: draft })
+  if (!tab) return
+  const isNewPage = previousPageId !== pageId
+  if (isNewPage || tab.draft) state.browserPaused = false
+  if (isNewPage) closeBrowserCredPanel()
+  tab.draft = false
+  tab.draftInput = ''
+  state.browserNotice = ''
+  state.browserNoticeBad = false
+  syncWorkbenchLayout()
+  renderWebPane()
+  if (tab.native) {
+    stopBrowserFramePolling()
+    scheduleDesktopBrowserViewSync()
+    return
+  }
+  startBrowserFramePolling()
+  loadBrowserFrame(true)
+}
+
+/** Agent 的 browser 工具结果到达时，把右侧切到同一 pageId 并开始投屏。 */
+function syncBrowserFromTrace(view) {
+  const pageId = String(view?.pageId || '').trim()
+  if (!pageId) return
+  const action = String(view.action || 'snapshot')
+  if (action === 'close') {
+    const tab = state.browserTabs.find((item) => item.pageId === pageId)
+    if (tab) {
+      removeBrowserTab(tab.tabId)
+      setBrowserStatus('页面已关闭', true)
+    }
+    return
+  }
+  applyBrowserPageResult(view)
+}
+
+// 与豆包桌面版默认搜索保持一致，裸词统一走必应；360 搜索不再作为默认入口。
+const BROWSER_SEARCH_URL = 'https://www.bing.com/search'
+
+function looksLikeBrowserAddress(value) {
+  if (/^https?:\/\//i.test(value)) return true
+  if (/\s/.test(value)) return false
+  if (/^(localhost|127\.0\.0\.1|\[[0-9a-f:]+\])(?::\d+)?(?:\/|$)/i.test(value)) return true
+  const authority = value.split(/[/?#]/)[0]
+  if (!authority || authority.includes('@')) return false
+  const host = authority.replace(/:\d+$/, '')
+  if (host.startsWith('[') && host.endsWith(']')) return true
+  return (
+    /^(?:\d{1,3}\.){3}\d{1,3}$/.test(host) ||
+    /^[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,}$/i.test(host)
+  )
+}
+
+/** 输入框同时承担地址栏和搜索框：像网址就打开，否则交给搜索页。 */
+function browserInputTarget(raw) {
+  const value = String(raw || '').trim()
+  if (!value) return null
+  if (!looksLikeBrowserAddress(value)) {
+    return {
+      kind: 'search',
+      query: value,
+      url: `${BROWSER_SEARCH_URL}?q=${encodeURIComponent(value)}`,
+    }
+  }
+  if (/^https?:\/\//i.test(value)) return { kind: 'url', url: value }
+  if (/^(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:\/|$)/i.test(value)) {
+    return { kind: 'url', url: `http://${value}` }
+  }
+  const authority = value.split(/[/?#]/)[0]
+  const host = authority.replace(/:\d+$/, '')
+  const plainHost = host.startsWith('[') || /^(?:\d{1,3}\.){3}\d{1,3}$/.test(host) || host === 'localhost'
+  return { kind: 'url', url: `${plainHost ? 'http' : 'https'}://${value}` }
+}
+
+async function navigateBrowserPage(action, rawInput = '') {
+  const page = state.browserPage
+  if (!page?.pageId || page.draft) return
+  if (state.browserNavigating || state.browserOpening) return
+  let target = null
+  if (action === 'navigate') {
+    target = browserInputTarget(rawInput)
+    if (!target) {
+      setBrowserStatus('请输入网址或搜索内容', true)
+      $('#web-address-input')?.focus()
+      return
+    }
+  }
+  const address = $('#web-address-input')
+  if (address) {
+    address.dataset.editing = '0'
+    address.blur()
+    if (target) address.value = browserAddressHost(target.url)
+  }
+  state.browserNavigating = true
+  const searching = target?.kind === 'search'
+  setBrowserStatus(
+    searching ? '正在搜索…' : action === 'reload' ? '正在刷新…' : '正在跳转…',
+  )
+  if (usesNativeBrowser(page)) {
+    try {
+      const result = await desktopBrowserHost.navigate(page.pageId, action, target?.url)
+      applyBrowserPageResult({ ...result, action, native: true })
+      setBrowserStatus(result?.loading ? '正在加载…' : '已连接')
+    } catch (err) {
+      setBrowserStatus(err.message || '导航失败', true)
+      updateBrowserAddress(state.browserPage?.url || '', true)
+      address?.focus()
+      address?.select()
+    } finally {
+      state.browserNavigating = false
+    }
+    return
+  }
+  try {
+    const result = await api(`/api/browser/workspace/${encodeURIComponent(page.pageId)}/nav-fast`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        action,
+        ...(action === 'navigate' ? { url: target.url } : {}),
+      }),
+    })
+    applyBrowserPageResult(result)
+    setBrowserStatus('正在加载…')
+  } catch (err) {
+    setBrowserStatus(err.message || '导航失败', true)
+    updateBrowserAddress(state.browserPage?.url || '', true)
+    address?.focus()
+    address?.select()
+  } finally {
+    state.browserNavigating = false
+  }
+}
+
+function warmBrowserRuntime() {
+  if (desktopBrowserHost) return
+  if (state.browserWarmStarted) return
+  state.browserWarmStarted = true
+  void api('/api/browser/workspace/warm', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: '{}',
+  }).catch(() => undefined)
+}
+
+async function openBrowserPage(rawUrl) {
+  const target = browserInputTarget(rawUrl)
+  if (!target) {
+    setBrowserStatus('请输入网址或搜索内容', true)
+    $('#web-newtab-input')?.focus()
+    return
+  }
+  if (state.browserOpening) return
+  state.browserOpening = true
+  // 打开期间用户可能切去别的标签；成功后仍然把结果放回发起请求的这个空网页标签。
+  const originTab = state.browserPage?.draft ? state.browserPage : null
+  if (originTab) originTab.draftInput = String(rawUrl || '').trim()
+  const searching = target.kind === 'search'
+  setBrowserStatus(searching ? '正在搜索…' : '正在打开…')
+  if (desktopBrowserHost) {
+    try {
+      const result = await desktopBrowserHost.open(target.url)
+      applyBrowserPageResult(
+        { ...result, action: 'open', native: true },
+        { reuseTab: originTab },
+      )
+      setBrowserStatus(searching ? '正在搜索…' : '正在打开…')
+    } catch (err) {
+      setBrowserStatus(err.message || (searching ? '搜索失败' : '打开失败'), true)
+      if (state.browserPage?.draft) {
+        const input = $('#web-newtab-input')
+        input?.focus()
+        input?.select()
+      }
+    } finally {
+      state.browserOpening = false
+    }
+    return
+  }
+  try {
+    const result = await api('/api/browser/workspace/open-fast', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ url: target.url }),
+    })
+    applyBrowserPageResult(result, { reuseTab: originTab })
+    setBrowserStatus(searching ? '正在搜索…' : '正在加载…')
+  } catch (err) {
+    setBrowserStatus(err.message || (searching ? '搜索失败' : '打开失败'), true)
+    if (state.browserPage?.draft) {
+      const input = $('#web-newtab-input')
+      input?.focus()
+      input?.select()
+    }
+  } finally {
+    state.browserOpening = false
+  }
+}
+
+async function closeBrowserPage(pageId = state.browserPage?.pageId, options = {}) {
+  if (!pageId) {
+    // 空草稿标签不走后端，直接从列表移除。
+    if (state.browserPage?.draft) removeBrowserTab(state.browserPage.tabId)
+    return
+  }
+  let closed = false
+  const nativeTab = state.browserTabs.find((item) => item.pageId === pageId && item.native)
+  if (nativeTab && desktopBrowserHost) {
+    try {
+      await desktopBrowserHost.close(pageId)
+      closed = true
+    } catch (err) {
+      if (!options.silent) setBrowserStatus(err.message || '关闭失败', true)
+    }
+  } else {
+    try {
+      await api(`/api/browser/workspace/${encodeURIComponent(pageId)}/close`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: '{}',
+      })
+      closed = true
+    } catch (err) {
+      if (err.status === 404) closed = true
+      else if (!options.silent) setBrowserStatus(err.message || '关闭失败', true)
+    }
+  }
+  if (!closed && !options.force) return
+  const tab = state.browserTabs.find((item) => item.pageId === pageId)
+  if (tab) removeBrowserTab(tab.tabId)
+  else if (state.browserPage?.pageId === pageId) {
+    state.browserPage = null
+    stopBrowserFramePolling()
+    renderWebPane()
+    syncWorkbenchLayout()
+  }
+}
+
+async function sendBrowserInput(payload) {
+  const page = state.browserPage
+  if (usesNativeBrowser(page)) return
+  if (!page?.pageId) {
+    setBrowserStatus('先在新标签页输入网址或搜索内容', true)
+    $('#web-newtab-input')?.focus()
+    return
+  }
+  if (state.browserNavigating) return
+  // 点击和滚轮是连续交互，不显示“正在操作…”避免状态栏频繁闪烁。
+  const quiet = payload.kind === 'click' || payload.kind === 'scroll'
+  try {
+    if (!quiet) setBrowserStatus('正在操作…')
+    const result = await api(`/api/browser/workspace/${encodeURIComponent(page.pageId)}/input`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    applyBrowserPageResult(result)
+    if (!quiet) setBrowserStatus('已连接')
+  } catch (err) {
+    setBrowserStatus(err.message || '操作失败', true)
+  }
+}
+
+function browserCredentialOrigin() {
+  const raw = String(state.browserPage?.url || '').trim()
+  if (!raw) return ''
+  try {
+    const parsed = new URL(raw)
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return ''
+    return parsed.origin
+  } catch {
+    return ''
+  }
+}
+
+function setBrowserCredNote(text, bad = false) {
+  const note = $('#web-cred-note')
+  if (!note) return
+  note.textContent = text
+  note.classList.toggle('is-error', Boolean(bad))
+}
+
+function setBrowserSessionState(session) {
+  const node = $('#web-session-state')
+  const remove = $('#web-session-delete')
+  const save = $('#web-session-save')
+  const configured = Boolean(session?.configured)
+  if (node) {
+    if (configured) {
+      const parts = []
+      if (Number(session?.cookieCount || 0) > 0) parts.push(`${Number(session.cookieCount)} 个 Cookie`)
+      if (Number(session?.localStorageCount || 0) > 0) parts.push(`${Number(session.localStorageCount)} 条本地存储`)
+      node.textContent = `已保存本站登录态${parts.length ? `（${parts.join('、')}）` : ''}`
+    } else {
+      node.textContent = '本站还没有保存登录态'
+    }
+  }
+  if (remove) remove.hidden = !configured
+  if (save) save.disabled = false
+}
+
+function setBrowserCredOpen(open) {
+  const panel = $('#web-cred-panel')
+  const button = $('#web-cred-open')
+  if (panel) panel.hidden = !open
+  if (button) button.setAttribute('aria-expanded', open ? 'true' : 'false')
+  syncWebPaneFoot()
+  requestAnimationFrame(syncDesktopBrowserView)
+}
+
+function closeBrowserCredPanel() {
+  setBrowserCredOpen(false)
+  const password = $('#web-cred-password')
+  if (password) password.value = ''
+}
+
+async function openBrowserCredPanel() {
+  const origin = browserCredentialOrigin()
+  if (!origin) {
+    setBrowserStatus('当前页面没有可保存的站点', true)
+    return
+  }
+  setBrowserCredOpen(true)
+  const originNode = $('#web-cred-origin')
+  if (originNode) originNode.textContent = origin
+  const username = $('#web-cred-username')
+  if (username) username.value = ''
+  const password = $('#web-cred-password')
+  if (password) password.value = ''
+  const remove = $('#web-cred-delete')
+  if (remove) remove.hidden = true
+  const fill = $('#web-cred-fill')
+  if (fill) fill.disabled = true
+  setBrowserSessionState(null)
+  if ($('#web-session-state')) $('#web-session-state').textContent = '正在读取本站登录态…'
+  setBrowserCredNote('正在读取本站保存状态…')
+  try {
+    const status = await api(`/api/browser/credentials?url=${encodeURIComponent(origin)}`)
+    if (username && status.username) username.value = status.username
+    if (remove) remove.hidden = !status.configured
+    if (fill) fill.disabled = !status.configured
+    setBrowserSessionState(status.session)
+    setBrowserCredNote(
+      status.configured
+        ? '已保存本站账号；填入只写页面输入框，不会自动提交。'
+        : '本站还没有保存账号密码。保存后可在登录页填入。',
+    )
+  } catch (err) {
+    setBrowserCredNote(err.message || '读取保存状态失败', true)
+  }
+}
+
+async function saveBrowserCredential() {
+  const origin = browserCredentialOrigin()
+  if (!origin) {
+    setBrowserCredNote('当前页面没有可保存的站点', true)
+    return
+  }
+  const username = ($('#web-cred-username')?.value || '').trim()
+  const password = $('#web-cred-password')?.value || ''
+  if (!username) {
+    setBrowserCredNote('先填写账号', true)
+    $('#web-cred-username')?.focus()
+    return
+  }
+  if (!password) {
+    setBrowserCredNote('先填写密码', true)
+    $('#web-cred-password')?.focus()
+    return
+  }
+  const save = $('#web-cred-save')
+  if (save) save.disabled = true
+  setBrowserCredNote('正在保存…')
+  try {
+    const status = await api('/api/browser/credentials', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ url: origin, username, password }),
+    })
+    const passwordInput = $('#web-cred-password')
+    if (passwordInput) passwordInput.value = ''
+    const fill = $('#web-cred-fill')
+    if (fill) fill.disabled = !status.configured
+    const remove = $('#web-cred-delete')
+    if (remove) remove.hidden = !status.configured
+    setBrowserCredNote('已保存到本机加密凭据库；填入时不会自动提交登录。')
+  } catch (err) {
+    setBrowserCredNote(err.message || '保存失败', true)
+  } finally {
+    if (save) save.disabled = false
+  }
+}
+
+async function fillBrowserCredential() {
+  const page = state.browserPage
+  if (!page?.pageId) {
+    setBrowserCredNote('先打开需要登录的页面', true)
+    return
+  }
+  const fill = $('#web-cred-fill')
+  if (fill) fill.disabled = true
+  setBrowserCredNote('正在填入当前页…')
+  try {
+    const result = await api(`/api/browser/workspace/${encodeURIComponent(page.pageId)}/fill-credentials`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    })
+    applyBrowserPageResult(result, { source: 'manual', label: '填入本站账号' })
+    setBrowserCredNote('已填入账号密码，请确认后手动点击登录。')
+  } catch (err) {
+    setBrowserCredNote(err.message || '填入失败', true)
+  } finally {
+    if (fill) fill.disabled = false
+  }
+}
+
+async function deleteBrowserCredential() {
+  const origin = browserCredentialOrigin()
+  if (!origin) return
+  const remove = $('#web-cred-delete')
+  if (remove) remove.disabled = true
+  setBrowserCredNote('正在删除…')
+  try {
+    await api(`/api/browser/credentials?url=${encodeURIComponent(origin)}`, { method: 'DELETE' })
+    const username = $('#web-cred-username')
+    if (username) username.value = ''
+    const password = $('#web-cred-password')
+    if (password) password.value = ''
+    if (remove) remove.hidden = true
+    const fill = $('#web-cred-fill')
+    if (fill) fill.disabled = true
+    setBrowserCredNote('已删除本站保存的账号密码。')
+  } catch (err) {
+    setBrowserCredNote(err.message || '删除失败', true)
+  } finally {
+    if (remove) remove.disabled = false
+  }
+}
+
+async function saveBrowserSessionState() {
+  const page = state.browserPage
+  if (!page?.pageId) {
+    setBrowserCredNote('先打开需要保存的页面', true)
+    return
+  }
+  const save = $('#web-session-save')
+  if (save) save.disabled = true
+  const node = $('#web-session-state')
+  if (node) node.textContent = '正在保存登录态…'
+  try {
+    const status = await api(`/api/browser/workspace/${encodeURIComponent(page.pageId)}/save-session`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    })
+    setBrowserSessionState(status)
+    setBrowserCredNote('登录态已加密保存；下次打开本站会自动恢复。')
+  } catch (err) {
+    if (node) node.textContent = '登录态未保存'
+    setBrowserCredNote(err.message || '保存登录态失败', true)
+  } finally {
+    if (save) save.disabled = false
+  }
+}
+
+async function deleteBrowserSessionState() {
+  const origin = browserCredentialOrigin()
+  if (!origin) return
+  const remove = $('#web-session-delete')
+  if (remove) remove.disabled = true
+  const node = $('#web-session-state')
+  if (node) node.textContent = '正在清除登录态…'
+  try {
+    const status = await api(`/api/browser/session?url=${encodeURIComponent(origin)}`, { method: 'DELETE' })
+    setBrowserSessionState(status)
+    setBrowserCredNote('已清除本站保存的登录态；当前页面仍保持登录，刷新或重开后失效。')
+  } catch (err) {
+    if (node) node.textContent = '清除登录态失败'
+    setBrowserCredNote(err.message || '清除登录态失败', true)
+  } finally {
+    if (remove) remove.disabled = false
+  }
+}
+
+function browserImagePoint(event) {
+  const page = state.browserPage
+  const img = $('#web-frame')
+  if (!page || !img) return null
+  const rect = img.getBoundingClientRect()
+  if (rect.width <= 0 || rect.height <= 0) return null
+  const naturalWidth = img.naturalWidth || page.width || 1280
+  const naturalHeight = img.naturalHeight || page.height || 800
+  // object-fit: contain 会在图片元素内留出等比黑边，点击坐标必须先扣除这段偏移。
+  const scale = Math.min(rect.width / naturalWidth, rect.height / naturalHeight)
+  const contentWidth = naturalWidth * scale
+  const contentHeight = naturalHeight * scale
+  const offsetX = (rect.width - contentWidth) / 2
+  const offsetY = (rect.height - contentHeight) / 2
+  const localX = event.clientX - rect.left - offsetX
+  const localY = event.clientY - rect.top - offsetY
+  if (localX < 0 || localY < 0 || localX > contentWidth || localY > contentHeight) return null
+  return {
+    x: Math.round(localX / scale),
+    y: Math.round(localY / scale),
+  }
+}
+
+/** 网页画面点击入口：由 HTML 的内联 onclick 直接调用，避免标签重渲染后监听器丢失。 */
+window.eabFrameClick = (event) => {
+  if (!event || event.button !== 0) return
+  const point = browserImagePoint(event)
+  if (!point) return
+  event.preventDefault()
+  void sendBrowserInput({ kind: 'click', x: point.x, y: point.y })
+}
+
+function bindWebPane() {
+  let browserWheelAt = 0
+  const newtabForm = $('#web-newtab-form')
+  const newtabInput = $('#web-newtab-input')
+  newtabForm?.addEventListener('submit', (event) => {
+    event.preventDefault()
+    void openBrowserPage(newtabInput?.value || '')
+  })
+  newtabInput?.addEventListener('input', (event) => {
+    if (state.browserPage?.draft) state.browserPage.draftInput = event.currentTarget.value
+    if (state.browserNotice) {
+      state.browserNotice = ''
+      state.browserNoticeBad = false
+      setBrowserStatus(state.browserPage?.draft ? '输入网址后打开' : '已连接')
+    }
+  })
+  const addressInput = $('#web-address-input')
+  addressInput?.addEventListener('focus', () => {
+    addressInput.dataset.editing = '1'
+    const fullUrl = addressInput.dataset.fullUrl || ''
+    addressInput.value = fullUrl || addressInput.dataset.host || ''
+    window.setTimeout(() => {
+      if (document.activeElement === addressInput) addressInput.select()
+    }, 60)
+  })
+  addressInput?.addEventListener('blur', () => {
+    addressInput.dataset.editing = '0'
+    const fullUrl = addressInput.dataset.fullUrl || ''
+    addressInput.value = browserAddressHost(fullUrl) || (state.browserPage ? 'about:blank' : '')
+  })
+  addressInput?.addEventListener('keydown', (event) => {
+    if (event.isComposing) return
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      addressInput.dataset.editing = '0'
+      addressInput.value = addressInput.dataset.host || ''
+      addressInput.blur()
+      return
+    }
+    if (event.key !== 'Enter') return
+    event.preventDefault()
+    void navigateBrowserPage('navigate', addressInput.value)
+  })
+  // 点击通过 HTML 上的内联回调直连 window.eabFrameClick：标签切换重新渲染画面后仍然生效。
+  document.addEventListener('wheel', (event) => {
+    const target = event.target instanceof Element ? event.target.closest('#web-frame-shell') : null
+    if (!target || !state.browserPage) return
+    event.preventDefault()
+    const now = Date.now()
+    if (now - browserWheelAt < 500) return
+    browserWheelAt = now
+    const dy = event.deltaY * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? 600 : 1)
+    void sendBrowserInput({ kind: 'scroll', dy })
+  }, { passive: false })
+  const sendText = () => {
+    const input = $('#web-input-text')
+    const text = input?.value || ''
+    if (!text) return
+    if (input) input.value = ''
+    void sendBrowserInput({ kind: 'text', text })
+  }
+  $('#web-input-send')?.addEventListener('click', sendText)
+  $('#web-input-text')?.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' || event.isComposing) return
+    event.preventDefault()
+    sendText()
+  })
+  $('#web-key-backspace')?.addEventListener('click', () => {
+    void sendBrowserInput({ kind: 'key', key: 'Backspace' })
+  })
+  $('#web-key-tab')?.addEventListener('click', () => {
+    void sendBrowserInput({ kind: 'key', key: 'Tab' })
+  })
+  $('#web-key-enter')?.addEventListener('click', () => {
+    void sendBrowserInput({ kind: 'key', key: 'Enter' })
+  })
+  $('#web-back')?.addEventListener('click', () => {
+    void navigateBrowserPage('back')
+  })
+  $('#web-forward')?.addEventListener('click', () => {
+    void navigateBrowserPage('forward')
+  })
+  $('#web-reload')?.addEventListener('click', () => {
+    void navigateBrowserPage('reload')
+  })
+  $('#web-pane-pause')?.addEventListener('click', () => {
+    state.browserPaused = !state.browserPaused
+    if (state.browserPaused) stopBrowserFramePolling()
+    renderWebPane()
+    syncWorkbenchLayout()
+    if (!state.browserPaused) {
+      startBrowserFramePolling()
+      loadBrowserFrame(true)
+    }
+  })
+  $('#web-control-toggle')?.addEventListener('click', () => {
+    if (usesNativeBrowser()) return
+    state.browserControlOpen = !state.browserControlOpen
+    renderWebPane()
+    if (state.browserControlOpen) {
+      window.setTimeout(() => $('#web-input-text')?.focus(), 30)
+    }
+  })
+  $('#web-cred-open')?.addEventListener('click', () => {
+    const panel = $('#web-cred-panel')
+    if (panel?.hidden) void openBrowserCredPanel()
+    else closeBrowserCredPanel()
+  })
+  $('#web-cred-close')?.addEventListener('click', closeBrowserCredPanel)
+  $('#web-cred-save')?.addEventListener('click', () => void saveBrowserCredential())
+  $('#web-cred-fill')?.addEventListener('click', () => void fillBrowserCredential())
+  $('#web-cred-delete')?.addEventListener('click', () => void deleteBrowserCredential())
+  $('#web-session-save')?.addEventListener('click', () => void saveBrowserSessionState())
+  $('#web-session-delete')?.addEventListener('click', () => void deleteBrowserSessionState())
+  $('#web-cred-password')?.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' || event.isComposing) return
+    event.preventDefault()
+    void saveBrowserCredential()
+  })
+  $('#web-empty')?.addEventListener('click', (event) => {
+    const action = event.target.closest('[data-web-draft-action]')
+    if (!action) return
+    const kind = action.dataset.webDraftAction
+    if (kind === 'cloud') {
+      openCloudSpacePane()
+      return
+    }
+    openWorkbenchKind(kind)
+  })
+}
+
+/** 快捷入口「打开云空间」：在右侧工作台浏览全部云端文件，不跟随当前会话的本地项目。 */
+function openCloudSpacePane() {
+  state.cloudSpaceOpen = true
+  state.cloudSpacePath = ''
+  state.workbenchCollapsed = false
+  state.workbenchSplit = false
+  state.workbenchTab = 'cloud'
+  syncWorkbenchLayout(true)
+  void refreshCloudSpace()
+}
+
+async function refreshCloudSpace() {
+  state.cloudSpaceLoading = true
+  state.cloudSpaceError = ''
+  renderCloudSpacePane()
+  try {
+    const data = await api(`/api/workspace/files${qs()}`)
+    state.files = data.items || []
+    if (state.cloudSpacePath && !workspacePathExists(state.files, state.cloudSpacePath)) {
+      state.cloudSpacePath = ''
+    }
+    renderWorkspaceFiles()
+  } catch (err) {
+    state.cloudSpaceError = err?.message || '云空间读取失败'
+  } finally {
+    state.cloudSpaceLoading = false
+    renderCloudSpacePane()
+    syncWorkbenchLayout(true)
+  }
+}
+
+function setCloudSpacePath(nextPath) {
+  const path = workspaceNormalizePath(nextPath)
+  if (path === state.cloudSpacePath) return
+  state.cloudSpacePath = path
+  renderCloudSpacePane()
+  const box = $('#cloud-pane-body')
+  if (box) box.scrollTop = 0
+  scheduleBrowserTabsPersist()
+}
+
+/** 云空间拖拽上传时更新“松开即可上传”的目标目录。 */
+function setCloudDropHint(visible) {
+  const pane = $('#cloud-pane')
+  const hint = $('#cloud-drop-hint')
+  if (!pane || !hint) return
+  pane.classList.toggle('is-drop-target', visible)
+  hint.hidden = !visible
+  if (visible) {
+    const pathLabel = $('#cloud-drop-path')
+    if (pathLabel) pathLabel.textContent = workspaceFolderLocationLabel(state.cloudSpacePath)
+    const head = pane.querySelector('.cloud-pane-head')
+    if (head) {
+      const paneTop = pane.getBoundingClientRect().top
+      hint.style.top = `${Math.max(48, head.getBoundingClientRect().bottom - paneTop + 6)}px`
+    }
+  }
+}
+
+function cloudDragHasFiles(event) {
+  const types = Array.from(event.dataTransfer?.types || [])
+  return types.includes('Files') && !types.includes(WORKSPACE_DRAG_MIME)
+}
+
+function renderCloudSpacePane() {
+  const box = $('#cloud-pane-body')
+  if (!box) return
+  if (state.cloudSpacePath && !workspacePathExists(state.files, state.cloudSpacePath)) {
+    state.cloudSpacePath = ''
+  }
+  const view = workspaceDirView(state.files, state.cloudSpacePath)
+  state.cloudSpacePath = view.path
+  const pathBox = $('#cloud-pane-path')
+  if (pathBox) {
+    const crumbs = ['<button type="button" data-cloud-path="">全部文件</button>']
+    let path = ''
+    for (const part of view.path ? view.path.split('/') : []) {
+      path = path ? `${path}/${part}` : part
+      crumbs.push('<span class="cloud-crumb-sep" aria-hidden="true">/</span>')
+      crumbs.push(`<button type="button" data-cloud-path="${esc(path)}">${esc(part)}</button>`)
+    }
+    pathBox.innerHTML = `<span class="cloud-crumb-root">云空间</span><span class="cloud-crumb-sep" aria-hidden="true">/</span>${crumbs.join('')}`
+    for (const button of pathBox.querySelectorAll('[data-cloud-path]')) {
+      button.addEventListener('click', () => setCloudSpacePath(button.dataset.cloudPath))
+    }
+  }
+  if (state.cloudSpaceLoading && state.files.length === 0) {
+    box.innerHTML = '<div class="cloud-pane-state">正在读取云空间…</div>'
+    return
+  }
+  if (state.cloudSpaceError) {
+    box.innerHTML = `<div class="cloud-pane-state is-bad"><strong>云空间加载失败</strong><span>${esc(state.cloudSpaceError)}</span><button class="btn ghost sm" type="button" data-cloud-retry>重试</button></div>`
+    box.querySelector('[data-cloud-retry]')?.addEventListener('click', () => void refreshCloudSpace())
+    return
+  }
+  if (view.folders.length === 0 && view.files.length === 0) {
+    box.innerHTML = `<div class="cloud-pane-state"><strong>${view.path ? '这个文件夹是空的' : '云空间还是空的'}</strong><span>${view.path ? '点上方「全部文件」回到根目录，或右键空白处新建文件/文件夹。' : '点右上角「上传」，或右键空白处新建文件/文件夹。'}</span></div>`
+    return
+  }
+  const folderRows = view.folders
+    .map(
+      (folder) => `<button class="cloud-row" type="button" data-cloud-folder="${esc(folder.path)}" aria-haspopup="menu">
+        <span class="cloud-row-icon is-folder" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M3.6 5.6h4.7l1.5 2h6.6v7.1a1.5 1.5 0 0 1-1.5 1.5H3.6a1.5 1.5 0 0 1-1.5-1.5V5.6Z" fill="none" stroke="currentColor" stroke-width="1.2"/><path d="M3.6 5.6V4.5A1.3 1.3 0 0 1 4.9 3.2h3.2l1.4 1.9h4.6A1.3 1.3 0 0 1 15.4 6.4v1.2" fill="none" stroke="currentColor" stroke-width="1.05"/></svg></span>
+        <span class="cloud-row-main"><span class="cloud-row-name">${esc(folder.name)}</span><span class="cloud-row-meta">${esc(
+          folder.fileCount || folder.folderCount
+            ? [
+                folder.fileCount ? `${folder.fileCount} 个文件` : '',
+                folder.folderCount ? `${folder.folderCount} 个文件夹` : '',
+              ]
+                .filter(Boolean)
+                .join(' · ')
+            : '空文件夹',
+        )}</span></span>
+        <span class="cloud-row-tail" aria-hidden="true">›</span>
+      </button>`,
+    )
+    .join('')
+  const fileRows = view.files
+    .map(
+      (file) => `<button class="cloud-row" type="button" data-cloud-file="${esc(file.id)}" title="${esc(file.relPath || file.name)}" aria-haspopup="menu">
+        <span class="cloud-row-icon" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M5 2.4h6l4 4v11.2H5z" fill="none" stroke="currentColor" stroke-width="1.2"/><path d="M11 2.4v4h4M7.4 10h5.2M7.4 12.6h4" fill="none" stroke="currentColor" stroke-width="1.05"/></svg></span>
+        <span class="cloud-row-main"><span class="cloud-row-name">${esc(file.name)}${file.shared ? ' <span class="cloud-row-badge">共享</span>' : ''}</span><span class="cloud-row-meta">${esc(fmtSize(file.size))} · 更新于 ${esc(workspaceFileDate(file.updatedAt))}</span></span>
+        <span class="cloud-row-tail is-open">打开</span>
+      </button>`,
+    )
+    .join('')
+  box.innerHTML = folderRows + fileRows
+  for (const button of box.querySelectorAll('[data-cloud-folder]')) {
+    button.addEventListener('click', () => setCloudSpacePath(button.dataset.cloudFolder))
+    button.addEventListener('contextmenu', (event) => {
+      event.preventDefault()
+      event.stopPropagation()
+      showFolderMenu(
+        button.dataset.cloudFolder,
+        { left: event.clientX, top: event.clientY, right: event.clientX, bottom: event.clientY },
+        true,
+        'cloud',
+      )
+    })
+  }
+  for (const button of box.querySelectorAll('[data-cloud-file]')) {
+    button.addEventListener('click', (event) => {
+      if (event.isTrusted) setWorkbenchCollapsed(false)
+      void openWorkspaceFile(button.dataset.cloudFile, { opener: button })
+    })
+    button.addEventListener('contextmenu', (event) => {
+      event.preventDefault()
+      event.stopPropagation()
+      showFileMenu(
+        button.dataset.cloudFile,
+        { left: event.clientX, top: event.clientY, right: event.clientX, bottom: event.clientY },
+        true,
+        'cloud',
+      )
+    })
+  }
+}
+
+
+
+/** 云空间头部按钮、空白右键菜单与桌面文件拖拽上传。 */
+function bindCloudSpaceActions() {
+  const pane = $('#cloud-pane')
+  const body = $('#cloud-pane-body')
+  if (!pane || !body) return
+
+  $('#cloud-pane-new-folder')?.addEventListener('click', () => createWorkspaceFolder(state.cloudSpacePath))
+  $('#cloud-pane-upload')?.addEventListener('click', () => $('#cloud-upload-input')?.click())
+  $('#cloud-upload-input')?.addEventListener('change', async (event) => {
+    const files = Array.from(event.target.files || [])
+    event.target.value = ''
+    if (files.length) {
+      await uploadWorkspaceFiles(files, {
+        parentPath: state.cloudSpacePath,
+        uploadButton: $('#cloud-pane-upload'),
+      })
+    }
+  })
+  $('#cloud-upload-status')?.addEventListener('click', (event) => {
+    if (!event.target.closest('[data-ws-upload-close]')) return
+    window.clearTimeout(state.wsUploadHideTimer)
+    state.wsUploads = []
+    renderWorkspaceUploads()
+  })
+
+  body.addEventListener('contextmenu', (event) => {
+    if (event.target.closest('.cloud-row')) return
+    event.preventDefault()
+    showCloudBlankMenu(
+      { left: event.clientX, top: event.clientY, right: event.clientX, bottom: event.clientY },
+      true,
+    )
+  })
+
+  let dragDepth = 0
+  const resetDrag = () => {
+    dragDepth = 0
+    setCloudDropHint(false)
+  }
+  pane.addEventListener('dragenter', (event) => {
+    if (!cloudDragHasFiles(event)) return
+    event.preventDefault()
+    dragDepth += 1
+    setCloudDropHint(true)
+  })
+  pane.addEventListener('dragover', (event) => {
+    if (!cloudDragHasFiles(event)) return
+    event.preventDefault()
+    if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy'
+  })
+  pane.addEventListener('dragleave', (event) => {
+    if (dragDepth > 0) dragDepth -= 1
+    const next = event.relatedTarget
+    if (!next || !(next instanceof Node) || !pane.contains(next)) resetDrag()
+  })
+  pane.addEventListener('drop', (event) => {
+    if (!cloudDragHasFiles(event)) return
+    event.preventDefault()
+    resetDrag()
+    const files = Array.from(event.dataTransfer?.files || [])
+    if (!files.length) {
+      banner('没有检测到可上传的文件；暂不支持直接拖入文件夹', 'warn')
+      return
+    }
+    void uploadWorkspaceFiles(files, {
+      parentPath: state.cloudSpacePath,
+      uploadButton: $('#cloud-pane-upload'),
+    })
+  })
+}
+
+/** 右侧工作台：团队 / 网页 / 文件 / 并排。面板同级，团队不在文件预览里面。 */
+function openWorkbenchKind(kind) {
+  if (kind === 'web') {
+    newBrowserDraftTab()
+    return
+  }
+  if (kind === 'team') {
+    state.teamTabOpen = true
+    state.workbenchTab = 'team'
+    state.workbenchCollapsed = false
+    state.workbenchSplit = false
+    stopBrowserFramePolling()
+    syncWorkbenchLayout()
+    return
+  }
+  if (kind === 'perm') {
+    if (state.permOpen) {
+      state.workbenchTab = 'perm'
+      state.workbenchCollapsed = false
+      state.workbenchSplit = false
+      stopBrowserFramePolling()
+      syncWorkbenchLayout()
+      void loadPermissionData()
+    } else {
+      openPermissionPane()
+    }
+  }
+}
+
+function newBrowserTabFromToolbar() {
+  state.workbenchCollapsed = false
+  state.workbenchTab = 'web'
+  state.workbenchSplit = false
+  newBrowserDraftTab()
+}
+
+function bindWorkbenchAddMenu() {
+  const add = $('#workbench-add')
+  const dock = $('#workbench-dock')
+  add?.addEventListener('click', (event) => {
+    event.preventDefault()
+    event.stopPropagation()
+    newBrowserTabFromToolbar()
+  })
+  dock?.addEventListener('click', (event) => {
+    event.preventDefault()
+    event.stopPropagation()
+    newBrowserTabFromToolbar()
+  })
+}
+
 function bindWorkbenchTabs() {
+  bindWebPane()
+  bindDesktopBrowser()
+  bindDesktopUpdates()
+  bindBrowserPaneShortcuts()
+  bindWorkbenchAddMenu()
+  bindCloudSpaceActions()
+  $('#cloud-pane-refresh')?.addEventListener('click', () => void refreshCloudSpace())
   try {
     state.workbenchCollapsed = localStorage.getItem(WORKBENCH_COLLAPSED_KEY) === '1'
   } catch {
@@ -9416,13 +13715,69 @@ function bindWorkbenchTabs() {
   }
   const tabs = $('#workbench-tabs')
   if (tabs) {
+    const tabList = $('#workbench-tab-list')
+    tabList?.addEventListener('wheel', (event) => {
+      if (Math.abs(event.deltaY) <= Math.abs(event.deltaX)) return
+      if (tabList.scrollWidth <= tabList.clientWidth) return
+      event.preventDefault()
+      tabList.scrollLeft += event.deltaY
+    }, { passive: false })
     tabs.addEventListener('click', (event) => {
-      const tab = event.target.closest('[data-workbench-tab]')
+      const close = event.target.closest('[data-workbench-close]')
+      if (close) {
+        event.preventDefault()
+        event.stopPropagation()
+        const kind = close.getAttribute('data-workbench-close')
+        if (kind === 'web') {
+          const tabId = close.getAttribute('data-browser-tab') || state.browserPage?.tabId || ''
+          const tab = state.browserTabs.find((item) => item.tabId === tabId)
+          if (tab && !tab.pageId) {
+            removeBrowserTab(tab.tabId)
+            return
+          }
+          void closeBrowserPage(tab?.pageId || '')
+          return
+        }
+        if (kind === 'file') {
+          closeWorkspaceFile()
+          if (!$('#workbench-rail')?.hidden) $('#workbench-add')?.focus()
+          else $('#workbench-dock')?.focus()
+          return
+        }
+        if (kind === 'cloud') {
+          state.cloudSpaceOpen = false
+          state.cloudSpaceError = ''
+          if (state.workbenchTab === 'cloud') state.workbenchTab = state.filePreview ? 'file' : 'team'
+          syncWorkbenchLayout(true)
+          if (!$('#workbench-rail')?.hidden) $('#workbench-add')?.focus()
+          else $('#workbench-dock')?.focus()
+          return
+        }
+        if (kind === 'team') {
+          state.teamTabOpen = false
+          syncWorkbenchLayout()
+          return
+        }
+        if (kind === 'perm') {
+          closePermissionPane()
+          if (!$('#workbench-rail')?.hidden) $('#workbench-add')?.focus()
+          else $('#workbench-dock')?.focus()
+          return
+        }
+        return
+      }
+      const tab = event.target.closest('[data-workbench-kind]')
       if (!tab) return
-      const name = tab.getAttribute('data-workbench-tab')
+      const kind = tab.getAttribute('data-workbench-kind')
+      state.workbenchCollapsed = false
       state.workbenchSplit = false
-      state.workbenchTab = name === 'file' ? 'file' : name === 'perm' ? 'perm' : 'team'
-      if (state.workbenchTab === 'perm') {
+      if (kind === 'web') {
+        activateBrowserTab(tab.getAttribute('data-browser-tab') || '')
+        return
+      }
+      state.workbenchTab = kind === 'file' ? 'file' : kind === 'perm' ? 'perm' : kind === 'cloud' ? 'cloud' : 'team'
+      if (kind === 'team') state.teamTabOpen = true
+      if (kind === 'perm') {
         state.permOpen = true
         state.permError = ''
         void loadPermissionData()
@@ -9434,17 +13789,9 @@ function bindWorkbenchTabs() {
     state.workbenchSplit = !state.workbenchSplit
     syncWorkbenchLayout()
   })
-  $('#workbench-close')?.addEventListener('click', () => {
-    closePermissionPane()
-    $('#perm-entry')?.focus()
-  })
-  $('#workbench-collapse')?.addEventListener('click', () => {
-    setWorkbenchCollapsed(true)
-    $('#workbench-restore')?.focus()
-  })
   $('#workbench-restore')?.addEventListener('click', () => {
     setWorkbenchCollapsed(false)
-    $('#workbench-collapse')?.focus()
+    $('#workbench-add')?.focus()
   })
   // 子 Agent 列表：点哪一行，右边的详情窗口就切到哪个 Agent 的工作过程。
   // 用 pointerdown 先选中：流式期间行节点即使被更新，也不会因为 click 跨帧丢失而“点了没反应”。
@@ -9504,7 +13851,6 @@ function bindWorkbenchTabs() {
 }
 
 function bindWorkspaceFilePane() {
-  $('#file-pane-close')?.addEventListener('click', closeWorkspaceFile)
   $('#file-pane-download')?.addEventListener('click', downloadWorkspacePreview)
   $('#file-pane-versions')?.addEventListener('click', () => {
     const file = state.filePreview
@@ -9665,19 +14011,19 @@ function wsUploadSummary(items) {
 }
 
 function renderWorkspaceUploads() {
-  const box = $('#ws-upload-status')
-  if (!box) return
+  const boxes = [$('#ws-upload-status'), $('#cloud-upload-status')].filter(Boolean)
+  if (!boxes.length) return
   const items = state.wsUploads || []
   if (!items.length) {
-    box.hidden = true
-    box.innerHTML = ''
+    for (const box of boxes) {
+      box.hidden = true
+      box.innerHTML = ''
+    }
     return
   }
-  box.hidden = false
   const allDone = items.every((item) => item.status === 'done')
   const hasError = items.some((item) => item.status === 'error')
-  box.classList.toggle('has-error', hasError)
-  box.innerHTML = `
+  const html = `
     <div class="ws-upload-head">
       <span class="ws-upload-title">${esc(wsUploadSummary(items))}</span>
       <button class="ws-upload-close" type="button" data-ws-upload-close aria-label="关闭上传进度">×</button>
@@ -9702,6 +14048,11 @@ function renderWorkspaceUploads() {
           </div>`
       }).join('')}
     </div>`
+  for (const box of boxes) {
+    box.hidden = false
+    box.classList.toggle('has-error', hasError)
+    box.innerHTML = html
+  }
   if (!allDone && !hasError) return
   window.clearTimeout(state.wsUploadHideTimer)
   if (allDone) {
@@ -9719,7 +14070,7 @@ function setWorkspaceUploadItem(id, patch) {
   renderWorkspaceUploads()
 }
 
-function uploadWorkspaceFileWithProgress(file, contentBase64, onProgress) {
+function uploadWorkspaceFileWithProgress(file, contentBase64, onProgress, parentPath = state.workspacePath) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest()
     xhr.open('POST', `/api/workspace/files${qs()}`, true)
@@ -9746,7 +14097,7 @@ function uploadWorkspaceFileWithProgress(file, contentBase64, onProgress) {
     }
     xhr.onerror = () => reject(new Error('网络中断，文件未上传'))
     xhr.onabort = () => reject(new Error('上传已取消'))
-    const parent = workspaceNormalizePath(state.workspacePath)
+    const parent = workspaceNormalizePath(parentPath)
     xhr.send(JSON.stringify({
       path: parent ? `${parent}/${file.name}` : file.name,
       name: file.name,
@@ -9756,10 +14107,13 @@ function uploadWorkspaceFileWithProgress(file, contentBase64, onProgress) {
   })
 }
 
-async function uploadWorkspaceFiles(fileList) {
+async function uploadWorkspaceFiles(fileList, options = {}) {
   const files = Array.from(fileList || [])
   if (!files.length) return
-  const uploadButton = $('#ws-upload')
+  const parentPath = workspaceNormalizePath(
+    options.parentPath === undefined ? state.workspacePath : options.parentPath,
+  )
+  const uploadButton = options.uploadButton || $('#ws-upload')
   if (uploadButton?.disabled) return
   window.clearTimeout(state.wsUploadHideTimer)
   const stamp = Date.now()
@@ -9792,7 +14146,7 @@ async function uploadWorkspaceFiles(fileList) {
         setWorkspaceUploadItem(item.id, { status: 'uploading', progress: 0 })
         await uploadWorkspaceFileWithProgress(file, base64, (progress) => {
           setWorkspaceUploadItem(item.id, { status: 'uploading', progress })
-        })
+        }, parentPath)
         setWorkspaceUploadItem(item.id, { status: 'done', progress: 100 })
       } catch (err) {
         setWorkspaceUploadItem(item.id, {
@@ -11575,8 +15929,12 @@ function playWorkspaceEnter() {
 }
 
 function setChatMode(mode) {
-  if (state.filePreview) closeWorkspaceFile()
+  if (state.projectHomeOpen) closeProjectHome({ silent: true })
   const next = mode === 'workspace' ? 'workspace' : 'chat'
+  // 从空白草稿切到工作台属于离开会话：草稿和它自己的右侧标签一起丢弃。
+  if (next === 'workspace' && (state.draftSession || browserTabsScopeSessionId === '')) {
+    discardDraftSession()
+  }
   state.mode = next
   state.view = next
   $('.chat-main').classList.toggle('is-workspace', next === 'workspace')
@@ -15602,15 +19960,25 @@ function historyAiBubble(text, meta, rich, options = {}) {
   const answerBody = clarify && options.pendingClarify
     ? clarifyInlineNote()
     : `<div class="answer-text">${renderAnswer(text, { omitCodeBlocks: writtenFileContentBlocks(tools) })}</div>`
-  // 父消息同时有正文和进度卡时两份都要保留：进度卡紧跟在工具调用
-  // 摘要下方、正文之前，先看子 Agent 进度，再读最终结论。
-  const body = progressCard
-    ? `${progressCard}${String(text || '').trim() ? answerBody : ''}`
-    : answerBody
-  return `${reasoning ? thinkPanelHtml(reasoning) : ''}
-    ${tools.length > 0 ? toolPanelHtml(tools) : ''}
-    ${memoryCard}
-    ${body}
+  const sourceCard = kbSourcePanelHtml(rich?.citations)
+  const attachmentStrip = answerAttachmentsHtml(rich?.attachments)
+  const evidenceHtml = `${sourceCard}${attachmentStrip}${memoryCard}`
+  // 最终回答固定为：思考与工具 → 结论 → 来源/附件；过程材料先给依据，正文随后落地。
+  // 即使来源/附件为空也保留同一层 DOM，避免流式收尾换成历史气泡后结构缩水。
+  return `<div class="process-stack">
+      ${reasoning ? thinkPanelHtml(reasoning) : ''}
+      ${tools.length > 0 ? toolPanelHtml(tools) : ''}
+      ${progressCard}
+    </div>
+    <div class="answer-block">
+      ${answerBody}
+      <div class="answer-error" hidden></div>
+      <div class="answer-evidence"${evidenceHtml ? '' : ' hidden'}>
+        <div class="answer-sources"${sourceCard ? '' : ' hidden'}>${sourceCard}</div>
+        <div class="answer-attachments"${attachmentStrip ? '' : ' hidden'}>${attachmentStrip}</div>
+        <div class="memory-slot"${memoryCard ? '' : ' hidden'}>${memoryCard}</div>
+      </div>
+    </div>
     ${metaText || channel ? `<span class="meta"${metaTip ? ` data-tip="${esc(metaTip)}"` : ''}>${channel}${metaText ? esc(metaText) : ''}</span>` : ''}`
 }
 
@@ -15684,6 +20052,225 @@ function memorySourceHtml(hitsInput, scopeInput) {
       <span class="memory-chevron" aria-hidden="true">⌄</span>
     </button>
     <div class="memory-body">${items}</div>
+  </div>`
+}
+
+/** 回答来源与失败状态：都只消费后端已有的 meta，不在前端推断新的证据。 */
+const ANSWER_FRESHNESS_LABEL = {
+  fresh: '较新',
+  aging: '较旧',
+  stale: '可能过期',
+  unknown: '时效未知',
+}
+
+function answerSourceUpdatedAt(value) {
+  const number = Number(value)
+  if (!Number.isFinite(number) || number <= 0) return ''
+  const date = new Date(number < 1e11 ? number * 1000 : number)
+  if (Number.isNaN(date.getTime())) return ''
+  return `${date.getMonth() + 1}月${date.getDate()}日更新`
+}
+
+function answerSourceLayoutText(layout) {
+  if (!layout || typeof layout !== 'object') return ''
+  if (layout.kind === 'image') return layout.pageNo ? `图片 · 第 ${layout.pageNo} 页` : '图片'
+  if (layout.kind === 'table') {
+    const sheet = layout.sheetName ? `表格 · ${layout.sheetName}` : '表格'
+    return layout.rowRange ? `${sheet} · 第 ${layout.rowRange[0]}-${layout.rowRange[1]} 行` : sheet
+  }
+  if (layout.kind === 'mixed') return '表格/图片'
+  if (layout.kind === 'text') return layout.pageNo ? `正文 · 第 ${layout.pageNo} 页` : '正文'
+  return ''
+}
+
+function answerSourceFreshness(citation) {
+  const raw = citation?.freshness
+  if (!raw || typeof raw !== 'object') return null
+  const level = ['fresh', 'aging', 'stale', 'unknown'].includes(String(raw.level))
+    ? String(raw.level)
+    : 'unknown'
+  return {
+    level,
+    label: ANSWER_FRESHNESS_LABEL[level],
+    message: String(raw.message || '').trim(),
+    warn: raw.shouldWarn === true || level === 'stale' || level === 'aging',
+  }
+}
+
+/** 用户先读结论，再看到证据；来源默认展开但最多占 220px 高，长列表不挤走正文。 */
+function kbSourcePanelHtml(input) {
+  const citations = Array.isArray(input)
+    ? input.filter((citation) => citation && typeof citation === 'object' && String(citation.title || '').trim())
+    : []
+  if (citations.length === 0) return ''
+  const docCount = new Set(citations.map((citation) => String(citation.docId || citation.title || ''))).size
+  const warnCount = citations.filter((citation) => answerSourceFreshness(citation)?.warn).length
+  const collapsed = citations.length > 3
+  const summary = `${citations.length} 条${docCount > 1 ? ` · ${docCount} 个文档` : ''}${
+    warnCount > 0 ? ` · ${warnCount} 条需核对` : ''
+  }`
+  const items = citations.map((citation, offset) => {
+    const index = Number(citation.index) || offset + 1
+    const freshness = answerSourceFreshness(citation)
+    const layout = answerSourceLayoutText(citation.layout)
+    const updated = answerSourceUpdatedAt(citation.docUpdatedAt)
+    const meta = [String(citation.collection || '').trim(), layout, updated, freshness?.message]
+      .filter(Boolean)
+      .join(' · ')
+    const excerpt = String(citation.excerpt || '').trim()
+    return `<div class="kb-source-item">
+      <div class="kb-source-line">
+        <span class="kb-source-ref">[${esc(index)}]</span>
+        <span class="kb-source-title">${esc(citation.title)}</span>
+        ${freshness ? `<span class="kb-source-freshness is-${esc(freshness.level)}">${esc(
+          freshness.warn ? '需核对' : freshness.label
+        )}</span>` : ''}
+        ${String(citation.source || '') !== 'local' ? '<span class="kb-source-freshness is-unknown">外部</span>' : ''}
+      </div>
+      ${meta ? `<span class="kb-source-meta">${esc(meta)}</span>` : ''}
+      ${excerpt ? `<span class="kb-source-excerpt">${esc(excerpt)}</span>` : ''}
+    </div>`
+  }).join('')
+  return `<div class="kb-source-panel${collapsed ? ' is-collapsed' : ''}">
+    <button class="kb-source-head" type="button" aria-expanded="${collapsed ? 'false' : 'true'}"
+      data-tip="${collapsed ? '展开这次回答引用的知识来源' : '收起知识来源，只看结论与附件'}">
+      <span class="kb-source-icon" aria-hidden="true">▤</span>
+      <span class="kb-source-title-label">来源</span>
+      <span class="kb-source-divider">·</span>
+      <span class="kb-source-summary">${esc(summary)}</span>
+      <span class="kb-source-chevron" aria-hidden="true">⌄</span>
+    </button>
+    <div class="kb-source-body">${items}</div>
+  </div>`
+}
+
+function answerAttachmentKind(file) {
+  if (file?.conversationId) return '对话'
+  if (file?.workspaceKind === 'folder') return '文件夹'
+  if (file?.workspaceKind === 'file') return '文件'
+  if (isRasterImageAttachment(file)) return '图片'
+  return '附件'
+}
+
+function answerAttachmentState(file) {
+  const status = String(file?.workspaceStatus || '')
+  if (!status || status === 'active') return ''
+  if (status === 'pending') return '处理中'
+  if (status === 'deleted' || status === 'removed') return '已失效'
+  return '不可用'
+}
+
+/** 附件不重复整张卡片，只保留“名称 + 类型 + 状态”；可打开的文件直接接到右侧预览。 */
+function answerAttachmentsHtml(input) {
+  const list = Array.isArray(input) ? input.filter((file) => file && typeof file === 'object') : []
+  if (list.length === 0) return ''
+  const chips = list.map((file) => {
+    const name = attachmentDisplayName(file)
+    const size = attachmentDisplaySize(file)
+    const kind = answerAttachmentKind(file)
+    const state = answerAttachmentState(file)
+    const fileId = String(file.workspaceFileId || '').trim()
+    const canOpen = Boolean(fileId && file.workspaceKind === 'file' && !state)
+    const tip = [name, size, state, canOpen ? '点击在右侧打开' : ''].filter(Boolean).join(' · ')
+    const content = `<span class="answer-attachment-kind">${esc(kind)}</span>
+      <span class="answer-attachment-name">${esc(name)}</span>
+      ${state ? `<span class="answer-attachment-state">${esc(state)}</span>` : ''}`
+    const attrs = `class="answer-attachment${canOpen ? ' is-link' : ''}${state ? ' is-muted' : ''}" data-tip="${esc(tip)}"`
+    if (canOpen) {
+      return `<button type="button" ${attrs} data-answer-file-id="${esc(fileId)}">${content}</button>`
+    }
+    return `<span ${attrs}>${content}</span>`
+  }).join('')
+  return `<div class="answer-attach-strip" aria-label="本轮附件">
+    <span class="answer-attach-label">附件 · ${list.length}</span>
+    <div class="answer-attach-list">${chips}</div>
+  </div>`
+}
+
+function answerFailureInfo(message, info = {}) {
+  const text = `${message || ''} ${info.code || ''}`.toLowerCase()
+  if (/401|403|forbidden|permission|denied|unauthor|pdp|无权限|没有权限|权限不足/.test(text)) {
+    return {
+      kind: 'permission',
+      label: '没有权限',
+      title: '这次回答没有完成',
+      summary: '当前身份没有权限完成这次回答。重试不会改变结果，请切换账号或联系管理员开通权限。',
+      retryable: false,
+      retryLabel: '',
+      switchAccount: true,
+    }
+  }
+  if (/429|quota|rate.?limit|额度|限流|超限/.test(text)) {
+    return {
+      kind: 'quota',
+      label: '请求受限',
+      title: '请求暂时受限',
+      summary: String(message || '请求过于频繁或额度不足，稍等片刻再重试。'),
+      retryable: true,
+      retryLabel: '稍后重试',
+      switchAccount: false,
+    }
+  }
+  if (/abort|停止|cancel|中断|网络|连接|断线|timeout|超时|fetch|network/.test(text)) {
+    return {
+      kind: 'network',
+      label: '连接中断',
+      title: '回答生成中断',
+      summary: String(message || '连接中断，这次回答没有完成。重试会重新发送上一个问题。'),
+      retryable: true,
+      retryLabel: '重试',
+      switchAccount: false,
+    }
+  }
+  return {
+    kind: 'server',
+    label: '服务错误',
+    title: '回答没有完成',
+    summary: String(message || '服务暂时不可用，重试会重新发送上一个问题。'),
+    retryable: true,
+    retryLabel: '重试',
+    switchAccount: false,
+  }
+}
+
+function answerFailureStateHtml(info, rawDetail = '') {
+  const detail = String(rawDetail || '').trim()
+  const showDetail = info.kind !== 'network' || detail.length > 60
+  return `<div class="answer-state is-error" role="alert">
+    <div class="answer-state-head">
+      <span class="answer-state-icon" aria-hidden="true">!</span>
+      <div class="answer-state-title-wrap">
+        <strong class="answer-state-title">${esc(info.title)}</strong>
+        <span class="answer-state-kind">${esc(info.label)}</span>
+      </div>
+    </div>
+    <p class="answer-state-message">${esc(info.summary)}</p>
+    ${showDetail && detail ? `<details class="answer-state-detail">
+      <summary>查看错误详情</summary>
+      <pre>${esc(detail)}</pre>
+    </details>` : ''}
+    <div class="answer-state-actions">
+      ${info.retryable ? `<button class="btn sm primary answer-state-action" type="button" data-answer-retry>${esc(
+        info.retryLabel || '重试'
+      )}</button>` : ''}
+      ${info.switchAccount ? '<button class="btn sm answer-state-action" type="button" data-answer-switch-account>切换账号</button>' : ''}
+    </div>
+  </div>`
+}
+
+function answerInterruptedStateHtml() {
+  return `<div class="answer-state is-interrupted" role="status">
+    <div class="answer-state-head">
+      <span class="answer-state-icon" aria-hidden="true">■</span>
+      <div class="answer-state-title-wrap">
+        <strong class="answer-state-title">生成已停止</strong>
+        <span class="answer-state-kind">手动停止</span>
+      </div>
+    </div>
+    <p class="answer-state-message">当前内容可能不完整。重新生成会重新发送上一个问题。</p>
+    <div class="answer-state-actions">
+      <button class="btn sm answer-state-action" type="button" data-answer-retry>重新生成</button>
+    </div>
   </div>`
 }
 
@@ -16261,6 +20848,7 @@ async function runClarifyStep(flow, answer, answeredClarify) {
         text: answer,
         sessionId: targetSessionId,
         spaceKind: state.spaceKind,
+        spaceId: state.spaceId,
         clarifyFlowId: flow.id,
         clarifyStep: nextStep,
         activeFile: activePreviewFilePayload(),
@@ -16461,11 +21049,11 @@ async function runClarifyStep(flow, answer, answeredClarify) {
 }
 
 function bindToolToggles(node) {
-  for (const button of node.querySelectorAll('.tool-head, .think-head, .memory-head')) {
+  for (const button of node.querySelectorAll('.tool-head, .think-head, .memory-head, .kb-source-head')) {
     if (button.dataset.bound === 'true') continue
     button.dataset.bound = 'true'
     button.addEventListener('click', () => {
-      const panel = button.closest('.tool-panel, .tool-card, .think-panel, .memory-panel')
+      const panel = button.closest('.tool-panel, .tool-card, .think-panel, .memory-panel, .kb-source-panel')
       if (!panel) return
       const collapsed = panel.classList.toggle('is-collapsed')
       button.setAttribute('aria-expanded', collapsed ? 'false' : 'true')
@@ -16474,6 +21062,8 @@ function bindToolToggles(node) {
         button.dataset.tip = collapsed ? '展开这次回答的完整思考过程' : '收起思考过程，只看回答正文'
       } else if (panel.classList.contains('memory-panel')) {
         button.dataset.tip = collapsed ? '展开这次回答引用的记忆来源' : '收起记忆来源'
+      } else if (panel.classList.contains('kb-source-panel')) {
+        button.dataset.tip = collapsed ? '展开这次回答引用的知识来源' : '收起知识来源，只看结论与附件'
       } else if (panel.classList.contains('tool-panel') || panel.classList.contains('tool-card')) {
         button.dataset.tip = collapsed
           ? '展开这次工具调用的完整参数与结果'
@@ -16524,6 +21114,8 @@ const MESSAGE_ACTION_ICONS = {
   edit: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.5 19.5h4L19 9a2.2 2.2 0 0 0-3.1-3.1L5.5 16.4v3.1Z" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="m13.5 6.5 3.1 3.1" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>',
   recall:
     '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 7 5 11l4 4" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M5 11h8.2A5.8 5.8 0 0 1 19 16.8" fill="none" stroke="currentColor" stroke-width="1.7"/></svg>',
+  copy:
+    '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>',
   delete:
     '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M9 7V5h6v2M8 7l1 12h6l1-12M10 10v6M14 10v6" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>',
 }
@@ -16534,7 +21126,8 @@ function messageFooterMarkup(role) {
       ? `<button type="button" class="msg-action" data-message-act="edit" data-tip="编辑这条消息并重新发送" aria-label="编辑后重发">${MESSAGE_ACTION_ICONS.edit}</button>
          <button type="button" class="msg-action" data-message-act="recall" data-tip="撤回这条消息" aria-label="撤回">${MESSAGE_ACTION_ICONS.recall}</button>
          <button type="button" class="msg-action is-danger" data-message-act="delete" data-tip="删除这条消息" aria-label="删除">${MESSAGE_ACTION_ICONS.delete}</button>`
-      : `<button type="button" class="msg-action is-danger" data-message-act="delete" data-tip="删除这条回答" aria-label="删除回答">${MESSAGE_ACTION_ICONS.delete}</button>`
+      : `<button type="button" class="msg-action" data-answer-copy data-tip="复制这条回答的正文" aria-label="复制回答">${MESSAGE_ACTION_ICONS.copy}</button>
+         <button type="button" class="msg-action is-danger" data-message-act="delete" data-tip="删除这条回答" aria-label="删除回答">${MESSAGE_ACTION_ICONS.delete}</button>`
   const actionsBlock = `<div class="msg-actions" role="group" aria-label="消息操作" hidden>${actions}</div>`
   const speech =
     role === 'ai'
@@ -16572,6 +21165,103 @@ function sessionReplyBusy() {
 function syncMessageActionAvailability() {
   const thread = $('#thread')
   if (thread) thread.dataset.replyBusy = sessionReplyBusy() ? 'true' : 'false'
+}
+
+function answerPlainText(node) {
+  const answer = node?.querySelector('.answer-text')
+  return String(answer?.innerText || answer?.textContent || '').trim()
+}
+
+function fallbackCopyPlainText(text) {
+  const area = document.createElement('textarea')
+  area.value = text
+  area.setAttribute('readonly', '')
+  area.style.position = 'fixed'
+  area.style.left = '-9999px'
+  document.body.appendChild(area)
+  area.select()
+  try {
+    if (!document.execCommand('copy')) throw new Error('copy command failed')
+  } finally {
+    area.remove()
+  }
+}
+
+async function copyAnswerText(node, button) {
+  const text = answerPlainText(node)
+  if (!text) {
+    banner('这条回答没有可复制的正文', 'warn')
+    return
+  }
+  try {
+    if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(text)
+    else fallbackCopyPlainText(text)
+    const oldTip = button?.dataset.tip || '复制这条回答的正文'
+    if (button) {
+      button.dataset.tip = '已复制'
+      button.setAttribute('aria-label', '已复制')
+      window.setTimeout(() => {
+        if (!button.isConnected) return
+        button.dataset.tip = oldTip
+        button.setAttribute('aria-label', '复制回答')
+      }, 1400)
+    }
+    banner('已复制回答正文', 'ok')
+  } catch {
+    banner('复制失败，请手动选中正文复制', 'bad')
+  }
+}
+
+function retryUserBeforeAnswer(node) {
+  let previous = node?.previousElementSibling || null
+  while (previous && !previous.classList.contains('me')) previous = previous.previousElementSibling
+  return previous
+}
+
+async function retryAnswerFromNode(node) {
+  if (!node || (node.dataset.answerState !== 'error' && node.dataset.answerState !== 'stopped')) return
+  if (sessionReplyBusy()) {
+    banner('这一轮还在生成，结束后再重试', 'warn')
+    return
+  }
+  // 只重试当前最后一条失败回答：delete after 会连带删除后续消息，不能在中段误删。
+  if (node.nextElementSibling) {
+    banner('只能重试当前最后一条回答', 'warn')
+    return
+  }
+  const userNode = retryUserBeforeAnswer(node)
+  const message = userNode?.chatMessage
+  const text = String(message?.text || userNode?.querySelector('.bubble')?.innerText || '').trim()
+  if (!message?.id) {
+    const input = $('#input')
+    if (input && text) {
+      input.value = text
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+      input.focus()
+    }
+    banner('原始提问已放回输入框，请确认后发送', 'warn')
+    return
+  }
+  const attachments = Array.isArray(userNode.chatAttachments)
+    ? userNode.chatAttachments.filter(isPersistentAttachment)
+    : []
+  banner('正在用原问题重新生成', 'ok')
+  await send({
+    retryOf: message.id,
+    retrySessionId: state.sessionId,
+    text,
+    attachments,
+    keepComposerDraft: true,
+  })
+}
+
+async function switchAccountForAnswer() {
+  try {
+    await fetch('/api/auth/logout', { method: 'POST', credentials: 'same-origin' })
+  } catch {
+    /* 网络失败也回登录页，避免把用户困在无权限的会话里 */
+  }
+  location.replace('/chat')
 }
 
 /**
@@ -16643,19 +21333,28 @@ function createAiTurn(options = {}) {
   const node = document.createElement('div')
   node.className = 'msg ai'
   node.innerHTML = `${aiWhoMarkup()}<div class="msg-body"><div class="bubble ai-turn">
-    <div class="think-panel is-collapsed" hidden>
-      <button class="think-head" type="button" data-tip="查看这次回答的思考过程；生成中也会实时更新" aria-expanded="false" aria-label="展开思考过程">
-        <span class="think-icon" aria-hidden="true">✦</span><span class="think-title">思考中</span><span class="think-divider" hidden>·</span><span class="think-preview"></span><span class="think-chevron" aria-hidden="true">⌄</span>
-      </button>
-      <div class="think-body"></div>
+    <div class="process-stack">
+      <div class="think-panel is-collapsed" hidden>
+        <button class="think-head" type="button" data-tip="查看这次回答的思考过程；生成中也会实时更新" aria-expanded="false" aria-label="展开思考过程">
+          <span class="think-icon" aria-hidden="true">✦</span><span class="think-title">思考中</span><span class="think-divider" hidden>·</span><span class="think-preview"></span><span class="think-chevron" aria-hidden="true">⌄</span>
+        </button>
+        <div class="think-body"></div>
+      </div>
+      <div class="tool-slot" hidden></div>
+      <div class="ai-team-progress" hidden></div>
     </div>
-    <div class="tool-slot" hidden></div>
-    <div class="ai-team-progress" hidden></div>
-    <div class="memory-slot" hidden></div>
-    <div class="ai-status"><span class="ai-status-dot"></span><span class="ai-status-text">正在思考中…</span></div>
-    <div class="ai-waiting" hidden><span class="ai-waiting-dot"></span><span class="ai-waiting-text">等待回复中…</span></div>
-    <div class="clarify-slot" hidden></div>
-    <div class="answer-text"></div>
+    <div class="answer-block">
+      <div class="ai-status"><span class="ai-status-dot"></span><span class="ai-status-text">正在思考中…</span></div>
+      <div class="ai-waiting" hidden><span class="ai-waiting-dot"></span><span class="ai-waiting-text">等待回复中…</span></div>
+      <div class="clarify-slot" hidden></div>
+      <div class="answer-text" hidden></div>
+      <div class="answer-error" hidden></div>
+      <div class="answer-evidence" hidden>
+        <div class="answer-sources" hidden></div>
+        <div class="answer-attachments" hidden></div>
+        <div class="memory-slot" hidden></div>
+      </div>
+    </div>
     <span class="meta" hidden></span>
   </div>${messageFooterMarkup('ai')}</div>`
   setMessageTime(node, options.createdAt || Date.now())
@@ -16677,6 +21376,10 @@ function createAiTurn(options = {}) {
   const teamProgress = node.querySelector('.ai-team-progress')
   const memorySlot = node.querySelector('.memory-slot')
   const answer = node.querySelector('.answer-text')
+  const answerEvidence = node.querySelector('.answer-evidence')
+  const answerSources = node.querySelector('.answer-sources')
+  const answerAttachments = node.querySelector('.answer-attachments')
+  const answerError = node.querySelector('.answer-error')
   const metaLine = node.querySelector('.meta')
   const clarifySlot = node.querySelector('.clarify-slot')
   const waiting = node.querySelector('.ai-waiting')
@@ -16744,12 +21447,50 @@ function createAiTurn(options = {}) {
     if (card) applyTeamProgressCard(card, progress)
     teamProgress.hidden = false
   }
+  const updateEvidence = () => {
+    if (!answerEvidence) return
+    const hasEvidence = Array.from(answerEvidence.children).some(
+      (child) => !child.hidden && Boolean(child.textContent.trim())
+    )
+    answerEvidence.hidden = !hasEvidence
+  }
+  const clearEvidence = () => {
+    if (answerSources) {
+      answerSources.innerHTML = ''
+      answerSources.hidden = true
+    }
+    if (answerAttachments) {
+      answerAttachments.innerHTML = ''
+      answerAttachments.hidden = true
+    }
+    if (memorySlot) {
+      memorySlot.innerHTML = ''
+      memorySlot.hidden = true
+    }
+    updateEvidence()
+  }
+  const setAnswerSources = (citations) => {
+    if (!answerSources) return
+    const html = kbSourcePanelHtml(citations)
+    answerSources.innerHTML = html
+    answerSources.hidden = !html
+    if (html) bindToolToggles(node)
+    updateEvidence()
+  }
+  const setAnswerAttachments = (attachments) => {
+    if (!answerAttachments) return
+    const html = answerAttachmentsHtml(attachments)
+    answerAttachments.innerHTML = html
+    answerAttachments.hidden = !html
+    updateEvidence()
+  }
   const setMemorySources = (hits, scope, longTermTraces) => {
     if (!memorySlot) return
     const html = `${longTermMemorySourceHtml(longTermTraces)}${memorySourceHtml(hits, scope)}`
     memorySlot.innerHTML = html
     memorySlot.hidden = !html
     if (html) bindToolToggles(node)
+    updateEvidence()
   }
   const setStatus = (text, progressInput) => {
     if (!text) {
@@ -16879,6 +21620,12 @@ function createAiTurn(options = {}) {
     clarifySlot.hidden = true
     clarifySlot.innerHTML = ''
     answer.hidden = true
+    if (answerError) {
+      answerError.hidden = true
+      answerError.innerHTML = ''
+    }
+    clearEvidence()
+    node.dataset.answerState = 'streaming'
     setStatus('正在思考中…')
     waiting.hidden = false
     waitingText.textContent = text
@@ -16910,6 +21657,11 @@ function createAiTurn(options = {}) {
     answer.innerHTML = ''
     answer.hidden = true
     answer.classList.remove('is-clarify-note', 'is-error')
+    if (answerError) {
+      answerError.innerHTML = ''
+      answerError.hidden = true
+    }
+    clearEvidence()
     clarifySlot.innerHTML = content
     clarifySlot.hidden = false
     bindClarifyPanel(clarifySlot)
@@ -17000,8 +21752,12 @@ function createAiTurn(options = {}) {
           })
         }
       }
-      if (snapshot.status === 'error') this.fail(snapshot.error || '回答失败')
-      else if (snapshot.status === 'stopped') this.stop()
+      if (snapshot.status === 'error') {
+        this.fail(snapshot.error || '回答失败', '', {
+          code: snapshot.errorCode || snapshot.code || '',
+          traceId: snapshot.traceId || '',
+        })
+      } else if (snapshot.status === 'stopped') this.stop()
     },
     reasoning(text) {
       if (!text) return
@@ -17104,6 +21860,7 @@ function createAiTurn(options = {}) {
       if (event.diff) trace.diff = event.diff
       if (event.batch) trace.batch = event.batch
       if (event.view) trace.view = event.view
+      if (event.view?.kind === 'browser' && event.view.pageId) syncBrowserFromTrace(event.view)
       setStatus('')
       updateFileActivity(trace)
       renderToolPanel(toolTraces.some((item) => item.status === 'running'))
@@ -17141,6 +21898,12 @@ function createAiTurn(options = {}) {
         showClarifyPrompt(data.clarify)
       } else {
         hideWaiting()
+        if (answerError) {
+          answerError.innerHTML = ''
+          answerError.hidden = true
+        }
+        setAnswerSources(data?.citations || [])
+        setAnswerAttachments(data?.attachments || [])
         setMemorySources(data?.memoryHits || [], data?.memoryScope, data?.longTermMemoryRecall || [])
         clarifySlot.hidden = true
         clarifySlot.innerHTML = ''
@@ -17187,24 +21950,39 @@ function createAiTurn(options = {}) {
         setSelected(data.modelId, { persist: false })
       }
       if (data.fallbackFromModelId) void refreshModelCatalog()
+      node.dataset.answerState = 'done'
       finalScroll()
       if (node.isConnected) settleFileDock()
       if (data?.clarify) startClarifyAutoSelect(state.clarifyFlow)
     },
-    fail(message, meta) {
+    fail(message, meta, info = {}) {
       setStatus('')
       hideWaiting()
       clarifySlot.hidden = true
       clarifySlot.innerHTML = ''
       collapseThink(true)
-      answer.hidden = false
-      answer.classList.remove('is-clarify-note')
-      if (!answer.textContent) answer.textContent = message || '回答失败'
-      answer.classList.add('is-error')
-      if (meta) {
+      const rawMessage = String(message || '回答失败')
+      const shownMessage = rawMessage.replace(/\s*（(?:EAB_[A-Z0-9_]+|HTTP \d+)）\s*$/i, '').trim() || rawMessage
+      const failure = answerFailureInfo(shownMessage, info)
+      const detail = [rawMessage, info.code ? `错误码：${info.code}` : '', info.traceId ? `traceId：${info.traceId}` : '']
+        .filter(Boolean)
+        .join('\n')
+      if (answerError) {
+        answerError.innerHTML = answerFailureStateHtml(failure, detail)
+        answerError.hidden = false
+      }
+      answer.classList.remove('is-error')
+      if (rawAnswer && answer.textContent.trim()) {
+        answer.hidden = false
+      } else {
+        answer.hidden = true
+        answer.innerHTML = ''
+      }
+      node.dataset.answerState = 'error'
+      if (meta || info.traceId) {
         metaLine.hidden = false
-        metaLine.textContent = meta
-        metaLine.dataset.tip = `这次回答失败：${meta}`
+        metaLine.textContent = meta || `traceId ${info.traceId}`
+        metaLine.dataset.tip = `这次回答失败：${detail}`
       }
       if (node.isConnected) settleFileDock()
       scroll()
@@ -17215,12 +21993,21 @@ function createAiTurn(options = {}) {
       clarifySlot.hidden = true
       clarifySlot.innerHTML = ''
       collapseThink(true)
-      answer.hidden = false
-      answer.classList.remove('is-clarify-note')
-      if (!rawAnswer) answer.textContent = '已停止生成'
+      answer.classList.remove('is-clarify-note', 'is-error')
+      if (rawAnswer && answer.textContent.trim()) {
+        answer.hidden = false
+      } else {
+        answer.hidden = true
+        answer.innerHTML = ''
+      }
+      if (answerError) {
+        answerError.innerHTML = answerInterruptedStateHtml()
+        answerError.hidden = false
+      }
+      node.dataset.answerState = 'stopped'
       metaLine.hidden = false
       metaLine.textContent = '已停止生成'
-      metaLine.dataset.tip = '这次生成已手动停止；可以重新提问或继续追问'
+      metaLine.dataset.tip = '这次生成已手动停止；可以重新生成或继续追问'
       if (node.isConnected) settleFileDock()
       scroll()
     },
@@ -17739,9 +22526,14 @@ function autosize() {
 
 /** 读取后端 SSE：meta / reasoning / delta / tool / tool_result / done / error。 */
 async function streamChat(payload, onEvent, signal) {
+  const headers = { 'content-type': 'application/json' }
+  if (desktopBrowserHost && state.desktopInfo?.deviceId) {
+    headers['x-eab-desktop'] = '1'
+    headers['x-eab-desktop-device'] = state.desktopInfo.deviceId
+  }
   const response = await fetch(`/api/chat/messages${qs()}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers,
     body: JSON.stringify({ ...payload, stream: true }),
     signal,
   })
@@ -18745,9 +23537,12 @@ async function transcribeVoice(blob, options = {}) {
 async function send(options = {}) {
   if (!options.voiceInput && state.voiceConversation.active) exitVoiceConversation({ silent: true })
   const input = $('#input')
-  const text = input.value.trim()
-  if (!text && state.attachments.length === 0) return
-  if (handleModelCommand(text)) {
+  const draftText = input.value.trim()
+  const text = options.text != null ? String(options.text).trim() : draftText
+  const retryAttachments = Array.isArray(options.attachments) ? options.attachments.slice() : null
+  const draftAttachmentCount = retryAttachments ? retryAttachments.length : state.attachments.length
+  if (!text && draftAttachmentCount === 0) return
+  if (!options.retryOf && handleModelCommand(text)) {
     input.value = ''
     input.style.height = '44px'
     updateSendState()
@@ -18755,7 +23550,7 @@ async function send(options = {}) {
   }
   // 引导式澄清还开着时，底部输入框里的内容也算当前这一步的回答；
   // 直接续跑同一个澄清流程，不落成普通用户消息。
-  if (state.clarifyFlow && state.pendingClarify && state.attachments.length === 0) {
+  if (!options.retryOf && state.clarifyFlow && state.pendingClarify && state.attachments.length === 0) {
     if (state.clarifyFlow.busy) return
     input.value = ''
     input.style.height = '44px'
@@ -18765,6 +23560,27 @@ async function send(options = {}) {
   }
   // 只要用户真正发了消息（包括带附件），底部澄清就完成使命。
   clearClarifyDock()
+
+  // 失败重试：先删掉上一组“提问 + 失败回答”，再按同一问题重新请求，
+  // 避免把旧回答继续留在模型上下文或页面里形成两份。
+  if (options.retryOf) {
+    if (options.retrySessionId && options.retrySessionId !== state.sessionId) {
+      banner('会话已切换，不能重试上一条回答', 'warn')
+      return
+    }
+    if (sessionReplyBusy()) {
+      banner('这一轮还在生成，结束后再重试', 'warn')
+      return
+    }
+    if (state.messageEdit) cancelMessageEdit({ clearInput: false, silent: true })
+    try {
+      const result = await deleteMessageApi(String(options.retryOf), 'after')
+      removeDeletedMessageNodes(result.deletedIds)
+    } catch (err) {
+      banner(`重新生成失败：${err.message}`, 'bad')
+      return
+    }
+  }
 
   // 编辑后重发：先回退到被编辑消息之前，再按正常发送走一遍，
   // 避免旧提问和旧回答继续留在模型上下文里。
@@ -18796,7 +23612,7 @@ async function send(options = {}) {
   }
 
   const modelId = state.selected || null
-  const pending = state.attachments.slice()
+  const pending = retryAttachments ? retryAttachments : state.attachments.slice()
   const spaceKind = state.spaceKind
   const attachmentMeta = pending.map((file) => {
     const base = {
@@ -18848,7 +23664,10 @@ async function send(options = {}) {
     pending,
     attachmentMeta,
     spaceKind,
+    spaceId: state.spaceId,
     sessionId: state.sessionId,
+    // 未落库草稿：把草稿类型（对话 / 任务）带给后端，首条消息落库时保留。
+    projectMode: state.sessionId ? null : (state.draftSession?.mode === 'task' ? 'task' : 'chat'),
     runtimeKey: runtime.key,
     voiceInput: Boolean(options.voiceInput),
     voiceConversation: Boolean(options.voiceConversation),
@@ -18870,15 +23689,19 @@ async function send(options = {}) {
   }
 
   runtime.queue.push(item)
-  input.value = ''
-  input.style.height = '44px'
+  if (!options.keepComposerDraft) {
+    input.value = ''
+    input.style.height = '44px'
+  }
   item.node = appendMessage('me', text, undefined, attachmentMeta, undefined, { createdAt: item.createdAt, animate: true })
   scrollThreadToBottomInstant()
 
-  state.attachments = pending.filter(isPersistentAttachment)
-  renderAttachments()
-  for (const file of pending) {
-    if (!isPersistentAttachment(file) && String(file.previewUrl || '').startsWith('blob:')) URL.revokeObjectURL(file.previewUrl)
+  if (!options.keepComposerDraft) {
+    state.attachments = pending.filter(isPersistentAttachment)
+    renderAttachments()
+    for (const file of pending) {
+      if (!isPersistentAttachment(file) && String(file.previewUrl || '').startsWith('blob:')) URL.revokeObjectURL(file.previewUrl)
+    }
   }
 
   renderQueueState()
@@ -18941,6 +23764,8 @@ async function drainQueue(runtime = currentRuntime()) {
         references,
         sessionId: item.sessionId,
         spaceKind: item.spaceKind,
+        spaceId: item.spaceId,
+        projectMode: item.projectMode,
         // 右侧正在预览的文件：让模型知道「这个文件」指谁；面板没开就不传。
         activeFile: activePreviewFilePayload(),
       },
@@ -18997,13 +23822,24 @@ async function drainQueue(runtime = currentRuntime()) {
               void loadSessions()
             }
             if (state.sessionId === null || state.sessionId === data.sessionId) {
+              // 草稿首条消息刚落库：把空白草稿里已经打开的右侧标签整体转给新会话。
+              if (createdSession && state.sessionId === null && !browserTabsScopeSessionId) {
+                adoptBrowserTabsForSession(data.sessionId)
+              }
               state.sessionId = data.sessionId
+              // 草稿已落库，清空未落库草稿标记，后续按正式会话处理。
+              state.draftSession = null
               persistChatLocation()
               // 新会话首条消息落库后，把输入区当前常驻引用（含发送过程中新增/删除的）同步一次。
               if (createdSession) void syncSessionReferences()
             }
-            if (isCurrentRun && $('#chat-title').textContent === '新对话') {
-              $('#chat-title').textContent = (item.text || attachments[0]?.name || '新对话').slice(0, 24)
+            const headTitle = $('#chat-title')?.textContent?.trim() || ''
+            if (isCurrentRun && (headTitle === '新对话' || headTitle === '新工作任务')) {
+              const nextTitle = (item.text || attachments[0]?.name || headTitle).slice(0, 24)
+              $('#chat-title').textContent = nextTitle
+              const listed = state.sessions.find((session) => session.id === data.sessionId)
+              if (listed) listed.title = nextTitle
+              renderSessions()
             }
             markSessionActive(data.sessionId)
             renderSessions()
@@ -19308,6 +24144,31 @@ function bindSettings() {
       renderVoiceSettings()
       banner(err.message || '保存失败，请重试', 'bad')
     }
+  })
+  const desktopDownloadButton = $('#open-desktop-download')
+  if (desktopDownloadButton) {
+    desktopDownloadButton.hidden = Boolean(desktopBrowserHost)
+    desktopDownloadButton.addEventListener('click', () => {
+      window.open('/download/desktop', '_blank', 'noopener')
+    })
+  }
+  const desktopTitle = $('#settings-desktop-title')
+  const desktopHint = $('#settings-desktop-hint')
+  if (desktopBrowserHost) {
+    if (desktopTitle) desktopTitle.textContent = 'EAB 服务器'
+    if (desktopHint) desktopHint.textContent = '修改当前桌面版连接的 EAB 服务地址'
+  } else {
+    if (desktopTitle) desktopTitle.textContent = '下载桌面版'
+    if (desktopHint) desktopHint.textContent = 'Windows 原生网页标签，重网页和音视频更快'
+  }
+  $('#settings-desktop').addEventListener('click', () => {
+    if (desktopBrowserHost) {
+      if (typeof desktopBrowserHost.openServerSettings === 'function') {
+        void desktopBrowserHost.openServerSettings()
+      }
+      return
+    }
+    window.location.href = '/download/desktop'
   })
   $('#settings-password').addEventListener('click', showPasswordModal)
   $('#settings-logout').addEventListener('click', logout)
@@ -19688,7 +24549,8 @@ function focusSideToggle() {
 }
 
 function canSidePeek() {
-  return window.matchMedia('(min-width: 861px)').matches
+  // ≤1120 侧栏是抽屉，悬停预览会和抽屉抢同一块区域。
+  return window.matchMedia('(min-width: 1121px)').matches
 }
 
 function syncSidePeekInsets() {
@@ -19791,6 +24653,8 @@ function setSidebarCollapsed(collapsed, options = {}) {
     button.setAttribute('aria-label', isCollapsed ? '展开侧边栏' : '收起侧边栏')
     button.title = isCollapsed ? '展开侧边栏' : '收起侧边栏'
   }
+  const scrim = $('#side-drawer-scrim')
+  if (scrim) scrim.setAttribute('aria-hidden', String(isCollapsed))
   if (options.persist !== false) {
     try {
       localStorage.setItem(SIDEBAR_COLLAPSED_KEY, isCollapsed ? '1' : '0')
@@ -19802,11 +24666,17 @@ function setSidebarCollapsed(collapsed, options = {}) {
 }
 
 function initSidebarToggle() {
+  const isCompactShell = () => window.matchMedia('(max-width: 1120px)').matches
   let collapsed = false
   try {
     collapsed = localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === '1'
   } catch {
     collapsed = false
+  }
+  // 窄屏首屏先收起侧栏，展开时由 CSS 变为覆盖式抽屉，不再挤占对话宽度。
+  if (isCompactShell()) {
+    collapsed = true
+    document.body.dataset.sideAutoCollapsed = '1'
   }
   setSidebarCollapsed(collapsed, { persist: false })
   const button = $('#side-toggle')
@@ -19814,7 +24684,9 @@ function initSidebarToggle() {
   if (button && button.dataset.bound !== '1') {
     button.dataset.bound = '1'
     button.addEventListener('click', () => {
-      setSidebarCollapsed(!document.body.classList.contains('is-side-collapsed'))
+      const compact = isCompactShell()
+      setSidebarCollapsed(!document.body.classList.contains('is-side-collapsed'), { persist: !compact })
+      if (compact) document.body.dataset.sideAutoCollapsed = '0'
     })
     button.addEventListener('pointerenter', (event) => {
       if (event.pointerType === 'touch') return
@@ -19832,6 +24704,37 @@ function initSidebarToggle() {
       }
     })
     button.addEventListener('blur', scheduleSidePeekClose)
+  }
+  const scrim = $('#side-drawer-scrim')
+  if (scrim && scrim.dataset.bound !== '1') {
+    scrim.dataset.bound = '1'
+    scrim.addEventListener('click', () => {
+      setSidebarCollapsed(true, { persist: !isCompactShell() })
+      if (isCompactShell()) document.body.dataset.sideAutoCollapsed = '0'
+    })
+  }
+  if (document.body.dataset.compactSideBound !== '1') {
+    document.body.dataset.compactSideBound = '1'
+    const compactQuery = window.matchMedia('(max-width: 1120px)')
+    compactQuery.addEventListener('change', (event) => {
+      if (event.matches) {
+        if (!document.body.classList.contains('is-side-collapsed')) {
+          setSidebarCollapsed(true, { persist: false })
+          document.body.dataset.sideAutoCollapsed = '1'
+        }
+        return
+      }
+      setSidePeek(false)
+      if (document.body.dataset.sideAutoCollapsed !== '1') return
+      let stored = false
+      try {
+        stored = localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === '1'
+      } catch {
+        stored = false
+      }
+      setSidebarCollapsed(stored, { persist: false })
+      document.body.dataset.sideAutoCollapsed = '0'
+    })
   }
   if (side && side.dataset.peekBound !== '1') {
     side.dataset.peekBound = '1'
@@ -19864,6 +24767,12 @@ function initSidebarToggle() {
         return
       }
       if (document.body.classList.contains('is-side-collapsed')) return
+      if (isCompactShell()) {
+        setSidebarCollapsed(true, { persist: false })
+        document.body.dataset.sideAutoCollapsed = '0'
+        focusSideToggle()
+        return
+      }
       if (!$('#chat-side')?.contains(document.activeElement) && document.activeElement?.id !== 'side-toggle') return
       setSidebarCollapsed(true)
       focusSideToggle()
@@ -19991,12 +24900,14 @@ function fileSplitContentWidth(main) {
   }
 }
 
-/** 右栏最小 440（列表 200 + 详情）、对话最小 360；文件模式沿用原来的 284/320。 */
+/** 右栏最小 440（列表 200 + 详情）、对话最小 360；文件模式右栏 320、对话 420。 */
 function splitBounds(teamMode, contentWidth) {
-  const minRail = teamMode ? 440 : 284
-  const minChat = teamMode ? 360 : 320
-  const minRatio = Math.min(0.5, minRail / contentWidth)
-  const maxRatio = Math.max(minRatio, 1 - minChat / contentWidth)
+  const minRail = teamMode ? 440 : 320
+  const minChat = teamMode ? 360 : 420
+  // --file-split / --team-split 表示左栏（对话）占比，不是右栏占比。
+  // 三列网格里左栏是 calc(ratio - 4px)、右栏是剩余宽度，预留 12px 吸收间距与边框。
+  const minRatio = Math.min(0.5, (minChat + 12) / contentWidth)
+  const maxRatio = Math.max(minRatio, 1 - (minRail + 12) / contentWidth)
   return { minRatio, maxRatio }
 }
 
@@ -20004,13 +24915,14 @@ function applySplitRatio(ratio, options = {}) {
   const main = $('.chat-main')
   if (!main) return
   const teamMode = Boolean(options.team)
-  const varName = teamMode ? '--team-split' : '--file-split'
-  const fallback = teamMode ? 0.56 : 0.5
+  const webMode = Boolean(options.web)
+  const varName = webMode ? '--web-split' : teamMode ? '--team-split' : '--file-split'
+  const fallback = webMode ? 0.44 : teamMode ? 0.56 : 0.5
   const geometry = fileSplitContentWidth(main)
   let value = Number(ratio)
   if (!Number.isFinite(value) || value <= 0) value = fallback
   if (geometry.contentWidth > 1) {
-    const bounds = splitBounds(teamMode, geometry.contentWidth)
+    const bounds = splitBounds(teamMode || webMode, geometry.contentWidth)
     value = Math.max(bounds.minRatio, Math.min(bounds.maxRatio, value))
   }
   main.style.setProperty(varName, `${(value * 100).toFixed(2)}%`)
@@ -20018,7 +24930,10 @@ function applySplitRatio(ratio, options = {}) {
   if (resizer) resizer.setAttribute('aria-valuenow', String(Math.round(value * 100)))
   if (options.persist !== false) {
     try {
-      localStorage.setItem(teamMode ? TEAM_SPLIT_RATIO_KEY : FILE_SPLIT_RATIO_KEY, String(value))
+      localStorage.setItem(
+        webMode ? WEB_SPLIT_RATIO_KEY : teamMode ? TEAM_SPLIT_RATIO_KEY : FILE_SPLIT_RATIO_KEY,
+        String(value),
+      )
     } catch {
       /* 忽略本地存储失败 */
     }
@@ -20031,6 +24946,10 @@ function applyFileSplitRatio(ratio, options = {}) {
 
 function applyTeamSplitRatio(ratio, options = {}) {
   applySplitRatio(ratio, { ...options, team: true })
+}
+
+function applyWebSplitRatio(ratio, options = {}) {
+  applySplitRatio(ratio, { ...options, web: true })
 }
 
 function restoreFileSplitRatio() {
@@ -20054,6 +24973,17 @@ function restoreTeamSplitRatio() {
     ratio = 0.56
   }
   applyTeamSplitRatio(ratio, { persist: false })
+}
+
+function restoreWebSplitRatio() {
+  let ratio = 0.44
+  try {
+    const saved = Number(localStorage.getItem(WEB_SPLIT_RATIO_KEY))
+    if (Number.isFinite(saved) && saved >= 0.25 && saved <= 0.7) ratio = saved
+  } catch {
+    ratio = 0.44
+  }
+  applyWebSplitRatio(ratio, { persist: false })
 }
 
 /** 团队栏内部的列表/预览分界线：像左侧对话/文件一样可拖，宽度记在本地。 */
@@ -20152,9 +25082,17 @@ function bindTeamListResizer() {
   })
 }
 
-/** 当前分栏是不是团队模式（团队独占或团队+文件并排） */
+/** 当前分栏是否使用 --team-split（团队、权限审批共用同一套分栏变量；网页用独立变量） */
 function isTeamSplitMode(main) {
-  return Boolean(main?.classList.contains('is-team-only') || main?.classList.contains('is-team-file'))
+  return Boolean(
+    main?.classList.contains('is-team-only') ||
+      main?.classList.contains('is-team-file') ||
+      main?.classList.contains('is-perm-only')
+  )
+}
+
+function isWebSplitMode(main) {
+  return Boolean(main?.classList.contains('is-web-only'))
 }
 
 function bindFileSplitResizer() {
@@ -20166,9 +25104,9 @@ function bindFileSplitResizer() {
   const finishDrag = (pointerId) => {
     if (!drag || (pointerId != null && pointerId !== drag.pointerId)) return
     const main = $('.chat-main')
-    const varName = drag.team ? '--team-split' : '--file-split'
+    const varName = drag.web ? '--web-split' : drag.team ? '--team-split' : '--file-split'
     const ratio = Number.parseFloat(main?.style.getPropertyValue(varName) || '') / 100
-    if (Number.isFinite(ratio)) applySplitRatio(ratio, { team: drag.team })
+    if (Number.isFinite(ratio)) applySplitRatio(ratio, { team: drag.team, web: drag.web })
     drag = null
     document.body.classList.remove('is-resizing-split')
   }
@@ -20178,7 +25116,9 @@ function bindFileSplitResizer() {
     if (!main?.classList.contains('is-workbench-open')) return
     if (event.pointerType === 'mouse' && event.button !== 0) return
     const geometry = fileSplitContentWidth(main)
-    drag = { pointerId: event.pointerId, ...geometry, team: isTeamSplitMode(main) }
+    const web = isWebSplitMode(main)
+    const team = !web && isTeamSplitMode(main)
+    drag = { pointerId: event.pointerId, ...geometry, team, web }
     resizer.setPointerCapture?.(event.pointerId)
     document.body.classList.add('is-resizing-split')
     event.preventDefault()
@@ -20187,9 +25127,9 @@ function bindFileSplitResizer() {
   resizer.addEventListener('pointermove', (event) => {
     if (!drag || event.pointerId !== drag.pointerId) return
     const x = event.clientX - drag.rect.left - drag.padLeft
-    const bounds = splitBounds(drag.team, drag.contentWidth)
+    const bounds = splitBounds(drag.team || drag.web, drag.contentWidth)
     const ratio = Math.max(bounds.minRatio, Math.min(bounds.maxRatio, x / drag.contentWidth))
-    applySplitRatio(ratio, { team: drag.team, persist: false })
+    applySplitRatio(ratio, { team: drag.team, web: drag.web, persist: false })
     event.preventDefault()
   })
 
@@ -20200,28 +25140,30 @@ function bindFileSplitResizer() {
   resizer.addEventListener('keydown', (event) => {
     const main = $('.chat-main')
     if (!main?.classList.contains('is-workbench-open')) return
-    const team = isTeamSplitMode(main)
-    const varName = team ? '--team-split' : '--file-split'
+    const web = isWebSplitMode(main)
+    const team = !web && isTeamSplitMode(main)
+    const varName = web ? '--web-split' : team ? '--team-split' : '--file-split'
     const current = Number.parseFloat(main.style.getPropertyValue(varName) || '') / 100
-    let next = Number.isFinite(current) && current > 0 ? current : (team ? 0.56 : 0.5)
+    let next = Number.isFinite(current) && current > 0 ? current : web ? 0.44 : team ? 0.56 : 0.5
     if (event.key === 'ArrowLeft') next -= 0.02
     else if (event.key === 'ArrowRight') next += 0.02
-    else if (event.key === 'Home') next = team ? 0.36 : 0.3
-    else if (event.key === 'End') next = team ? 0.7 : 0.7
+    else if (event.key === 'Home') next = web ? 0.3 : team ? 0.36 : 0.3
+    else if (event.key === 'End') next = team || web ? 0.7 : 0.7
     else return
     event.preventDefault()
-    applySplitRatio(next, { team })
+    applySplitRatio(next, { team, web })
   })
 
   // 窗口变窄时按新宽度重新夹一次，避免对话区被压没
   window.addEventListener('resize', () => {
     const main = $('.chat-main')
     if (!main?.classList.contains('is-workbench-open')) return
-    const team = isTeamSplitMode(main)
-    const varName = team ? '--team-split' : '--file-split'
+    const web = isWebSplitMode(main)
+    const team = !web && isTeamSplitMode(main)
+    const varName = web ? '--web-split' : team ? '--team-split' : '--file-split'
     const current = Number.parseFloat(main.style.getPropertyValue(varName) || '') / 100
     if (Number.isFinite(current) && current > 0) {
-      applySplitRatio(current, { team, persist: false })
+      applySplitRatio(current, { team, web, persist: false })
     }
   })
 }
@@ -20238,6 +25180,7 @@ async function boot() {
   initSidebarToggle()
   bindFileSplitResizer()
   restoreTeamSplitRatio()
+  restoreWebSplitRatio()
   bindTeamListResizer()
   restoreTeamListWidth()
   bindSideSectionResizer()
@@ -20304,7 +25247,8 @@ async function boot() {
 
   renderSideUser(me)
   void refreshConsoleEntry()
-  $('#side-files').hidden = false
+  const cloudSection = $('#side-files')
+  if (cloudSection) cloudSection.hidden = state.spaceKind === 'local'
   // 权限角标依赖登录态；登录成功后再拉取，避免登录页发出 401 请求。
   void refreshPermissionBadge()
 
@@ -20335,7 +25279,9 @@ async function boot() {
     renderSuggestions()
     renderAttachments()
     $('#demo-pill').hidden = !models.models.every((model) => model.provider === 'demo')
-    await loadSessions()
+    await ensureDesktopInfo()
+    await Promise.all([loadSessions(), loadLocalProjects()])
+    void syncDesktopProjectBindings()
     setupChatEvents()
     await loadActiveRuns()
     const savedLocation = deniedFromConsole ? null : readChatLocation()
@@ -20344,15 +25290,17 @@ async function boot() {
       if (savedSessionId && state.sessions.some((session) => session.id === savedSessionId)) {
         await openSession(savedSessionId)
       } else if (savedSessionId === '') {
-        newSession()
+        newSession({ create: false })
       } else {
         await openSession(state.sessions[0].id)
       }
     } else {
-      newSession()
+      newSession({ create: false })
     }
     restoreChatLocation(savedLocation)
     await loadWorkspaceFiles()
+    // 标签页恢复放在会话与工作台布局初始化之后，避免刚加上的标签被后续初始化覆盖掉。
+    await restoreBrowserTabs()
   } catch (err) {
     renderDenied(err)
     endBoot('工作台加载遇到问题…')
@@ -20403,6 +25351,7 @@ async function boot() {
     if (state.wake.enabled && !state.voiceConversation.active) scheduleWakeRestart(120)
   })
   window.addEventListener('pagehide', () => {
+    persistBrowserTabsNow()
     if (!state.voiceConversation.active) stopWakeListener({ keepEnabled: true })
   })
   $('#voice-dock-action')?.addEventListener('click', handleVoiceDockAction)
@@ -20602,7 +25551,47 @@ async function boot() {
   })
 
   // 会话
-  $('#new-session').addEventListener('click', newSession)
+  bindSideNav()
+  $('#new-project')?.addEventListener('click', () => void beginNewLocalProject())
+  $('#project-modal-close')?.addEventListener('click', closeProjectModal)
+  $('#project-modal-cancel')?.addEventListener('click', closeProjectModal)
+  $('#project-modal-create')?.addEventListener('click', () => void submitNewLocalProject())
+  $('#project-folder-pick')?.addEventListener('click', async () => {
+    try {
+      const picked = await pickLocalProjectFolder()
+      if (!picked) return
+      state.projectDraft.path = picked.path
+      state.projectDraft.rootRealPath = picked.rootRealPath || ''
+      if (!state.projectDraft.name) state.projectDraft.name = picked.name
+      syncProjectDraftUI()
+    } catch (err) {
+      banner(err.message || '选择文件夹失败', 'bad')
+    }
+  })
+  $('#project-name')?.addEventListener('input', (event) => {
+    state.projectDraft.name = event.target.value
+  })
+  $('#project-instructions')?.addEventListener('input', (event) => {
+    state.projectDraft.instructions = event.target.value
+  })
+  $('#project-cloud-pick')?.addEventListener('click', () => openCloudPicker({ target: 'draft' }))
+  $('#cloud-pick-close')?.addEventListener('click', closeCloudPicker)
+  $('#cloud-pick-confirm')?.addEventListener('click', applyCloudPick)
+  $('#project-modal')?.addEventListener('click', (event) => {
+    if (event.target === $('#project-modal')) closeProjectModal()
+  })
+  $('#cloud-pick-modal')?.addEventListener('click', (event) => {
+    if (event.target === $('#cloud-pick-modal')) closeCloudPicker()
+  })
+  $('#project-menu')?.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-project-act]')
+    if (button) void handleProjectMenuAction(button.dataset.projectAct)
+  })
+  document.addEventListener('click', (event) => {
+    if (!event.target.closest('#project-menu') && !event.target.closest('[data-project-more]')) hideProjectMenu()
+  })
+  $('#local-project-refresh')?.addEventListener('click', () => void loadLocalFiles(state.localFilePath))
+  $('#local-project-open')?.addEventListener('click', openLocalProjectFolder)
   $('#session-menu').addEventListener('click', (event) => {
     const action = event.target.closest('[data-act]')
     if (!action) return
@@ -20614,13 +25603,26 @@ async function boot() {
   })
   $('#file-menu').addEventListener('click', (event) => {
     const menu = $('#file-menu')
+    const cloudAction = event.target.closest('[data-cloud-act]')
+    if (cloudAction) {
+      hideFileMenu()
+      if (cloudAction.disabled) return
+      if (cloudAction.dataset.cloudAct === 'new-folder') createWorkspaceFolder(state.cloudSpacePath)
+      else if (cloudAction.dataset.cloudAct === 'new-file') createWorkspaceFile(state.cloudSpacePath)
+      else if (cloudAction.dataset.cloudAct === 'upload') $('#cloud-upload-input')?.click()
+      return
+    }
     const folderAction = event.target.closest('[data-folder-act]')
     if (folderAction) {
       const folderPath = menu.dataset.folder
+      const scope = menu.dataset.scope || 'workspace'
       hideFileMenu()
       if (!folderPath || folderAction.disabled) return
-      if (folderAction.dataset.folderAct === 'open') setWorkspacePath(folderPath)
-      else if (folderAction.dataset.folderAct === 'new') createWorkspaceFolder(folderPath)
+      if (folderAction.dataset.folderAct === 'open') {
+        if (scope === 'cloud') setCloudSpacePath(folderPath)
+        else setWorkspacePath(folderPath)
+      } else if (folderAction.dataset.folderAct === 'new') createWorkspaceFolder(folderPath)
+      else if (folderAction.dataset.folderAct === 'new-file') createWorkspaceFile(folderPath)
       else if (folderAction.dataset.folderAct === 'rename') renameWorkspaceFolder(folderPath)
       else if (folderAction.dataset.folderAct === 'delete') deleteWorkspaceFolder(folderPath)
       return
@@ -20631,7 +25633,8 @@ async function boot() {
     const file = fileById(fileId)
     hideFileMenu()
     if (!file) return
-    if (action.dataset.fileAct === 'rename') renameWorkspaceFile(file)
+    if (action.dataset.fileAct === 'open') void openWorkspaceFile(file.id)
+    else if (action.dataset.fileAct === 'rename') renameWorkspaceFile(file)
     else if (action.dataset.fileAct === 'edit') editWorkspaceFile(file)
     else if (action.dataset.fileAct === 'delete') deleteWorkspaceFile(file)
     else if (action.dataset.fileAct === 'send-dingtalk') sendWorkspaceFileToDingTalk(file)
@@ -20653,6 +25656,34 @@ async function boot() {
   })
   $('#message-edit-cancel').addEventListener('click', () => cancelMessageEdit({ clearInput: true }))
   $('#thread').addEventListener('click', (event) => {
+    const copyButton = event.target.closest('[data-answer-copy]')
+    if (copyButton) {
+      event.preventDefault()
+      const node = copyButton.closest('.msg')
+      void copyAnswerText(node, copyButton)
+      return
+    }
+    const retryButton = event.target.closest('[data-answer-retry]')
+    if (retryButton) {
+      event.preventDefault()
+      const node = retryButton.closest('.msg')
+      void retryAnswerFromNode(node)
+      return
+    }
+    if (event.target.closest('[data-answer-switch-account]')) {
+      event.preventDefault()
+      switchAccountForAnswer()
+      return
+    }
+    const attachmentButton = event.target.closest('[data-answer-file-id]')
+    if (attachmentButton) {
+      event.preventDefault()
+      const fileId = String(attachmentButton.dataset.answerFileId || '').trim()
+      if (fileId) {
+        openWorkspaceFile(fileId).catch((err) => banner(`打开附件失败：${err.message}`, 'bad'))
+      }
+      return
+    }
     const action = event.target.closest('.msg-actions [data-message-act]')
     if (!action || action.disabled) return
     const node = action.closest('.msg')
@@ -20697,15 +25728,15 @@ async function boot() {
   })
 
   // 个人工作区
-  $('#ws-new-folder').addEventListener('click', () => createWorkspaceFolder())
-  $('#ws-upload').addEventListener('click', () => $('#ws-input').click())
-  $('#ws-input').addEventListener('change', async (event) => {
+  $('#ws-new-folder')?.addEventListener('click', () => createWorkspaceFolder())
+  $('#ws-upload')?.addEventListener('click', () => $('#ws-input')?.click())
+  $('#ws-input')?.addEventListener('change', async (event) => {
     // FileList 是实时集合：先复制再清空 input，否则 next files.length 会变成 0。
     const files = Array.from(event.target.files || [])
     event.target.value = ''
     if (files.length) await uploadWorkspaceFiles(files)
   })
-  $('#ws-upload-status').addEventListener('click', (event) => {
+  $('#ws-upload-status')?.addEventListener('click', (event) => {
     if (!event.target.closest('[data-ws-upload-close]')) return
     window.clearTimeout(state.wsUploadHideTimer)
     state.wsUploads = []

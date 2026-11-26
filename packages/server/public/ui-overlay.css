@@ -377,3 +377,43 @@ body.eab-modal-open {
     transition: none;
   }
 }
+
+/* --------------------------------------------------------------------------
+   4. B27 全站焦点与减少动态效果
+   -------------------------------------------------------------------------- */
+
+/* 原生键盘焦点统一为“白色内环 + 深色外环”，在浅色和品牌绿按钮上都可见。
+   输入框不叠加这层外环，保留各业务输入框自己的聚焦样式。 */
+:is(
+  a[href],
+  button,
+  summary,
+  [tabindex]:not([tabindex="-1"])
+):focus-visible {
+  outline: 2px solid #fff !important;
+  outline-offset: 1px !important;
+  box-shadow: 0 0 0 4px rgba(16, 24, 40, 0.88) !important;
+}
+
+/* 深色预览层改用浅色外环，避免焦点环被背景吞掉。 */
+.image-lightbox-dialog :is(button, a[href], [tabindex]:not([tabindex="-1"])):focus-visible {
+  outline-color: #fff !important;
+  box-shadow: 0 0 0 4px rgba(255, 255, 255, 0.72) !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto !important;
+  }
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-delay: 0ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    transition-delay: 0ms !important;
+    scroll-behavior: auto !important;
+  }
+}

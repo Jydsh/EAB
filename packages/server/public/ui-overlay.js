@@ -418,10 +418,277 @@
     activePopconfirm?.cancel(true)
   }
 
+  /* ------------------------------------------------------------------------
+     B27：全站模态焦点守卫
+     - 只接管 role="dialog" + aria-modal="true" 的可见浮层；
+     - 已有本地 Tab 循环的确认卡标 data-eab-focus-owned，避免双重处理；
+     - 打开时记住触发元素，关闭/移除后回到触发元素；
+     - 不主动关闭浮层，Esc 仍交给各浮层自己的关闭逻辑。
+     ------------------------------------------------------------------------ */
+  const DIALOG_SELECTOR = '[role="dialog"][aria-modal="true"]'
+  const FOCUSABLE_SELECTOR = [
+    'a[href]',
+    'button:not([disabled])',
+    'input:not([disabled]):not([type="hidden"])',
+    'select:not([disabled])',
+    'textarea:not([disabled])',
+    'summary',
+    '[tabindex]:not([tabindex="-1"])',
+    '[contenteditable="true"]',
+  ].join(',')
+  const dialogOpeners = new WeakMap()
+  let lastExternalFocus = null
+
+  function isVisible(node) {
+    if (!(node instanceof Element) || !node.isConnected) return false
+    if (node.closest('[hidden]')) return false
+    const style = getComputedStyle(node)
+    return style.display !== 'none' && style.visibility !== 'hidden'
+  }
+
+  function visibleDialogs() {
+    return [...document.querySelectorAll(DIALOG_SELECTOR)].filter(isVisible)
+  }
+
+  function activeDialog() {
+    return visibleDialogs().at(-1) || null
+  }
+
+  function focusableIn(root) {
+    return [...root.querySelectorAll(FOCUSABLE_SELECTOR)]
+      .filter(isVisible)
+      .filter((node) => !node.closest('[inert]'))
+  }
+
+  function rememberExternalFocus(target) {
+    if (!(target instanceof Element)) return
+    if (target === document.body || target === document.documentElement) return
+    lastExternalFocus = target
+  }
+
+  function restoreFocus(target) {
+    if (!(target instanceof HTMLElement) || !target.isConnected) return
+    if (target.closest('[hidden], [inert]')) return
+    if (activeDialog()) return
+    target.focus({ preventScroll: true })
+  }
+
+  function showDialog(dialog) {
+    if (!dialogOpeners.has(dialog)) {
+      dialogOpeners.set(dialog, lastExternalFocus)
+    }
+    if (dialog.contains(document.activeElement)) return
+    const focusFirst = () => {
+      if (!dialog.isConnected || !isVisible(dialog) || dialog.contains(document.activeElement)) return
+      const first = focusableIn(dialog)[0]
+      if (first) {
+        first.focus({ preventScroll: true })
+        return
+      }
+      if (!dialog.hasAttribute('tabindex')) dialog.setAttribute('tabindex', '-1')
+      dialog.focus({ preventScroll: true })
+    }
+    requestAnimationFrame(focusFirst)
+    setTimeout(focusFirst, 60)
+  }
+
+  function closeDialog(dialog) {
+    const opener = dialogOpeners.get(dialog)
+    if (!opener) return
+    dialogOpeners.delete(dialog)
+    if (!visibleDialogs().length) requestAnimationFrame(() => restoreFocus(opener))
+  }
+
+  function dialogsInside(node) {
+    if (!(node instanceof Element)) return []
+    const list = []
+    if (node.matches(DIALOG_SELECTOR)) list.push(node)
+    list.push(...node.querySelectorAll(DIALOG_SELECTOR))
+    return list
+  }
+
+  function syncDialogs(node) {
+    for (const dialog of dialogsInside(node)) {
+      if (isVisible(dialog)) showDialog(dialog)
+      else closeDialog(dialog)
+    }
+  }
+
+  document.addEventListener(
+    'focusin',
+    (event) => {
+      const dialog = activeDialog()
+      const target = event.target
+      if (!(target instanceof Element)) return
+      if (dialog && dialog.contains(target)) return
+      rememberExternalFocus(target)
+    },
+    true,
+  )
+
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Tab' || event.defaultPrevented) return
+    if (event.altKey || event.ctrlKey || event.metaKey) return
+    const dialog = activeDialog()
+    if (!dialog) return
+    if (dialog.closest('[data-eab-focus-owned="1"]')) return
+    const items = focusableIn(dialog)
+    if (!items.length) {
+      event.preventDefault()
+      if (!dialog.hasAttribute('tabindex')) dialog.setAttribute('tabindex', '-1')
+      dialog.focus({ preventScroll: true })
+      return
+    }
+    const first = items[0]
+    const last = items[items.length - 1]
+    const current = document.activeElement
+    if (!dialog.contains(current)) {
+      event.preventDefault()
+      ;(event.shiftKey ? last : first).focus({ preventScroll: true })
+      return
+    }
+    if (event.shiftKey && (current === first || current === dialog)) {
+      event.preventDefault()
+      last.focus({ preventScroll: true })
+      return
+    }
+    if (!event.shiftKey && (current === last || current === dialog)) {
+      event.preventDefault()
+      first.focus({ preventScroll: true })
+    }
+  })
+
+  /* 图标按钮的可读名称：只有符号/无文字且有 data-tip/title 时补 aria-label。 */
+  function labelIconButton(node) {
+    if (!(node instanceof HTMLElement)) return
+    if (!node.matches('button, a[href]')) return
+    if (node.getAttribute('aria-label') || node.getAttribute('aria-labelledby')) return
+    const text = (node.innerText || '').replace(/\s+/g, '')
+    const onlySymbol = !text || /^[×✕✖⋯·•⌄⌃‹›<>←→↑↓+\-—–]+$/.test(text)
+    if (!onlySymbol) return
+    const tip = node.getAttribute('data-tip') || node.getAttribute('title') || ''
+    const symbolLabel = /^[×✕✖]$/.test(text) ? '关闭' : /^⋯$/.test(text) ? '更多操作' : ''
+    const label = (tip || symbolLabel).replace(/\s+/g, ' ').trim().slice(0, 80)
+    if (label) node.setAttribute('aria-label', label)
+  }
+
+  function labelIconButtons(root) {
+    if (!(root instanceof Element)) return
+    labelIconButton(root)
+    root.querySelectorAll('button, a[href]').forEach(labelIconButton)
+  }
+
+  /* 标准 tablist：Tab 只停在当前页签，左右/上下箭头切换，Home/End 到首尾。 */
+  function visibleTabs(list) {
+    return [...list.querySelectorAll('[role="tab"]')].filter(isVisible)
+  }
+
+  function syncTabStops(list) {
+    const tabs = visibleTabs(list)
+    if (tabs.length < 2) return
+    const active =
+      tabs.find((tab) => tab.getAttribute('aria-selected') === 'true') ||
+      tabs.find((tab) => tab.classList.contains('is-active')) ||
+      tabs[0]
+    tabs.forEach((tab) => {
+      tab.tabIndex = tab === active ? 0 : -1
+    })
+  }
+
+  function setupTablist(list) {
+    if (!(list instanceof Element) || !list.matches('[role="tablist"]')) return
+    syncTabStops(list)
+    if (list.dataset.eabTabsReady === '1') return
+    list.dataset.eabTabsReady = '1'
+    list.addEventListener('keydown', (event) => {
+      if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key)) return
+      const tabs = visibleTabs(list)
+      if (tabs.length < 2) return
+      event.preventDefault()
+      const current = tabs.indexOf(document.activeElement)
+      let next = current < 0 ? tabs.findIndex((tab) => tab.tabIndex === 0) : current
+      if (next < 0) next = 0
+      if (event.key === 'Home') next = 0
+      else if (event.key === 'End') next = tabs.length - 1
+      else if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') next = (next - 1 + tabs.length) % tabs.length
+      else next = (next + 1) % tabs.length
+      const tab = tabs[next]
+      tab.focus({ preventScroll: true })
+      tab.click()
+    })
+    list.addEventListener('click', (event) => {
+      if (event.target instanceof Element && event.target.closest('[role="tab"]')) syncTabStops(list)
+    })
+  }
+
+  function setupTablists(root) {
+    if (!(root instanceof Element)) return
+    if (root.matches('[role="tablist"]')) setupTablist(root)
+    root.querySelectorAll('[role="tablist"]').forEach(setupTablist)
+    const owner = root.closest?.('[role="tablist"]')
+    if (owner) setupTablist(owner)
+  }
+
+  function initFocusGuard() {
+    if (!document.body) {
+      document.addEventListener('DOMContentLoaded', initFocusGuard, { once: true })
+      return
+    }
+    labelIconButtons(document.body)
+    setupTablists(document.body)
+    syncDialogs(document.body)
+    const observer = new MutationObserver((records) => {
+      for (const record of records) {
+        if (record.type === 'childList') {
+          record.addedNodes.forEach((node) => {
+            syncDialogs(node)
+            labelIconButtons(node)
+            setupTablists(node)
+          })
+          record.removedNodes.forEach((node) => {
+            dialogsInside(node).forEach(closeDialog)
+          })
+          continue
+        }
+        if (record.target instanceof Element && record.target.matches(DIALOG_SELECTOR)) {
+          if (isVisible(record.target)) showDialog(record.target)
+          else closeDialog(record.target)
+          continue
+        }
+        if (record.target instanceof Element) {
+          dialogsInside(record.target).forEach((dialog) => {
+            if (isVisible(dialog)) showDialog(dialog)
+            else closeDialog(dialog)
+          })
+        }
+        requestAnimationFrame(() => setupTablists(document.body))
+      }
+    })
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['hidden', 'aria-hidden'],
+    })
+  }
+
+  window.EABFocus = {
+    activeDialog,
+    focusableIn,
+    labelIconButtons,
+    version: '2026.11.25',
+  }
+
   window.EABOverlay = {
     toast,
     popconfirm,
     closeAll,
     version: '2026.11.24',
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initFocusGuard, { once: true })
+  } else {
+    initFocusGuard()
   }
 })()

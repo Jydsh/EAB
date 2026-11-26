@@ -846,6 +846,78 @@ describe('钉钉 A2UI 卡片可见性与底色', () => {
     })
   })
 
+  it('澄清选项不再截断为 4 个，12 个模型全部生成可点击整行', () => {
+    const options = Array.from({ length: 12 }, (_, index) => ({
+      id: `option-${index + 1}`,
+      label: `模型 ${index + 1}`,
+      description: index === 0 ? '当前正在使用' : '',
+    }))
+    const messages = buildDingTalkA2UIUpdateMessages(
+      's',
+      {
+        answer: '要切换到哪个模型？',
+        reasoning: '',
+        tools: [],
+        thinkingDone: true,
+        clarify: {
+          sessionId: 'chat_test',
+          question: '要切换到哪个模型？',
+          kind: 'single',
+          allowCustom: false,
+          options,
+        },
+      },
+      false,
+    )
+    expect((updateValues(messages)['/clarify'] as { options: unknown[] }).options).toHaveLength(12)
+    expect(uiValues(messages)).toMatchObject({
+      '/ui/showClarifyOption11': true,
+      '/ui/showClarifyOption12': false,
+    })
+    const components = finalComponentsOf(messages)
+    expect(components.find((component) => component.id === 'clarifyOptions')).toMatchObject({
+      children: Array.from({ length: 12 }, (_, index) => `clarifyOptionCard${index}`),
+    })
+    expect(components.find((component) => component.id === 'clarifyOptionCard11')).toMatchObject({
+      visible: { path: '/ui/showClarifyOption11' },
+      action: {
+        event: {
+          name: 'eab_clarify_select',
+          context: {
+            optionId: 'option-12',
+            optionLabel: '模型 12',
+          },
+        },
+      },
+    })
+  })
+
+  it('异常多的澄清选项仍按 24 个防御上限截断', () => {
+    const messages = buildDingTalkA2UIUpdateMessages(
+      's',
+      {
+        answer: '选项很多',
+        reasoning: '',
+        tools: [],
+        thinkingDone: true,
+        clarify: {
+          sessionId: 'chat_test',
+          question: '选项很多',
+          kind: 'single',
+          options: Array.from({ length: 26 }, (_, index) => ({
+            id: `option-${index + 1}`,
+            label: `选项 ${index + 1}`,
+          })),
+        },
+      },
+      false,
+    )
+    expect((updateValues(messages)['/clarify'] as { options: unknown[] }).options).toHaveLength(24)
+    const components = finalComponentsOf(messages)
+    expect(components.find((component) => component.id === 'clarifyOptionCard23')).toBeDefined()
+    expect(components.find((component) => component.id === 'clarifyOptionCard24')).toBeUndefined()
+  })
+
   it('题组卡的正文不再重复渲染当前题干，题干只由澄清区展示', () => {
     const question = '第 1 题 · 判断题（安全）\n\n检修作业中，发现设备出现异常，应立即停止作业并报告。'
     const messages = buildDingTalkA2UIUpdateMessages(

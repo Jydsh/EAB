@@ -932,7 +932,7 @@ function cloneClarifyState(clarify: DingTalkClarifyState): DingTalkClarifyState 
   const questions = (clarify.questions ?? []).map((question) => ({
     id: String(question.id ?? ''),
     question: String(question.question ?? ''),
-    options: (question.options ?? []).slice(0, 4).map((option) => ({
+    options: (question.options ?? []).slice(0, MAX_CLARIFY_CARD_OPTIONS).map((option) => ({
       id: String(option.id ?? ''),
       label: String(option.label ?? ''),
       description: String(option.description ?? ''),
@@ -953,7 +953,7 @@ function cloneClarifyState(clarify: DingTalkClarifyState): DingTalkClarifyState 
   return {
     sessionId: String(clarify.sessionId ?? ''),
     question: String(clarify.question ?? ''),
-    options: (clarify.options ?? []).slice(0, 4).map((option) => ({
+    options: (clarify.options ?? []).slice(0, MAX_CLARIFY_CARD_OPTIONS).map((option) => ({
       id: String(option.id ?? ''),
       label: String(option.label ?? ''),
       description: String(option.description ?? ''),
@@ -1298,6 +1298,8 @@ interface DingTalkRichCardData {
     showClarifyDesc1: boolean
     showClarifyDesc2: boolean
     showClarifyDesc3: boolean
+    [key: `showClarifyOption${number}`]: boolean
+    [key: `showClarifyDesc${number}`]: boolean
     [key: `showAnswerUnit${number}`]: boolean
     [key: `showAnswerText${number}`]: boolean
     [key: `showAnswerTable${number}`]: boolean
@@ -1321,6 +1323,15 @@ interface DingTalkAnswerBlock {
  * 多张表，6 块会把后面的表降级成纯文本；这里留足 24 块，覆盖 9 张表左右的回答。
  */
 const MAX_ANSWER_BLOCKS = 24
+/**
+ * 澄清/模型选择卡的单卡选项上限。
+ *
+ * A2UI 的澄清选项是 Column 里的整行 Row，没有平台层面的“4 个按钮”限制；
+ * 这里按 24 个放开，让 /model 能列出当前员工全部可见模型，避免只显示前 4 个。
+ * 仍保留上限是为了防止异常模型目录生成过大的组件树，而不是产品交互限制。
+ */
+const MAX_CLARIFY_CARD_OPTIONS = 24
+type ClarifyOptionUiKey = `showClarifyOption${number}` | `showClarifyDesc${number}`
 
 function plainTableCell(value: string): string {
   return String(value ?? '')
@@ -1685,7 +1696,7 @@ function richCardData(
   const clarifyStep = Math.max(1, Math.trunc(Number(state.clarify?.step) || 1))
   const clarifySelected = (clarifyAnswer?.selected ?? []).map((value) => String(value))
   const clarifyText = String(clarifyAnswer?.text ?? '')
-  const clarifyOptions = (currentClarify?.options ?? state.clarify?.options ?? []).slice(0, 4).map((option) => {
+  const clarifyOptions = (currentClarify?.options ?? state.clarify?.options ?? []).slice(0, MAX_CLARIFY_CARD_OPTIONS).map((option) => {
     const id = String(option.id ?? '')
     const label = String(option.label ?? '')
     const description = String(option.description ?? '')
@@ -1709,7 +1720,11 @@ function richCardData(
     : hasClarify && clarifyStep > 1
       ? `第 ${clarifyStep} 题`
       : ''
-  const clarifyUi: Record<string, boolean> = {}
+  const clarifyUi = {} as Record<ClarifyOptionUiKey, boolean>
+  for (let index = 0; index < MAX_CLARIFY_CARD_OPTIONS; index += 1) {
+    clarifyUi[`showClarifyOption${index}`] = false
+    clarifyUi[`showClarifyDesc${index}`] = false
+  }
   clarifyOptions.forEach((option, optionIndex) => {
     clarifyUi[`showClarifyOption${optionIndex}`] = clarifyKind === 'single' && Boolean(option.label)
     clarifyUi[`showClarifyDesc${optionIndex}`] = clarifyKind === 'single' && Boolean(option.description)
@@ -1855,11 +1870,12 @@ function richCardComponents(
   const clarifyFieldKey = `${clarifyIndex}_${clarifyStep}`
   const clarifyBlankId = (index: number) => `clarifyBlank_${clarifyFieldKey}_${index}`
   const clarifyTextFieldId = `clarifyTextField_${clarifyFieldKey}`
-  const clarifyOptions = (currentClarify?.options ?? clarify?.options ?? []).slice(0, 4).map((option) => ({
+  const clarifyOptions = (currentClarify?.options ?? clarify?.options ?? []).slice(0, MAX_CLARIFY_CARD_OPTIONS).map((option) => ({
     id: String(option.id ?? ''),
     label: String(option.label ?? ''),
     description: String(option.description ?? ''),
   }))
+  const clarifyOptionIndexes = Array.from({ length: clarifyOptions.length }, (_, index) => index)
   const clarifyIsBatch = clarifyTotal > 1
   // 只让“进行中”的标题做流光，不碰面板内容、正文和终态；
   // 这样 iOS 上是标题文字扫光，不会整块面板一起动。
@@ -2097,7 +2113,7 @@ function richCardComponents(
     {
       id: 'clarifyOptions',
       component: 'Column',
-      children: ['clarifyOptionCard0', 'clarifyOptionCard1', 'clarifyOptionCard2', 'clarifyOptionCard3'],
+      children: clarifyOptionIndexes.map((index) => `clarifyOptionCard${index}`),
       gap: 8,
       visible: { path: '/ui/showClarifySingle' },
     },
@@ -2232,7 +2248,7 @@ function richCardComponents(
     // 用带背景/圆角的 Row 承载整个选项，并把 action 挂在 Row 上：
     // 这样整行都能点，不再只有文字宽度的小按钮；Button 的 child 只能放 Text，
     // 无法同时放标题和描述，也不方便做整行卡片。
-    ...[0, 1, 2, 3].map((index) => ({
+    ...clarifyOptionIndexes.map((index) => ({
       id: `clarifyOptionCard${index}`,
       component: 'Row',
       children: [`clarifyOptionBody${index}`, `clarifyOptionArrow${index}`],
@@ -2274,7 +2290,7 @@ function richCardComponents(
             },
       },
     })),
-    ...[0, 1, 2, 3].map((index) => ({
+    ...clarifyOptionIndexes.map((index) => ({
       id: `clarifyOptionBody${index}`,
       component: 'Column',
       gap: 3,
@@ -2282,7 +2298,7 @@ function richCardComponents(
       children: [`clarifyOptionLabel${index}`, `clarifyOptionDesc${index}`],
       visible: { path: `/ui/showClarifyOption${index}` },
     })),
-    ...[0, 1, 2, 3].flatMap((index) => [
+    ...clarifyOptionIndexes.flatMap((index) => [
       {
         id: `clarifyOptionLabel${index}`,
         component: 'Text',

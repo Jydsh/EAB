@@ -4,6 +4,86 @@
 >
 > 本文只做方案，不改代码。涉及“本地目录”的部分按当前单机部署前提设计：EAB 服务端与用户要访问的本地目录在同一台 Windows 电脑上。
 
+## 0. 实施状态（2026-11-26）
+
+一期“本地项目工作区”已落地并通过真实 UI 验收，实际命名和范围与下文原计划有以下差异：
+
+| 项 | 已实现 | 说明 |
+|---|---|---|
+| 资源命名 | **本地项目（local project）** | 对外 UI 与接口统一用“项目”，表仍为 `user_local_spaces` |
+| REST 接口 | `GET/POST/PATCH/DELETE /api/local-projects`、`GET /api/local-projects/:id/files?path=&depth=&limit=` | 计划里的 `/local-spaces`、`entries/file/download/move/mkdir` 未采用 |
+| Agent 文件工具 | `project.list`、`project.read`、`project.search`、`project.write`、`project.edit`、`project.delete` | 计划里的 `local.move/mkdir` 未实现；`project.delete` 只删文件、不递归删目录，且逐次审批 |
+| 会话字段 | `chat_sessions.space_kind='local'` + `space_id` | 与计划一致 |
+| 权限 | `local-space:read/write` | 与计划一致 |
+| 桌面目录选择 | Electron `eab:pick-directory` 选目录；创建项目弹窗含项目名称、工作目录、云端资源、项目指令 | 仅桌面端可创建；Web 端不显示创建入口 |
+| 桌面文件桥 | `POST /register`、`GET /jobs`（20s 长轮询）、`POST /jobs/:id/result`、`GET /status`；任务经桥转发到桌面端 | 服务端可远端部署；项目文件永远只在桌面电脑上 |
+| 桌面浏览器桥 | 同一桥新增 `kind='browser'` 任务；`POST /api/desktop/bridge/tabs` 上报标签 | Agent 可读取/操作右侧 Electron 原生标签；仅桌面端可用，Web 端 409 |
+| 会话类型 | `chat_sessions.project_mode='chat' \| 'task'` | 项目下直接挂会话；侧栏不再显示「对话 / 工作任务」分组标签，任务用图标区分；项目主页已不再是入口 |
+| 命令执行 | 桌面设备绑定的项目本期不开放 `project.exec`（403） | 需要构建/测试时由用户在桌面终端手动执行 |
+| 未落地 | 云端资源内容读取、配额统计、文件下载、图片预览、目录移动/删除 | 云端资源本期只做选择、存储和提示词清单 |
+| 验证 | `typecheck` 通过；项目/系统提示/审批 20+ 用例通过；真实桌面端完成弹窗选目录创建、项目侧栏纯文件夹、输入区项目归属选择与刷新恢复、项目内会话菜单、项目操作菜单与桥任务 | 2026-11-26 侧栏与项目选择器验收 |
+
+> 2026-11-26 二期已改为“桌面端绑定真实目录 + 服务端文件桥代理”：本地项目只能在桌面端创建，服务端可与桌面不在同一台电脑；文件读写经 `register / jobs / result` 长轮询任务转发到桌面端执行。服务端只保存 deviceId、显示路径、真实路径快照、项目指令和云端资源清单，不直接访问客户端磁盘。详见 §0.1。
+
+### 0.1 二期落地：桌面项目与文件桥（2026-11-26）
+
+- 创建入口只在桌面端：侧栏顶部固定导航「更多 → 新建项目」，弹窗字段为项目名称、工作目录、云端资源、项目指令；Web 端隐藏项目区，`POST /api/local-projects` 强制要求 `x-eab-desktop:1` 和在线 `deviceId`。
+- 服务端不直接访问客户端路径：创建时经桥 `describeRoot` 让桌面端校验目录并回传 `rootRealPath`；文件 `list/read/search/write/edit/delete` 全部转成桥任务，任务只带相对路径。
+- 桌面端保存 `projectId -> root` 绑定表；`local-files.mjs` 做绝对路径、可写、危险根、越界、符号链接逃逸和敏感文件闸。
+- 项目侧栏收口为一个可折叠的本地文件夹：项目行只保留文件夹图标、名称和更多菜单，不显示展开/收起箭头，也不显示“桌面端在线/离线”；项目下直接挂对话，任务用图标区分，不再显示「对话 / 工作任务」分组标签或绿色“＋ 新建对话”按钮；项目文件树不再占用左侧栏。
+- 项目内会话复用普通会话菜单，支持悬浮“⋯”和右键重命名、删除；新建项目或新建项目会话后只展开项目，不再进入项目主页。项目操作菜单保留新建对话、新建工作任务、打开文件夹、重命名、移除项目。
+- 输入区「云空间」chip 改为豆包式项目选择器：列出当前账号的项目，当前项目行显示根路径、桌面在线状态和勾选，底部为“创建新项目（仅桌面端）/ 不使用项目”；选中项目直接通过 `PATCH /api/chat/sessions/:id/space` 把已有会话归属到该项目，未落库的新对话只更新前端待发送状态；选择“不使用项目”退回云空间。网页端不显示创建入口，但可选择同账号的远程项目。
+- 项目主页代码暂留但不再是任何入口；`#project-pane` 保持隐藏，后续可单独清理。
+- 删除项目只解除项目绑定，不删除磁盘文件；项目内的对话和工作任务会一并逻辑删除；桌面端离线时项目可见，文件操作仍会返回桌面桥错误提示。
+- 项目文件删除：新增 `project.delete`，只允许删除文件，不递归删除目录；命令经桌面桥 `delete` 在客户端执行，服务端本机项目走同语义卸载；`mode='read_only'` 时拒绝，工具风险等级为 `irreversible`，每次执行都要审批。
+- 2026-11-26 第十三轮把同一个桌面桥扩成通用任务桥，新增 `kind='browser'`：Agent 的 `browser` 工具按 `x-eab-desktop-device` 路由到桌面主进程，对右侧 `WebContentsView` 执行 `list/open/activate/snapshot/click/type/scroll/navigate/back/forward/reload/screenshot/close`，不再只看服务端 Playwright 页面。
+- 标签持久化：主进程把 `{ownerUserId,activePageId,tabs}` 写入 `desktop-config.json` 的 `browserTabs` 并上报服务端；聊天页刷新只隐藏原生视图、不销毁，应用重启按 URL 恢复；前端另用 `localStorage` 键 `eab.chat.browserTabs.v1:<person.id>` 保存草稿与布局。换账号或换服务器会清空旧标签，避免登录态泄露。
+- 审批：`list/snapshot/screenshot/scroll/activate` 免审批；`open/navigate/click/type/back/forward/reload/close` 记 `tool:browser` 并逐次审批。
+- 验收：真实桌面端完成刷新保留标签、重启恢复 3 个标签、Agent `snapshot` 读取 example.com、`click` 跳到 IANA、`type` 写入百度搜索框且不提交、`open` 新标签并同步前端标签栏、`screenshot` 在云空间生成 44 KB PNG、`close` 关闭标签后前端剩 3 个、`reload` 重新读出 IANA 页面、`back/forward` 调用成功（单页历史未产生位移）；`typecheck`、26 个项目/提示用例、13 个审批用例通过。
+- 未验收：真实长页滚动位移、多页历史下的 `back/forward` 跳转；失效 URL 可能恢复成空白标签。
+- 桌面端本地项目读取修复（2026-11-26）：旧安装包 `preload.cjs` 缺 `getDesktopInfo/pickDirectory/bindProject`，`main.mjs` 缺 `local-files`，导致新建项目弹窗一直停在“正在读取桌面设备…”。根因是桌面包过旧，不是 Windows 权限。构建脚本 `build-win-portable.mjs` 又漏拷 `main.mjs` 启动即 import 的 `local-files.mjs`，已补齐。修复后安装版能读取设备、点击“添加本地文件夹”可打开 Windows 原生目录对话框、`bindProject/unbindProject` 可用；新建的便携包和 Setup 均已重建，版本仍 `2026.11.24`，同版本旧客户端需手动重装。
+- 豆包式桌面侧栏第一轮（2026-11-26）：顶部固定导航改为「新工作任务 / 新对话 / 工作台 / 定时任务 / 插件·技能·伙伴 / 云空间 / 更多」，中部滚动区直接显示项目及项目会话，再显示「最近」独立会话；底部收成紧凑账号 + 设置。云空间不再常驻侧栏文件列表，点击顶部「云空间」打开右侧面板；原上下拖拽条、配额角标、项目/新建项目标题和新建按钮从侧栏 DOM 移除。新增 `#schedule-modal` 展示员工端 `GET /api/schedules` 并支持暂停/恢复/刷新；新增「更多」浮层承载新建项目、打开云空间、管理后台（按权限显隐）和设置。会话行统一加线性图标，任务用方框笔图标。详见总体架构 23.3.7.7。
+
+### 0.2 第二轮：入口即时性、顶部信息卡与网页远程项目（2026-11-26）
+
+- **新会话即时入列**：`openNewSession(mode)` 统一“新工作任务 / 新对话”。云空间也会 `POST /api/chat/sessions` 创建 `projectMode=task|chat` 的会话并立即 `loadSessions()`，不再等首条消息；已有同类型空白会话时只回输入框，不叠加空记录。`newSession({create:false})` 保留给启动引导和定时任务草稿。**该做法已在 §0.5 收口：改为首条用户消息后才落库，空会话不进列表。**
+- **头部语义拆开**：标题显示会话自己的 `title`；项目名单独放 `#chat-project-badge`，任务徽标只由 `projectMode='task'` 控制，网页端另有 `#chat-device-badge`。首条消息发送后若标题仍是“新对话 / 新工作任务”，前端用首条文字更新标题，服务端 `ensureSession()` 对默认标题补一次自动命名，用户手改过的标题不覆盖。
+- **个人信息卡上移**：`#side-user` 从 `.side-bottom` 移到品牌区下方、固定导航上方，展示头像、姓名、职位、公司/部门、在线点；底部只保留“设置”。
+- **空项目不占位**：`renderLocalProjects()` 在 `projects.length === 0` 时整块收起 `#side-projects`，不再渲染“还没有项目”空态。
+- **网页端远程项目**：`GET /api/chat/sessions` 增加 `projectDeviceOnline`，历史接口和 `PATCH .../space` 返回 `project.deviceOnline`。网页“最近”混排 `spaceKind='local'` 会话并显示项目名与设备状态；打开会话恢复项目、项目指令和 `spaceId`；输入区项目选择器可切换远程项目，网页端不显示创建入口。文件操作带 `deviceId` 经桌面桥转发，因此另一台电脑只要项目所属桌面在线，就能继续对话并读写该项目文件。
+- **验收**：临时远程项目会话在网页“最近”第 3 条出现，头部显示“远程项目验收 / 远程项目任务 / 工作任务 / 桌面在线”；在该会话发送“只回复 OK，不要调用任何工具”后返回 `OK`（Kilo Auto Free，70.1 tok/s）；依次新建工作任务、新对话后列表立即增至 4、5 条，任务徽标只在任务会话出现；清理后回到 2 条且项目区隐藏。`node --check chat.js`、`typecheck` 通过，`chat-session-space-route.test.ts` 2 条、`local-project.test.ts` 5 条通过。
+- **边界**：远程项目只开放文件读写，不开 `project.exec` / 远程 shell；构建、测试、启动服务仍要在项目所属电脑本地执行。REST 直接创建的项目不会自动进入桌面桥 `bindings`，正常从桌面端“新建项目”创建才会绑定；旧安装包仍是 `2026.11.24`，需重装或更新后才能看到本轮 UI。
+
+### 0.3 第三轮：项目入口与标签页会话隔离（2026-11-26）
+
+- **云空间降为平台能力**：云空间本来就所有对话都有，不再做成输入区可选项。输入区绿色“云空间”胶囊改为豆包式中性灰“项目”胶囊：线性文件夹图标 + “项目” + 右箭头；未归项目显示“项目”，归项目显示项目名。菜单仍是项目列表 / 创建新项目 / 不使用项目，其中“不使用项目”只表示不挂项目，不表示失去云空间。
+- **标签页按会话隔离**：`eab.chat.browserTabs.v2:<userId>:session:<sessionId>` 一对话一份快照，无会话用 `:draft`。切会话前先保存旧会话，再清空当前标签并通知桌面主进程切到新会话；只恢复目标会话自己的标签和工作台状态。没开过标签的对话，右侧网页栏整块隐藏；开过的切回时恢复。
+- **修复恢复竞态**：`browserTabsLoadedScope` 用 `null` 表示未恢复，`persistBrowserTabsNow()` 在恢复完成前拒绝写入。否则切会话时“先清空、后恢复”的 250ms 防抖会把该会话快照写成空数组，导致切回来没有标签。
+- **桌面主进程**：新增 `activeChatSessionId`、按会话的 `browserTabsPayload`、`setActiveChatSession`、v2 持久化 `{version:2, ownerUserId, activeSessionId, sessions}`；每个原生页带 `sessionId`，打开、关闭、激活、bounds、show、Agent browser 动作都校验当前会话。IPC 新增 `eab:set-browser-session`，`eab:browser-tabs` 接收 `(userId, sessionId)`。
+- **服务端桥**：`browserTabsBySession` 按会话存快照，每设备保留最近 40 个对话；系统提示和桌面 `browserCall` 都传 `sessionId`。
+- **验收**：网页端“项目 >”胶囊显示正常；A 会话开标签后切到“钉钉·对话”右侧隐藏、标签为空，切回 A 恢复“新标签页”，刷新后仍恢复。桌面端源码启动实测草稿标签、真实 `example.com` 原生标签、切走隐藏、切回恢复、重启恢复全部成立；`node --check` 三文件、`typecheck` 通过，`desktop-bridge-tabs` 2 条 + 会话归属 2 条 + 本地项目 5 条共 9 条通过。
+- **边界**：云空间默认空间与文件工具未改；桌面原生视图是隐藏保活，未做销毁/LRU；旧全局标签只在空草稿兜底；已删除会话的 v2 快照不会自动清理；安装包仍为 `2026.11.24`，打包版需重建后才能看到本轮 UI 与主进程逻辑。
+
+### 0.4 第四轮：云空间头部、右键与拖拽上传（2026-11-26）
+
+- **头部补齐**：右侧云空间面板顶部增加“新建文件夹”“上传”，和刷新按钮并列；新建与上传都作用于当前面包屑目录。上传改用独立的 `#cloud-upload-input`，不再借用侧栏工作区的文件选择。
+- **右键菜单**：文件和文件夹行都在 `contextmenu` 打开 `#file-menu`，并带 `dataset.scope='cloud'`。文件项为打开、下载、重命名、编辑、发送到钉钉、删除；文件夹项为打开、新建子文件夹、新建文件、重命名、删除；共享文件夹的整体重命名/删除限制不变。
+- **空白区菜单**：`#cloud-pane-body` 空白处右键出现“新建文件夹 / 新建文件 / 上传文件”，标题显示“云空间 / 当前路径”；新建文件弹窗先检查同名文件和文件夹，避免覆盖。
+- **拖拽上传**：云空间面板监听 `dragenter/dragover/dragleave/drop`，只接受外部文件（排除侧栏文件拖拽的自定义 MIME）；拖入时显示“松开即可上传 + 目标目录”虚线遮罩，`drop` 后按当前目录逐个上传，并复用现有上传进度条。
+- **状态同步**：`loadWorkspaceFiles()` 和 workspace 删除事件都会同步重渲染云空间面板；文件夹重命名/删除同时修正 `state.cloudSpacePath`，避免停留在已失效路径。
+- **验收**：网页端新建文件夹、进入空目录新建文件、文件选择上传、拖拽上传、文件重命名/删除、文件夹删除全部通过；桌面端源码调试端口实测头部按钮、文件右键、空白右键和拖拽上传一致，验收后恢复普通启动。`node --check`、`typecheck`、15 条相关测试通过。
+- **边界**：拖拽不递归上传文件夹；单文件上限沿用 50 MB 面板限制；新建文件只创建空文件；安装包仍为 `2026.11.24`，未重建。
+
+### 0.5 第五轮：空草稿与会话标签收口（2026-11-26）
+
+- **空对话不进列表**：`enterBlankDraft()` 只在内存建草稿，`state.sessionId=null`；首条消息由 `ensureSession()` 落库并取第一句话前 24 字作标题。`GET /api/chat/sessions` 在路由层批量检查 `chat_messages` 是否存在 `role='user'`，无用户消息的预创建会话/历史空会话不返回；SQLite 与 PostgreSQL 读源共用该过滤。
+- **空草稿切走即丢弃**：`persistBrowserTabsNow()` 对空 scope 直接返回并删除 `:draft` 快照；`restoreBrowserTabsForSession('')` 不读旧 draft，清空标签。切到工作台、切到正式会话、换新任务类型都调用 `discardDraftSession()`，关闭草稿中的真实网页页并清掉云空间/文件/团队/审批。
+- **标签按会话常驻**：v2 快照增加 `shell`，除网页标签外保存 `cloudSpaceOpen/cloudSpacePath/teamTabOpen/permOpen/filePreviewId/filePreviewSplit/workbenchTab/workbenchCollapsed/workbenchSplit`。`switchBrowserTabScope()` 先保存旧正式会话，再清空并恢复目标会话；文件按 id 异步重开，云空间按路径刷新，审批重新加载。
+- **首条消息收养标签**：`meta` 返回新 sessionId 后，`adoptBrowserTabsForSession()` 把空 scope 的网页标签、云空间、文件等整体归入正式会话；桌面端新增 `eab:adopt-browser-session`，只收养列出的 `sessionId=''` 原生标签。
+- **文件不再自动关**：`setChatMode()` 去掉无条件 `closeWorkspaceFile()`，切对话/切模式不会自动关文件标签；只有用户点 × 关闭。
+- **验收**：空 POST 会话 `visible=false`；草稿开标签后左侧列表不变、`:draft` 为空；A/B 的云空间、文件、网页标签互不串且切回恢复；刷新恢复云空间；首条消息后标题、列表、scope 与标签归属一致。`node --check`、`typecheck`、16 条相关测试通过。
+- **边界**：旧空会话只隐藏不删除；草稿发送后立即切走的竞态未覆盖；桌面安装包仍为 `2026.11.24`，需重建后才能获得新 IPC。桌面打包版本已改为读取项目根 `package.json`，与网页 `/api/health` 同源，不再单独取 `packages/desktop/package.json`。
+
 ## 1. 需求理解
 
 ### 1.1 云空间
@@ -29,6 +109,7 @@
 - 在输入框上方/输入区工具条增加一个“空间”浮动按钮或 chip。
 - 点击后可选择云空间、本地空间，或跳去绑定新的本地目录。
 - 当前选择要跟会话绑定：重新打开该会话时，尽量恢复上次使用的空间。
+- **2026-11-26 调整**：云空间是所有对话自带能力，不再作为用户可选空间。输入区入口改为豆包式“项目”胶囊，只负责选择当前对话归属的项目；具体见 `0.3`。
 
 ### 1.4 一期不做的事
 
@@ -58,7 +139,7 @@
 ### 2.2 关键约束
 
 1. **浏览器不能直接给出任意本地绝对路径。** `<input type="file" webkitdirectory>` 只能拿到相对文件名，拿不到 `D:\Projects\demo` 这种根路径，也不能让 Agent 直接写回原目录。
-2. 当前 EAB 是单机本地部署，Node 服务进程本身就在用户电脑上，所以可以让服务端直接读写用户指定目录。若以后服务端搬到远程服务器，这个前提就不成立。
+2. 当前 EAB 是单机本地部署，Node 服务进程本身就在用户电脑上，所以一期可以让服务端直接读写用户指定目录。**二期已改为桌面文件桥，不再依赖这个前提**，服务端可在远端。
 3. 本地目录的读写权限比云空间敏感，必须做路径边界、软链接、敏感文件、大小和审计限制。
 4. 云空间的 `/api/workspace/*` 和 `workspace_files` 是已有稳定契约，本次只改显示名，不改内部表名和接口名，避免历史数据/调用方返工。
 
@@ -445,18 +526,18 @@ EAB 服务端跑在用户本机，`D:\AI kaifa\EAB` 这类路径对 Node 进程�
 - 本机 `pnpm dev` / 本机安装包；
 - 单公司本地部署。
 
-### 9.2 远程部署（后续）
+### 9.2 远程部署（二期已落地）
 
-如果 8787 服务端在机房/云主机，用户浏览器在另一台电脑，服务端无法直接访问用户磁盘。需要增加“EAB 本地连接器”：
+如果 8787 服务端在机房/云主机，用户浏览器在另一台电脑，服务端无法直接访问用户磁盘。二期已经用桌面文件桥实现这条链路：
 
 ```text
-浏览器 → EAB 服务端 → 本地连接器（用户电脑）→ 本地目录
+浏览器 → EAB 服务端 → EAB 桌面端（安装在那台电脑上）→ 本地目录
 ```
 
-- 连接器负责实际的 `fs` 操作；
-- 服务端只转发已签名的空间/文件请求；
-- 连接器需用户安装并授权目录；
-- 本期不做，但数据表保留 `connector_id` / `host_kind` 扩展位，避免以后改表。
+- 桌面端负责实际的 `fs` 操作，服务端只转发任务，不直接访问客户端磁盘；
+- 服务端按 `companyId + userId + deviceId` 隔离设备，任务只带相对路径；
+- 桌面端需用户安装、登录并在线；项目只能在桌面端创建；
+- 数据表用 `user_local_spaces.device_id` 标识设备，不再需要单独的 `connector_id`。
 
 ## 10. 分阶段实施
 

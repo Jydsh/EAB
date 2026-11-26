@@ -156,7 +156,7 @@ describe('渠道机器人对话内模型切换', () => {
     })
   })
 
-  it('模型引导卡最多 4 个选项，3 个模型时保留自动选择', () => {
+  it('模型引导卡按可见模型全量展示，3 个模型时保留自动选择', () => {
     const picker = planChannelModelPicker(
       [
         { id: 'plugin:our-free-model:kilo-auto%2Ffree', name: 'Kilo Auto Free' },
@@ -177,17 +177,29 @@ describe('渠道机器人对话内模型切换', () => {
     expect(picker?.options[3].id).toBe('option-auto')
   })
 
-  it('模型超过 4 个时只展示前 4 个，并提示用 /model 切换其余模型', () => {
+  it('模型超过 4 个时不再截断，全量返回当前可见模型', () => {
     const picker = planChannelModelPicker(models, null)
     expect(picker?.omitted).toBe(0)
     expect(picker?.options).toHaveLength(4)
     expect(picker?.options.some((option) => option.id === 'option-auto')).toBe(false)
 
     const many = [...models, secretModel]
-    const truncated = planChannelModelPicker(many, null)
-    expect(truncated?.omitted).toBe(1)
-    expect(truncated?.options).toHaveLength(4)
-    expect(truncated?.question).toContain('/model')
+    const all = planChannelModelPicker(many, null)
+    expect(all?.omitted).toBe(0)
+    expect(all?.options).toHaveLength(5)
+    expect(all?.question).not.toContain('/model')
+    expect(all?.options.at(-1)?.label).toBe(secretModel.name)
+  })
+
+  it('异常大的模型目录仍有 24 个防御上限，超出部分提示用 /model 切换', () => {
+    const huge = Array.from({ length: 26 }, (_, index) => ({
+      id: `model-${index + 1}`,
+      name: `模型 ${index + 1}`,
+    }))
+    const picker = planChannelModelPicker(huge, null)
+    expect(picker?.options).toHaveLength(24)
+    expect(picker?.omitted).toBe(2)
+    expect(picker?.question).toContain('/model')
   })
 
   it('模型卡不会重复同一个模型，空列表不建卡', () => {

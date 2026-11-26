@@ -33,9 +33,14 @@ import { findActivePerson } from './session.js'
 import { registerAdminRoutes } from './routes/admin.js'
 import { registerAuthRoutes } from './routes/auth.js'
 import { registerBootRoutes } from './routes/boot.js'
+import { registerBrowserRoutes } from './routes/browser.js'
+import { registerDesktopDownloadRoutes } from './routes/desktop-download.js'
 import { registerChannelRoutes } from './routes/channel.js'
 import { registerChatRoutes } from './routes/chat.js'
 import { registerContentRoutes } from './routes/content.js'
+import { registerLocalProjectRoutes } from './routes/local-projects.js'
+import { registerDesktopBridgeRoutes } from './routes/desktop-bridge.js'
+import { createDesktopBridgeHub } from './desktop-bridge.js'
 import { registerConsoleRoutes } from './routes/console.js'
 import { registerConsoleDatabaseRoutes } from './routes/console-databases.js'
 import { registerConsoleMcpRoutes } from './routes/console-mcp.js'
@@ -110,7 +115,7 @@ function isPath(path: string, prefixes: string[]): boolean {
 function installSurfaceGuard(app: FastifyInstance, surface: AppSurface): void {
   if (surface === 'all') return
   const consoleOnly = ['/admin', '/admin.html', '/app.js', '/api/console']
-  const chatOnly = ['/chat', '/chat.html', '/chat.js', '/chat.css', '/api/chat', '/api/content', '/api/memories', '/api/workspace', '/api/schedules', '/api/auth']
+  const chatOnly = ['/chat', '/chat.html', '/chat.js', '/chat.css', '/api/chat', '/api/browser', '/api/content', '/api/memories', '/api/workspace', '/api/local-projects', '/api/desktop/bridge', '/api/schedules', '/api/auth']
   app.addHook('onRequest', async (req, reply) => {
     const path = (req.raw.url ?? '').split('?')[0] ?? ''
     if (surface === 'chat' && isPath(path, consoleOnly)) {
@@ -342,6 +347,10 @@ export function buildApp(deps: ServerDeps, surface: AppSurface = 'all'): Fastify
           companyMaxConcurrent: deps.config.chatCompanyMaxConcurrent ?? deps.config.chatMaxConcurrent ?? 8,
         }),
       }
+  // 文件桥是进程内长轮询调度器；缺省时自动创建，测试可直接注入替身。
+  const bridgeDeps: ServerDeps = runtimeDeps.desktopBridge
+    ? runtimeDeps
+    : { ...runtimeDeps, desktopBridge: createDesktopBridgeHub() }
 
   app.addHook('onSend', async (req: FastifyRequest, reply: FastifyReply) => {
     reply.header('x-eab-version', readVersion())
@@ -475,7 +484,9 @@ export function buildApp(deps: ServerDeps, surface: AppSurface = 'all'): Fastify
   registerOrgSyncRoutes(app, deps)
   registerPermissionRoutes(app, deps)
   registerKbRoutes(app, deps)
-  registerChatRoutes(app, runtimeDeps)
+  registerChatRoutes(app, bridgeDeps)
+  registerLocalProjectRoutes(app, bridgeDeps)
+  registerDesktopBridgeRoutes(app, bridgeDeps)
   if (surface !== 'console') registerContentRoutes(app, runtimeDeps)
   registerMemoryRoutes(app, deps)
   registerPluginRoutes(app, deps)
@@ -493,7 +504,9 @@ export function buildApp(deps: ServerDeps, surface: AppSurface = 'all'): Fastify
   registerUpdateRoutes(app, deps)
   registerScheduleRoutes(app, deps)
   registerWorkspaceRoutes(app, deps)
-  registerToolRoutes(app, deps)
+  registerBrowserRoutes(app, deps)
+  registerDesktopDownloadRoutes(app, deps)
+  registerToolRoutes(app, bridgeDeps)
 
   app.setNotFoundHandler((req, reply) => {
     const err = new EabError(EC.NOT_FOUND, `接口不存在: ${req.method} ${req.url}`)

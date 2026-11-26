@@ -152,12 +152,17 @@ const state = {
   quotaScope: 'company',
   quotaMonth: '',
   taskStatus: 'all',
+  /** 任务中心客户端分页：刷新、操作后保留当前页 */
+  taskPage: 0,
   /** 任务中心当前在右侧抽屉里打开的任务 id（用于列表行高亮） */
   taskOpen: '',
   databaseStatus: 'all',
   databaseDrivers: [],
   deptFilter: null,
   memberSearch: '',
+  /** 成员表客户端分页：服务端一次返回全部成员，翻页只切当前可见行 */
+  memberPage: 0,
+  memberPageSize: 10,
   collapsed: new Set(),
   kb: null,
   selectedCollection: null,
@@ -3728,14 +3733,14 @@ async function loadDocs(collectionId, options = {}) {
 
     host.innerHTML = `
       <section class="panel kb-summary-panel">
-        <div class="panel-head">
-          <div>
+        <div class="panel-head kb-summary-head">
+          <div class="kb-summary-copy">
             <h2>${esc(data.collection.name)} ${sourceBadge}</h2>
             <span class="hint">${esc(MODE_LABEL[data.collection.aclMode] || data.collection.aclMode)} · ${
               pagination.total
             } 篇文档${external ? '' : ` · ${totalChunks} 个切片`}</span>
           </div>
-          <div class="head-actions">
+          <div class="head-actions kb-summary-actions">
             ${
               sourceKind !== 'local'
                 ? '<button class="btn" type="button" id="kb-test">测试连接</button>'
@@ -4134,21 +4139,20 @@ async function loadMembers(container) {
         const identityRows = identities
           .map((identity) => {
             const label = CHANNEL_SOURCE_LABEL[identity.provider] || identity.provider
-            return `<div class="desc mono"><span class="pill">${esc(label)}</span> ${esc(label)} ID：${esc(identity.externalUserId)}</div>`
+            return `<div class="desc mono member-identity-row"><span class="pill">${esc(label)}</span> ${esc(label)} ID：${esc(identity.externalUserId)}</div>`
           })
           .join('')
         const titleLine = m.title ? `<div class="desc">${esc(m.title)}</div>` : ''
         return `<tr data-member-search="${esc(searchTextOf(m))}">
         <td class="name-cell"><strong>${esc(m.name)}</strong>${titleLine}${identityRows}</td>
-        <td>${esc(m.deptName)}<div class="desc mono">${esc(m.deptPath)}</div></td>
+        <td>${esc(m.deptName)}<div class="desc mono member-dept-path">${esc(m.deptPath)}</div></td>
         <td>${(m.roles || []).map((r) => `<span class="chip accent">${esc(ROLE_LABEL[r.code] || r.code)}</span>`).join(' ')}</td>
         <td><span class="pill ${m.status === 'active' ? 'ok' : m.status === 'disabled' ? 'warn' : 'danger'}">${esc(
           STATUS_LABEL[m.status] || m.status,
         )}</span></td>
         <td><div class="row-actions member-actions">
           <button class="row-action primary" type="button" data-member-roles="${esc(m.id)}" title="角色权限">角色权限</button>
-          <button class="row-action" type="button" data-member-edit="${esc(m.id)}" title="编辑成员资料">编辑</button>
-          <button class="row-action icon" type="button" data-member-more="${esc(m.id)}" title="更多操作" aria-haspopup="true">⋯</button>
+          <button class="row-action icon" type="button" data-member-more="${esc(m.id)}" title="更多操作" aria-label="更多成员操作" aria-haspopup="true">⋯</button>
         </div></td>
       </tr>`
       })
@@ -4178,23 +4182,34 @@ async function loadMembers(container) {
       action: 'member-clear-search',
     })
 
+    const deptScopeLabel = deptLabel(state.deptFilter)
+    const initialSearch = state.memberSearch.trim()
+
     host.innerHTML = `
       <section class="panel">
-        <div class="panel-head">
+        <div class="panel-head table-panel-head">
           <div><h2>${esc(deptLabel(state.deptFilter))} · 成员</h2><span class="hint" id="member-count">${members.length} 人</span></div>
-          <div class="panel-actions">
-            <label class="inline-field"><span>部门</span><select id="org-dept-filter">${deptSelectOptions(
+          <div class="panel-actions member-panel-actions">
+            <label class="inline-field member-dept-field"><span>部门</span><select id="org-dept-filter">${deptSelectOptions(
               state.deptFilter,
             )}</select></label>
             <label class="inline-field member-search-field"><span>搜索</span><input id="member-search" type="search" placeholder="姓名 / 工号 / 部门 / 角色" value="${esc(
               state.memberSearch,
             )}" autocomplete="off" /></label>
-            <button class="btn sm ghost" type="button" id="member-export">导出名单</button>
-            <button class="btn sm ghost" type="button" id="member-bulk">批量授权</button>
-            <button class="btn sm primary" type="button" id="member-new">＋ 新建成员</button>
+            <div class="member-action-group">
+              <button class="btn sm ghost" type="button" id="member-export">导出名单</button>
+              <button class="btn sm ghost" type="button" id="member-bulk">批量授权</button>
+              <button class="btn sm primary" type="button" id="member-new">＋ 新建成员</button>
+            </div>
           </div>
         </div>
-        <div class="table-scroll">
+        <div class="table-summary" id="member-summary">
+          <span class="summary-label">筛选</span>
+          <span class="summary-chip"><span>部门</span><strong title="${esc(deptScopeLabel)}">${esc(deptScopeLabel)}</strong></span>
+          <span class="summary-chip" id="member-search-chip"${initialSearch ? '' : ' hidden'}><span>搜索</span><strong id="member-search-value" title="${esc(initialSearch)}">${esc(initialSearch)}</strong></span>
+          <button class="summary-reset" type="button" id="member-search-clear"${initialSearch ? '' : ' hidden'}>清除搜索</button>
+        </div>
+        <div class="table-scroll member-table-scroll" id="member-table-scroll">
           <table class="data member-table">
             <thead><tr><th>姓名</th><th>部门</th><th>角色</th><th>状态</th><th>操作</th></tr></thead>
             <tbody>${
@@ -4204,6 +4219,7 @@ async function loadMembers(container) {
             }</tbody>
           </table>
         </div>
+        <div id="member-pager"></div>
       </section>
       <section class="panel" id="dept-policy">
         <div class="panel-head"><div><h2>部门权限概览</h2><span class="hint">${esc(deptLabel(state.deptFilter))}</span></div></div>
@@ -4239,32 +4255,69 @@ async function loadMembers(container) {
     const applyMemberSearch = () => {
       const query = state.memberSearch.trim().toLowerCase()
       const tokens = query.split(/\s+/).filter(Boolean)
-      let shown = 0
-      for (const row of host.querySelectorAll('.member-table tbody tr[data-member-search]')) {
+      const dataRows = [...host.querySelectorAll('.member-table tbody tr[data-member-search]')]
+      const matchedRows = []
+      for (const row of dataRows) {
         const haystack = row.dataset.memberSearch || ''
         const matched = tokens.length === 0 || tokens.every((token) => haystack.includes(token))
-        row.hidden = !matched
-        if (matched) shown += 1
+        if (matched) matchedRows.push(row)
+        else row.hidden = true
       }
+      const totalMatched = matchedRows.length
+      const pageSize = state.memberPageSize
+      const totalPages = Math.max(1, Math.ceil(totalMatched / pageSize))
+      state.memberPage = Math.min(Math.max(Number(state.memberPage) || 0, 0), totalPages - 1)
+      const start = state.memberPage * pageSize
+      const end = start + pageSize
+      matchedRows.forEach((row, index) => {
+        row.hidden = index < start || index >= end
+      })
       const count = host.querySelector('#member-count')
-      if (count) count.textContent = tokens.length ? `${shown} / ${members.length} 人` : `${members.length} 人`
+      if (count) count.textContent = tokens.length ? `${totalMatched} / ${members.length} 人` : `${members.length} 人`
+      const searchChip = host.querySelector('#member-search-chip')
+      const searchValue = host.querySelector('#member-search-value')
+      const searchClear = host.querySelector('#member-search-clear')
+      if (searchChip && searchValue && searchClear) {
+        searchChip.hidden = tokens.length === 0
+        searchClear.hidden = tokens.length === 0
+        searchValue.textContent = tokens.length ? state.memberSearch.trim() : ''
+        searchValue.title = searchValue.textContent
+      }
       const empty = host.querySelector('#member-search-empty')
-      if (empty) empty.hidden = !tokens.length || shown > 0
+      if (empty) empty.hidden = !tokens.length || totalMatched > 0
+      const pager = host.querySelector('#member-pager')
+      if (pager) {
+        pager.innerHTML = totalMatched > 0 ? pagerHtml(totalMatched, state.memberPage, pageSize) : ''
+        bindPager(pager, (next) => {
+          state.memberPage = next
+          applyMemberSearch()
+          host.querySelector('#member-table-scroll')?.scrollTo({ top: 0 })
+        })
+      }
     }
     const searchInput = host.querySelector('#member-search')
     if (searchInput) {
       searchInput.addEventListener('input', () => {
         state.memberSearch = searchInput.value
+        state.memberPage = 0
         applyMemberSearch()
       })
       applyMemberSearch()
     }
+    host.querySelector('#member-search-clear')?.addEventListener('click', () => {
+      state.memberSearch = ''
+      state.memberPage = 0
+      if (searchInput) searchInput.value = ''
+      applyMemberSearch()
+      searchInput?.focus()
+    })
 
     const deptSelect = host.querySelector('#org-dept-filter')
     if (deptSelect) {
       deptSelect.addEventListener('change', () => {
         const option = deptSelect.selectedOptions[0]
         state.deptFilter = option?.dataset.path || null
+        state.memberPage = 0
         loadMembers(host)
       })
     }
@@ -4284,12 +4337,6 @@ async function loadMembers(container) {
       button.addEventListener('click', () => {
         const member = data.members.find((item) => item.id === button.dataset.memberOverride)
         if (member) openOverrideModal(member)
-      })
-    })
-    host.querySelectorAll('[data-member-edit]').forEach((button) => {
-      button.addEventListener('click', () => {
-        const member = data.members.find((item) => item.id === button.dataset.memberEdit)
-        if (member) openMemberEdit(member)
       })
     })
     host.querySelectorAll('[data-member-password]').forEach((button) => {
@@ -4324,6 +4371,7 @@ async function loadMembers(container) {
     host.querySelector('[data-state-action="member-new"]')?.addEventListener('click', () => newMember?.click())
     host.querySelector('[data-state-action="member-clear-search"]')?.addEventListener('click', () => {
       state.memberSearch = ''
+      state.memberPage = 0
       if (searchInput) searchInput.value = ''
       applyMemberSearch()
       searchInput?.focus()
@@ -4357,6 +4405,7 @@ function showMemberMenu(member, host, x, y) {
   el.id = 'member-menu'
   el.innerHTML = `
     <div class="ctx-menu-head">${esc(member.name)} · 成员操作</div>
+    <button type="button" data-member-act="edit">编辑资料</button>
     <button type="button" data-member-act="quota">存储配额</button>
     <button type="button" data-member-act="override">临时授权</button>
     <button type="button" data-member-act="password">重置密码</button>
@@ -4364,7 +4413,7 @@ function showMemberMenu(member, host, x, y) {
     <button type="button" data-member-act="delete" class="danger">删除成员</button>`
   document.body.appendChild(el)
   const width = 188
-  const height = 238
+  const height = 274
   el.style.left = `${Math.min(x, window.innerWidth - width - 8)}px`
   el.style.top = `${Math.min(y, window.innerHeight - height - 8)}px`
   memberMenu = el
@@ -4372,6 +4421,7 @@ function showMemberMenu(member, host, x, y) {
     const action = event.target.closest('[data-member-act]')?.dataset.memberAct
     if (!action) return
     hideMemberMenu()
+    if (action === 'edit') openMemberEdit(member)
     if (action === 'quota') openMemberQuota(member, host)
     if (action === 'override') openOverrideModal(member)
     if (action === 'password') openMemberPassword(member)
@@ -11303,7 +11353,7 @@ function confirmCard({
       tone === 'warning'
         ? '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 9v4m0 3h.01M10.29 3.86 1.82 17a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/></svg>'
         : '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2m-9 0 1 13h8l1-13M10 11v5m4-5v5"/></svg>'
-    overlay.innerHTML = `<div class="confirm-card${toneClass}" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
+    overlay.innerHTML = `<div class="confirm-card${toneClass}" data-eab-focus-owned="1" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
       <div class="confirm-head">
         <span class="confirm-icon">${icon}</span>
         <div class="confirm-copy">
@@ -11385,9 +11435,21 @@ function modelModal(html) {
   const overlay = document.createElement('div')
   overlay.className = 'modal-overlay'
   overlay.innerHTML = `<div class="modal">${html}</div>`
+  const modal = overlay.querySelector('.modal')
+  if (modal) {
+    modal.setAttribute('role', 'dialog')
+    modal.setAttribute('aria-modal', 'true')
+    const title = modal.querySelector('.modal-head h3, .modal-head h2, h3, h2')?.textContent?.trim()
+    modal.setAttribute('aria-label', title || '对话框')
+  }
   document.body.appendChild(overlay)
   overlay.addEventListener('click', (event) => {
     if (event.target === overlay) overlay.remove()
+  })
+  overlay.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return
+    if (document.querySelector('[role="dialog"][aria-modal="true"][data-eab-focus-owned="1"]')) return
+    overlay.remove()
   })
   return overlay
 }
@@ -11514,9 +11576,6 @@ async function openAgentRunDetail(runId) {
     <div class="agent-run-empty">正在读取运行详情…</div>
   </div>`)
   overlay.classList.add('agent-run-detail-overlay')
-  overlay.setAttribute('role', 'dialog')
-  overlay.setAttribute('aria-modal', 'true')
-  overlay.setAttribute('aria-label', '运行详情')
   overlay.querySelector('.modal').classList.add('agent-run-detail-modal')
   const body = overlay.querySelector('#agent-run-detail-body')
   let generation = 0
@@ -12995,19 +13054,24 @@ async function loadModels() {
             ? `${provider.apiKeyEnv} ${provider.keyPresent ? '已注入' : '未注入'}`
             : ''
           const providerKeyState = provider.apiKeyEnv ? (provider.keyPresent ? '已注入' : '未注入') : ''
+          const providerKeyBrief = pluginChannel
+            ? '密钥 · 插件托管'
+            : provider.apiKeyEnv
+              ? `密钥 · ${provider.keyPresent ? '已注入' : '未注入'}`
+              : '密钥 · 不需要'
           return `<tr>
-            <td>
+            <td class="col-provider-name">
               <div class="models-provider-cell">
                 <span class="models-provider-mark">${esc((provider.name || '?').slice(0, 1).toUpperCase())}</span>
                 <div><strong>${esc(provider.name)}</strong><div class="desc">${
                   pluginChannel
                     ? `插件 ${esc(provider.pluginId || '')}<br>${esc(provider.route || '')}`
                     : esc(provider.kindLabel)
-                }</div></div>
+                }</div><div class="desc models-key-brief">${esc(providerKeyBrief)}</div></div>
               </div>
             </td>
-            <td class="mono models-endpoint">${esc(pluginChannel ? '随插件宿主注入' : (provider.baseUrl || '—'))}</td>
-            <td class="models-secret-cell">${
+            <td class="mono models-endpoint col-provider-endpoint">${esc(pluginChannel ? '随插件宿主注入' : (provider.baseUrl || '—'))}</td>
+            <td class="models-secret-cell col-provider-key">${
               pluginChannel
                 ? '<span class="pill ok"><span class="models-secret-text">插件托管</span></span>'
                 : provider.apiKeyEnv
@@ -13016,11 +13080,11 @@ async function loadModels() {
                     )}</span><span class="models-secret-state">${providerKeyState}</span></span>`
                   : '<span class="muted">不需要</span>'
             }</td>
-            <td><span class="models-count">${provider.models}</span></td>
-            <td><span class="pill ${pluginChannel ? 'ok' : (provider.status === 'active' ? 'ok' : 'warn')}">${
+            <td class="col-provider-model"><span class="models-count">${provider.models}</span></td>
+            <td class="col-provider-status"><span class="pill ${pluginChannel ? 'ok' : (provider.status === 'active' ? 'ok' : 'warn')}">${
               pluginChannel ? '已注入' : (provider.status === 'active' ? '启用' : '停用')
             }</span></td>
-            <td class="model-actions">
+            <td class="model-actions col-provider-actions">
               ${
                 pluginChannel
                   ? `<button class="btn sm model-action-btn" type="button" data-refresh-plugin-channel="${esc(provider.id)}" data-tip="让插件重新探测模型并刷新目录。" aria-label="刷新插件模型">${modelActionIcon('discover')}</button>`
@@ -13105,7 +13169,7 @@ async function loadModels() {
         </div>
         <div class="models-table-scroll">
           <table class="data models-provider-table">
-            <thead><tr><th>供应商</th><th>端点</th><th>密钥</th><th>模型</th><th>状态</th><th>操作</th></tr></thead>
+            <thead><tr><th class="col-provider-name">供应商</th><th class="col-provider-endpoint">端点</th><th class="col-provider-key">密钥</th><th class="col-provider-model">模型</th><th class="col-provider-status">状态</th><th class="col-provider-actions">操作</th></tr></thead>
             <tbody>${providerRows}</tbody>
           </table>
         </div>
@@ -13139,7 +13203,7 @@ async function loadModels() {
         <div class="models-filter-bar" id="model-filter"></div>
         <div class="models-table-scroll models-catalog-scroll">
           <table class="data models-table">
-            <thead><tr><th>模型</th><th>供应商</th><th>类型</th><th>上下文 / 输出</th><th>能力 / 擅长场景</th><th>可见角色</th><th>状态</th><th>操作</th></tr></thead>
+            <thead><tr><th class="col-model-name">模型</th><th class="col-model-provider">供应商</th><th class="col-model-type">类型</th><th class="col-model-context">上下文 / 输出</th><th class="col-model-capabilities">能力 / 擅长场景</th><th class="col-model-roles">可见角色</th><th class="col-model-status">状态</th><th class="col-model-actions">操作</th></tr></thead>
             <tbody id="model-rows"></tbody>
           </table>
         </div>
@@ -13246,26 +13310,26 @@ async function loadModels() {
             (model.roles.length > 2 ? `<span class="models-role-more">+${model.roles.length - 2}</span>` : '')
         : '<span class="muted">未授权角色</span>'
       return `<tr data-model-row="${esc(model.id)}">
-        <td>
+        <td class="col-model-name">
           <div class="models-model-cell">
             <strong>${esc(model.name)}${readonly ? '<span class="models-source-tag">插件</span>' : ''}${thinkTag}</strong>
             <span class="mono models-model-key">${esc(model.modelKey)}</span>
           </div>
         </td>
-        <td>
+        <td class="col-model-provider">
           <span class="models-provider-pill">${esc(model.providerName)}</span>
           <div class="desc">${readonly ? '插件注入 · 角色可配置' : `${esc(model.providerKind)} · 优先级 ${model.priority}`}</div>
         </td>
-        <td><span class="models-type-badge ${type.tone}">${esc(type.label)}</span>${
+        <td class="col-model-type"><span class="models-type-badge ${type.tone}">${esc(type.label)}</span>${
           model.endpointKind && model.endpointKind !== 'chat'
             ? `<div class="desc">${esc(endpointKindLabel(model.endpointKind))}端点</div>`
             : ''
         }</td>
-        <td class="models-limits-cell">
+        <td class="models-limits-cell col-model-context">
           <span class="mono">${contextLabel}</span>
           <div class="desc">输出 ${outputLabel}</div>
         </td>
-        <td>
+        <td class="col-model-capabilities">
           ${
             readonly
               ? `<span class="models-caps-readonly" title="能力由插件定义，插件更新后自动变化">${capabilityChipsHtml(model.tags, 3)}</span>`
@@ -13274,9 +13338,9 @@ async function loadModels() {
           </button>`
           }
         </td>
-        <td class="models-roles-cell">${roleChips}</td>
-        <td><span class="pill ${model.enabled ? 'ok' : 'warn'}">${model.enabled ? '启用' : '停用'}</span></td>
-        <td class="model-actions">
+        <td class="models-roles-cell col-model-roles">${roleChips}</td>
+        <td class="col-model-status"><span class="pill ${model.enabled ? 'ok' : 'warn'}">${model.enabled ? '启用' : '停用'}</span></td>
+        <td class="model-actions col-model-actions">
           ${
             readonly
               ? `<button class="btn sm model-action-btn" type="button" data-edit-plugin-model="${esc(model.id)}" data-tip="配置这个插件模型可见的角色；上下文与输出由插件声明。" aria-label="配置插件模型可见角色">${modelActionIcon('edit')}</button>`
@@ -14432,7 +14496,7 @@ async function loadSys() {
           <div><span>SQLITE_BUSY</span><strong>${fmtNum(concurrency?.sqlite?.busyTotal ?? 0)}<span class="desc" style="display:block;font-weight:400">写事务抢锁次数</span></strong></div>
         </div>
         <div class="table-scroll" style="margin-top:14px">
-          <table class="data">
+          <table class="data sys-models-table">
             <thead><tr><th>模型</th><th>正在生成</th><th>排队</th></tr></thead>
             <tbody>
               ${(cap?.models ?? []).length
@@ -14442,7 +14506,7 @@ async function loadSys() {
           </table>
         </div>
         <div class="table-scroll" style="margin-top:12px">
-          <table class="data">
+          <table class="data sys-tools-table">
             <thead><tr><th>工具</th><th>正在执行</th><th>排队</th><th>累计次数</th><th>失败</th><th>平均耗时</th></tr></thead>
             <tbody>
               ${toolRows.length
@@ -14462,7 +14526,7 @@ async function loadSys() {
           </div>
         </div>
         <div class="table-scroll">
-          <table class="data">
+          <table class="data sys-inflight-table">
             <thead><tr><th>工具</th><th>入口</th><th>已耗时</th></tr></thead>
             <tbody>
               ${inflightRows.length
@@ -14481,7 +14545,7 @@ async function loadSys() {
           </div>
         </div>
         <div class="table-scroll">
-          <table class="data">
+          <table class="data sys-latency-table">
             <thead><tr><th>工具</th><th>调用</th><th>p50</th><th>p95</th><th>最长</th><th>超阈值</th></tr></thead>
             <tbody>
               ${(toolMetrics?.tools ?? []).length
@@ -14523,7 +14587,7 @@ async function loadSys() {
             <span class="pill">${agentCards.length} 张</span>
           </div>
           <div class="table-scroll">
-            <table class="data">
+            <table class="data agent-cards-table">
               <thead><tr><th>岗位 / 名称</th><th>来源</th><th>技能</th><th>工具</th><th>限制</th><th>健康</th></tr></thead>
               <tbody>
                 ${agentCards.length
@@ -14532,7 +14596,7 @@ async function loadSys() {
                     const healthClass = card.health === 'healthy' ? 'ok' : card.health === 'offline' ? 'warn' : 'warn'
                     const sourceText = card.source === 'company'
                       ? (card.overridden ? '公司覆盖' : '公司新增')
-                      : '代码内置'
+                      : '内置'
                     const limits = card.limits ?? {}
                     const limitText = [
                       limits.maxRounds ? `${limits.maxRounds} 轮` : '',
@@ -17142,13 +17206,30 @@ function pagerHtml(total, page, size) {
   const totalPages = Math.max(1, Math.ceil(Number(total) / size))
   if (totalPages <= 1) return ''
   const current = Math.min(Math.max(page, 0), totalPages - 1)
+  const start = Number(total) > 0 ? current * size + 1 : 0
+  const end = Math.min(Number(total), (current + 1) * size)
   return `<div class="pager">
-    <span class="pager-info">共 ${Number(total)} 条 · 第 ${current + 1}/${totalPages} 页</span>
+    <span class="pager-info">第 ${start}–${end} 条 · 共 ${Number(total)} 条 · 第 ${current + 1}/${totalPages} 页</span>
     <div class="pager-actions">
       <button class="btn sm ghost" type="button" data-page="${current - 1}" ${current === 0 ? 'disabled' : ''}>上一页</button>
       <button class="btn sm ghost" type="button" data-page="${current + 1}" ${current >= totalPages - 1 ? 'disabled' : ''}>下一页</button>
     </div>
   </div>`
+}
+
+/** 列表页的筛选摘要：把“当前看的是哪一档数据”放在表头上方，清空动作同时保留。 */
+function tableSummaryHtml(items = [], reset = null) {
+  const chips = items
+    .filter((item) => item && item.value !== undefined && item.value !== null && String(item.value) !== '')
+    .map(
+      (item) =>
+        `<span class="summary-chip"><span>${esc(item.label)}</span><strong title="${esc(item.value)}">${esc(item.value)}</strong></span>`,
+    )
+    .join('')
+  const resetButton = reset
+    ? `<button class="summary-reset" type="button" data-summary-action="${esc(reset.action)}">${esc(reset.label)}</button>`
+    : ''
+  return `<div class="table-summary"><span class="summary-label">筛选</span>${chips || '<span class="summary-empty">未设置筛选</span>'}${resetButton}</div>`
 }
 
 function bindPager(container, onPage) {
@@ -17814,12 +17895,21 @@ function openQuotaEdit(row) {
   })
 }
 
+const AUDIT_ACTION_LABEL = {
+  'org.member': '成员变更',
+  'org.dept': '部门变更',
+  chat: '对话',
+  auth: '登录',
+  plugin: '插件',
+}
+
 async function loadAudit(action = '', page = 0) {
   const view = $('#view')
+  const actionLabel = action ? AUDIT_ACTION_LABEL[action] || action : '全部操作'
   renderLoading(view, '正在读取审计记录', { skeleton: true, rows: 6 })
   setSide(`
     <div class="side-head audit-side-head"><span class="side-title">审计</span>${hintBadge('审计说明', '审计表 append-only + 哈希链；列表/导出可配置读 PG 镜像，哈希链校验始终读 SQLite 权威链。')}</div>
-    <div class="side-list">
+    <div class="side-list audit-filter-list">
       <button class="side-item ${action ? '' : 'is-active'}" type="button" id="audit-all">全部操作</button>
       <button class="side-item ${action === 'org.member' ? 'is-active' : ''}" type="button" data-audit-action="org.member">成员变更</button>
       <button class="side-item ${action === 'org.dept' ? 'is-active' : ''}" type="button" data-audit-action="org.dept">部门变更</button>
@@ -17837,12 +17927,14 @@ async function loadAudit(action = '', page = 0) {
     const rows = data.items
       .map((item) => {
         const [date, time] = fmtDateTime(item.createdAt).split(' ')
+        const actor = item.actorUserId || '—'
+        const actorShort = actor.length > 22 ? `${actor.slice(0, 12)}…${actor.slice(-7)}` : actor
         return `<tr>
           <td class="mono">#${item.seq}</td>
           <td><span class="chip">${esc(item.action)}</span><div class="desc">${esc(item.resourceType || '')} ${esc(item.resourceId || '')}</div></td>
-          <td>${esc(item.actorUserId || '—')}</td>
+          <td class="audit-actor" title="${esc(actor)}">${esc(actorShort)}</td>
           <td><span class="pill ${item.result === 'success' ? 'ok' : 'warn'}">${esc(item.result)}</span></td>
-          <td class="mono">${esc(item.ip || '—')}</td>
+          <td class="mono col-audit-ip">${esc(item.ip || '—')}</td>
           <td class="mono" title="${esc(item.createdAt)}"><span>${esc(date || '—')}</span><div class="desc">${esc(time || '')}</div></td>
         </tr>`
       })
@@ -17858,10 +17950,10 @@ async function loadAudit(action = '', page = 0) {
     })
     view.innerHTML = `
       <section class="panel">
-        <div class="panel-head">
+        <div class="panel-head table-panel-head">
           <div class="panel-title-line">
             <h2>操作记录</h2>
-            <span class="hint">${data.total} 条${action ? ` · 过滤 ${esc(action)}` : ''}</span>
+            <span class="hint">${data.total} 条 · ${esc(actionLabel)}</span>
             <span class="hint">数据源 ${data.source === 'postgres' ? 'PostgreSQL' : 'SQLite'}${data.fallbackReason ? ` · ${esc(data.fallbackReason)}` : ''}</span>
             ${hintBadge('导出说明', '导出包含最近 10 万条；更早的记录不会写入导出文件。')}
           </div>
@@ -17871,16 +17963,21 @@ async function loadAudit(action = '', page = 0) {
             <button class="btn sm ghost" type="button" id="audit-json">导出 JSON</button>
           </div>
         </div>
+        ${tableSummaryHtml(
+          [{ label: '动作', value: actionLabel }],
+          action ? { label: '查看全部', action: 'audit-clear-filter' } : null,
+        )}
         <div id="audit-verify-result"></div>
         <div class="table-scroll">
-          <table class="data">
-            <thead><tr><th>序号</th><th>动作</th><th>操作者</th><th>结果</th><th>IP</th><th>时间</th></tr></thead>
+          <table class="data audit-table">
+            <thead><tr><th>序号</th><th>动作</th><th>操作者</th><th>结果</th><th class="col-audit-ip">IP</th><th>时间</th></tr></thead>
             <tbody>${rows || `<tr><td colspan="6">${emptyAuditState}</td></tr>`}</tbody>
           </table>
         </div>
         ${pagerHtml(data.total, page, AUDIT_PAGE_SIZE)}
       </section>`
     bindPager(view, (next) => loadAudit(action, next))
+    view.querySelector('[data-summary-action="audit-clear-filter"]')?.addEventListener('click', () => loadAudit('', 0))
     view.querySelector('[data-state-action^="audit-"]')?.addEventListener('click', (event) => {
       const value = event.currentTarget.dataset.stateAction
       if (value === 'audit-all') loadAudit('', 0)
@@ -18241,10 +18338,13 @@ function webServiceEntries(settings) {
 
   const networkHosts = Array.isArray(browserNetwork.allowedHosts) ? browserNetwork.allowedHosts : []
   const hostCount = networkHosts.length
+  const allPrivate = networkHosts.includes('*')
   const networkStatusKey = browserNetwork.enabled ? (browserNetwork.missingHosts ? 'error' : 'ok') : 'untested'
-  const networkTarget = hostCount
-    ? `${networkHosts.slice(0, 2).join('、')}${hostCount > 2 ? ` 等 ${hostCount} 个` : ''}`
-    : '未配置目标'
+  const networkTarget = allPrivate
+    ? '全部企业局域网'
+    : hostCount
+      ? `${networkHosts.slice(0, 2).join('、')}${hostCount > 2 ? ` 等 ${hostCount} 个` : ''}`
+      : '未配置目标'
   const networkStateLabel = browserNetwork.missingHosts
     ? '名单为空'
     : browserNetwork.enabled
@@ -18259,9 +18359,9 @@ function webServiceEntries(settings) {
       <button class="link-btn db-title" type="button" data-net-edit="network">内网访问</button>
       <div class="desc"><span class="db-kind-badge">访问策略</span><span class="db-category-tag db-category-policy">浏览器准入</span></div>
     </td>
-    <td><span class="mono db-target">${esc(networkTarget)}</span><div class="desc">${hostCount ? `共 ${hostCount} 个域名 / IP` : '默认拒绝所有内网目标'}</div></td>
+    <td><span class="mono db-target">${esc(networkTarget)}</span><div class="desc">${allPrivate ? 'RFC1918 / CGNAT / IPv6 ULA' : hostCount ? `共 ${hostCount} 个域名 / IP` : '默认拒绝所有内网目标'}</div></td>
     <td class="db-transport"><span class="desc">内网 80 / 443</span></td>
-    <td><span class="pill ${networkTone}">${esc(networkStateLabel)}</span><div class="desc">${browserNetwork.missingHosts ? '开关已打开但名单为空，未生效' : browserNetwork.enabled ? '只放行名单内目标' : '公共网站不受影响'}</div></td>
+    <td><span class="pill ${networkTone}">${esc(networkStateLabel)}</span><div class="desc">${browserNetwork.missingHosts ? '开关已打开但名单为空，未生效' : browserNetwork.enabled ? (allPrivate ? '不含本机、链路本地和云元数据' : '只放行名单内目标') : '公共网站不受影响'}</div></td>
     <td class="desc">${networkLast}</td>
     <td><div class="row-actions"><button class="link-btn" type="button" data-net-edit="network">配置</button></div></td>
   </tr>`
@@ -18290,7 +18390,8 @@ function connectionWizardServiceCards(settings) {
   const { webSearch, browserCap, browserNetwork } = webServicesDefaults(settings)
   const searchProvider = WEB_SEARCH_PROVIDER_LABEL[webSearch.provider] ?? webSearch.provider
   const browserReady = browserCap.enabled && browserCap.available
-  const networkHosts = Array.isArray(browserNetwork.allowedHosts) ? browserNetwork.allowedHosts.length : 0
+  const networkHosts = Array.isArray(browserNetwork.allowedHosts) ? browserNetwork.allowedHosts : []
+  const allPrivate = networkHosts.includes('*')
   const cards = [
     {
       id: 'search',
@@ -18316,7 +18417,7 @@ function connectionWizardServiceCards(settings) {
       iconClass: 'db-category-policy',
       title: '内网访问',
       desc: '浏览器访问内网 / OA 的白名单',
-      state: browserNetwork.enabled ? `${networkHosts} 个目标` : '未开启',
+      state: browserNetwork.enabled ? (allPrivate ? '全部企业局域网' : `${networkHosts.length} 个目标`) : '未开启',
       tone: browserNetwork.enabled ? 'is-warn' : '',
     },
   ]
@@ -18802,10 +18903,10 @@ function browserNetworkConfigHtml(settings, options = {}) {
   const { browserNetwork } = webServicesDefaults(settings)
   const networkHosts = Array.isArray(browserNetwork.allowedHosts) ? browserNetwork.allowedHosts : []
   const closeLabel = options.closeLabel || '取消'
-  return `${hintNote('策略说明', '默认拒绝所有内网目标。打开开关后只放行名单内的域名 / IP；公共网站不受影响，localhost 和 EAB 自身地址始终拒绝。策略只应用于内置浏览器，web.fetch 仍只读公网。')}
+  return `${hintNote('策略说明', '默认拒绝所有内网目标。打开开关后只放行名单内的域名 / IP；填 * 可放行全部企业局域网（RFC1918 / CGNAT / IPv6 ULA）。localhost、链路本地、云元数据和 EAB 自身地址始终拒绝；公共网站不受影响。策略只应用于内置浏览器，web.fetch 仍只读公网。')}
     <form class="db-form" id="browser-network-form" autocomplete="off">
-      <label class="check db-enabled-row"><input id="browser-network-enabled" type="checkbox"${browserNetwork.allowPrivateNetwork ? ' checked' : ''} /><span>允许内置浏览器访问下列内网 / OA 目标</span></label>
-      <label class="field field-wide"><span>域名或 IP 白名单 <span class="desc">每行一个；支持 *.example.com 子域，不填协议和路径</span></span>
+      <label class="check db-enabled-row"><input id="browser-network-enabled" type="checkbox"${browserNetwork.allowPrivateNetwork ? ' checked' : ''} /><span>允许内置浏览器访问内网 / OA 目标</span></label>
+      <label class="field field-wide"><span>域名或 IP 白名单 <span class="desc">每行一个；支持 *.example.com 子域；填 * 表示放行全部企业局域网，不填协议和路径</span></span>
         <textarea id="browser-network-hosts" rows="5" spellcheck="false" placeholder="oa.example.com&#10;10.20.30.40">${esc(networkHosts.join('\n'))}</textarea>
       </label>
     </form>
@@ -18852,10 +18953,13 @@ function bindBrowserNetworkConfig(root, options = {}) {
         allowedHosts: hosts,
       })
       const policy = result?.browserNetwork ?? {}
+      const allPrivate = Array.isArray(policy.allowedHosts) && policy.allowedHosts.includes('*')
       state.networkSavedAt = Date.now()
       showTopToast(
         policy.enabled
-          ? `内网访问已开启 · ${policy.allowedHosts?.length ?? hosts.length} 个目标`
+          ? allPrivate
+            ? '内网访问已开启 · 全部企业局域网'
+            : `内网访问已开启 · ${policy.allowedHosts?.length ?? hosts.length} 个目标`
           : '内网访问已关闭',
       )
       await onSaved()
@@ -19757,7 +19861,7 @@ async function loadTaskGraphsView() {
   await loadTaskGraphPanel()
 }
 
-async function loadTasks(status = state.taskStatus || 'all', viewKey = state.taskView || 'schedules') {
+async function loadTasks(status = state.taskStatus || 'all', viewKey = state.taskView || 'schedules', page = null) {
   if (viewKey === 'graphs') {
     await loadTaskGraphsView()
     return
@@ -19771,26 +19875,8 @@ async function loadTasks(status = state.taskStatus || 'all', viewKey = state.tas
   try {
     const data = await api(`/api/console/schedules?status=${encodeURIComponent(status)}`)
     const counts = data.counts || {}
-    const rows = (data.items || [])
-      .map(
-        (item) => `<tr class="task-row${state.taskOpen === item.id ? ' is-open' : ''}" data-task-row="${esc(item.id)}">
-          <td>
-            <button class="link-btn task-title" type="button" data-task-open="${esc(item.id)}">${esc(item.title)}</button>
-            <div class="desc">${esc(taskPromptBrief(item.prompt))}</div>
-          </td>
-          <td class="task-owner" title="${esc(item.userId || '')}">${esc(item.userName || item.userId || '—')}</td>
-          <td>${esc(taskRuleText(item))}<div class="desc">${esc(item.nextRunLocal)} · ${esc(item.timezone)}</div></td>
-          <td>${taskStatusPill(item.status)}${item.lastError ? `<div class="desc danger-text">${esc(item.lastError)}</div>` : ''}</td>
-          <td class="desc">${
-            item.lastRun
-              ? `${esc(new Date(item.lastRun.startedAt).toLocaleString('zh-CN'))}<div class="desc">${esc(TASK_RUN_LABEL[item.lastRun.status] || item.lastRun.status)}${item.lastRun.delivery ? ` · ${esc(TASK_DELIVERY_LABEL[item.lastRun.delivery] || item.lastRun.delivery)}` : ''}</div>`
-              : '还没有执行记录'
-          }</td>
-          <td>${taskRowActions(item)}</td>
-        </tr>`,
-      )
-      .join('')
-    const filters = [
+    const TASK_PAGE_SIZE = 10
+    const filtersMeta = [
       ['all', '全部'],
       ['active', '待触发'],
       ['paused', '已暂停'],
@@ -19799,12 +19885,40 @@ async function loadTasks(status = state.taskStatus || 'all', viewKey = state.tas
       ['error', '失败'],
       ['cancelled', '已取消'],
     ]
+    const statusLabel = filtersMeta.find(([key]) => key === state.taskStatus)?.[1] || '全部'
+    const allItems = data.items || []
+    const totalForFilter = allItems.length
+    const totalPages = Math.max(1, Math.ceil(totalForFilter / TASK_PAGE_SIZE))
+    const requestedPage = page === null ? state.taskPage : page
+    const currentPage = Math.min(Math.max(Number(requestedPage) || 0, 0), totalPages - 1)
+    state.taskPage = currentPage
+    const pageItems = allItems.slice(currentPage * TASK_PAGE_SIZE, (currentPage + 1) * TASK_PAGE_SIZE)
+    const rows = pageItems
+      .map(
+        (item) => `<tr class="task-row${state.taskOpen === item.id ? ' is-open' : ''}" data-task-row="${esc(item.id)}">
+          <td>
+            <button class="link-btn task-title" type="button" data-task-open="${esc(item.id)}">${esc(item.title)}</button>
+            <div class="desc">${esc(taskPromptBrief(item.prompt))}</div>
+          </td>
+          <td class="task-owner col-task-owner" title="${esc(item.userId || '')}">${esc(item.userName || item.userId || '—')}</td>
+          <td class="col-task-rule">${esc(taskRuleText(item))}<div class="desc">${esc(item.nextRunLocal)} · ${esc(item.timezone)}</div></td>
+          <td>${taskStatusPill(item.status)}${item.lastError ? `<div class="desc danger-text">${esc(item.lastError)}</div>` : ''}</td>
+          <td class="desc col-task-last">${
+            item.lastRun
+              ? `${esc(new Date(item.lastRun.startedAt).toLocaleString('zh-CN'))}<div class="desc">${esc(TASK_RUN_LABEL[item.lastRun.status] || item.lastRun.status)}${item.lastRun.delivery ? ` · ${esc(TASK_DELIVERY_LABEL[item.lastRun.delivery] || item.lastRun.delivery)}` : ''}</div>`
+              : '还没有执行记录'
+          }</td>
+          <td>${taskRowActions(item)}</td>
+        </tr>`,
+      )
+      .join('')
+    const filters = filtersMeta
       .map(
         ([key, label]) =>
           `<button class="${state.taskStatus === key ? 'active' : ''}" type="button" data-task-status="${key}">${esc(label)} <span class="muted">${Number(counts[key] || 0)}</span></button>`,
       )
       .join('')
-    const shown = state.taskStatus === 'all' ? Number(data.total || 0) : (data.items || []).length
+    const shown = totalForFilter
     const emptyTaskState = stateBlockHtml({
       compact: true,
       title: state.taskStatus === 'all' ? '还没有定时任务' : '当前筛选没有任务',
@@ -19817,22 +19931,27 @@ async function loadTasks(status = state.taskStatus || 'all', viewKey = state.tas
     view.innerHTML = `
       ${taskCenterTabsHtml('schedules')}
       <section class="panel">
-        <div class="panel-head">
+        <div class="panel-head table-panel-head">
           <div class="panel-title-line">
             <h2>定时任务 <span class="muted">${shown}</span></h2>
             ${hintBadge('定时任务说明', '定时任务由员工在对话或 HTTP 创建；这里可以看到全公司的定时触发表、最近一次执行和 append-only 事件时间线，暂停/恢复/取消会写审计。多步骤流程请切到上方「任务图」。')}
           </div>
           <div class="panel-actions"><div class="segmented">${filters}</div></div>
         </div>
-        <table class="data task-table">
-          <thead><tr><th>任务</th><th>创建人</th><th>规则 / 下一次</th><th>状态</th><th>最近执行</th><th>操作</th></tr></thead>
-          <tbody>${rows || `<tr><td colspan="6">${emptyTaskState}</td></tr>`}</tbody>
-        </table>
+        ${tableSummaryHtml([{ label: '状态', value: statusLabel }])}
+        <div class="table-scroll task-table-scroll">
+          <table class="data task-table">
+            <thead><tr><th>任务</th><th class="col-task-owner">创建人</th><th class="col-task-rule">规则 / 下一次</th><th>状态</th><th class="col-task-last">最近执行</th><th>操作</th></tr></thead>
+            <tbody>${rows || `<tr><td colspan="6">${emptyTaskState}</td></tr>`}</tbody>
+          </table>
+        </div>
+        ${pagerHtml(totalForFilter, currentPage, TASK_PAGE_SIZE)}
       </section>`
 
+    bindPager(view, (next) => loadTasks(state.taskStatus, 'schedules', next))
     bindTaskCenterTabs(view)
     for (const button of view.querySelectorAll('[data-task-status]')) {
-      button.addEventListener('click', () => loadTasks(button.dataset.taskStatus || 'all', 'schedules'))
+      button.addEventListener('click', () => loadTasks(button.dataset.taskStatus || 'all', 'schedules', 0))
     }
     for (const button of view.querySelectorAll('[data-task-open]')) {
       button.addEventListener('click', () => openTaskDetail(button.dataset.taskOpen))
@@ -19867,7 +19986,7 @@ async function loadTasks(status = state.taskStatus || 'all', viewKey = state.tas
     }
     view.querySelector('[data-state-action^="task-"]')?.addEventListener('click', (event) => {
       const value = event.currentTarget.dataset.stateAction
-      if (value === 'task-all') loadTasks('all', 'schedules')
+      if (value === 'task-all') loadTasks('all', 'schedules', 0)
       if (value === 'task-reload') loadTasks(state.taskStatus, 'schedules')
     })
   } catch (err) {

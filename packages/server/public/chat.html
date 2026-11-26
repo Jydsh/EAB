@@ -3,6 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" href="data:," />
     <title>EAB 工作台</title>
     <style>
       /* 首帧兜底：只保留启动层最必要的绘制规则，详细视觉仍由 boot-splash.css 接管。 */
@@ -23,15 +24,16 @@
     </style>
     <script src="/theme.js?v=20261117a" data-surface="chat"></script>
     <script src="/brand.js?v=20261115c" defer></script>
-    <link rel="stylesheet" href="/app.css?v=20261122c" />
-    <link rel="stylesheet" href="/chat.css?v=20261125uiP13E" />
-    <link rel="stylesheet" href="/theme.css?v=20261115b" />
+    <link rel="stylesheet" href="/app.css?v=20261125uiP29E" />
+    <link rel="stylesheet" href="/chat.css?v=20261126uiP34B" />
+    <link rel="stylesheet" href="/theme.css?v=20261125uiP29D" />
     <link rel="stylesheet" href="/ui-motion.css?v=20261124motionE" />
-    <link rel="stylesheet" href="/ui-overlay.css?v=20261124overlayB" />
+    <link rel="stylesheet" href="/ui-overlay.css?v=20261125uiP28A" />
     <link rel="stylesheet" href="/boot-splash.css?v=20261115i" />
   </head>
   <body class="chat-body">
     <script src="/boot/config.js?surface=chat" defer></script>
+    <button class="side-drawer-scrim" id="side-drawer-scrim" type="button" aria-label="关闭侧边栏" tabindex="-1" aria-hidden="true"></button>
     <div class="eab-boot" id="eab-boot" hidden aria-hidden="true" aria-live="polite">
       <div class="eab-boot-atmosphere" aria-hidden="true">
         <span class="eab-boot-glow"></span>
@@ -85,77 +87,109 @@
       })()
     </script>
 
-    <!-- 左侧：账号与可用模型。桌面网页对话产品的常规布局，右侧只放对话。 -->
+    <!-- 左侧：固定主导航 + 可滚动的项目/对话列表，结构对齐豆包桌面版。 -->
     <aside class="chat-side" id="chat-side">
-      <div class="side-brand">
-        <span class="logo" data-brand-logo>EAB</span>
-        <span class="side-brand-text" data-brand-name>企业AI智能体基座</span>
-      </div>
+      <div class="side-fixed" id="side-fixed">
+        <div class="side-brand">
+          <span class="logo" data-brand-logo>EAB</span>
+          <span class="side-brand-text" data-brand-name>企业AI智能体基座</span>
+          <span class="side-brand-chevron" aria-hidden="true">›</span>
+        </div>
 
-      <div class="side-user" id="side-user" hidden>
-        <div class="side-user-row">
-          <span class="avatar lg" id="user-avatar">·</span>
-          <div class="side-user-meta">
-            <strong id="user-name">—</strong>
-            <span class="muted" id="user-title">—</span>
+        <div class="side-user side-user-compact side-profile-card" id="side-user" hidden>
+          <div class="side-user-row">
+            <span class="avatar lg" id="user-avatar">·</span>
+            <div class="side-user-meta">
+              <strong id="user-name">—</strong>
+              <span class="muted" id="user-title">—</span>
+            </div>
+            <span class="side-profile-status" id="user-work-status" title="当前工作状态"></span>
           </div>
+          <div class="side-user-org muted" id="user-org">—</div>
+          <div class="side-user-roles" id="user-roles"></div>
         </div>
-        <div class="side-user-org muted" id="user-org">—</div>
-        <div class="side-user-roles" id="user-roles"></div>
+
+        <nav class="side-nav" aria-label="主导航">
+          <button class="side-nav-item" type="button" data-side-action="new-task">
+            <span class="side-nav-icon" aria-hidden="true"><svg viewBox="0 0 20 20"><rect x="3.2" y="3.2" width="12.2" height="12.2" rx="2.3" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="m7 12.6.5-2.5 5.7-5.7a1.2 1.2 0 0 1 1.7 0l.7.7a1.2 1.2 0 0 1 0 1.7l-5.7 5.7-2.9.1Z" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linejoin="round"/></svg></span>
+            <span class="side-nav-label">新工作任务</span>
+          </button>
+          <button class="side-nav-item" type="button" data-side-action="new-chat">
+            <span class="side-nav-icon" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M3.4 5.1A2.1 2.1 0 0 1 5.5 3h9a2.1 2.1 0 0 1 2.1 2.1v6.2a2.1 2.1 0 0 1-2.1 2.1H8.7l-3.3 2.5v-2.5H5.5a2.1 2.1 0 0 1-2.1-2.1V5.1Z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg></span>
+            <span class="side-nav-label">新对话</span>
+          </button>
+          <button class="side-nav-item" type="button" data-side-action="workspace">
+            <span class="side-nav-icon" aria-hidden="true"><svg viewBox="0 0 20 20"><rect x="3" y="3" width="5.2" height="5.2" rx="1.1" fill="none" stroke="currentColor" stroke-width="1.45"/><rect x="11.8" y="3" width="5.2" height="5.2" rx="1.1" fill="none" stroke="currentColor" stroke-width="1.45"/><rect x="3" y="11.8" width="5.2" height="5.2" rx="1.1" fill="none" stroke="currentColor" stroke-width="1.45"/><path d="M14.4 11.2v5.9M11.5 14.2h5.9" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round"/></svg></span>
+            <span class="side-nav-label">工作台</span>
+          </button>
+          <button class="side-nav-item" type="button" data-side-action="schedules">
+            <span class="side-nav-icon" aria-hidden="true"><svg viewBox="0 0 20 20"><circle cx="10" cy="10" r="7" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M10 6.2v4.1l2.7 1.6" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+            <span class="side-nav-label">定时任务</span>
+          </button>
+          <button class="side-nav-item" type="button" data-side-action="plugins">
+            <span class="side-nav-icon" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="m10 2.5 6.3 3.5-6.3 3.5-6.3-3.5L10 2.5Z" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linejoin="round"/><path d="m3.7 10 6.3 3.5 6.3-3.5M3.7 13.9l6.3 3.5 6.3-3.5" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+            <span class="side-nav-label">插件·技能·伙伴</span>
+          </button>
+          <button class="side-nav-item" type="button" data-side-action="cloud">
+            <span class="side-nav-icon" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M4.2 5.3h3.4l1.3 1.7h6.9a1.3 1.3 0 0 1 1.3 1.3v6.2a1.3 1.3 0 0 1-1.3 1.3H4.2a1.3 1.3 0 0 1-1.3-1.3V6.6a1.3 1.3 0 0 1 1.3-1.3Z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M2.9 7h14.2" fill="none" stroke="currentColor" stroke-width="1.25"/></svg></span>
+            <span class="side-nav-label">云空间</span>
+          </button>
+          <button class="side-nav-item side-nav-more" id="side-more" type="button" data-side-action="more" aria-haspopup="menu" aria-expanded="false">
+            <span class="side-nav-icon" aria-hidden="true"><svg viewBox="0 0 20 20"><rect x="3" y="3" width="5.2" height="5.2" rx="1.4" fill="none" stroke="currentColor" stroke-width="1.5"/><rect x="11.8" y="3" width="5.2" height="5.2" rx="1.4" fill="none" stroke="currentColor" stroke-width="1.5"/><rect x="3" y="11.8" width="5.2" height="5.2" rx="1.4" fill="none" stroke="currentColor" stroke-width="1.5"/><rect x="11.8" y="11.8" width="5.2" height="5.2" rx="1.4" fill="none" stroke="currentColor" stroke-width="1.5"/></svg></span>
+            <span class="side-nav-label">更多</span>
+            <span class="side-nav-chevron" aria-hidden="true">›</span>
+          </button>
+        </nav>
       </div>
 
-      <div class="side-section" id="side-sessions" hidden>
-        <div class="side-section-title side-section-title-row">
-          <span>对话</span>
-          <button class="side-mini-btn" id="new-session" type="button">新建</button>
+      <div class="side-scroll" id="side-scroll">
+        <div class="side-section side-projects" id="side-projects" hidden>
+          <div class="side-sessions project-tree" id="project-list"></div>
         </div>
-        <div class="side-sessions" id="session-list"></div>
-      </div>
 
-      <div
-        class="side-split-resizer"
-        id="side-split-resizer"
-        role="separator"
-        aria-orientation="horizontal"
-        aria-label="调整对话和云空间高度"
-        aria-valuemin="20"
-        aria-valuemax="80"
-        aria-valuenow="50"
-        title="拖动调整对话和云空间高度"
-        tabindex="0"
-        hidden
-      ></div>
-
-      <div class="side-section" id="side-files" hidden>
-        <div class="side-section-title side-section-title-row">
-          <span>云空间</span>
-          <span class="side-title-tools">
-            <span class="side-info-wrap">
-              <button class="side-info-badge" id="ws-info" type="button" aria-label="查看云空间使用情况" aria-expanded="false">i</button>
-              <div class="side-popover" id="ws-quota-popover" hidden></div>
-            </span>
-            <button class="side-mini-btn" id="ws-new-folder" type="button" title="在当前目录新建文件夹">新建文件夹</button>
-            <button class="side-mini-btn" id="ws-upload" type="button">上传</button>
-          </span>
+        <div class="side-section" id="side-sessions" hidden>
+          <div class="side-section-title">
+            <span>最近</span>
+          </div>
+          <div class="side-sessions" id="session-list"></div>
         </div>
-        <input id="ws-input" type="file" multiple hidden />
-        <div id="ws-upload-status" class="ws-upload-status" hidden aria-live="polite"></div>
-        <div class="ws-path" id="ws-path" hidden aria-label="当前云空间位置"></div>
-        <div class="side-sessions" id="ws-list"></div>
-      </div>
 
-      <div class="side-section" id="side-models-section" hidden>
-        <div class="side-section-title">可用模型</div>
-        <div class="side-models" id="side-models"></div>
+        <div class="side-section" id="side-models-section" hidden>
+          <div class="side-section-title">可用模型</div>
+          <div class="side-models" id="side-models"></div>
+        </div>
       </div>
 
       <div class="side-bottom">
         <button class="side-settings-btn" id="open-settings" type="button">
-          <span class="side-settings-icon">⚙</span>
+          <span class="side-settings-icon" aria-hidden="true"><svg viewBox="0 0 20 20"><circle cx="10" cy="10" r="2.8" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M10 2.8v2M10 15.2v2M17.2 10h-2M4.8 10h-2M15.1 4.9l-1.4 1.4M6.3 13.7l-1.4 1.4M15.1 15.1l-1.4-1.4M6.3 6.3 4.9 4.9" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></span>
           <span>设置</span>
         </button>
       </div>
+
+      <div class="side-more-menu" id="side-more-menu" role="menu" aria-label="更多操作" hidden>
+        <button type="button" role="menuitem" id="side-more-new-project">
+          <span class="side-more-icon" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M10 4v12M4 10h12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></span>
+          <span>新建项目</span>
+        </button>
+        <button type="button" role="menuitem" id="side-more-cloud">
+          <span class="side-more-icon" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M4.2 5.3h3.4l1.3 1.7h6.9a1.3 1.3 0 0 1 1.3 1.3v6.2a1.3 1.3 0 0 1-1.3 1.3H4.2a1.3 1.3 0 0 1-1.3-1.3V6.6a1.3 1.3 0 0 1 1.3-1.3Z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M2.9 7h14.2" fill="none" stroke="currentColor" stroke-width="1.2"/></svg></span>
+          <span>打开云空间</span>
+        </button>
+        <button type="button" role="menuitem" id="side-more-console" hidden>
+          <span class="side-more-icon" aria-hidden="true"><svg viewBox="0 0 20 20"><rect x="3" y="3" width="5.2" height="5.2" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4"/><rect x="11.8" y="3" width="5.2" height="5.2" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4"/><rect x="3" y="11.8" width="5.2" height="5.2" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4"/><rect x="11.8" y="11.8" width="5.2" height="5.2" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4"/></svg></span>
+          <span>管理后台</span>
+        </button>
+        <button type="button" role="menuitem" id="side-more-settings">
+          <span class="side-more-icon" aria-hidden="true"><svg viewBox="0 0 20 20"><circle cx="10" cy="10" r="2.8" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M10 2.8v2M10 15.2v2M17.2 10h-2M4.8 10h-2M15.1 4.9l-1.4 1.4M6.3 13.7l-1.4 1.4M15.1 15.1l-1.4-1.4M6.3 6.3 4.9 4.9" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg></span>
+          <span>设置</span>
+        </button>
+      </div>
+
+      <input id="ws-input" type="file" multiple hidden />
+      <div id="ws-upload-status" class="ws-upload-status" hidden aria-live="polite"></div>
     </aside>
+
 
     <div class="chat-stage" id="chat-stage">
       <header class="chat-head">
@@ -172,11 +206,15 @@
             <button class="chat-mode-btn" type="button" data-mode="workspace" role="tab" aria-selected="false">工作台</button>
           </div>
         </div>
-        <div class="chat-head-title" id="chat-title">新对话</div>
+        <div class="chat-head-title-wrap">
+          <span class="chat-project-badge" id="chat-project-badge" hidden></span>
+          <div class="chat-head-title" id="chat-title">新对话</div>
+          <span class="chat-task-badge" id="chat-task-badge" hidden>工作任务</span>
+          <span class="chat-device-badge" id="chat-device-badge" hidden></span>
+        </div>
         <div class="chat-head-right">
-          <button class="perm-entry" id="perm-entry" type="button" aria-haspopup="dialog" aria-controls="workbench-rail" title="打开审批">
-            <span>审批</span>
-            <span class="perm-entry-count" id="perm-entry-count" hidden>0</span>
+          <button class="workbench-dock" id="workbench-dock" type="button" title="新建网页标签页" aria-label="新建网页标签页">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3.2v9.6M3.2 8h9.6" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
           </button>
           <button class="theme-toggle" type="button" data-theme-toggle role="switch" aria-checked="false" aria-label="切换到深色主题" title="切换深浅色主题">
             <span class="theme-toggle-track">
@@ -200,7 +238,12 @@
               </span>
             </span>
           </button>
+          <button class="btn ghost sm" id="open-desktop-download" type="button" hidden>下载桌面端</button>
           <span class="chat-demo-pill" id="demo-pill" hidden>演示回声</span>
+          <button class="desktop-update-chip" id="desktop-update-chip" type="button" hidden aria-live="polite">
+            <span class="desktop-update-dot" aria-hidden="true"></span>
+            <span id="desktop-update-chip-label">检查更新</span>
+          </button>
           <button class="btn ghost sm" id="console-entry" type="button" hidden>管理后台</button>
           <button class="btn ghost sm" id="login-btn" type="button" hidden>登录</button>
         </div>
@@ -221,17 +264,16 @@
         <div class="file-split-resizer" id="file-split-resizer" role="separator" aria-orientation="vertical" aria-label="拖动调整对话与右侧栏的宽度" tabindex="0" hidden></div>
 
         <div class="workbench-rail" id="workbench-rail" hidden>
-          <div class="workbench-tabs" id="workbench-tabs" role="tablist" aria-label="右侧工作台">
-            <button class="workbench-tab is-active" type="button" role="tab" data-workbench-tab="team" aria-selected="true">
-              Agent 团队 <span class="workbench-tab-count" id="workbench-team-count" hidden>0</span>
+          <div class="workbench-topbar">
+            <div class="workbench-tabs" id="workbench-tabs" role="tablist" aria-label="右侧工作台标签页">
+              <div class="workbench-tab-list" id="workbench-tab-list"></div>
+            </div>
+            <button class="workbench-add" id="workbench-add" type="button" title="新建网页标签页" aria-label="新建网页标签页">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3.2v9.6M3.2 8h9.6" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
             </button>
-            <button class="workbench-tab" type="button" role="tab" data-workbench-tab="file" aria-selected="false">文件预览</button>
-            <button class="workbench-tab" type="button" role="tab" data-workbench-tab="perm" aria-selected="false">
-              权限审批 <span class="workbench-tab-count" id="workbench-perm-count" hidden>0</span>
-            </button>
-            <button class="workbench-tab workbench-split-btn" type="button" id="workbench-split" title="团队与文件并排显示" aria-pressed="false">并排</button>
-            <button class="workbench-collapse workbench-close" type="button" id="workbench-close" title="关闭权限审批" aria-label="关闭权限审批" hidden>关闭</button>
-            <button class="workbench-collapse" type="button" id="workbench-collapse" title="收起右侧工作台" aria-label="收起右侧工作台" aria-controls="workbench-rail" aria-expanded="true">收起</button>
+            <div class="workbench-topbar-tools">
+              <button class="workbench-split-btn" type="button" id="workbench-split" title="团队与文件并排显示" aria-pressed="false" hidden>并排</button>
+            </div>
           </div>
 
           <div class="workbench-body" id="workbench-body">
@@ -270,29 +312,166 @@
               </div>
             </section>
 
+            <section class="web-pane" id="web-pane" hidden aria-label="网页工作台">
+              <div class="web-browser-bar" id="web-browser-bar" hidden>
+                <div class="web-browser-nav" role="group" aria-label="网页导航">
+                  <button class="web-browser-icon" id="web-back" type="button" title="后退" aria-label="后退">
+                    <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M11.5 5 6.5 10l5 5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                  </button>
+                  <button class="web-browser-icon" id="web-forward" type="button" title="前进" aria-label="前进">
+                    <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M8.5 5 13.5 10l-5 5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                  </button>
+                  <button class="web-browser-icon" id="web-reload" type="button" title="刷新" aria-label="刷新">
+                    <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M15.2 9a5.4 5.4 0 1 1-1.6-3.8M15.4 4.7v4.1h-4.1" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                  </button>
+                </div>
+                <div class="web-address-field" id="web-address-field">
+                  <svg class="web-address-globe" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="6.8" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M3.6 10h12.8M10 3.2c1.9 1.8 2.9 4.2 2.9 6.8s-1 5-2.9 6.8c-1.9-1.8-2.9-4.2-2.9-6.8s1-5 2.9-6.8Z" fill="none" stroke="currentColor" stroke-width="1.2"/></svg>
+                  <input id="web-address-input" type="text" inputmode="url" enterkeyhint="go" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="搜索或输入网址" aria-label="地址栏，输入网址或搜索">
+                  <span class="web-pane-status" id="web-pane-status" role="status" aria-live="polite">就绪</span>
+                </div>
+                <div class="web-browser-actions">
+                  <button class="web-browser-icon" id="web-cred-open" type="button" title="本站登录信息" aria-label="本站登录信息" aria-expanded="false">
+                    <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="7.4" cy="12.6" r="3.1" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M9.7 10.3 15.4 4.6M12.5 7.5l1.6 1.6M14.1 5.9l1.5 1.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+                  </button>
+                  <button class="web-browser-icon web-control-toggle" id="web-control-toggle" type="button" title="键盘输入" aria-label="键盘输入" aria-expanded="false" hidden>
+                    <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="2.8" y="6" width="14.4" height="8.6" rx="2" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M5.2 8.8h1M8 8.8h1M10.8 8.8h1M13.6 8.8h1M5.2 11.2h1M8 11.2h1M10.8 11.2h1M13.6 11.2h1M6.6 13.6h6.8" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
+                  </button>
+                  <button class="web-browser-icon web-pause-toggle" id="web-pane-pause" type="button" title="暂停画面" aria-label="暂停画面" aria-pressed="false">
+                    <svg class="web-icon-pause" viewBox="0 0 20 20" aria-hidden="true"><path d="M7 5.5v9M13 5.5v9" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>
+                    <svg class="web-icon-play" viewBox="0 0 20 20" aria-hidden="true"><path d="M7.3 5.2 14.6 10l-7.3 4.8V5.2Z" fill="currentColor"/></svg>
+                  </button>
+                </div>
+              </div>
+              <div class="web-frame-shell" id="web-frame-shell">
+                <div class="web-empty" id="web-empty">
+                  <div class="web-newtab-actions" role="group" aria-label="新标签页快捷入口">
+                    <form class="web-newtab-search" id="web-newtab-form" autocomplete="off">
+                      <span class="web-newtab-icon" aria-hidden="true">
+                        <svg viewBox="0 0 18 18"><circle cx="8" cy="8" r="4.6" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M14.2 14.2 16.6 16.6" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+                      </span>
+                      <input id="web-newtab-input" type="text" inputmode="search" enterkeyhint="search" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="搜索或输入网址，回车打开" aria-label="搜索或输入网址，回车打开">
+                    </form>
+                    <button class="web-newtab-action" type="button" data-web-draft-action="team">
+                      <span class="web-newtab-icon" aria-hidden="true">
+                        <svg viewBox="0 0 18 18"><circle cx="9" cy="4.6" r="2" fill="none" stroke="currentColor" stroke-width="1.3"/><circle cx="4.4" cy="13" r="1.9" fill="none" stroke="currentColor" stroke-width="1.3"/><circle cx="13.6" cy="13" r="1.9" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M8 6.4 5.4 11.2M10 6.4l2.6 4.8M6.3 13h5.4" fill="none" stroke="currentColor" stroke-width="1.1"/></svg>
+                      </span>
+                      <span>打开 Agent 团队</span>
+                    </button>
+                    <button class="web-newtab-action" type="button" data-web-draft-action="perm">
+                      <span class="web-newtab-icon" aria-hidden="true">
+                        <svg viewBox="0 0 18 18"><path d="M9 2.6 14.4 4.6v3.8c0 3.4-2.3 6.2-5.4 7.2C5.9 14.6 3.6 11.8 3.6 8.4V4.6L9 2.6Z" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="m6.6 9 1.7 1.7 3.2-3.2" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
+                      </span>
+                      <span>打开审批</span>
+                    </button>
+                    <button class="web-newtab-action" type="button" data-web-draft-action="cloud">
+                      <span class="web-newtab-icon" aria-hidden="true">
+                        <svg viewBox="0 0 18 18"><path d="M3.4 5.2h4l1.4 1.8h5.8v6.4a1.4 1.4 0 0 1-1.4 1.4H4.8a1.4 1.4 0 0 1-1.4-1.4V5.2Z" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M3.4 5.2V4.1A1.2 1.2 0 0 1 4.6 2.9h3.1l1.3 1.7h3.5A1.2 1.2 0 0 1 13.8 5.8v1.2" fill="none" stroke="currentColor" stroke-width="1.1"/></svg>
+                      </span>
+                      <span>打开云空间</span>
+                    </button>
+                  </div>
+                  <span class="web-empty-title" hidden>在右侧打开一个网页</span>
+                  <p hidden>Agent 打开网页后会自动出现在这里；你也可以输入网址。画面是服务端浏览器投屏，点击画面即可操作。</p>
+                </div>
+                <img class="web-frame" id="web-frame" alt="网页实时画面" draggable="false" hidden onclick="window.eabFrameClick && window.eabFrameClick(event)">
+              </div>
+              <div class="web-pane-foot" id="web-pane-foot" hidden>
+                <div class="web-cred-panel" id="web-cred-panel" hidden>
+                  <div class="web-cred-head">
+                    <strong>本站登录信息</strong>
+                    <span class="web-cred-origin" id="web-cred-origin">—</span>
+                    <button class="web-cred-close" id="web-cred-close" type="button" aria-label="关闭登录信息面板">×</button>
+                  </div>
+                  <div class="web-cred-fields">
+                    <label>账号<input id="web-cred-username" type="text" autocomplete="off" spellcheck="false" placeholder="手机号 / 账号"></label>
+                    <label>密码<input id="web-cred-password" type="password" autocomplete="new-password" placeholder="保存到本机加密凭据库"></label>
+                  </div>
+                  <div class="web-cred-actions">
+                    <button class="btn primary sm" id="web-cred-save" type="button">保存</button>
+                    <button class="btn ghost sm" id="web-cred-fill" type="button" disabled>填入当前页</button>
+                    <button class="btn ghost sm web-cred-delete" id="web-cred-delete" type="button" hidden>删除</button>
+                    <span class="web-cred-note" id="web-cred-note">账号密码只在本机加密保存，不进入模型上下文；不会自动提交登录。</span>
+                  </div>
+                  <div class="web-session-actions">
+                    <span class="web-session-state" id="web-session-state">本站还没有保存登录态</span>
+                    <button class="btn ghost sm" id="web-session-save" type="button">保存登录态</button>
+                    <button class="btn ghost sm" id="web-session-delete" type="button" hidden>清除登录态</button>
+                  </div>
+                </div>
+                <div class="web-takeover" id="web-takeover" hidden>
+                  <span class="web-takeover-label">键盘输入</span>
+                  <input id="web-input-text" type="text" autocomplete="off" spellcheck="false" placeholder="先点页面输入框，再在这里输入；不会进入模型上下文" aria-label="向网页当前焦点输入内容">
+                  <button class="btn ghost sm" id="web-input-send" type="button">输入</button>
+                  <button class="btn ghost sm" id="web-key-backspace" type="button" title="退格">⌫</button>
+                  <button class="btn ghost sm" id="web-key-tab" type="button" title="Tab">Tab</button>
+                  <button class="btn ghost sm" id="web-key-enter" type="button" title="回车">↵</button>
+                </div>
+              </div>
+            </section>
+
+            <section class="cloud-pane" id="cloud-pane" hidden aria-label="云空间">
+              <div class="cloud-pane-head">
+                <div class="cloud-pane-head-main">
+                  <span class="cloud-pane-kicker">CLOUD SPACE</span>
+                  <h2>云空间</h2>
+                  <div class="cloud-pane-path" id="cloud-pane-path"></div>
+                </div>
+                <div class="cloud-pane-actions">
+                  <button class="btn ghost sm cloud-action" id="cloud-pane-new-folder" type="button" title="在当前目录新建文件夹">
+                    <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3.6 5.6h4.7l1.5 2h6.6v7.1a1.5 1.5 0 0 1-1.5 1.5H3.6a1.5 1.5 0 0 1-1.5-1.5V5.6Z" fill="none" stroke="currentColor" stroke-width="1.2"/><path d="M3.6 5.6V4.5A1.3 1.3 0 0 1 4.9 3.2h3.2l1.4 1.9h4.6A1.3 1.3 0 0 1 15.4 6.4v1.2M10 11.4v4M8 13.4h4" fill="none" stroke="currentColor" stroke-width="1.05"/></svg>
+                    <span>新建文件夹</span>
+                  </button>
+                  <button class="btn ghost sm cloud-action" id="cloud-pane-upload" type="button" title="上传文件到当前目录">
+                    <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 12.4v3.1A1.5 1.5 0 0 0 5.5 17h9a1.5 1.5 0 0 0 1.5-1.5v-3.1M10 13.2V3.4M6.3 7.1 10 3.4l3.7 3.7" fill="none" stroke="currentColor" stroke-width="1.2"/></svg>
+                    <span>上传</span>
+                  </button>
+                  <button class="btn ghost sm cloud-icon-btn" id="cloud-pane-refresh" type="button" title="刷新" aria-label="刷新">
+                    <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M16.2 10a6.2 6.2 0 1 1-1.8-4.4M16.2 3.8v4.2h-4.2" fill="none" stroke="currentColor" stroke-width="1.25"/></svg>
+                  </button>
+                </div>
+              </div>
+              <input id="cloud-upload-input" type="file" multiple hidden />
+              <div class="ws-upload-status cloud-upload-status" id="cloud-upload-status" hidden aria-live="polite"></div>
+              <div class="cloud-drop-hint" id="cloud-drop-hint" hidden aria-hidden="true">
+                <strong>松开即可上传</strong>
+                <span id="cloud-drop-path">云空间</span>
+              </div>
+              <div class="cloud-pane-body" id="cloud-pane-body"></div>
+            </section>
+
           <section class="file-pane" id="file-pane" hidden>
           <div class="file-pane-head">
-            <div class="file-pane-head-main">
-              <span class="file-pane-kicker" id="file-pane-kicker">云空间</span>
-              <div class="file-pane-title-row">
-                <h2 id="file-pane-name">未选择文件</h2>
-                <div class="file-pane-meta muted" id="file-pane-meta"></div>
+            <div class="file-pane-head-row">
+              <div class="file-pane-head-main">
+                <span class="file-pane-kicker" id="file-pane-kicker">云空间</span>
+                <div class="file-pane-title-row">
+                  <h2 id="file-pane-name">未选择文件</h2>
+                  <div class="file-pane-meta muted" id="file-pane-meta"></div>
+                </div>
               </div>
             </div>
-            <div class="file-pane-actions">
-              <button class="btn ghost sm" id="file-pane-versions" type="button" hidden>历史版本</button>
-              <button class="btn ghost sm" id="file-pane-export" type="button" hidden>导出 PDF</button>
-              <button class="btn ghost sm" id="file-pane-gui" type="button" hidden>GUI 兜底</button>
-              <button class="btn ghost sm" id="file-pane-download" type="button">下载</button>
-              <button class="btn ghost sm file-pane-fullscreen" id="file-pane-fullscreen" type="button" title="全屏预览" aria-label="全屏预览" aria-pressed="false">
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M21 16v5h-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
-                <span id="file-pane-fullscreen-label">全屏</span>
-              </button>
-              <button class="btn ghost sm" id="file-pane-send-dingtalk" type="button">发送到钉钉</button>
-              <button class="btn ghost sm" id="file-pane-rename" type="button" hidden>重命名</button>
-              <button class="btn ghost sm" id="file-pane-edit" type="button" hidden>编辑</button>
-              <button class="btn danger sm" id="file-pane-delete" type="button" hidden>删除</button>
-              <button class="icon-btn file-pane-x" id="file-pane-close" type="button" title="关闭文件" aria-label="关闭文件">×</button>
+            <div class="file-pane-actions" role="toolbar" aria-label="文件操作">
+              <div class="file-pane-action-group" role="group" aria-label="阅读与导航">
+                <button class="btn ghost sm" id="file-pane-versions" type="button" hidden>历史版本</button>
+                <button class="btn ghost sm file-pane-fullscreen" id="file-pane-fullscreen" type="button" title="全屏预览" aria-label="全屏预览" aria-pressed="false">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M21 16v5h-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+                  <span id="file-pane-fullscreen-label">全屏</span>
+                </button>
+              </div>
+              <div class="file-pane-action-group" role="group" aria-label="编辑">
+                <button class="btn ghost sm" id="file-pane-gui" type="button" hidden title="图形界面兜底编辑">GUI 兜底</button>
+                <button class="btn ghost sm" id="file-pane-edit" type="button" hidden>编辑</button>
+              </div>
+              <div class="file-pane-action-group" role="group" aria-label="导出与发送">
+                <button class="btn ghost sm" id="file-pane-export" type="button" hidden>导出 PDF</button>
+                <button class="btn ghost sm" id="file-pane-download" type="button">下载</button>
+                <button class="btn ghost sm" id="file-pane-send-dingtalk" type="button">发送钉钉</button>
+              </div>
+              <div class="file-pane-action-group is-danger" role="group" aria-label="危险操作">
+                <button class="btn ghost sm" id="file-pane-rename" type="button" hidden>重命名</button>
+                <button class="btn danger sm" id="file-pane-delete" type="button" hidden>删除</button>
+              </div>
             </div>
           </div>
           <div class="file-pane-sync-notice" id="file-pane-sync-notice" hidden>
@@ -305,7 +484,7 @@
             <textarea id="file-pane-text" spellcheck="false" aria-label="编辑文件内容"></textarea>
             <div class="file-pane-diff" id="file-pane-diff" hidden></div>
             <div class="file-pane-editor-actions">
-              <span class="hint" id="file-pane-editor-hint"></span>
+              <span class="hint" id="file-pane-editor-hint" role="status" aria-live="polite"></span>
               <button class="btn ghost sm" id="file-pane-diff-toggle" type="button" aria-controls="file-pane-diff" aria-pressed="false" hidden>查看差异</button>
               <button class="btn ghost" id="file-pane-cancel" type="button">取消</button>
               <button class="btn primary" id="file-pane-save" type="button">保存</button>
@@ -361,6 +540,10 @@
               <div class="plugin-empty muted">正在读取插件…</div>
             </main>
           </div>
+        </section>
+
+        <section class="project-pane" id="project-pane" hidden aria-label="项目主页">
+          <div class="project-pane-inner" id="project-pane-inner"></div>
         </section>
 
         <footer class="composer">
@@ -419,6 +602,12 @@
                   <span class="caret">▾</span>
                 </button>
                 <div class="model-menu" id="model-menu" hidden></div>
+                <button class="space-chip" id="space-chip" type="button" aria-haspopup="menu" aria-expanded="false" aria-label="项目">
+                  <span class="space-chip-icon" aria-hidden="true"><svg viewBox="0 0 16 16"><path d="M2.4 5.2h4l1.2 1.4h5.9v5.6a1.4 1.4 0 0 1-1.4 1.4H3.8a1.4 1.4 0 0 1-1.4-1.4V5.2Z" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round"/><path d="M2.4 5.2V4.4A1.2 1.2 0 0 1 3.6 3.2h2.8l1.2 1.2h3.6A1.2 1.2 0 0 1 12.4 5.6v.8" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round"/></svg></span>
+                  <span id="space-chip-label">项目</span>
+                  <span class="caret" aria-hidden="true"><svg viewBox="0 0 12 12"><path d="m4.2 2.6 3.6 3.4-3.6 3.4" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+                </button>
+                <div class="space-menu" id="space-menu" role="menu" hidden></div>
                 <div class="think-wrap" id="think-wrap" hidden>
                   <button class="think-chip" id="think-chip" type="button" aria-haspopup="listbox" aria-expanded="false">
                     <span class="think-mark" aria-hidden="true">◐</span>
@@ -528,6 +717,22 @@
           </div>
 
           <div class="settings-group">
+            <div class="settings-group-title">客户端</div>
+            <button class="settings-row" id="settings-desktop" type="button">
+              <span class="settings-row-text">
+                <strong id="settings-desktop-title">桌面版</strong>
+                <em id="settings-desktop-hint">获取 Windows 桌面版，使用原生网页标签</em>
+              </span>
+            </button>
+            <button class="settings-row" id="settings-update" type="button" hidden>
+              <span class="settings-row-text">
+                <strong>检查更新</strong>
+                <em id="settings-update-hint">从当前 EAB 服务器检查桌面版更新</em>
+              </span>
+            </button>
+          </div>
+
+          <div class="settings-group">
             <div class="settings-group-title">账号安全</div>
             <button class="settings-row" id="settings-password" type="button">
               <span class="settings-row-text">
@@ -557,6 +762,93 @@
     <div class="session-menu" id="session-menu" hidden></div>
     <div class="session-menu" id="file-menu" hidden></div>
     <div class="session-menu" id="message-menu" hidden></div>
+    <div class="session-menu" id="project-menu" hidden></div>
+
+    <div class="schedule-modal" id="schedule-modal" hidden>
+      <div class="schedule-card" role="dialog" aria-modal="true" aria-labelledby="schedule-title" tabindex="-1">
+        <div class="schedule-head">
+          <div>
+            <span class="project-modal-kicker">SCHEDULES</span>
+            <h2 id="schedule-title">定时任务</h2>
+          </div>
+          <div class="schedule-head-actions">
+            <button class="btn ghost sm" id="schedule-new" type="button">新建</button>
+            <button class="project-modal-close" id="schedule-close" type="button" aria-label="关闭">×</button>
+          </div>
+        </div>
+        <div class="schedule-list" id="schedule-list"></div>
+        <div class="schedule-foot">
+          <span>到点后自动执行，并通过当前渠道回推结果。</span>
+          <button class="btn ghost sm" id="schedule-refresh" type="button">刷新</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="project-modal" id="project-modal" hidden>
+      <div class="project-modal-card" role="dialog" aria-modal="true" aria-labelledby="project-modal-title">
+        <div class="project-modal-head">
+          <div>
+            <span class="project-modal-kicker">NEW PROJECT</span>
+            <h2 id="project-modal-title">新建项目</h2>
+          </div>
+          <button class="project-modal-close" id="project-modal-close" type="button" aria-label="关闭">×</button>
+        </div>
+        <div class="project-modal-body">
+          <label class="project-field">
+            <span class="project-field-label">项目名称</span>
+            <input id="project-name" type="text" maxlength="60" autocomplete="off" placeholder="例如：官网重构" />
+          </label>
+          <div class="project-field">
+            <span class="project-field-label">工作目录</span>
+            <button class="project-folder-pick" id="project-folder-pick" type="button">
+              <span class="project-folder-icon" aria-hidden="true">
+                <svg viewBox="0 0 20 20"><path d="M2.8 5.3h4.3l1.4 1.8h8.7v7.2a1.4 1.4 0 0 1-1.4 1.4H4.2a1.4 1.4 0 0 1-1.4-1.4V5.3Z" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>
+              </span>
+              <span id="project-folder-label">添加本地文件夹</span>
+              <span class="project-folder-hint">仅桌面端</span>
+            </button>
+            <div class="project-folder-path" id="project-folder-path" hidden></div>
+          </div>
+          <div class="project-field">
+            <span class="project-field-label">云端资源 <em>可选</em></span>
+            <button class="project-cloud-pick" id="project-cloud-pick" type="button">
+              <span>选择云空间文件</span>
+              <span class="project-cloud-count" id="project-cloud-count">未选择</span>
+            </button>
+            <div class="project-cloud-chips" id="project-cloud-chips"></div>
+          </div>
+          <label class="project-field">
+            <span class="project-field-label">项目指令 <em>可选</em></span>
+            <textarea id="project-instructions" rows="4" maxlength="8000" placeholder="告诉 Agent 这个项目的长期规则、技术栈、交付标准或偏好。项目内所有对话和工作任务都会遵守。"></textarea>
+          </label>
+          <div class="project-modal-note">
+            <span class="project-device-dot" id="project-device-dot" aria-hidden="true"></span>
+            <span id="project-device-label">正在读取桌面设备…</span>
+          </div>
+        </div>
+        <div class="project-modal-foot">
+          <button class="btn ghost" id="project-modal-cancel" type="button">取消</button>
+          <button class="btn primary" id="project-modal-create" type="button">创建</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="cloud-pick-modal" id="cloud-pick-modal" hidden>
+      <div class="cloud-pick-card" role="dialog" aria-modal="true" aria-labelledby="cloud-pick-title">
+        <div class="cloud-pick-head">
+          <div>
+            <span class="project-modal-kicker">CLOUD RESOURCES</span>
+            <h3 id="cloud-pick-title">选择云端资源</h3>
+          </div>
+          <button class="project-modal-close" id="cloud-pick-close" type="button" aria-label="关闭">×</button>
+        </div>
+        <div class="cloud-pick-list" id="cloud-pick-list"></div>
+        <div class="cloud-pick-foot">
+          <span class="muted" id="cloud-pick-summary">已选 0 项</span>
+          <button class="btn primary sm" id="cloud-pick-confirm" type="button">确定</button>
+        </div>
+      </div>
+    </div>
 
     <!-- 未登录：只显示登录，不展示任何组织/成员信息 -->
     <div class="login-gate" id="login-gate" hidden>
@@ -647,15 +939,8 @@
     </script>
     <script src="/boot-splash.js?v=20261118d" data-surface="chat" defer></script>
     <script src="/ui-motion.js?v=20261124motionG" defer></script>
-    <script src="/ui-overlay.js?v=20261124overlayB" defer></script>
-    <script src="/chat.js?v=20261125uiP13E" defer></script>
+    <script src="/ui-overlay.js?v=20261125uiP27G" defer></script>
+    <script src="/chat.js?v=20261126uiP35H" defer></script>
   </body>
 </html>
-
-
-
-
-
-
-
 

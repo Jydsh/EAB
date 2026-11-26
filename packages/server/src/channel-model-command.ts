@@ -101,8 +101,9 @@ export function planChannelModelSelection(
 /**
  * 把“有哪些模型/切换模型”这类意图直接变成可点击的模型卡。
  *
- * 钉钉卡片最多渲染 4 个选项；模型较多时优先展示前 4 个，并在题目里提示
- * 其余模型可以直接发 /model 模型名切换。自动选择只在有空位时占一个按钮。
+ * 钉钉 A2UI 卡片的选项是普通 Column 子节点，没有“最多 4 个按钮”的平台限制；
+ * 这里按当前员工可见模型全量渲染。仅保留 24 个防御上限，避免异常模型目录把卡片撑爆。
+ * 自动选择只在模型不超过 3 个时占一个按钮，避免挤掉真实模型。
  */
 export interface ChannelModelPickerOption {
   id: string
@@ -119,7 +120,7 @@ export interface ChannelModelPicker {
 export function planChannelModelPicker(
   models: readonly ChannelModelOption[],
   currentModelId: string | null,
-  maxOptions = 4,
+  maxOptions = 24,
 ): ChannelModelPicker | null {
   const unique: ChannelModelOption[] = []
   const seen = new Set<string>()
@@ -132,10 +133,10 @@ export function planChannelModelPicker(
   }
   if (unique.length === 0) return null
 
-  const limit = Math.min(4, Math.max(2, Math.trunc(maxOptions) || 4))
-  // 自动选择是“恢复不固定模型”，不是某个模型；只有留出空位时才和模型并列。
-  const showAuto = unique.length <= limit - 1
-  const modelSlots = showAuto ? limit - 1 : limit
+  const limit = Math.min(24, Math.max(2, Math.trunc(maxOptions) || 24))
+  // 自动选择是“恢复不固定模型”，不是某个模型；只在模型很少时占一个按钮。
+  const showAuto = unique.length <= 3
+  const modelSlots = showAuto ? Math.max(1, limit - 1) : limit
   const visible = unique.slice(0, modelSlots)
   const options: ChannelModelPickerOption[] = visible.map((model, index) => ({
     id: `option-model-${index + 1}`,

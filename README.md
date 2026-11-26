@@ -11,9 +11,11 @@ EAB 是一套面向**单公司本地部署**的企业智能体基座：一个进
 
 ---
 
-## 一、安装方式（Web / Node）
+## 一、安装方式（Web / Node，Windows 桌面客户端可选）
 
-> **桌面版已停止发布。** 旧版 Windows 安装包中的本地服务不再维护，Release 也不再提供 `EAB-Setup-*.exe`。已经安装桌面版的用户，请先卸载桌面版，再按下面的 Web / Node 方式重新部署；数据备份、迁移和清理步骤见 [`docs/UNINSTALL-REDEPLOY.md`](docs/UNINSTALL-REDEPLOY.md)。
+> **Web / Node 仍是默认入口，桌面版是可选客户端。** 新版 Windows 桌面客户端只访问已经部署好的 EAB 服务，不在本机另起一套服务端、不复制数据；服务端部署仍不需要安装 Electron。
+>
+> 旧版「安装包内置本地服务」的桌面版已经停止维护，数据迁移与卸载步骤见 [`docs/UNINSTALL-REDEPLOY.md`](docs/UNINSTALL-REDEPLOY.md)。当前桌面客户端从服务端下载页获取：`http://<你的 EAB 地址>/download/desktop`。
 
 适合部署在 Windows / macOS / Linux 服务器上，用浏览器访问。
 
@@ -30,7 +32,43 @@ pnpm install
 node scripts/eab.mjs server
 ```
 
-> 如果 `pnpm install` 卡住，先确认网络和镜像配置；服务端运行不需要 Electron，也不再有桌面端依赖。
+> 如果 `pnpm install` 卡住，先确认网络和镜像配置；服务端运行不需要 Electron。
+
+### Windows 桌面客户端（可选）
+
+桌面客户端和 Web 使用同一套界面与账号，不另做第二套 UI。它额外提供：
+
+- 原生 Chromium 网页标签，不再依赖服务端 JPEG 投屏；超链接按浏览器习惯处理：普通链接当前标签跳转，`target=_blank` / `window.open` / Ctrl+点击新开标签，Ctrl+点击和中键在后台打开；
+- 内网 HTTP 语音：把当前 EAB 服务地址设为可信来源，无 HTTPS 的局域网部署也能申请麦克风和进行语音对话；
+- 原生页右键菜单、Ctrl+T / Ctrl+W / Ctrl+Tab / Ctrl+L / Alt+←→ / F5，与豆包浏览器的标签操作对齐；
+- Windows 安装包会读取下载来源，首次启动直接绑定提供安装包的 EAB 服务器，不再要求手动填写地址；
+- 与主窗口共用同一个持久会话，登录一次后网页标签共享登录态；
+- 启动后自动向当前 EAB 服务器检查桌面版更新，发现新版本后在顶栏提示、下载并校验 SHA256，再静默安装并重启；
+- 设置页可直接打开「EAB 服务器」重新配置，也可从 Web 设置页下载客户端；
+- **本地项目工作区**：桌面版可以用系统文件夹选择框把本机某个项目目录登记为工作区，对话侧栏会出现项目、项目文件和会话列表；Agent 直接在项目目录里 `list/read/search/write/edit`，新建对话仍留在同一项目。删除项目只解除绑定，不删磁盘文件。
+
+本地项目要求 EAB 服务与桌面在同一台电脑：服务端按真实路径访问磁盘。需要让 Agent 跑 `npm install`、构建或测试时，给服务进程设置 `EAB_PROJECT_EXEC=1`（本地直跑）或 `EAB_PROJECT_EXEC=strict`（Docker/bwrap 沙箱）后重启；默认只能改文件，不能执行命令。敏感文件（`.env`、私钥、云凭据等）默认拒绝读写，项目路径必须位于登记的真实目录内。方案与一期范围见 [`docs/local-space-plan.md`](docs/local-space-plan.md)。
+
+构建 Windows 安装包（同时生成便携包）：
+
+```powershell
+pnpm desktop:installer
+```
+
+产物：
+
+- 安装包：`packages/desktop/release/EAB-Setup-<版本>-x64.exe`（版本与网页共用项目根 `package.json`，即 `/api/health` 显示的同一个版本）
+- 便携目录：`packages/desktop/release/EAB-Desktop-Windows-x64`
+- 便携压缩包：`packages/desktop/release/EAB-Desktop-Windows-x64.zip`
+- 服务端下载页：`http://<你的 EAB 地址>/download/desktop`
+- 安装包下载：`http://<你的 EAB 地址>/download/desktop/windows`（优先返回 EXE）
+- 便携版下载：`http://<你的 EAB 地址>/download/desktop/portable`
+
+安装向导默认安装到 `C:\Program Files\EAB`，在「选择安装位置」页可以点“浏览”改到其他目录；安装完成后可从开始菜单或桌面快捷方式启动。安装时会把下载来源服务器写入 `<安装目录>\resources\app\desktop-config.json`，首次启动直接进入该服务器的工作台；只有便携版或无法识别下载来源时才需要手动填写地址。卸载入口在 Windows「设置 > 应用 > 已安装的应用」，卸载向导会询问是否同时删除 `%APPDATA%\EAB` 里的登录状态和服务地址，默认保留。
+
+桌面安装包和 `desktop-release.json` 会同步到数据目录：`EAB_DESKTOP_RELEASE_DIR` > `EAB_HOME/desktop-release` > `.eab-dev/desktop-release`。服务端优先从数据目录读，`eab update` 整包替换 `packages` 也不会丢包；数据目录没有包时可用 `EAB_DESKTOP_RELEASE_URL` 指向 GitHub Release 下载目录回源，默认 `https://github.com/Jydsh/EAB/releases/latest/download`。Docker 部署请把该目录挂载到 `/data/desktop-release`。
+
+安装包只安装客户端，不自带服务端、数据库或模型。桌面版启动后会自动请求当前服务器的 `api/desktop/update`，只从该服务器下载更新包并校验 SHA256；安装阶段会触发一次 Windows 管理员权限确认。安装包当前未做代码签名，Windows 可能提示“未知发布者”；代码签名尚未接入。
 
 ### 联网搜索会自动补齐 SearXNG
 
@@ -303,7 +341,7 @@ powershell -File .eab-dev\start-searxng.ps1
 EAB 的版本来自 GitHub Release：
 
 - Release tag：`v2026.11.24`
-- Release 资产：源码 zip（`EAB-2026.11.24.zip`）。桌面安装包、`latest.yml`、`.blockmap` 已停止发布。
+- Release 资产：源码 zip（`EAB-2026.11.24.zip`）。Windows 桌面客户端由服务端下载页或本地 `pnpm desktop:build` 分发，不放进 GitHub Release。
 
 ### 两种更新方式
 
@@ -369,6 +407,8 @@ EAB/
 pnpm install
 pnpm typecheck
 pnpm test
+pnpm perf                 # AGT-21 压测基线（隔离库 + mock 上游）
+pnpm perf:enforce         # 同一套场景，SLO 不通过时非零退出
 pnpm dev                  # 等价于 eab start
 ```
 
@@ -377,7 +417,7 @@ pnpm dev                  # 等价于 eab start
 1. 改根 `package.json` 的 `version`；
 2. 更新 `README.md` 版本与源码包名；
 3. 提交并打 tag：`git tag v2026.11.23 && git push origin v2026.11.23`；
-4. GitHub Actions 只构建源码 zip 并创建/更新 Release，不再生成桌面安装包；
+4. GitHub Actions 只构建源码 zip 并创建/更新 Release；Windows 桌面客户端单独用 `pnpm desktop:build` 构建，由服务端下载页分发；
 5. 控制台/CLI 的版本检查读取该 Release。
 
 ---
@@ -402,9 +442,13 @@ pnpm dev                  # 等价于 eab start
 **Q：更新后数据还在吗？**  
 在。更新器只替换代码，不碰 `.eab-dev` / `EAB_HOME`。
 
-**Q：以前装过桌面版，现在怎么办？**
+**Q：桌面版和 Web 版是什么关系？**
 
-先退出桌面版并备份 `%APPDATA%\EAB\data`，再卸载桌面版，按本文的 Web / Node 方式部署；完整步骤见 [`docs/UNINSTALL-REDEPLOY.md`](docs/UNINSTALL-REDEPLOY.md)。
+桌面版是访问同一套 EAB 服务的可选 Windows 客户端，适合需要原生网页标签、独立窗口和本地会话的岗位。Web 仍是默认零安装入口；桌面客户端不自带服务端，不改变数据和服务端配置。下载入口在 Web 设置页，或直接访问 `http://<你的 EAB 地址>/download/desktop`。
+
+**Q：以前装过旧桌面版，现在怎么办？**
+
+旧版「安装包内置本地服务」已停止维护。先退出旧桌面版并备份 `%APPDATA%\EAB\data`，再按本文的 Web / Node 方式部署服务端；新桌面客户端只作为访问端安装。完整步骤见 [`docs/UNINSTALL-REDEPLOY.md`](docs/UNINSTALL-REDEPLOY.md)。
 
 **Q：为什么只有一家公司？**  
 这是产品边界：一个实例服务一家公司。多公司请部署多个实例/多个数据目录。

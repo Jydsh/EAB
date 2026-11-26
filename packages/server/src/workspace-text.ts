@@ -278,6 +278,8 @@ export function searchWorkspaceText(
     caseSensitive?: boolean
     timeLimitMs?: number
     maxScanMatches?: number
+    /** 命中前先按相对路径过滤；本地项目用它拦截 `.env`、私钥等敏感文件。 */
+    skipPath?: (relPath: string) => boolean
   },
 ): TextSearchResult {
   const query = String(options.query ?? '')
@@ -307,11 +309,14 @@ export function searchWorkspaceText(
   const targetStat = lstatSync(target)
   if (targetStat.isSymbolicLink()) throw new EabError(EC.VALIDATION, '不支持搜索符号链接')
   const scan = collectTextFiles(target, MAX_SEARCH_FILES, deadline)
+  const files = options.skipPath
+    ? scan.files.filter((file) => !options.skipPath?.(toRelativePath(root, file)))
+    : scan.files
   const matches: TextSearchMatch[] = []
   const nameMatches: TextSearchNameMatch[] = []
   const nameNeedle = normalizeNameForMatch(query)
   if (nameNeedle) {
-    for (const file of scan.files) {
+    for (const file of files) {
       if (nameMatches.length >= maxResults) break
       const path = toRelativePath(root, file)
       if (!normalizeNameForMatch(path).includes(nameNeedle)) continue
@@ -324,7 +329,7 @@ export function searchWorkspaceText(
   let timeLimitHit = scan.timeLimitHit
   let stop = false
 
-  for (const file of scan.files) {
+  for (const file of files) {
     if (stop) break
     if (Date.now() > deadline) {
       timeLimitHit = true

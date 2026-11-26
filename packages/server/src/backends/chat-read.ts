@@ -42,7 +42,7 @@ export class SqliteChatReadSource implements ChatReadSource {
   async list(query: ChatSessionListQuery): Promise<ChatSessionListPage> {
     const rows = this.db
       .prepare(
-        `SELECT id, title, source, created_at, updated_at, last_message_at, last_read_at,
+        `SELECT id, title, source, space_kind, space_id, project_mode, created_at, updated_at, last_message_at, last_read_at,
                 EXISTS(
                   SELECT 1 FROM chat_messages m
                    WHERE m.session_id = chat_sessions.id

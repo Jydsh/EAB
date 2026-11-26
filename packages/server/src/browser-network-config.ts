@@ -1,7 +1,8 @@
 /**
  * 内置浏览器内网访问策略。
  *
- * 默认关闭；管理员显式打开并填写域名/IP 白名单后，只放行名单内的私网目标。
+ * 默认关闭；管理员显式打开后，只放行名单内的私网目标；名单填 `*` 表示放行
+ * 全部企业局域网（RFC1918 / CGNAT / IPv6 ULA），本机和链路本地仍拒绝。
  * 公共域名仍然按公网规则访问，web.fetch 不跟随这份白名单。
  */
 import { EC, EabError } from '@eab/domain'
@@ -69,7 +70,7 @@ export function saveBrowserNetworkSettings(input: {
   const allowedHosts = normalizeBrowserPrivateHosts(input.allowedHosts)
   if (allowPrivateNetwork && allowedHosts.length === 0) {
     throw new EabError(EC.VALIDATION, '开启内网访问前，至少填写一个域名或 IP', {
-      hint: '默认关闭；只有名单内的目标会被放行',
+      hint: '默认关闭；填 * 可放行全部企业局域网目标',
     })
   }
   writeConsoleSettings({

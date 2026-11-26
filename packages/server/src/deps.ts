@@ -5,12 +5,15 @@ import type { NetworkApplyResult, NetworkTarget } from './network-settings.js'
 import type { StorageApplyPlan, StorageApplyResult } from './settings.js'
 import type { BackendRuntime } from './backends/runtime.js'
 import type { AttachmentObjectStore } from './object-storage.js'
+import type { DesktopBridgeHub } from './desktop-bridge.js'
 
 export interface ServerDeps {
   readonly db: Db
   readonly config: ServerConfig
   readonly companyId: string
   readonly migrations: readonly string[]
+  /** 桌面客户端文件桥；测试或纯网页部署也可缺省，缺省时本地项目只能使用服务端旧路径模式。 */
+  readonly desktopBridge?: DesktopBridgeHub
   /** 可选后端插件状态（SQLite 内置 + Redis/PG 外部）；测试可不注入 */
   readonly backends?: BackendRuntime
   /** 解析后的控制台口令（环境变量优先；本机演示自动生成） */
