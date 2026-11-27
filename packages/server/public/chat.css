@@ -18469,27 +18469,25 @@ body.is-resizing-team-list .team-list-resizer {
 
 .side-profile-card .side-user-org {
   display: flex;
-  flex-direction: row;
-  gap: 5px;
-  margin: 6px 0 0 40px;
-  overflow: hidden;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  margin: 5px 0 0 40px;
   color: #9aa1a7;
   font-size: 9.5px;
   line-height: 13px;
-  white-space: nowrap;
+  white-space: normal;
 }
 
 .side-profile-card .side-user-org .side-org-company,
 .side-profile-card .side-user-org .side-org-dept {
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  max-width: 100%;
+  overflow-wrap: anywhere;
 }
 
 .side-profile-card .side-user-org .side-org-dept::before {
-  content: '·';
-  margin-right: 5px;
-  color: #c1c6cb;
+  content: none;
 }
 
 .side-nav { margin-top: 8px; }
