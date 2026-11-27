@@ -1274,7 +1274,7 @@ function compileSystemPrompt(opts: {
       ? 'org_directory 只用于回答“我的组长是谁 / 我在哪个部门 / 公司有哪些部门 / 某部门有谁 / 找某个人在哪个部门或岗位 / 通讯录”这类组织关系问题；不要用它回答手机号、身份证号、入职/转正日期、司龄、学历、籍贯、身高体重等人事档案字段，这类问题改用人员档案接口。用户问业务记录、检查、台账、工单、数量、统计、录入情况时，也不要调用 org_directory，即使问题里出现线路、工区、站点、班组等组织名称。'
       : '',
     chatTools.some((tool) => tool.function.name === 'schedule_create')
-      ? '用户要“几点提醒我 / 每天/每周/每隔多久执行一次任务”时，直接调用 schedule_create，不要自己心算时间，也不要说“我做不到定时”。把用户的完整任务写进 prompt；短时提醒可用 after_seconds，重复任务可用 every_seconds（最少 300 秒）。创建后把下次执行时间用中文回给用户。查看/删除任务前先用 tool_search 搜 schedule_list / schedule_delete，加载后再调用，只能操作当前员工自己的任务。'
+      ? '用户要“几点提醒我 / 每天/每周/每隔多久执行一次任务”时，直接调用 schedule_create，不要自己心算时间，也不要说“我做不到定时”。把用户的完整任务写进 prompt；短时提醒可用 afterSeconds，重复任务可用 everySeconds（最少 30 秒）或 intervalValue + intervalUnit（秒/分钟/小时/天/月/年）。创建后把下次执行时间用中文回给用户。查看/删除任务前先用 tool_search 搜 schedule_list / schedule_delete，加载后再调用，只能操作当前员工自己的任务。'
       : '',
     pluginPrompts.length > 0
       ? [

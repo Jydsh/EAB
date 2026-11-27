@@ -4342,7 +4342,7 @@ web-*   ← shared-types（**禁止** import server/runtime/storage）
 - 构建：`pnpm desktop:installer` 先用 `build-win-portable.mjs` 复制 Electron 运行时、应用代码和 setup 页，生成便携目录与 zip；再写 `installer/generated/build.nsh`，调用 NSIS 3 编译 `EAB-Setup-<版本>-x64.exe`。安装器脚本为 `installer/eab-installer.nsi`，品牌资源在 `installer/assets`，不依赖 electron-builder。`.gitignore` 已排除 `packages/desktop/release/`。
 - 安装向导：欢迎 → 选择安装位置（默认 `C:\Program Files\EAB`，可点“浏览”改路径）→ 安装进度 → 完成并默认勾选“立即启动 EAB”。安装前 `taskkill /IM EAB.exe /F /T`，避免 Electron 文件被占用；写入开始菜单 `EAB` 程序组、公共桌面快捷方式、`HKLM\Software\EAB`（记住上次安装路径）和 `HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall\EAB` 卸载项。安装目录写 `.eab-install` 标记，卸载时据此确认目录归属，避免用户误选根目录后递归删除。
 - 卸载向导：欢迎 → 卸载选项（默认保留 `%APPDATA%\EAB`；勾选后删除登录状态和服务地址）→ 确认 → 进度 → 完成。卸载删除程序目录、开始菜单、桌面快捷方式和注册表项。
-- 分发：服务端 `GET /download/desktop` 提供说明页；`GET /download/desktop/windows` 优先返回最新 Setup EXE，安装包缺失时退回 zip；`GET /download/desktop/setup` 只返回 EXE；`GET /download/desktop/portable` 只返回便携 zip。路由在 `packages/server/src/routes/desktop-download.ts`，由 `app.ts` 注册。
+- 分发：服务端 `GET /download/desktop` 提供下载中心；`GET /download/desktop/windows` 优先返回最新 Setup EXE，安装包缺失时退回 zip；`GET /download/desktop/setup` 只返回 EXE，新增 `?version=<版本号>` 按版本返回历史包；`GET /download/desktop/portable` 只返回便携 zip，同样支持 `?version=<版本号>` 按版本返回历史归档。路由在 `packages/server/src/routes/desktop-download.ts`，整页 HTML 拆到 `desktop-download-page.ts`，由 `app.ts` 注册。
 - 本机验收：默认 `C:\Program Files\EAB` 和自定义 `D:\...\install-test` 两条路径都安装成功；自定义路径安装后 `InstallLocation`、`UninstallString`、开始菜单和公共桌面快捷方式均指向自定义目录。卸载向导五页可走通，默认保留 `%APPDATA%\EAB\desktop-config.json`；程序目录、注册表卸载项、开始菜单和桌面快捷方式均被清理。安装器资源包含 `eab.ico`、`wizard.bmp`、`header.bmp`，窗口、快捷方式和卸载项共用该图标。
 - 图标资源：`installer/assets/eab.ico` 必须是 Windows 能解析的多尺寸 ICO，由同目录 `eab.png` 生成 16/24/32/48/64/128/256 七个尺寸；安装段创建 `$INSTDIR\assets` 并释放该文件，快捷方式与 `DisplayIcon` 才能稳定显示品牌图标。
 - 未完成：`dp_*` / `bp_*` pageId 统一、Web 到桌面的免登录握手、安装包代码签名、macOS/Linux 构建。安装包未签名，Windows 可能提示“未知发布者”；自动更新链路已落地，见下节。
@@ -4460,7 +4460,8 @@ web-*   ← shared-types（**禁止** import server/runtime/storage）
 - `云空间`放在固定导航的“资料库”位置，点击打开右侧云空间面板；侧栏底部原来的 `#side-files` 文件列表、`#side-split-resizer` 上下拖拽条和配额角标已从 DOM 移除。输入区 chip 仍负责把当前会话归属到项目/云空间，二者职责分开。
 - 中部滚动区不再显示“项目 / 新建项目”标题和按钮，直接显示项目行；项目行使用浅灰底 20px 线性文件夹图标、项目名和悬浮“⋯”，不显示箭头、不显示绿色虚线“新建对话”。项目列表之后显示“最近”，独立会话行左侧统一加淡蓝圆底聊天气泡图标；工作任务行使用方框笔图标和淡紫圆底。
 - 底部用户信息收成紧凑两行：28px 头像、姓名、职位；公司/部门/角色明细只在设置页完整展示。下面固定“设置”入口。
-- `更多`是右侧浮出菜单，当前承载四个真实入口：新建项目（仅桌面端）、打开云空间、管理后台（按 `#console-entry` 可见性同步）、设置；四项图标统一为线性 SVG。点击外部或按 Esc 收起。
+- `更多`是右侧浮出菜单，当前承载四个真实入口：新建项目（仅桌面端）、打开云空间、管理后台（按 `/api/me/console-entry` 可见性同步，是唯一入口）、设置；四项图标统一为线性 SVG。点击外部或按 Esc 收起。
+- 员工端聊天页头部不再放“管理后台”按钮（原 `#console-entry` 已移除），避免把管理入口与日常对话操作混在同一排；后台入口收进 `更多`，点击后仍走 `POST /api/me/console-entry/session` 换取跳转地址并携带当前 `company` 与 `from=chat`。
 
 **导航动作**
 - `新工作任务`：项目内调用 `createProjectSession(project,'task')`；云空间创建 `projectMode='task'` 的独立任务，头部显示任务徽标，最近列表用任务图标。
@@ -4470,6 +4471,7 @@ web-*   ← shared-types（**禁止** import server/runtime/storage）
 - `云空间`：`openCloudSpacePane()`，右侧全宽文件浏览，不占用左侧项目/对话滚动区。
 
 **定时任务浮层**
+- 该浮层后来由独立定时任务页替代，页面布局与文案规则见 23.3.7.15；以下保留当轮浮层验收记录。
 - 新增 `#schedule-modal`，从员工端 `GET /api/schedules` 读取任务，展示标题、状态、下次执行/上次执行、执行模式（对话/工作任务/单次）、渠道（网页/钉钉）。
 - 状态映射：`active→运行中`、`paused→已暂停`、`running→执行中`、`done→已完成`、`error→失败`、`cancelled→已取消`；已完成/失败/取消不再把旧的 `nextRunAt`伪装成“下次执行”。
 - `active` 可暂停、`paused` 可恢复，分别调用 `POST /api/schedules/:id/pause|resume`；支持刷新；空态提示在对话里描述周期任务，由 Agent 创建。
@@ -4673,13 +4675,666 @@ web-*   ← shared-types（**禁止** import server/runtime/storage）
 - 重启服务、模拟 `eab update` 删除 `packages` 后，数据目录中的安装包仍可下载。
 - 清空数据目录后首次请求会回源 GitHub 并缓存，第二次请求直接走本地。
 
-### 23.4 当前安全边界
+#### 23.3.7.14 下载中心改版与历史版本档案（2026-11-27）
+
+**目标**
+
+1. 当前只有 Windows x64 包，也要把下载页做成完整的产品下载中心，而不是单张说明卡。
+2. 打开页面时自动识别访问设备的系统与架构，高亮并推荐对应安装通道。
+3. 提前在页面上预留 Windows ARM64、macOS Apple Silicon / Intel、Linux x64、Android、iOS/iPadOS、HarmonyOS NEXT 的版本位与文件类型。
+4. 每种安装包显示历史版本，旧包不覆盖，可按版本独立下载并核对 SHA256。
+
+**实现**
+
+- 页面从 `desktop-download.ts` 的内联单卡片重构为 `desktop-download-page.ts` 的整页下载中心：顶栏、首屏设备识别卡、原生窗口示意、平台矩阵、版本档案、安装流程和页脚；仍由服务端内联输出 CSS/JS，不依赖外网资源。
+- 下载页不再沿用浏览器默认圆点图标：`<head>` 内联一枚与工作台一致的 EAB 品牌方块 SVG favicon，并设置 `theme-color`；页面加载后再读 `/api/branding`，如果企业上传过自定义图标或改了 Logo 文字，只替换 favicon，不改下载页标题。
+- 发布目录扫描从“只挑 mtime 最新的 Setup”改为 `listSetupReleases()` 扫描 `EAB-Setup-*-x64.exe` 全部历史文件，按版本号倒序生成归档；每个归档独立计算或沿用清单 SHA256，`publishedAt` 优先读 `desktop-release.json`，否则取文件 mtime。
+- `GET /download/desktop/setup?version=<版本号>` 精确匹配发布目录中的历史包；找不到返回 404，不静默回落到最新版。无 `version` 参数时保持原行为，始终返回最新版，兼容桌面自动更新。
+- 页面客户端脚本用 `navigator.userAgentData` 的 `architecture` / `bitness` 与 UA 兜底识别 Windows、macOS、Linux、Android、iOS、HarmonyOS；Windows x64 高亮 `data-platform="windows-x64"` 并显示“当前设备”，Windows ARM64 提示先使用 x64 兼容包，非 Windows 设备把主按钮切到“查看平台支持计划”，同时保留 Windows 包下载入口。
+- 便携版也进入同一套归档：`listPortableReleases()` 扫描 `EAB-Desktop-Windows-x64.zip` 与 `EAB-Desktop-Windows-x64-<版本>.zip`，按版本倒序去重；固定名 zip 视为最新构建，带版本号副本保留历史。`build-win-portable.mjs` 每次压缩后额外复制一份带版本号 zip，`build-win-installer.mjs` 发布缓存同时同步固定名与版本号副本。
+- `GET /download/desktop/portable?version=<版本号>` 精确匹配历史便携包；无参数仍返回最新便携包，未知版本返回 404。
+- 当前发布目录只有 `EAB-Desktop-Windows-x64.zip`，没有更早的便携归档，因此现在页面显示“1 个归档”；从下一次版本构建开始，带版本号副本会持续累积并可独立回滚。
+
+**验收**
+
+- `/download/desktop` 返回完整下载中心；Windows 浏览器显示“检测到 Windows · x64”、高亮 Windows x64 卡片，主按钮指向最新 Setup。
+- 浏览器标签显示 EAB 品牌图标而非默认圆点，标签标题保持“下载 EAB · 桌面版与移动端”；下载页控制台无品牌接口报错。
+- 版本档案同时出现 `v2026.11.26` 与 `v2026.11.24`，历史行带“历史”标记和独立下载链接。
+- `GET /download/desktop/setup?version=2026.11.24` 返回 `EAB-Setup-2026.11.24-x64.exe`，`content-length` 与文件一致；不存在的版本返回 404。
+- 便携版面板显示当前归档的版本、大小、日期、SHA256 和下载入口；存在旧便携归档时，面板底部列出“更早归档”，每条按 `?version=` 独立下载。
+- 平台矩阵同时呈现 5 个桌面端和 3 个移动端版本位，未发布平台只显示“规划中/预留通道”，不产生虚假下载入口。
+- `desktop-download.test.ts` 覆盖历史版本列表、按版本下载、历史便携包下载与未知版本 404；`pnpm typecheck` 通过；真实浏览器控制台无报错。
+
+#### 23.3.7.15 定时任务页满宽与文案精简（2026-11-27）
+
+**目标**
+
+1. 定时任务页不再固定在 1180px 居中，进入页面后铺满左侧栏右侧的整个内容区。
+2. 删除“一眼就知道怎么用”的说明性文案，只保留操作、字段、状态、数量与真实错误信息。
+3. 宽屏下任务列表自然扩展，右侧创建表单保持可读宽度；窄容器自动改为上下堆叠。
+
+**实现**
+
+- `.schedules-main` 去掉 `max-width: 1180px`，改为 `width: 100%`；两列网格为 `minmax(0, 1fr) clamp(380px, 29vw, 460px)`，宽屏多出的宽度全部给任务列表。
+- `.schedules-stage` 设为 `container-type: inline-size`，用 `@container (max-width: 900px)` 取代原先按 viewport 的 900px 断点；侧栏展开或收起时，按真实内容区宽度决定双列还是上下堆叠，右侧表单在窄屏变为 100% 宽。
+- 删除说明性文案：页头“个人空间 · 只显示我的任务”、Hero 说明段、“SCHEDULE CENTER / CREATE”英文眉题、列表底部执行说明、“仅自己可见”徽章、表单头部说明、表单底部操作提示、间隔输入的最小/最大提示。
+- 保留功能性信息：`Asia/Shanghai`、筛选计数、`共 N 个`、字段名、`选填`、占位示例、状态、执行时间、渠道和表单错误。
+- 空状态只留标题（如“没有进行中任务”），不再追加“去右侧创建 / 切换筛选”等指导句。
+
+**验收**
+
+- 1647×963 视口、264px 侧栏下，`.schedules-stage` 与 `.schedules-main` 宽度均为 1383px，左右内边距 26px，任务列表 853px，创建表单 460px；页面 `scrollWidth=1647`，无横向溢出。
+- 1200px 容器下仍为双列（`grid-template-columns: 670px 460px`）；800px 容器下自动变为 `display:flex` 上下堆叠。
+- 页面文本只剩标题、时区、筛选、计数、任务内容、表单字段和按钮；控制台无报错，`node --check chat.js` 通过。
+
+#### 23.3.7.16 员工端头部管理后台入口移除（2026-11-27）
+
+**改动**
+
+- 从员工端聊天页头部删除 `#console-entry` 按钮，日常对话顶栏不再出现“管理后台”。
+- 管理后台入口统一收进左侧栏 `更多` 菜单的 `#side-more-console`；入口仍按 `/api/me/console-entry` 的 `visible` 显示，点击时调用 `POST /api/me/console-entry/session` 换取跳转地址。
+- `chat.js` 的入口逻辑改为 `openConsoleEntry()` 与 `refreshConsoleEntry()` 共享，不再依赖头部按钮是否存在；同时给两个入口绑定点击，避免删除头部按钮后侧栏入口失效。
+- 跳转仍携带当前 `company` 与 `from=chat`；403 时重新拉取可见性并回到受控状态。
+
+**验收**
+
+- 员工端头部 `#console-entry` 数量为 0。
+- `#side-more-console` 不再隐藏，点击后真实进入 `http://127.0.0.1:8788/admin?company=c1&from=chat`。
+- 控制台无报错；`node --check chat.js` 通过。
+
+#### 23.3.7.17 个人插件栏范围说明移除（2026-11-27）
+
+**改动**
+
+- 插件·技能·伙伴页左侧 `myPluginRailHtml()` 的 `plugin-scope-block` 只保留“个人空间”眉题和本人姓名，删除 `<small>只显示你自己安装的插件</small>`。
+- 范围规则本身不变：接口和权限仍只返回、只操作本人安装的插件；本次仅移除重复说明文案。
+- 已安装数量、启用数量、工具数量、安装按钮和插件列表保持原样。
+
+**验收**
+
+- 插件工作台打开后，左侧顶部显示“个人空间 / 李鹏”，下方不再出现“只显示你自己安装的插件”。
+- `.plugin-scope-block small` 数量为 0；插件列表、统计和安装按钮正常。
+- 控制台无报错；`node --check chat.js` 通过。
+
+#### 23.3.7.18 项目浮层锚点修正（2026-11-27）
+
+**问题**
+
+输入区“项目”气泡打开后，`.space-menu` 虽然使用 `position:absolute`，但最近定位祖先是整条 `.composer-left`，而 `left:0` 又让它贴到输入区最左侧。结果浮层与右侧“项目”按钮脱节，横向落在输入框左边。
+
+**改动**
+
+- 用 `.space-picker` 包住 `#space-chip` 与 `#space-menu`，并设为 `position:relative; display:inline-flex; flex:0 0 auto`，让浮层锚点回到项目按钮本身。
+- `.space-menu` 使用 `left:0; right:auto`，浮层左边缘与项目气泡左边缘对齐，向上展开，不再固定贴输入区最左侧。
+- 宽度保留 `316px`，增加 `max-width: calc(100vw - 32px)`；`@media (max-width: 760px)` 时改为右对齐，避免窄屏向左溢出。
+
+**验收**
+
+- 1647px 视口下，项目气泡 `826–906px`，浮层 `826–1142px`，左边缘与气泡严格对齐；宽度 316px，右边缘仍在输入框（`468–1444px`）内。
+- 浮层仍向上展开，任务为空时显示“同账号还没有桌面项目”和“不使用项目”。
+- 页面 `scrollWidth` 等于视口宽度，无横向溢出；控制台无报错。
+
+#### 23.3.7.19 定时任务编辑、重新启用与物理删除（2026-11-27）
+
+**目标**
+
+员工端定时任务从“只能新建、暂停/恢复、软取消”扩展为可编辑、可重新启用、可物理删除。删除必须清除后台任务数据，不再保留 `cancelled` 占位行。
+
+**卡片动作矩阵**
+
+- `active`：暂停、编辑、复制、删除。
+- `paused`：启用、编辑、复制、删除。
+- `running`：仅复制；编辑与删除不渲染，服务端同时返回 409。
+- `done` / `error` / `cancelled`：编辑、复制、删除。已结束任务的卡片按钮统一叫“编辑”，进入编辑表单后由底部“保存并启用”说明会自动重新启用。
+
+员工端不再单独提供“取消”按钮，统一由“删除”停止后续执行；管理控制台旧的取消接口继续保留，语义仍是软取消。
+
+**编辑态**
+
+- 复用右侧创建表单，不另开弹窗。标题改为“编辑定时任务”，当前编辑卡片加品牌色描边，底部“清空”改为“退出编辑”。
+- 原 `active` 保存后保持启用并重算下次执行，按钮“保存修改”。
+- 原 `paused` 保存后保持暂停，不自动启用，按钮“保存修改”；之后在卡片点“启用”。
+- 原 `done/error/cancelled` 保存后自动转 `active`，清空 `attempts` 与 `last_error`，按钮“保存并启用”。
+- 一次性任务原时间已过期时，保存会被拒绝，要求重选未来时间，不静默改成十分钟后。
+- 单次任务回填时，`payload.at` 的 ISO/UTC 时间先转成本地时间再写入 `datetime-local`，避免后台存 `06:00Z`、表单显示 `06:00` 而卡片显示 `14:00` 的偏差。
+- 重新启用已结束任务同样受“每个员工最多 50 个进行中任务”限制。
+
+**接口**
+
+- `PATCH /api/schedules/:id`：接收与创建相同的 `title/prompt/mode/at/time/days/intervalMinutes/timezone/channel`，增加 `activate`；已结束任务必须显式传 `true`。
+- `DELETE /api/schedules/:id`：物理删除任务行、`schedule_runs` 执行记录和 `schedule_events` 事件日志；已产生的 `chat_messages` 对话内容和已经发出的钉钉消息保留。
+- `schedule.delete` 对话工具同步改为物理删除；控制台取消仍走软取消。
+
+**并发保护**
+
+- 调度器先用 `(schedule_id, scheduled_for)` 的 `INSERT OR IGNORE` 认领 occurrence，再用 `id + status='active' + updated_at` 条件更新为 `running`；条件不成立就删除刚插入的 run 并跳过本轮。
+- 编辑与删除都以 `updated_at` / `status` 做条件写，运行中任务直接 409，避免调度器用旧规则继续执行或用完成回调覆盖新状态。
+
+**验收**
+
+- 单元测试：`schedule.test.ts` 14 项通过，覆盖编辑保持启用、编辑保持暂停、结束后显式启用、物理删除三张表、运行中拒绝编辑/删除、过期单次任务明确提示；`console-schedules.test.ts` 5 项通过。
+- 真实页面：已取消的“页面联调测试”点“编辑”进入表单，点“保存并启用”后变为“运行中”，下次执行重算为 2026-11-28 09:00；暂停后再编辑仍保持“已暂停”；点“启用”恢复运行；删除确认文案正确，删除后列表从 4 条变 3 条。
+- 单次任务“下午两点提鿁”的 `payload.at` 为 `2026-11-24T06:00Z`，编辑表单已回填为本地 `2026-11-24T14:00`。
+- 删除后直接查询运行库，`user_schedules`、`schedule_runs`、`schedule_events` 中该任务计数均为 0；页面控制台无报错。
+
+#### 23.3.7.20 过期单次任务即时提醒
+
+**设计口径**
+
+- 已过期的单次时间不创建、不落库。创建后既不会执行，还会占一条“进行中”记录并触发上限校验，因此采用“提醒并拦截”，而不是静默生成永不执行的任务。
+- 提醒从“提交后报错”提前到“输入时提示”：`#schedule-once-at` 下方常驻一个 `role="alert"` 提示位，仅异常时显示红字，正常时隐藏且不占位。
+- 三类异常分别给不同文案：已过期、距当前不足 30 秒、时间格式无效；已过期文案明确写出“该任务时间已过期，不会执行。请选择未来时间。”，让员工知道后果而不只是“时间不合法”。
+- 编辑已结束的单次任务时，回填的旧时间通常已过期，进入编辑即显示提示；员工改到未来时间后提示自动消失，保存并启用才会成功。
+- 前端拦截不作为唯一防线：服务端 `createSchedule` 与 `updateSchedule` 共用 `assertOnceRunFuture`，绕过页面直接调接口同样返回 `not_future`，提示文案与前端一致。
+
+**实现**
+
+- `chat.html`：`#schedule-once-warning` 位于时间输入框之后。
+- `chat.js`：`scheduleOnceTimeState()` 将单次时间分为 `empty / invalid / expired / too_soon / ok`；`refreshScheduleOnceWarning()` 在模式切换、编辑回填和输入时实时刷新，非单次模式自动隐藏并移除 `aria-invalid`；`buildSchedulePayload()` 在提交前复用同一判断并抛出对应文案。
+- `chat.css`：`.schedules-field-warning` 用 `--deny` 红色小字，跟随字段宽度，不挤压表单布局。
+- `schedule.ts`：`assertOnceRunFuture(next, now)` 先判断 `next < now` 返回“已过期，不会执行”，再判断 `next <= now + 30s` 返回“时间太近”；创建和编辑统一调用，替换原先只校验 30 秒且文案笼统的实现。
+
+**验证**
+
+- `schedule.test.ts` 14 项通过，新增“创建已过期的单次任务时明确说明不会执行”，断言错误码 `not_future`、消息同时包含“已过期”和“不会执行”。
+- `pnpm typecheck` 与 `node --check chat.js` 通过。
+- 真实页面：编辑“下午两点提鿁”，单次时间回填为本地 `2026/11/24 14:00`，字段下方立即出现红色提示；改为未来 10 分钟后提示消失且 `aria-invalid` 移除；提交过期时间时表单错误与字段提示同时出现，未写入任务记录；退出编辑后提示复位隐藏。
+
+#### 23.3.7.21 定时任务流式回复与钉钉过程面板（2026-11-27）
+
+**问题**
+
+- 定时任务原先走“后台跑完整轮、再插入 assistant 消息、最后 `publishChatEvent({ type: 'message' })`”的路径，页面在任务执行期间没有任何增量，回答只能一次性出现。
+- 定时任务 assistant 消息的过程元数据写成 `meta.tools`，页面历史与实时收口读的是 `meta.toolCalls` 和 `meta.reasoning`，因此刷新后即使有调用记录也不显示思考与工具。
+- 钉钉最终通知使用 `sendDingTalkRichTextToUser()`，构造 A2UI 卡片时把 `reasoning` 和 `tools` 固定为空；面板切换回调又依赖 `channel_turns` 反查 `card_instance_id -> session_id`，定时任务没有登记这张表，用户点击思考/工具面板会被拒绝，日志表现为“卡片与会话不匹配”。
+
+**设计口径**
+
+- 不新增前端协议：定时任务复用普通对话已经在用的 `chat-events` 总线和 `delta / tool / tool_result / subagent` 渲染链，避免维护两套前端状态机。
+- 先分配稳定的 `assistantMessageId`，再开始执行；所有增量都绑定这个节点，最终 assistant 消息复用同一 ID，页面收口时不会出现“实时气泡消失、另起一条历史消息”的跳变。
+- 定时任务期间关闭模型事件缓冲（`bufferModelEvents: false`），正文与思考按 token 发出；普通后台唤醒仍保留缓冲，避免无人观看时浪费事件。
+- 落库元数据与普通对话统一为 `reasoning / toolCalls / thinkingMs`；工具记录统一走 `chat.tracesForStorage()`，不把临时 `trace` 直接写进消息。
+- 钉钉采用“先建流式卡、边跑边更新、结束时同一张卡收口”；建卡或收口失败时才退回最终富文本/A2UI 新卡，不让用户丢结果。
+- 为了让面板点击可反查会话，定时任务建卡成功后立即写一行 `channel_turns`，以 `schedule:<scheduleId>:<runId>` 作为 `event_key`，避开唯一索引，并记录 `card_instance_id`、`session_id`、`assistant_message_id`；结束后把状态更新为 `completed` 或 `failed`。
+
+**实现**
+
+- `packages/server/src/schedule.ts`：`runSchedule()` 新增 `liveAnswer / liveReasoning / liveTools / liveToolNames / thinkingStartedAt / thinkingDone / thinkingMs / dingCard / dingCardTurnId`；`emit` 按事件类型分流：
+  - `reasoning` 累加思考并 `publishChatEvent({ type: 'delta', kind: 'reasoning' })`；
+  - 首个 `content` 到达时结算 `thinkingMs`、把 `thinkingDone` 置真，再按 token 广播 `delta/content`；
+  - `tool` 与 `tool_result` 同时更新本地记录和钉钉卡片，并向 SSE 广播工具事件；
+  - `agent` 事件转成 `subagent` 广播，保留子 Agent 团队面板。
+  - 最终 assistant 消息的 `meta` 改为 `reasoning: finalReasoning`、`toolCalls: storedTools`、`thinkingMs`、`runId`。
+- `packages/server/src/dingtalk-outbound.ts`：新增 `DingTalkRichTextSendInput`（可选 `reasoning / tools / toolDetails / thinkingMs / sessionId`）和 `startDingTalkAICardToUser()`；`sendDingTalkRichTextToUser()` 的 A2UI `state` 不再固定清空思考与工具。原有审批、工具审批调用方不传这些字段，行为保持不变。
+- `packages/server/src/dingtalk-card.ts`：沿用 `DingTalkAICardStream.start/update/finish/fail`，状态覆盖正文、思考、工具摘要、工具明细、思考耗时和会话 ID。
+- `channel_turns` 登记字段：`provider='dingtalk'`、`external_id` 为外部用户 ID、`session_id`、`card_instance_id`、`card_kind='a2ui'`、`status='running'`，结束时更新为 `completed/failed`。
+- 回退卡补登记：流式卡收口失败后重新发送最终 A2UI 卡时，原 `channel_turns` 行的 `card_instance_id` 更新为新卡；建卡直接失败、最终卡才成功的场景补写 `<runId>:fallback` 行。这样两种路径的思考/工具按钮都能反查到会话。
+- 回退通道与会话绑定：创建钉钉任务时忽略请求里的网页 `sessionId`，只有网页任务允许保留当前网页会话；编辑任务时，钉钉通道一律解绑旧会话，执行时由 `ensureChannelSession` 重新取固定钉钉会话，网页通道未改通道则继续沿用原网页会话。
+- 执行前再校验会话来源：`chat_sessions.source` 不是 `dingtalk`、或 `external_id` 与当前员工不一致时，钉钉任务会丢弃旧 `session_id`；网页任务也会拒绝钉钉会话。这样即使历史数据里通道被改过，也不会把钉钉结果和 SSE 增量塞进当前网页对话。
+- 未修改 `chat.js / chat.html / chat.css`：现有前端已支持按 `messageId` 建实时快照、按 `tool/tool_result` 建工具卡、最终用 `meta.reasoning / meta.toolCalls` 收口。
+
+**验证**
+
+- 真实网页任务 `流式验收2`（`sch_7ff5aef2-780c-48cc-8d00-e037785ba95f`）：21:02:08 出现独立实时节点 `msg_71f4a9a7-b09f-4858-a87f-11bc4146bbec`，状态“正在思考中…”，SSE 连续收到 `delta/reasoning`；21:02:14 工具面板出现“写任务计划 → 列出我的文件和文件夹”；随后依次出现“读取 README.md”“读取工作区文件”“读取 AGT-08_测试用例摘要.md”；21:03:59 正文开始按 token 增长，21:04:02 落库完成。
+- 该轮 `schedule_runs` 状态 `success`、`delivery='sent'`；assistant 消息正文 3534 字、`reasoning` 4860 字、`thinkingMs=117191`、`toolCalls` 8 条，`channel='web'`。页面最终节点同时保留可展开的思考面板与工具面板（`think-panel is-collapsed` + `tool-panel is-collapsed`），工具明细含参数与结果，不再出现“只有正文、没有过程”。
+- 钉钉侧新建“介绍一下自己”任务复跑：A2UI 卡片 `eab_a2ui_101516e028934516b70692ac607092c3` 创建成功，`channel_turns` 已记录 `card_instance_id`、`external_id` 与 `session_id`，状态 `completed`；面板回调可据此反查到正确会话。旧测试卡 `eab_a2ui_acd1beeac01c4741b765543df5d03067` 早于登记逻辑，没有 `channel_turns`，点击仍会被拒绝，属于历史卡限制。
+- `packages/server/test/dingtalk-outbound.test.ts` 7 项通过，新增“定时任务通知把思考过程和工具明细写进最终卡片”，断言创建请求包含思考文本、工具名与正文。
+- 真实接口验证通道解绑：带当前网页 `sessionId` 创建钉钉任务，返回 `sessionId:null`；创建网页任务仍保留原网页会话；把该网页任务 PATCH 成钉钉通道后 `sessionId` 归零。验证后已删除两条临时任务。
+- `schedule.test.ts` 15 项、`console-schedules.test.ts` 5 项通过；新增“钉钉通道不复用网页会话，切换回推通道时解绑旧会话”。
+- `pnpm typecheck` 通过；未改前端，因此无需重新构建静态资源。
+
+#### 23.3.7.22 定时任务图表按投递渠道收窄（2026-11-27）
+
+**问题**
+
+- 钉钉定时任务“个人本月加班数据分析”返回了折线图和一个 `doughnut` 环形图；折线图正常渲染，环形图被钉钉卡片判定为非原生图表，最终卡片出现“这个图表类型在钉钉消息里无法保持原图，已不画近似图；请到网页端查看”的提示。
+- 实时钉钉对话早已按 `channel='dingtalk'` 构建提示词，只有定时任务漏了渠道参数：`runSchedule()` 调用 `chat.buildSystemPrompt()` 时没有传 `channel`，函数默认按 `web` 处理，模型拿到的是网页端 17 种图表清单，因此会生成环形图、面积图、雷达图等钉钉不支持的类型。
+
+**修复**
+
+- `packages/server/src/schedule.ts`：`runSchedule()` 按任务行 `row.channel` 计算提示渠道，`dingtalk` 传 `dingtalk`，其余传 `web`；定时任务不再默认落到网页图表清单。
+- `packages/domain/src/chart-catalog.ts`：图表选型句也按渠道分流。钉钉只保留“占比 pie、比较 bar/horizontalBar、趋势 line、关系 scatter、结构对比 stackedBar/groupedBar”，不再向模型提示 `doughnut`、`area`、`radar` 等清单外类型；多序列数据形态说明中的 `line/area` 在钉钉改为 `line`。
+- 钉钉提示词只列 `pie / bar / horizontalBar / line / scatter / stackedBar / groupedBar` 7 种原生图表；构成类数据应使用饼图，不再生成环形图。
+
+**验证**
+
+- 从 `.eab-dev/eab.db` 读出问题任务的最近一次 `schedule_runs.result_text`，确认正文同时包含 `line` 与 `doughnut` 两个 `chart` 块；对应任务 `sch_a75bd2d4-7c37-462a-809d-365d47c41f90`，`channel='dingtalk'`。
+- `data-turn-prompt.test.ts`（8 项）、`chart-catalog.test.ts`（9 项）、`dingtalk-outbound.test.ts`（7 项）、`schedule.test.ts`（17 项）共 41 项通过；`data-turn-prompt` 新增断言：钉钉提示词全文不出现 `doughnut` 与 `line/area`。`tsc -p tsconfig.json --noEmit` 通过。
+- 历史已发出的卡片不回溯改写；修复从下一次定时任务执行开始生效。
+
+#### 23.3.7.23 定时任务间隔支持秒/分钟/小时/天/月/年（2026-11-27）
+
+**问题**
+
+- 原“间隔”只能填分钟（`intervalMinutes`，前端 5～10080 分钟），无法配置秒级巡检、按天轮询、月度盘点和年度复盘。
+- 工具 schema、API、前端标签、控制台标签都写死“分钟”，DSH 的 `every_seconds` 又要求最少 300 秒，短周期任务只能退化成分钟任务。
+
+**设计口径**
+
+- interval 规则改成“数值 + 单位”：`intervalValue` 为正整数，`intervalUnit` 取 `second / minute / hour / day / month / year`；单位同时接受中文“秒/分钟/小时/天/月/年”和常见英文缩写。
+- 秒级最低 30 秒：调度 worker 每 15 秒扫一次，低于 30 秒没有实际精度；分钟/小时/天/月/年最低 1。
+- 数值上限 10000，避免极端配置把下一次执行时间推到不可控范围。
+- 月和年按任务时区的本地日历推进，不按固定 30 天/365 天：1 月 31 日加 1 个月落到 2 月末，闰年 2 月 29 日加 1 年落到次年 2 月 28 日。
+- 旧任务不改写：`rule_json` 里只有 `intervalMinutes` 的历史任务继续按分钟解释；编辑保存后再写成新字段。API 仍接受 `intervalMinutes` 兜底，工具仍接受 `every_seconds`。
+- 秒级任务的“下次执行”显示到秒；日/周/单次任务保持原来的分钟粒度，不额外制造噪音。
+
+**实现**
+
+- `packages/server/src/schedule.ts`：新增 `IntervalUnit` 类型、`ScheduleRule.intervalValue / intervalUnit`、`ScheduleInput.intervalValue / intervalUnit`；新增 `INTERVAL_UNIT_ALIASES`、`INTERVAL_UNIT_MS`、`MIN_INTERVAL_SECONDS=30`、`MAX_INTERVAL_VALUE=10000`。
+- `normalizeIntervalUnit()` 负责单位归一化；`intervalRuleOf()` 统一校验正整数、上限与秒级下限，`normalizeRule()` 的 `intervalValue / intervalUnit` 分支和 `everySeconds` 分支都复用它。
+- `addLocalMonths()` / `addIntervalAt()` 负责推进：秒/分钟/小时按固定毫秒，天/月/年按任务时区的本地日历推进（天保持本地钟点，月/年夹到目标月最后一天）；`nextRunAt()` 的 interval 分支改走 `addIntervalAt()`。
+- `toLocalIso()` 增加可选 `withSeconds` 参数；`rowView()` 只在秒级 interval 的 `nextRunLocal` 传 `true`，其余任务保持 `HH:mm`。`scheduleFailure` 的提示文案改为六种单位并提示 `intervalValue + intervalUnit`。
+- `packages/server/src/routes/schedules.ts`：`scheduleInputFromBody()` 增加 `intervalValue / intervalUnit` 透传。
+- `packages/server/src/routes/tools.ts`：`schedule.create` 描述与 schema 增加 `intervalValue / intervalUnit`，`everySeconds` 下限从 300 改为 30；执行时把两个新参数传给 `createSchedule()`。
+- `packages/server/src/routes/chat.ts`：系统提示同步为 `every_seconds（最少 30 秒）`或 `interval_value + interval_unit`。
+- 前端 `chat.html`：`#schedule-field-interval` 内改为数值输入 `#schedule-interval-value`（1～10000）加单位下拉 `#schedule-interval-unit`（秒/分钟/小时/天/月/年），默认 30 分钟。
+- `chat.js`：`scheduleIntervalParts()` 统一解析新旧规则，列表标签输出“每 30 秒 / 每分钟 / 每 2 小时 / 每 2 天 / 每月 / 每年”；`buildSchedulePayload()` 提交 `intervalValue + intervalUnit` 并做前端校验；编辑回填数值与单位；单位切到“秒”时把最小值抬到 30 并自动纠正小于 30 的数值。
+- `chat.css`：新增 `.schedule-interval-row`，输入框自适应、单位下拉固定 96px，与已有周几行保持同一套间距。
+- `app.js`：控制台 `taskRuleText()` 同步六种单位与新字段，旧 `intervalMinutes` 仍显示“每 N 分钟”。
+
+**验证**
+
+- `schedule.test.ts` 17 项通过：新增“数值 + 单位、秒级最低 30 秒”“月/年按本地日历夹到月末与闰日”“兼容旧 intervalMinutes”，`every_seconds` 断言改为返回 `intervalValue/intervalUnit` 并按 20 秒触发 `frequency_too_high`。
+- `console-schedules.test.ts` 5 项、`dingtalk-outbound.test.ts` 7 项通过，共 29 项；`pnpm typecheck`（`tsc -p tsconfig.json --noEmit`）通过。
+- 真实页面验收：创建 30 秒网页任务后列表显示“每 30 秒 / 下次 2026-11-27 21:22:57”，删除确认后任务立即消失；创建“每 2 天”任务后列表显示“每 2 天 / 下次 2026-11-29 21:29”，点击编辑回填数值 `2` 与单位 `天`，随后删除。两条临时任务均已清理，没有产生 `schedule_runs` 或对话消息。
+- 页面截图：`.eab-dev/schedules-interval-units-20261127.png`。
+
+#### 23.3.7.24 定时任务时间选择器改为自定义连续双列（2026-11-27）
+
+**问题**
+
+- 定时任务的每日/每周时间仍使用原生 `<input type="time">`。Chromium 原生弹层在选中 `09:00` 时，左侧小时列从 `09` 连续向下，右侧分钟列却从 `01` 重新开始且整体下移，`00` 与 `01` 之间出现一块明显空白；该弹层属于浏览器 UI，页面 CSS 无法修正内部行距。
+
+**实现**
+
+- `chat.html`：`#schedule-daily-time`、`#schedule-weekly-time` 从 `type="time"` 改为 `type="text" readonly`，保留 `value="09:00"`；单次任务拆成日期 `#schedule-once-date` 加自定义时间 `#schedule-once-time`，隐藏域 `#schedule-once-at` 继续保存 `YYYY-MM-DDTHH:mm`，业务侧仍按原格式读取，不改 `buildSchedulePayload()` 与提交格式。
+- `chat.js`：新增单例 `#schedule-time-popover`，两列分别渲染小时 `00–23`、分钟 `00–59`，共 84 个 `button[role="option"]`；选项高 32px、无外边距和间隙，列高固定并可滚动，滚动条隐藏，保证上下连续。
+- 三个时间输入共用同一套选择器；单次的日期或时间变化都会回写隐藏域并刷新过期/过近提示。
+- 打开时按输入框位置向下展开，空间不足则向上；选中项滚到列顶部并与另一列对齐，避免两列选中行一高一低。点击选项立即写回输入框并派发 `input` 事件。
+- 支持 ArrowUp/Down 连续切换、Home/End、左右列切换、Esc 关闭、点击外部或焦点移出关闭；输入框 Enter/Space/ArrowDown 打开。窗口 resize 与页面滚动时重新定位。
+- `chat.css`：新增 `.schedule-time-input`、`.schedule-time-popover`、`.schedule-time-columns`、`.schedule-time-column`、`.schedule-time-option`、`.is-selected`；选中项使用品牌浅绿底。浮层默认 `opacity:1`，避免入场过渡在低帧率环境下停留于透明状态；暗色主题单独调整阴影。
+
+**验证**
+
+- `node --check packages/server/public/chat.js`、`node --check packages/server/public/app.js` 通过。
+- 真实页面点击“每天几点”后浮层可见，小时列从 `09` 起连续显示 `10/11/12...`，分钟列从 `00` 起连续显示 `01/02/03...`，`00` 与 `01` 之间无空白；点击分钟后输入框从 `09:00` 变为 `09:01`，再点小时变为 `10:01`，两列选中态同步；Esc 关闭后焦点回到输入框，`aria-expanded` 复位。
+- 切到“每周”后同一浮层在周几行上方正常展开，仍为 84 个连续选项；切到“单次”后日期与时间拆成同一行，时间列从选中值连续展示，选择 `21:51` 后隐藏域同步为 `2026-11-27T21:51`，修改日期后同步为 `2026-11-28T21:51`。
+- 页面截图：`.eab-dev/schedules-time-picker-20261127.png`、`.eab-dev/schedules-weekly-time-picker-20261127.png`、`.eab-dev/schedules-once-time-picker-20261127.png`。
+
+**后续增强：循环滚动与键盘输入（2026-11-27）**
+
+- 小时/分钟两列由单份 `00–23` / `00–59` 改为 5 份首尾相接的循环内容（共 420 个选项），可视区固定在中间副本；滚动越过边界时按整周期平移 `scrollTop`，实现向上、向下都能无限循环，`23→00`、`59→00` 不再停住。
+- 每日、每周、单次、间隔四个时间输入取消 `readonly`，保留点击打开轮盘的行为，同时把焦点留在输入框并全选当前值，用户可直接键入时间，不必再手动清空。
+- 支持 `930`、`0930`、`9:30`、`2359`、`23:59`、`9`、`23` 等写法；按 `Enter` 或失焦时归一为 `HH:MM`，并同步单次/间隔的隐藏 `at` 值。
+- 输入非法（如 `24:00`、`9:60`）时回退到上一个有效时间，短暂显示 1.2 秒警示边框；输入合法后立即清除警示。
+- 点击输入框且尚未输入时仍可打开轮盘；一旦开始键入，轮盘自动收起，避免键盘输入与轮盘选中状态不一致。
+- 验证：`node --check chat.js` 通过；浏览器实测点击后输入 `930` 并按 Enter 得到 `09:30`，间隔隐藏值同步为 `2026-11-27T09:30`；输入 `2359` 后点击其他字段得到 `23:59`；输入 `2460` 失焦回退到 `09:30` 且隐藏值同步；每日、单次输入同样生效。
+
+#### 23.3.7.25 定时任务结果回推到改为钉钉/对话/新建对话（2026-11-27）
+
+**问题**
+
+- 原下拉只有“网页对话 / 钉钉”两个泛选项，网页对话无法指定落到哪一个会话，也不支持让定时任务自动建一个对话显示结果。用户要求显示钉钉和全部网页对话、移除“网页对话”，并增加“新建对话”；选中新建对话后，首次执行时新建会话，后续每次执行继续落在这个会话里。
+
+**实现**
+
+- `chat.html`：`#schedule-channel` 保留为隐藏值容器（`dingtalk` / `new` / `session:<id>`），外层改为自定义触发按钮 + 搜索浮层。浮层内平铺“钉钉”“新建对话”和侧栏全部网页对话标题，不显示“对话”“已有对话”等分组标题。
+- `chat.js`：新增 `scheduleSessionTargets()`、`scheduleSessionTitle()`、`scheduleTargetValue()`、`scheduleTargetLabel()`、`renderScheduleTargetOptions()`、`renderScheduleTargetMenu()`、`bindScheduleTargetPicker()` 等；只列非钉钉、非飞书的网页会话，按最近使用排序。搜索框按标题包含关键词过滤（支持空格分隔多个关键词、忽略大小写），“钉钉”“新建对话”始终固定在最上方。选择后按钮显示真实标题，编辑表单不再显示“对话 ·”前缀。
+- 下拉支持键盘操作：触发按钮 Enter/Space/ArrowDown 打开，搜索框 ArrowDown/Up 进入选项列表，选项间 ArrowDown/Up/Home/End 移动，Enter 选中搜索到的会话，Esc 或点击外部关闭；窗口 resize、页面滚动时自动重新定位，空间不足时向上展开。
+- `chat.css`：`.schedule-target-trigger` 负责输入框外观与省略长标题，`.schedule-target-popover` 为固定定位浮层，`.schedule-target-options` 限高滚动，选中项使用品牌浅绿底和右侧对勾；浮层阴影在暗色主题单独调整。
+- `buildSchedulePayload()` 继续读取隐藏 `#schedule-channel`，发送 `channel: 'dingtalk' | 'web'` 与 `sessionId: string | null`；打开定时任务页时刷新选项。
+- `schedule.ts`：`ScheduleInput.sessionId` 支持 `null`；`createSchedule` 把 `null` 保存为 SQL NULL，表示首次执行时新建对话。新增 `bindScheduleSession()` 统一处理执行时的会话解析：已有会话仍存在且渠道匹配则复用；网页任务无会话时创建 `source='schedule'` 的 `chat_<uuid>` 会话并回写 `user_schedules.session_id`；钉钉通道继续由 `ensureChannelSession()` 建固定会话。调度 worker 每次 tick 重新 `SELECT *` 取任务行，因此第一次回写后，后续执行拿到的就是已绑定会话。
+- `routes/schedules.ts`：`scheduleInputFromBody` 保留 `sessionId` 的 `null` 语义，POST 直接传完整 `ScheduleInput`，不再把 JSON `null` 经 `String()` 写成字符串 `"null"`。
+
+**验证**
+
+- `schedule.test.ts` 覆盖“网页任务可以选择已有对话，也可以选择新建对话；编辑时显式 null 会解绑”，并新增“新建对话只在首次执行建会话，后续执行沿用同一个会话”：首次 `bindScheduleSession()` 生成一个 `chat_...` 并回写任务行，第二次以回写后的任务行再执行仍返回同一 ID，`chat_sessions` 中 `source='schedule'` 的会话数量保持 1。
+- 真实页面验收：下拉平铺“钉钉 / 新建对话 / 晚上好”，无分组标题；搜索“晚上”保留匹配会话，搜索“abc”只保留两个固定项并显示“没有匹配的对话”；选中“晚上好”后按钮显示“晚上好”，隐藏值变为 `session:chat_...`，再次打开搜索框已清空。
+- `tsc -p tsconfig.json --noEmit`、`node --check chat.js` 与 `schedule` 21 项测试通过。
+- 页面截图：`.eab-dev/schedule-target-dropdown-20261127.png`。
+
+#### 23.3.7.26 间隔任务增加“执行时间”并重排三块布局（2026-11-27）
+
+**问题**
+
+- 间隔模式原先只有“数值 + 单位”，用户无法在创建前确认下一次到底什么时候执行；编辑已有任务时也看不出服务端已经排到哪一次。
+
+**口径**
+
+- “执行时间”不是让用户填首次执行时间，而是只读显示下一次执行时间：新建时等于“当前时间 + 间隔”，编辑时优先显示服务端真实的 `nextRunAt`。
+- 任务每次执行完成后，服务端把 `next_run_at` 推进到“执行完成时间 + 间隔”；页面在定时任务页可见时每 15 秒静默同步一次，并在窗口重新获得焦点或标签页恢复可见时立即同步，因此该显示会一直是新的下一次时间，不需要用户手动刷新。
+- 静默同步使用 `cache: 'no-store'` 并附带 `ts` 时间戳，避免浏览器复用旧的 `/api/schedules` 响应；静默请求不受页面加载锁影响，避免一次挂起请求把自动刷新永久卡住。
+
+**实现**
+
+- `chat.html`：间隔字段拆为三块——数值输入、单位下拉、只读“执行时间”卡片；数值和单位合入 `.schedule-interval-every`，视觉上仍为三个字段。
+- `chat.js`：新增 `schedulePreviewNextAt()`、`schedulePreviewText()`、`refreshScheduleIntervalPreview()`、`scheduleIntervalPreviewBound` 与每秒定时器；支持秒/分钟/小时/天/月/年，月/年推进沿用服务端的月末夹取规则。编辑真实任务时绑定 `nextRunAt`，用户改动数值或单位后解除绑定并按“现在 + 新间隔”重算。
+- `chat.js`：新增 `scheduleLastListSyncAt` 和静默 `loadSchedules({ silent: true })`；定时任务页可见时每 15 秒拉一次最新排期，`window` 获得焦点、标签页恢复可见时也立即拉取，执行完成后的 `nextRunAt` 会直接反映到任务卡片与编辑表单，不闪“正在读取”。
+- `chat.css`：`.schedule-interval-row` 使用两列网格，左侧组合控件为“数值 + 单位”，右侧为执行时间卡片；聚焦只改组合控件边框，不出现 outline 或外圈阴影；暗色主题沿用现有变量。
+- 时间显示格式：同年 `MM-DD HH:mm`，跨年 `YYYY-MM-DD HH:mm`，秒级追加 `:ss`；无效值显示“下次 —”。
+
+**验证**
+
+- 新页面加载后，1367 宽度下卡片约 `180 × 40`、数值输入约 `91 × 38`、单位下拉 `74 × 38`；1050 宽度下卡片约 `335 × 40`、数值输入约 `234 × 38`，三块同排、同高、无溢出。
+- 新建间隔任务实测：1 分钟任务的 `created_at=1795787327685`、`next_run_at=1795787387685`，严格相差 60,000ms；到点执行后 `last_run_at=1795787396323`、`next_run_at=1795787466529`，下一次已自动顺延，并创建网页会话、正确回写 `session_id`。
+- 编辑已有任务时，表单“执行时间”显示服务端真实的 `下次 2026-11-27 21:51:06`，与 `next_run_at` 一致，不是“当前时间 + 间隔”的错误预览。
+- 预览联动：1 小时显示 `下次 11-27 22:48`，45 秒显示 `下次 11-27 21:49:15`，1 分钟显示 `下次 11-27 21:49`。
+- 自动刷新实测：30 秒间隔任务创建时卡片显示 `下次 2026-11-27 22:15:21`，首次执行结束后未点刷新，卡片自动变为 `下次 2026-11-27 22:16:01`，与服务端推进后的 `next_run_at` 一致；观察期间 `/api/schedules` 每 15 秒出现一次新请求。
+- 页面截图：`.eab-dev/schedule-interval-next-20261127.png`（1367 新建）、`.eab-dev/schedule-interval-edit-20261127.png`（1050 编辑，显示真实下次时间）。
+- 验收任务“间隔时间验收”“自动刷新验收”“自动刷新最终”“自动刷新终验”及其实测会话均已删除；`user_schedules` 计数为 0，相关测试会话 `deleted_at` 均已写入，属于软删除，可在审计中追溯。
+
+#### 23.3.7.27 桌面本机终端（2026-11-27）
+
+**目标**
+
+- 桌面版右侧“新标签页”补上「打开终端」胶囊，打开后在右侧工作台生成独立「终端」标签，和网页标签、云空间、审批、文件预览并列。
+- 交互与视觉对齐豆包桌面版：深色终端画布、顶部 PowerShell 标识、当前目录、清屏/复制/重启/关闭、底部状态与快捷键提示。
+- 该能力只在 Electron 桌面宿主出现。Web 形态没有 `window.eabDesktop`，新标签页不渲染入口，也不会产生终端标签。
+
+**实现**
+
+- `packages/desktop/main.mjs`：新增 `terminalSessions` 和按会话隔离的 PowerShell 子进程。启动参数固定为 `-NoLogo -NoProfile -NoExit -Command`，初始化 `[Console]::InputEncoding/OutputEncoding`、`$OutputEncoding` 为 UTF-8，关闭进度条，`prompt` 固定为 `PS> `。
+- IPC：`eab:terminal-create` / `eab:terminal-input` / `eab:terminal-close` / `eab:terminal-restart` / `eab:terminal-copy`；主进程按 16ms 合并 stdout 后通过 `eab:terminal-data` 推送，退出通过 `eab:terminal-exit` 推送。关闭窗口、页面重载、渲染进程崩溃和应用退出时统一按进程树结束，避免残留 PowerShell。
+- `packages/desktop/preload.cjs`：通过 `contextBridge` 暴露 `terminalCreate`、`terminalInput`、`terminalClose`、`terminalRestart`、`terminalCopy`、`onTerminalData`、`onTerminalExit`，不暴露 Node 能力。
+- `chat.html`：新标签页增加 `#web-draft-terminal` 胶囊；工作台增加 `#terminal-pane`，包含输出区、输入行、状态栏和四个操作按钮。
+- `chat.js`：新增 `terminal` 工作台类型与 `hasTerminal/showTerminal` 布局；终端打开后加入标签栏，关闭时按进程树结束；支持命令历史（↑↓）、Ctrl+L 清屏、Ctrl+` 打开、复制全部输出、重启、错误/退出状态；输入焦点只改输入行边框，不画 outline 或外圈阴影。
+- `chat.css`：终端使用独立深色面板和等宽字体，容器宽度小于 430px 或窗口小于 900px 时头部改纵向、按钮换行；终端栏沿用网页栏 44% 的默认分栏比例。
+
+**边界**
+
+- 当前使用 `child_process` 管道，不是完整 PTY。支持交互式命令行程序的“逐行输入/输出”，但 vim、ssh、top 等依赖光标定位和全屏重绘的程序不保证可用；需要时再引入 `node-pty` 并处理 Electron 原生模块重建。
+- 终端命令以当前 Windows 用户身份执行，不再经过 Agent 工具审批；它是用户主动打开的本机终端，不是模型可调用的工具。模型仍只能使用受限的 `project.exec` / 文件桥能力。
+
+**验证**
+
+- Electron `--terminal-probe` 自检：`terminalCreate` 返回 `{ ok:true, shell:"PowerShell", cwd:"D:\\AI kaifa\\EAB", pid:... }`，输入 `echo 中文终端测试` 后输出 `PS> echo 中文终端测试\r\n中文终端测试\r\nPS> exit\r\n`，中文未乱码，`exit` 触发退出码 0；`terminalCopy` 返回 `{ok:true}`。
+- 前端用桌面桥模拟验证：新标签页显示「打开终端」，点击后生成「终端」标签，输入命令后输出、清屏、关闭均正常；移除模拟桥后 Web 端 `terminalHidden=true`，不显示入口。
+
+#### 23.3.7.28 侧栏响应式断点与抽屉空白修复（2026-11-27）
+
+**问题**
+
+- 侧栏原在 `≤1120px` 切换为覆盖式抽屉，但文件末尾的桌面侧栏样式又把 `.chat-side` 覆盖成 `position: relative; flex: 0 0 264px; width: 264px`。收起后侧栏自身仍占一列布局宽度，同时又被 `transform` 移出画面，于是留下一整条空白，看起来像“侧边栏不见了”。
+- 用户截图 `1237×1290` 对应 CSS 视口约 `998px`：实测侧栏 `x=-316 / width=304 / visibility:hidden`，对话舞台从 `x=304` 开始，左侧空白正好是抽屉宽度。
+
+**实现**
+
+- `chat.js`：侧栏紧凑断点从 `1120px` 改为 `960px`；`canSidePeek()` 的桌面判断改为 `min-width: 961px`，`isCompactShell()` 与 `matchMedia` 变更监听同步为 `max-width: 960px`。
+- `chat.css`：旧抽屉媒体查询同步改为 `960px`；并在文件末尾补一段最终覆盖规则，避免被后续桌面侧栏样式反超。
+- `961–1216px`：侧栏保持普通固定列，宽 `264px`，对话舞台从侧栏右侧开始，不再自动收起。
+- `≤960px`：侧栏改为 `position: absolute` 的 `288px` 抽屉，对话舞台始终 `width: 100%`；收起时抽屉 `translate3d(-104%, 0, 0)` 且不可见，展开时覆盖在内容上，配套遮罩与顶栏按钮品牌色提示。
+- 抽屉的 `flex/width/padding` 使用 `.chat-body.is-side-collapsed .chat-side` 同等或更高优先级覆盖旧的 `304px` 规则，避免打开/收起时宽度跳变。
+
+**验证**
+
+- CSS 视口 `998px`：`chat-side` 为 `x=0 / width=264 / visible`，`chat-stage` 为 `x=264 / width=734`，左侧不再有空白；顶部栏按钮可见。
+- CSS 视口 `900px`（同源 iframe 验收）：收起态 `chat-side` 为 `x≈-299 / width=288 / visibility:hidden`，`chat-stage` 为 `x=0 / width=900`；展开态抽屉 `x=0 / width=288`，舞台仍为 `x=0 / width=900`，按钮为 `32×32`。
+- `node --check packages/server/public/chat.js` 通过；浏览器确认最终 `@media (max-width: 960px)` 规则已加载。
+- 页面截图：`.eab-dev/sidebar-998-chat-fixed.png`。
+
+#### 23.3.7.29 定时任务窄屏单列不再与表单重叠（2026-11-27）
+
+**问题**
+
+- 定时任务页在容器宽度 `≤900px` 时从双列改为单列；但 `.schedules-left` 和 `.schedules-compose` 仍保留默认 `flex-shrink: 1`。有任务列表时，两块内容总高度超过一屏，表单被纵向压扁，而 `overflow: visible` 让表单内容溢出自身盒子，直接盖到任务卡片上。
+- 用户截图物理宽度 `1014px`（约 `814px` CSS 宽度）正是该区间：任务卡片底部与“新建定时任务”表单顶部相互覆盖。
+
+**实现**
+
+- `chat.css` 的 `@container (max-width: 900px)` 内，给 `.schedules-left` 与 `.schedules-compose` 统一加 `flex: 0 0 auto`，两块都按自身内容高度排布，不再互相挤压。
+- 单列滚动统一交给 `.schedules-main`（已有 `overflow-y: auto`）；列表和表单仍保持 `14px` 间距，表单在列表之后完整展开，用户滚动即可看到全部字段。
+- 双列布局（`>900px`）不变，表单仍固定在右侧列。
+
+**验证**
+
+- CSS 视口 `814px`：`.schedules-left` 为 `y=76 / height=470`，`.schedules-compose` 从 `y=560` 开始，间距 `14px`，两者无重叠；`.schedules-main` 可视高度 `905`、内容高度 `1101`，可正常纵向滚动。
+- `919px` 下仍为双列，任务列表与表单左右并列，无回归；`node --check packages/server/public/chat.js` 通过。
+- 页面截图：`.eab-dev/schedules-814-stacked-fixed.png`。
+
+#### 23.3.7.30 全站滚动条改为隐藏但可滚动（2026-11-27）
+
+**问题**
+
+- Windows Chromium 会把纵向滚动条常驻绘制在聊天线程、定时任务页、设置页和各类弹层右侧；在浅色页面里形成一条明显的灰条，并且 `scrollbar-gutter: stable` 还会预留一条空白，页面切换时宽度跳动。
+- 用户要求保留滚轮、触控板和键盘滚动，但不显示滚动条本身。
+
+**实现**
+
+- `chat.css` 末尾增加全局规则：`html`、`body`、`.chat-body` 及其全部后代统一 `scrollbar-width: none`、`-ms-overflow-style: none`、`scrollbar-gutter: auto`。
+- Chromium/Edge 通过 `::-webkit-scrollbar` 把宽高归零并 `display:none`；`thumb`、`track`、`corner` 背景同时置为透明，避免旧样式残留。
+- 不改 `overflow-y: auto/scroll`，滚动容器仍可正常滚动；文本框、代码块、表格和终端也不显示滚动条。
+
+**验证**
+
+- 聊天线程 `scrollbarWidth` 为 `none`，可视高度 `744px`、内容高度 `7361px`，仍可通过滚轮/触控板滚动；页面截图无右侧灰条。
+- 定时任务页在 `919px` 宽度下滚动条消失，双列内容、表单和侧栏布局不变。
+- 页面截图：`.eab-dev/scrollbars-hidden-20261127.png`、`.eab-dev/schedules-scrollbar-hidden-20261127.png`。
+
+#### 23.3.7.31 间隔任务先设首次执行时间并按原定时间顺延（2026-11-27）
+
+**目标**
+
+- 间隔任务不再由系统直接按“当前时间 + 间隔”推一个只读的“下次执行时间”，而是先由用户设置首次执行时间，再设置间隔。
+- 新建时显示“首次执行时间”，创建后第一次严格按该时间触发；之后每次执行完成，自动推进为下一次执行时间，不需要再次设置。
+- 编辑已有任务时显示真实的下次执行时间；修改后按新时间重新排期。
+- 顺延规则采用方案 A：始终从第一次设定的时间锚点按间隔推进，不按执行完成时间重算，避免任务越跑越漂移。
+
+**规则与后端**
+
+- `ScheduleRule` / `ScheduleInput` 新增 `interval.startAt`，格式为本地时间字符串，例如 `2026-11-28 09:00`。
+- 创建或编辑时如果显式传入 `startAt`，必须在当前时间 30 秒之后，否则返回 `not_future`；不传时保留旧行为“现在 + 间隔”。
+- `nextRunAt()` 对带 `startAt` 的 interval 规则改为锚点推进：秒/分钟/小时按固定毫秒计算，天/月/年按本地日历推进；当执行完成时间已越过一个或多个周期时，只取下一个未来槽位，不补跑。
+- 编辑只改标题/提示词、不传 `startAt` 时，沿用原规则的 `startAt`，不会把任务重置成“现在 + 间隔”。
+- `schedule.create` 工具同步暴露可选 `startAt`，支持“从明天九点开始，每 30 分钟”这类明确表述。
+
+**界面与布局**
+
+- 执行频率选择“间隔”后，右侧表单卡片改为“执行时间 → 执行间隔”的上下两段式：
+  - 第一行是日期 + 时分选择器，右侧状态胶囊动态显示“首次 / 下次 / 启用”；
+  - 第二行是间隔数值 + 单位；表单只保留执行时间和执行间隔两块，不再显示额外的排期摘要条。
+- 新建默认把首次执行时间设为“当前时间 + 当前间隔”，并向上对齐到下一分钟；切换间隔单位后不重置已填时间。
+- 时间早于当前、距离当前不足 30 秒或为空时，日期与时间输入框变为红色边框，并在下方给出明确错误；提交时再次校验。
+- 输入框聚焦只改边框色，不画 outline 或外圈阴影。
+- 不使用 `container-type` 包裹整个表单，改为日期/时间输入 `flex-wrap` 自适应；避免窄屏容器查询把表单高度压成 0。
+
+**验证**
+
+- `packages/server/test/schedule.test.ts` 新增用例：`startAt` 原样落库；首次触发等于设定时间；12:05 开始、每 5 分钟，12:07:30 跑完下一次为 12:10；正好 12:10 完成下一次为 12:15；只改标题不改间隔锚点；过期 `startAt` 返回 `not_future`。
+- `pnpm typecheck` 通过；`schedule.test.ts` 20 项全部通过。
+- 浏览器实测创建“布局验证临时任务”：设定 `2026-11-28 09:00`，列表显示“每 30 分钟 / 下次 2026-11-28 09:00”；编辑态显示“执行时间 / 下次 / 2026-11-28 / 09:00”。
+- 浏览器实测过期时间：输入昨天 09:00 后出现“执行时间已过期，请选择未来时间”，输入框红色边框，隐藏值同步为 `2026-11-26T09:00`。
+- CSS 视口 `980px`：表单完整展开，高度 493px；修复了原先容器查询导致的表单高度 0、只显示空白圆角条的问题。
+- 验证任务已通过 `DELETE /api/schedules/:id` 删除，任务计数恢复为 0。
+- 页面截图：`.eab-dev/schedule-interval-first-20261127.png`。
+
+#### 23.3.7.32 对话与工作台分界线改为细线 + 中央胶囊（2026-11-27）
+
+**目标**
+
+- 把员工端对话与右侧工作台之间的可拖拽分界线对齐豆包：整高 1px 细线，中央一枚小胶囊拖拽柄，线不依赖右栏自身的 `border-left`。
+- 默认网页分栏比例由“右栏更宽”调整为对话约 64% / 工作台约 36%；同时保留用户拖拽后记住宽度的能力。
+
+**实现**
+
+- `chat.css`：三类分栏（文件、团队、网页）的中间 gutter 从 `8px` 改为 `12px`，网格公式统一为 `calc(var(--xxx-split) - 6px) 12px minmax(0, 1fr)`。
+- `.file-split-resizer` 热区宽 `20px`，`::before` 只画一条 `1px` 竖线；`::after` 画 `8×28`、圆角 `4px` 的白色胶囊，线色 `#e7e8eb`、边框 `#e2e4e8`，默认态几乎融入页面。
+- 悬停时线加深到 `#d4d7dc`，胶囊放大到 `10×34`、底色 `#f7f8f9`、边框 `#cdd1d7`；拖拽态与键盘态沿用同一尺寸，边框改为品牌绿混合色。
+- `chat.js` 在 `pointerenter/pointerleave` 上同步 `.is-hovered`，避免触屏或合成指针只依赖 `:hover`；`focus` / `focus-visible` 只改胶囊边框和底色，不画 outline 或外圈阴影。
+- 去掉右栏重复的 `border-left`，但规则排除 `.is-workbench-collapsed`，折叠态 44px 恢复栏仍保留边界线。
+- 网页分栏默认值改为 `0.64`；`localStorage` 键升级为 `eab.chat.webSplitRatio.v2`，避免旧宽度覆盖新默认，用户拖动后仍会写入并复用。
+- `splitBounds` 为网页模式单独设最小右栏 `300px`、最小对话 `380px`，避免原先借用团队模式 `440px` 下限导致 64% 被夹回约 49%。
+
+**验证**
+
+- 真机 `1318×963`、右侧云空间打开时，`#file-split-resizer` 宽 `20`、高约 `905`，`::before` 为 `rgb(231,232,235)` 的 1px 线，`::after` 为 `8×28` 白底胶囊；分栏约为对话 63.8% / 工作台 36.2%，与参考图比例一致。
+- 悬停后 `.is-hovered=true`，胶囊计算样式变为 `10×34`、底色 `rgb(247,248,249)`、边框 `rgb(205,209,215)`，线色变为 `rgb(212,215,220)`。
+- 拖拽实测：从约 64% 拖到 `57.87%` 后 `eab.chat.webSplitRatio.v2=0.5787`，松手后 `body.is-resizing-split` 正常移除；键盘左右键每次调整 `2%`，焦点态 `outline-style=none`。
+- 页面截图：`.eab-dev/split-divider-final-20261127.png`（默认）、`.eab-dev/split-divider-final-hover-20261127.png`（悬停）。
+
+**边界**
+
+- 分栏宽度仍是本机 `localStorage` 偏好，不跨设备同步；团队、文件模式的默认比例未改，只共享新的 gutter 与胶囊外观。
+- 窄屏 `≤900px` 和折叠态仍走原有堆叠/44px 恢复栏逻辑，本轮只做了边界规则排除，未改变窄屏结构。
+
+#### 23.3.7.33 定时任务“结果回推到”改为可搜索下拉框（2026-11-28）
+
+**问题**
+
+- 定时任务表单里，“结果回推到”原本是“独立模糊搜索框 + 下拉选择框”两件控件叠在一起：搜索框常驻在触发按钮下方，既占高度，又让同一个字段出现两个焦点入口。
+- 用户从浏览器批注明确要求：搜索框不要单独显示在下面，搜索能力直接合并进下拉框。
+
+**实现**
+
+- `chat.html` 删除 `#schedule-target-search` 和只读的 `#schedule-target-value`；`#schedule-target-trigger` 由 `<button>` 改为 `<input type="text" role="combobox">`，左侧放大镜图标、右侧 caret 保持在同一个控件内，`aria-controls` 指向 `#schedule-target-options`。
+- `#schedule-target-popover` 只保留选项列表与空状态，不再放搜索输入；隐藏的 `#schedule-channel` select 继续作为表单真实值来源，提交逻辑不变。
+- 交互规则：
+  - 点击控件打开弹层并全选当前值，直接输入即可替换为搜索词；
+  - 输入实时过滤，按标题匹配；无查询时显示“钉钉 / 新建对话 / 已有对话”，有查询时只显示匹配项，避免输入“东环”后 Enter 误选排在前面的“钉钉”；
+  - 点击或 Enter 选择；有查询时 Enter 选第一项匹配，无查询时 Enter 保持当前项；ArrowUp/ArrowDown 在选项间移动，Home/End 跳到首尾；
+  - Escape 只关闭下拉并回焦输入框，`stopPropagation` 防止冒泡到全局 Escape 把定时任务页退回对话；
+  - 点外、焦点外关闭，关闭后输入框恢复选中项标题，查询词清空。
+- 打开弹层不再绑定 `focus` 事件：仅点击、输入、方向键或 Enter 打开。这样页面刷新、浏览器恢复焦点或 Tab 进入输入框时不会自动弹层；聚焦本身只改边框色，不画 outline 或外圈阴影。
+- `chat.css` 将 `.schedule-target-trigger` 按输入框重写，搜索图标 `z-index: 2` 避免被输入框背景盖住；popover 宽度跟随触发控件，选项区 `flex: 1 1 auto`，窄屏仍按 900px 单列规则展开。
+
+**验证**
+
+- `node --check packages/server/public/chat.js` 通过。
+- 真机 `1367×963` 定时任务页：刷新后输入框显示“新建对话”、弹层关闭、`document.activeElement` 为 `body`，不再自动展开。
+- 点击打开后输入“东环”，选项实时收敛为“东环线有多少人”；Enter 后输入框与隐藏 select 同步为 `session:chat_c4a23097-...`，弹层关闭。
+- 无查询按 Enter 保持当前选中项；Escape 关闭后 `#schedules-stage.hidden=false`、焦点回到输入框；点击任务名称输入框后弹层关闭并恢复标题。
+- 输入不存在的标题显示“没有匹配的对话”，选项数为 0；清空查询后恢复完整列表。
+- 页面截图：`.eab-dev/schedule-combobox-closed-20261128.png`、`.eab-dev/schedule-combobox-open-final-20261128.png`、`.eab-dev/schedule-combobox-filter-final-20261128.png`。
+
+**边界**
+
+- 搜索只匹配对话标题，不搜消息正文；大小写与空格做归一化，不做拼音首字母匹配。
+- “钉钉 / 新建对话”在有搜索词时也参与过滤，只有标题命中才显示；否则优先保证 Enter 选到用户输入的目标。
+- 本轮不改变回推渠道的数据结构，也不新增回推目标类型。
+
+#### 23.3.7.34 创建任务按钮成功对勾与轻弹反馈（2026-11-28）
+
+**问题**
+
+- 定时任务提交时，按钮只从“创建任务”切成“创建中…”，成功后靠顶部 Toast 和列表变化提示；按钮本身没有明确的完成态，视线停在按钮上时确认感偏弱。
+- 如果直接把按钮文字替换成对勾，按钮宽度会随文字长度变化，右侧表单操作区会横向跳动。
+
+**实现**
+
+- `chat.html` 的 `#schedule-create` 内部拆成两部分：正常标签 `.schedules-submit-label` 保留在文档流中负责占宽，对勾图层 `.schedules-submit-check` 绝对定位覆盖按钮内容区；检查路径使用 `pathLength="1"`，只对 `stroke-dashoffset` 做描线动画。
+- 成功时给按钮加 `.is-success`：
+  - 标签快速淡出并上移 `3px`、缩到 `.96`；
+  - 18px 对勾在 `180ms` 内从左到右描出；
+  - 按钮整体在 `320ms` 内 `1 → 1.026 → .997 → 1` 轻弹一次，只改 `transform`，不触发布局。
+- `chat.js` 新增 `playScheduleSubmitSuccess()`：接口成功后保持 `.is-success` 约 `600ms`，期间按钮保持禁用，防止连点重复创建；到时移除状态、恢复按钮并调用 `syncScheduleEditorChrome()`。
+- 所有按钮文字统一走 `setScheduleSubmitLabel()` 改内部标签，不再用 `button.textContent` 覆盖；加载态、失败态、新建/编辑/保存并启用等文案都能正确恢复，不会破坏对勾结构。
+- 失败时不播放对勾，只恢复按钮并显示原有表单错误；编辑保存成功同样复用该反馈，恢复为编辑态对应文案。
+- `prefers-reduced-motion: reduce` 下取消轻弹和描线动画，对勾直接显示并停留同样时长，信息不丢失。
+
+**验证**
+
+- 真实页面创建临时任务，按钮宽度点击前、成功态、恢复后均为 `293.2875px`，没有横向跳动。
+- MutationObserver 记录：`.is-success` 从 `6284ms` 到 `6886ms`，实际停留 `602ms`；恢复后 `disabled=false`、文案回到“创建任务”。
+- 成功态截图确认按钮内显示居中对勾；临时任务创建后已通过删除确认弹窗清理，任务计数恢复为 `0`。
+- `node --check packages/server/public/chat.js` 通过。
+- 页面截图：`.eab-dev/schedule-submit-check-20261128.png`。
+
+**边界**
+
+- 对勾只代表请求成功，不代替列表和 Toast；失败、校验错误、网络异常一律不显示成功态。
+- 动画不使用 `width / height / left / top`，按钮宽度由常驻标签决定；窄屏单列表单同样保持宽度。
+- 600ms 内按钮保持禁用，键盘 Enter 重复提交由 `submitScheduleForm()` 顶部的 disabled 守卫拦截。
+
+#### 23.3.7.35 定时任务统计数字改为向上滚出、下方滚入（2026-11-28）
+
+**问题**
+
+- 四个统计标签里的数字原来直接改 `strong.textContent`；`1 → 2` 没有过渡，`9 → 10` 还会让数字宽度变化，卡片内部出现轻微横向跳动。
+- 用户要求：收录数变化时旧数字向上移出、新数字从下方滚入，只过渡一次，并给数字预留固定宽度。
+
+**实现**
+
+- `chat.html` 的四个 `strong` 统一加 `.schedule-stat-number`，内部放一个 `.schedule-stat-number-value.is-current` 当前值；外层只负责固定容器。
+- `chat.css` 为数字容器设置 `display: inline-grid`、`width: 3ch`、`height: 1em`、`overflow: hidden`、`font-variant-numeric: tabular-nums`。当前值与离场值都放在同一网格单元，旧值和新值重叠但不撑宽。
+- `chat.js` 新增 `setScheduleCountValue()`：
+  - 首次渲染只赋值，不播放动画；值没变直接返回。
+  - 变化时保留当前值作为 `.is-leaving`，新值作为新的 `.is-current`，从 `translateY(105%)` 进入。
+  - 旧值 `230ms` 内从 `translateY(0)` 升到 `-105%` 并淡出；新值 `250ms` 内从 `105%` 回到 `0` 并淡入；两条动画都只执行一次。
+  - 动画结束后移除旧节点、清掉内联 transform，只保留一个当前节点；`getAnimations({ subtree: true })` 用于覆盖子元素动画。
+  - 连续更新时先取消上一轮动画并清理离场节点，避免叠出多组数字。
+- `prefers-reduced-motion: reduce` 下跳过滚动，直接替换为新值。
+
+**验证**
+
+- 四个数字容器在 `1367×963` 下均为 `37.96px × 22px`，与数字位数无关；`font-variant-numeric` 为 `tabular-nums`。
+- 真实创建再删除临时任务：`#schedule-count-all` 和 `#schedule-count-active` 同时出现 2 条动画，旧值 `1` 位于 `translateY(0) / opacity 1`，新值 `0` 位于 `translateY(23.1px) / opacity 0`；动画结束后只剩一个 `.is-current` 节点，动画数为 0。
+- 临时任务已删除，四个统计恢复 `0`，列表为空；`node --check packages/server/public/chat.js` 通过。
+- 页面截图：`.eab-dev/schedule-count-roll-mid-20261128.png`（放慢到 10% 的中间态）、`.eab-dev/schedule-count-idle-20261128.png`（静止态）。
+
+**边界**
+
+- 数字容器固定按 3 位预留；当前统计超过 `999` 时会被容器裁切，若后续出现千级任务量，应把宽度改为 `4ch` 或按最大位数统一预留。
+- 动画只改 `transform / opacity`，不改卡片或数字盒子的宽高；每个数字同一时间最多一组进出动画。
+- 数值没变、首次加载、减少动态效果时不播放滚动。
+
+#### 23.3.7.36 分界线中央胶囊改为仅悬停/拖拽时显示（2026-11-28）
+
+**问题**
+
+- 对话与右侧栏之间的 20px 拖拽热区里，中央 `8×28` 白色胶囊一直可见。分栏常态下这条灰底上多出一个白色小方块，干扰右侧工作台内容，看起来像未对齐的控件。
+- 用户要求：鼠标移入分界线才显示小方块，移出立即隐藏；整高 1px 细线保留。
+
+**实现**
+
+- `chat.css` 的 `.file-split-resizer::after` 默认改为 `opacity: 0`、`transform: translate(-50%, -50%) scale(.94)`，随鼠标移出自然消失。
+- 显示状态统一为 `opacity: 1`、`scale(1)`，覆盖：
+  - `:hover` 与 JS 的 `.is-hovered`（鼠标移入 20px 热区）；
+  - `:active` 与 `body.is-resizing-split`（按住拖拽时，即使指针短暂离开也保持可见）；
+  - `:focus-visible`（键盘 Tab 到分隔条时作为无障碍例外显示）。
+- 隐藏/显示只过渡 `opacity .12s` 和 `transform .16s`；原有悬停放大 `10×34`、边线与底色加深继续保留。
+- 整高 1px 细线 `::before` 不参与隐藏，常态仍保留分栏位置提示。
+
+**验证**
+
+- 真机 `1367×963`，右侧网页工作台打开：
+  - 鼠标离开分界线：`is-hovered=false`，`::after` 计算样式 `opacity=0`、`8×28px`；
+  - 移入分界线：`is-hovered=true`，过渡完成后 `opacity=1`、`10×34px`，截图可见中央胶囊；
+  - 再移出：`is-hovered=false`，`opacity` 回到 `0`，数字/卡片布局不变。
+- 页面截图：`.eab-dev/split-handle-hidden-20261128.png`（默认隐藏）、`.eab-dev/split-handle-hover-20261128.png`（悬停显示）。
+
+**边界**
+
+- 触屏没有持续 hover；拖拽态仍由 `body.is-resizing-split` 保持可见。
+- 键盘聚焦时胶囊会显示，这是可访问性需要，不与“鼠标移出隐藏”冲突。
+- 不改变 20px 命中热区、分隔线颜色和分栏宽度逻辑。
 
 - 仍然只允许 http/https；默认只读公网。内网地址必须由控制台显式开启，可配置精确主机白名单或 `*` 放行全部企业局域网，本机、链路本地和云元数据地址始终拒绝。
 - 自动登录、验证码/短信/2FA 自动处理尚未实现；当前登录流程由用户在右侧接管完成，扫码页只做识别提示，不解码二维码。
 - 站点账号密码已进入服务端加密凭据库；登录态复用已支持用户手动保存 Cookie/localStorage，但自动保存、站点适配器和招标分析流水线尚未落地。
 - 不自动破解图形验证码、不绕过平台付费墙或会员权限；批量数据优先使用平台官方搜索、订阅、导出能力。
 - 标标达站点适配器、招标项目数据模型和需求抽取流水线尚未落地，当前只能完成通用浏览器打开、人工登录和页面读取。
+
+#### 23.3.7.37 v2026.11.27 发布收口（2026-11-28）
+
+**版本口径**
+
+- 根 `package.json`、`packages/desktop/package.json`、`/api/health`、Windows 安装包、`desktop-release.json`、Git tag 和 GitHub Release 统一为 `2026.11.27` / `v2026.11.27`。
+- 桌面包版本必须与网页版本一致；桌面端更新检查会把低于当前服务版本的安装包判为旧版。
+
+**发布内容**
+
+- 定时任务：编辑/重新启用/物理删除、过期单次拦截、流式回复与钉钉过程面板、六种间隔单位、自定义连续时间选择器、可搜索回推目标、成功对勾与统计数字滚动。
+- 桌面端：本机 PowerShell 终端标签、版本档案下载中心、历史安装包/便携包独立下载、带版本号便携 zip 副本。
+- 员工端：960px 侧栏断点、定时任务窄屏单列、隐藏滚动条、分界线胶囊仅悬停/拖拽显示。
+- 图表：定时任务按投递渠道收窄，钉钉只使用 7 种原生图表。
+
+**发布验证**
+
+- 根目录 `pnpm typecheck` 通过。
+- `pnpm test` 全量通过（259 个测试文件、1632 个用例），测试日志保存在 `.eab-dev/release-test-20261127.log`。
+- Windows 便携包和 NSIS 安装包使用 `2026.11.27` 构建，安装包、便携 zip、`desktop-release.json` 同步写入 `.eab-dev/desktop-release` 并上传 Release。
+- 安装包 `EAB-Setup-2026.11.27-x64.exe`，113074274 字节，SHA256 `8f5d4fd35c4ff880e5bd4c63ea0152ee949c76f6e81a251e1d7f9a5cca2b9f0e`；便携包 `EAB-Desktop-Windows-x64.zip`，158277244 字节，SHA256 `3e78fa647113274be2b883eba777797b0f62583924452b2ed50b4fdab6ebf17`。
+- `/api/health` 返回 `2026.11.27`；`/download/desktop` 同时列出 `v2026.11.27` 与 `v2026.11.26`。
+- GitHub Release 资产包含源码 zip、Windows 安装包、便携 zip 和更新清单。
 
 ### 23.5 下一阶段（B1）
 
@@ -4757,6 +5412,9 @@ web-*   ← shared-types（**禁止** import server/runtime/storage）
 | 23.3.4 桌面宿主与原生浏览器 | `packages/desktop`（D1 起）、`packages/server/public/chat.js` 的 `window.eabDesktop` 分支、`packages/server/src/browser-session.ts` 的桌面控制驱动 |
 | 23.3.5 浏览器 UI 对齐 | `packages/server/public/chat.html` 的 `#workbench-tabs` / `#web-browser-bar`、`chat.js` 的 `renderWorkbenchTabs` / `applyDesktopBrowserState`、`chat.css` 末尾“浏览器工作台：对齐豆包桌面版”整段 |
 | 23.3.7 桌面分发 / 更新 | `packages/desktop/main.mjs`、`preload.cjs`、`installer/eab-installer.nsi`、`installer/scripts/detect-server-url.ps1`、`scripts/build-win-installer.mjs`、`packages/server/src/routes/desktop-download.ts`、`chat.js` 的 `bindDesktopUpdates` / `renderDesktopUpdate`、`chat.html` 的 `#desktop-update-chip` / `#settings-update` |
+| 23.3.7.27 桌面本机终端 | `packages/desktop/main.mjs` 的 `terminalSessions` / `createTerminalSession` / 终端 IPC、`preload.cjs` 的 `terminalCreate` 等桥方法、`chat.html` 的 `#web-draft-terminal` / `#terminal-pane`、`chat.js` 的 `terminalAvailable` / `openTerminalPane` / `bindTerminalPane`、`chat.css` 末尾“本机终端”整段 |
+| 23.3.7.31 间隔任务首次执行时间 | `packages/server/src/schedule.ts` 的 `ScheduleRule.startAt` / `nextAnchoredIntervalRun` / `assertIntervalStartFuture`、`packages/server/src/routes/schedules.ts` 的 `startAt` 入参、`chat.html` 的 `#schedule-interval-date` / `#schedule-interval-time` / `#schedule-interval-at`、`chat.js` 的 `setScheduleIntervalFields` / `refreshScheduleIntervalPreview`、`chat.css` 的 `.schedule-interval-plan` 整段 |
+| 23.3.7.32 对话/工作台分界线 | `packages/server/public/chat.css` 的 `.file-split-resizer` 与三类 `--file/team/web-split` 网格、`chat.js` 的 `splitBounds` / `bindFileSplitResizer` / `restoreWebSplitRatio`、`chat.html` 的 `#file-split-resizer` |
 | 16 接口契约 | `packages/server/src/routes/*.ts`（实况）；没有独立的 shared-types 包 |
 | 18 工程结构 | `packages/*`、`scripts/smoke-http.mjs` |
 | 20 进度 | 本文件 20.2.2、`docs/EAB-P*-2026-11-24.md`、`docs/EAB-Agent框架对照审计与能力建设需求-2026-11-23.md` |

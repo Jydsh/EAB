@@ -7,9 +7,10 @@ import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { ServerDeps } from '../deps.js'
 import { ok, readVersion } from '../http.js'
 import { defaultHomeDir } from '../settings.js'
+import { desktopDownloadPage, type DownloadPageRelease } from './desktop-download-page.js'
 
 const SETUP_RE = /^EAB-Setup-([\w.-]+)-x64\.exe$/i
-const PORTABLE_RE = /^EAB-Desktop-Windows-x64\.zip$/i
+const PORTABLE_RE = /^EAB-Desktop-Windows-x64(?:-([\w.-]+))?\.zip$/i
 const MANIFEST_NAME = 'desktop-release.json'
 const DEFAULT_REMOTE_BASE = 'https://github.com/Jydsh/EAB/releases/latest/download'
 const REMOTE_MANIFEST_TTL_MS = 5 * 60 * 1000
@@ -32,6 +33,17 @@ interface DesktopRelease {
   publishedAt: string
   notes: string
   remoteUrl: string
+  platform: string
+  arch: string
+}
+
+interface PortableRelease {
+  artifact: DesktopArtifact
+  fileName: string
+  version: string
+  sha256: string
+  size: number
+  publishedAt: string
 }
 
 const digestCache = new Map<string, { mtimeMs: number; size: number; sha256: string }>()
@@ -94,31 +106,63 @@ function remoteAssetUrl(fileName: string): string {
   return `${remoteBaseUrl()}/${encodeURIComponent(safeName)}`
 }
 
-function newestMatch(dir: string, pattern: RegExp): string {
-  if (!existsSync(dir)) return ''
+function isoFromMtime(file: string): string {
   try {
-    return readdirSync(dir)
-      .filter((name) => pattern.test(name))
-      .map((name) => path.join(dir, name))
-      .filter((file) => existsSync(file))
-      .sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs)[0] || ''
+    return new Date(statSync(file).mtimeMs).toISOString()
   } catch {
     return ''
   }
 }
 
-function findInstaller(): DesktopArtifact | null {
-  for (const dir of releaseDirs()) {
-    const file = newestMatch(dir, SETUP_RE)
-    if (!file) continue
-    return {
+function releaseFromSetupFile(file: string, manifest: DesktopRelease | null): DesktopRelease | null {
+  const name = path.basename(file)
+  const match = SETUP_RE.exec(name)
+  if (!match) return null
+  const version = match[1]
+  const size = statSync(file).size
+  const declared = manifest?.version === version ? manifest : null
+  return {
+    artifact: {
       file,
-      name: path.basename(file),
-      size: statSync(file).size,
+      name,
+      size,
       contentType: 'application/vnd.microsoft.portable-executable',
+    },
+    fileName: name,
+    version,
+    sha256: declared?.sha256 || sha256File(file),
+    size,
+    publishedAt: declared?.publishedAt || isoFromMtime(file),
+    notes: declared?.notes || '',
+    remoteUrl: remoteAssetUrl(name),
+    platform: 'win32',
+    arch: 'x64',
+  }
+}
+
+/**
+ * 扫描发布目录里的全部安装包，而不是只挑 mtime 最新的一个。
+ * 这样下载页可以列出历史版本，并为每个版本提供独立下载入口。
+ */
+function listSetupReleases(): DesktopRelease[] {
+  const byVersion = new Map<string, DesktopRelease>()
+  for (const dir of releaseDirs()) {
+    if (!existsSync(dir)) continue
+    const manifest = readReleaseManifest(dir)
+    try {
+      for (const name of readdirSync(dir)) {
+        if (!SETUP_RE.test(name)) continue
+        const file = path.join(dir, name)
+        if (!existsSync(file)) continue
+        const release = releaseFromSetupFile(file, manifest)
+        if (!release) continue
+        if (!byVersion.has(release.version)) byVersion.set(release.version, release)
+      }
+    } catch {
+      // 目录不可读时继续尝试下一个候选目录。
     }
   }
-  return null
+  return [...byVersion.values()].sort((left, right) => compareVersions(right.version, left.version))
 }
 
 function normalizeRelease(parsed: Record<string, unknown>, dir: string): DesktopRelease | null {
@@ -154,6 +198,8 @@ function normalizeRelease(parsed: Record<string, unknown>, dir: string): Desktop
     publishedAt: String(parsed.publishedAt || ''),
     notes: String(parsed.notes || ''),
     remoteUrl: remoteAssetUrl(fileName),
+    platform: String(parsed.platform || 'win32'),
+    arch: String(parsed.arch || 'x64'),
   }
 }
 
@@ -168,23 +214,13 @@ function readReleaseManifest(dir: string): DesktopRelease | null {
 }
 
 function localRelease(): DesktopRelease | null {
-  for (const dir of releaseDirs()) {
-    const release = readReleaseManifest(dir)
-    if (release?.artifact) return release
-  }
-  const artifact = findInstaller()
-  if (!artifact) return null
-  const match = SETUP_RE.exec(artifact.name)
-  return {
-    artifact,
-    fileName: artifact.name,
-    version: String(match?.[1] || readVersion()),
-    sha256: sha256File(artifact.file),
-    size: artifact.size,
-    publishedAt: '',
-    notes: '',
-    remoteUrl: remoteAssetUrl(artifact.name),
-  }
+  return listSetupReleases()[0] || null
+}
+
+function localReleaseByVersion(version: string): DesktopRelease | null {
+  const target = String(version || '').trim().replace(/^v/i, '')
+  if (!target) return null
+  return listSetupReleases().find((release) => release.version === target) || null
 }
 
 async function remoteRelease(): Promise<DesktopRelease | null> {
@@ -265,101 +301,92 @@ async function materializeRelease(release: DesktopRelease): Promise<DesktopArtif
   }
 }
 
-function findPortable(): DesktopArtifact | null {
+function listPortableReleases(): PortableRelease[] {
+  const fallbackVersion = listSetupReleases()[0]?.version || readVersion()
+  const byVersion = new Map<string, PortableRelease>()
+  const mtimes = new Map<string, number>()
   for (const dir of releaseDirs()) {
-    const file = newestMatch(dir, PORTABLE_RE)
-    if (!file) continue
-    return {
-      file,
-      name: path.basename(file),
-      size: statSync(file).size,
-      contentType: 'application/zip',
+    if (!existsSync(dir)) continue
+    try {
+      for (const name of readdirSync(dir)) {
+        const match = PORTABLE_RE.exec(name)
+        if (!match) continue
+        const file = path.join(dir, name)
+        if (!existsSync(file)) continue
+        // 旧便携包文件名没有版本号，沿用当前最新桌面版本的归档位；
+        // 新构建会同时产出带版本号的副本，后续历史版本可按版本号精确下载。
+        const version = String(match[1] || fallbackVersion || '').replace(/^v/i, '')
+        if (!version) continue
+        const stat = statSync(file)
+        const existing = byVersion.get(version)
+        if (existing && (mtimes.get(version) || 0) >= stat.mtimeMs) continue
+        byVersion.set(version, {
+          artifact: {
+            file,
+            name,
+            size: stat.size,
+            contentType: 'application/zip',
+          },
+          fileName: name,
+          version,
+          sha256: sha256File(file),
+          size: stat.size,
+          publishedAt: new Date(stat.mtimeMs).toISOString(),
+        })
+        mtimes.set(version, stat.mtimeMs)
+      }
+    } catch {
+      // 目录不可读时继续尝试下一个候选目录。
     }
   }
-  return null
+  return [...byVersion.values()].sort((left, right) => compareVersions(right.version, left.version))
 }
 
-function mb(bytes: number): string {
-  return (bytes / 1024 / 1024).toFixed(1)
+function findPortable(): DesktopArtifact | null {
+  return listPortableReleases()[0]?.artifact || null
 }
 
-function pageHtml(release: DesktopRelease | null, serverVersion: string, portable: DesktopArtifact | null): string {
-  const version = release?.version ? `v${release.version.replace(/^v/i, '')}` : '未构建'
-  const setupHref = release ? '/download/desktop/windows' : ''
-  const portableHref = portable ? '/download/desktop/portable' : ''
-  const setupSize = release?.size || release?.artifact?.size || 0
-  const setupLabel = release ? `下载 Windows 安装包 · ${mb(setupSize)} MB` : '安装包尚未构建'
-  const portableLabel = portable ? `下载便携版 zip · ${mb(portable.size)} MB` : '便携版尚未构建'
-  return `<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>下载 EAB 桌面版</title>
-  <style>
-    :root { --brand:#0f7a5a; --ink:#182320; --muted:#66756f; --line:#dbe5e0; }
-    * { box-sizing: border-box; }
-    body {
-      margin:0; min-height:100vh; display:grid; place-items:center; padding:32px;
-      background: radial-gradient(1100px 560px at 12% -8%, rgba(15,122,90,.13), transparent 60%), #f4f7f5;
-      color:var(--ink); font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif;
-    }
-    .card {
-      width:min(720px,100%); background:#fff; border:1px solid var(--line); border-radius:24px;
-      padding:38px; box-shadow:0 24px 70px rgba(23,42,34,.10);
-    }
-    .brand { display:flex; align-items:center; gap:12px; margin-bottom:24px; }
-    .mark { width:44px; height:44px; border-radius:13px; display:grid; place-items:center; background:var(--brand); color:#fff; font-weight:800; }
-    h1 { margin:0; font-size:28px; letter-spacing:-.5px; }
-    .sub { margin:10px 0 26px; color:var(--muted); line-height:1.75; font-size:14px; }
-    .actions { display:flex; flex-wrap:wrap; gap:10px; }
-    .download {
-      display:inline-flex; align-items:center; gap:10px; height:48px; padding:0 22px;
-      border-radius:12px; background:var(--brand); color:#fff; text-decoration:none;
-      font-weight:700; box-shadow:0 12px 26px rgba(15,122,90,.20);
-    }
-    .download.secondary { background:#fff; color:var(--brand); border:1px solid var(--line); box-shadow:none; }
-    .download[aria-disabled="true"] { background:#8aa99e; pointer-events:none; box-shadow:none; color:#fff; }
-    .meta { margin-top:14px; color:var(--muted); font-size:12px; line-height:1.7; }
-    .steps { margin-top:26px; padding-top:22px; border-top:1px solid var(--line); display:grid; gap:12px; }
-    .step { display:flex; gap:12px; align-items:flex-start; font-size:13px; line-height:1.65; }
-    .step b { flex:0 0 22px; height:22px; border-radius:50%; display:grid; place-items:center; background:#eaf4ef; color:var(--brand); font-size:12px; }
-    .note { margin-top:20px; padding:12px 14px; border-radius:11px; background:#f6f9f7; color:var(--muted); font-size:12px; line-height:1.7; }
-    code { padding:1px 5px; border-radius:5px; background:#eef4f1; }
-  </style>
-</head>
-<body>
-  <main class="card">
-    <div class="brand">
-      <div class="mark">EAB</div>
-      <div><strong>EAB 企业智能体基座</strong><div class="meta">Windows 桌面版</div></div>
-    </div>
-    <h1>把网页工作台变成原生浏览器</h1>
-    <p class="sub">桌面版和网页版共用同一套聊天、Agent、审批与云空间；右侧网页工作台换成原生 Chromium 标签，支持真实键鼠、音视频、下载和内网系统。</p>
-    <div class="actions">
-      <a class="download" href="${setupHref}" aria-disabled="${release ? 'false' : 'true'}">${setupLabel}</a>
-      <a class="download secondary" href="${portableHref}" aria-disabled="${portable ? 'false' : 'true'}">${portableLabel}</a>
-    </div>
-    <div class="meta">桌面端 <code>${version}</code> · 当前服务 <code>${serverVersion}</code> · Windows 10/11 x64 · 安装包默认安装到 <code>C:\\Program Files\\EAB</code></div>
-    <div class="steps">
-      <div class="step"><b>1</b><span>运行 <code>EAB-Setup</code> 安装包，在安装向导里确认或更改安装位置。</span></div>
-      <div class="step"><b>2</b><span>安装包会记住当前下载来源服务器，首次启动自动连接，不再要求手动填写 EAB 地址。</span></div>
-      <div class="step"><b>3</b><span>在桌面窗口里登录；后续打开直接进入。开始菜单和桌面会生成 EAB 快捷方式。</span></div>
-      <div class="step"><b>4</b><span>桌面端启动后会自动向当前 EAB 服务器检查新版本，发现更新后可下载、校验并静默安装。</span></div>
-      <div class="step"><b>5</b><span>需要移除时，在 Windows“设置 > 应用 > 已安装的应用”里卸载 EAB，可选保留或清除本机登录状态。</span></div>
-    </div>
-    <div class="note">安装包尚未做代码签名，Windows 可能提示“未知发布者”，请确认来源后再运行。更新包同样通过当前 EAB 服务器分发并做 SHA256 校验；Web 版仍然可用，桌面版是可选的高性能形态。</div>
-  </main>
-</body>
-</html>`
+function findPortableByVersion(version: string): PortableRelease | null {
+  const target = String(version || '').trim().replace(/^v/i, '')
+  if (!target) return null
+  return listPortableReleases().find((release) => release.version === target) || null
 }
 
-function sendMissing(reply: FastifyReply): FastifyReply {
+function toPageRelease(release: DesktopRelease): DownloadPageRelease {
+  return {
+    version: release.version,
+    fileName: release.fileName,
+    size: release.size,
+    sha256: release.sha256,
+    publishedAt: release.publishedAt,
+    notes: release.notes,
+  }
+}
+
+function pageHtml(release: DesktopRelease | null, releases: DesktopRelease[], portables: PortableRelease[], serverVersion: string): string {
+  return desktopDownloadPage({
+    latest: release ? toPageRelease(release) : null,
+    releases: releases.map(toPageRelease),
+    portables: portables.map((portable) => ({
+      name: portable.fileName,
+      size: portable.size,
+      sha256: portable.sha256,
+      publishedAt: portable.publishedAt,
+      version: portable.version,
+    })),
+    serverVersion,
+  })
+}
+function sendMissing(
+  reply: FastifyReply,
+  heading = '桌面版安装包尚未构建',
+  detail = '请先在开发机执行 <code>pnpm desktop:installer</code>，生成 <code>packages/desktop/release/EAB-Setup-*.exe</code> 后再下载。',
+): FastifyReply {
   return reply
     .code(404)
     .type('text/html; charset=utf-8')
     .send(
-      `<!doctype html><meta charset="utf-8"><body style="font-family:system-ui;padding:40px;color:#333"><h2>桌面版安装包尚未构建</h2><p>请先在开发机执行 <code>pnpm desktop:installer</code>，生成 <code>packages/desktop/release/EAB-Setup-*.exe</code> 后再下载。</p></body>`,
+      `<!doctype html><meta charset="utf-8"><body style="font-family:system-ui;padding:40px;color:#333"><h2>${heading}</h2><p>${detail}</p></body>`,
     )
 }
 
@@ -394,9 +421,11 @@ export function registerDesktopDownloadRoutes(app: FastifyInstance, _deps: Serve
   app.get('/download/desktop', async (_req, reply) => {
     reply.header('cache-control', 'no-store')
     const release = await desktopRelease()
+    const local = listSetupReleases()
+    const catalog = local.length ? local : release ? [release] : []
     return reply
       .type('text/html; charset=utf-8')
-      .send(pageHtml(release, readVersion(), findPortable()))
+      .send(pageHtml(release, catalog, listPortableReleases(), readVersion()))
   })
 
   // 桌面端版本清单：更新源固定在当前 EAB 服务器，远端清单只用于服务器没有本地包时回源。
@@ -453,13 +482,39 @@ export function registerDesktopDownloadRoutes(app: FastifyInstance, _deps: Serve
     return sendMissing(reply)
   })
 
-  app.get('/download/desktop/setup', async (_req, reply) => {
+  app.get('/download/desktop/setup', async (req, reply) => {
+    const query = (req.query || {}) as Record<string, unknown>
+    const requested = String(query.version || '').trim().replace(/^v/i, '')
+    if (requested) {
+      const local = localReleaseByVersion(requested)
+      if (local) return sendRelease(reply, local)
+      const latest = await desktopRelease()
+      if (latest && latest.version === requested) return sendRelease(reply, latest)
+      return sendMissing(
+        reply,
+        '未找到该版本的安装包',
+        `发布目录中没有 <code>EAB-Setup-${escapeHtml(requested)}-x64.exe</code>，该版本可能已被移除，请从版本档案选择其他版本。`,
+      )
+    }
     const release = await desktopRelease()
     if (!release) return sendMissing(reply)
     return sendRelease(reply, release)
   })
 
-  app.get('/download/desktop/portable', async (_req, reply) => {
+  app.get('/download/desktop/portable', async (req, reply) => {
+    const query = (req.query || {}) as Record<string, unknown>
+    const requested = String(query.version || '').trim().replace(/^v/i, '')
+    if (requested) {
+      const release = findPortableByVersion(requested)
+      if (!release) {
+        return sendMissing(
+          reply,
+          '未找到该版本的便携包',
+          `发布目录中没有 <code>EAB-Desktop-Windows-x64-${escapeHtml(requested)}.zip</code> 或对应的当前构建，请从版本档案选择其他版本。`,
+        )
+      }
+      return sendArtifact(reply, release.artifact)
+    }
     const artifact = findPortable()
     if (!artifact) return sendMissing(reply)
     return sendArtifact(reply, artifact)

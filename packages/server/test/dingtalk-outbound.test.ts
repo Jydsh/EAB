@@ -114,6 +114,38 @@ describe('钉钉主动富文本通知', () => {
     expect(calls.some((call) => call.url.includes('/oToMessages/batchSend'))).toBe(false)
   })
 
+  it('定时任务通知把思考过程和工具明细写进最终卡片', async () => {
+    process.env.EAB_TEST_DING_SECRET = 'secret_test'
+    const { deps } = testDeps('ding_test_rich_trace')
+    const calls = mockDingTalkRichCard()
+
+    const sent = await sendDingTalkRichTextToUser(deps, {
+      companyId: 'c1',
+      userId: 'u_test',
+      title: '⏰ 定时任务',
+      text: '任务结果正文',
+      reasoning: '先查目录，再读取文件。',
+      tools: ['列出我的文件和文件夹'],
+      toolDetails: [{
+        id: 'call_1',
+        name: '列出我的文件和文件夹',
+        toolId: 'workspace.list',
+        status: 'done',
+        summary: '2 个文件',
+        durationMs: 12,
+      }],
+      thinkingMs: 3_500,
+    })
+    expect(sent.mode).toBe('a2ui')
+    expect(sent.cardId).toBeTruthy()
+
+    const create = calls.find((call) => call.url.includes('/v1.0/card/ai/instances/createAndDeliver'))
+    const body = JSON.stringify(JSON.parse(String(create?.init?.body)))
+    expect(body).toContain('先查目录，再读取文件。')
+    expect(body).toContain('列出我的文件和文件夹')
+    expect(body).toContain('任务结果正文')
+  })
+
   it('A2UI 创建失败时退回 sampleMarkdown，保留标题和正文排版', async () => {
     process.env.EAB_TEST_DING_SECRET = 'secret_test'
     const { deps } = testDeps('ding_test_rich_fallback')

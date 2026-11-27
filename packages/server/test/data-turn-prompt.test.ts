@@ -111,6 +111,8 @@ describe('取数轮的系统提示降级（所有工具通用）', () => {
     expect(dingtalk).toContain('钉钉消息当前可用 7 种')
     expect(dingtalk).not.toContain('- radar（')
     expect(dingtalk).not.toContain('- doughnut（')
+    expect(dingtalk).not.toContain('doughnut')
+    expect(dingtalk).not.toContain('line/area')
     expect(dingtalk).toContain('清单外的类型')
 
     const web = prompt('邓骏的本月加班数据', { channel: 'web' })

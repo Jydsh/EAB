@@ -1,6 +1,6 @@
 {
   "name": "@eab/desktop",
-  "version": "2026.11.26",
+  "version": "2026.11.27",
   "private": true,
   "type": "module",
   "description": "EAB 桌面宿主：原生 Chromium 网页标签，不再使用 JPEG 投屏",

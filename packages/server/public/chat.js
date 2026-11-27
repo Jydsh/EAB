@@ -2093,11 +2093,14 @@ const state = {
   pluginTab: 'overview',
   pluginPageKey: null,
   workspaceKind: 'plugins',
+  /** 工作台总览的聚合数据；只在独立工作台页打开时刷新。 */
+  workspaceSummary: { loaded: false, plugins: 0, skills: 0, activeSchedules: 0 },
+  workspaceSummaryLoading: false,
   skills: [],
   skillData: null,
   skillSelected: null,
   mode: 'chat',
-  /** 当前实际停留的界面：chat / workspace / settings，刷新后恢复 */
+  /** 当前实际停留的界面：chat / workspace / plugins / settings / schedules，刷新后恢复 */
   view: 'chat',
   filePreview: null,
   /** 右侧「云空间」浏览面板；独立于当前会话的文件空间，只读浏览全部云端文件 */
@@ -2105,6 +2108,21 @@ const state = {
   cloudSpacePath: '',
   cloudSpaceLoading: false,
   cloudSpaceError: '',
+  /** 桌面版本机终端：Web 形态没有终端会话，入口也不会显示。 */
+  terminalOpen: false,
+  terminalSessionId: '',
+  terminalPid: 0,
+  terminalShell: 'PowerShell',
+  terminalCwd: '',
+  terminalStatus: 'idle',
+  terminalBusy: false,
+  terminalLineBuffer: '',
+  terminalLines: 0,
+  terminalHistory: [],
+  terminalHistoryIndex: 0,
+  terminalHistoryDraft: '',
+  terminalDataBound: false,
+  terminalExitBound: false,
   /** 当前对话回合的子 Agent 团队；key 为 childId，同一子 Agent 复用同一窗口 */
   agentRuns: new Map(),
   /** 父 Agent 名称，用于团队标题 */
@@ -2186,7 +2204,7 @@ const SIDEBAR_COLLAPSED_KEY = 'eab.chat.sidebarCollapsed'
 const FILE_SPLIT_RATIO_KEY = 'eab.chat.fileSplitRatio'
 /** 右栏（Agent 团队 / 文件）与对话之间的宽度比例，独立于文件预览记住 */
 const TEAM_SPLIT_RATIO_KEY = 'eab.chat.teamSplitRatio'
-const WEB_SPLIT_RATIO_KEY = 'eab.chat.webSplitRatio'
+const WEB_SPLIT_RATIO_KEY = 'eab.chat.webSplitRatio.v2'
 const WORKBENCH_COLLAPSED_KEY = 'eab.chat.workbenchCollapsed'
 const TEAM_LIST_WIDTH_KEY = 'eab.chat.teamListWidth'
 const SIDE_SECTION_RATIO_KEY = 'eab.chat.sideSectionRatio'
@@ -2279,8 +2297,9 @@ function readChatLocation() {
     const parsed = JSON.parse(raw)
     return {
       sessionId: typeof parsed?.sessionId === 'string' ? parsed.sessionId : null,
-      view: ['chat', 'workspace', 'settings'].includes(parsed?.view) ? parsed.view : 'chat',
+      view: ['chat', 'workspace', 'plugins', 'settings', 'schedules'].includes(parsed?.view) ? parsed.view : 'chat',
       mode: parsed?.mode === 'workspace' ? 'workspace' : 'chat',
+      kind: parsed?.kind === 'skills' ? 'skills' : 'plugins',
     }
   } catch {
     return null
@@ -2297,6 +2316,7 @@ function persistChatLocation() {
         sessionId: state.sessionId || '',
         view: state.view || 'chat',
         mode: state.mode === 'workspace' ? 'workspace' : 'chat',
+        kind: state.workspaceKind === 'skills' ? 'skills' : 'plugins',
       }),
     )
   } catch {
@@ -2306,9 +2326,18 @@ function persistChatLocation() {
 
 function restoreChatLocation(location) {
   if (!location || location.view === 'chat') return
-  const workspaceBehindSettings = location.view === 'settings' && location.mode === 'workspace'
-  setChatMode(location.view === 'workspace' || workspaceBehindSettings ? 'workspace' : 'chat')
+  if (location.view === 'workspace') {
+    openWorkspacePage()
+    return
+  }
+  if (location.view === 'plugins') {
+    openPluginsPage(location.kind)
+    return
+  }
+  // 旧版本把「工作台 + 设置/定时任务」记成 mode=workspace；这里只恢复上层独立页，不再恢复已删除的嵌入工作台。
+  setChatMode('chat')
   if (location.view === 'settings') showSettings()
+  if (location.view === 'schedules') openSchedulesPage()
 }
 
 /* ---------------- 登录态 ---------------- */
@@ -2340,49 +2369,67 @@ function endBoot(text) {
   }
 }
 
+let consoleEntryTarget = '/admin'
+let consoleEntryBusy = false
+
+function consoleEntryHref(href) {
+  const target = new URL(href || '/admin', location.href)
+  const company = new URLSearchParams(location.search).get('company')
+  if (company) target.searchParams.set('company', company)
+  target.searchParams.set('from', 'chat')
+  return target.toString()
+}
+
+async function openConsoleEntry() {
+  if (consoleEntryBusy) return
+  consoleEntryBusy = true
+  hideSideMoreMenu()
+  const entry = $('#console-entry')
+  const label = entry?.textContent || ''
+  if (entry) {
+    entry.disabled = true
+    entry.textContent = '进入中…'
+  }
+  try {
+    const session = await api('/api/me/console-entry/session', {
+      method: 'POST',
+      headers: { 'x-eab-console-entry': '1' },
+    })
+    location.href = consoleEntryHref(session?.href || consoleEntryTarget)
+  } catch (err) {
+    banner(err?.message || '进入管理后台失败，请稍后重试', 'bad')
+    if (err?.status === 403) void refreshConsoleEntry()
+  } finally {
+    consoleEntryBusy = false
+    if (entry) {
+      entry.disabled = false
+      entry.textContent = label
+    }
+  }
+}
+
 async function refreshConsoleEntry() {
   const entry = $('#console-entry')
   const moreEntry = $('#side-more-console')
-  if (!entry) {
-    if (moreEntry) moreEntry.hidden = true
-    return
-  }
+  if (!entry && !moreEntry) return
   try {
     const data = await api('/api/me/console-entry')
     if (!data?.visible) {
-      entry.hidden = true
+      if (entry) entry.hidden = true
       if (moreEntry) moreEntry.hidden = true
       return
     }
-    entry.hidden = false
-    if (moreEntry) moreEntry.hidden = false
-    const company = new URLSearchParams(location.search).get('company')
-    const targetOf = (href) => {
-      const target = new URL(href || '/admin', location.href)
-      if (company) target.searchParams.set('company', company)
-      target.searchParams.set('from', 'chat')
-      return target.toString()
+    consoleEntryTarget = data.href || '/admin'
+    if (entry) {
+      entry.hidden = false
+      entry.onclick = () => void openConsoleEntry()
     }
-    entry.onclick = async () => {
-      if (entry.disabled) return
-      entry.disabled = true
-      const label = entry.textContent
-      entry.textContent = '进入中…'
-      try {
-        const session = await api('/api/me/console-entry/session', {
-          method: 'POST',
-          headers: { 'x-eab-console-entry': '1' },
-        })
-        location.href = targetOf(session?.href || data.href)
-      } catch (err) {
-        entry.disabled = false
-        entry.textContent = label
-        banner(err?.message || '进入管理后台失败，请稍后重试', 'bad')
-        if (err?.status === 403) refreshConsoleEntry()
-      }
+    if (moreEntry) {
+      moreEntry.hidden = false
+      moreEntry.onclick = () => void openConsoleEntry()
     }
   } catch {
-    entry.hidden = true
+    if (entry) entry.hidden = true
     if (moreEntry) moreEntry.hidden = true
   }
 }
@@ -2394,7 +2441,7 @@ function showLogin() {
   const stage = $('#chat-stage')
   if (side) side.hidden = true
   if (stage) stage.hidden = true
-  for (const id of ['#mode-switch', '#chat-title', '#login-btn', '#console-entry', '#side-user', '#side-actions', '#side-sessions', '#side-files', '#attach-strip']) {
+  for (const id of ['#chat-title', '#login-btn', '#console-entry', '#side-user', '#side-actions', '#side-sessions', '#side-files', '#attach-strip']) {
     const node = $(id)
     if (node) node.hidden = true
   }
@@ -2523,6 +2570,7 @@ function projectOnlineState(project) {
 
 function renderSessions() {
   const box = $('#session-list')
+  if (state.view === 'workspace') renderWorkspaceHome()
   // 桌面端把项目会话挂在项目树里；网页端没有项目树，最近列表直接展示远端项目会话。
   const sessions = sortSessionsByRecent(state.sessions).filter(
     (session) => !desktopBrowserHost || session.spaceKind !== 'local',
@@ -2605,6 +2653,7 @@ async function loadSessions() {
   }
   renderSessions()
   renderLocalProjects()
+  if (state.view === 'schedules') renderScheduleTargetOptions()
 }
 
 /** 同一 messageId 的后续结果：更新原气泡，而不是再追加一条。 */
@@ -3677,6 +3726,18 @@ function discardDraftSession() {
 }
 
 /**
+ * 从定时任务、工作台、插件、设置等独立页回到聊天主视图。
+ * 新对话 / 新工作任务必须同时切回聊天，不能只把草稿状态建在后台。
+ */
+function ensureChatViewVisible() {
+  closeSchedulesPage({ restoreFocus: false })
+  closeWorkspacePage({ restoreFocus: false })
+  closePluginsPage({ restoreFocus: false })
+  const settings = $('#settings-stage')
+  if (settings && !settings.hidden) hideSettings({ restoreFocus: false })
+}
+
+/**
  * 纯前端空白草稿：不落库、不进左侧列表。首条消息发出后才由后端创建会话；
  * 在此之前切走 / 关闭标签，草稿直接丢弃，不留任何记录。
  */
@@ -3730,6 +3791,9 @@ async function openNewSession(mode = 'chat') {
     state.historyMessageIds.size === 0 &&
     !sessionReplyBusy()
   ) {
+    // 已是同一份空白草稿时不会再走 setChatMode()，这里也要先退出独立页，
+    // 否则会只聚焦到被定时任务/工作台盖住的输入框。
+    ensureChatViewVisible()
     $('#input')?.focus()
     return
   }
@@ -3777,16 +3841,20 @@ async function startNewWorkTask() {
 }
 
 function openPluginsWorkspace() {
-  // 切到工作台属于离开对话：未发送消息的草稿连同右侧标签直接丢弃。
-  discardDraftSession()
-  setChatMode('workspace')
-  if (state.workspaceKind !== 'plugins') setWorkspaceKind('plugins')
+  openPluginsPage('plugins')
 }
 
-/* ---------------- 定时任务浮层 ---------------- */
+/* ---------------- 定时任务页 ---------------- */
 
 let scheduleLoading = false
 let scheduleTrigger = null
+let scheduleItems = []
+let scheduleFilter = 'all'
+let scheduleEditingId = null
+let scheduleFormMode = 'daily'
+let scheduleLastListSyncAt = 0
+let scheduleFileDockWasHidden = true
+let schedulesBound = false
 
 const SCHEDULE_STATUS = {
   active: { label: '运行中', className: 'is-active' },
@@ -3797,141 +3865,2000 @@ const SCHEDULE_STATUS = {
   cancelled: { label: '已取消', className: '' },
 }
 
+const SCHEDULE_INTERVAL_UNITS = {
+  second: '秒',
+  minute: '分钟',
+  hour: '小时',
+  day: '天',
+  month: '月',
+  year: '年',
+}
+
+function scheduleIntervalParts(rule) {
+  const unit = String(rule?.intervalUnit || '')
+  const value = Number(rule?.intervalValue)
+  if (SCHEDULE_INTERVAL_UNITS[unit] && Number.isFinite(value) && value > 0) {
+    return { value: Math.floor(value), unit }
+  }
+  const minutes = Number(rule?.intervalMinutes)
+  if (!Number.isFinite(minutes) || minutes <= 0) return null
+  if (minutes % 1440 === 0) return { value: minutes / 1440, unit: 'day' }
+  if (minutes % 60 === 0) return { value: minutes / 60, unit: 'hour' }
+  return { value: Math.floor(minutes), unit: 'minute' }
+}
+
+function syncScheduleIntervalMin() {
+  const value = $('#schedule-interval-value')
+  const unit = $('#schedule-interval-unit')
+  if (!value || !unit) return
+  const isSecond = unit.value === 'second'
+  value.min = isSecond ? '30' : '1'
+  if (isSecond && Number(value.value) < 30) value.value = '30'
+}
+
+function addSchedulePreviewMonths(base, months) {
+  const date = new Date(base)
+  const day = date.getDate()
+  date.setDate(1)
+  date.setMonth(date.getMonth() + months)
+  const lastDay = new Date(date.getFullYear(), date.getMonth() + 1, 0).getDate()
+  date.setDate(Math.min(day, lastDay))
+  return date.getTime()
+}
+
+function schedulePreviewNextAt(value, unit, base = Date.now()) {
+  const amount = Number(value)
+  if (!Number.isFinite(amount) || amount <= 0) return null
+  const safe = Math.floor(amount)
+  if (unit === 'second') return base + Math.max(30, safe) * 1000
+  if (unit === 'minute') return base + safe * 60_000
+  if (unit === 'hour') return base + safe * 60 * 60_000
+  if (unit === 'day') {
+    const date = new Date(base)
+    date.setDate(date.getDate() + safe)
+    return date.getTime()
+  }
+  if (unit === 'month') return addSchedulePreviewMonths(base, safe)
+  if (unit === 'year') return addSchedulePreviewMonths(base, safe * 12)
+  return null
+}
+
+function ceilScheduleMinute(epoch) {
+  const date = new Date(epoch)
+  if (date.getSeconds() > 0 || date.getMilliseconds() > 0) date.setMinutes(date.getMinutes() + 1, 0, 0)
+  return date.getTime()
+}
+
+function scheduleLocalInputValue(epoch) {
+  const date = new Date(epoch)
+  if (Number.isNaN(date.getTime())) return ''
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000)
+  return local.toISOString().slice(0, 16)
+}
+
+/** 间隔任务的默认首次时间：按当前间隔往后推，并对齐到下一分钟。 */
+function defaultIntervalStartValue() {
+  const value = $('#schedule-interval-value')?.value || '30'
+  const unit = String($('#schedule-interval-unit')?.value || 'minute')
+  const next = schedulePreviewNextAt(value, unit) ?? (Date.now() + 30 * 60_000)
+  return scheduleLocalInputValue(ceilScheduleMinute(next))
+}
+
+function scheduleIntervalInputValue(raw) {
+  const value = scheduleOnceInputValue(raw)
+  if (!value) return ''
+  return scheduleLocalInputValue(ceilScheduleMinute(Date.parse(value)))
+}
+
+function syncScheduleIntervalValue() {
+  const dateInput = $('#schedule-interval-date')
+  const timeInput = $('#schedule-interval-time')
+  const hidden = $('#schedule-interval-at')
+  if (!hidden) return
+  const date = String(dateInput?.value || '').trim()
+  const time = String(timeInput?.value || '').trim()
+  hidden.value = date && time ? `${date}T${time}` : ''
+  refreshScheduleIntervalWarning()
+  refreshScheduleIntervalPreview()
+}
+
+function setScheduleIntervalFields(raw) {
+  const value = scheduleIntervalInputValue(raw) || defaultIntervalStartValue()
+  const [date, time] = value.split('T')
+  const dateInput = $('#schedule-interval-date')
+  const timeInput = $('#schedule-interval-time')
+  const hidden = $('#schedule-interval-at')
+  if (dateInput) dateInput.value = date || ''
+  if (timeInput) timeInput.value = time || '09:00'
+  if (hidden) hidden.value = date && time ? `${date}T${time}` : ''
+  refreshScheduleIntervalWarning()
+  refreshScheduleIntervalPreview()
+}
+
+function refreshScheduleIntervalWarning() {
+  const warning = $('#schedule-interval-warning')
+  const start = $('#schedule-interval-start')
+  const hidden = $('#schedule-interval-at')
+  if (!warning) return
+  if (scheduleFormMode !== 'interval') {
+    warning.hidden = true
+    warning.textContent = ''
+    start?.classList.remove('is-invalid')
+    hidden?.removeAttribute('aria-invalid')
+    return
+  }
+  const state = scheduleOnceTimeState(hidden?.value)
+  const text = state === 'expired'
+    ? '执行时间已过期，请选择未来时间。'
+    : state === 'too_soon'
+      ? '执行时间太近，请至少留出 30 秒。'
+      : state === 'invalid'
+        ? '请选择有效的执行时间。'
+        : state === 'empty'
+          ? '请选择执行时间。'
+          : ''
+  warning.hidden = !text
+  warning.textContent = text
+  start?.classList.toggle('is-invalid', Boolean(text))
+  if (text) hidden?.setAttribute('aria-invalid', 'true')
+  else hidden?.removeAttribute('aria-invalid')
+}
+
+function refreshScheduleIntervalPreview() {
+  if (scheduleFormMode !== 'interval') return
+  const label = $('#schedule-interval-time-label')
+  const badge = $('#schedule-interval-time-badge')
+  const item = scheduleEditingId ? findScheduleItem(scheduleEditingId) : null
+  const terminal = Boolean(item && ['done', 'error', 'cancelled'].includes(item.status))
+  if (label) label.textContent = '执行时间'
+  if (badge) badge.textContent = !scheduleEditingId ? '首次' : terminal ? '启用' : '下次'
+}
+
+const SCHEDULE_WEEKDAYS = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
+const SCHEDULE_FILTER_LABELS = { all: '全部任务', active: '进行中', paused: '已暂停', ended: '已结束' }
+
 function scheduleStatusMeta(status) {
   return SCHEDULE_STATUS[String(status || '')] || { label: status || '未知', className: '' }
 }
 
-function scheduleModeLabel(mode) {
-  return {
-    chat: '对话',
-    task: '工作任务',
-    agent: 'Agent',
-    once: '单次',
-  }[String(mode || '')] || String(mode || '任务')
+function scheduleSessionTargets() {
+  return sortSessionsByRecent(state.sessions || []).filter(
+    (session) => session && session.source !== 'dingtalk' && session.source !== 'feishu',
+  )
 }
 
-function scheduleChannelLabel(channel) {
-  return channel === 'dingtalk' ? '钉钉' : '网页'
+function scheduleSessionTitle(sessionId) {
+  const session = (state.sessions || []).find((item) => item.id === sessionId)
+  return String(session?.title || '当前绑定的对话').trim() || '当前绑定的对话'
 }
+
+function scheduleTargetValue(item) {
+  if (!item || item.channel === 'dingtalk') return 'dingtalk'
+  return item.sessionId ? `session:${item.sessionId}` : 'new'
+}
+
+function scheduleTargetLabel(item) {
+  if (!item || item.channel === 'dingtalk') return '钉钉'
+  if (!item.sessionId) return '新建对话'
+  const title = scheduleSessionTitle(item.sessionId)
+  return `对话 · ${title.length > 16 ? `${title.slice(0, 16)}…` : title}`
+}
+
+/** 结果去向下拉：钉钉 + 新建对话 + 侧栏当前能看到的全部网页对话，平铺展示并支持标题搜索。 */
+function renderScheduleTargetOptions(extraSessionId = null) {
+  const select = $('#schedule-channel')
+  if (!select) return
+  const current = select.value || 'new'
+  const sessions = scheduleSessionTargets()
+  const seen = new Set(sessions.map((session) => session.id))
+  const editing = scheduleEditingId ? findScheduleItem(scheduleEditingId) : null
+  const extras = [extraSessionId, current.startsWith('session:') ? current.slice(8) : '', editing?.sessionId || '']
+    .filter((id, index, list) => id && !seen.has(id) && list.indexOf(id) === index)
+    .map((id) => ({ id, title: scheduleSessionTitle(id) }))
+  select.innerHTML = [
+    '<option value="dingtalk">钉钉</option>',
+    '<option value="new">新建对话</option>',
+    ...sessions.map((session) => {
+      const title = String(session.title || '未命名对话').trim() || '未命名对话'
+      return `<option value="session:${esc(session.id)}" title="${esc(title)}">${esc(title)}</option>`
+    }),
+    ...extras.map(
+      (session) => `<option value="session:${esc(session.id)}" title="${esc(session.title)}">${esc(session.title)}</option>`,
+    ),
+  ].join('')
+  if ([...select.options].some((option) => option.value === current)) {
+    select.value = current
+  } else if (current.startsWith('session:')) {
+    const id = current.slice(8)
+    const option = document.createElement('option')
+    option.value = current
+    option.textContent = scheduleSessionTitle(id)
+    select.append(option)
+    select.value = current
+  } else {
+    select.value = 'new'
+  }
+  syncScheduleTargetTrigger()
+  renderScheduleTargetMenu()
+}
+
+function scheduleTargetEntries() {
+  const select = $('#schedule-channel')
+  if (!select) return []
+  return [...select.options].map((option) => ({
+    value: option.value,
+    label: String(option.textContent || '').trim() || '未命名对话',
+    fixed: option.value === 'dingtalk' || option.value === 'new',
+  }))
+}
+
+function scheduleTargetSearchTokens(query) {
+  return String(query || '')
+    .trim()
+    .toLocaleLowerCase()
+    .split(/\s+/)
+    .filter(Boolean)
+}
+
+function scheduleTargetMatchesQuery(label, tokens) {
+  if (!tokens.length) return true
+  const haystack = String(label || '').toLocaleLowerCase()
+  return tokens.every((token) => haystack.includes(token))
+}
+
+function scheduleTargetSelectedLabel() {
+  const select = $('#schedule-channel')
+  const selected = select?.selectedOptions?.[0]
+  return String(selected?.textContent || '新建对话').trim() || '新建对话'
+}
+
+let scheduleTargetQuery = '';
+
+function syncScheduleTargetTrigger() {
+  const select = $('#schedule-channel')
+  const trigger = $('#schedule-target-trigger')
+  if (!select || !trigger) return
+  const label = scheduleTargetSelectedLabel()
+  const panel = $('#schedule-target-popover')
+  if (!panel || panel.hidden) trigger.value = label
+  trigger.title = label === '新建对话' ? '选择结果回推位置' : label
+}
+
+function renderScheduleTargetMenu() {
+  const list = $('#schedule-target-options')
+  const empty = $('#schedule-target-empty')
+  if (!list) return
+  const tokens = scheduleTargetSearchTokens(scheduleTargetQuery)
+  const selectedValue = $('#schedule-channel')?.value || 'new'
+  const visible = scheduleTargetEntries().filter((entry) => scheduleTargetMatchesQuery(entry.label, tokens))
+  const buttons = visible.map((entry) => {
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.className = `schedule-target-option${entry.value === selectedValue ? ' is-selected' : ''}`
+    button.dataset.value = entry.value
+    button.setAttribute('role', 'option')
+    button.setAttribute('aria-selected', entry.value === selectedValue ? 'true' : 'false')
+    button.tabIndex = -1
+    const label = document.createElement('span')
+    label.className = 'schedule-target-option-label'
+    label.textContent = entry.label
+    const check = document.createElement('span')
+    check.className = 'schedule-target-option-check'
+    check.setAttribute('aria-hidden', 'true')
+    button.append(label, check)
+    return button
+  })
+  list.replaceChildren(...buttons)
+  if (empty) empty.hidden = !tokens.length || visible.length > 0
+}
+
+function positionScheduleTargetPicker() {
+  const trigger = $('#schedule-target-trigger')
+  const panel = $('#schedule-target-popover')
+  if (!trigger || !panel || panel.hidden) return
+  const rect = trigger.getBoundingClientRect()
+  const margin = 8
+  const gap = 6
+  const width = Math.min(Math.max(rect.width, 260), window.innerWidth - margin * 2)
+  panel.style.width = `${Math.round(width)}px`
+  const height = panel.offsetHeight
+  const left = Math.min(Math.max(rect.left, margin), window.innerWidth - width - margin)
+  let top = rect.bottom + gap
+  if (top + height > window.innerHeight - margin) {
+    const above = rect.top - height - gap
+    top = above >= margin ? above : Math.max(margin, window.innerHeight - margin - height)
+  }
+  panel.style.left = `${Math.round(left)}px`
+  panel.style.top = `${Math.round(top)}px`
+}
+
+function openScheduleTargetPicker() {
+  const panel = $('#schedule-target-popover')
+  const trigger = $('#schedule-target-trigger')
+  if (!panel || !trigger || !panel.hidden) return
+  scheduleTargetQuery = ''
+  panel.hidden = false
+  trigger.setAttribute('aria-expanded', 'true')
+  renderScheduleTargetMenu()
+  positionScheduleTargetPicker()
+  const selected = $('#schedule-target-options .schedule-target-option.is-selected')
+  selected?.scrollIntoView({ block: 'nearest' })
+  if (document.activeElement !== trigger) {
+    trigger.focus({ preventScroll: true })
+    trigger.select()
+  }
+}
+
+function closeScheduleTargetPicker({ restoreFocus = false } = {}) {
+  const panel = $('#schedule-target-popover')
+  const trigger = $('#schedule-target-trigger')
+  if (panel) panel.hidden = true
+  scheduleTargetQuery = ''
+  if (trigger) {
+    trigger.setAttribute('aria-expanded', 'false')
+    trigger.value = scheduleTargetSelectedLabel()
+    if (restoreFocus) requestAnimationFrame(() => trigger.focus({ preventScroll: true }))
+  }
+}
+
+function setScheduleTargetValue(value, { close = true, focus = false } = {}) {
+  const select = $('#schedule-channel')
+  if (!select || !value) return
+  if (![...select.options].some((option) => option.value === value)) {
+    if (!String(value).startsWith('session:')) return
+    const option = document.createElement('option')
+    option.value = value
+    option.textContent = scheduleSessionTitle(String(value).slice(8))
+    select.append(option)
+  }
+  select.value = value
+  syncScheduleTargetTrigger()
+  renderScheduleTargetMenu()
+  if (close) closeScheduleTargetPicker({ restoreFocus: focus })
+  select.dispatchEvent(new Event('change', { bubbles: true }))
+}
+
+function bindScheduleTargetPicker() {
+  const trigger = $('#schedule-target-trigger')
+  const panel = $('#schedule-target-popover')
+  const list = $('#schedule-target-options')
+  if (!trigger || !panel || !list) return
+
+  const choose = (button) => {
+    const value = button?.dataset?.value
+    if (!value) return
+    setScheduleTargetValue(value, { close: true, focus: true })
+  }
+  const focusOption = (direction) => {
+    const buttons = [...list.querySelectorAll('.schedule-target-option')]
+    if (!buttons.length) return
+    const target = direction === 'last' ? buttons.at(-1) : buttons[0]
+    target?.focus({ preventScroll: true })
+  }
+  const isInsidePicker = (target) => Boolean(target && (panel.contains(target) || trigger.contains(target)))
+  const selectedOption = () => list.querySelector('.schedule-target-option.is-selected')
+
+  trigger.addEventListener('click', () => {
+    if (panel.hidden) {
+      openScheduleTargetPicker()
+      trigger.select()
+      return
+    }
+    if (!scheduleTargetQuery) trigger.select()
+  })
+  trigger.addEventListener('input', () => {
+    if (panel.hidden) openScheduleTargetPicker()
+    scheduleTargetQuery = trigger.value
+    renderScheduleTargetMenu()
+    positionScheduleTargetPicker()
+  })
+  trigger.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && !panel.hidden) {
+      event.preventDefault()
+      event.stopPropagation()
+      closeScheduleTargetPicker({ restoreFocus: true })
+      return
+    }
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault()
+      if (panel.hidden) openScheduleTargetPicker()
+      focusOption(event.key === 'ArrowUp' ? 'last' : 'first')
+      return
+    }
+    if (event.key !== 'Enter') return
+    event.preventDefault()
+    if (panel.hidden) {
+      openScheduleTargetPicker()
+      return
+    }
+    const target = scheduleTargetQuery.trim()
+      ? list.querySelector('.schedule-target-option')
+      : selectedOption()
+    if (target) choose(target)
+  })
+
+  list.addEventListener('click', (event) => {
+    const button = event.target.closest?.('.schedule-target-option')
+    if (button) choose(button)
+  })
+  list.addEventListener('keydown', (event) => {
+    const button = event.target.closest?.('.schedule-target-option')
+    if (!button) return
+    if (!['ArrowDown', 'ArrowUp', 'Home', 'End', 'Enter', 'Escape'].includes(event.key)) return
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      event.stopPropagation()
+      closeScheduleTargetPicker({ restoreFocus: true })
+      return
+    }
+    if (event.key === 'Enter') {
+      event.preventDefault()
+      choose(button)
+      return
+    }
+    if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return
+    event.preventDefault()
+    const buttons = [...list.querySelectorAll('.schedule-target-option')]
+    const index = buttons.indexOf(button)
+    if (event.key === 'ArrowUp' && index === 0) {
+      trigger.focus({ preventScroll: true })
+      trigger.select()
+      return
+    }
+    const next =
+      event.key === 'Home'
+        ? buttons[0]
+        : event.key === 'End'
+          ? buttons.at(-1)
+          : event.key === 'ArrowDown'
+            ? buttons[index + 1]
+            : buttons[index - 1]
+    next?.focus({ preventScroll: true })
+  })
+
+  document.addEventListener('pointerdown', (event) => {
+    if (panel.hidden || isInsidePicker(event.target)) return
+    closeScheduleTargetPicker()
+  })
+  document.addEventListener('focusin', (event) => {
+    if (panel.hidden || isInsidePicker(event.target)) return
+    closeScheduleTargetPicker()
+  })
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape' || panel.hidden) return
+    event.preventDefault()
+    closeScheduleTargetPicker({ restoreFocus: true })
+  })
+  window.addEventListener('resize', positionScheduleTargetPicker)
+  window.addEventListener('scroll', positionScheduleTargetPicker, true)
+}
+
 
 function formatScheduleDate(value) {
   if (!value) return ''
   const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return ''
+  if (Number.isNaN(date.getTime())) return String(value)
   return date.toLocaleString('zh-CN', { hour12: false, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+}
+
+function scheduleRuleObject(item) {
+  const raw = item?.rule
+  if (raw && typeof raw === 'object') return raw
+  if (typeof raw === 'string') {
+    try {
+      return JSON.parse(raw)
+    } catch {
+      return {}
+    }
+  }
+  return {}
+}
+
+function scheduleDayLabel(day) {
+  return SCHEDULE_WEEKDAYS[Number(day)] || ''
+}
+
+function scheduleRuleLabel(item) {
+  const rule = scheduleRuleObject(item)
+  const mode = String(rule.mode || item?.mode || '')
+  if (mode === 'daily') return `每天 ${rule.time || '—'}`
+  if (mode === 'weekly') {
+    const days = Array.isArray(rule.days) ? rule.days.map(scheduleDayLabel).filter(Boolean) : []
+    return `每周${days.length ? days.join('、') : '—'} ${rule.time || ''}`.trim()
+  }
+  if (mode === 'once') {
+    const at = String(rule.at || item?.nextRunLocal || '')
+    return `单次 ${at.includes('T') ? formatScheduleDate(at) : at || '—'}`
+  }
+  if (mode === 'interval') {
+    const parts = scheduleIntervalParts(rule)
+    if (!parts) return '每 —'
+    const unit = SCHEDULE_INTERVAL_UNITS[parts.unit]
+    return parts.value === 1 ? `每${unit}` : `每 ${parts.value} ${unit}`
+  }
+  return '按规则执行'
 }
 
 function scheduleTimeLabel(item) {
   const status = String(item.status || '')
-  if (status === 'active' || status === 'running' || status === 'paused') {
+  if (status === 'running') return '正在执行，完成后按规则继续'
+  if (status === 'active' || status === 'paused') {
     const next = item.nextRunLocal || formatScheduleDate(item.nextRunAt)
     return next ? `下次 ${next}` : '暂无下次执行'
   }
   const last = formatScheduleDate(item.lastRunAt)
   if (last) return `上次 ${last}`
-  if (status === 'cancelled') return '已取消'
   if (status === 'error' && item.lastError) return `最近失败：${item.lastError}`
+  if (status === 'cancelled') return '已取消'
   return '已结束'
 }
 
-function renderScheduleList(items) {
+function scheduleFilterMatches(item) {
+  if (scheduleFilter === 'all') return true
+  if (scheduleFilter === 'active') return item.status === 'active' || item.status === 'running'
+  if (scheduleFilter === 'paused') return item.status === 'paused'
+  if (scheduleFilter === 'ended') return ['done', 'error', 'cancelled'].includes(item.status)
+  return true
+}
+
+function scheduleItemsForFilter() {
+  return scheduleItems.filter(scheduleFilterMatches)
+}
+
+function scheduleCountCurrent(node) {
+  let current = node.querySelector('.schedule-stat-number-value.is-current')
+  if (!current) {
+    current = document.createElement('span')
+    current.className = 'schedule-stat-number-value is-current'
+    current.textContent = String(node.textContent || '0').trim() || '0'
+    node.replaceChildren(current)
+  }
+  return current
+}
+
+function setScheduleCountValue(node, value) {
+  if (!node) return
+  const next = String(value)
+  const current = scheduleCountCurrent(node)
+  if (!node.dataset.countValue) {
+    node.dataset.countValue = next
+    current.textContent = next
+    return
+  }
+  if (node.dataset.countValue === next) return
+  node.dataset.countValue = next
+
+  const incoming = document.createElement('span')
+  incoming.className = 'schedule-stat-number-value is-current'
+  incoming.textContent = next
+
+  const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+  if (reduceMotion || typeof current.animate !== 'function') {
+    node.__scheduleCountAnimations?.forEach((animation) => animation.cancel())
+    node.__scheduleCountAnimations = null
+    node.replaceChildren(incoming)
+    return
+  }
+
+  node.__scheduleCountAnimations?.forEach((animation) => animation.cancel())
+  node.querySelectorAll('.schedule-stat-number-value:not(.is-current)').forEach((node) => node.remove())
+  current.style.transform = ''
+  current.style.opacity = ''
+  current.classList.remove('is-current')
+  current.classList.add('is-leaving')
+  current.setAttribute('aria-hidden', 'true')
+  incoming.style.transform = 'translateY(105%)'
+  incoming.style.opacity = '0'
+  node.append(incoming)
+
+  const outgoingAnimation = current.animate(
+    [
+      { transform: 'translateY(0)', opacity: 1 },
+      { transform: 'translateY(-105%)', opacity: 0 },
+    ],
+    { duration: 230, easing: 'cubic-bezier(.4, 0, .2, 1)', fill: 'both' },
+  )
+  const incomingAnimation = incoming.animate(
+    [
+      { transform: 'translateY(105%)', opacity: 0 },
+      { transform: 'translateY(0)', opacity: 1 },
+    ],
+    { duration: 250, easing: 'cubic-bezier(.2, .8, .25, 1)', fill: 'both' },
+  )
+  node.__scheduleCountAnimations = [outgoingAnimation, incomingAnimation]
+
+  Promise.allSettled([outgoingAnimation.finished, incomingAnimation.finished]).then(() => {
+    if (!incoming.isConnected || !incoming.classList.contains('is-current')) return
+    outgoingAnimation.cancel()
+    incomingAnimation.cancel()
+    incoming.style.transform = ''
+    incoming.style.opacity = ''
+    if (current.isConnected) current.remove()
+    node.__scheduleCountAnimations = null
+  })
+}
+
+function renderScheduleStats() {
+  const counts = { all: scheduleItems.length, active: 0, paused: 0, ended: 0 }
+  for (const item of scheduleItems) {
+    if (item.status === 'active' || item.status === 'running') counts.active += 1
+    else if (item.status === 'paused') counts.paused += 1
+    else counts.ended += 1
+  }
+  const entries = [
+    ['all', '#schedule-count-all'],
+    ['active', '#schedule-count-active'],
+    ['paused', '#schedule-count-paused'],
+    ['ended', '#schedule-count-ended'],
+  ]
+  for (const [key, selector] of entries) {
+    const node = $(selector)
+    if (node) setScheduleCountValue(node, counts[key])
+  }
+  for (const button of document.querySelectorAll('[data-schedule-filter]')) {
+    const active = button.dataset.scheduleFilter === scheduleFilter
+    button.classList.toggle('is-active', active)
+    button.setAttribute('aria-pressed', active ? 'true' : 'false')
+  }
+}
+
+function renderScheduleList() {
   const list = $('#schedule-list')
   if (!list) return
-  if (!Array.isArray(items) || items.length === 0) {
+  renderScheduleStats()
+  const filtered = scheduleItemsForFilter()
+  const title = $('#schedules-list-title')
+  const hint = $('#schedules-list-hint')
+  if (title) title.textContent = SCHEDULE_FILTER_LABELS[scheduleFilter] || '全部任务'
+  if (hint) hint.textContent = `共 ${filtered.length} 个`
+
+  if (filtered.length === 0) {
+    const emptyTitle =
+      scheduleFilter === 'all'
+        ? '还没有定时任务'
+        : `没有${SCHEDULE_FILTER_LABELS[scheduleFilter] || '相关'}任务`
     list.innerHTML = `<div class="schedule-list-empty">
-      <strong>还没有定时任务</strong>
-      <span>在对话里描述“每天/每周要做什么”，Agent 会帮你创建。</span>
+      <span class="schedules-empty-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.4" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M12 7.4V12l3.2 2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+      <strong>${esc(emptyTitle)}</strong>
     </div>`
     return
   }
-  list.innerHTML = items
+
+  list.innerHTML = filtered
     .map((item) => {
       const status = scheduleStatusMeta(item.status)
-      const when = scheduleTimeLabel(item)
       const canToggle = item.status === 'active' || item.status === 'paused'
-      return `<div class="schedule-item" data-schedule-id="${esc(item.id)}">
-        <div class="schedule-item-main">
-          <div class="schedule-item-title">
-            <strong title="${esc(item.title || item.prompt || '定时任务')}">${esc(item.title || item.prompt || '定时任务')}</strong>
+      const canManage = item.status !== 'running'
+      const title = item.title || item.prompt || '定时任务'
+      const prompt = String(item.prompt || '').trim()
+      const when = scheduleTimeLabel(item)
+      const editing = scheduleEditingId === item.id
+      return `<article class="schedule-task-card${editing ? ' is-editing' : ''}" data-status="${esc(item.status || '')}" data-schedule-id="${esc(item.id)}">
+        <div class="schedule-task-top">
+          <div class="schedule-task-heading">
+            <strong title="${esc(title)}">${esc(title)}</strong>
             <span class="schedule-status ${status.className}">${esc(status.label)}</span>
           </div>
-          <div class="schedule-item-meta">
-            <span class="is-next" title="${esc(when)}">${esc(when)}</span>
-            <span>${esc(scheduleModeLabel(item.mode))}</span>
-            <span>${esc(scheduleChannelLabel(item.channel))}</span>
+          <span class="schedule-channel" title="${esc(scheduleTargetLabel(item))}">${esc(scheduleTargetLabel(item))}</span>
+        </div>
+        <p class="schedule-task-prompt" title="${esc(prompt)}">${esc(prompt)}</p>
+        <div class="schedule-task-rule">
+          <span class="is-rule">${esc(scheduleRuleLabel(item))}</span>
+          <span class="is-next">${esc(when)}</span>
+        </div>
+        <div class="schedule-task-bottom">
+          <span class="schedule-task-time" title="${esc(item.createdAt || '')}">创建于 ${esc(formatScheduleDate(item.createdAt) || '—')}</span>
+          <div class="schedule-task-actions">
+            ${canToggle ? `<button class="schedule-action" type="button" data-schedule-action="${item.status === 'active' ? 'pause' : 'resume'}" data-schedule-id="${esc(item.id)}">${item.status === 'active' ? '暂停' : '启用'}</button>` : ''}
+            ${canManage ? `<button class="schedule-action" type="button" data-schedule-action="edit" data-schedule-id="${esc(item.id)}">编辑</button>` : ''}
+            <button class="schedule-action" type="button" data-schedule-action="copy" data-schedule-id="${esc(item.id)}">复制</button>
+            ${canManage ? `<button class="schedule-action is-danger" type="button" data-schedule-action="delete" data-schedule-id="${esc(item.id)}">删除</button>` : ''}
           </div>
         </div>
-        ${
-          canToggle
-            ? `<button class="schedule-toggle" type="button" data-schedule-toggle="${esc(item.id)}" data-action="${item.status === 'active' ? 'pause' : 'resume'}">${item.status === 'active' ? '暂停' : '恢复'}</button>`
-            : ''
-        }
-      </div>`
+      </article>`
     })
     .join('')
 }
 
-async function loadSchedules() {
+async function loadSchedules(options = {}) {
   const list = $('#schedule-list')
-  const refresh = $('#schedule-refresh')
-  if (!list || scheduleLoading) return
+  const refresh = $('#schedules-refresh')
+  const silent = options.silent === true
+  if (!list || (scheduleLoading && !silent)) return
   scheduleLoading = true
-  if (refresh) refresh.disabled = true
-  list.innerHTML = `<div class="schedule-list-empty"><span>正在读取定时任务…</span></div>`
+  if (refresh && !silent) refresh.disabled = true
+  if (!silent) list.innerHTML = `<div class="schedule-list-empty"><span>正在读取定时任务…</span></div>`
   try {
-    const data = await api('/api/schedules')
-    renderScheduleList(data?.schedules || [])
+    const data = await api(`/api/schedules?ts=${Date.now()}`, { cache: 'no-store' })
+    scheduleItems = Array.isArray(data?.schedules) ? data.schedules : []
+    renderScheduleList()
+    refreshScheduleIntervalPreview()
   } catch (err) {
+    if (silent) return
+    scheduleItems = []
+    renderScheduleStats()
     const hint = err?.status === 403 ? '当前账号没有查看定时任务的权限。' : err?.message || '读取定时任务失败'
-    list.innerHTML = `<div class="schedule-list-empty"><strong>暂时读不到定时任务</strong><span>${esc(hint)}</span></div>`
+    list.innerHTML = `<div class="schedule-list-empty">
+      <strong>暂时读不到定时任务</strong>
+      <span>${esc(hint)}</span>
+    </div>`
   } finally {
     scheduleLoading = false
+    scheduleLastListSyncAt = Date.now()
+    if (refresh && !silent) refresh.disabled = false
+  }
+}
+
+function openSchedulesPage(trigger) {
+  const stage = $('#schedules-stage')
+  if (!stage) return
+  if (!stage.hidden) {
+    void loadSchedules()
+    return
+  }
+  dismissSideDrawersForPage()
+  closeWorkspacePage({ restoreFocus: false })
+  closePluginsPage({ restoreFocus: false })
+  scheduleFilter = 'all'
+  resetScheduleForm()
+  if (state.view === 'settings') hideSettings({ restoreFocus: false })
+  hideSideMoreMenu()
+  scheduleTrigger = trigger || null
+  const fileDock = $('#file-dock')
+  scheduleFileDockWasHidden = !fileDock || fileDock.hidden
+  if (fileDock) fileDock.hidden = true
+  $('.chat-head').hidden = true
+  $('.chat-main').hidden = true
+  stage.hidden = false
+  playPaneEnter(stage)
+  state.view = 'schedules'
+  persistChatLocation()
+  for (const button of document.querySelectorAll('[data-side-action]')) {
+    button.classList.toggle('is-active', button.dataset.sideAction === 'schedules')
+  }
+  syncDesktopBrowserView()
+  void loadSchedules()
+}
+
+function closeSchedulesPage(options = {}) {
+  const stage = $('#schedules-stage')
+  if (!stage || stage.hidden) return
+  stage.hidden = true
+  clearPaneEnter(stage)
+  $('.chat-head').hidden = false
+  $('.chat-main').hidden = false
+  const fileDock = $('#file-dock')
+  if (fileDock) fileDock.hidden = scheduleFileDockWasHidden
+  for (const button of document.querySelectorAll('[data-side-action]')) button.classList.remove('is-active')
+  state.view = state.mode
+  persistChatLocation()
+  syncDesktopBrowserView()
+  if (options.restoreFocus !== false) {
+    const target = scheduleTrigger && scheduleTrigger.isConnected ? scheduleTrigger : state.mode === 'chat' ? $('#input') : null
+    target?.focus({ preventScroll: true })
+  }
+  scheduleTrigger = null
+}
+
+/* ---------------- 独立页：工作台总览 / 插件与技能 ---------------- */
+
+let workspacePageTrigger = null
+let pluginsPageTrigger = null
+let standaloneFileDockWasHidden = true
+
+const WS_FOLDER_ICON = '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 6.6h5l1.5 1.8h7.5v6.2a1.5 1.5 0 0 1-1.5 1.5H4.5A1.5 1.5 0 0 1 3 12.6V6.6Z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M3 6.6V5.2A1.3 1.3 0 0 1 4.3 3.9h3.2L8.9 5.4h5.3A1.3 1.3 0 0 1 15.5 6.7v1" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>'
+const WS_CHAT_ICON = '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3.6 4.8h12.8v8.4H9l-3.4 2.4v-2.4H3.6V4.8Z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M6.4 8h7.2M6.4 10.6h4.8" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>'
+const WS_TASK_ICON = '<svg viewBox="0 0 20 20" aria-hidden="true"><rect x="4" y="3.8" width="12" height="12.6" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M7 7.2h6M7 10h6M7 12.8h3.6" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>'
+
+function markStandaloneNav(action) {
+  for (const button of document.querySelectorAll('[data-side-action]')) {
+    button.classList.toggle('is-active', button.dataset.sideAction === action)
+  }
+}
+
+function stashStandaloneFileDock() {
+  const dock = $('#file-dock')
+  standaloneFileDockWasHidden = !dock || dock.hidden
+  if (dock) dock.hidden = true
+}
+
+function restoreStandaloneFileDock() {
+  const dock = $('#file-dock')
+  if (dock) dock.hidden = standaloneFileDockWasHidden
+}
+
+function leaveStandalonePageForChat(options = {}) {
+  $('.chat-head').hidden = false
+  $('.chat-main').hidden = false
+  restoreStandaloneFileDock()
+  markStandaloneNav('')
+  state.view = state.mode
+  persistChatLocation()
+  syncDesktopBrowserView()
+  if (options.restoreFocus !== false) $('#input')?.focus({ preventScroll: true })
+}
+
+function openWorkspacePage(trigger) {
+  const stage = $('#workspace-stage')
+  if (!stage) return
+  if (!stage.hidden) {
+    void refreshWorkspacePage()
+    return
+  }
+  dismissSideDrawersForPage()
+  closeSchedulesPage({ restoreFocus: false })
+  closePluginsPage({ restoreFocus: false })
+  if ($('#settings-stage') && !$('#settings-stage').hidden) hideSettings({ restoreFocus: false })
+  hideSideMoreMenu()
+  workspacePageTrigger = trigger || null
+  stashStandaloneFileDock()
+  $('.chat-head').hidden = true
+  $('.chat-main').hidden = true
+  stage.hidden = false
+  playPaneEnter(stage)
+  state.view = 'workspace'
+  markStandaloneNav('workspace')
+  renderWorkspaceHome()
+  void loadWorkspaceSummary()
+  persistChatLocation()
+  syncDesktopBrowserView()
+}
+
+function closeWorkspacePage(options = {}) {
+  const stage = $('#workspace-stage')
+  if (!stage || stage.hidden) return
+  stage.hidden = true
+  clearPaneEnter(stage)
+  leaveStandalonePageForChat(options)
+  if (options.restoreFocus !== false) {
+    const target = workspacePageTrigger && workspacePageTrigger.isConnected ? workspacePageTrigger : null
+    target?.focus({ preventScroll: true })
+  }
+  workspacePageTrigger = null
+}
+
+function openPluginsPage(kind = 'plugins', trigger) {
+  const stage = $('#plugins-stage')
+  if (!stage) return
+  dismissSideDrawersForPage()
+  closeSchedulesPage({ restoreFocus: false })
+  closeWorkspacePage({ restoreFocus: false })
+  if ($('#settings-stage') && !$('#settings-stage').hidden) hideSettings({ restoreFocus: false })
+  hideSideMoreMenu()
+  pluginsPageTrigger = trigger || null
+  stashStandaloneFileDock()
+  $('.chat-head').hidden = true
+  $('.chat-main').hidden = true
+  stage.hidden = false
+  playPaneEnter(stage)
+  state.view = 'plugins'
+  markStandaloneNav('plugins')
+  const next = kind === 'skills' ? 'skills' : 'plugins'
+  state.workspaceKind = next
+  syncWorkspaceKindChrome()
+  loadWorkspaceKindContent()
+  $('.plugins-stage-body')?.scrollTo({ top: 0 })
+  persistChatLocation()
+  syncDesktopBrowserView()
+}
+
+function closePluginsPage(options = {}) {
+  const stage = $('#plugins-stage')
+  if (!stage || stage.hidden) return
+  stage.hidden = true
+  clearPaneEnter(stage)
+  leaveStandalonePageForChat(options)
+  if (options.restoreFocus !== false) {
+    const target = pluginsPageTrigger && pluginsPageTrigger.isConnected ? pluginsPageTrigger : null
+    target?.focus({ preventScroll: true })
+  }
+  pluginsPageTrigger = null
+}
+
+function loadWorkspaceKindContent() {
+  if (state.workspaceKind === 'skills') void loadMySkills()
+  else void loadMyPlugins()
+}
+
+function workspaceGreeting() {
+  const hour = new Date().getHours()
+  const prefix = hour < 5 ? '夜深了' : hour < 11 ? '早上好' : hour < 14 ? '中午好' : hour < 18 ? '下午好' : '晚上好'
+  const name = String(state.me?.person?.name || '').trim()
+  return name ? `${prefix}，${name}` : prefix
+}
+
+function workspaceTodayDate() {
+  const now = new Date()
+  const week = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][now.getDay()]
+  return `${now.getMonth() + 1}月${now.getDate()}日 · ${week}`
+}
+
+function workspaceSessionLabel(session) {
+  if (session.projectMode === 'task') return '工作任务'
+  if (session.source === 'dingtalk') return '钉钉'
+  if (session.spaceKind === 'local') return String(session.projectName || '项目')
+  return '对话'
+}
+
+function renderWorkspacePageShell() {
+  const createProject = $('#workspace-create-project')
+  const quickProject = $('#workspace-quick-project')
+  const quickDesktop = $('#workspace-quick-desktop')
+  const projectNew = $('#workspace-project-new')
+  for (const button of [createProject, quickProject, projectNew]) {
+    if (button) button.hidden = !desktopBrowserHost
+  }
+  if (quickDesktop) quickDesktop.hidden = Boolean(desktopBrowserHost)
+  const greeting = $('#workspace-greeting')
+  if (greeting) greeting.textContent = workspaceGreeting()
+  const today = $('#workspace-today-date')
+  if (today) today.textContent = workspaceTodayDate()
+}
+
+function renderWorkspaceHome() {
+  const stage = $('#workspace-stage')
+  if (!stage) return
+  renderWorkspacePageShell()
+  const projects = state.localProjects || []
+  const recent = sortSessionsByRecent(state.sessions || []).slice(0, 6)
+  const summary = state.workspaceSummary || {}
+  const activeSchedules = summary.loaded ? Number(summary.activeSchedules) || 0 : null
+  const pluginCount = summary.loaded ? Number(summary.plugins) || 0 : null
+  const skillCount = summary.loaded ? Number(summary.skills) || 0 : null
+
+  const setText = (selector, value) => {
+    const node = $(selector)
+    if (node) node.textContent = value
+  }
+  setText('#workspace-project-hint', projects.length ? `${projects.length} 个可用项目` : '还没有项目')
+  setText('#workspace-recent-hint', recent.length ? `最近 ${recent.length} 条会话` : '还没有对话')
+  setText('#workspace-today-recent', String((state.sessions || []).length))
+  setText('#workspace-today-schedules', activeSchedules == null ? '—' : String(activeSchedules))
+  setText('#workspace-quick-schedules', activeSchedules == null ? '自动执行' : `${activeSchedules} 个进行中`)
+  setText('#workspace-plugin-count', pluginCount == null ? '—' : String(pluginCount))
+  setText('#workspace-skill-count', skillCount == null ? '—' : String(skillCount))
+
+  const projectBox = $('#workspace-projects')
+  if (projectBox) {
+    if (!projects.length) {
+      projectBox.innerHTML = `<div class="workspace-home-empty">
+        <strong>${desktopBrowserHost ? '还没有项目' : '还没有可访问的桌面项目'}</strong>
+        <span>${desktopBrowserHost ? '把本机目录绑定成项目，文件、对话和工作任务会归到一起。' : '在桌面端创建项目后，同账号的网页端也能看到。'}</span>
+        ${desktopBrowserHost ? '<button class="workspace-home-empty-action" type="button" data-workspace-action="new-project">创建第一个项目</button>' : ''}
+      </div>`
+    } else {
+      projectBox.innerHTML = projects
+        .slice(0, 6)
+        .map((project) => {
+          const sessionCount = projectSessionsFor(project.id).length
+          const path = String(project.rootPath || project.rootRealPath || '')
+          const online = project.deviceOnline !== false
+          const stateLabel = online ? '桌面在线' : '桌面离线'
+          return `<button class="workspace-home-project" type="button" data-workspace-project="${esc(project.id)}" title="${esc(path || project.name)}">
+            <span class="workspace-home-project-top">
+              <span class="workspace-home-project-icon">${WS_FOLDER_ICON}</span>
+              <span class="workspace-home-project-state ${online ? '' : 'is-offline'}">${stateLabel}</span>
+            </span>
+            <strong>${esc(project.name)}</strong>
+            <span class="workspace-home-project-path">${esc(path || '本机项目目录')}</span>
+            <span class="workspace-home-project-foot">${sessionCount} 个会话 <em>打开 →</em></span>
+          </button>`
+        })
+        .join('')
+    }
+  }
+
+  const recentBox = $('#workspace-recent-list')
+  if (recentBox) {
+    recentBox.innerHTML = recent.length
+      ? recent
+          .map((session) => {
+            const task = session.projectMode === 'task'
+            const title = String(session.title || '').replace(/^钉钉\s*·\s*/, '') || '未命名对话'
+            const time = fmtSessionTime(session.updatedAt || session.lastMessageAt || session.createdAt)
+            return `<button class="workspace-home-recent-row" type="button" data-workspace-session="${esc(session.id)}" title="${esc(title)}">
+              <span class="workspace-home-recent-icon ${task ? 'is-task' : ''}">${task ? WS_TASK_ICON : WS_CHAT_ICON}</span>
+              <span class="workspace-home-recent-copy">
+                <strong>${esc(title)}</strong>
+                <em>${esc(workspaceSessionLabel(session))}${sessionIsRunning(session.id) ? ' · 正在回复' : ''}</em>
+              </span>
+              <span class="workspace-home-recent-time">${esc(time)}</span>
+            </button>`
+          })
+          .join('')
+      : `<div class="workspace-home-empty">
+          <strong>还没有对话</strong>
+          <span>开一个新对话，或者从工作任务开始。</span>
+          <button class="workspace-home-empty-action" type="button" data-workspace-action="new-chat">开始对话</button>
+        </div>`
+  }
+}
+
+async function loadWorkspaceSummary() {
+  if (state.workspaceSummaryLoading) return
+  state.workspaceSummaryLoading = true
+  const refresh = $('#workspace-refresh')
+  if (refresh) refresh.disabled = true
+  try {
+    const [plugins, skills, schedules] = await Promise.allSettled([
+      api(`/api/my/plugins${qs()}`),
+      api(`/api/my/skills${qs()}`),
+      api(`/api/schedules${qs()}`),
+    ])
+    const pluginList = plugins.status === 'fulfilled' && Array.isArray(plugins.value?.plugins) ? plugins.value.plugins : []
+    const skillList = skills.status === 'fulfilled' && Array.isArray(skills.value?.skills) ? skills.value.skills : []
+    const scheduleList = schedules.status === 'fulfilled' && Array.isArray(schedules.value?.schedules) ? schedules.value.schedules : []
+    state.workspaceSummary = {
+      loaded: true,
+      plugins: pluginList.length,
+      skills: skillList.length,
+      activeSchedules: scheduleList.filter((item) => item.status === 'active' || item.status === 'running').length,
+    }
+    renderWorkspaceHome()
+  } finally {
+    state.workspaceSummaryLoading = false
     if (refresh) refresh.disabled = false
   }
 }
 
-function openScheduleModal(trigger) {
-  const modal = $('#schedule-modal')
-  if (!modal) return
-  scheduleTrigger = trigger || null
-  hideSideMoreMenu()
-  modal.hidden = false
-  void loadSchedules()
-  $('.schedule-card')?.focus()
+async function refreshWorkspacePage() {
+  if (state.workspaceSummaryLoading) return
+  await Promise.all([loadSessions(), loadLocalProjects()])
+  await loadWorkspaceSummary()
+  renderWorkspaceHome()
 }
 
-function closeScheduleModal() {
-  const modal = $('#schedule-modal')
-  if (!modal) return
-  modal.hidden = true
-  if (scheduleTrigger && typeof scheduleTrigger.focus === 'function') scheduleTrigger.focus()
-  scheduleTrigger = null
+async function handleWorkspaceAction(action, trigger) {
+  switch (action) {
+    case 'new-task':
+      closeWorkspacePage({ restoreFocus: false })
+      await startNewWorkTask()
+      break
+    case 'new-chat':
+      closeWorkspacePage({ restoreFocus: false })
+      await newSession()
+      break
+    case 'new-project':
+      closeWorkspacePage({ restoreFocus: false })
+      await beginNewLocalProject()
+      break
+    case 'cloud':
+      closeWorkspacePage({ restoreFocus: false })
+      openCloudSpacePane()
+      break
+    case 'schedules':
+      openSchedulesPage(trigger)
+      break
+    case 'plugins':
+      openPluginsPage('plugins', trigger)
+      break
+    case 'settings':
+      showSettings()
+      break
+    case 'desktop':
+      window.open('/download/desktop', '_blank', 'noopener')
+      break
+    default:
+      break
+  }
 }
 
-async function startScheduleDraft() {
-  closeScheduleModal()
-  await newSession({ create: false })
-  const input = $('#input')
-  if (!input) return
-  input.value = '帮我创建一个定时任务：'
-  input.dispatchEvent(new Event('input', { bubbles: true }))
-  input.focus()
-  const end = input.value.length
-  if (typeof input.setSelectionRange === 'function') input.setSelectionRange(end, end)
+function bindWorkspacePage() {
+  $('#workspace-back')?.addEventListener('click', () => closeWorkspacePage())
+  $('#workspace-refresh')?.addEventListener('click', () => void refreshWorkspacePage())
+  $('#workspace-stage')?.addEventListener('click', (event) => {
+    const actionButton = event.target.closest('[data-workspace-action]')
+    if (actionButton) {
+      void handleWorkspaceAction(actionButton.dataset.workspaceAction, actionButton)
+      return
+    }
+    const projectButton = event.target.closest('[data-workspace-project]')
+    if (projectButton) {
+      const project = (state.localProjects || []).find((item) => item.id === projectButton.dataset.workspaceProject)
+      if (!project) return
+      closeWorkspacePage({ restoreFocus: false })
+      openProjectHome(project)
+      return
+    }
+    const sessionButton = event.target.closest('[data-workspace-session]')
+    if (sessionButton) {
+      closeWorkspacePage({ restoreFocus: false })
+      void openSession(sessionButton.dataset.workspaceSession)
+    }
+  })
 }
 
-async function toggleSchedule(button) {
-  const id = String(button?.dataset?.scheduleToggle || '')
-  const action = String(button?.dataset?.action || '')
+function bindPluginsPage() {
+  $('#plugins-back')?.addEventListener('click', () => closePluginsPage())
+  $('#plugins-refresh')?.addEventListener('click', () => {
+    if (state.view !== 'plugins') return
+    loadWorkspaceKindContent()
+  })
+}
+
+function setScheduleFilter(filter) {
+  scheduleFilter = ['all', 'active', 'paused', 'ended'].includes(filter) ? filter : 'all'
+  renderScheduleList()
+}
+
+function defaultOnceValue() {
+  const date = new Date(Date.now() + 10 * 60_000)
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000)
+  return local.toISOString().slice(0, 16)
+}
+
+function scheduleOnceInputValue(raw) {
+  const text = String(raw || '').trim()
+  if (!text) return ''
+  const hasZone = /(?:Z|[+-]\d{2}:\d{2})$/.test(text)
+  if (hasZone) {
+    const date = new Date(text)
+    if (!Number.isNaN(date.getTime())) {
+      const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000)
+      return local.toISOString().slice(0, 16)
+    }
+  }
+  const match = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})/.exec(text)
+  return match ? `${match[1]}T${match[2]}` : ''
+}
+
+function scheduleOnceTimeState(value) {
+  const text = String(value || '').trim()
+  if (!text) return 'empty'
+  const date = new Date(text)
+  if (Number.isNaN(date.getTime())) return 'invalid'
+  const diff = date.getTime() - Date.now()
+  if (diff < 0) return 'expired'
+  if (diff <= 30_000) return 'too_soon'
+  return 'ok'
+}
+
+function scheduleOnceWarningText(state) {
+  if (state === 'expired') return '该任务时间已过期，不会执行。请选择未来时间。'
+  if (state === 'too_soon') return '时间太近，请至少留出 30 秒。'
+  if (state === 'invalid') return '请选择有效的执行时间。'
+  return ''
+}
+
+function syncScheduleOnceValue() {
+  const dateInput = $('#schedule-once-date')
+  const timeInput = $('#schedule-once-time')
+  const hidden = $('#schedule-once-at')
+  if (!hidden) return
+  const date = String(dateInput?.value || '').trim()
+  const time = String(timeInput?.value || '').trim()
+  hidden.value = date && time ? `${date}T${time}` : ''
+  refreshScheduleOnceWarning()
+}
+
+function setScheduleOnceFields(raw) {
+  const value = scheduleOnceInputValue(raw) || defaultOnceValue()
+  const [date, time] = value.split('T')
+  const dateInput = $('#schedule-once-date')
+  const timeInput = $('#schedule-once-time')
+  const hidden = $('#schedule-once-at')
+  if (dateInput) dateInput.value = date || ''
+  if (timeInput) timeInput.value = time || '09:00'
+  if (hidden) hidden.value = date && time ? `${date}T${time}` : ''
+  refreshScheduleOnceWarning()
+}
+
+let scheduleTimeTarget = null
+let scheduleTimeState = { hour: 9, minute: 0 }
+let scheduleTimePanel = null
+let scheduleTimeGlobalsBound = false
+let scheduleTimeInternalUpdate = false
+
+// 时间轮盘用多份循环内容做无缝滚动：可视区始终落在中间副本，
+// 越过前后边界时按整轮高度平移 scrollTop，画面保持不动。
+const SCHEDULE_TIME_COPIES = 5
+const SCHEDULE_TIME_MIDDLE_COPY = 2
+
+function padScheduleTime(value) {
+  return String(value).padStart(2, '0')
+}
+
+function parseScheduleTime(value) {
+  const match = /^(\d{1,2}):(\d{2})/.exec(String(value || '').trim())
+  if (!match) return { hour: 9, minute: 0 }
+  return {
+    hour: Math.min(23, Math.max(0, Number(match[1]))),
+    minute: Math.min(59, Math.max(0, Number(match[2]))),
+  }
+}
+
+const SCHEDULE_TIME_INPUT_TITLE = '点击选择或直接输入，例如 09:30'
+
+function normalizeScheduleTypedTime(value) {
+  let text = String(value || '').trim()
+    .replace(/：/g, ':')
+    .replace(/[０-９]/g, (char) => String.fromCharCode(char.charCodeAt(0) - 0xfee0))
+  if (!text) return ''
+  let hourText = ''
+  let minuteText = ''
+  if (text.includes(':')) {
+    const match = /^(\d{1,2}):(\d{0,2})$/.exec(text)
+    if (!match) return ''
+    hourText = match[1]
+    minuteText = match[2] || '0'
+  } else if (/^\d{1,4}$/.test(text)) {
+    if (text.length <= 2) {
+      hourText = text
+      minuteText = '0'
+    } else {
+      hourText = text.slice(0, -2)
+      minuteText = text.slice(-2)
+    }
+  } else {
+    return ''
+  }
+  const hour = Number(hourText)
+  const minute = Number(minuteText)
+  if (!Number.isInteger(hour) || !Number.isInteger(minute)) return ''
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return ''
+  return `${padScheduleTime(hour)}:${padScheduleTime(minute)}`
+}
+
+function clearScheduleTimeInvalid(input) {
+  input.classList.remove('is-invalid')
+  input.removeAttribute('aria-invalid')
+  input.title = SCHEDULE_TIME_INPUT_TITLE
+}
+
+function dispatchScheduleTimeInput(input) {
+  scheduleTimeInternalUpdate = true
+  try {
+    input.dispatchEvent(new Event('input', { bubbles: true }))
+  } finally {
+    scheduleTimeInternalUpdate = false
+  }
+}
+
+function commitScheduleTypedTime(input) {
+  if (!input) return false
+  const normalized = normalizeScheduleTypedTime(input.value)
+  if (!normalized) {
+    input.value = normalizeScheduleTypedTime(input.dataset.scheduleTimeLast) || '09:00'
+    input.dataset.scheduleTimeLast = input.value
+    input.classList.add('is-invalid')
+    input.setAttribute('aria-invalid', 'true')
+    input.title = '时间格式无效，请按 HH:MM 输入，例如 09:30'
+    window.setTimeout(() => {
+      if (input.value === input.dataset.scheduleTimeLast) clearScheduleTimeInvalid(input)
+    }, 1200)
+    dispatchScheduleTimeInput(input)
+    return false
+  }
+  input.value = normalized
+  input.dataset.scheduleTimeLast = normalized
+  clearScheduleTimeInvalid(input)
+  if (scheduleTimeTarget === input && scheduleTimePanel && !scheduleTimePanel.hidden) {
+    scheduleTimeState = parseScheduleTime(normalized)
+    syncScheduleTimeSelection({ scroll: 'both' })
+  }
+  dispatchScheduleTimeInput(input)
+  return true
+}
+
+function scheduleTimeText() {
+  return `${padScheduleTime(scheduleTimeState.hour)}:${padScheduleTime(scheduleTimeState.minute)}`
+}
+
+function scheduleTimeCopyOption(column, value, copy = SCHEDULE_TIME_MIDDLE_COPY) {
+  return column?.querySelector(
+    `.schedule-time-option[data-schedule-time-copy="${copy}"][data-schedule-time-value="${value}"]`,
+  )
+}
+
+function recenterScheduleTimeColumn(column) {
+  if (!column?.scrollHeight) return
+  const period = column.scrollHeight / SCHEDULE_TIME_COPIES
+  if (!Number.isFinite(period) || period <= 0) return
+  const viewport = column.clientHeight
+  const minTop = period
+  const maxTop = column.scrollHeight - period - viewport
+  if (maxTop <= minTop) return
+  let next = column.scrollTop
+  if (next < minTop) {
+    next += Math.ceil((minTop - next) / period) * period
+  } else if (next > maxTop) {
+    next -= Math.ceil((next - maxTop) / period) * period
+  }
+  if (next !== column.scrollTop) column.scrollTop = next
+}
+
+function scrollScheduleTimeColumn(part) {
+  if (!scheduleTimePanel || part !== 'hour' && part !== 'minute') return
+  const column = scheduleTimePanel.querySelector(`[data-schedule-time-column="${part}"]`)
+  if (!column) return
+  const value = part === 'hour' ? scheduleTimeState.hour : scheduleTimeState.minute
+  const selected = scheduleTimeCopyOption(column, value)
+    || column.querySelector('.schedule-time-option.is-selected')
+  if (!selected) return
+  column.scrollTop = Math.max(0, selected.offsetTop - 4)
+  recenterScheduleTimeColumn(column)
+}
+
+function syncScheduleTimeSelection({ focusPart = '', scroll = '' } = {}) {
+  if (!scheduleTimePanel) return
+  for (const column of scheduleTimePanel.querySelectorAll('[data-schedule-time-column]')) {
+    const part = column.dataset.scheduleTimeColumn
+    const current = part === 'hour' ? scheduleTimeState.hour : scheduleTimeState.minute
+    for (const option of column.querySelectorAll('.schedule-time-option')) {
+      const selected = Number(option.dataset.scheduleTimeValue) === current
+      const primary = option.dataset.scheduleTimeCopy === String(SCHEDULE_TIME_MIDDLE_COPY)
+      option.classList.toggle('is-selected', selected)
+      option.setAttribute('aria-selected', selected ? 'true' : 'false')
+      option.tabIndex = selected && primary ? 0 : -1
+    }
+  }
+  if (scroll === 'both') {
+    scrollScheduleTimeColumn('hour')
+    scrollScheduleTimeColumn('minute')
+  } else if (scroll) {
+    scrollScheduleTimeColumn(scroll)
+  }
+  if (focusPart) {
+    const column = scheduleTimePanel.querySelector(`[data-schedule-time-column="${focusPart}"]`)
+    const value = focusPart === 'hour' ? scheduleTimeState.hour : scheduleTimeState.minute
+    scheduleTimeCopyOption(column, value)?.focus({ preventScroll: true })
+  }
+}
+
+function ensureScheduleTimePanel() {
+  if (scheduleTimePanel) return scheduleTimePanel
+  const panel = document.createElement('div')
+  panel.className = 'schedule-time-popover'
+  panel.id = 'schedule-time-popover'
+  panel.hidden = true
+  panel.setAttribute('role', 'group')
+  panel.setAttribute('aria-label', '选择时间')
+  const columns = document.createElement('div')
+  columns.className = 'schedule-time-columns'
+  for (const part of ['hour', 'minute']) {
+    const column = document.createElement('div')
+    column.className = 'schedule-time-column'
+    column.dataset.scheduleTimeColumn = part
+    column.setAttribute('role', 'listbox')
+    column.setAttribute('aria-label', part === 'hour' ? '小时' : '分钟')
+    const max = part === 'hour' ? 23 : 59
+    for (let copy = 0; copy < SCHEDULE_TIME_COPIES; copy += 1) {
+      for (let value = 0; value <= max; value += 1) {
+        const option = document.createElement('button')
+        option.type = 'button'
+        option.className = 'schedule-time-option'
+        option.dataset.scheduleTimePart = part
+        option.dataset.scheduleTimeValue = String(value)
+        option.dataset.scheduleTimeCopy = String(copy)
+        option.setAttribute('role', 'option')
+        option.setAttribute('aria-selected', 'false')
+        if (copy !== SCHEDULE_TIME_MIDDLE_COPY) option.setAttribute('aria-hidden', 'true')
+        option.tabIndex = -1
+        option.textContent = padScheduleTime(value)
+        column.append(option)
+      }
+    }
+    column.addEventListener('scroll', () => recenterScheduleTimeColumn(column), { passive: true })
+    columns.append(column)
+  }
+  panel.append(columns)
+  panel.addEventListener('click', (event) => {
+    const option = event.target.closest?.('.schedule-time-option')
+    if (!option || !panel.contains(option)) return
+    selectScheduleTimePart(option.dataset.scheduleTimePart, Number(option.dataset.scheduleTimeValue))
+  })
+  panel.addEventListener('keydown', (event) => {
+    const option = event.target.closest?.('.schedule-time-option')
+    if (!option) return
+    const part = option.dataset.scheduleTimePart
+    const value = Number(option.dataset.scheduleTimeValue)
+    const max = part === 'hour' ? 23 : 59
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault()
+      const next = event.key === 'ArrowDown' ? (value + 1 > max ? 0 : value + 1) : (value - 1 < 0 ? max : value - 1)
+      selectScheduleTimePart(part, next, { focusPart: part, scroll: part })
+    } else if (event.key === 'Home' || event.key === 'End') {
+      event.preventDefault()
+      selectScheduleTimePart(part, event.key === 'Home' ? 0 : max, { focusPart: part, scroll: part })
+    } else if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+      event.preventDefault()
+      const other = part === 'hour' ? 'minute' : 'hour'
+      syncScheduleTimeSelection({ focusPart: other })
+    }
+  })
+  document.body.append(panel)
+  scheduleTimePanel = panel
+  return panel
+}
+
+function selectScheduleTimePart(part, value, options = {}) {
+  if (!scheduleTimeTarget) return
+  if (part === 'hour') scheduleTimeState.hour = Math.min(23, Math.max(0, value))
+  else if (part === 'minute') scheduleTimeState.minute = Math.min(59, Math.max(0, value))
+  scheduleTimeTarget.value = scheduleTimeText()
+  scheduleTimeTarget.dataset.scheduleTimeLast = scheduleTimeTarget.value
+  clearScheduleTimeInvalid(scheduleTimeTarget)
+  dispatchScheduleTimeInput(scheduleTimeTarget)
+  syncScheduleTimeSelection(options)
+}
+
+function positionScheduleTimePanel() {
+  if (!scheduleTimePanel || scheduleTimePanel.hidden || !scheduleTimeTarget) return
+  const rect = scheduleTimeTarget.getBoundingClientRect()
+  const width = scheduleTimePanel.offsetWidth
+  const height = scheduleTimePanel.offsetHeight
+  const gap = 6
+  const left = Math.min(Math.max(8, rect.left), window.innerWidth - width - 8)
+  let top = rect.bottom + gap
+  if (top + height > window.innerHeight - 8) top = Math.max(8, rect.top - height - gap)
+  scheduleTimePanel.style.left = `${Math.round(left)}px`
+  scheduleTimePanel.style.top = `${Math.round(top)}px`
+}
+
+function openScheduleTimePicker(input) {
+  const panel = ensureScheduleTimePanel()
+  if (scheduleTimeTarget === input && !panel.hidden) {
+    closeScheduleTimePicker()
+    return
+  }
+  if (scheduleTimeTarget && scheduleTimeTarget !== input) closeScheduleTimePicker()
+  const normalized = normalizeScheduleTypedTime(input.value)
+  if (!normalized || normalized !== input.value) commitScheduleTypedTime(input)
+  scheduleTimeTarget = input
+  scheduleTimeState = parseScheduleTime(input.value)
+  panel.hidden = false
+  panel.classList.remove('is-open')
+  input.setAttribute('aria-expanded', 'true')
+  syncScheduleTimeSelection({ scroll: 'both' })
+  positionScheduleTimePanel()
+  panel.classList.add('is-open')
+}
+
+function closeScheduleTimePicker({ restoreFocus = false } = {}) {
+  if (!scheduleTimePanel || scheduleTimePanel.hidden) return
+  const target = scheduleTimeTarget
+  scheduleTimePanel.classList.remove('is-open')
+  scheduleTimePanel.hidden = true
+  scheduleTimeTarget = null
+  target?.setAttribute('aria-expanded', 'false')
+  if (restoreFocus) target?.focus({ preventScroll: true })
+}
+
+function bindScheduleTimeGlobals() {
+  if (scheduleTimeGlobalsBound) return
+  scheduleTimeGlobalsBound = true
+  document.addEventListener('pointerdown', (event) => {
+    if (!scheduleTimePanel || scheduleTimePanel.hidden) return
+    if (scheduleTimePanel.contains(event.target) || scheduleTimeTarget?.contains(event.target)) return
+    closeScheduleTimePicker()
+  })
+  document.addEventListener('focusin', (event) => {
+    if (!scheduleTimePanel || scheduleTimePanel.hidden) return
+    if (scheduleTimePanel.contains(event.target) || scheduleTimeTarget?.contains(event.target)) return
+    closeScheduleTimePicker()
+  })
+  document.addEventListener('keydown', (event) => {
+    if (!scheduleTimePanel || scheduleTimePanel.hidden || event.key !== 'Escape') return
+    event.preventDefault()
+    closeScheduleTimePicker({ restoreFocus: true })
+  })
+  window.addEventListener('resize', positionScheduleTimePanel)
+  window.addEventListener('scroll', positionScheduleTimePanel, { passive: true })
+}
+
+function bindScheduleTimePickers() {
+  bindScheduleTimeGlobals()
+  for (const input of [$('#schedule-daily-time'), $('#schedule-weekly-time'), $('#schedule-once-time'), $('#schedule-interval-time')]) {
+    if (!input || input.dataset.scheduleTimeBound === '1') continue
+    input.dataset.scheduleTimeBound = '1'
+    input.dataset.scheduleTimeLast = normalizeScheduleTypedTime(input.value) || '09:00'
+    input.addEventListener('click', () => openScheduleTimePicker(input))
+    input.addEventListener('focus', () => {
+      const normalized = normalizeScheduleTypedTime(input.value)
+      if (normalized) {
+        input.value = normalized
+        input.dataset.scheduleTimeLast = normalized
+      }
+      input.select()
+    })
+    input.addEventListener('input', () => {
+      if (scheduleTimeInternalUpdate) return
+      clearScheduleTimeInvalid(input)
+      if (scheduleTimeTarget === input) closeScheduleTimePicker()
+    })
+    input.addEventListener('blur', () => commitScheduleTypedTime(input))
+    input.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault()
+        commitScheduleTypedTime(input)
+        if (scheduleTimeTarget === input) closeScheduleTimePicker()
+        return
+      }
+      if (event.key === 'ArrowDown') {
+        event.preventDefault()
+        if (scheduleTimeTarget === input && scheduleTimePanel && !scheduleTimePanel.hidden) {
+          syncScheduleTimeSelection({ focusPart: 'hour' })
+        } else {
+          openScheduleTimePicker(input)
+          syncScheduleTimeSelection({ focusPart: 'hour' })
+        }
+      }
+    })
+  }
+  const onceDate = $('#schedule-once-date')
+  const onceTime = $('#schedule-once-time')
+  if (onceDate && onceDate.dataset.scheduleOnceBound !== '1') {
+    onceDate.dataset.scheduleOnceBound = '1'
+    onceDate.addEventListener('input', syncScheduleOnceValue)
+    onceDate.addEventListener('change', syncScheduleOnceValue)
+  }
+  if (onceTime && onceTime.dataset.scheduleOnceValueBound !== '1') {
+    onceTime.dataset.scheduleOnceValueBound = '1'
+    onceTime.addEventListener('input', syncScheduleOnceValue)
+  }
+  const intervalDate = $('#schedule-interval-date')
+  const intervalTime = $('#schedule-interval-time')
+  if (intervalDate && intervalDate.dataset.scheduleIntervalBound !== '1') {
+    intervalDate.dataset.scheduleIntervalBound = '1'
+    intervalDate.addEventListener('input', syncScheduleIntervalValue)
+    intervalDate.addEventListener('change', syncScheduleIntervalValue)
+  }
+  if (intervalTime && intervalTime.dataset.scheduleIntervalValueBound !== '1') {
+    intervalTime.dataset.scheduleIntervalValueBound = '1'
+    intervalTime.addEventListener('input', syncScheduleIntervalValue)
+  }
+}
+
+function refreshScheduleOnceWarning() {
+  const input = $('#schedule-once-at')
+  const warning = $('#schedule-once-warning')
+  if (!warning) return
+  if (scheduleFormMode !== 'once') {
+    warning.hidden = true
+    warning.textContent = ''
+    input?.removeAttribute('aria-invalid')
+    return
+  }
+  const text = scheduleOnceWarningText(scheduleOnceTimeState(input?.value))
+  warning.hidden = !text
+  warning.textContent = text
+  if (text) input?.setAttribute('aria-invalid', 'true')
+  else input?.removeAttribute('aria-invalid')
+}
+
+function setScheduleFormError(message) {
+  const box = $('#schedule-form-error')
+  if (!box) return
+  box.hidden = !message
+  box.textContent = message || ''
+}
+
+function selectedScheduleDays() {
+  return [...document.querySelectorAll('#schedule-weekly-days [data-schedule-day].is-active')]
+    .map((button) => Number(button.dataset.scheduleDay))
+    .filter((day) => Number.isInteger(day))
+    .sort((a, b) => a - b)
+}
+
+function setScheduleFormMode(mode) {
+  closeScheduleTimePicker()
+  scheduleFormMode = ['daily', 'weekly', 'once', 'interval'].includes(mode) ? mode : 'daily'
+  for (const button of document.querySelectorAll('#schedule-mode-switch [data-schedule-mode]')) {
+    const active = button.dataset.scheduleMode === scheduleFormMode
+    button.classList.toggle('is-active', active)
+    button.setAttribute('aria-pressed', active ? 'true' : 'false')
+  }
+  const fieldDaily = $('#schedule-field-daily')
+  const fieldWeekly = $('#schedule-field-weekly')
+  const fieldOnce = $('#schedule-field-once')
+  const fieldInterval = $('#schedule-field-interval')
+  if (fieldDaily) fieldDaily.hidden = scheduleFormMode !== 'daily'
+  if (fieldWeekly) fieldWeekly.hidden = scheduleFormMode !== 'weekly'
+  if (fieldOnce) fieldOnce.hidden = scheduleFormMode !== 'once'
+  if (fieldInterval) fieldInterval.hidden = scheduleFormMode !== 'interval'
+  if (scheduleFormMode === 'once') {
+    const dateInput = $('#schedule-once-date')
+    const timeInput = $('#schedule-once-time')
+    if (!dateInput?.value || !timeInput?.value) setScheduleOnceFields($('#schedule-once-at')?.value || defaultOnceValue())
+    else syncScheduleOnceValue()
+  }
+  if (scheduleFormMode === 'weekly' && selectedScheduleDays().length === 0) {
+    for (const button of document.querySelectorAll('#schedule-weekly-days [data-schedule-day]')) {
+      if (['1', '2', '3', '4', '5'].includes(button.dataset.scheduleDay)) button.classList.add('is-active')
+    }
+  }
+  if (scheduleFormMode === 'interval') {
+    const dateInput = $('#schedule-interval-date')
+    const timeInput = $('#schedule-interval-time')
+    if (!dateInput?.value || !timeInput?.value) setScheduleIntervalFields(defaultIntervalStartValue())
+    else syncScheduleIntervalValue()
+  }
+  refreshScheduleOnceWarning()
+  refreshScheduleIntervalPreview()
+}
+
+function scheduleEditingTerminal(item) {
+  return Boolean(item && ['done', 'error', 'cancelled'].includes(item.status))
+}
+
+function markScheduleEditingCard() {
+  for (const card of document.querySelectorAll('.schedule-task-card')) {
+    card.classList.toggle('is-editing', Boolean(scheduleEditingId) && card.dataset.scheduleId === scheduleEditingId)
+  }
+}
+
+function setScheduleSubmitLabel(text) {
+  const button = $('#schedule-create')
+  if (!button) return
+  const label = button.querySelector('.schedules-submit-label')
+  if (label) label.textContent = text
+  else button.textContent = text
+}
+
+function syncScheduleEditorChrome() {
+  const item = scheduleEditingId ? findScheduleItem(scheduleEditingId) : null
+  const editing = Boolean(scheduleEditingId)
+  const terminal = scheduleEditingTerminal(item)
+  const heading = $('#schedule-compose-title')
+  const submit = $('#schedule-create')
+  const reset = $('#schedule-form-reset')
+  if (heading) heading.textContent = editing ? '编辑定时任务' : '新建定时任务'
+  if (submit) setScheduleSubmitLabel(editing ? (terminal ? '保存并启用' : '保存修改') : '创建任务')
+  if (reset) reset.textContent = editing ? '退出编辑' : '清空'
+  refreshScheduleIntervalPreview()
+  markScheduleEditingCard()
+}
+
+async function playScheduleSubmitSuccess(button) {
+  if (!button) return
+  button.classList.remove('is-success')
+  void button.offsetWidth
+  button.classList.add('is-success')
+  await new Promise((resolve) => window.setTimeout(resolve, 600))
+  button.classList.remove('is-success')
+  button.disabled = false
+  syncScheduleEditorChrome()
+}
+
+function resetScheduleForm() {
+  scheduleEditingId = null
+  const title = $('#schedule-form-title')
+  const prompt = $('#schedule-form-prompt')
+  const daily = $('#schedule-daily-time')
+  const weekly = $('#schedule-weekly-time')
+  const interval = $('#schedule-interval-value')
+  const intervalUnit = $('#schedule-interval-unit')
+  if (title) title.value = ''
+  if (prompt) prompt.value = ''
+  if (daily) daily.value = '09:00'
+  if (weekly) weekly.value = '09:00'
+  setScheduleOnceFields(defaultOnceValue())
+  if (interval) interval.value = '30'
+  if (intervalUnit) intervalUnit.value = 'minute'
+  syncScheduleIntervalMin()
+  setScheduleIntervalFields(defaultIntervalStartValue())
+  renderScheduleTargetOptions()
+  setScheduleTargetValue('new', { close: false })
+  for (const button of document.querySelectorAll('#schedule-weekly-days [data-schedule-day]')) {
+    button.classList.toggle('is-active', ['1', '2', '3', '4', '5'].includes(button.dataset.scheduleDay))
+  }
+  setScheduleFormError('')
+  setScheduleFormMode('daily')
+  syncScheduleEditorChrome()
+}
+
+function buildSchedulePayload() {
+  const prompt = String($('#schedule-form-prompt')?.value || '').trim()
+  if (!prompt) throw new Error('请先写清楚到点要做什么。')
+  if (prompt.length > 4000) throw new Error('任务描述最多 4000 字。')
+  const title = String($('#schedule-form-title')?.value || '').trim()
+  const target = String($('#schedule-channel')?.value || 'new')
+  const channel = target === 'dingtalk' ? 'dingtalk' : 'web'
+  const sessionId = target.startsWith('session:') ? target.slice(8) : null
+  const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Shanghai'
+  const base = { title, prompt, mode: scheduleFormMode, channel, sessionId, timezone }
+
+  if (scheduleFormMode === 'daily') {
+    const time = String($('#schedule-daily-time')?.value || '').trim()
+    if (!time) throw new Error('请选择每天执行的时间。')
+    return { ...base, time }
+  }
+  if (scheduleFormMode === 'weekly') {
+    const time = String($('#schedule-weekly-time')?.value || '').trim()
+    if (!time) throw new Error('请选择每周执行的时间。')
+    const days = selectedScheduleDays()
+    if (days.length === 0) throw new Error('至少选择一天。')
+    return { ...base, time, days: days.join(',') }
+  }
+  if (scheduleFormMode === 'once') {
+    syncScheduleOnceValue()
+    const value = String($('#schedule-once-at')?.value || '').trim()
+    if (!value) throw new Error('请选择一次性任务的执行时间。')
+    const state = scheduleOnceTimeState(value)
+    if (state === 'invalid') throw new Error(scheduleOnceWarningText(state))
+    if (state === 'expired' || state === 'too_soon') throw new Error(scheduleOnceWarningText(state))
+    return { ...base, at: value.replace('T', ' ') }
+  }
+  const minutes = Number($('#schedule-interval-value')?.value)
+  const unit = String($('#schedule-interval-unit')?.value || 'minute')
+  if (!Number.isInteger(minutes) || minutes <= 0) throw new Error('间隔必须是大于 0 的整数。')
+  if (minutes > 10000) throw new Error('间隔数值最多 10000。')
+  if (!SCHEDULE_INTERVAL_UNITS[unit]) throw new Error('请选择间隔单位。')
+  if (unit === 'second' && minutes < 30) throw new Error('秒级间隔最少 30 秒。')
+  syncScheduleIntervalValue()
+  const startAt = String($('#schedule-interval-at')?.value || '').trim()
+  const startState = scheduleOnceTimeState(startAt)
+  if (startState === 'empty') throw new Error('请选择执行时间。')
+  if (startState !== 'ok') {
+    throw new Error(
+      startState === 'expired'
+        ? '执行时间已过期，请选择未来时间。'
+        : startState === 'too_soon'
+          ? '执行时间太近，请至少留出 30 秒。'
+          : '请选择有效的执行时间。',
+    )
+  }
+  return { ...base, intervalValue: String(minutes), intervalUnit: unit, startAt: startAt.replace('T', ' ') }
+}
+
+async function submitScheduleForm(event) {
+  event.preventDefault()
+  const button = $('#schedule-create')
+  if (button?.disabled) return
+  setScheduleFormError('')
+  const editingId = scheduleEditingId
+  const editing = editingId ? findScheduleItem(editingId) : null
+  if (editingId && !editing) {
+    resetScheduleForm()
+    setScheduleFormError('这个任务已经不存在，请刷新后重试。')
+    return
+  }
+  let payload
+  try {
+    payload = buildSchedulePayload()
+  } catch (err) {
+    setScheduleFormError(err.message || '请检查表单')
+    return
+  }
+  const reactivate = Boolean(editing && scheduleEditingTerminal(editing))
+  if (reactivate) payload.activate = true
+  let saved = false
+  if (button) {
+    button.disabled = true
+    setScheduleSubmitLabel(editing ? '保存中…' : '创建中…')
+  }
+  try {
+    if (editing) {
+      await api(`/api/schedules/${encodeURIComponent(editing.id)}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+      saved = true
+      banner(reactivate ? '定时任务已更新并启用' : '定时任务已更新', 'ok')
+      if (reactivate) scheduleFilter = 'all'
+      resetScheduleForm()
+      await loadSchedules()
+    } else {
+      await api('/api/schedules', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+      saved = true
+      banner('定时任务已创建', 'ok')
+      const title = $('#schedule-form-title')
+      const prompt = $('#schedule-form-prompt')
+      if (title) title.value = ''
+      if (prompt) prompt.value = ''
+      scheduleFilter = 'all'
+      await loadSchedules()
+    }
+  } catch (err) {
+    setScheduleFormError(err?.message || (editing ? '保存定时任务失败，请稍后重试' : '创建定时任务失败，请稍后重试'))
+    if (scheduleFormMode === 'once' && scheduleOnceTimeState($('#schedule-once-at')?.value) !== 'ok') {
+      const dateInput = $('#schedule-once-date')
+      const timeInput = $('#schedule-once-time')
+      ;(dateInput?.value ? timeInput : dateInput)?.focus({ preventScroll: true })
+    }
+    if (scheduleFormMode === 'interval' && scheduleOnceTimeState($('#schedule-interval-at')?.value) !== 'ok') {
+      const dateInput = $('#schedule-interval-date')
+      const timeInput = $('#schedule-interval-time')
+      ;(dateInput?.value ? timeInput : dateInput)?.focus({ preventScroll: true })
+    }
+  } finally {
+    if (button && saved) {
+      await playScheduleSubmitSuccess(button)
+    } else {
+      if (button) button.disabled = false
+      syncScheduleEditorChrome()
+    }
+  }
+}
+
+function findScheduleItem(id) {
+  return scheduleItems.find((item) => item.id === id) || null
+}
+
+function scheduleIntervalStartValue(item) {
+  const next = item?.nextRunAt ? Date.parse(item.nextRunAt) : NaN
+  if (Number.isFinite(next) && next > Date.now() + 30_000) {
+    return scheduleLocalInputValue(ceilScheduleMinute(next))
+  }
+  const rule = scheduleRuleObject(item)
+  if (rule.startAt) {
+    const raw = scheduleOnceInputValue(rule.startAt)
+    const epoch = raw ? Date.parse(raw) : NaN
+    if (Number.isFinite(epoch) && epoch > Date.now() + 30_000) {
+      return scheduleLocalInputValue(ceilScheduleMinute(epoch))
+    }
+  }
+  return defaultIntervalStartValue()
+}
+
+function fillScheduleForm(item, { editing = false } = {}) {
+  if (!item) return
+  const rule = scheduleRuleObject(item)
+  const title = $('#schedule-form-title')
+  const prompt = $('#schedule-form-prompt')
+  const daily = $('#schedule-daily-time')
+  const weekly = $('#schedule-weekly-time')
+  const interval = $('#schedule-interval-value')
+  const intervalUnit = $('#schedule-interval-unit')
+  if (title) title.value = item.title || ''
+  if (prompt) prompt.value = item.prompt || ''
+  renderScheduleTargetOptions(item.sessionId || null)
+  setScheduleTargetValue(scheduleTargetValue(item), { close: false })
+  setScheduleFormMode(rule.mode || item.mode || 'daily')
+  if (scheduleFormMode === 'daily' && daily && rule.time) daily.value = String(rule.time).slice(0, 5)
+  if (scheduleFormMode === 'weekly') {
+    if (weekly && rule.time) weekly.value = String(rule.time).slice(0, 5)
+    const days = new Set(Array.isArray(rule.days) ? rule.days.map(Number) : [])
+    for (const button of document.querySelectorAll('#schedule-weekly-days [data-schedule-day]')) {
+      button.classList.toggle('is-active', days.has(Number(button.dataset.scheduleDay)))
+    }
+  }
+  if (scheduleFormMode === 'once') {
+    setScheduleOnceFields(scheduleOnceInputValue(rule.at) || defaultOnceValue())
+  }
+  if (scheduleFormMode === 'interval') {
+    const parts = scheduleIntervalParts(rule)
+    if (parts && interval) {
+      interval.value = String(parts.value)
+      if (intervalUnit) intervalUnit.value = parts.unit
+      syncScheduleIntervalMin()
+    }
+    setScheduleIntervalFields(scheduleIntervalStartValue(item))
+  }
+  refreshScheduleOnceWarning()
+  scheduleEditingId = editing ? item.id : null
+  if (scheduleFormMode === 'interval') refreshScheduleIntervalPreview()
+  setScheduleFormError('')
+  syncScheduleEditorChrome()
+  $('.schedules-compose')?.scrollIntoView({ block: 'start', behavior: 'smooth' })
+  prompt?.focus({ preventScroll: true })
+}
+
+function copyScheduleToForm(id) {
+  fillScheduleForm(findScheduleItem(id), { editing: false })
+}
+
+function editScheduleToForm(id) {
+  fillScheduleForm(findScheduleItem(id), { editing: true })
+}
+
+async function deleteScheduleItem(id) {
+  const item = findScheduleItem(id)
+  const terminal = scheduleEditingTerminal(item)
+  const confirmed = await openConfirmCard({
+    eyebrow: '删除定时任务',
+    title: '删除后不再执行',
+    targetLabel: '任务',
+    target: item?.title || '定时任务',
+    message: terminal
+      ? '这个任务会从任务列表和后台数据中删除，历史对话和已发出的推送保留。'
+      : '删除后立即停止后续执行，已产生的对话和推送保留。',
+    confirmText: '删除任务',
+    cancelText: '保留任务',
+  })
+  if (!confirmed) return false
+  await api(`/api/schedules/${encodeURIComponent(id)}`, { method: 'DELETE' })
+  if (scheduleEditingId === id) resetScheduleForm()
+  banner('定时任务已删除', 'ok')
+  await loadSchedules()
+  return true
+}
+
+async function toggleScheduleAction(button) {
+  const id = String(button?.dataset?.scheduleId || '')
+  const action = String(button?.dataset?.scheduleAction || '')
   if (!id || !action) return
+  if (action === 'copy') {
+    copyScheduleToForm(id)
+    return
+  }
+  if (action === 'edit') {
+    editScheduleToForm(id)
+    return
+  }
+  if (action === 'delete') {
+    button.disabled = true
+    try {
+      await deleteScheduleItem(id)
+    } catch (err) {
+      banner(err?.message || '删除定时任务失败', 'bad')
+      button.disabled = false
+    }
+    return
+  }
+  if (action !== 'pause' && action !== 'resume') return
   button.disabled = true
   try {
     await api(`/api/schedules/${encodeURIComponent(id)}/${action}`, { method: 'POST' })
+    banner(action === 'pause' ? '已暂停定时任务' : '已启用定时任务', 'ok')
     await loadSchedules()
   } catch (err) {
-    banner(err?.message || (action === 'pause' ? '暂停定时任务失败' : '恢复定时任务失败'), 'bad')
+    banner(err?.message || (action === 'pause' ? '暂停定时任务失败' : '启用定时任务失败'), 'bad')
     button.disabled = false
   }
+}
+
+function bindSchedulesPage() {
+  if (schedulesBound) return
+  schedulesBound = true
+  const refreshSchedulesOnWake = () => {
+    if (document.hidden || $('#schedules-stage')?.hidden) return
+    void loadSchedules({ silent: true })
+  }
+  window.setInterval(() => {
+    if (document.hidden || $('#schedules-stage')?.hidden) return
+    if (Date.now() - scheduleLastListSyncAt > 15000) refreshSchedulesOnWake()
+    refreshScheduleIntervalPreview()
+  }, 1000)
+  window.addEventListener('focus', refreshSchedulesOnWake)
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) refreshSchedulesOnWake()
+  })
+  $('#schedules-back')?.addEventListener('click', () => closeSchedulesPage())
+  $('#schedules-refresh')?.addEventListener('click', () => void loadSchedules())
+  $('#schedule-form')?.addEventListener('submit', (event) => void submitScheduleForm(event))
+  $('#schedule-form')?.addEventListener('input', () => {
+    setScheduleFormError('')
+    refreshScheduleOnceWarning()
+  })
+  $('#schedule-interval-value')?.addEventListener('input', () => {
+    refreshScheduleIntervalPreview()
+  })
+  $('#schedule-interval-unit')?.addEventListener('change', () => {
+    syncScheduleIntervalMin()
+    refreshScheduleIntervalPreview()
+  })
+  bindScheduleTimePickers()
+  bindScheduleTargetPicker()
+  $('#schedule-form-reset')?.addEventListener('click', resetScheduleForm)
+  $('#schedule-mode-switch')?.addEventListener('click', (event) => {
+    const button = event.target.closest?.('[data-schedule-mode]')
+    if (!button) return
+    setScheduleFormError('')
+    setScheduleFormMode(button.dataset.scheduleMode)
+  })
+  $('#schedule-weekly-days')?.addEventListener('click', (event) => {
+    const button = event.target.closest?.('[data-schedule-day]')
+    if (!button) return
+    setScheduleFormError('')
+    button.classList.toggle('is-active')
+  })
+  for (const button of document.querySelectorAll('[data-schedule-filter]')) {
+    button.addEventListener('click', () => setScheduleFilter(button.dataset.scheduleFilter))
+  }
+  $('#schedule-list')?.addEventListener('click', (event) => {
+    const button = event.target.closest?.('[data-schedule-action]')
+    if (button) void toggleScheduleAction(button)
+  })
+  const timezoneLabel = $('#schedules-timezone')
+  if (timezoneLabel) timezoneLabel.textContent = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Shanghai'
+  setScheduleFormMode('daily')
+  syncScheduleEditorChrome()
 }
 
 /* ---------------- “更多”浮层 ---------------- */
@@ -3981,12 +5908,12 @@ function bindSideNav() {
         return
       }
       hideSideMoreMenu()
+      if (isGlobalDrawerOpen()) closeGlobalDrawer()
       if (action === 'new-task') void startNewWorkTask()
       else if (action === 'new-chat') void newSession()
-      else if (action === 'workspace') setChatMode('workspace')
-      else if (action === 'plugins') openPluginsWorkspace()
-      else if (action === 'schedules') openScheduleModal(button)
-      else if (action === 'cloud') openCloudSpacePane()
+      else if (action === 'workspace') openWorkspacePage(button)
+      else if (action === 'plugins') openPluginsPage('plugins', button)
+      else if (action === 'schedules') openSchedulesPage(button)
     })
   })
 
@@ -3998,28 +5925,19 @@ function bindSideNav() {
     hideSideMoreMenu()
     openCloudSpacePane()
   })
-  $('#side-more-console')?.addEventListener('click', () => {
+  $('#side-more-approval')?.addEventListener('click', () => {
     hideSideMoreMenu()
-    $('#console-entry')?.click()
+    openPermissionPane()
   })
   $('#side-more-settings')?.addEventListener('click', () => {
     hideSideMoreMenu()
     showSettings()
   })
 
+  $('#global-drawer-scrim')?.addEventListener('click', () => closeGlobalDrawer())
+
   const moreProject = $('#side-more-new-project')
   if (moreProject) moreProject.hidden = !desktopBrowserHost
-
-  $('#schedule-close')?.addEventListener('click', closeScheduleModal)
-  $('#schedule-refresh')?.addEventListener('click', () => void loadSchedules())
-  $('#schedule-new')?.addEventListener('click', () => void startScheduleDraft())
-  $('#schedule-modal')?.addEventListener('click', (event) => {
-    if (event.target === event.currentTarget) closeScheduleModal()
-  })
-  $('#schedule-list')?.addEventListener('click', (event) => {
-    const button = event.target.closest('[data-schedule-toggle]')
-    if (button) void toggleSchedule(button)
-  })
 
   document.addEventListener('click', (event) => {
     const menu = $('#side-more-menu')
@@ -4036,10 +5954,11 @@ function bindSideNav() {
       hideSideMoreMenu({ focusButton: true })
       return
     }
-    const modal = $('#schedule-modal')
-    if (modal && !modal.hidden) {
+    if (state.view === 'schedules') {
+      if (document.querySelector('.confirm-overlay')) return
       event.preventDefault()
-      closeScheduleModal()
+      event.stopImmediatePropagation()
+      closeSchedulesPage()
     }
   })
 }
@@ -4458,12 +6377,12 @@ function handleWorkspaceFilesEvent(payload) {
 }
 
 function renderWorkspaceQuota(quota) {
-  const box = $('#ws-quota-popover')
-  if (!box) return
+  const boxes = [$('#ws-quota-popover'), $('#cloud-quota-popover')].filter(Boolean)
+  const badges = [$('#ws-info'), $('#cloud-quota-badge')].filter(Boolean)
+  if (!boxes.length && !badges.length) return
   const user = quota.user || {}
   const used = Math.max(0, Number(user.used) || 0)
   const limit = Math.max(0, Number(user.limit ?? user.limitBytes) || 0)
-  const fileLimit = Math.max(0, Number(quota.fileLimitBytes ?? user.fileLimitBytes) || 0)
   const percent = limit > 0 ? Math.min(100, (used / limit) * 100) : 0
   const remaining = Math.max(
     0,
@@ -4472,42 +6391,28 @@ function renderWorkspaceQuota(quota) {
   const warning = quota.warning || user.warning || {}
   const level = String(warning.level || (percent >= 100 ? 'full' : percent >= 95 ? 'critical' : percent >= 85 ? 'warning' : percent >= 75 ? 'notice' : 'normal'))
   const warningMessage = String(warning.message || '').trim()
-  const source = String(quota.quotaSource || user.source || 'default')
-  const sourceLabel =
-    source === 'user' ? '个人配置' : source === 'role' ? '角色配置' : '默认配置'
-  const roleText = Array.isArray(quota.roleCodes) && quota.roleCodes.length ? ` · ${quota.roleCodes.join(' / ')}` : ''
-  const storageNote = '文件保存在 EAB 服务端，换设备登录仍可见'
-  const quotaBadgeTitle = `${sourceLabel}${roleText}；${storageNote}`
-  const badge = $('#ws-info')
-  badge?.classList.toggle('is-high', level === 'notice' || level === 'warning')
-  badge?.classList.toggle('is-critical', level === 'critical' || level === 'full')
-  badge?.setAttribute(
-    'aria-label',
-    `云空间剩余 ${fmtSize(remaining)}；已用 ${fmtSize(used)} / ${fmtQuota(limit)}${warningMessage ? `；${warningMessage}` : ''}`,
-  )
+  const badgeLabel = `云空间已用 ${fmtQuota(used)}，最大 ${fmtQuota(limit)}，剩余 ${fmtQuota(remaining)}`
+  for (const badge of badges) {
+    badge.classList.toggle('is-high', level === 'notice' || level === 'warning')
+    badge.classList.toggle('is-critical', level === 'critical' || level === 'full')
+    badge.setAttribute('aria-label', badgeLabel)
+  }
   const warningHtml =
     warningMessage && level !== 'normal'
       ? `<div class="ws-quota-warning${level === 'critical' || level === 'full' ? ' is-critical' : ''}">${esc(warningMessage)}</div>`
       : ''
-  box.innerHTML = `
+  const html = `
     <div class="ws-quota-head">
-      <div class="ws-quota-title">
-        <span class="ws-quota-label">云空间</span>
-        <span class="ws-quota-badge" title="${esc(quotaBadgeTitle)}" aria-label="${esc(quotaBadgeTitle)}">?</span>
-      </div>
-      <span class="ws-quota-value"><strong>${esc(fmtSize(used))}</strong><span class="ws-quota-sep">/</span>${esc(
-        fmtQuota(limit),
-      )}</span>
+      <span class="ws-quota-label">云空间容量</span>
+      <span class="ws-quota-value"><strong>${esc(fmtQuota(used))}</strong><span class="ws-quota-sep">/</span>${esc(fmtQuota(limit))}</span>
     </div>
     <div class="ws-quota-bar" role="progressbar" aria-label="云空间已用空间" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(
       percent,
-    )}" title="已用 ${esc(fmtSize(used))}，容量 ${esc(fmtQuota(limit))}">
-      <span class="ws-quota-fill${level === 'critical' || level === 'full' ? ' is-critical' : level === 'notice' || level === 'warning' ? ' is-high' : ''}" style="width:${percent.toFixed(1)}%"></span>
+    )}" title="已用 ${esc(fmtQuota(used))}，最大 ${esc(fmtQuota(limit))}">
+      <span class="ws-quota-fill${used > 0 ? ' has-usage' : ''}${level === 'critical' || level === 'full' ? ' is-critical' : level === 'notice' || level === 'warning' ? ' is-high' : ''}" style="width:${percent.toFixed(1)}%"></span>
     </div>
-    ${warningHtml}
-    <div class="ws-quota-foot">
-      <span>剩余 ${esc(fmtSize(remaining))} · 单文件 ≤ ${esc(fmtQuota(fileLimit))}</span>
-    </div>`
+    ${warningHtml}`
+  for (const box of boxes) box.innerHTML = html
 }
 
 let lastWorkspaceWarningLevel = ''
@@ -4889,6 +6794,7 @@ function renderLocalProjects() {
   const section = $('#side-projects')
   const box = $('#project-list')
   if (!section || !box) return
+  if (state.view === 'workspace') renderWorkspaceHome()
   ensureProjectCollapsedLoaded()
   const projects = state.localProjects || []
   // 网页端不再重复渲染项目树：远端项目会话直接进最近列表，通过输入区项目选择器继续。
@@ -7058,13 +8964,16 @@ function workbenchTabIcon(kind) {
   if (kind === 'cloud') {
     return '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.6 5.2h4.2l1.3 1.7h6.3v6.3a1.3 1.3 0 0 1-1.3 1.3H2.6A1.3 1.3 0 0 1 1.3 13.2V5.2Z" fill="none" stroke="currentColor" stroke-width="1.2"/><path d="M2.6 5.2V4.2A1.1 1.1 0 0 1 3.7 3.1h2.8l1.2 1.6h4.2A1.1 1.1 0 0 1 13 5.8v1" fill="none" stroke="currentColor" stroke-width="1.05"/></svg>'
   }
+  if (kind === 'terminal') {
+    return '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2.2" y="2.8" width="11.6" height="10.4" rx="2.6" fill="none" stroke="currentColor" stroke-width="1.2"/><path d="m5 6.6 2 1.9-2 1.9M8.4 10.4h2.9" fill="none" stroke="currentColor" stroke-width="1.05" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+  }
   if (kind === 'file') {
     return '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.4h5l3 3v8.2H4z" fill="none" stroke="currentColor" stroke-width="1.25"/><path d="M9 2.4v3h3M6 8h4M6 10.2h3" fill="none" stroke="currentColor" stroke-width="1.1"/></svg>'
   }
   return '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="5.3" fill="none" stroke="currentColor" stroke-width="1.25"/><path d="M3 8h10M8 2.8c1.6 1.5 2.3 3.2 2.3 5.2S9.6 12.5 8 13.2C6.4 12.5 5.7 10 5.7 8s.7-3.7 2.3-5.2Z" fill="none" stroke="currentColor" stroke-width="1.05"/></svg>'
 }
 
-function renderWorkbenchTabs({ hasTeam, hasFile, hasPerm, hasWeb, hasCloud }) {
+function renderWorkbenchTabs({ hasTeam, hasFile, hasPerm, hasWeb, hasCloud, hasTerminal }) {
   const list = $('#workbench-tab-list')
   if (!list) return
   const tabs = []
@@ -7077,15 +8986,6 @@ function renderWorkbenchTabs({ hasTeam, hasFile, hasPerm, hasWeb, hasCloud }) {
       close: state.agentRuns.size === 0 ? 'team' : '',
     })
   }
-  if (hasPerm) {
-    tabs.push({
-      key: 'perm',
-      kind: 'perm',
-      title: '审批',
-      count: state.permRequests.todo.length,
-      close: 'perm',
-    })
-  }
   if (hasCloud) {
     tabs.push({
       key: 'cloud',
@@ -7093,6 +8993,15 @@ function renderWorkbenchTabs({ hasTeam, hasFile, hasPerm, hasWeb, hasCloud }) {
       title: '云空间',
       count: 0,
       close: 'cloud',
+    })
+  }
+  if (hasPerm) {
+    tabs.push({
+      key: 'perm',
+      kind: 'perm',
+      title: '审批',
+      count: state.permRequests.todo.length,
+      close: 'perm',
     })
   }
   if (hasFile) {
@@ -7117,6 +9026,15 @@ function renderWorkbenchTabs({ hasTeam, hasFile, hasPerm, hasWeb, hasCloud }) {
         favicon: tab.favicon || '',
       })
     }
+  }
+  if (hasTerminal) {
+    tabs.push({
+      key: 'terminal',
+      kind: 'terminal',
+      title: '终端',
+      count: 0,
+      close: 'terminal',
+    })
   }
   list.innerHTML = ''
   for (const tab of tabs) {
@@ -7180,6 +9098,7 @@ function renderWorkbenchTabs({ hasTeam, hasFile, hasPerm, hasWeb, hasCloud }) {
 
 function workbenchLayoutStateSignature() {
   return [
+    state.view,
     state.mode,
     state.agentRuns.size,
     state.teamTabOpen ? '1' : '0',
@@ -7189,6 +9108,10 @@ function workbenchLayoutStateSignature() {
     state.cloudSpaceLoading ? '1' : '0',
     state.cloudSpaceError,
     Boolean(state.permOpen),
+    state.terminalOpen ? '1' : '0',
+    state.terminalSessionId,
+    state.terminalStatus,
+    state.terminalCwd,
     state.browserTabs.map((tab) => `${tab.tabId}:${tab.pageId}:${tab.title}:${tab.favicon || ''}`).join(','),
     state.browserPage?.tabId || '',
     state.browserPage?.pageId || '',
@@ -7580,8 +9503,9 @@ function syncWorkbenchLayout(force = false) {
   const filePane = $('#file-pane')
   const permPane = $('#perm-pane')
   const cloudPane = $('#cloud-pane')
+  const terminalPane = $('#terminal-pane')
   const main = $('.chat-main')
-  if (!rail || !teamPane || !webPane || !filePane || !permPane || !cloudPane || !main) return
+  if (!rail || !teamPane || !webPane || !filePane || !permPane || !cloudPane || !terminalPane || !main) return
   const signature = workbenchLayoutStateSignature()
   if (!force && signature === workbenchLayoutSignature) return
   workbenchLayoutSignature = signature
@@ -7590,9 +9514,12 @@ function syncWorkbenchLayout(force = false) {
   const hasTeam = inChat && (state.agentRuns.size > 0 || state.teamTabOpen)
   // 工作台整页预览也复用同一个文件栏；只看对话模式会把它藏掉，导致 PDF/Office 预览只剩 DOM。
   const hasFile = Boolean(state.filePreview)
-  const hasPerm = inChat && state.permOpen
-  const hasCloud = inChat && state.cloudSpaceOpen
+  // 云空间与审批可以在对话页作为分栏，也可以在独立页上作为右侧浮层抽屉打开。
+  const hasPerm = state.permOpen
+  const hasCloud = state.cloudSpaceOpen
   const hasWeb = inChat && state.browserTabs.length > 0
+  // 终端只属于桌面宿主；终端标签打开期间与网页标签并列在右栏。
+  const hasTerminal = inChat && Boolean(desktopBrowserHost) && state.terminalOpen
 
   // 页面对象与标签条目保持同一份引用；刷新后若只有 pageId 没有标签，补一个。
   if (inChat && state.browserPage?.pageId && !browserTabIdForPage(state.browserPage.pageId)) {
@@ -7612,17 +9539,17 @@ function syncWorkbenchLayout(force = false) {
     state.browserPage = null
     stopBrowserFramePolling()
   }
-  const hasWorkbench = hasTeam || hasFile || hasPerm || hasWeb || hasCloud
+  const hasWorkbench = hasTeam || hasFile || hasPerm || hasWeb || hasCloud || hasTerminal
   rail.hidden = !hasWorkbench
   const collapsed = hasWorkbench && state.workbenchCollapsed
   rail.classList.toggle('is-collapsed', collapsed)
 
   // 当前面板没有内容时自动切到另一个，避免打开一个空白面板。
   const tabAvailable = (name) =>
-    name === 'team' ? hasTeam : name === 'web' ? hasWeb : name === 'file' ? hasFile : name === 'cloud' ? hasCloud : hasPerm
+    name === 'team' ? hasTeam : name === 'web' ? hasWeb : name === 'file' ? hasFile : name === 'cloud' ? hasCloud : name === 'terminal' ? hasTerminal : hasPerm
   if (state.workbenchSplit && !(hasTeam && hasFile)) state.workbenchSplit = false
   if (!tabAvailable(state.workbenchTab)) {
-    state.workbenchTab = hasTeam ? 'team' : hasCloud ? 'cloud' : hasWeb ? 'web' : hasFile ? 'file' : hasPerm ? 'perm' : state.workbenchTab
+    state.workbenchTab = hasTeam ? 'team' : hasCloud ? 'cloud' : hasWeb ? 'web' : hasTerminal ? 'terminal' : hasFile ? 'file' : hasPerm ? 'perm' : state.workbenchTab
   }
 
   const showTeam = hasTeam && (state.workbenchSplit || state.workbenchTab === 'team')
@@ -7630,14 +9557,16 @@ function syncWorkbenchLayout(force = false) {
   const showFile = hasFile && (state.workbenchSplit || state.workbenchTab === 'file')
   const showPerm = hasPerm && !state.workbenchSplit && state.workbenchTab === 'perm'
   const showCloud = hasCloud && !state.workbenchSplit && state.workbenchTab === 'cloud'
+  const showTerminal = hasTerminal && !state.workbenchSplit && state.workbenchTab === 'terminal'
   teamPane.hidden = !showTeam
   webPane.hidden = !showWeb
   filePane.hidden = !showFile
   permPane.hidden = !showPerm
   cloudPane.hidden = !showCloud
+  terminalPane.hidden = !showTerminal
   $('#workbench-body')?.classList.toggle('is-split', state.workbenchSplit && showTeam && showFile)
 
-  renderWorkbenchTabs({ hasTeam, hasFile, hasPerm, hasWeb, hasCloud })
+  renderWorkbenchTabs({ hasTeam, hasFile, hasPerm, hasWeb, hasCloud, hasTerminal })
   const split = $('#workbench-split')
   if (split) {
     split.hidden = !(hasTeam && hasFile)
@@ -7657,9 +9586,11 @@ function syncWorkbenchLayout(force = false) {
             ? '云空间'
             : state.workbenchTab === 'perm' && hasPerm
               ? '审批'
-              : state.workbenchTab === 'file' && hasFile
-                ? '文件'
-                : '团队'
+              : state.workbenchTab === 'terminal' && hasTerminal
+                ? '终端'
+                : state.workbenchTab === 'file' && hasFile
+                  ? '文件'
+                  : '团队'
     }
     const restoreCount = $('#workbench-restore-count')
     if (restoreCount) {
@@ -7670,7 +9601,9 @@ function syncWorkbenchLayout(force = false) {
             ? state.files.length
             : state.workbenchTab === 'perm' && hasPerm
               ? state.permRequests.todo.length
-              : state.agentRuns.size
+              : state.workbenchTab === 'terminal' && hasTerminal
+                ? 0
+                : state.agentRuns.size
       restoreCount.hidden = total === 0
       restoreCount.textContent = String(total)
     }
@@ -7691,6 +9624,7 @@ function syncWorkbenchLayout(force = false) {
   main.classList.toggle('is-team-file', !rail.hidden && hasTeam && hasFile)
   main.classList.toggle('is-perm-only', !rail.hidden && hasPerm && !hasTeam && !hasFile)
   main.classList.toggle('is-web-only', !rail.hidden && hasWeb && !hasTeam && !hasFile && !hasPerm)
+  main.classList.toggle('is-terminal-only', !rail.hidden && hasTerminal && !hasWeb && !hasTeam && !hasFile && !hasPerm)
   main.classList.toggle('is-web-active', !rail.hidden && !collapsed && showWeb)
   const resizer = $('#file-split-resizer')
   if (resizer) resizer.hidden = !(inChat && !rail.hidden && !collapsed)
@@ -7701,9 +9635,65 @@ function syncWorkbenchLayout(force = false) {
       if (state.agentSelectedId) restoreAgentThreadScroll(state.agentSelectedId)
     })
   }
+  // 从定时任务等窄容器页面切回对话时，.chat-main 会先以窄宽度参与一次夹取；
+  // 布局落位后按记住的原始比例重算一次，避免 64% 被临时窄宽度压成 47%。
+  if (inChat && !rail.hidden && !collapsed && !document.body.classList.contains('is-resizing-split')) {
+    if (hasTeam) restoreTeamSplitRatio()
+    else if (hasFile) restoreFileSplitRatio()
+    else if (hasWeb || hasTerminal) restoreWebSplitRatio()
+    else if (hasPerm) restoreTeamSplitRatio()
+  }
   // 原生网页 View 覆盖在 Web 页面之上，必须在布局真正落位后再同步矩形。
   scheduleDesktopBrowserViewSync()
+  syncGlobalDrawerChrome()
   scheduleBrowserTabsPersist()
+}
+
+/**
+ * 云空间 / 审批从独立页打开时，不切回对话，而是把右侧工作台变成覆盖在页面上的抽屉。
+ * 对话页仍沿用原来的左右分栏，不改已有布局。
+ */
+function syncGlobalDrawerChrome() {
+  const main = $('.chat-main')
+  const scrim = $('#global-drawer-scrim')
+  if (!main) return
+  const overlay = state.view !== 'chat' && Boolean(state.cloudSpaceOpen || state.permOpen)
+  document.body.classList.toggle('is-global-drawer', overlay)
+  if (scrim) scrim.hidden = !overlay
+  // 独立页没有抽屉时保持隐藏；有抽屉时让 chat-main 变成只承载右侧抽屉的透明固定层。
+  main.hidden = overlay ? false : state.view !== 'chat'
+}
+
+function isGlobalDrawerOpen() {
+  return document.body.classList.contains('is-global-drawer')
+}
+
+function closeGlobalDrawer() {
+  if (!isGlobalDrawerOpen()) return
+  state.cloudSpaceOpen = false
+  state.cloudSpaceError = ''
+  state.permOpen = false
+  state.permSelected = ''
+  state.permError = ''
+  state.permSuccess = ''
+  state.workbenchCollapsed = false
+  syncWorkbenchLayout(true)
+}
+
+/** 从对话侧栏进入独立页时收起右侧抽屉，避免把对话页的云空间 / 审批状态带到整页上。 */
+function dismissSideDrawersForPage() {
+  if (!state.cloudSpaceOpen && !state.permOpen) return
+  state.cloudSpaceOpen = false
+  state.cloudSpaceError = ''
+  state.permOpen = false
+  state.permSelected = ''
+  state.permError = ''
+  state.permSuccess = ''
+  state.workbenchCollapsed = false
+  document.body.classList.remove('is-global-drawer')
+  const scrim = $('#global-drawer-scrim')
+  if (scrim) scrim.hidden = true
+  syncWorkbenchLayout(true)
 }
 
 function setWorkbenchCollapsed(collapsed, options = {}) {
@@ -8307,7 +10297,8 @@ function openPermissionPane() {
   state.workbenchSplit = false
   state.permSuccess = ''
   setWorkbenchCollapsed(false)
-  syncWorkbenchLayout()
+  syncWorkbenchLayout(true)
+  syncGlobalDrawerChrome()
   renderPermissionPane()
   void loadPermissionData()
   $('#perm-body')?.scrollTo?.({ top: 0 })
@@ -8318,7 +10309,8 @@ function closePermissionPane() {
   state.permSelected = ''
   state.permError = ''
   state.permSuccess = ''
-  syncWorkbenchLayout()
+  syncWorkbenchLayout(true)
+  syncGlobalDrawerChrome()
 }
 
 async function submitPermissionApply(event) {
@@ -11060,6 +13052,9 @@ async function openWorkspaceFile(id, options = {}) {
   releaseWorkspacePreviewUrl()
   destroyOnlyOfficeEditor()
   hideFilePaneSyncNotice()
+  // 文件预览属于对话主体；从独立工作台/能力页打开文件时先回到对话，避免整页 Stage 盖住预览。
+  closeWorkspacePage({ restoreFocus: false })
+  closePluginsPage({ restoreFocus: false })
   const token = requestSeq
   const split = state.mode === 'chat' && options.split !== false
   state.filePreview = file
@@ -11081,7 +13076,6 @@ async function openWorkspaceFile(id, options = {}) {
   syncWorkbenchLayout()
   // 对话内预览保留左栏对话和输入区，只把右侧让给文件；工作台/窄屏仍走整页预览。
   $('#thread').hidden = !split
-  $('#workspace-pane').hidden = true
   $('.composer').hidden = !split
   $('#file-pane-editor').hidden = true
   $('#file-pane-diff').hidden = true
@@ -11281,8 +13275,7 @@ function closeWorkspaceFile() {
   $('#file-pane-body').innerHTML = ''
   $('#thread').hidden = state.mode !== 'chat'
   $('.composer').hidden = state.mode !== 'chat'
-  $('#workspace-pane').hidden = state.mode !== 'workspace'
-  $('#chat-title').textContent = state.mode === 'workspace' ? '工作台' : state.sessionId ? '对话' : '新对话'
+  syncChatTitle()
   syncWorkbenchLayout()
   renderWorkspaceFiles()
   restoreFileDockAfterPreview()
@@ -12043,6 +14036,7 @@ function syncDesktopBrowserView() {
   if (
     !usesNativeBrowser(page) ||
     state.mode !== 'chat' ||
+    state.view !== 'chat' ||
     state.workbenchCollapsed ||
     state.workbenchTab !== 'web' ||
     !shell ||
@@ -13420,13 +15414,31 @@ function bindWebPane() {
 
 /** 快捷入口「打开云空间」：在右侧工作台浏览全部云端文件，不跟随当前会话的本地项目。 */
 function openCloudSpacePane() {
+  const overlay = state.view !== 'chat'
+  const reopening = state.cloudSpaceOpen
+  if (!overlay) {
+    closeSchedulesPage({ restoreFocus: false })
+    closeWorkspacePage({ restoreFocus: false })
+    closePluginsPage({ restoreFocus: false })
+    if ($('#settings-stage') && !$('#settings-stage').hidden) hideSettings({ restoreFocus: false })
+  }
   state.cloudSpaceOpen = true
-  state.cloudSpacePath = ''
+  if (!reopening) state.cloudSpacePath = ''
+  state.cloudSpaceError = ''
   state.workbenchCollapsed = false
   state.workbenchSplit = false
   state.workbenchTab = 'cloud'
   syncWorkbenchLayout(true)
+  syncGlobalDrawerChrome()
   void refreshCloudSpace()
+}
+
+function closeCloudSpacePane() {
+  state.cloudSpaceOpen = false
+  state.cloudSpaceError = ''
+  if (state.workbenchTab === 'cloud') state.workbenchTab = state.filePreview ? 'file' : 'team'
+  syncWorkbenchLayout(true)
+  syncGlobalDrawerChrome()
 }
 
 async function refreshCloudSpace() {
@@ -13434,12 +15446,16 @@ async function refreshCloudSpace() {
   state.cloudSpaceError = ''
   renderCloudSpacePane()
   try {
-    const data = await api(`/api/workspace/files${qs()}`)
+    const [data, quota] = await Promise.all([
+      api(`/api/workspace/files${qs()}`),
+      api(`/api/workspace/quota${qs()}`).catch(() => null),
+    ])
     state.files = data.items || []
     if (state.cloudSpacePath && !workspacePathExists(state.files, state.cloudSpacePath)) {
       state.cloudSpacePath = ''
     }
     renderWorkspaceFiles()
+    if (quota) renderWorkspaceQuota(quota)
   } catch (err) {
     state.cloudSpaceError = err?.message || '云空间读取失败'
   } finally {
@@ -13649,10 +15665,410 @@ function bindCloudSpaceActions() {
   })
 }
 
+function terminalAvailable() {
+  return Boolean(desktopBrowserHost && typeof desktopBrowserHost.terminalCreate === 'function')
+}
+
+function shortenTerminalPath(value) {
+  const raw = String(value || '').trim()
+  if (!raw) return '~'
+  const home = String(state.desktopInfo?.homeDir || '').trim()
+  if (home && (raw === home || raw.startsWith(`${home}\\`) || raw.startsWith(`${home}/`))) {
+    return `~${raw.slice(home.length)}`
+  }
+  return raw
+}
+
+function renderTerminalMeta() {
+  const title = $('#terminal-title')
+  if (title) title.textContent = state.terminalShell || 'PowerShell'
+  const cwd = $('#terminal-cwd')
+  if (cwd) {
+    const label = shortenTerminalPath(state.terminalCwd)
+    cwd.textContent = label
+    cwd.title = state.terminalCwd || label
+  }
+  const status = $('#terminal-status')
+  const input = $('#terminal-input')
+  const running = state.terminalStatus === 'running'
+  if (status) {
+    if (state.terminalStatus === 'starting') status.textContent = '正在启动 PowerShell…'
+    else if (state.terminalStatus === 'restarting') status.textContent = '正在重启 PowerShell…'
+    else if (running) status.textContent = state.terminalPid ? `运行中 · PID ${state.terminalPid}` : '运行中'
+    else if (state.terminalStatus === 'exited') status.textContent = '进程已退出，可点「重启」重新打开'
+    else if (state.terminalStatus === 'error') status.textContent = '终端启动失败'
+    else status.textContent = '未连接'
+    status.classList.toggle('is-error', state.terminalStatus === 'error' || state.terminalStatus === 'exited')
+  }
+  if (input) {
+    input.disabled = !running
+    input.placeholder = running ? '输入命令，Enter 执行' : '终端未运行，点击「重启」'
+  }
+  const hint = $('#terminal-input-hint')
+  if (hint) hint.textContent = running ? 'Enter' : '离线'
+}
+
+function terminalStripAnsi(text) {
+  return String(text || '')
+    .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, '')
+    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/\u001b[@-_]/g, '')
+}
+
+function terminalScrollToBottom(force = false) {
+  const output = $('#terminal-output')
+  if (!output) return
+  const atBottom = output.scrollHeight - output.scrollTop - output.clientHeight < 56
+  if (force || atBottom) output.scrollTop = output.scrollHeight
+}
+
+function terminalTrimOutput() {
+  const output = $('#terminal-output')
+  if (!output) return
+  while (output.childElementCount > 2600) output.firstElementChild?.remove()
+  state.terminalLines = output.childElementCount
+}
+
+function terminalWriteLine(line, stream = 'stdout') {
+  const output = $('#terminal-output')
+  if (!output) return
+  const row = document.createElement('div')
+  row.className = 'terminal-line'
+  if (stream === 'stderr') row.classList.add('is-error')
+  else if (stream === 'system') row.classList.add('is-system')
+  const text = String(line ?? '').replace(/\t/g, '    ')
+  if (stream === 'stdout' && text.startsWith('PS> ')) {
+    row.classList.add('is-command')
+    const prompt = document.createElement('span')
+    prompt.className = 'terminal-line-prompt'
+    prompt.textContent = 'PS> '
+    const command = document.createElement('span')
+    command.className = 'terminal-line-command'
+    command.textContent = text.slice(4)
+    row.append(prompt, command)
+  } else {
+    row.textContent = text || '\u00a0'
+  }
+  output.append(row)
+  state.terminalLines += 1
+  terminalTrimOutput()
+  terminalScrollToBottom()
+}
+
+function terminalAppendText(text, stream = 'stdout') {
+  const clean = terminalStripAnsi(text).replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+  if (!clean) return
+  if (stream === 'stderr') {
+    for (const line of clean.split('\n')) {
+      if (line) terminalWriteLine(line, 'stderr')
+    }
+    return
+  }
+  state.terminalLineBuffer += clean
+  const parts = state.terminalLineBuffer.split('\n')
+  state.terminalLineBuffer = parts.pop() || ''
+  for (const line of parts) terminalWriteLine(line, 'stdout')
+  // 极端长行（例如压缩后的 JSON）及时落盘，避免输入区被撑爆。
+  if (state.terminalLineBuffer.length > 6000) {
+    terminalWriteLine(state.terminalLineBuffer, 'stdout')
+    state.terminalLineBuffer = ''
+  }
+}
+
+function clearTerminalOutput({ keepSystem = false } = {}) {
+  const output = $('#terminal-output')
+  if (!output) return
+  output.innerHTML = ''
+  state.terminalLineBuffer = ''
+  state.terminalLines = 0
+  if (keepSystem) terminalWriteLine('终端输出已清空', 'system')
+}
+
+function terminalCollectText() {
+  const output = $('#terminal-output')
+  if (!output) return ''
+  return [...output.children].map((row) => row.textContent || '').join('\n')
+}
+
+function focusTerminalInput(select = false) {
+  const input = $('#terminal-input')
+  if (!input || input.disabled) return
+  input.focus()
+  if (select) input.select()
+}
+
+function bindTerminalStreams() {
+  if (state.terminalDataBound || !terminalAvailable()) return
+  state.terminalDataBound = true
+  desktopBrowserHost.onTerminalData?.((payload) => {
+    if (!state.terminalOpen) return
+    const id = String(payload?.id || '')
+    if (id && state.terminalSessionId && id !== state.terminalSessionId) return
+    // 首次输出可能早于 invoke 返回，此时还没有 sessionId，直接接收。
+    if (id && !state.terminalSessionId) state.terminalSessionId = id
+    terminalAppendText(payload?.data, payload?.stream === 'stderr' ? 'stderr' : 'stdout')
+    if (state.terminalStatus !== 'running') {
+      state.terminalStatus = 'running'
+      renderTerminalMeta()
+    }
+  })
+  desktopBrowserHost.onTerminalExit?.((payload) => {
+    if (!state.terminalOpen) return
+    const id = String(payload?.id || '')
+    if (id && state.terminalSessionId && id !== state.terminalSessionId) return
+    if (state.terminalLineBuffer) {
+      terminalWriteLine(state.terminalLineBuffer, 'stdout')
+      state.terminalLineBuffer = ''
+    }
+    state.terminalSessionId = ''
+    state.terminalPid = 0
+    state.terminalStatus = 'exited'
+    const code = payload?.code
+    const error = String(payload?.error || '')
+    terminalWriteLine(
+      error ? `终端进程异常：${error}` : `进程已退出${code === null || code === undefined ? '' : `（退出码 ${code}）`}`,
+      error ? 'stderr' : 'system',
+    )
+    renderTerminalMeta()
+    syncWorkbenchLayout()
+  })
+}
+
+async function startTerminalSession({ cwd = null } = {}) {
+  if (!terminalAvailable() || state.terminalBusy) return false
+  state.terminalBusy = true
+  state.terminalStatus = 'starting'
+  state.terminalLineBuffer = ''
+  state.terminalCwd = String(cwd || state.terminalCwd || state.localProject?.rootPath || '')
+  renderTerminalMeta()
+  const requestedCwd = cwd || state.localProject?.rootPath || ''
+  const cols = Math.max(60, Math.floor(($('#terminal-surface')?.clientWidth || 720) / 8))
+  try {
+    const result = await desktopBrowserHost.terminalCreate({ cwd: requestedCwd, cols, rows: 32 })
+    if (!result?.ok) {
+      state.terminalStatus = 'error'
+      terminalWriteLine(`终端启动失败：${result?.error || '未知错误'}`, 'stderr')
+      renderTerminalMeta()
+      return false
+    }
+    state.terminalSessionId = String(result.id || '')
+    state.terminalShell = String(result.shell || 'PowerShell')
+    state.terminalCwd = String(result.cwd || requestedCwd || '')
+    state.terminalPid = Number(result.pid) || 0
+    state.terminalStatus = 'running'
+    renderTerminalMeta()
+    syncWorkbenchLayout()
+    focusTerminalInput()
+    return true
+  } catch (error) {
+    state.terminalStatus = 'error'
+    terminalWriteLine(`终端启动失败：${error?.message || error}`, 'stderr')
+    renderTerminalMeta()
+    return false
+  } finally {
+    state.terminalBusy = false
+  }
+}
+
+async function openTerminalPane({ restart = false } = {}) {
+  if (!terminalAvailable()) {
+    banner('本机终端只在 EAB 桌面版提供', 'warn')
+    return
+  }
+  const wasOpen = state.terminalOpen
+  state.terminalOpen = true
+  state.workbenchCollapsed = false
+  state.workbenchTab = 'terminal'
+  state.workbenchSplit = false
+  state.terminalStatus = state.terminalSessionId ? 'running' : 'starting'
+  if (!wasOpen || restart) {
+    clearTerminalOutput()
+    terminalWriteLine('EAB 本机终端 · 命令以当前 Windows 用户身份执行', 'system')
+  }
+  syncWorkbenchLayout()
+  bindTerminalStreams()
+  if (!state.terminalSessionId) {
+    await startTerminalSession()
+  } else {
+    renderTerminalMeta()
+    focusTerminalInput()
+  }
+}
+
+async function closeTerminalPane({ focusAdd = false } = {}) {
+  const id = state.terminalSessionId
+  state.terminalOpen = false
+  state.terminalSessionId = ''
+  state.terminalPid = 0
+  state.terminalStatus = 'closed'
+  state.terminalBusy = false
+  state.terminalLineBuffer = ''
+  syncWorkbenchLayout()
+  if (focusAdd) {
+    if (!$('#workbench-rail')?.hidden) $('#workbench-add')?.focus()
+    else $('#workbench-dock')?.focus()
+  }
+  if (id && terminalAvailable()) {
+    try {
+      await desktopBrowserHost.terminalClose(id)
+    } catch {
+      // 关闭失败不阻塞界面退出，主进程会随窗口关闭统一清理。
+    }
+  }
+}
+
+async function restartTerminalPane() {
+  if (!terminalAvailable() || state.terminalBusy) return
+  const previousId = state.terminalSessionId
+  const cwd = state.terminalCwd
+  state.terminalOpen = true
+  state.workbenchTab = 'terminal'
+  state.workbenchCollapsed = false
+  state.terminalStatus = 'restarting'
+  state.terminalSessionId = ''
+  state.terminalPid = 0
+  state.terminalLineBuffer = ''
+  clearTerminalOutput()
+  terminalWriteLine('正在重新启动 PowerShell…', 'system')
+  renderTerminalMeta()
+  syncWorkbenchLayout()
+  if (previousId) {
+    try {
+      await desktopBrowserHost.terminalClose(previousId)
+    } catch {
+      // 继续启动新会话
+    }
+  }
+  await startTerminalSession({ cwd })
+}
+
+function sendTerminalCommand(value) {
+  const command = String(value ?? '')
+  if (!state.terminalSessionId || state.terminalStatus !== 'running') {
+    banner('终端未运行，请先点「重启」', 'warn')
+    return
+  }
+  const trimmed = command.trim()
+  if (trimmed) {
+    const history = state.terminalHistory
+    if (history[history.length - 1] !== trimmed) history.push(trimmed)
+    if (history.length > 200) history.splice(0, history.length - 200)
+  }
+  state.terminalHistoryIndex = state.terminalHistory.length
+  state.terminalHistoryDraft = ''
+  const written = desktopBrowserHost.terminalInput?.(state.terminalSessionId, `${command}\r\n`)
+  if (written === false) {
+    banner('命令没有送达终端，请重启终端后重试', 'warn')
+    return
+  }
+  const input = $('#terminal-input')
+  if (input) input.value = ''
+}
+
+function bindTerminalPane() {
+  const terminalButton = $('#web-draft-terminal')
+  if (terminalButton) terminalButton.hidden = !terminalAvailable()
+  if (!terminalAvailable()) return
+
+  bindTerminalStreams()
+
+  $('#terminal-input-form')?.addEventListener('submit', (event) => {
+    event.preventDefault()
+    sendTerminalCommand($('#terminal-input')?.value || '')
+  })
+
+  $('#terminal-input')?.addEventListener('keydown', (event) => {
+    if (event.isComposing) return
+    const input = event.currentTarget
+    if (event.key === 'Enter' && !event.shiftKey && !event.altKey && !event.ctrlKey) {
+      event.preventDefault()
+      sendTerminalCommand(input.value)
+      return
+    }
+    if (event.key === 'ArrowUp') {
+      event.preventDefault()
+      if (!state.terminalHistory.length) return
+      if (state.terminalHistoryIndex >= state.terminalHistory.length) {
+        state.terminalHistoryDraft = input.value
+      }
+      state.terminalHistoryIndex = Math.max(0, state.terminalHistoryIndex - 1)
+      input.value = state.terminalHistory[state.terminalHistoryIndex] || ''
+      requestAnimationFrame(() => input.setSelectionRange(input.value.length, input.value.length))
+      return
+    }
+    if (event.key === 'ArrowDown') {
+      event.preventDefault()
+      if (!state.terminalHistory.length) return
+      if (state.terminalHistoryIndex < state.terminalHistory.length - 1) {
+        state.terminalHistoryIndex += 1
+        input.value = state.terminalHistory[state.terminalHistoryIndex] || ''
+      } else {
+        state.terminalHistoryIndex = state.terminalHistory.length
+        input.value = state.terminalHistoryDraft || ''
+      }
+      requestAnimationFrame(() => input.setSelectionRange(input.value.length, input.value.length))
+      return
+    }
+    if (event.key.toLowerCase() === 'l' && (event.ctrlKey || event.metaKey)) {
+      event.preventDefault()
+      clearTerminalOutput()
+      return
+    }
+  })
+
+  $('#terminal-clear')?.addEventListener('click', () => {
+    clearTerminalOutput()
+    focusTerminalInput()
+  })
+
+  $('#terminal-copy')?.addEventListener('click', async () => {
+    const text = terminalCollectText()
+    if (!text.trim()) {
+      banner('终端里还没有可复制的内容', 'info')
+      return
+    }
+    try {
+      if (typeof desktopBrowserHost.terminalCopy === 'function') {
+        await desktopBrowserHost.terminalCopy(text)
+      } else {
+        await navigator.clipboard.writeText(text)
+      }
+      banner('已复制终端输出', 'success')
+    } catch {
+      banner('复制失败，请手动选中输出复制', 'warn')
+    }
+    focusTerminalInput()
+  })
+
+  $('#terminal-restart')?.addEventListener('click', () => void restartTerminalPane())
+  $('#terminal-close')?.addEventListener('click', () => void closeTerminalPane({ focusAdd: true }))
+
+  // Ctrl+`：桌面端从任意对话打开终端；已在终端里时只把焦点拉回输入框。
+  document.addEventListener('keydown', (event) => {
+    if (!terminalAvailable() || event.defaultPrevented) return
+    if (!event.ctrlKey || event.altKey || event.metaKey) return
+    if (event.key !== '`' && event.code !== 'Backquote') return
+    event.preventDefault()
+    if (state.terminalOpen) {
+      state.workbenchCollapsed = false
+      state.workbenchTab = 'terminal'
+      state.workbenchSplit = false
+      syncWorkbenchLayout()
+      focusTerminalInput()
+      return
+    }
+    void openTerminalPane()
+  })
+}
+
 /** 右侧工作台：团队 / 网页 / 文件 / 并排。面板同级，团队不在文件预览里面。 */
 function openWorkbenchKind(kind) {
   if (kind === 'web') {
     newBrowserDraftTab()
+    return
+  }
+  if (kind === 'terminal') {
+    openTerminalPane()
     return
   }
   if (kind === 'team') {
@@ -13707,6 +16123,7 @@ function bindWorkbenchTabs() {
   bindBrowserPaneShortcuts()
   bindWorkbenchAddMenu()
   bindCloudSpaceActions()
+  bindTerminalPane()
   $('#cloud-pane-refresh')?.addEventListener('click', () => void refreshCloudSpace())
   try {
     state.workbenchCollapsed = localStorage.getItem(WORKBENCH_COLLAPSED_KEY) === '1'
@@ -13745,12 +16162,12 @@ function bindWorkbenchTabs() {
           return
         }
         if (kind === 'cloud') {
-          state.cloudSpaceOpen = false
-          state.cloudSpaceError = ''
-          if (state.workbenchTab === 'cloud') state.workbenchTab = state.filePreview ? 'file' : 'team'
-          syncWorkbenchLayout(true)
+          closeCloudSpacePane()
           if (!$('#workbench-rail')?.hidden) $('#workbench-add')?.focus()
-          else $('#workbench-dock')?.focus()
+          return
+        }
+        if (kind === 'terminal') {
+          closeTerminalPane({ focusAdd: true })
           return
         }
         if (kind === 'team') {
@@ -13775,8 +16192,13 @@ function bindWorkbenchTabs() {
         activateBrowserTab(tab.getAttribute('data-browser-tab') || '')
         return
       }
-      state.workbenchTab = kind === 'file' ? 'file' : kind === 'perm' ? 'perm' : kind === 'cloud' ? 'cloud' : 'team'
+      state.workbenchTab = kind === 'file' ? 'file' : kind === 'perm' ? 'perm' : kind === 'cloud' ? 'cloud' : kind === 'terminal' ? 'terminal' : 'team'
       if (kind === 'team') state.teamTabOpen = true
+      if (kind === 'terminal') {
+        syncWorkbenchLayout()
+        focusTerminalInput()
+        return
+      }
       if (kind === 'perm') {
         state.permOpen = true
         state.permError = ''
@@ -14242,22 +16664,18 @@ function applyAssistantIdentity(name, avatarUrl) {
 }
 
 function renderSideUser(me) {
-  $('#side-user').hidden = false
+  const sideUser = $('#side-user')
+  sideUser.hidden = false
   const sideAvatar = $('#user-avatar')
   const avatarSrc = meAvatarUrl(me)
   sideAvatar.innerHTML = avatarInner(me.person.name, avatarSrc)
   sideAvatar.classList.toggle('has-photo', Boolean(avatarSrc))
   $('#user-name').textContent = me.person.name
   $('#user-title').textContent = me.person.title || '—'
-  const company = me.company?.name || ''
-  const dept = me.person.deptName || ''
-  const org = $('#user-org')
-  if (company && dept && dept !== company) {
-    org.innerHTML = `<span class="side-org-company">${esc(company)}</span><span class="side-org-dept">${esc(dept)}</span>`
-    org.dataset.orgText = `${company} · ${dept}`
-  } else {
-    org.textContent = org.dataset.orgText = company || dept || '—'
-  }
+  sideUser.setAttribute(
+    'aria-label',
+    `${me.person.name}${me.person.title ? ` · ${me.person.title}` : ''}，打开设置`,
+  )
   $('#user-roles').innerHTML = (me.roles || [])
     .map((role) => `<span class="pill">${esc(ROLE_LABEL[role] || role)}</span>`)
     .join('')
@@ -15892,10 +18310,6 @@ function showPasswordModal() {
 function syncChatTitle() {
   const el = $('#chat-title')
   if (!el) return
-  if (state.mode === 'workspace') {
-    el.textContent = '工作台'
-    return
-  }
   const sessions = Array.isArray(state.sessions) ? state.sessions : []
   const current = state.sessionId ? sessions.find((item) => item.id === state.sessionId) : null
   el.textContent = (current && current.title) || (state.sessionId ? '对话' : '新对话')
@@ -15924,39 +18338,24 @@ function playPaneEnter(pane) {
   paneEnterTimers.set(pane, timer)
 }
 
-function playWorkspaceEnter() {
-  playPaneEnter($('#workspace-pane'))
-}
-
 function setChatMode(mode) {
+  if (mode === 'workspace') {
+    openWorkspacePage()
+    return
+  }
+  if ($('#settings-stage') && !$('#settings-stage').hidden) hideSettings({ restoreFocus: false })
+  closeSchedulesPage({ restoreFocus: false })
+  closeWorkspacePage({ restoreFocus: false })
+  closePluginsPage({ restoreFocus: false })
   if (state.projectHomeOpen) closeProjectHome({ silent: true })
-  const next = mode === 'workspace' ? 'workspace' : 'chat'
-  // 从空白草稿切到工作台属于离开会话：草稿和它自己的右侧标签一起丢弃。
-  if (next === 'workspace' && (state.draftSession || browserTabsScopeSessionId === '')) {
-    discardDraftSession()
-  }
-  state.mode = next
-  state.view = next
-  $('.chat-main').classList.toggle('is-workspace', next === 'workspace')
-  $('#thread').hidden = next !== 'chat'
-  $('.composer').hidden = next !== 'chat'
-  $('#workspace-pane').hidden = next !== 'workspace'
+  state.mode = 'chat'
+  state.view = 'chat'
+  $('.chat-main').classList.remove('is-workspace')
+  $('#thread').hidden = false
+  $('.composer').hidden = false
   syncWorkbenchLayout()
-  for (const button of $('#mode-switch').querySelectorAll('[data-mode]')) {
-    const active = button.dataset.mode === next
-    button.classList.toggle('is-active', active)
-    button.setAttribute('aria-selected', active ? 'true' : 'false')
-  }
-  if (next === 'workspace') {
-    playWorkspaceEnter()
-    syncChatTitle()
-    if (state.workspaceKind === 'skills') loadMySkills()
-    else loadMyPlugins()
-  } else {
-    clearPaneEnter($('#workspace-pane'))
-    syncChatTitle()
-    syncThreadScrollState()
-  }
+  syncChatTitle()
+  syncThreadScrollState()
   persistChatLocation()
 }
 
@@ -16134,7 +18533,6 @@ function myPluginRailHtml(data) {
       <div class="plugin-scope-block">
         <span class="plugin-scope-eyebrow">个人空间</span>
         <strong>${esc(who)}</strong>
-        <small>只显示你自己安装的插件</small>
       </div>
       <div class="plugin-rail-metrics">
         <div><strong>${stats.installed}</strong><span>已装</span></div>
@@ -16143,7 +18541,6 @@ function myPluginRailHtml(data) {
       </div>
       <div class="plugin-rail-actions">
         <button class="btn primary sm" type="button" data-my-plugin-install ${myPluginCan('install') ? '' : 'disabled title="当前角色没有安装个人插件权限"'}>＋ 安装插件</button>
-        <button class="btn ghost sm" type="button" data-my-plugin-refresh>刷新</button>
       </div>
     </div>
     <div class="plugin-rail-head">已安装 <span class="muted">${plugins.length}</span><span class="plugin-rail-head-hint" title="点击卡片切换下方详情" aria-label="点击卡片切换下方详情"><svg aria-hidden="true" width="10" height="10" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6.2" stroke="currentColor" stroke-width="1.2"/><path d="M8 7.4v3.6" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/><circle cx="8" cy="4.6" r=".9" fill="currentColor"/></svg></span></div>
@@ -16383,7 +18780,6 @@ function myPluginWelcomeHtml(data) {
     </div>
     <div class="plugin-welcome-actions">
       <button class="btn primary" type="button" data-my-plugin-install ${myPluginCan('install') ? '' : 'disabled title="当前角色没有安装个人插件权限"'}>安装个人插件</button>
-      <button class="btn ghost" type="button" data-my-plugin-refresh>刷新</button>
     </div>
     ${myPluginCan('install') ? '' : myPluginLockedNote('install')}
   </div>`
@@ -16673,7 +19069,6 @@ function mySkillRailHtml(data) {
       </div>
       <div class="plugin-rail-actions">
         <button class="btn primary sm" type="button" data-my-skill-install ${mySkillCan('install') ? '' : 'disabled title="当前角色没有安装个人技能权限"'}>＋ 安装技能</button>
-        <button class="btn ghost sm" type="button" data-my-skill-refresh>刷新</button>
       </div>
     </div>
     <div class="plugin-rail-head">已安装 <span class="muted">${skills.length}</span><span class="plugin-rail-head-hint" title="点击卡片切换下方详情" aria-label="点击卡片切换下方详情"><svg aria-hidden="true" width="10" height="10" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6.2" stroke="currentColor" stroke-width="1.2"/><path d="M8 7.4v3.6" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/><circle cx="8" cy="4.6" r=".9" fill="currentColor"/></svg></span></div>
@@ -16796,7 +19191,6 @@ function mySkillWelcomeHtml(data) {
     </div>
     <div class="plugin-welcome-actions">
       <button class="btn primary" type="button" data-my-skill-install ${mySkillCan('install') ? '' : 'disabled title="当前角色没有安装个人技能权限"'}>安装个人技能</button>
-      <button class="btn ghost" type="button" data-my-skill-refresh>刷新</button>
     </div>
     ${mySkillCan('install') ? '' : mySkillLockedNote('install')}
   </div>`
@@ -16823,9 +19217,9 @@ let mySkillWatchTimer = 0
 /** 技能工作台只读轮询：Agent 热安装后，已打开的详情页自动刷新校验和与 SKILL.md。 */
 function scheduleMySkillWatch() {
   window.clearTimeout(mySkillWatchTimer)
-  if (state.mode !== 'workspace' || state.workspaceKind !== 'skills') return
+  if (state.view !== 'plugins' || state.workspaceKind !== 'skills') return
   mySkillWatchTimer = window.setTimeout(async () => {
-    if (state.mode !== 'workspace' || state.workspaceKind !== 'skills') return
+    if (state.view !== 'plugins' || state.workspaceKind !== 'skills') return
     try {
       const next = await api(`/api/my/skills${qs()}`)
       if (mySkillSignature(next) !== mySkillSignature(state.skillData)) {
@@ -17185,10 +19579,8 @@ function bindMySkillWorkspace() {
   }
 }
 
-function setWorkspaceKind(kind) {
-  const next = kind === 'skills' ? 'skills' : 'plugins'
-  if (state.workspaceKind === next) return
-  state.workspaceKind = next
+function syncWorkspaceKindChrome() {
+  const next = state.workspaceKind === 'skills' ? 'skills' : 'plugins'
   for (const button of document.querySelectorAll('#workspace-kind-switch [data-workspace-kind]')) {
     const active = button.dataset.workspaceKind === next
     button.classList.toggle('is-active', active)
@@ -17198,7 +19590,7 @@ function setWorkspaceKind(kind) {
   const title = $('#workspace-title')
   const badge = $('#workspace-scope-badge')
   if (eyebrow) eyebrow.textContent = next === 'skills' ? 'PERSONAL SKILL WORKSPACE' : 'PERSONAL PLUGIN WORKSPACE'
-  if (title) title.textContent = next === 'skills' ? '技能工作台' : '我的工作台'
+  if (title) title.textContent = next === 'skills' ? '技能' : '插件'
   if (badge) {
     badge.textContent = next === 'skills' ? '仅本人技能' : '仅本人可见'
     badge.dataset.tip =
@@ -17206,9 +19598,14 @@ function setWorkspaceKind(kind) {
         ? '只显示你自己安装的技能。安装、启停、卸载和风险详情都只影响你本人；高风险包会被拦截并写入隔离记录。'
         : '只显示你自己安装的插件。启停、卸载、查看详情和打开插件页面都只影响你本人，不会碰公司和别人的安装。'
   }
-  if (state.mode === 'workspace') {
-    if (next === 'skills') loadMySkills()
-    else loadMyPlugins()
+}
+
+function setWorkspaceKind(kind) {
+  state.workspaceKind = kind === 'skills' ? 'skills' : 'plugins'
+  syncWorkspaceKindChrome()
+  if (state.view === 'plugins') {
+    loadWorkspaceKindContent()
+    persistChatLocation()
   }
 }
 
@@ -17218,16 +19615,13 @@ function bindWorkspaceKindSwitch() {
   }
 }
 
-/** 技能工具卡的 previewPath 用 ?workspace=skills&skill=<id> 直达技能工作台详情。 */
+/** 技能工具卡的 previewPath 用 ?workspace=skills&skill=<id> 直达个人技能详情页。 */
 function applyWorkspaceDeepLink() {
   const params = new URLSearchParams(location.search)
   if (params.get('workspace') !== 'skills') return false
   const skillId = String(params.get('skill') || '').trim()
-  const settingsStage = $('#settings-stage')
-  if (settingsStage && !settingsStage.hidden) hideSettings()
   state.skillSelected = skillId || null
-  setWorkspaceKind('skills')
-  setChatMode('workspace')
+  openPluginsPage('skills')
   return true
 }
 
@@ -23994,7 +26388,12 @@ function renderSettingsProfile() {
   // 直接复用侧栏已经渲染好的身份信息，避免两处字段口径不一致
   const name = $('#user-name')?.textContent?.trim() || '—'
   const title = $('#user-title')?.textContent?.trim() || '—'
-  const org = $('#user-org')?.dataset.orgText || $('#user-org')?.textContent?.trim() || '—'
+  const company = state.me?.company?.name || ''
+  const dept = state.me?.person?.deptName || ''
+  const orgParts = []
+  if (company) orgParts.push(company)
+  if (dept && dept !== company) orgParts.push(dept)
+  const org = orgParts.join(' · ') || '—'
   const roles = $('#user-roles')?.innerHTML || ''
   const rawId = String(state.me?.person?.id || '')
   const account = rawId.replace(/^u_[a-z0-9]+_/i, '') || '—'
@@ -24044,11 +26443,15 @@ function renderChatSendModeSetting() {
 function showSettings() {
   const stage = $('#settings-stage')
   if (!stage) return
+  dismissSideDrawersForPage()
+  closeSchedulesPage({ restoreFocus: false })
+  closeWorkspacePage({ restoreFocus: false })
+  closePluginsPage({ restoreFocus: false })
   $('.chat-head').hidden = true
   $('.chat-main').hidden = true
   stage.hidden = false
   playPaneEnter(stage)
-  $('#open-settings').classList.add('is-active')
+  $('#side-user')?.classList.add('is-active')
   state.view = 'settings'
   persistChatLocation()
   renderSettingsProfile()
@@ -24057,17 +26460,18 @@ function showSettings() {
   void loadVoiceSettings()
 }
 
-function hideSettings() {
+function hideSettings(options = {}) {
   const stage = $('#settings-stage')
   if (!stage) return
   stage.hidden = true
   clearPaneEnter(stage)
   $('.chat-head').hidden = false
   $('.chat-main').hidden = false
-  $('#open-settings').classList.remove('is-active')
+  $('#side-user')?.classList.remove('is-active')
+  closeSchedulesPage({ restoreFocus: false })
   state.view = state.mode
   persistChatLocation()
-  $('#input').focus()
+  if (options.restoreFocus !== false) $('#input').focus()
 }
 
 async function logout() {
@@ -24083,7 +26487,13 @@ let settingsBound = false
 function bindSettings() {
   if (settingsBound) return
   settingsBound = true
-  $('#open-settings').addEventListener('click', showSettings)
+  const sideUser = $('#side-user')
+  sideUser?.addEventListener('click', showSettings)
+  sideUser?.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return
+    event.preventDefault()
+    showSettings()
+  })
   $('#settings-back').addEventListener('click', hideSettings)
   $('#settings-memories').addEventListener('click', showMemories)
   $('#settings-caps').addEventListener('click', showMyCaps)
@@ -24145,9 +26555,10 @@ function bindSettings() {
       banner(err.message || '保存失败，请重试', 'bad')
     }
   })
+  const desktopDownloadEntry = $('#side-bottom')
+  if (desktopDownloadEntry) desktopDownloadEntry.hidden = Boolean(desktopBrowserHost)
   const desktopDownloadButton = $('#open-desktop-download')
   if (desktopDownloadButton) {
-    desktopDownloadButton.hidden = Boolean(desktopBrowserHost)
     desktopDownloadButton.addEventListener('click', () => {
       window.open('/download/desktop', '_blank', 'noopener')
     })
@@ -24549,8 +26960,8 @@ function focusSideToggle() {
 }
 
 function canSidePeek() {
-  // ≤1120 侧栏是抽屉，悬停预览会和抽屉抢同一块区域。
-  return window.matchMedia('(min-width: 1121px)').matches
+  // ≤960 侧栏是抽屉，悬停预览会和抽屉抢同一块区域。
+  return window.matchMedia('(min-width: 961px)').matches
 }
 
 function syncSidePeekInsets() {
@@ -24666,7 +27077,7 @@ function setSidebarCollapsed(collapsed, options = {}) {
 }
 
 function initSidebarToggle() {
-  const isCompactShell = () => window.matchMedia('(max-width: 1120px)').matches
+  const isCompactShell = () => window.matchMedia('(max-width: 960px)').matches
   let collapsed = false
   try {
     collapsed = localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === '1'
@@ -24715,7 +27126,7 @@ function initSidebarToggle() {
   }
   if (document.body.dataset.compactSideBound !== '1') {
     document.body.dataset.compactSideBound = '1'
-    const compactQuery = window.matchMedia('(max-width: 1120px)')
+    const compactQuery = window.matchMedia('(max-width: 960px)')
     compactQuery.addEventListener('change', (event) => {
       if (event.matches) {
         if (!document.body.classList.contains('is-side-collapsed')) {
@@ -24761,6 +27172,21 @@ function initSidebarToggle() {
     document.body.dataset.sidebarEscBound = '1'
     document.addEventListener('keydown', (event) => {
       if (event.key !== 'Escape') return
+      // 独立页、定时任务页或确认卡打开时，Esc 只关闭当前层，不把侧栏一起收起。
+      if (document.querySelector('.confirm-overlay')) return
+      if (isGlobalDrawerOpen()) {
+        closeGlobalDrawer()
+        return
+      }
+      if (state.view === 'workspace') {
+        closeWorkspacePage()
+        return
+      }
+      if (state.view === 'plugins') {
+        closePluginsPage()
+        return
+      }
+      if (state.view === 'schedules') return
       if (document.body.classList.contains('is-side-peek')) {
         setSidePeek(false)
         focusSideToggle()
@@ -24900,12 +27326,12 @@ function fileSplitContentWidth(main) {
   }
 }
 
-/** 右栏最小 440（列表 200 + 详情）、对话最小 360；文件模式右栏 320、对话 420。 */
-function splitBounds(teamMode, contentWidth) {
-  const minRail = teamMode ? 440 : 320
-  const minChat = teamMode ? 360 : 420
-  // --file-split / --team-split 表示左栏（对话）占比，不是右栏占比。
-  // 三列网格里左栏是 calc(ratio - 4px)、右栏是剩余宽度，预留 12px 吸收间距与边框。
+/** 右栏最小宽度：团队 440（列表 200 + 详情）、网页 300、文件 320；对话最小 360 / 380 / 420。 */
+function splitBounds(teamMode, contentWidth, webMode = false) {
+  const minRail = teamMode ? 440 : webMode ? 300 : 320
+  const minChat = teamMode ? 360 : webMode ? 380 : 420
+  // --file-split / --team-split / --web-split 表示左栏（对话）占比，不是右栏占比。
+  // 三列网格里左栏是 calc(ratio - 6px)、右栏是剩余宽度，预留 12px 吸收间距与边框。
   const minRatio = Math.min(0.5, (minChat + 12) / contentWidth)
   const maxRatio = Math.max(minRatio, 1 - (minRail + 12) / contentWidth)
   return { minRatio, maxRatio }
@@ -24917,12 +27343,12 @@ function applySplitRatio(ratio, options = {}) {
   const teamMode = Boolean(options.team)
   const webMode = Boolean(options.web)
   const varName = webMode ? '--web-split' : teamMode ? '--team-split' : '--file-split'
-  const fallback = webMode ? 0.44 : teamMode ? 0.56 : 0.5
+  const fallback = webMode ? 0.64 : teamMode ? 0.56 : 0.5
   const geometry = fileSplitContentWidth(main)
   let value = Number(ratio)
   if (!Number.isFinite(value) || value <= 0) value = fallback
   if (geometry.contentWidth > 1) {
-    const bounds = splitBounds(teamMode || webMode, geometry.contentWidth)
+    const bounds = splitBounds(teamMode, geometry.contentWidth, webMode)
     value = Math.max(bounds.minRatio, Math.min(bounds.maxRatio, value))
   }
   main.style.setProperty(varName, `${(value * 100).toFixed(2)}%`)
@@ -24976,12 +27402,12 @@ function restoreTeamSplitRatio() {
 }
 
 function restoreWebSplitRatio() {
-  let ratio = 0.44
+  let ratio = 0.64
   try {
     const saved = Number(localStorage.getItem(WEB_SPLIT_RATIO_KEY))
     if (Number.isFinite(saved) && saved >= 0.25 && saved <= 0.7) ratio = saved
   } catch {
-    ratio = 0.44
+    ratio = 0.64
   }
   applyWebSplitRatio(ratio, { persist: false })
 }
@@ -25101,6 +27527,11 @@ function bindFileSplitResizer() {
   resizer.dataset.bound = '1'
   let drag = null
 
+  // 触屏 / 键盘没有可靠的 CSS :hover，显式记录指针进入，保证胶囊的悬停反馈一致。
+  resizer.addEventListener('pointerenter', () => resizer.classList.add('is-hovered'))
+  resizer.addEventListener('pointerleave', () => resizer.classList.remove('is-hovered'))
+  resizer.addEventListener('pointerdown', () => resizer.classList.add('is-hovered'))
+
   const finishDrag = (pointerId) => {
     if (!drag || (pointerId != null && pointerId !== drag.pointerId)) return
     const main = $('.chat-main')
@@ -25127,7 +27558,7 @@ function bindFileSplitResizer() {
   resizer.addEventListener('pointermove', (event) => {
     if (!drag || event.pointerId !== drag.pointerId) return
     const x = event.clientX - drag.rect.left - drag.padLeft
-    const bounds = splitBounds(drag.team || drag.web, drag.contentWidth)
+    const bounds = splitBounds(drag.team, drag.contentWidth, drag.web)
     const ratio = Math.max(bounds.minRatio, Math.min(bounds.maxRatio, x / drag.contentWidth))
     applySplitRatio(ratio, { team: drag.team, web: drag.web, persist: false })
     event.preventDefault()
@@ -25144,7 +27575,7 @@ function bindFileSplitResizer() {
     const team = !web && isTeamSplitMode(main)
     const varName = web ? '--web-split' : team ? '--team-split' : '--file-split'
     const current = Number.parseFloat(main.style.getPropertyValue(varName) || '') / 100
-    let next = Number.isFinite(current) && current > 0 ? current : web ? 0.44 : team ? 0.56 : 0.5
+    let next = Number.isFinite(current) && current > 0 ? current : web ? 0.64 : team ? 0.56 : 0.5
     if (event.key === 'ArrowLeft') next -= 0.02
     else if (event.key === 'ArrowRight') next += 0.02
     else if (event.key === 'Home') next = web ? 0.3 : team ? 0.36 : 0.3
@@ -25174,9 +27605,6 @@ async function boot() {
 
   // 登录页右侧扫码入口由 setupLoginSso() 按公司已配置的渠道动态展示。
 
-  for (const button of $('#mode-switch').querySelectorAll('[data-mode]')) {
-    button.addEventListener('click', () => setChatMode(button.dataset.mode))
-  }
   initSidebarToggle()
   bindFileSplitResizer()
   restoreTeamSplitRatio()
@@ -25221,7 +27649,6 @@ async function boot() {
   const stageShell = $('#chat-stage')
   if (sideShell) sideShell.hidden = false
   if (stageShell) stageShell.hidden = false
-  $('#mode-switch').hidden = false
   $('#chat-title').hidden = false
   $('#demo-pill').hidden = true
 
@@ -25297,10 +27724,11 @@ async function boot() {
     } else {
       newSession({ create: false })
     }
-    restoreChatLocation(savedLocation)
     await loadWorkspaceFiles()
     // 标签页恢复放在会话与工作台布局初始化之后，避免刚加上的标签被后续初始化覆盖掉。
     await restoreBrowserTabs()
+    // 独立页面（设置 / 定时任务）在右侧标签恢复后再落位，避免被工作台初始化冲掉。
+    restoreChatLocation(savedLocation)
   } catch (err) {
     renderDenied(err)
     endBoot('工作台加载遇到问题…')
@@ -25399,6 +27827,44 @@ async function boot() {
   document.addEventListener('click', (event) => {
     if (!event.target.closest('#ws-info') && !event.target.closest('#ws-quota-popover')) hideQuota()
   })
+
+  // 云空间标题后的 ? 角标：悬停、聚焦或点击都能看到已用 / 最大容量
+  const cloudQuotaPopover = $('#cloud-quota-popover')
+  const cloudQuotaBadge = $('#cloud-quota-badge')
+  if (cloudQuotaPopover && cloudQuotaBadge) {
+    let hideTimer = 0
+    const showCloudQuota = () => {
+      clearTimeout(hideTimer)
+      cloudQuotaPopover.hidden = false
+      cloudQuotaBadge.setAttribute('aria-expanded', 'true')
+    }
+    const hideCloudQuota = () => {
+      clearTimeout(hideTimer)
+      cloudQuotaPopover.hidden = true
+      cloudQuotaBadge.setAttribute('aria-expanded', 'false')
+    }
+    const scheduleHideCloudQuota = () => {
+      clearTimeout(hideTimer)
+      hideTimer = window.setTimeout(hideCloudQuota, 160)
+    }
+    cloudQuotaBadge.addEventListener('mouseenter', showCloudQuota)
+    cloudQuotaBadge.addEventListener('focus', showCloudQuota)
+    cloudQuotaBadge.addEventListener('click', (event) => {
+      event.stopPropagation()
+      showCloudQuota()
+    })
+    cloudQuotaBadge.addEventListener('mouseleave', () => {
+      if (!cloudQuotaBadge.matches(':focus')) scheduleHideCloudQuota()
+    })
+    cloudQuotaBadge.addEventListener('blur', scheduleHideCloudQuota)
+    cloudQuotaPopover.addEventListener('mouseenter', showCloudQuota)
+    cloudQuotaPopover.addEventListener('mouseleave', scheduleHideCloudQuota)
+    document.addEventListener('click', (event) => {
+      if (!event.target.closest('#cloud-quota-badge') && !event.target.closest('#cloud-quota-popover')) {
+        hideCloudQuota()
+      }
+    })
+  }
 
   // 模型选择：输入框里的气泡
   $('#model-chip').addEventListener('click', () => {
@@ -25552,6 +28018,7 @@ async function boot() {
 
   // 会话
   bindSideNav()
+  bindSchedulesPage()
   $('#new-project')?.addEventListener('click', () => void beginNewLocalProject())
   $('#project-modal-close')?.addEventListener('click', closeProjectModal)
   $('#project-modal-cancel')?.addEventListener('click', closeProjectModal)
@@ -25758,8 +28225,10 @@ bindSettings()
 window.addEventListener('eab:branding', () => {
   try { paintLoginBrand() } catch { /* 登录页不在当前视图时忽略 */ }
 })
-bindHintTips($('#workspace-pane'))
+bindHintTips($('#plugins-stage'))
 bindThreadHintTips()
 watchThreadTitles()
 bindWorkspaceKindSwitch()
+bindWorkspacePage()
+bindPluginsPage()
 boot()

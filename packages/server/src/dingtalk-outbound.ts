@@ -217,6 +217,41 @@ export interface DingTalkRichTextSendResult {
   readonly finished?: boolean
 }
 
+export interface DingTalkRichTextSendInput {
+  companyId: string
+  userId: string
+  title?: string
+  text: string
+  /** 可展开的思考过程；主动通知的最终卡也保留，不再只发一段正文。 */
+  reasoning?: string
+  tools?: string[]
+  toolDetails?: DingTalkRichCardState['toolDetails']
+  thinkingMs?: number
+  sessionId?: string
+}
+
+/**
+ * 为后台任务创建一张可继续更新的 A2UI 卡片，调用方在模型生成过程中持续调用
+ * `card.update()`，让定时任务也能在钉钉里看到思考与工具进度。
+ * 卡片创建失败时返回 card=null，由调用方在结束时回退普通 Markdown。
+ */
+export async function startDingTalkAICardToUser(
+  deps: ServerDeps,
+  input: {
+    companyId: string
+    userId: string
+    title?: string
+    state: DingTalkRichCardState
+  },
+): Promise<{ externalUserId: string; card: DingTalkAICardStream | null }> {
+  const config = outboundConfig(deps, input.companyId)
+  const externalUserId = externalUserIdOf(deps, input.companyId, input.userId)
+  const title = String(input.title ?? '').trim() || 'EAB 通知'
+  const card = new DingTalkAICardStream(config.appId, config.secret, externalUserId, config.robotCode)
+  const started = await card.start(input.state, title)
+  return { externalUserId, card: started ? card : null }
+}
+
 /**
  * 主动推送到当前员工的钉钉单聊，优先复用聊天回复的 A2UI 卡片，
  * 让子 Agent 完成汇报、定时任务通知也有标题、分段和表格排版。
@@ -226,7 +261,7 @@ export interface DingTalkRichTextSendResult {
  */
 export async function sendDingTalkRichTextToUser(
   deps: ServerDeps,
-  input: { companyId: string; userId: string; title?: string; text: string },
+  input: DingTalkRichTextSendInput,
 ): Promise<DingTalkRichTextSendResult> {
   const text = String(input.text ?? '').trim()
   if (!text) throw new EabError(EC.VALIDATION, '消息内容不能为空')
@@ -236,9 +271,12 @@ export async function sendDingTalkRichTextToUser(
 
   const state: DingTalkRichCardState = {
     answer: text,
-    reasoning: '',
-    tools: [],
+    reasoning: String(input.reasoning ?? ''),
+    tools: (input.tools ?? []).filter(Boolean),
+    toolDetails: input.toolDetails ?? [],
     thinkingDone: true,
+    thinkingMs: Math.max(0, Math.trunc(Number(input.thinkingMs) || 0)),
+    sessionId: input.sessionId,
   }
   const card = new DingTalkAICardStream(config.appId, config.secret, externalUserId, config.robotCode)
   if (await card.start(state, title)) {

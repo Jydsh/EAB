@@ -152,7 +152,7 @@ import {
   runProjectCommand,
   startProjectJob,
 } from '../project-runner.js'
-import { createSchedule, deleteSchedule, listSchedules } from '../schedule.js'
+import { createSchedule, listSchedules, removeSchedule } from '../schedule.js'
 import {
   addDocxComment,
   addXlsxCellComment,
@@ -632,6 +632,9 @@ export const TOOLS: readonly ToolDef[] = [
     scope: SC.AGENT_TOOL_INVOKE,
     dangerous: false,
     concurrency: 'write',
+    // 右侧浏览器是用户可见、由用户主动要求打开的工作台标签页，不能按“命令执行工具”逐次审批。
+    // 逐次审批会让一次 open 卡满审批等待时间，对话里表现为“内置浏览器打不开网站”。
+    approval: 'never',
     lockKey: (_deps, actor) => `browser:${actor.subject.companyId}:${actor.subject.userId}`,
     input: {
       action: {
@@ -930,7 +933,7 @@ export const TOOLS: readonly ToolDef[] = [
     id: 'schedule.create',
     name: '创建定时任务',
     description:
-      '创建属于当前员工自己的定时提醒。它是挂在当前会话上的持久提醒，到点后会在原会话里自动跑一轮并把结果回复给用户。用户说“30 秒后提醒我 / 明天早上 8 点提醒我开会 / 每天 9 点把日报发我 / 每周一 10 点汇总上周数据 / 每 10 分钟检查一次”时调用。prompt 写到点要执行的完整任务。时间选择器优先级：after_seconds（多少秒后一次）> every_seconds（每多少秒，最少 300）> at（指定时间）> daily/weekly（日历规则）。不要自己计算绝对时间。',
+      '创建属于当前员工自己的定时提醒。它是挂在当前会话上的持久提醒，到点后会在原会话里自动跑一轮并把结果回复给用户。用户说“30 秒后提醒我 / 明天早上 8 点提醒我开会 / 每天 9 点把日报发我 / 每周一 10 点汇总上周数据 / 每 10 分钟或每 2 小时检查一次”时调用。prompt 写到点要执行的完整任务。时间选择器优先级：after_seconds（多少秒后一次）> every_seconds（每多少秒，最少 30）> intervalValue + intervalUnit（按秒/分钟/小时/天/月/年重复）> at（指定时间）> daily/weekly（日历规则）。不要自己计算绝对时间。',
     scope: SC.SCHEDULE_WRITE,
     dangerous: false,
     concurrency: 'write',
@@ -947,9 +950,19 @@ export const TOOLS: readonly ToolDef[] = [
       at: { type: 'string', description: 'once 用，例如 2026-11-10 09:00 或 2026-11-10T09:00:00+08:00' },
       time: { type: 'string', description: 'daily/weekly 用，HH:MM，例如 08:30' },
       days: { type: 'string', description: 'weekly 用，0=周日…6=周六，可写 1,3,5' },
-      intervalMinutes: { type: 'string', description: 'interval 用，最小 5 分钟，例如 30' },
+      intervalValue: { type: 'string', description: 'interval 用，间隔数值，例如 30；必须大于 0 且为整数' },
+      intervalUnit: {
+        type: 'string',
+        description: 'interval 用，间隔单位：second/minute/hour/day/month/year，也接受中文秒/分钟/小时/天/月/年；秒级最少 30',
+      },
+      intervalMinutes: { type: 'string', description: '旧字段，interval 用分钟数；新调用优先用 intervalValue + intervalUnit' },
+      startAt: {
+        type: 'string',
+        description:
+          'interval 用，首次执行时间，例如 2026-11-28 09:00；用户明确说“从明天九点开始，每 30 分钟”时填。不填则按现在 + 间隔。之后每次执行完成都从原定时间顺延。',
+      },
       afterSeconds: { type: 'string', description: '多少秒后触发一次（once），最少 30，例如 60' },
-      everySeconds: { type: 'string', description: '每隔多少秒重复（interval），最少 300，例如 600' },
+      everySeconds: { type: 'string', description: '每隔多少秒重复（interval），最少 30，例如 600' },
       timezone: { type: 'string', description: '时区，默认 Asia/Shanghai；一般不用填' },
       channel: { type: 'string', description: '结果回推通道：dingtalk（默认，回到当前员工钉钉）或 web（只落网页会话）' },
     },
@@ -967,7 +980,7 @@ export const TOOLS: readonly ToolDef[] = [
   {
     id: 'schedule.delete',
     name: '删除定时任务',
-    description: '删除当前员工自己的一个定时任务，删除后不会再有后续触发。用户说“取消明天那个提醒/删掉那个任务/不要再发了”时调用；先用 schedule.list 找到 id。',
+    description: '物理删除当前员工自己的一个定时任务，任务行、执行记录和事件日志会一并清除，删除后不会再有后续触发。用户说“取消明天那个提醒/删掉那个任务/不要再发了”时调用；先用 schedule.list 找到 id。',
     scope: SC.SCHEDULE_WRITE,
     dangerous: false,
     concurrency: 'write',
@@ -3134,6 +3147,9 @@ export async function executeTool(
           time: args.time === undefined ? undefined : String(args.time),
           days: args.days === undefined ? undefined : String(args.days),
           intervalMinutes: args.intervalMinutes === undefined ? undefined : String(args.intervalMinutes),
+          intervalValue: args.intervalValue === undefined ? undefined : String(args.intervalValue),
+          intervalUnit: args.intervalUnit === undefined ? undefined : String(args.intervalUnit),
+          startAt: args.startAt === undefined ? undefined : String(args.startAt),
           afterSeconds: args.afterSeconds === undefined ? undefined : String(args.afterSeconds),
           everySeconds: args.everySeconds === undefined ? undefined : String(args.everySeconds),
           timezone: args.timezone === undefined ? undefined : String(args.timezone),
@@ -3150,7 +3166,7 @@ export async function executeTool(
     case 'schedule.delete': {
       const id = String(args.id ?? '').trim()
       if (!id) throw new EabError(EC.VALIDATION, 'id 不能为空')
-      result = deleteSchedule(deps.db, actor, id)
+      result = removeSchedule(deps.db, actor, id)
       break
     }
     case 'math.eval': {

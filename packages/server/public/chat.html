@@ -25,7 +25,7 @@
     <script src="/theme.js?v=20261117a" data-surface="chat"></script>
     <script src="/brand.js?v=20261115c" defer></script>
     <link rel="stylesheet" href="/app.css?v=20261125uiP29E" />
-    <link rel="stylesheet" href="/chat.css?v=20261126uiP34B" />
+    <link rel="stylesheet" href="/chat.css?v=20261127targetH" />
     <link rel="stylesheet" href="/theme.css?v=20261125uiP29D" />
     <link rel="stylesheet" href="/ui-motion.css?v=20261124motionE" />
     <link rel="stylesheet" href="/ui-overlay.css?v=20261125uiP28A" />
@@ -96,7 +96,7 @@
           <span class="side-brand-chevron" aria-hidden="true">›</span>
         </div>
 
-        <div class="side-user side-user-compact side-profile-card" id="side-user" hidden>
+        <div class="side-user side-user-compact side-profile-card" id="side-user" role="button" tabindex="0" title="打开设置" aria-label="打开设置" hidden>
           <div class="side-user-row">
             <span class="avatar lg" id="user-avatar">·</span>
             <div class="side-user-meta">
@@ -105,7 +105,6 @@
             </div>
             <span class="side-profile-status" id="user-work-status" title="当前工作状态"></span>
           </div>
-          <div class="side-user-org muted" id="user-org">—</div>
           <div class="side-user-roles" id="user-roles"></div>
         </div>
 
@@ -129,10 +128,6 @@
           <button class="side-nav-item" type="button" data-side-action="plugins">
             <span class="side-nav-icon" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="m10 2.5 6.3 3.5-6.3 3.5-6.3-3.5L10 2.5Z" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linejoin="round"/><path d="m3.7 10 6.3 3.5 6.3-3.5M3.7 13.9l6.3 3.5 6.3-3.5" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
             <span class="side-nav-label">插件·技能·伙伴</span>
-          </button>
-          <button class="side-nav-item" type="button" data-side-action="cloud">
-            <span class="side-nav-icon" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M4.2 5.3h3.4l1.3 1.7h6.9a1.3 1.3 0 0 1 1.3 1.3v6.2a1.3 1.3 0 0 1-1.3 1.3H4.2a1.3 1.3 0 0 1-1.3-1.3V6.6a1.3 1.3 0 0 1 1.3-1.3Z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M2.9 7h14.2" fill="none" stroke="currentColor" stroke-width="1.25"/></svg></span>
-            <span class="side-nav-label">云空间</span>
           </button>
           <button class="side-nav-item side-nav-more" id="side-more" type="button" data-side-action="more" aria-haspopup="menu" aria-expanded="false">
             <span class="side-nav-icon" aria-hidden="true"><svg viewBox="0 0 20 20"><rect x="3" y="3" width="5.2" height="5.2" rx="1.4" fill="none" stroke="currentColor" stroke-width="1.5"/><rect x="11.8" y="3" width="5.2" height="5.2" rx="1.4" fill="none" stroke="currentColor" stroke-width="1.5"/><rect x="3" y="11.8" width="5.2" height="5.2" rx="1.4" fill="none" stroke="currentColor" stroke-width="1.5"/><rect x="11.8" y="11.8" width="5.2" height="5.2" rx="1.4" fill="none" stroke="currentColor" stroke-width="1.5"/></svg></span>
@@ -160,10 +155,18 @@
         </div>
       </div>
 
-      <div class="side-bottom">
-        <button class="side-settings-btn" id="open-settings" type="button">
-          <span class="side-settings-icon" aria-hidden="true"><svg viewBox="0 0 20 20"><circle cx="10" cy="10" r="2.8" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M10 2.8v2M10 15.2v2M17.2 10h-2M4.8 10h-2M15.1 4.9l-1.4 1.4M6.3 13.7l-1.4 1.4M15.1 15.1l-1.4-1.4M6.3 6.3 4.9 4.9" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></span>
-          <span>设置</span>
+      <div class="side-bottom" id="side-bottom" hidden>
+        <button class="side-desktop-entry" id="open-desktop-download" type="button">
+          <span class="side-desktop-icon" aria-hidden="true">
+            <svg viewBox="0 0 20 20"><rect x="3.2" y="4.1" width="13.6" height="9.2" rx="1.4" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M7.2 15.9h5.6M10 13.3v2.6" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+          </span>
+          <span class="side-desktop-copy">
+            <strong>下载桌面端</strong>
+            <small>Windows 客户端 · 本地项目</small>
+          </span>
+          <span class="side-desktop-arrow" aria-hidden="true">
+            <svg viewBox="0 0 16 16"><path d="M8 3.4v7.2M5.2 8.2 8 11l2.8-2.8M3.4 12.6h9.2" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </span>
         </button>
       </div>
 
@@ -175,6 +178,10 @@
         <button type="button" role="menuitem" id="side-more-cloud">
           <span class="side-more-icon" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M4.2 5.3h3.4l1.3 1.7h6.9a1.3 1.3 0 0 1 1.3 1.3v6.2a1.3 1.3 0 0 1-1.3 1.3H4.2a1.3 1.3 0 0 1-1.3-1.3V6.6a1.3 1.3 0 0 1 1.3-1.3Z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M2.9 7h14.2" fill="none" stroke="currentColor" stroke-width="1.2"/></svg></span>
           <span>打开云空间</span>
+        </button>
+        <button type="button" role="menuitem" id="side-more-approval">
+          <span class="side-more-icon" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M10 2.9l5.4 2v4.3c0 3.3-2.2 5.8-5.4 7.1-3.2-1.3-5.4-3.8-5.4-7.1V4.9l5.4-2Z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M7.4 9.9l1.8 1.8 3.5-3.6" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg></span>
+          <span>打开审批</span>
         </button>
         <button type="button" role="menuitem" id="side-more-console" hidden>
           <span class="side-more-icon" aria-hidden="true"><svg viewBox="0 0 20 20"><rect x="3" y="3" width="5.2" height="5.2" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4"/><rect x="11.8" y="3" width="5.2" height="5.2" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4"/><rect x="3" y="11.8" width="5.2" height="5.2" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4"/><rect x="11.8" y="11.8" width="5.2" height="5.2" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4"/></svg></span>
@@ -192,6 +199,7 @@
 
 
     <div class="chat-stage" id="chat-stage">
+      <div class="global-drawer-scrim" id="global-drawer-scrim" hidden></div>
       <header class="chat-head">
         <div class="chat-head-left">
           <button class="chat-side-toggle" id="side-toggle" type="button" aria-expanded="true" aria-label="收起侧边栏" title="收起侧边栏">
@@ -201,10 +209,6 @@
               <path class="side-toggle-arrow" d="M13.2 9.2l-2.8 2.8 2.8 2.8" />
             </svg>
           </button>
-          <div class="chat-mode-switch" id="mode-switch" role="tablist" aria-label="页面切换">
-            <button class="chat-mode-btn is-active" type="button" data-mode="chat" role="tab" aria-selected="true">对话</button>
-            <button class="chat-mode-btn" type="button" data-mode="workspace" role="tab" aria-selected="false">工作台</button>
-          </div>
         </div>
         <div class="chat-head-title-wrap">
           <span class="chat-project-badge" id="chat-project-badge" hidden></span>
@@ -238,13 +242,11 @@
               </span>
             </span>
           </button>
-          <button class="btn ghost sm" id="open-desktop-download" type="button" hidden>下载桌面端</button>
           <span class="chat-demo-pill" id="demo-pill" hidden>演示回声</span>
           <button class="desktop-update-chip" id="desktop-update-chip" type="button" hidden aria-live="polite">
             <span class="desktop-update-dot" aria-hidden="true"></span>
             <span id="desktop-update-chip-label">检查更新</span>
           </button>
-          <button class="btn ghost sm" id="console-entry" type="button" hidden>管理后台</button>
           <button class="btn ghost sm" id="login-btn" type="button" hidden>登录</button>
         </div>
       </header>
@@ -370,6 +372,12 @@
                       </span>
                       <span>打开云空间</span>
                     </button>
+                    <button class="web-newtab-action" id="web-draft-terminal" type="button" data-web-draft-action="terminal" hidden>
+                      <span class="web-newtab-icon" aria-hidden="true">
+                        <svg viewBox="0 0 18 18"><rect x="2.6" y="3.2" width="12.8" height="11.6" rx="3" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="m5.6 7.4 2.3 2.2-2.3 2.2M9.6 11.8h3" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                      </span>
+                      <span>打开终端</span>
+                    </button>
                   </div>
                   <span class="web-empty-title" hidden>在右侧打开一个网页</span>
                   <p hidden>Agent 打开网页后会自动出现在这里；你也可以输入网址。画面是服务端浏览器投屏，点击画面即可操作。</p>
@@ -410,11 +418,46 @@
               </div>
             </section>
 
+            <section class="terminal-pane" id="terminal-pane" hidden aria-label="本机终端">
+              <div class="terminal-pane-head">
+                <div class="terminal-pane-head-main">
+                  <span class="terminal-pane-kicker">LOCAL TERMINAL</span>
+                  <div class="terminal-pane-title-row">
+                    <h2 id="terminal-title">PowerShell</h2>
+                    <span class="terminal-pane-badge">本机</span>
+                    <span class="terminal-pane-cwd" id="terminal-cwd" title="">~</span>
+                  </div>
+                </div>
+                <div class="terminal-pane-actions">
+                  <button class="terminal-action" id="terminal-clear" type="button" title="清空屏幕输出">清屏</button>
+                  <button class="terminal-action" id="terminal-copy" type="button" title="复制全部终端输出">复制</button>
+                  <button class="terminal-action" id="terminal-restart" type="button" title="重新启动本机终端">重启</button>
+                  <button class="terminal-action terminal-action-close" id="terminal-close" type="button" title="关闭终端">关闭</button>
+                </div>
+              </div>
+              <div class="terminal-surface" id="terminal-surface">
+                <div class="terminal-output" id="terminal-output" role="log" aria-live="polite" aria-label="终端输出"></div>
+                <form class="terminal-input-row" id="terminal-input-form" autocomplete="off">
+                  <span class="terminal-prompt" aria-hidden="true">PS&gt;</span>
+                  <input id="terminal-input" class="terminal-input" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="输入命令，Enter 执行" aria-label="终端命令输入">
+                  <span class="terminal-input-hint" id="terminal-input-hint">Enter</span>
+                </form>
+              </div>
+              <div class="terminal-pane-foot">
+                <span class="terminal-status" id="terminal-status">正在启动 PowerShell…</span>
+                <span class="terminal-shortcuts">↑↓ 历史 · Ctrl+L 清屏 · Ctrl+` 打开终端</span>
+              </div>
+            </section>
+
             <section class="cloud-pane" id="cloud-pane" hidden aria-label="云空间">
               <div class="cloud-pane-head">
                 <div class="cloud-pane-head-main">
                   <span class="cloud-pane-kicker">CLOUD SPACE</span>
-                  <h2>云空间</h2>
+                  <div class="cloud-pane-title-row">
+                    <h2>云空间</h2>
+                    <button class="ws-quota-badge cloud-quota-badge" id="cloud-quota-badge" type="button" aria-label="查看云空间容量" aria-haspopup="dialog" aria-expanded="false" aria-controls="cloud-quota-popover">?</button>
+                    <div class="cloud-quota-popover ws-quota-card" id="cloud-quota-popover" hidden role="dialog" aria-label="云空间容量"></div>
+                  </div>
                   <div class="cloud-pane-path" id="cloud-pane-path"></div>
                 </div>
                 <div class="cloud-pane-actions">
@@ -518,30 +561,6 @@
           </button>
         </div>
 
-        <section class="workspace-pane" id="workspace-pane" hidden>
-          <div class="workspace-head">
-            <div class="workspace-head-main">
-              <div>
-                <span class="workspace-eyebrow" id="workspace-eyebrow">PERSONAL PLUGIN WORKSPACE</span>
-                <h2 id="workspace-title">我的工作台</h2>
-              </div>
-              <div class="chat-mode-switch" id="workspace-kind-switch" role="tablist" aria-label="工作台类型">
-                <button class="chat-mode-btn is-active" type="button" data-workspace-kind="plugins" role="tab" aria-selected="true">插件</button>
-                <button class="chat-mode-btn" type="button" data-workspace-kind="skills" role="tab" aria-selected="false">技能</button>
-              </div>
-            </div>
-            <span class="workspace-scope-badge hint-badge" id="workspace-scope-badge" data-tip="只显示你自己安装的插件。启停、卸载、查看详情和打开插件页面都只影响你本人，不会碰公司和别人的安装。" tabindex="0" aria-label="个人工作台插件范围说明">仅本人可见</span>
-          </div>
-          <div class="workspace-shell">
-            <aside class="ws-plugin-rail" id="my-plugin-rail" aria-label="个人插件列表">
-              <div class="plugin-empty muted">正在读取插件…</div>
-            </aside>
-            <main class="ws-plugin-main" id="my-plugin-detail" aria-live="polite">
-              <div class="plugin-empty muted">正在读取插件…</div>
-            </main>
-          </div>
-        </section>
-
         <section class="project-pane" id="project-pane" hidden aria-label="项目主页">
           <div class="project-pane-inner" id="project-pane-inner"></div>
         </section>
@@ -602,12 +621,6 @@
                   <span class="caret">▾</span>
                 </button>
                 <div class="model-menu" id="model-menu" hidden></div>
-                <button class="space-chip" id="space-chip" type="button" aria-haspopup="menu" aria-expanded="false" aria-label="项目">
-                  <span class="space-chip-icon" aria-hidden="true"><svg viewBox="0 0 16 16"><path d="M2.4 5.2h4l1.2 1.4h5.9v5.6a1.4 1.4 0 0 1-1.4 1.4H3.8a1.4 1.4 0 0 1-1.4-1.4V5.2Z" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round"/><path d="M2.4 5.2V4.4A1.2 1.2 0 0 1 3.6 3.2h2.8l1.2 1.2h3.6A1.2 1.2 0 0 1 12.4 5.6v.8" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round"/></svg></span>
-                  <span id="space-chip-label">项目</span>
-                  <span class="caret" aria-hidden="true"><svg viewBox="0 0 12 12"><path d="m4.2 2.6 3.6 3.4-3.6 3.4" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
-                </button>
-                <div class="space-menu" id="space-menu" role="menu" hidden></div>
                 <div class="think-wrap" id="think-wrap" hidden>
                   <button class="think-chip" id="think-chip" type="button" aria-haspopup="listbox" aria-expanded="false">
                     <span class="think-mark" aria-hidden="true">◐</span>
@@ -615,6 +628,14 @@
                     <span class="caret">▾</span>
                   </button>
                   <div class="think-menu" id="think-menu" role="listbox" hidden></div>
+                </div>
+                <div class="space-picker">
+                  <button class="space-chip" id="space-chip" type="button" aria-haspopup="menu" aria-expanded="false" aria-label="项目">
+                    <span class="space-chip-icon" aria-hidden="true"><svg viewBox="0 0 16 16"><path d="M2.4 5.2h4l1.2 1.4h5.9v5.6a1.4 1.4 0 0 1-1.4 1.4H3.8a1.4 1.4 0 0 1-1.4-1.4V5.2Z" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round"/><path d="M2.4 5.2V4.4A1.2 1.2 0 0 1 3.6 3.2h2.8l1.2 1.2h3.6A1.2 1.2 0 0 1 12.4 5.6v.8" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round"/></svg></span>
+                    <span id="space-chip-label">项目</span>
+                    <span class="caret" aria-hidden="true"><svg viewBox="0 0 12 12"><path d="m4.2 2.6 3.6 3.4-3.6 3.4" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+                  </button>
+                  <div class="space-menu" id="space-menu" role="menu" hidden></div>
                 </div>
               </div>
               <button class="send-btn" id="send" type="button" title="发送" aria-label="发送">
@@ -636,6 +657,411 @@
           </div>
         </footer>
       </main>
+
+    <section class="schedules-stage" id="schedules-stage" hidden>
+      <header class="schedules-head">
+        <button class="schedules-back" id="schedules-back" type="button">← 返回</button>
+        <div class="schedules-head-copy">
+          <span class="schedules-head-title">定时任务</span>
+        </div>
+        <span class="schedules-head-spacer"></span>
+        <button class="schedules-refresh" id="schedules-refresh" type="button">
+          <svg viewBox="0 0 18 18" aria-hidden="true"><path d="M14.4 8.2a5.4 5.4 0 1 1-1.6-3.8M14.6 3.8v4.4h-4.4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          刷新
+        </button>
+      </header>
+
+      <div class="schedules-main">
+        <section class="schedules-left" aria-label="我的定时任务">
+          <div class="schedules-hero">
+            <div class="schedules-hero-copy">
+              <h1>到点自动执行，结果回到对话。</h1>
+              <div class="schedules-hero-tags">
+                <span id="schedules-timezone">Asia/Shanghai</span>
+              </div>
+            </div>
+            <div class="schedules-hero-clock" aria-hidden="true">
+              <svg viewBox="0 0 48 48">
+                <circle cx="24" cy="24" r="18" fill="none" stroke="currentColor" stroke-width="1.4" opacity=".32"/>
+                <path d="M24 13.2V24l7.2 4.4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+                <circle cx="24" cy="24" r="1.4" fill="currentColor"/>
+              </svg>
+            </div>
+          </div>
+
+          <div class="schedules-stats" aria-label="任务统计">
+            <button class="schedule-stat is-active" type="button" data-schedule-filter="all">
+              <span>全部任务</span>
+              <strong class="schedule-stat-number" id="schedule-count-all"><span class="schedule-stat-number-value is-current">0</span></strong>
+            </button>
+            <button class="schedule-stat" type="button" data-schedule-filter="active">
+              <span>进行中</span>
+              <strong class="schedule-stat-number" id="schedule-count-active"><span class="schedule-stat-number-value is-current">0</span></strong>
+            </button>
+            <button class="schedule-stat" type="button" data-schedule-filter="paused">
+              <span>已暂停</span>
+              <strong class="schedule-stat-number" id="schedule-count-paused"><span class="schedule-stat-number-value is-current">0</span></strong>
+            </button>
+            <button class="schedule-stat" type="button" data-schedule-filter="ended">
+              <span>已结束</span>
+              <strong class="schedule-stat-number" id="schedule-count-ended"><span class="schedule-stat-number-value is-current">0</span></strong>
+            </button>
+          </div>
+
+          <div class="schedules-list-head">
+            <div>
+              <span class="schedules-list-title" id="schedules-list-title">全部任务</span>
+              <span class="schedules-list-hint" id="schedules-list-hint">共 0 个</span>
+            </div>
+          </div>
+
+          <div class="schedules-list" id="schedule-list">
+            <div class="schedule-list-empty"><span>正在读取定时任务…</span></div>
+          </div>
+        </section>
+
+        <aside class="schedules-compose" aria-labelledby="schedule-compose-title">
+          <div class="schedules-compose-head">
+            <h2 id="schedule-compose-title">新建定时任务</h2>
+          </div>
+
+          <form class="schedules-form" id="schedule-form" novalidate>
+            <label class="schedules-field">
+              <span class="schedules-label">任务名称 <em>选填</em></span>
+              <input id="schedule-form-title" type="text" maxlength="40" autocomplete="off" placeholder="例如：每天行业晨报" />
+            </label>
+
+            <label class="schedules-field">
+              <span class="schedules-label">到点做什么</span>
+              <textarea id="schedule-form-prompt" rows="5" maxlength="4000" placeholder="例如：汇总今天的行业新闻，按重要程度排序，并给出三条值得跟进的方向。"></textarea>
+            </label>
+
+            <div class="schedules-field">
+              <span class="schedules-label">执行频率</span>
+              <div class="schedules-mode" id="schedule-mode-switch" role="group" aria-label="执行频率">
+                <button type="button" data-schedule-mode="daily" class="is-active">每天</button>
+                <button type="button" data-schedule-mode="weekly">每周</button>
+                <button type="button" data-schedule-mode="once">单次</button>
+                <button type="button" data-schedule-mode="interval">间隔</button>
+              </div>
+            </div>
+
+            <div class="schedules-time-fields">
+              <label class="schedules-field" id="schedule-field-daily">
+                <span class="schedules-label">每天几点</span>
+                <input id="schedule-daily-time" type="text" autocomplete="off" class="schedule-time-input" value="09:00" maxlength="5" spellcheck="false" title="点击选择或直接输入，例如 09:30" aria-label="每天执行时间" aria-haspopup="listbox" aria-expanded="false" />
+              </label>
+
+              <div class="schedules-field schedule-weekly-field" id="schedule-field-weekly" hidden>
+                <span class="schedules-label">每周执行</span>
+                <div class="schedule-weekly-row">
+                  <input id="schedule-weekly-time" type="text" autocomplete="off" class="schedule-time-input" value="09:00" maxlength="5" spellcheck="false" title="点击选择或直接输入，例如 09:30" aria-label="每周执行时间" aria-haspopup="listbox" aria-expanded="false" />
+                  <div class="schedule-days" id="schedule-weekly-days" role="group" aria-label="选择星期">
+                    <button type="button" data-schedule-day="1" class="is-active">一</button>
+                    <button type="button" data-schedule-day="2" class="is-active">二</button>
+                    <button type="button" data-schedule-day="3" class="is-active">三</button>
+                    <button type="button" data-schedule-day="4" class="is-active">四</button>
+                    <button type="button" data-schedule-day="5" class="is-active">五</button>
+                    <button type="button" data-schedule-day="6">六</button>
+                    <button type="button" data-schedule-day="0">日</button>
+                  </div>
+                </div>
+              </div>
+
+              <label class="schedules-field" id="schedule-field-once" hidden>
+                <span class="schedules-label">执行时间</span>
+                <div class="schedule-once-row">
+                  <input id="schedule-once-date" type="date" aria-label="执行日期" />
+                  <input id="schedule-once-time" type="text" autocomplete="off" class="schedule-time-input" value="09:00" maxlength="5" spellcheck="false" title="点击选择或直接输入，例如 09:30" aria-label="执行时间" aria-haspopup="listbox" aria-expanded="false" />
+                </div>
+                <input id="schedule-once-at" type="hidden" />
+                <span class="schedules-field-warning" id="schedule-once-warning" role="alert" hidden></span>
+              </label>
+
+              <div class="schedules-field" id="schedule-field-interval" hidden>
+                <div class="schedule-interval-plan">
+                  <div class="schedule-interval-plan-row">
+                    <div class="schedule-interval-plan-head">
+                      <span class="schedules-label" id="schedule-interval-time-label">首次执行时间</span>
+                      <span class="schedule-interval-plan-badge" id="schedule-interval-time-badge">首次</span>
+                    </div>
+                    <div class="schedule-interval-start" id="schedule-interval-start">
+                      <input id="schedule-interval-date" type="date" autocomplete="off" aria-label="首次执行日期" />
+                      <input id="schedule-interval-time" type="text" autocomplete="off" class="schedule-time-input" value="09:00" maxlength="5" spellcheck="false" title="点击选择或直接输入，例如 09:30" aria-label="首次执行时间" aria-haspopup="listbox" aria-expanded="false" />
+                    </div>
+                    <input id="schedule-interval-at" type="hidden" />
+                    <span class="schedules-field-warning" id="schedule-interval-warning" role="alert" hidden></span>
+                  </div>
+
+                  <div class="schedule-interval-divider" aria-hidden="true"></div>
+
+                  <div class="schedule-interval-plan-row">
+                    <label class="schedules-label" for="schedule-interval-value">执行间隔</label>
+                    <div class="schedule-interval-every">
+                      <input id="schedule-interval-value" type="number" min="1" max="10000" step="1" value="30" aria-label="间隔数值" />
+                      <select id="schedule-interval-unit" aria-label="间隔单位">
+                        <option value="second">秒</option>
+                        <option value="minute" selected>分钟</option>
+                        <option value="hour">小时</option>
+                        <option value="day">天</option>
+                        <option value="month">月</option>
+                        <option value="year">年</option>
+                      </select>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="schedules-field">
+              <span class="schedules-label" id="schedule-channel-label">结果回推到</span>
+              <div class="schedule-target" id="schedule-target">
+                <select id="schedule-channel" class="schedule-target-native" tabindex="-1" aria-hidden="true" hidden>
+                  <option value="dingtalk">钉钉</option>
+                  <option value="new" selected>新建对话</option>
+                </select>
+                <div class="schedule-target-control">
+                  <span class="schedule-target-search-icon" aria-hidden="true">
+                    <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+                      <circle cx="6.8" cy="6.8" r="4.2"></circle>
+                      <path d="M10 10l3 3"></path>
+                    </svg>
+                  </span>
+                  <input
+                    class="schedule-target-trigger"
+                    id="schedule-target-trigger"
+                    type="text"
+                    role="combobox"
+                    autocomplete="off"
+                    spellcheck="false"
+                    placeholder="搜索对话标题"
+                    aria-haspopup="listbox"
+                    aria-expanded="false"
+                    aria-autocomplete="list"
+                    aria-controls="schedule-target-options"
+                    aria-labelledby="schedule-channel-label"
+                    title="选择结果回推位置"
+                  />
+                  <span class="schedule-target-caret" aria-hidden="true"></span>
+                </div>
+                <div class="schedule-target-popover" id="schedule-target-popover" hidden>
+                  <div
+                    class="schedule-target-options"
+                    id="schedule-target-options"
+                    role="listbox"
+                    aria-labelledby="schedule-channel-label"
+                  ></div>
+                  <p class="schedule-target-empty" id="schedule-target-empty" hidden>没有匹配的对话</p>
+                </div>
+              </div>
+            </div>
+
+            <div class="schedules-form-error" id="schedule-form-error" role="alert" hidden></div>
+
+            <div class="schedules-form-actions">
+              <button class="schedules-reset" id="schedule-form-reset" type="button">清空</button>
+              <button class="schedules-submit" id="schedule-create" type="submit">
+                <span class="schedules-submit-label">创建任务</span>
+                <span class="schedules-submit-check" aria-hidden="true">
+                  <svg viewBox="0 0 20 20" focusable="false">
+                    <path d="M4.4 10.3 8.2 14.1 15.7 5.9" pathLength="1" />
+                  </svg>
+                </span>
+              </button>
+            </div>
+          </form>
+        </aside>
+      </div>
+    </section>
+
+    <section class="workspace-stage" id="workspace-stage" hidden>
+      <header class="page-stage-head">
+        <button class="page-stage-back" id="workspace-back" type="button">← 返回</button>
+        <div class="page-stage-copy">
+          <span class="page-stage-title">工作台</span>
+          <span class="page-stage-sub">个人空间 · 项目、对话与能力</span>
+        </div>
+        <span class="page-stage-spacer"></span>
+        <button class="page-stage-refresh" id="workspace-refresh" type="button">
+          <svg viewBox="0 0 18 18" aria-hidden="true"><path d="M14.4 8.2a5.4 5.4 0 1 1-1.6-3.8M14.6 3.8v4.4h-4.4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          刷新
+        </button>
+      </header>
+
+      <div class="workspace-stage-body">
+        <div class="workspace-home">
+          <section class="workspace-home-hero" aria-labelledby="workspace-greeting">
+            <div class="workspace-home-hero-copy">
+              <span class="workspace-home-kicker">YOUR WORKSPACE</span>
+              <h1 id="workspace-greeting">工作台</h1>
+              <p>从这里继续最近的项目和对话，或者直接开始一件新任务。</p>
+              <div class="workspace-home-actions">
+                <button class="workspace-home-primary" type="button" data-workspace-action="new-task">
+                  新工作任务
+                  <span aria-hidden="true">→</span>
+                </button>
+                <button class="workspace-home-button" type="button" data-workspace-action="new-chat">新对话</button>
+                <button class="workspace-home-button" id="workspace-create-project" type="button" data-workspace-action="new-project" hidden>创建项目</button>
+              </div>
+            </div>
+            <aside class="workspace-home-today" aria-label="今日概览">
+              <span class="workspace-home-today-label">TODAY</span>
+              <strong id="workspace-today-date">—</strong>
+              <div class="workspace-home-today-stats">
+                <div>
+                  <span>进行中任务</span>
+                  <b id="workspace-today-schedules">—</b>
+                </div>
+                <div>
+                  <span>最近对话</span>
+                  <b id="workspace-today-recent">0</b>
+                </div>
+              </div>
+            </aside>
+          </section>
+
+          <div class="workspace-home-columns">
+            <section class="workspace-home-main" aria-label="个人工作内容">
+              <div class="workspace-home-block">
+                <div class="workspace-home-block-head">
+                  <div>
+                    <h2>我的项目</h2>
+                    <span id="workspace-project-hint">本机与远端项目</span>
+                  </div>
+                  <button class="workspace-home-link" id="workspace-project-new" type="button" data-workspace-action="new-project" hidden>新建项目</button>
+                </div>
+                <div class="workspace-home-projects" id="workspace-projects">
+                  <div class="workspace-home-empty"><strong>正在读取项目…</strong></div>
+                </div>
+              </div>
+
+              <div class="workspace-home-block">
+                <div class="workspace-home-block-head">
+                  <div>
+                    <h2>最近对话</h2>
+                    <span id="workspace-recent-hint">最近活动的会话</span>
+                  </div>
+                  <button class="workspace-home-link" type="button" data-workspace-action="new-chat">新建对话</button>
+                </div>
+                <div class="workspace-home-recent" id="workspace-recent-list">
+                  <div class="workspace-home-empty"><strong>正在读取对话…</strong></div>
+                </div>
+              </div>
+            </section>
+
+            <aside class="workspace-home-side" aria-label="个人快捷入口">
+              <section class="workspace-home-quick">
+                <div class="workspace-home-block-head">
+                  <div>
+                    <h2>快捷入口</h2>
+                    <span>常用空间与设置</span>
+                  </div>
+                </div>
+                <div class="workspace-home-quick-grid">
+                  <button class="workspace-home-quick-card" type="button" data-workspace-action="cloud">
+                    <span class="workspace-home-quick-icon" aria-hidden="true">
+                      <svg viewBox="0 0 20 20"><path d="M6.2 14.8h8.1a3.2 3.2 0 0 0 .3-6.4 4.4 4.4 0 0 0-8.4-1.1 3.6 3.6 0 0 0 0 7.5Z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>
+                    </span>
+                    <strong>云空间</strong>
+                    <span>文件与附件</span>
+                  </button>
+                  <button class="workspace-home-quick-card" type="button" data-workspace-action="schedules">
+                    <span class="workspace-home-quick-icon" aria-hidden="true">
+                      <svg viewBox="0 0 20 20"><circle cx="10" cy="10" r="6.2" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M10 6.4v4l2.8 1.7" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+                    </span>
+                    <strong>定时任务</strong>
+                    <span id="workspace-quick-schedules">自动执行</span>
+                  </button>
+                  <button class="workspace-home-quick-card" id="workspace-quick-project" type="button" data-workspace-action="new-project" hidden>
+                    <span class="workspace-home-quick-icon" aria-hidden="true">
+                      <svg viewBox="0 0 20 20"><path d="M3 6.6h5l1.5 1.8h7.5v6.2a1.5 1.5 0 0 1-1.5 1.5H4.5A1.5 1.5 0 0 1 3 12.6V6.6Z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M3 6.6V5.2A1.3 1.3 0 0 1 4.3 3.9h3.2L8.9 5.4h5.3A1.3 1.3 0 0 1 15.5 6.7v1" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>
+                    </span>
+                    <strong>新建项目</strong>
+                    <span>绑定本机目录</span>
+                  </button>
+                  <button class="workspace-home-quick-card" id="workspace-quick-desktop" type="button" data-workspace-action="desktop" hidden>
+                    <span class="workspace-home-quick-icon" aria-hidden="true">
+                      <svg viewBox="0 0 20 20"><rect x="3.2" y="4.2" width="13.6" height="9.2" rx="1.4" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M7.2 16h5.6M10 13.4V16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+                    </span>
+                    <strong>桌面版</strong>
+                    <span>获取 Windows 客户端</span>
+                  </button>
+                  <button class="workspace-home-quick-card" type="button" data-workspace-action="settings">
+                    <span class="workspace-home-quick-icon" aria-hidden="true">
+                      <svg viewBox="0 0 20 20"><path d="M3 6.2h8M14 6.2h3M3 13.8h3M9 13.8h8" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><circle cx="12.8" cy="6.2" r="1.6" fill="none" stroke="currentColor" stroke-width="1.4"/><circle cx="7.2" cy="13.8" r="1.6" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>
+                    </span>
+                    <strong>设置</strong>
+                    <span>账号、语音与外观</span>
+                  </button>
+                </div>
+              </section>
+
+              <section class="workspace-home-capability">
+                <div class="workspace-home-block-head">
+                  <div>
+                    <h2>个人能力</h2>
+                    <span>只统计你自己安装的能力</span>
+                  </div>
+                </div>
+                <div class="workspace-home-capability-stats">
+                  <div>
+                    <strong id="workspace-plugin-count">—</strong>
+                    <span>已装插件</span>
+                  </div>
+                  <div>
+                    <strong id="workspace-skill-count">—</strong>
+                    <span>已装技能</span>
+                  </div>
+                </div>
+                <button class="workspace-home-capability-link" type="button" data-workspace-action="plugins">
+                  管理插件与技能
+                  <span aria-hidden="true">→</span>
+                </button>
+              </section>
+            </aside>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="plugins-stage" id="plugins-stage" hidden>
+      <header class="page-stage-head">
+        <button class="page-stage-back" id="plugins-back" type="button">← 返回</button>
+        <div class="page-stage-copy">
+          <span class="page-stage-title">插件 · 技能 · 伙伴</span>
+          <span class="page-stage-sub">个人安装的能力 · 只影响我自己</span>
+        </div>
+        <span class="page-stage-spacer"></span>
+        <button class="page-stage-refresh" id="plugins-refresh" type="button">
+          <svg viewBox="0 0 18 18" aria-hidden="true"><path d="M14.4 8.2a5.4 5.4 0 1 1-1.6-3.8M14.6 3.8v4.4h-4.4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          刷新
+        </button>
+      </header>
+
+      <div class="plugins-stage-body">
+        <div class="plugins-page-inner">
+          <div class="plugins-lead">
+            <div class="plugins-lead-copy">
+              <span class="workspace-eyebrow" id="workspace-eyebrow">PERSONAL PLUGIN WORKSPACE</span>
+              <h2 id="workspace-title">插件</h2>
+            </div>
+            <div class="chat-mode-switch" id="workspace-kind-switch" role="tablist" aria-label="能力类型">
+              <button class="chat-mode-btn is-active" type="button" data-workspace-kind="plugins" role="tab" aria-selected="true">插件</button>
+              <button class="chat-mode-btn" type="button" data-workspace-kind="skills" role="tab" aria-selected="false">技能</button>
+            </div>
+            <span class="workspace-scope-badge hint-badge" id="workspace-scope-badge" data-tip="只显示你自己安装的插件。启停、卸载、查看详情和打开插件页面都只影响你本人，不会碰公司和别人的安装。" tabindex="0" aria-label="个人工作台插件范围说明">仅本人可见</span>
+          </div>
+          <div class="workspace-shell">
+            <aside class="ws-plugin-rail" id="my-plugin-rail" aria-label="个人能力列表">
+              <div class="plugin-empty muted">正在读取插件…</div>
+            </aside>
+            <main class="ws-plugin-main" id="my-plugin-detail" aria-live="polite">
+              <div class="plugin-empty muted">正在读取插件…</div>
+            </main>
+          </div>
+        </div>
+      </div>
+    </section>
 
       <section class="settings-stage" id="settings-stage" hidden>
         <header class="settings-head">
@@ -764,25 +1190,7 @@
     <div class="session-menu" id="message-menu" hidden></div>
     <div class="session-menu" id="project-menu" hidden></div>
 
-    <div class="schedule-modal" id="schedule-modal" hidden>
-      <div class="schedule-card" role="dialog" aria-modal="true" aria-labelledby="schedule-title" tabindex="-1">
-        <div class="schedule-head">
-          <div>
-            <span class="project-modal-kicker">SCHEDULES</span>
-            <h2 id="schedule-title">定时任务</h2>
-          </div>
-          <div class="schedule-head-actions">
-            <button class="btn ghost sm" id="schedule-new" type="button">新建</button>
-            <button class="project-modal-close" id="schedule-close" type="button" aria-label="关闭">×</button>
-          </div>
-        </div>
-        <div class="schedule-list" id="schedule-list"></div>
-        <div class="schedule-foot">
-          <span>到点后自动执行，并通过当前渠道回推结果。</span>
-          <button class="btn ghost sm" id="schedule-refresh" type="button">刷新</button>
-        </div>
-      </div>
-    </div>
+
 
     <div class="project-modal" id="project-modal" hidden>
       <div class="project-modal-card" role="dialog" aria-modal="true" aria-labelledby="project-modal-title">
@@ -940,7 +1348,7 @@
     <script src="/boot-splash.js?v=20261118d" data-surface="chat" defer></script>
     <script src="/ui-motion.js?v=20261124motionG" defer></script>
     <script src="/ui-overlay.js?v=20261125uiP27G" defer></script>
-    <script src="/chat.js?v=20261126uiP35H" defer></script>
+    <script src="/chat.js?v=20261127targetS" defer></script>
   </body>
 </html>
 

@@ -4,8 +4,8 @@ EAB 是一套面向**单公司本地部署**的企业智能体基座：一个进
 
 - 员工入口：`http://127.0.0.1:8787/chat`
 - 管理控制台：`http://127.0.0.1:8788/admin`
-- 当前版本：`2026.11.24`
-- 本版发布说明：[`docs/releases/v2026.11.24.md`](docs/releases/v2026.11.24.md)
+- 当前版本：`2026.11.27`
+- 本版发布说明：[`docs/releases/v2026.11.27.md`](docs/releases/v2026.11.27.md)
 
 > 单公司边界：一个实例只服务一家公司。钉钉、飞书、企业微信、模型供应商、知识库、插件都在控制台里配置。
 
@@ -59,10 +59,12 @@ pnpm desktop:installer
 
 - 安装包：`packages/desktop/release/EAB-Setup-<版本>-x64.exe`（版本与网页共用项目根 `package.json`，即 `/api/health` 显示的同一个版本）
 - 便携目录：`packages/desktop/release/EAB-Desktop-Windows-x64`
-- 便携压缩包：`packages/desktop/release/EAB-Desktop-Windows-x64.zip`
+- 便携压缩包：`packages/desktop/release/EAB-Desktop-Windows-x64.zip`（最新构建），同时保留 `EAB-Desktop-Windows-x64-<版本>.zip` 历史副本
 - 服务端下载页：`http://<你的 EAB 地址>/download/desktop`
 - 安装包下载：`http://<你的 EAB 地址>/download/desktop/windows`（优先返回 EXE）
+- 历史版本安装包：`http://<你的 EAB 地址>/download/desktop/setup?version=<版本号>`（版本档案里的每个历史包都能独立下载）
 - 便携版下载：`http://<你的 EAB 地址>/download/desktop/portable`
+- 历史版本便携包：`http://<你的 EAB 地址>/download/desktop/portable?version=<版本号>`（版本档案里每个便携归档都能独立下载）
 
 安装向导默认安装到 `C:\Program Files\EAB`，在「选择安装位置」页可以点“浏览”改到其他目录；安装完成后可从开始菜单或桌面快捷方式启动。安装时会把下载来源服务器写入 `<安装目录>\resources\app\desktop-config.json`，首次启动直接进入该服务器的工作台；只有便携版或无法识别下载来源时才需要手动填写地址。卸载入口在 Windows「设置 > 应用 > 已安装的应用」，卸载向导会询问是否同时删除 `%APPDATA%\EAB` 里的登录状态和服务地址，默认保留。
 
@@ -340,8 +342,8 @@ powershell -File .eab-dev\start-searxng.ps1
 
 EAB 的版本来自 GitHub Release：
 
-- Release tag：`v2026.11.24`
-- Release 资产：源码 zip（`EAB-2026.11.24.zip`）。Windows 桌面客户端由服务端下载页或本地 `pnpm desktop:build` 分发，不放进 GitHub Release。
+- Release tag：`v2026.11.27`
+- Release 资产：源码 zip（`EAB-2026.11.27.zip`）、Windows 安装包、便携 zip 和 `desktop-release.json`。
 
 ### 两种更新方式
 

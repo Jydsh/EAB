@@ -51,6 +51,29 @@ contextBridge.exposeInMainWorld('eabDesktop', {
   focusPage: (pageId) => ipcRenderer.send('eab:focus-page', String(pageId || '')),
   hideAll: () => ipcRenderer.send('eab:hide-all'),
   diagnostics: () => ipcRenderer.invoke('eab:diagnostics'),
+  terminalCreate: (options) =>
+    ipcRenderer.invoke('eab:terminal-create', {
+      cwd: String(options?.cwd || ''),
+      cols: Number(options?.cols) || 100,
+      rows: Number(options?.rows) || 30,
+    }),
+  terminalInput: (id, data) =>
+    ipcRenderer.send('eab:terminal-input', String(id || ''), String(data || '')),
+  terminalClose: (id) => ipcRenderer.invoke('eab:terminal-close', String(id || '')),
+  terminalRestart: (id) => ipcRenderer.invoke('eab:terminal-restart', String(id || '')),
+  terminalCopy: (text) => ipcRenderer.invoke('eab:terminal-copy', String(text || '')),
+  onTerminalData: (callback) => {
+    if (typeof callback !== 'function') return () => undefined
+    const handler = (_event, payload) => callback(payload)
+    ipcRenderer.on('eab:terminal-data', handler)
+    return () => ipcRenderer.removeListener('eab:terminal-data', handler)
+  },
+  onTerminalExit: (callback) => {
+    if (typeof callback !== 'function') return () => undefined
+    const handler = (_event, payload) => callback(payload)
+    ipcRenderer.on('eab:terminal-exit', handler)
+    return () => ipcRenderer.removeListener('eab:terminal-exit', handler)
+  },
   checkUpdates: () => ipcRenderer.invoke('eab:update-check'),
   downloadUpdate: () => ipcRenderer.invoke('eab:update-download'),
   applyUpdate: () => ipcRenderer.invoke('eab:update-apply'),

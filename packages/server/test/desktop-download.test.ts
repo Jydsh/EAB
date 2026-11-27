@@ -115,7 +115,44 @@ describe('桌面版下载发布目录', () => {
     const page = await app.inject({ method: 'GET', url: '/download/desktop' })
     expect(page.statusCode).toBe(200)
     expect(page.body).toContain('v2026.11.26')
-    expect(page.body).toContain('下载便携版 zip')
+    expect(page.body).toContain('下载便携版')
+    expect(page.body).toContain('data-platform="windows-x64"')
+    expect(page.body).toContain('navigator.userAgentData')
+  })
+
+  it('版本档案列出历史安装包，并支持按版本下载', async () => {
+    const { app, releaseDir } = makeApp()
+    const older = Buffer.from('older-eab-setup')
+    const olderPortable = Buffer.from('older-eab-portable')
+    writeFileSync(join(releaseDir, 'EAB-Setup-2026.11.24-x64.exe'), older)
+    writeFileSync(join(releaseDir, 'EAB-Desktop-Windows-x64-2026.11.24.zip'), olderPortable)
+    await app.ready()
+
+    const page = await app.inject({ method: 'GET', url: '/download/desktop' })
+    expect(page.statusCode).toBe(200)
+    expect(page.body).toContain('v2026.11.24')
+    expect(page.body).toContain('/download/desktop/setup?version=2026.11.24')
+    expect(page.body).toContain('/download/desktop/portable?version=2026.11.24')
+    expect(page.body).toContain('history-chip')
+    expect(page.body).toContain('portable-history-row')
+    expect(page.body).toContain('id="eab-favicon"')
+    expect(page.body).toContain('data:image/svg+xml')
+
+    const olderDownload = await app.inject({ method: 'GET', url: '/download/desktop/setup?version=2026.11.24' })
+    expect(olderDownload.statusCode).toBe(200)
+    expect(olderDownload.headers['content-disposition']).toContain('EAB-Setup-2026.11.24-x64.exe')
+
+    const missing = await app.inject({ method: 'GET', url: '/download/desktop/setup?version=2026.10.01' })
+    expect(missing.statusCode).toBe(404)
+    expect(missing.body).toContain('未找到该版本的安装包')
+
+    const olderPortableDownload = await app.inject({ method: 'GET', url: '/download/desktop/portable?version=2026.11.24' })
+    expect(olderPortableDownload.statusCode).toBe(200)
+    expect(olderPortableDownload.headers['content-disposition']).toContain('EAB-Desktop-Windows-x64-2026.11.24.zip')
+
+    const missingPortable = await app.inject({ method: 'GET', url: '/download/desktop/portable?version=2026.10.01' })
+    expect(missingPortable.statusCode).toBe(404)
+    expect(missingPortable.body).toContain('未找到该版本的便携包')
   })
 
   it('安装包和便携包都从当前发布目录下载', async () => {

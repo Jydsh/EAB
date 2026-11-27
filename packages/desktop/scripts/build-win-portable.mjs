@@ -90,9 +90,15 @@ async function main() {
   )
   if (compress.status !== 0) throw new Error('压缩便携包失败')
 
+  // 保留一份带版本号的副本，下载页的历史版本档案才能按版本下载旧便携包；
+  // 固定文件名继续作为“最新便携版”入口，兼容现有下载链接。
+  const versionedZipPath = path.join(releaseRoot, `EAB-Desktop-Windows-x64-${pkg.version}.zip`)
+  await cp(zipPath, versionedZipPath)
+
   const zipStat = await stat(zipPath)
   console.log(`EAB Desktop Windows: ${appDir}`)
   console.log(`Download zip: ${zipPath} (${(zipStat.size / 1024 / 1024).toFixed(1)} MB)`)
+  console.log(`Versioned zip: ${versionedZipPath}`)
 }
 
 main().catch((err) => {

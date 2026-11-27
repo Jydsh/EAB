@@ -9,7 +9,40 @@ import { SC } from '@eab/domain'
 import type { ServerDeps } from '../deps.js'
 import { ok, requireScope } from '../http.js'
 import { resolveActor } from '../session.js'
-import { cancelSchedule, createSchedule, listSchedules, setSchedulePaused } from '../schedule.js'
+import {
+  cancelSchedule,
+  createSchedule,
+  listSchedules,
+  removeSchedule,
+  setSchedulePaused,
+  updateSchedule,
+  type ScheduleInput,
+} from '../schedule.js'
+
+function scheduleInputFromBody(body: Record<string, unknown>): ScheduleInput {
+  return {
+    title: body.title === undefined ? undefined : String(body.title),
+    prompt: String(body.prompt ?? ''),
+    mode: String(body.mode ?? ''),
+    at: body.at === undefined ? undefined : String(body.at),
+    time: body.time === undefined ? undefined : String(body.time),
+    days: body.days === undefined ? undefined : String(body.days),
+    intervalMinutes: body.intervalMinutes === undefined ? undefined : String(body.intervalMinutes),
+    intervalValue: body.intervalValue === undefined ? undefined : String(body.intervalValue),
+    intervalUnit: body.intervalUnit === undefined ? undefined : String(body.intervalUnit),
+    startAt: body.startAt === undefined ? undefined : String(body.startAt),
+    afterSeconds: body.afterSeconds === undefined ? undefined : String(body.afterSeconds),
+    everySeconds: body.everySeconds === undefined ? undefined : String(body.everySeconds),
+    timezone: body.timezone === undefined ? undefined : String(body.timezone),
+    channel: body.channel === undefined ? undefined : String(body.channel),
+    sessionId:
+      body.sessionId === undefined
+        ? undefined
+        : body.sessionId === null
+          ? null
+          : String(body.sessionId),
+  }
+}
 
 export function registerScheduleRoutes(app: FastifyInstance, deps: ServerDeps): void {
   app.get('/api/schedules', async (req) => {
@@ -23,25 +56,25 @@ export function registerScheduleRoutes(app: FastifyInstance, deps: ServerDeps): 
     const actor = resolveActor(deps.db, deps.config, req, deps.companyId)
     requireScope(actor.subject, SC.SCHEDULE_WRITE)
     const body = (req.body ?? {}) as Record<string, unknown>
-    const schedule = createSchedule(
-      deps.db,
-      actor,
-      {
-        title: body.title === undefined ? undefined : String(body.title),
-        prompt: String(body.prompt ?? ''),
-        mode: String(body.mode ?? ''),
-        at: body.at === undefined ? undefined : String(body.at),
-        time: body.time === undefined ? undefined : String(body.time),
-        days: body.days === undefined ? undefined : String(body.days),
-        intervalMinutes: body.intervalMinutes === undefined ? undefined : String(body.intervalMinutes),
-        afterSeconds: body.afterSeconds === undefined ? undefined : String(body.afterSeconds),
-        everySeconds: body.everySeconds === undefined ? undefined : String(body.everySeconds),
-        timezone: body.timezone === undefined ? undefined : String(body.timezone),
-        channel: body.channel === undefined ? undefined : String(body.channel),
-      },
-      { sessionId: body.sessionId === undefined ? undefined : String(body.sessionId) },
-    )
+    const schedule = createSchedule(deps.db, actor, scheduleInputFromBody(body))
     return ok({ schedule })
+  })
+
+  app.patch('/api/schedules/:id', async (req) => {
+    const actor = resolveActor(deps.db, deps.config, req, deps.companyId)
+    requireScope(actor.subject, SC.SCHEDULE_WRITE)
+    const id = String((req.params as { id?: string }).id ?? '')
+    const body = (req.body ?? {}) as Record<string, unknown>
+    const activate = body.activate === true || body.activate === 'true'
+    const schedule = updateSchedule(deps.db, actor, id, scheduleInputFromBody(body), { activate })
+    return ok({ schedule })
+  })
+
+  app.delete('/api/schedules/:id', async (req) => {
+    const actor = resolveActor(deps.db, deps.config, req, deps.companyId)
+    requireScope(actor.subject, SC.SCHEDULE_WRITE)
+    const id = String((req.params as { id?: string }).id ?? '')
+    return ok(removeSchedule(deps.db, actor, id))
   })
 
   app.post('/api/schedules/:id/cancel', async (req) => {

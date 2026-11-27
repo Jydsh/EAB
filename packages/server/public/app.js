@@ -19781,7 +19781,15 @@ function taskRuleText(task) {
     const every = Array.isArray(rule.days) && rule.days.length === 1 ? `每${days}` : `每周 ${days}`
     return `${every} ${rule.time || '—'}`
   }
-  if (mode === 'interval') return `每 ${rule.intervalMinutes || '—'} 分钟`
+  if (mode === 'interval') {
+    const unitLabels = { second: '秒', minute: '分钟', hour: '小时', day: '天', month: '月', year: '年' }
+    const unit = String(rule.intervalUnit || '')
+    const value = Number(rule.intervalValue)
+    if (unitLabels[unit] && Number.isFinite(value) && value > 0) {
+      return value === 1 ? `每${unitLabels[unit]}` : `每 ${Math.floor(value)} ${unitLabels[unit]}`
+    }
+    return `每 ${rule.intervalMinutes || '—'} 分钟`
+  }
   return mode || '—'
 }
 

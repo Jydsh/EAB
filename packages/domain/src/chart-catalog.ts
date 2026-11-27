@@ -421,6 +421,11 @@ const SHAPE_GUIDE: Record<ChartDataShape, string> = {
   heatmap: '{"xAxis":["A","B"],"yAxis":["甲","乙"],"data":[[0,0,3],[1,0,5]]}，data 是 [x下标,y下标,数值]。',
 }
 
+const CHART_SELECTION_GUIDE: Record<ChartChannel, string> = {
+  web: '选型：每条的类型名和 purpose 就是选型依据；常见场景——占比 pie/doughnut，比较 bar/horizontalBar，趋势 line/area，关系 scatter，大小+关系 bubble，多维画像 radar，结构对比 stackedBar/groupedBar，单指标完成度 gauge，流程转化 funnel，二维分布 heatmap，逐项累加 waterfall。',
+  dingtalk: '选型：只在当前清单内选择；占比 pie，比较 bar/horizontalBar，趋势 line，关系 scatter，结构对比 stackedBar/groupedBar。',
+}
+
 /** 给 Agent 的图表能力说明；类型清单、数量、数据形态全部由目录按渠道生成。 */
 export function chartCatalogPrompt(channel: ChartChannel = 'web'): string {
   const types = chartCatalogForChannel(channel)
@@ -432,7 +437,9 @@ export function chartCatalogPrompt(channel: ChartChannel = 'web'): string {
   const shapes = [...new Set(types.map((item) => item.shape))]
   const shapeLines = shapes.map((shape, index) => {
     const ids = types.filter((item) => item.shape === shape).map((item) => item.id)
-    return `${index + 1}. ${shape}（${ids.join('/')}）：${SHAPE_GUIDE[shape] ?? '按该类型的 limits 给数据。'}`
+    const baseGuide = SHAPE_GUIDE[shape] ?? '按该类型的 limits 给数据。'
+    const guide = channel === 'dingtalk' ? baseGuide.replace('line/area', 'line') : baseGuide
+    return `${index + 1}. ${shape}（${ids.join('/')}）：${guide}`
   })
   const channelRule = channel === 'dingtalk'
     ? '钉钉卡片原生只认 lineChart、histogram、pieChart；清单里剩下的都是能保持原形的类型。清单外的类型（如环形、面积、雷达、极坐标、气泡、玫瑰、仪表盘、漏斗、热力、瀑布）在钉钉会被丢弃或变形，不要输出，改为说明“该图请在网页端查看”，并推荐清单内的近似类型。'
@@ -443,7 +450,7 @@ export function chartCatalogPrompt(channel: ChartChannel = 'web'): string {
     ...lines,
     '数据结构（按 shape 分组，新增同形态图表会自动归入对应组）：',
     ...shapeLines,
-    '选型：每条的类型名和 purpose 就是选型依据；常见场景——占比 pie/doughnut，比较 bar/horizontalBar，趋势 line/area，关系 scatter，大小+关系 bubble，多维画像 radar，结构对比 stackedBar/groupedBar，单指标完成度 gauge，流程转化 funnel，二维分布 heatmap，逐项累加 waterfall。',
+    CHART_SELECTION_GUIDE[channel],
     channelRule,
     `硬约束：type 只能是上面 ${count} 个 id；data 的每个数值必须来自工具真实结果或已抄好的统计，没有可靠数据就不要画。`,
   ].join('\n')

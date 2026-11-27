@@ -11,6 +11,7 @@ import { DesktopLocalProjects } from './local-files.mjs'
 const here = path.dirname(fileURLToPath(import.meta.url))
 const DEFAULT_COMPANY = 'c1'
 const PROBE = process.argv.includes('--probe')
+const TERMINAL_PROBE = process.argv.includes('--terminal-probe')
 const APP_ICON = path.join(here, 'assets', 'eab.ico')
 
 // 开发态从源码启动时也复用安装版的用户目录与登录配置，避免出现两套账号/标签数据。
@@ -84,8 +85,202 @@ function desktopInfo() {
     platform: process.platform,
     arch: process.arch,
     version: app.getVersion(),
+    homeDir: app.getPath('home'),
   }
 }
+
+/* -------------------------------------------------------------------------- */
+/* 本机终端：只在桌面宿主里存在，用 Windows PowerShell 子进程承载。 */
+/* Web 形态没有这组 IPC，聊天页也不会渲染终端入口。 */
+/* -------------------------------------------------------------------------- */
+
+const terminalSessions = new Map()
+let terminalSeq = 0
+
+function terminalSend(channel, payload) {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  mainWindow.webContents.send(channel, payload)
+}
+
+function terminalShellSpec() {
+  if (process.platform === 'win32') {
+    const init = [
+      '[Console]::InputEncoding=[System.Text.Encoding]::UTF8',
+      '[Console]::OutputEncoding=[System.Text.Encoding]::UTF8',
+      '$OutputEncoding=[System.Text.Encoding]::UTF8',
+      "$ProgressPreference='SilentlyContinue'",
+      "if ($PSVersionTable.PSVersion.Major -ge 7) { $PSStyle.OutputRendering='PlainText' }",
+      'function prompt { "PS> " }',
+    ].join('; ')
+    return {
+      file: 'powershell.exe',
+      args: ['-NoLogo', '-NoProfile', '-NoExit', '-Command', init],
+      label: 'PowerShell',
+    }
+  }
+  return {
+    file: process.env.SHELL || '/bin/sh',
+    args: ['-i'],
+    label: path.basename(process.env.SHELL || 'sh'),
+  }
+}
+
+function resolveTerminalCwd(raw) {
+  const requested = String(raw || '').trim()
+  if (requested) {
+    try {
+      if (existsSync(requested) && statSync(requested).isDirectory()) return requested
+    } catch {
+      // 目录不可访问时回落到用户主目录。
+    }
+  }
+  return app.getPath('home') || os.homedir()
+}
+
+function flushTerminalOutput(session) {
+  if (!session || !session.pending) return
+  const text = session.pending
+  session.pending = ''
+  session.flushTimer = null
+  terminalSend('eab:terminal-data', {
+    id: session.id,
+    stream: 'stdout',
+    data: text,
+  })
+}
+
+function queueTerminalOutput(session, text, stream = 'stdout') {
+  if (!text) return
+  if (stream === 'stderr') {
+    // stderr 直接发，避免和 stdout 合并后丢失颜色语义。
+    terminalSend('eab:terminal-data', { id: session.id, stream: 'stderr', data: String(text) })
+    return
+  }
+  session.pending += String(text)
+  if (session.pending.length > 32_000) {
+    if (session.flushTimer) clearTimeout(session.flushTimer)
+    flushTerminalOutput(session)
+    return
+  }
+  if (session.flushTimer) return
+  session.flushTimer = setTimeout(() => flushTerminalOutput(session), 16)
+}
+
+function createTerminalSession(options = {}) {
+  const shell = terminalShellSpec()
+  const cwd = resolveTerminalCwd(options.cwd)
+  terminalSeq += 1
+  const id = `term_${Date.now().toString(36)}_${terminalSeq}`
+  let child
+  try {
+    child = spawn(shell.file, shell.args, {
+      cwd,
+      env: { ...process.env, EAB_TERMINAL: '1' },
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+    })
+  } catch (error) {
+    return { ok: false, error: String(error?.message || error) }
+  }
+  const session = {
+    id,
+    child,
+    shell: shell.label,
+    cwd,
+    pending: '',
+    flushTimer: null,
+    closed: false,
+    exited: false,
+    exitCode: null,
+  }
+  terminalSessions.set(id, session)
+  child.stdout?.setEncoding('utf8')
+  child.stderr?.setEncoding('utf8')
+  child.stdout?.on('data', (data) => queueTerminalOutput(session, data, 'stdout'))
+  child.stderr?.on('data', (data) => queueTerminalOutput(session, data, 'stderr'))
+  child.on('error', (error) => {
+    if (session.exited) return
+    session.exited = true
+    terminalSessions.delete(id)
+    terminalSend('eab:terminal-exit', {
+      id,
+      code: null,
+      signal: null,
+      error: String(error?.message || error),
+    })
+  })
+  child.on('exit', (code, signal) => {
+    if (session.exited) return
+    session.exited = true
+    session.exitCode = code
+    if (session.flushTimer) clearTimeout(session.flushTimer)
+    flushTerminalOutput(session)
+    terminalSessions.delete(id)
+    if (session.closed) return
+    terminalSend('eab:terminal-exit', { id, code, signal, error: '' })
+  })
+  child.stdin?.on('error', () => {
+    // 进程刚退出时写入会 EPIPE，交给 exit 事件统一提示，避免刷屏。
+  })
+  return {
+    ok: true,
+    id,
+    shell: shell.label,
+    cwd,
+    pid: child.pid || 0,
+  }
+}
+
+function writeTerminalInput(id, data) {
+  const session = terminalSessions.get(String(id || ''))
+  if (!session || session.closed) return false
+  const text = String(data || '')
+  if (!text) return true
+  try {
+    session.child.stdin.write(text, 'utf8')
+    return true
+  } catch {
+    return false
+  }
+}
+
+function closeTerminalSession(id) {
+  const key = String(id || '')
+  const session = terminalSessions.get(key)
+  if (!session) return { ok: true, alreadyClosed: true }
+  session.closed = true
+  terminalSessions.delete(key)
+  if (session.flushTimer) clearTimeout(session.flushTimer)
+  const pid = Number(session.child.pid) || 0
+  try {
+    session.child.stdin?.end()
+  } catch {
+    // 忽略
+  }
+  try {
+    session.child.kill()
+  } catch {
+    // 忽略
+  }
+  // Windows 下 PowerShell 可能有子进程，按进程树结束，避免留下后台命令。
+  if (process.platform === 'win32' && pid > 0) {
+    try {
+      const killer = spawn('taskkill.exe', ['/pid', String(pid), '/T', '/F'], {
+        windowsHide: true,
+        stdio: 'ignore',
+      })
+      killer.unref()
+    } catch {
+      // 忽略
+    }
+  }
+  return { ok: true }
+}
+
+function destroyAllTerminals() {
+  for (const id of [...terminalSessions.keys()]) closeTerminalSession(id)
+}
+
 
 async function desktopCookieHeader() {
   if (!chatUrl) return ''
@@ -1588,11 +1783,15 @@ async function createWindow() {
   // 主页面刷新时不要销毁右侧标签页：标签页本体在 Electron 主进程里，
   // 刷新只重建聊天页面。这里先隐藏，等新页面通过 eab:browser-tabs 取回并重新绑定。
   mainWindow.webContents.on('did-start-navigation', (_event, _url, isInPlace, isMainFrame) => {
-    if (isMainFrame && !isInPlace) hideAllViews()
+    if (isMainFrame && !isInPlace) {
+      hideAllViews()
+      destroyAllTerminals()
+    }
   })
   mainWindow.webContents.on('render-process-gone', () => {
     if (browserViews.size > 0) persistBrowserTabsNow()
     destroyAllViews()
+    destroyAllTerminals()
     browserTabsRestored = false
   })
   // 地址栏 / 新标签输入框在主窗口渲染进程里，原生页的 before-input-event 接不到；
@@ -1607,6 +1806,7 @@ async function createWindow() {
     // 退出前同步落盘一次，避免最后一个标签页的防抖保存还没执行。
     if (browserViews.size > 0) persistBrowserTabsNow()
     destroyAllViews()
+    destroyAllTerminals()
     stopDesktopBridge()
     mainWindow = null
   })
@@ -1657,6 +1857,32 @@ ipcMain.handle('eab:get-server', () => ({ serverUrl: chatUrl }))
  * 返回真实绝对路径给网页；服务端只接受已存在且可写的目录。
  */
 ipcMain.handle('eab:desktop-info', () => desktopInfo())
+
+ipcMain.handle('eab:terminal-create', (_event, options) => createTerminalSession({
+  cwd: options?.cwd,
+  cols: options?.cols,
+  rows: options?.rows,
+}))
+
+ipcMain.on('eab:terminal-input', (_event, id, data) => {
+  writeTerminalInput(id, data)
+})
+
+ipcMain.handle('eab:terminal-close', (_event, id) => closeTerminalSession(id))
+
+ipcMain.handle('eab:terminal-restart', (_event, id) => {
+  const previous = terminalSessions.get(String(id || ''))
+  const cwd = previous?.cwd || ''
+  closeTerminalSession(id)
+  return createTerminalSession({ cwd })
+})
+
+ipcMain.handle('eab:terminal-copy', (_event, text) => {
+  const value = String(text || '')
+  if (!value) return { ok: false, error: '没有可复制的内容' }
+  clipboard.writeText(value)
+  return { ok: true, length: value.length }
+})
 
 ipcMain.handle('eab:bind-project', (_event, payload) => {
   try {
@@ -1888,6 +2114,59 @@ ipcMain.handle('eab:diagnostics', () => {
 })
 
 app.whenReady().then(async () => {
+  if (TERMINAL_PROBE) {
+    // 终端自检：隐藏窗口加载 preload，通过真实 IPC 启动 PowerShell、写入命令并读取输出。
+    mainWindow = new BrowserWindow({
+      show: false,
+      webPreferences: {
+        preload: path.join(here, 'preload.cjs'),
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: true,
+      },
+    })
+    await mainWindow.loadURL('data:text/html;charset=utf-8,<body>terminal probe</body>')
+    const setup = await mainWindow.webContents.executeJavaScript(`
+      window.__term = { data: [], exit: [] };
+      window.eabDesktop.onTerminalData((p) => window.__term.data.push(p));
+      window.eabDesktop.onTerminalExit((p) => window.__term.exit.push(p));
+      true
+    `)
+    const created = await mainWindow.webContents.executeJavaScript(
+      `window.eabDesktop.terminalCreate({ cwd: ${JSON.stringify(path.resolve(here, '../..'))} })`,
+    )
+    await new Promise((resolve) => setTimeout(resolve, 900))
+    await mainWindow.webContents.executeJavaScript(
+      `window.eabDesktop.terminalInput(${JSON.stringify(created.id)}, ${JSON.stringify('echo 中文终端测试\r\n')})`,
+    )
+    await new Promise((resolve) => setTimeout(resolve, 700))
+    const beforeExit = await mainWindow.webContents.executeJavaScript('window.__term')
+    await mainWindow.webContents.executeJavaScript(
+      `window.eabDesktop.terminalInput(${JSON.stringify(created.id)}, ${JSON.stringify('exit\r\n')})`,
+    )
+    await new Promise((resolve) => setTimeout(resolve, 700))
+    const afterExit = await mainWindow.webContents.executeJavaScript('window.__term')
+    const copied = await mainWindow.webContents.executeJavaScript(
+      `window.eabDesktop.terminalCopy(${JSON.stringify('EAB terminal copy probe')})`,
+    )
+    const text = (afterExit.data || []).map((item) => item.data || '').join('')
+    console.log(JSON.stringify({
+      ok: Boolean(
+        created.ok &&
+          text.includes('中文终端测试') &&
+          (afterExit.exit || []).length > 0 &&
+          copied.ok,
+      ),
+      setup,
+      created,
+      text,
+      hasChinese: text.includes('中文终端测试'),
+      exit: afterExit.exit,
+      copy: copied,
+    }))
+    app.quit()
+    return
+  }
   if (PROBE) {
     // 冒烟探针：不开窗口，只验证 Electron 能启动并创建原生 WebContentsView。
     const view = new WebContentsView({ webPreferences: { sandbox: true, contextIsolation: true } })
@@ -1905,6 +2184,10 @@ app.whenReady().then(async () => {
       createWindow().catch(() => undefined)
     }
   })
+})
+
+app.on('before-quit', () => {
+  destroyAllTerminals()
 })
 
 app.on('window-all-closed', () => {

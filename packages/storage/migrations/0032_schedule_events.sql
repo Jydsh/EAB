@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS schedule_events (
   schedule_id  TEXT NOT NULL,
   company_id   TEXT NOT NULL,
   user_id      TEXT NOT NULL,
-  type         TEXT NOT NULL,   -- create | delete | pause | resume | fire | complete | error | delivery | recover
+  type         TEXT NOT NULL,   -- create | update | delete | pause | resume | fire | complete | error | delivery | recover
   payload_json TEXT NOT NULL DEFAULT '{}',
   created_at   INTEGER NOT NULL
 );

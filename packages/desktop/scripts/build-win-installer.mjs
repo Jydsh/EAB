@@ -103,7 +103,7 @@ function findOutput() {
  * eab update 会整包替换 packages，安装包会被一起删掉。
  * 这里同步一份到数据目录，服务端优先从那里读，升级后仍能下载。
  */
-function publishToReleaseCache(finalFile, manifestFile) {
+function publishToReleaseCache(finalFile, manifestFile, version) {
   const dir = process.env.EAB_DESKTOP_RELEASE_DIR?.trim()
     ? path.resolve(process.env.EAB_DESKTOP_RELEASE_DIR.trim())
     : process.env.EAB_HOME?.trim()
@@ -114,6 +114,8 @@ function publishToReleaseCache(finalFile, manifestFile) {
   copyFileSync(manifestFile, path.join(dir, 'desktop-release.json'))
   const portableZip = path.join(releaseDir, 'EAB-Desktop-Windows-x64.zip')
   if (existsSync(portableZip)) copyFileSync(portableZip, path.join(dir, 'EAB-Desktop-Windows-x64.zip'))
+  const versionedPortableZip = path.join(releaseDir, `EAB-Desktop-Windows-x64-${version}.zip`)
+  if (existsSync(versionedPortableZip)) copyFileSync(versionedPortableZip, path.join(dir, path.basename(versionedPortableZip)))
   return dir
 }
 
@@ -175,7 +177,7 @@ function main() {
     notes: 'EAB Windows 桌面版安装包；支持内网 HTTP 语音、品牌图标、服务器驱动更新和本地项目工作区（原生目录选择、项目文件面板）。',
   }
   writeFileSync(path.join(releaseDir, 'desktop-release.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8')
-  const cacheDir = publishToReleaseCache(finalFile, path.join(releaseDir, 'desktop-release.json'))
+  const cacheDir = publishToReleaseCache(finalFile, path.join(releaseDir, 'desktop-release.json'), version)
   console.log(`Installer: ${finalFile}`)
   console.log(`Size: ${(size / 1024 / 1024).toFixed(1)} MB`)
   console.log(`SHA256: ${sha256}`)

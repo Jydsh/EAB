@@ -785,13 +785,11 @@
 }
 
 [data-theme='dark'] .chat-side .side-brand-text,
-[data-theme='dark'] .chat-side .side-user-meta strong,
-[data-theme='dark'] .chat-side .side-user-org .side-org-company {
+[data-theme='dark'] .chat-side .side-user-meta strong {
   color: var(--text);
 }
 
 [data-theme='dark'] .chat-side .side-user-meta .muted,
-[data-theme='dark'] .chat-side .side-org-dept,
 [data-theme='dark'] .chat-side .side-section-title {
   color: var(--muted);
 }
@@ -1142,4 +1140,97 @@
   .theme-icon {
     transition-duration: 0.01ms !important;
   }
+}
+
+[data-theme='dark'] .plugin-scope-block strong,
+[data-theme='dark'] .plugin-rail-text strong {
+  color: var(--ink);
+}
+
+[data-theme='dark'] .plugin-scope-block small,
+[data-theme='dark'] .plugin-scope-eyebrow,
+[data-theme='dark'] .plugin-rail-text small {
+  color: var(--muted);
+}
+
+/* ---------------- 深色审批面板 ---------------- */
+[data-theme='dark'] .perm-pane-kicker {
+  color: #6fd3c2;
+}
+
+[data-theme='dark'] .perm-pane-head h2,
+[data-theme='dark'] .perm-empty-title,
+[data-theme='dark'] .perm-role-title,
+[data-theme='dark'] .perm-current-label,
+[data-theme='dark'] .perm-scope-empty strong,
+[data-theme='dark'] .perm-complete-state strong {
+  color: var(--ink);
+}
+
+[data-theme='dark'] .perm-pane-sub,
+[data-theme='dark'] .perm-field-hint,
+[data-theme='dark'] .perm-complete-state > span:not(.perm-complete-badge),
+[data-theme='dark'] .perm-complete-stats span {
+  color: var(--muted);
+}
+
+[data-theme='dark'] .perm-switch {
+  border-color: rgba(111, 211, 194, .18);
+  background: rgba(111, 211, 194, .07);
+}
+
+[data-theme='dark'] .perm-switch-btn {
+  color: #b6c7d7;
+}
+
+[data-theme='dark'] .perm-switch-btn:hover {
+  color: #8ae1d1;
+  background: rgba(111, 211, 194, .12);
+}
+
+[data-theme='dark'] .perm-complete-state {
+  border-color: #2a403f;
+  background: linear-gradient(180deg, #14262a, #111b21);
+}
+
+[data-theme='dark'] .perm-complete-badge {
+  background: rgba(52, 160, 139, .18);
+  color: #86d9c8;
+}
+
+[data-theme='dark'] .perm-complete-stats div {
+  border-color: #2a3f44;
+  background: #16242c;
+}
+
+[data-theme='dark'] .perm-current-details,
+[data-theme='dark'] .perm-scope-empty {
+  border-color: #2a3f44;
+  background: #14212a;
+}
+
+[data-theme='dark'] .perm-field-label {
+  color: #a8bfce;
+}
+
+[data-theme='dark'] .perm-chip {
+  border-color: rgba(111, 211, 194, .18);
+  background: #1a2a33;
+  color: #a7c0ce;
+}
+
+[data-theme='dark'] .perm-role,
+[data-theme='dark'] .perm-scope {
+  border-color: rgba(111, 211, 194, .16);
+  background: rgba(24, 38, 46, .72);
+}
+
+[data-theme='dark'] .perm-role-title,
+[data-theme='dark'] .perm-role-code,
+[data-theme='dark'] .perm-role-scopes {
+  color: #b6c9d7;
+}
+
+[data-theme='dark'] .perm-role-radio {
+  background: #16242c;
 }
